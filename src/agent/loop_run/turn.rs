@@ -42,6 +42,7 @@ use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::deterministic;
@@ -88,6 +89,7 @@ const VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES: usize = 32_768;
 const VERIFIER_REPAIR_PASS_MAX_REASON_CHARS: usize = 180;
 const VERIFIER_REPAIR_PASS_MAX_EDITS: usize = 16;
 const VERIFIER_REPAIR_PASS_MAX_REPLACE_ALL_MATCHES: usize = 32;
+const VERIFIER_REPAIR_CHEAP_CHECK_TIMEOUT_SECS: u64 = 5;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
@@ -151,7 +153,21 @@ struct ValidatedVerifierRepairEdit {
     relative_path: String,
     canonical_path: PathBuf,
     updated_contents: String,
+    preimage_hash: String,
+    postimage_hash: String,
     fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifierRepairCheapCheckPolicy {
+    Disabled,
+    PythonSyntaxOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifierRepairIntentApplyResult {
+    updated_contents: String,
+    used_whitespace_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1620,7 +1636,7 @@ fn verifier_diagnostic_messages(
             "Diagnose the verifier failure and choose safe workspace repair targets.\n\
 Allowed failure_kind values: dependency_missing, local_import_contract_mismatch, compile_or_syntax_error, assertion_mismatch, runtime_error, test_bug, config_or_verifier_error, unknown.\n\
 Allowed probable_cause_role values: implementation, test, setup, usage_docs, unknown.\n\
-Schema: {{\"failure_kind\":\"...\",\"probable_cause_role\":\"...\",\"repair_targets\":[{{\"path\":\"workspace-relative existing file\",\"confidence\":0.0,\"reason\":\"short bounded reason\"}}],\"repair_plan\":[{{\"target\":\"workspace-relative existing file\",\"intent\":\"short bounded intent\",\"confidence\":0.0}}],\"secondary_targets\":[\"workspace-relative existing file\"],\"summary\":\"short bounded summary\"}}.\n\
+Schema: {{\"failure_kind\":\"...\",\"probable_cause_role\":\"...\",\"repair_targets\":[{{\"path\":\"workspace-relative existing file\",\"confidence\":0.0,\"reason\":\"short bounded reason\"}}],\"repair_plan\":[{{\"target\":\"workspace-relative existing file\",\"intent\":\"short bounded intent\",\"confidence\":0.0}}],\"secondary_targets\":[\"workspace-relative existing file\"],\"do_not_edit_tests_without_evidence\":true,\"summary\":\"short bounded summary\"}}.\n\
 Only include paths present in changed_candidates or safe_file_excerpts. For local import contract mismatches, prefer the provider/source file named by the import error before importer test frames. Use setup files only for dependency_missing or config_or_verifier_error. Payload JSON:\n{payload}"
         )),
     ]
@@ -1655,7 +1671,9 @@ fn verifier_diagnostic_file_excerpts(
     hints
         .into_iter()
         .filter_map(|hint| {
-            let excerpt = safe_verifier_diagnostic_file_excerpt(work_root, &hint.path)?;
+            let target_line = verifier_repair_context_line_for_path(context, &hint.path);
+            let excerpt =
+                safe_verifier_diagnostic_file_excerpt(work_root, &hint.path, target_line)?;
             Some(VerifierDiagnosticFileExcerpt {
                 path: hint.path,
                 role: hint.role,
@@ -1665,7 +1683,23 @@ fn verifier_diagnostic_file_excerpts(
         .collect()
 }
 
-fn safe_verifier_diagnostic_file_excerpt(work_root: &Path, raw_path: &str) -> Option<String> {
+fn verifier_repair_context_line_for_path(
+    context: &super::VerifierRepairContext,
+    path: &str,
+) -> Option<usize> {
+    let target = context.target_hint.as_ref()?;
+    if target.path == path {
+        context.target_line
+    } else {
+        None
+    }
+}
+
+fn safe_verifier_diagnostic_file_excerpt(
+    work_root: &Path,
+    raw_path: &str,
+    target_line: Option<usize>,
+) -> Option<String> {
     if !verifier_diagnostic_path_input_is_safe(raw_path) {
         return None;
     }
@@ -1680,7 +1714,11 @@ fn safe_verifier_diagnostic_file_excerpt(work_root: &Path, raw_path: &str) -> Op
     }
     let bytes = std::fs::read(canonical).ok()?;
     let text = String::from_utf8_lossy(&bytes);
-    let lines = text.lines().take(80).collect::<Vec<_>>().join("\n");
+    let lines = verifier_file_excerpt_for_line(
+        &text,
+        target_line,
+        VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES,
+    );
     Some(truncate(
         &crate::session::feedback::mask_secrets(&lines),
         VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES,
@@ -1693,8 +1731,10 @@ fn verifier_repair_pass_messages(
     target_hint: &super::task_contract::RecoveryTargetHint,
     active_request: &str,
 ) -> Result<Vec<ConversationMessage>, String> {
-    let target_excerpt = safe_verifier_repair_file_excerpt(work_root, &target_hint.path)
-        .ok_or_else(|| "selected target cannot be safely excerpted".to_string())?;
+    let target_line = verifier_repair_context_line_for_path(context, &target_hint.path);
+    let target_excerpt =
+        safe_verifier_repair_file_excerpt(work_root, &target_hint.path, target_line)
+            .ok_or_else(|| "selected target cannot be safely excerpted".to_string())?;
     let related = context
         .assessment
         .as_ref()
@@ -1705,13 +1745,16 @@ fn verifier_repair_pass_messages(
                 .filter(|hint| hint.path != target_hint.path)
                 .take(3)
                 .filter_map(|hint| {
-                    safe_verifier_repair_file_excerpt(work_root, &hint.path).map(|excerpt| {
-                        serde_json::json!({
-                            "path": hint.path,
-                            "role": hint.role.label(),
-                            "excerpt": excerpt,
-                        })
-                    })
+                    let target_line = verifier_repair_context_line_for_path(context, &hint.path);
+                    safe_verifier_repair_file_excerpt(work_root, &hint.path, target_line).map(
+                        |excerpt| {
+                            serde_json::json!({
+                                "path": hint.path,
+                                "role": hint.role.label(),
+                                "excerpt": excerpt,
+                            })
+                        },
+                    )
                 })
                 .collect::<Vec<_>>()
         })
@@ -1797,7 +1840,11 @@ fn verifier_repair_pass_retry_message(last_error: &str) -> String {
     format!("The previous repair intent was rejected: {reason}. {guidance}")
 }
 
-fn safe_verifier_repair_file_excerpt(work_root: &Path, raw_path: &str) -> Option<String> {
+fn safe_verifier_repair_file_excerpt(
+    work_root: &Path,
+    raw_path: &str,
+    target_line: Option<usize>,
+) -> Option<String> {
     if !verifier_repair_path_input_is_safe(raw_path) {
         return None;
     }
@@ -1813,8 +1860,81 @@ fn safe_verifier_repair_file_excerpt(work_root: &Path, raw_path: &str) -> Option
     }
     let bytes = std::fs::read(canonical).ok()?;
     let text = std::str::from_utf8(&bytes).ok()?;
-    let excerpt = head_tail_excerpt(text, VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES);
+    let excerpt = verifier_file_excerpt_for_line(
+        text,
+        target_line,
+        VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES,
+    );
     Some(crate::session::feedback::mask_secrets(&excerpt))
+}
+
+fn verifier_file_excerpt_for_line(
+    text: &str,
+    target_line: Option<usize>,
+    max_bytes: usize,
+) -> String {
+    let Some(target_line) = target_line.filter(|line| *line > 0) else {
+        return head_tail_excerpt(text, max_bytes);
+    };
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let target_index = target_line
+        .saturating_sub(1)
+        .min(lines.len().saturating_sub(1));
+    let mut start = target_index;
+    let mut end = target_index.saturating_add(1);
+    let mut current_len = lines[target_index].len();
+    let mut before_turn = true;
+    while current_len < max_bytes {
+        let mut expanded = false;
+        if before_turn && start > 0 {
+            let next_len = current_len.saturating_add(lines[start - 1].len());
+            if next_len <= max_bytes {
+                start -= 1;
+                current_len = next_len;
+                expanded = true;
+            }
+        } else if !before_turn && end < lines.len() {
+            let next_len = current_len.saturating_add(lines[end].len());
+            if next_len <= max_bytes {
+                current_len = next_len;
+                end += 1;
+                expanded = true;
+            }
+        }
+        before_turn = !before_turn;
+        if !expanded {
+            if start == 0 && end >= lines.len() {
+                break;
+            }
+            let can_expand_before =
+                start > 0 && current_len.saturating_add(lines[start - 1].len()) <= max_bytes;
+            let can_expand_after =
+                end < lines.len() && current_len.saturating_add(lines[end].len()) <= max_bytes;
+            if !can_expand_before && !can_expand_after {
+                break;
+            }
+        }
+    }
+    let mut excerpt = String::new();
+    if start > 0 {
+        excerpt.push_str("...[truncated before target line]...\n");
+    }
+    for line in &lines[start..end] {
+        excerpt.push_str(line);
+    }
+    if end < lines.len() {
+        if !excerpt.ends_with('\n') {
+            excerpt.push('\n');
+        }
+        excerpt.push_str("...[truncated after target line]...\n");
+    }
+    truncate(&excerpt, max_bytes)
 }
 
 fn head_tail_excerpt(text: &str, max_bytes: usize) -> String {
@@ -8993,10 +9113,8 @@ impl Agent {
                         if context.applied_repair_intents.contains(&edit.fingerprint) {
                             last_error =
                                 "duplicate repair edit intent for the same failure".to_string();
-                        } else if let Err(err) =
-                            std::fs::write(&edit.canonical_path, edit.updated_contents.as_bytes())
-                        {
-                            last_error = format!("failed to write {}: {err}", edit.relative_path);
+                        } else if let Err(err) = apply_validated_verifier_repair_edit(&edit) {
+                            last_error = format!("failed to apply {}: {err}", edit.relative_path);
                             break;
                         } else {
                             self.record_controller_verifier_repair_edit(
@@ -9010,6 +9128,8 @@ impl Agent {
                                     "session_id": self.session_store.session_id(),
                                     "model": model,
                                     "path": edit.relative_path,
+                                    "preimage_hash": edit.preimage_hash,
+                                    "postimage_hash": edit.postimage_hash,
                                     "attempt": attempt,
                                 }),
                             );
@@ -13066,6 +13186,8 @@ fn classify_verifier_failure_type(output: &str) -> super::VerifierFailureType {
         return super::VerifierFailureType::ImportOrDependency;
     }
     if lower.contains("syntaxerror")
+        || lower.contains("indentationerror")
+        || lower.contains("taberror")
         || lower.contains("compileerror")
         || lower.contains("could not compile")
         || lower.contains("compilation failed")
@@ -13201,6 +13323,7 @@ struct ParsedVerifierRepairAssessment {
     repair_targets: Vec<ParsedVerifierRepairTarget>,
     repair_plan: Vec<ParsedVerifierRepairTarget>,
     secondary_targets: Vec<String>,
+    do_not_edit_tests_without_evidence: bool,
     summary: Option<String>,
 }
 
@@ -13258,6 +13381,11 @@ fn parse_verifier_repair_assessment_reply(reply: &str) -> Option<ParsedVerifierR
     )
     .map(parse_verifier_secondary_targets_value)
     .unwrap_or_default();
+    let do_not_edit_tests_without_evidence = object
+        .get("do_not_edit_tests_without_evidence")
+        .or_else(|| object.get("avoid_test_edits_without_evidence"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     let summary = object
         .get("summary")
         .and_then(serde_json::Value::as_str)
@@ -13272,6 +13400,7 @@ fn parse_verifier_repair_assessment_reply(reply: &str) -> Option<ParsedVerifierR
         repair_targets,
         repair_plan,
         secondary_targets,
+        do_not_edit_tests_without_evidence,
         summary,
     })
 }
@@ -13425,8 +13554,9 @@ fn validate_verifier_repair_intents(
     }
     let bytes =
         std::fs::read(&canonical).map_err(|err| format!("failed to read repair target: {err}"))?;
-    let mut contents = String::from_utf8(bytes)
+    let original_contents = String::from_utf8(bytes)
         .map_err(|_| "repair target is not valid UTF-8 text".to_string())?;
+    let mut contents = original_contents.clone();
     let relative_path = canonical
         .strip_prefix(&root)
         .map_err(|_| "repair target escapes workspace".to_string())?
@@ -13434,6 +13564,7 @@ fn validate_verifier_repair_intents(
         .replace('\\', "/");
 
     let mut total_edit_bytes = 0usize;
+    let mut used_whitespace_fallback = false;
     for intent in &intents {
         if !verifier_repair_path_input_is_safe(&intent.path) {
             return Err("repair intent path is not a safe workspace-relative path".to_string());
@@ -13474,7 +13605,7 @@ fn validate_verifier_repair_intents(
             apply_bounded_replace_all(&contents, &intent.old_string, &intent.new_string)
                 .map_err(|err| format!("repair intent replace_all rejected: {err}"))?
         } else {
-            apply_exact_once_with_whitespace_fallback(
+            let result = apply_exact_once_with_whitespace_fallback(
                 &contents,
                 &intent.old_string,
                 &intent.new_string,
@@ -13484,9 +13615,16 @@ fn validate_verifier_repair_intents(
                     "repair intent exact edit rejected: {err}; old_string_excerpt={}",
                     compact_verifier_failure_text(&intent.old_string, 120)
                 )
-            })?
+            })?;
+            used_whitespace_fallback |= result.used_whitespace_fallback;
+            result.updated_contents
         };
     }
+    validate_verifier_repair_candidate_contents(
+        &relative_path,
+        &contents,
+        used_whitespace_fallback,
+    )?;
 
     let fingerprint = verifier_repair_intents_fingerprint(context, &relative_path, &intents);
     if context.applied_repair_intents.contains(&fingerprint) {
@@ -13495,24 +13633,170 @@ fn validate_verifier_repair_intents(
     Ok(ValidatedVerifierRepairEdit {
         relative_path,
         canonical_path: canonical,
+        preimage_hash: sha256_hex(original_contents.as_bytes()),
+        postimage_hash: sha256_hex(contents.as_bytes()),
         updated_contents: contents,
         fingerprint,
     })
+}
+
+fn apply_validated_verifier_repair_edit(edit: &ValidatedVerifierRepairEdit) -> Result<(), String> {
+    let current = std::fs::read(&edit.canonical_path)
+        .map_err(|err| format!("failed to read current target before apply: {err}"))?;
+    let current_hash = sha256_hex(&current);
+    if current_hash != edit.preimage_hash {
+        return Err("preimage changed after validation".to_string());
+    }
+    std::fs::write(&edit.canonical_path, edit.updated_contents.as_bytes())
+        .map_err(|err| format!("failed to write validated repair target: {err}"))?;
+    Ok(())
 }
 
 fn apply_exact_once_with_whitespace_fallback(
     contents: &str,
     old: &str,
     new: &str,
-) -> Result<String, String> {
+) -> Result<VerifierRepairIntentApplyResult, String> {
     match crate::tools::edit::apply_exact_once(contents, old, new) {
-        Ok(updated) => Ok(updated),
+        Ok(updated) => Ok(VerifierRepairIntentApplyResult {
+            updated_contents: updated,
+            used_whitespace_fallback: false,
+        }),
         Err(err) if err == "old_string was not found" => {
-            apply_unique_whitespace_normalized_replacement(contents, old, new).map_err(
-                |fallback_err| format!("{err}; whitespace fallback rejected: {fallback_err}"),
-            )
+            apply_unique_whitespace_normalized_replacement(contents, old, new)
+                .map(|updated| VerifierRepairIntentApplyResult {
+                    updated_contents: updated,
+                    used_whitespace_fallback: true,
+                })
+                .map_err(|fallback_err| {
+                    format!("{err}; whitespace fallback rejected: {fallback_err}")
+                })
         }
         Err(err) => Err(err),
+    }
+}
+
+fn validate_verifier_repair_candidate_contents(
+    relative_path: &str,
+    candidate_contents: &str,
+    used_whitespace_fallback: bool,
+) -> Result<(), String> {
+    match verifier_repair_cheap_check_policy(relative_path) {
+        VerifierRepairCheapCheckPolicy::Disabled => {
+            if used_whitespace_fallback
+                && verifier_repair_path_is_whitespace_sensitive(relative_path)
+            {
+                return Err(
+                    "whitespace fallback rejected: no safe cheap check is available".to_string(),
+                );
+            }
+            Ok(())
+        }
+        VerifierRepairCheapCheckPolicy::PythonSyntaxOnly => {
+            run_python_syntax_cheap_check(relative_path, candidate_contents).map_err(|err| {
+                format!("repair candidate cheap check failed for {relative_path}: {err}")
+            })
+        }
+    }
+}
+
+fn verifier_repair_cheap_check_policy(relative_path: &str) -> VerifierRepairCheapCheckPolicy {
+    match Path::new(relative_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("py") | Some("pyw") => VerifierRepairCheapCheckPolicy::PythonSyntaxOnly,
+        _ => VerifierRepairCheapCheckPolicy::Disabled,
+    }
+}
+
+fn verifier_repair_path_is_whitespace_sensitive(relative_path: &str) -> bool {
+    matches!(
+        Path::new(relative_path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("py") | Some("pyw") | Some("yaml") | Some("yml")
+    )
+}
+
+fn run_python_syntax_cheap_check(relative_path: &str, contents: &str) -> Result<(), String> {
+    let temp_root = std::env::temp_dir().join(format!(
+        "anvil-verifier-repair-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let result = (|| {
+        std::fs::create_dir_all(&temp_root)
+            .map_err(|err| format!("failed to create cheap check temp dir: {err}"))?;
+        let file_name = Path::new(relative_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("candidate.py");
+        let shadow_path = temp_root.join(file_name);
+        std::fs::write(&shadow_path, contents.as_bytes())
+            .map_err(|err| format!("failed to write cheap check shadow file: {err}"))?;
+        let mut command = Command::new("python3");
+        command
+            .arg("-I")
+            .arg("-B")
+            .arg("-m")
+            .arg("py_compile")
+            .arg(&shadow_path)
+            .current_dir(&temp_root)
+            .env_remove("PYTHONPATH")
+            .env_remove("VIRTUAL_ENV")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONNOUSERSITE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = run_verifier_repair_command_with_timeout(
+            command,
+            Duration::from_secs(VERIFIER_REPAIR_CHEAP_CHECK_TIMEOUT_SECS),
+        )?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stderr}\n{stdout}");
+        Err(compact_verifier_failure_text(&combined, 320))
+    })();
+    let _ = std::fs::remove_dir_all(&temp_root);
+    result
+}
+
+fn run_verifier_repair_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to start cheap check command: {err}"))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|err| format!("failed to collect cheap check output: {err}"));
+            }
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "cheap check timed out after {}s",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed while waiting for cheap check: {err}"));
+            }
+        }
     }
 }
 
@@ -13962,6 +14246,25 @@ fn recovery_target_hint_for_diagnostic_path(
     Some(hint)
 }
 
+fn diagnostic_target_allowed_by_confidence(
+    hint: &super::task_contract::RecoveryTargetHint,
+    confidence: f64,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+    probable_cause_role: Option<super::task_contract::ArtifactRole>,
+    do_not_edit_tests_without_evidence: bool,
+) -> bool {
+    if hint.role != super::task_contract::ArtifactRole::Test || !do_not_edit_tests_without_evidence
+    {
+        return true;
+    }
+    if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug)
+        || probable_cause_role == Some(super::task_contract::ArtifactRole::Test)
+    {
+        return confidence >= 0.60;
+    }
+    confidence >= 0.85
+}
+
 fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
     let path = raw_path.trim();
     if path.is_empty() || path.contains('\0') || Path::new(path).is_absolute() {
@@ -14016,6 +14319,15 @@ fn model_assessment_to_verifier_repair_assessment(
                 &target.reason,
                 failure_kind,
             )
+            .filter(|hint| {
+                diagnostic_target_allowed_by_confidence(
+                    hint,
+                    target.confidence,
+                    failure_kind,
+                    parsed.probable_cause_role,
+                    parsed.do_not_edit_tests_without_evidence,
+                )
+            })
             .map(|hint| (hint, target.confidence))
         })
         .collect::<Vec<_>>();
@@ -14029,6 +14341,15 @@ fn model_assessment_to_verifier_repair_assessment(
                 &target.reason,
                 failure_kind,
             )
+            .filter(|hint| {
+                diagnostic_target_allowed_by_confidence(
+                    hint,
+                    target.confidence,
+                    failure_kind,
+                    parsed.probable_cause_role,
+                    parsed.do_not_edit_tests_without_evidence,
+                )
+            })
         })
         .collect::<Vec<_>>();
     if repair_plan.is_empty() {
@@ -16470,7 +16791,8 @@ mod progress_tests {
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
         VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
         VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS, VerifierRepairDecision, VerifierRepairIntent,
-        artifact_directed_tool_policy_error, deterministic_empty_framework_app_files,
+        apply_validated_verifier_repair_edit, artifact_directed_tool_policy_error,
+        classify_verifier_failure_type, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         effective_tool_batch_action, effective_tool_policy_error_for_call,
@@ -16504,12 +16826,12 @@ mod progress_tests {
         task_contract_verifier_edit_required_note, task_contract_verifier_target_discovery_note,
         tool_color, tool_display, tool_emoji, unicode_supported, validate_verifier_repair_intent,
         validate_verifier_repair_intents, verifier_diagnostic_attempt_spec,
-        verifier_diagnostic_messages, verifier_repair_context_from_failure,
-        verifier_repair_decision, verifier_repair_effective_target_hint,
-        verifier_repair_intent_fingerprint, verifier_repair_pass_messages,
-        verifier_repair_pass_retry_message, verifier_repair_policy_for_decision,
-        verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
-        workspace_appears_empty,
+        verifier_diagnostic_messages, verifier_file_excerpt_for_line,
+        verifier_repair_context_from_failure, verifier_repair_decision,
+        verifier_repair_effective_target_hint, verifier_repair_intent_fingerprint,
+        verifier_repair_pass_messages, verifier_repair_pass_retry_message,
+        verifier_repair_policy_for_decision, verifier_repair_target_candidate_from_output,
+        verifier_repair_target_hint_from_output, workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -17552,6 +17874,39 @@ mod progress_tests {
     }
 
     #[test]
+    fn verifier_repair_intent_validation_rejects_python_whitespace_fallback_syntax_breakage() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "todos = {}\n\n@app.delete(\"/todos/{todo_id}\", status_code=204)\ndef delete_todo(todo_id: int) -> None:\n    \"\"\"ToDoを削除する\"\"\"\n    if todo_id not in todos:\n        raise HTTPException(status_code=404, detail=\"ToDo not found\")\n    del todos[todo_id]\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "@app.delete(\"/todos/{todo_id}\", status_code=204)\ndef delete_todo(todo_id: int) -> None:\n     \"\"\"ToDoを削除する\"\"\"\n    if todo_id not in todos:\n        raise HTTPException(status_code=404, detail=\"ToDo not found\")\n    del todos[todo_id]".to_string(),
+            new_string: "@app.delete(\"/todos/{todo_id}\", status_code=204)\ndef delete_todo(todo_id: int) -> None:\n     \"\"\"ToDoを削除する\"\"\"\n    if todo_id not in todos:\n        raise HTTPException(status_code=404, detail=\"ToDo not found\")\n    del todos[todo_id]\n\n\n@app.patch(\"/todos/{todo_id}/complete\")\ndef toggle_complete(todo_id: int) -> dict:\n     \"\"\"ToDoの完了状態を切り替える\"\"\"\n    return todos[todo_id]".to_string(),
+            reason: "add missing endpoint".to_string(),
+            replace_all: false,
+        };
+
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("cheap check failed"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("app/main.py")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
     fn verifier_repair_intent_validation_rejects_ambiguous_whitespace_normalized_edit() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();
@@ -17629,6 +17984,40 @@ mod progress_tests {
         assert!(!edit.updated_contents.contains("_todos"));
         assert!(edit.updated_contents.contains("todos: dict[int, str] = {}"));
         assert!(edit.updated_contents.contains("return todos.get(1)"));
+    }
+
+    #[test]
+    fn verifier_repair_apply_rejects_changed_preimage() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target_path = work_root.join("app/main.py");
+        std::fs::write(&target_path, "value = 1\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "value = 1".to_string(),
+            new_string: "value = 2".to_string(),
+            reason: "fix value".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
+        std::fs::write(&target_path, "value = 3\n").unwrap();
+
+        let err = apply_validated_verifier_repair_edit(&edit).unwrap_err();
+        assert!(err.contains("preimage changed"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            "value = 3\n"
+        );
     }
 
     #[test]
@@ -18062,7 +18451,7 @@ E   assert 201 == 422\n";
                 "probable_cause_role":"implementation",
                 "repair_plan":[
                     {"target":"app/main.py","intent":"align API response","confidence":0.90},
-                    {"target":"tests/test_health.py","intent":"isolate state","confidence":0.70}
+                    {"target":"tests/test_health.py","intent":"isolate state","confidence":0.90}
                 ],
                 "summary":"multiple artifacts must be repaired before rerun"
             }"#,
@@ -18086,6 +18475,66 @@ E   assert 201 == 422\n";
                 .as_ref()
                 .map(|hint| hint.path.as_str()),
             Some("app/main.py")
+        );
+    }
+
+    #[test]
+    fn verifier_diagnostic_rejects_low_confidence_test_edit_without_evidence() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let test = work_root.join("tests").join("test_health.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&app, "todos = {}\n").unwrap();
+        std::fs::write(&test, "def test_api():\n    assert False\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+        let parsed = super::parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"assertion_mismatch",
+                "probable_cause_role":"implementation",
+                "do_not_edit_tests_without_evidence":true,
+                "repair_plan":[
+                    {"target":"tests/test_health.py","intent":"change assertion to match implementation","confidence":0.40},
+                    {"target":"app/main.py","intent":"fix implementation behavior","confidence":0.88}
+                ],
+                "summary":"prefer implementation repair"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment =
+            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+
+        assert_eq!(
+            assessment
+                .repair_plan
+                .iter()
+                .map(|hint| hint.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app/main.py"]
+        );
+    }
+
+    #[test]
+    fn verifier_file_excerpt_centers_target_line() {
+        let text = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let excerpt = verifier_file_excerpt_for_line(&text, Some(100), 360);
+
+        assert!(excerpt.contains("line 100"));
+        assert!(excerpt.contains("truncated before target line"));
+        assert!(!excerpt.contains("line 1\n"));
+    }
+
+    #[test]
+    fn verifier_failure_classifies_indentation_error_as_syntax() {
+        let output = "E     File \"/tmp/app/main.py\", line 117\nE       if todo_id not in todos:\nE                               ^\nE   IndentationError: unindent does not match any outer indentation level";
+
+        assert_eq!(
+            classify_verifier_failure_type(output),
+            super::super::VerifierFailureType::CompileOrSyntax
         );
     }
 
