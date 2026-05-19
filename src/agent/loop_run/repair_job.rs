@@ -21,9 +21,7 @@ use super::{VerifierFailureType, VerifierRepairAssessment, VerifierRepairRerunOu
 use crate::session::store::ConversationMessage;
 
 /// Maximum byte length retained for sanitized snapshot text fields. Consumed
-/// by `truncate_for_snapshot` and the `failure_snapshot` test path; #638 will
-/// route the snapshot through prompt / event-log persistence.
-#[allow(dead_code)] // exercised only via cfg(test); production caller lands with #638.
+/// by `truncate_for_snapshot` and the `failure_snapshot` production path (Issue #638).
 pub(super) const SNAPSHOT_FIELD_BYTE_CAP: usize = 4096;
 
 /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
@@ -82,9 +80,7 @@ pub(super) enum VerifierRepairState {
 
 /// Read-only snapshot consumed by #638 and by event-log persistence. Each
 /// text field is re-sanitized at snapshot time so the SSOT for redaction is
-/// preserved at every transfer boundary. Signature is frozen for #638 — do
-/// not change without coordinating that issue.
-#[allow(dead_code)] // exercised only via cfg(test); production caller lands with #638.
+/// preserved at every transfer boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VerifierFailureSnapshot {
     pub(super) failure_signature: String,
@@ -103,17 +99,38 @@ impl RepairJob {
     /// Re-runs `sanitize_repair_job_text` / `redact_verifier_command_for_storage`
     /// so the SSOT defence-in-depth posture holds even if upstream code
     /// stored slightly stale text.
-    #[allow(dead_code)] // exercised only via cfg(test); production caller lands with #638.
+    ///
+    /// `target_path` is projected from `target_hint` only when the raw path
+    /// passes syntactic safety (no absolute path, no `..` traversal, no NUL /
+    /// control chars). Symlink-escape validation is the responsibility of
+    /// the upstream admission functions (`recovery_target_hint_for_existing_path`
+    /// / `recovery_target_hint_for_diagnostic_path`).
     pub(super) fn failure_snapshot(&self) -> VerifierFailureSnapshot {
         VerifierFailureSnapshot {
             failure_signature: sanitize_repair_job_text(&self.failure_signature),
             command: crate::session::feedback::redact_verifier_command_for_storage(&self.command),
             output_excerpt: sanitize_repair_job_text(&self.output_excerpt),
             failure_type: self.failure_type,
-            target_path: self
-                .target_hint
-                .as_ref()
-                .map(|hint| PathBuf::from(&hint.path)),
+            // Issue #638 (Task 1.6 / §5 Security boundary): only project path
+            // when it passes syntactic safety. Symlink-escape is upstream's
+            // responsibility (recovery_target_hint_for_existing_path).
+            target_path: self.target_hint.as_ref().and_then(|hint| {
+                let raw = hint.path.as_str();
+                // Reject absolute paths, `..` components, and ANY control char
+                // (C0 < 0x20 + DEL 0x7f) for parity with sanitize_repair_job_text
+                // (Codex CB-003 reflected).
+                if raw.is_empty()
+                    || raw.chars().any(|c| c.is_control())
+                    || Path::new(raw).is_absolute()
+                    || Path::new(raw)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    None
+                } else {
+                    Some(PathBuf::from(raw))
+                }
+            }),
             diagnostic_error: self
                 .diagnostic_error
                 .as_deref()
@@ -131,7 +148,6 @@ impl RepairJob {
 /// - Authorization / Cookie / X-API-Key / X-Auth-Token: `session::feedback::mask_header_family`
 /// - log/report injection: ASCII C0 + DEL → space
 /// - bounded retention: UTF-8 safe `SNAPSHOT_FIELD_BYTE_CAP`-byte cap
-#[allow(dead_code)] // exercised only via cfg(test); production caller lands with #638.
 pub(super) fn sanitize_repair_job_text(input: &str) -> String {
     truncate_for_snapshot(&mask_and_neutralize(input))
 }
@@ -149,6 +165,14 @@ pub(super) fn sanitize_repair_job_text_with_char_cap(input: &str, max_chars: usi
 }
 
 /// Shared SSOT prefix: mask_secrets → mask_header_family → control-char neutralize.
+///
+/// Exposed to `super::turn` so prompt file excerpts (`safe_verifier_*_file_excerpt`)
+/// can apply the same defence layer the snapshot pipeline uses (Issue #638
+/// design judgment #4 + Codex CB-002 reflected).
+pub(super) fn mask_secrets_headers_and_neutralize(input: &str) -> String {
+    mask_and_neutralize(input)
+}
+
 fn mask_and_neutralize(input: &str) -> String {
     let masked = crate::session::feedback::mask_header_family(
         &crate::session::feedback::mask_secrets(input),
@@ -166,7 +190,6 @@ fn mask_and_neutralize(input: &str) -> String {
 }
 
 /// UTF-8 safe truncate to `SNAPSHOT_FIELD_BYTE_CAP` bytes.
-#[allow(dead_code)] // exercised only via cfg(test); production caller lands with #638.
 pub(super) fn truncate_for_snapshot(s: &str) -> String {
     if s.len() <= SNAPSHOT_FIELD_BYTE_CAP {
         return s.to_string();

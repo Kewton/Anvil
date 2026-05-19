@@ -508,6 +508,11 @@ pub struct Agent {
     /// `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (= 3); not to be confused
     /// with the wider `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT` (= 6).
     repair_job_artifact_attempts: usize,
+    /// Issue #638 (Task 1.4): turn-local bounded failure report produced when
+    /// `record_verifier_diagnostic_unavailable` is called. Reset at the start
+    /// of every user turn alongside `repair_job`. Not persisted to
+    /// `self.session.messages` (design policy §5 — A-only, turn-local).
+    repair_failure_snapshot: Option<repair_job::VerifierFailureSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +728,7 @@ impl Agent {
             task_contract_verifier_repair_pending: false,
             repair_job: None,
             repair_job_artifact_attempts: 0,
+            repair_failure_snapshot: None,
         }
     }
 
