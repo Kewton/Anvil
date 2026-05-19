@@ -112,13 +112,12 @@ impl ArtifactState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum VerifierRepairState {
-    None,
-    WaitingForEdit {
-        target_hint: Option<RecoveryTargetHint>,
-    },
-}
+// Issue #637: `VerifierRepairState` definition lives in
+// `super::repair_job::VerifierRepairState` so that the verifier-repair
+// state machine has a single owner. We re-export the name here as a
+// `pub(super)` alias to keep call sites and tests inside `task_contract`
+// unchanged.
+pub(super) use super::repair_job::VerifierRepairState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ArtifactRecoveryAction {

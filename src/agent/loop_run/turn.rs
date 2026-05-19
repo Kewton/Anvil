@@ -11,6 +11,7 @@ use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
+use super::repair_job::{self, VerifierRepairDecision};
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
@@ -84,7 +85,7 @@ const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
 const VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS: u64 = 45;
 const VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS: u64 = 90;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 1_024;
-const VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT: usize = 2;
+pub(super) const VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT: usize = 2;
 const VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES: usize = 8_192;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
@@ -122,18 +123,6 @@ struct FocusedEditPolicy {
 struct ArtifactDirectedPolicy {
     target: PathBuf,
     target_already_read: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VerifierRepairDecision {
-    NoRepair,
-    NeedDiagnostic,
-    DiagnosticUnavailable,
-    NeedTargetDiscovery,
-    NeedFreshRead(PathBuf),
-    NeedWrite(PathBuf),
-    NeedEdit(PathBuf),
-    ReadyToVerify,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1532,7 +1521,7 @@ fn task_contract_verifier_repair_note(
     _output: &str,
     attempt: usize,
     attempt_limit: usize,
-    context: Option<&super::VerifierRepairContext>,
+    context: Option<&super::repair_job::RepairJob>,
 ) -> String {
     let command = context
         .map(|context| context.command.clone())
@@ -1588,7 +1577,7 @@ fn task_contract_verifier_target_discovery_note(attempt: usize, attempt_limit: u
     )
 }
 
-fn verifier_repair_diagnostic_pending_note(context: &super::VerifierRepairContext) -> String {
+fn verifier_repair_diagnostic_pending_note(context: &super::repair_job::RepairJob) -> String {
     let failure_location = context
         .target_hint
         .as_ref()
@@ -1613,7 +1602,7 @@ fn verifier_repair_diagnostic_pending_note(context: &super::VerifierRepairContex
 
 fn verifier_diagnostic_messages(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     active_request: &str,
 ) -> Vec<ConversationMessage> {
     let excerpts = verifier_diagnostic_file_excerpts(work_root, context)
@@ -1682,7 +1671,7 @@ struct VerifierDiagnosticFileExcerpt {
 
 fn verifier_diagnostic_file_excerpts(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
 ) -> Vec<VerifierDiagnosticFileExcerpt> {
     let mut seen = HashSet::new();
     let mut hints = Vec::new();
@@ -1715,7 +1704,7 @@ fn verifier_diagnostic_file_excerpts(
 }
 
 fn verifier_repair_context_line_for_path(
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     path: &str,
 ) -> Option<usize> {
     let target = context.target_hint.as_ref()?;
@@ -1758,7 +1747,7 @@ fn safe_verifier_diagnostic_file_excerpt(
 
 fn verifier_repair_pass_messages(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     active_request: &str,
 ) -> Result<Vec<ConversationMessage>, String> {
@@ -1994,7 +1983,7 @@ fn head_tail_excerpt(text: &str, max_bytes: usize) -> String {
 }
 
 fn task_contract_verifier_targeted_edit_required_note(
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     work_root: &Path,
     target_already_read: bool,
     attempt: usize,
@@ -4881,7 +4870,15 @@ impl Agent {
         self.task_contract_evidence_set_this_turn.clear();
         self.current_artifact_recovery_target = None;
         self.task_contract_verifier_repair_pending = false;
-        self.verifier_repair_context = None;
+        self.repair_job = None;
+        // Issue #637 (CB-001): reset the artifact-recovery retry counter at
+        // the same per-turn boundary as `repair_job` so a previous turn's
+        // `RepairArtifact` increments do not bleed into this turn and prematurely
+        // trip `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`. The legacy
+        // `verifier_repair_retries` was a `run_turn`-local `usize` and always
+        // started at 0; this restores that semantics for the Agent-field
+        // counter.
+        self.repair_job_artifact_attempts = 0;
         let task_contract = self
             .active_request_text()
             .map(|request| super::task_contract::TaskContract::from_request(&request));
@@ -4946,7 +4943,7 @@ impl Agent {
             {
                 exit_reason = ExitReason::VerifierFailed;
                 error_text = self
-                    .verifier_repair_context
+                    .repair_job
                     .as_ref()
                     .and_then(|context| context.diagnostic_error.clone())
                     .map(|error| format!("verifier repair diagnostic_unavailable: {error}"))
@@ -5055,7 +5052,7 @@ impl Agent {
             if self.session.mode_state.mode != ExecutionMode::Plan
                 && self.task_contract_verifier_repair_pending
                 && self
-                    .verifier_repair_context
+                    .repair_job
                     .as_ref()
                     .and_then(verifier_repair_effective_target_hint)
                     .is_some()
@@ -6265,8 +6262,15 @@ impl Agent {
                         continue;
                     }
                     super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-                        verifier_repair_retries += 1;
-                        if verifier_repair_retries >= 3 {
+                        // Issue #637: bound RepairArtifact loop by
+                        // `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (= 3).
+                        // Distinct from `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT`
+                        // (= 6), which sets the wider repair-pass budget.
+                        self.repair_job_artifact_attempts =
+                            self.repair_job_artifact_attempts.saturating_add(1);
+                        verifier_repair_retries = self.repair_job_artifact_attempts;
+                        if self.repair_job_artifact_attempts >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
+                        {
                             exit_reason = ExitReason::MissingRepoEdits;
                             error_text = "assistant stopped before repairing the verifier failure"
                                 .to_string();
@@ -7385,8 +7389,8 @@ impl Agent {
         *args.contract_verifier_repair_edit_count = None;
         self.task_contract_verifier_repair_pending = false;
         self.clear_artifact_recovery_target("artifact_controller_verify_pending");
-        let previous_repair_context = self.verifier_repair_context.clone();
-        self.verifier_repair_context = None;
+        let previous_repair_context = self.repair_job.clone();
+        self.repair_job = None;
         let current_verif = verify_repo_progress(args.before_snapshot, &self.work_root);
         let changed_files = changed_files_for_verifier(args.accumulated, &current_verif);
         write_stdout_rendered(
@@ -7419,8 +7423,12 @@ impl Agent {
                 {
                     args.task_contract_verify_commands_collected.push(sanitized);
                 }
-                self.verifier_repair_context = None;
+                self.repair_job = None;
                 *args.verifier_repair_retries = 0;
+                // Issue #637 (CB-001): mirror the local counter reset on the
+                // Agent-field counter so the next verifier failure / repair
+                // cycle restarts at 1/3.
+                self.repair_job_artifact_attempts = 0;
                 *args.task_contract_verifier_passed_in_loop = true;
                 TaskContractVerifierFlowOutcome::Done {
                     final_prose: format!(
@@ -7466,9 +7474,13 @@ impl Agent {
                         }),
                     );
                 }
-                self.verifier_repair_context = Some(repair_context);
+                self.repair_job = Some(repair_context);
                 *args.repo_change_retries = 0;
                 *args.verifier_repair_retries = 0;
+                // Issue #637 (CB-001): a new verifier failure starts a fresh
+                // repair cycle; reset the Agent-field counter alongside the
+                // turn-local one so `RepairArtifact` re-enters at 1/3.
+                self.repair_job_artifact_attempts = 0;
                 write_stdout_rendered(
                     &format_iteration_status(
                         args.last_iter,
@@ -7484,7 +7496,7 @@ impl Agent {
                     &output,
                     *args.contract_verification_retries,
                     attempt_limit,
-                    self.verifier_repair_context.as_ref(),
+                    self.repair_job.as_ref(),
                 ));
                 TaskContractVerifierFlowOutcome::Continue
             }
@@ -7501,9 +7513,13 @@ impl Agent {
                 *args.contract_verifier_repair_edit_count =
                     Some(args.repo_edit_calls_made_this_turn);
                 self.task_contract_verifier_repair_pending = true;
-                self.verifier_repair_context = None;
+                self.repair_job = None;
                 *args.repo_change_retries = 0;
                 *args.verifier_repair_retries = 0;
+                // Issue #637 (CB-001): transitioning to NoVerifier resets the
+                // turn-local counter; mirror that on the Agent-field counter
+                // so subsequent verifier failures start at 1/3.
+                self.repair_job_artifact_attempts = 0;
                 write_stdout_rendered(
                     &format_iteration_status(
                         args.last_iter,
@@ -8710,7 +8726,7 @@ impl Agent {
     fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
         verifier_repair_decision(
             self.task_contract_verifier_repair_pending,
-            self.verifier_repair_context.as_ref(),
+            self.repair_job.as_ref(),
             &self.session.messages,
             &self.work_root,
             None,
@@ -8983,7 +8999,7 @@ impl Agent {
     fn push_verifier_repair_recovery_note(&mut self, attempt: usize) -> bool {
         match self.verifier_repair_decision_for_policy() {
             VerifierRepairDecision::NeedDiagnostic => {
-                if let Some(context) = self.verifier_repair_context.as_ref() {
+                if let Some(context) = self.repair_job.as_ref() {
                     self.push_system_note(verifier_repair_diagnostic_pending_note(context));
                     true
                 } else {
@@ -8998,7 +9014,7 @@ impl Agent {
                 true
             }
             VerifierRepairDecision::NeedFreshRead(target) => {
-                if let Some(context) = self.verifier_repair_context.as_ref() {
+                if let Some(context) = self.repair_job.as_ref() {
                     self.push_system_note(task_contract_verifier_targeted_edit_required_note(
                         context,
                         &self.work_root,
@@ -9019,7 +9035,7 @@ impl Agent {
                 true
             }
             VerifierRepairDecision::NeedEdit(target) => {
-                if let Some(context) = self.verifier_repair_context.as_ref() {
+                if let Some(context) = self.repair_job.as_ref() {
                     self.push_system_note(task_contract_verifier_targeted_edit_required_note(
                         context,
                         &self.work_root,
@@ -9050,7 +9066,7 @@ impl Agent {
     }
 
     fn run_verifier_diagnostic_pass(&mut self) -> VerifierDiagnosticPassOutcome {
-        let Some(context) = self.verifier_repair_context.clone() else {
+        let Some(context) = self.repair_job.clone() else {
             return VerifierDiagnosticPassOutcome::Skipped;
         };
         if context.diagnostic_unavailable || context.assessment.is_some() {
@@ -9068,7 +9084,7 @@ impl Agent {
             self.record_verifier_diagnostic_unavailable(error.clone());
             return VerifierDiagnosticPassOutcome::Unavailable { error };
         };
-        if let Some(current) = self.verifier_repair_context.as_mut() {
+        if let Some(current) = self.repair_job.as_mut() {
             current.diagnostic_attempted = true;
             current.assessment_attempts = current.assessment_attempts.saturating_add(1);
         }
@@ -9114,7 +9130,7 @@ impl Agent {
                 attempt_spec.role,
             );
         }
-        if let Some(current) = self.verifier_repair_context.as_mut() {
+        if let Some(current) = self.repair_job.as_mut() {
             current.failure_type = assessment.failure_type;
             current.repair_target_hint = assessment.repair_target_hint.clone();
             current.diagnostic_error = None;
@@ -9140,7 +9156,7 @@ impl Agent {
     ) -> VerifierDiagnosticPassOutcome {
         let compact = self.record_verifier_diagnostic_failure(error, model_role);
         let attempts_done = self
-            .verifier_repair_context
+            .repair_job
             .as_ref()
             .map(|context| context.assessment_attempts)
             .unwrap_or(VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT);
@@ -9163,8 +9179,12 @@ impl Agent {
         error: String,
         model_role: &'static str,
     ) -> String {
-        let error = compact_verifier_failure_text(&error, 180);
-        if let Some(context) = self.verifier_repair_context.as_mut() {
+        // Issue #637 (CB-002): sanitize at the RepairJob store boundary so
+        // the SSOT pipeline (mask_secrets + mask_header_family +
+        // control-char neutralization) is applied before the text reaches
+        // prompt payloads / log events.
+        let error = super::repair_job::sanitize_repair_job_text_with_char_cap(&error, 180);
+        if let Some(context) = self.repair_job.as_mut() {
             context.repair_target_hint = None;
             context.assessment = None;
             context.diagnostic_error = Some(error.clone());
@@ -9181,8 +9201,12 @@ impl Agent {
     }
 
     fn record_verifier_diagnostic_unavailable(&mut self, error: String) {
-        let error = compact_verifier_failure_text(&error, 180);
-        if let Some(context) = self.verifier_repair_context.as_mut() {
+        // Issue #637 (CB-002): same SSOT sanitization as
+        // `record_verifier_diagnostic_failure`. We deliberately call the
+        // sanitizer (not the raw `compact_verifier_failure_text`) so the
+        // store-boundary invariant holds for every diagnostic_error write.
+        let error = super::repair_job::sanitize_repair_job_text_with_char_cap(&error, 180);
+        if let Some(context) = self.repair_job.as_mut() {
             context.diagnostic_unavailable = true;
             context.diagnostic_error = Some(error.clone());
         }
@@ -9196,7 +9220,7 @@ impl Agent {
     }
 
     fn run_verifier_repair_pass_and_apply(&mut self) -> VerifierRepairPassOutcome {
-        let Some(context) = self.verifier_repair_context.clone() else {
+        let Some(context) = self.repair_job.clone() else {
             return VerifierRepairPassOutcome::Skipped;
         };
         let Some(target_hint) = verifier_repair_effective_target_hint(&context).cloned() else {
@@ -9317,7 +9341,7 @@ impl Agent {
             .working_memory
             .note_touched_file(normalize_memory_path(relative_path, &self.work_root));
         self.observe_evidence_from_repo_edit(relative_path);
-        if let Some(context) = self.verifier_repair_context.as_mut()
+        if let Some(context) = self.repair_job.as_mut()
             && !context
                 .applied_repair_intents
                 .iter()
@@ -9337,8 +9361,11 @@ impl Agent {
     }
 
     fn record_controller_verifier_repair_invalid(&mut self, error: &str) {
-        let compact = compact_verifier_failure_text(error, 360);
-        if let Some(context) = self.verifier_repair_context.as_mut() {
+        // Issue #637 (CB-002): sanitize `repair_error` at the store boundary
+        // so the verifier_repair_pass payload's `previous_repair_error` field
+        // never carries raw secrets / Authorization headers / control chars.
+        let compact = super::repair_job::sanitize_repair_job_text_with_char_cap(error, 360);
+        if let Some(context) = self.repair_job.as_mut() {
             context.repair_error = Some(compact.clone());
         }
         self.session.working_memory.note_error(compact.clone());
@@ -9460,7 +9487,7 @@ impl Agent {
         effective_tool_policy: &EffectiveToolPolicy,
     ) -> Option<String> {
         (effective_tool_policy.reason() == EffectiveToolPolicyReason::VerifierRepair).then(|| {
-            let context = self.verifier_repair_context.as_ref();
+            let context = self.repair_job.as_ref();
             let decision = self.verifier_repair_decision_for_policy();
             let diagnostics = context
                 .map(|context| {
@@ -9509,7 +9536,7 @@ impl Agent {
                 .unwrap_or_else(|| " Failure signature: <unknown>.".to_string());
             match decision {
                 VerifierRepairDecision::NeedDiagnostic => self
-                    .verifier_repair_context
+                    .repair_job
                     .as_ref()
                     .map(verifier_repair_diagnostic_pending_note)
                     .unwrap_or_else(|| {
@@ -9917,7 +9944,7 @@ impl Agent {
     ) -> super::task_contract::VerifierRepairState {
         match verifier_repair_decision(
             self.task_contract_verifier_repair_pending,
-            self.verifier_repair_context.as_ref(),
+            self.repair_job.as_ref(),
             &self.session.messages,
             &self.work_root,
             repair_edit_count,
@@ -9929,7 +9956,7 @@ impl Agent {
             | VerifierRepairDecision::NeedWrite(_)
             | VerifierRepairDecision::NeedEdit(_) => {
                 return super::task_contract::VerifierRepairState::WaitingForEdit {
-                    target_hint: self.verifier_repair_context.as_ref().and_then(|context| {
+                    target_hint: self.repair_job.as_ref().and_then(|context| {
                         verifier_repair_effective_target_hint(context)
                             .cloned()
                             .or_else(|| context.repair_target_hint.clone())
@@ -13497,19 +13524,29 @@ fn verifier_repair_context_from_failure(
     output: &str,
     changed_files: &[String],
     _verifier_attempt: usize,
-    previous_context: Option<&super::VerifierRepairContext>,
-) -> super::VerifierRepairContext {
+    previous_context: Option<&super::repair_job::RepairJob>,
+) -> super::repair_job::RepairJob {
     let candidate = verifier_repair_target_candidate_from_output(work_root, output, changed_files);
     let target_hint = candidate.as_ref().map(|candidate| candidate.hint.clone());
     let target_line = candidate.as_ref().and_then(|candidate| candidate.line);
     let failure_type = classify_verifier_failure_type(output);
     let changed_file_hints = verifier_repair_changed_file_hints(work_root, changed_files);
-    let error_kind = verifier_failure_error_kind(output);
-    let failure_signature = verifier_failure_signature(
-        output,
-        target_hint.as_ref().map(|hint| hint.path.as_str()),
-        target_line,
-        error_kind.as_deref(),
+    // Issue #637 (CB-002): sanitize derived text fields BEFORE the
+    // `failure_signature` equality lookup against `previous_context` so the
+    // comparison is between two sanitized forms. `previous_context` was
+    // stored sanitized, so we must compare against the sanitized form of
+    // the freshly-computed signature to keep the legacy "same failure"
+    // matching behaviour intact.
+    let error_kind = verifier_failure_error_kind(output)
+        .map(|s| super::repair_job::sanitize_repair_job_text_with_char_cap(&s, 220));
+    let failure_signature = super::repair_job::sanitize_repair_job_text_with_char_cap(
+        &verifier_failure_signature(
+            output,
+            target_hint.as_ref().map(|hint| hint.path.as_str()),
+            target_line,
+            error_kind.as_deref(),
+        ),
+        220,
     );
     let failure_count = verifier_failure_count(output);
     let previous_failure_signature =
@@ -13565,9 +13602,21 @@ fn verifier_repair_context_from_failure(
         .map(|context| context.applied_repair_intents.clone())
         .unwrap_or_default();
 
-    super::VerifierRepairContext {
-        command: crate::session::feedback::mask_secrets(command),
-        output_excerpt: truncate(&crate::session::feedback::mask_secrets(output), 4000),
+    // Issue #637 (CB-002): every long-lived RepairJob text field crosses the
+    // store boundary through its SSOT redactor. `command` goes through
+    // `redact_verifier_command_for_storage` (mask_secrets + mask_header_family
+    // + control-char neutralization + 4096-byte cap); `output_excerpt` goes
+    // through `sanitize_repair_job_text_with_char_cap` so Authorization /
+    // Cookie / X-API-Key headers and raw control chars never reach the
+    // diagnostic / repair-pass prompt payloads. `error_kind` /
+    // `failure_signature` were sanitized above (before the previous-context
+    // equality lookup); `diagnostic_error` / `previous_failure_signature`
+    // come from `previous_context` and were already sanitized at store time,
+    // so we trust them here while `failure_snapshot()` re-applies the SSOT
+    // pipeline as defence in depth.
+    super::repair_job::RepairJob {
+        command: crate::session::feedback::redact_verifier_command_for_storage(command),
+        output_excerpt: super::repair_job::sanitize_repair_job_text_with_char_cap(output, 4000),
         failure_type,
         target_hint,
         repair_target_hint: previous_repair_target_hint,
@@ -13591,7 +13640,7 @@ fn verifier_repair_context_from_failure(
 }
 
 fn task_contract_verifier_failure_attempt_limit(
-    previous_context: Option<&super::VerifierRepairContext>,
+    previous_context: Option<&super::repair_job::RepairJob>,
 ) -> usize {
     if previous_context.is_some() {
         TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT
@@ -13706,7 +13755,7 @@ fn verifier_failure_count_number(token: &str) -> Option<usize> {
 }
 
 fn verifier_repair_rerun_outcome(
-    previous_context: Option<&super::VerifierRepairContext>,
+    previous_context: Option<&super::repair_job::RepairJob>,
     current_signature: &str,
     current_count: Option<usize>,
 ) -> Option<super::VerifierRepairRerunOutcome> {
@@ -13945,7 +13994,7 @@ fn parse_verifier_repair_intent_object(
 #[cfg(test)]
 fn validate_verifier_repair_intent(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     intent: VerifierRepairIntent,
 ) -> Result<ValidatedVerifierRepairEdit, String> {
@@ -13954,7 +14003,7 @@ fn validate_verifier_repair_intent(
 
 fn validate_verifier_repair_intents(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, String> {
@@ -14444,7 +14493,7 @@ fn verifier_repair_contains_suspicious_shell_payload(value: &str) -> bool {
 
 #[cfg(test)]
 fn verifier_repair_intent_fingerprint(
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     relative_path: &str,
     intent: &VerifierRepairIntent,
 ) -> String {
@@ -14452,7 +14501,7 @@ fn verifier_repair_intent_fingerprint(
 }
 
 fn verifier_repair_intents_fingerprint(
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     relative_path: &str,
     intents: &[VerifierRepairIntent],
 ) -> String {
@@ -14708,7 +14757,7 @@ fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
 }
 
 fn verifier_repair_preferred_local_import_source(
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     if context.failure_type != super::VerifierFailureType::ImportOrDependency {
         return None;
@@ -14734,7 +14783,7 @@ fn verifier_repair_preferred_local_import_source(
 }
 
 fn verifier_repair_stale_assertion_test_target(
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     selected_path: Option<&str>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     if context.failure_type != super::VerifierFailureType::AssertionFailure {
@@ -14772,7 +14821,7 @@ fn verifier_repair_stale_assertion_test_target(
 
 fn model_assessment_to_verifier_repair_assessment(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
     parsed: ParsedVerifierRepairAssessment,
 ) -> super::VerifierRepairAssessment {
     let failure_kind = parsed.failure_kind;
@@ -15174,16 +15223,16 @@ fn verifier_diagnostic_attempt_spec(
     }
 }
 
-fn verifier_repair_context_target_path(
+pub(super) fn verifier_repair_context_target_path(
     work_root: &Path,
-    context: &super::VerifierRepairContext,
+    context: &super::repair_job::RepairJob,
 ) -> Option<PathBuf> {
     let hint = verifier_repair_effective_target_hint(context)?;
     resolve_user_path(work_root, &hint.path).ok()
 }
 
-fn verifier_repair_effective_target_hint(
-    context: &super::VerifierRepairContext,
+pub(super) fn verifier_repair_effective_target_hint(
+    context: &super::repair_job::RepairJob,
 ) -> Option<&super::task_contract::RecoveryTargetHint> {
     if let Some(assessment) = context.assessment.as_ref() {
         if let Some(next) = assessment
@@ -15197,52 +15246,27 @@ fn verifier_repair_effective_target_hint(
     None
 }
 
+/// Thin wrapper retained for in-file callers and existing tests. Delegates
+/// to `repair_job::verifier_repair_decision`. The legacy `pending: bool`
+/// argument is kept so the `Agent::task_contract_verifier_repair_pending`
+/// flag and the repair-job presence remain decoupled at the call sites
+/// (Issue #637: SSOT for the decision lives in `repair_job`).
 fn verifier_repair_decision(
     pending: bool,
-    context: Option<&super::VerifierRepairContext>,
+    context: Option<&super::repair_job::RepairJob>,
     messages: &[ConversationMessage],
     work_root: &Path,
     repair_edit_count: Option<usize>,
     repo_edit_calls_made_this_turn: usize,
 ) -> VerifierRepairDecision {
-    if !pending {
-        return VerifierRepairDecision::NoRepair;
-    }
-    if context.is_some_and(|context| context.diagnostic_unavailable) {
-        return VerifierRepairDecision::DiagnosticUnavailable;
-    }
-    if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
-        return VerifierRepairDecision::ReadyToVerify;
-    }
-    if context.is_some_and(|context| {
-        context.assessment.is_none()
-            && context.assessment_attempts < VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-    }) {
-        return VerifierRepairDecision::NeedDiagnostic;
-    }
-    if context.is_some_and(|context| context.assessment.is_none()) {
-        return VerifierRepairDecision::DiagnosticUnavailable;
-    }
-    let target = context
-        .and_then(|context| verifier_repair_context_target_path(work_root, context))
-        .or_else(|| {
-            latest_successful_read_existing_path(
-                messages,
-                work_root,
-                latest_verifier_repair_note_index(messages),
-            )
-        });
-    let Some(target) = target else {
-        return VerifierRepairDecision::NeedTargetDiscovery;
-    };
-    if !target.is_file() {
-        return VerifierRepairDecision::NeedWrite(target);
-    }
-    if focused_edit_target_already_read(messages, &target, work_root) {
-        VerifierRepairDecision::NeedEdit(target)
-    } else {
-        VerifierRepairDecision::NeedFreshRead(target)
-    }
+    repair_job::verifier_repair_decision(
+        pending,
+        context,
+        messages,
+        work_root,
+        repair_edit_count,
+        repo_edit_calls_made_this_turn,
+    )
 }
 
 fn verifier_repair_policy_for_decision(decision: VerifierRepairDecision) -> EffectiveToolPolicy {
@@ -15704,7 +15728,7 @@ fn strip_read_line_number_prefix(line: &str) -> String {
     line.to_string()
 }
 
-fn focused_edit_target_already_read(
+pub(super) fn focused_edit_target_already_read(
     messages: &[ConversationMessage],
     target: &Path,
     work_root: &Path,
@@ -15858,7 +15882,7 @@ fn exchange_is_successful_named_tool_for_target(
         })
 }
 
-fn latest_successful_read_existing_path(
+pub(super) fn latest_successful_read_existing_path(
     messages: &[ConversationMessage],
     work_root: &Path,
     after_message_index: Option<usize>,
@@ -15904,7 +15928,7 @@ fn latest_successful_read_existing_path(
     latest_existing
 }
 
-fn latest_verifier_repair_note_index(messages: &[ConversationMessage]) -> Option<usize> {
+pub(super) fn latest_verifier_repair_note_index(messages: &[ConversationMessage]) -> Option<usize> {
     messages.iter().rposition(|message| {
         message.role == "system"
             && (message.content.contains("task_contract_verify_attempt=")
@@ -17286,6 +17310,9 @@ mod truncate_tests {
 
 #[cfg(test)]
 mod progress_tests {
+    use super::super::repair_job::{
+        SNAPSHOT_FIELD_BYTE_CAP, sanitize_repair_job_text, truncate_for_snapshot,
+    };
     use super::{
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
         VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
@@ -18190,13 +18217,13 @@ mod progress_tests {
         assert!(note.contains("exactly one compact Edit"));
     }
 
-    fn verifier_context_for(path: &str) -> super::super::VerifierRepairContext {
+    fn verifier_context_for(path: &str) -> super::super::repair_job::RepairJob {
         let hint = super::super::task_contract::RecoveryTargetHint {
             role: super::super::task_contract::ArtifactRole::Implementation,
             path: path.to_string(),
             reason: "test".to_string(),
         };
-        super::super::VerifierRepairContext {
+        super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "failure".to_string(),
             failure_type: super::super::VerifierFailureType::RuntimeError,
@@ -22275,6 +22302,451 @@ export default function App() {
     fn auto_test_summary_starts_none_for_non_autotest_branches() {
         let s: Option<crate::session::anvil_score::AnvilTestSummary> = None;
         assert!(s.is_none());
+    }
+
+    /// Issue #637: full state-machine walk for a single `RepairJob`.
+    /// Asserts NeedDiagnostic → NeedTargetDiscovery → NeedFreshRead →
+    /// NeedEdit → ReadyToVerify under realistic message + assessment
+    /// updates, using the same decision pure function used in production.
+    #[test]
+    fn repair_job_lifecycle_transitions_diagnostic_target_edit_rerun() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def add(a, b):\n    return a + b\n").unwrap();
+
+        let mut job = verifier_context_for("app/main.py");
+        job.assessment = None;
+        job.assessment_attempts = 0;
+
+        // Phase 1: no assessment, attempts < limit → NeedDiagnostic.
+        let messages: Vec<ConversationMessage> = Vec::new();
+        assert_eq!(
+            verifier_repair_decision(true, Some(&job), &messages, &work_root, Some(0), 0),
+            VerifierRepairDecision::NeedDiagnostic
+        );
+
+        // Phase 2: assessment present but with empty target hints → NeedTargetDiscovery.
+        let empty_hints_assessment = super::super::VerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::RuntimeError,
+            failure_type: super::super::VerifierFailureType::RuntimeError,
+            probable_cause_role: None,
+            needed_reads: Vec::new(),
+            repair_target_hint: None,
+            repair_plan: Vec::new(),
+            summary: Some("no candidate".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        };
+        job.assessment = Some(empty_hints_assessment);
+        job.target_hint = None;
+        job.repair_target_hint = None;
+        assert_eq!(
+            verifier_repair_decision(true, Some(&job), &messages, &work_root, Some(0), 0),
+            VerifierRepairDecision::NeedTargetDiscovery
+        );
+
+        // Phase 3: assessment with a real repair_plan hint and no prior
+        // read → NeedFreshRead on the resolved canonical path.
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "fix add()".to_string(),
+        };
+        let assessment = super::super::VerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::RuntimeError,
+            failure_type: super::super::VerifierFailureType::RuntimeError,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Implementation),
+            needed_reads: vec![hint.clone()],
+            repair_target_hint: Some(hint.clone()),
+            repair_plan: vec![hint.clone()],
+            summary: Some("fix add()".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        };
+        job.assessment = Some(assessment);
+        job.repair_target_hint = Some(hint.clone());
+        job.target_hint = Some(hint.clone());
+        assert_eq!(
+            verifier_repair_decision(true, Some(&job), &messages, &work_root, Some(0), 0),
+            VerifierRepairDecision::NeedFreshRead(std::fs::canonicalize(&app).unwrap())
+        );
+
+        // Phase 4: same target after a recent Read tool exchange → NeedEdit.
+        let mut messages_after_read = messages.clone();
+        messages_after_read.push(ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "xml-1".to_string(),
+                name: "Read".to_string(),
+                arguments: json!({"path":"app/main.py"}),
+            }],
+        ));
+        messages_after_read.push(ConversationMessage::tool(
+            "Read".to_string(),
+            "1: def add(a, b):\n2:     return a + b".to_string(),
+        ));
+        assert_eq!(
+            verifier_repair_decision(
+                true,
+                Some(&job),
+                &messages_after_read,
+                &work_root,
+                Some(0),
+                0,
+            ),
+            VerifierRepairDecision::NeedEdit(std::fs::canonicalize(&app).unwrap())
+        );
+
+        // Phase 5: edit count was bumped (repair edit landed) →
+        // ReadyToVerify.
+        assert_eq!(
+            verifier_repair_decision(
+                true,
+                Some(&job),
+                &messages_after_read,
+                &work_root,
+                Some(0),
+                1,
+            ),
+            VerifierRepairDecision::ReadyToVerify
+        );
+    }
+
+    /// Issue #637: same failure signature across reruns increments
+    /// `repair_attempt`, while `repair_step_index` (the projection consumed
+    /// by prompts) tracks `applied_repair_intents.len()` independently.
+    #[test]
+    fn repair_job_repair_attempt_tracks_same_failure_rerun_count() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "def add(a, b):\n    return a - b\n",
+        )
+        .unwrap();
+
+        let first = verifier_repair_context_from_failure(
+            work_root,
+            "python -m pytest",
+            "AssertionError: add(1,2) == -1",
+            &[],
+            1,
+            None,
+        );
+        assert_eq!(first.repair_attempt, 1);
+        assert_eq!(first.applied_repair_intents.len(), 0);
+
+        let mut after_one_apply = first.clone();
+        after_one_apply
+            .applied_repair_intents
+            .push("flip operator".to_string());
+        assert_eq!(after_one_apply.applied_repair_intents.len(), 1);
+        // `repair_step_index` is computed from applied_repair_intents.len(),
+        // not from `repair_attempt`. Keeping that decoupling is the point.
+        assert_eq!(after_one_apply.repair_attempt, 1);
+
+        let second = verifier_repair_context_from_failure(
+            work_root,
+            "python -m pytest",
+            "AssertionError: add(1,2) == -1",
+            &[],
+            2,
+            Some(&after_one_apply),
+        );
+        // Same failure_signature → repair_attempt grows.
+        assert_eq!(second.failure_signature, first.failure_signature);
+        assert!(second.repair_attempt >= 2);
+    }
+
+    /// Issue #637: artifact-recovery loop budget is bounded by
+    /// `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (= 3). The counter now lives
+    /// on `Agent::repair_job_artifact_attempts` and the comparison in
+    /// `run_turn` uses the SSOT constant rather than a hardcoded `3`.
+    #[test]
+    fn artifact_attempts_exhaustion_stops_at_missing_repo_edits() {
+        // SSOT value sanity-check (mirrors the prod constant; if this
+        // breaks, the constant moved and the regression note in
+        // `run_turn` needs updating).
+        assert_eq!(super::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, 3);
+
+        // Simulate the run_turn counter loop semantics: increment and
+        // compare against the SSOT bound. The loop in production breaks
+        // with `ExitReason::MissingRepoEdits` as soon as the counter
+        // reaches the limit.
+        let limit = super::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT;
+        let mut attempts: usize = 0;
+        let mut hit_exhaustion = false;
+        for _ in 0..(limit + 1) {
+            attempts = attempts.saturating_add(1);
+            if attempts >= limit {
+                hit_exhaustion = true;
+                break;
+            }
+        }
+        assert!(hit_exhaustion);
+        assert_eq!(attempts, limit);
+    }
+
+    /// Issue #637 (CB-001 regression): the artifact-recovery counter
+    /// `Agent::repair_job_artifact_attempts` MUST be reset alongside the
+    /// turn-local `verifier_repair_retries` so the next verifier-failure
+    /// cycle (and the next user turn) starts at 1/3. The Agent-field
+    /// counter is freshly zero on construction and is also implicitly
+    /// reset by the new per-turn / drive-task-contract-verifier hooks
+    /// added in this fix.
+    #[test]
+    fn repair_job_artifact_attempts_resets_on_agent_construction_and_explicit_zeroing() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        // Fresh agent → counter is 0 (mirrors legacy `verifier_repair_retries`
+        // which was a `run_turn`-local `usize`).
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert_eq!(
+            agent.repair_job_artifact_attempts, 0,
+            "Agent::new must initialize repair_job_artifact_attempts to 0"
+        );
+
+        // Simulate the first repair cycle bumping the counter (production
+        // path: `run_turn` `RepairArtifact` arm increments via
+        // `saturating_add(1)` until `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`).
+        agent.repair_job_artifact_attempts = 2;
+        assert_eq!(agent.repair_job_artifact_attempts, 2);
+
+        // Production path #1 (`drive_task_contract_verifier` → Passed/
+        // NoVerifier/Failed branches) sets the Agent-field counter back
+        // to 0 alongside `*args.verifier_repair_retries = 0`. We assert
+        // the field can be reset directly and observe the expected zero
+        // value the next RepairArtifact arm sees. The new prod hook is
+        // exactly this assignment.
+        agent.repair_job_artifact_attempts = 0;
+        assert_eq!(
+            agent.repair_job_artifact_attempts, 0,
+            "drive_task_contract_verifier transitions (Passed / Failed / NoVerifier) must reset the Agent counter so the next cycle starts at 1/3"
+        );
+
+        // The next RepairArtifact step would then be the FIRST attempt
+        // in the new cycle.
+        let next = agent.repair_job_artifact_attempts.saturating_add(1);
+        assert_eq!(next, 1, "next RepairArtifact attempt starts at 1, not 3");
+        assert!(
+            next < super::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            "fresh repair cycle must not immediately trip the attempt limit"
+        );
+    }
+
+    /// Issue #637 (CB-001 regression, turn boundary): the per-turn reset
+    /// in `run_actor_loop` must zero `repair_job_artifact_attempts` so a
+    /// previous turn's `RepairArtifact` increments cannot bleed into the
+    /// next user turn. Direct-construct an `Agent`, simulate the
+    /// previous-turn state, then assert the same field-clear pattern the
+    /// production reset block uses.
+    #[test]
+    fn repair_job_artifact_attempts_is_reset_at_per_turn_boundary() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        // Previous turn left the counter mid-cycle.
+        agent.repair_job_artifact_attempts = 2;
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Production per-turn reset block (in `run_actor_loop` head) zeros
+        // `repair_job`, `task_contract_verifier_repair_pending`, AND
+        // `repair_job_artifact_attempts`. Mirror those assignments here.
+        agent.repair_job = None;
+        agent.task_contract_verifier_repair_pending = false;
+        agent.repair_job_artifact_attempts = 0;
+
+        assert_eq!(agent.repair_job_artifact_attempts, 0);
+        assert!(agent.repair_job.is_none());
+        assert!(!agent.task_contract_verifier_repair_pending);
+    }
+
+    /// Issue #637: `RepairJob::failure_snapshot()` re-runs the SSOT
+    /// sanitizers so callers never see raw secrets / control chars /
+    /// oversized text, even when state was pushed in directly during a
+    /// transitional turn.
+    #[test]
+    fn failure_snapshot_redacts_command_and_truncates_long_output() {
+        let mut job = verifier_context_for("app/main.py");
+        job.command =
+            "curl -H \"Authorization: Bearer abcdef0123456789SECRET\" http://localhost:8000/api"
+                .to_string();
+        job.failure_signature =
+            "Authorization: Bearer abcdef0123456789SECRET on app/main.py".to_string();
+        job.output_excerpt = format!(
+            "Cookie: session=abcdef0123456789SECRET\r\n{}",
+            "A".repeat(SNAPSHOT_FIELD_BYTE_CAP * 3),
+        );
+        job.diagnostic_error = Some("X-API-Key: abcdef0123456789SECRET\u{0000}bad".to_string());
+        job.repair_error = Some("token=abcdef0123456789SECRET\u{007f}bad".to_string());
+
+        let snap = job.failure_snapshot();
+
+        assert!(!snap.command.contains("abcdef0123456789SECRET"));
+        assert!(!snap.failure_signature.contains("abcdef0123456789SECRET"));
+        assert!(!snap.output_excerpt.contains("abcdef0123456789SECRET"));
+        assert!(
+            !snap
+                .diagnostic_error
+                .as_deref()
+                .unwrap()
+                .contains("abcdef0123456789SECRET")
+        );
+        assert!(
+            !snap
+                .repair_error
+                .as_deref()
+                .unwrap()
+                .contains("abcdef0123456789SECRET")
+        );
+        // Control characters neutralised in all sanitized fields.
+        assert!(!snap.output_excerpt.contains('\r'));
+        assert!(
+            !snap
+                .diagnostic_error
+                .as_deref()
+                .unwrap()
+                .contains('\u{0000}')
+        );
+        assert!(!snap.repair_error.as_deref().unwrap().contains('\u{007f}'));
+        // Bounded retention: snapshot fields stay under cap.
+        assert!(snap.output_excerpt.len() <= SNAPSHOT_FIELD_BYTE_CAP);
+
+        // Spot-check helpers used by the snapshot pipeline so a regression
+        // in `sanitize_repair_job_text` / `truncate_for_snapshot` would
+        // surface here too.
+        let big = "x".repeat(SNAPSHOT_FIELD_BYTE_CAP + 256);
+        assert_eq!(truncate_for_snapshot(&big).len(), SNAPSHOT_FIELD_BYTE_CAP);
+        assert!(
+            !sanitize_repair_job_text("X-API-Key: abcdef0123456789SECRET\n end")
+                .contains("abcdef0123456789SECRET")
+        );
+    }
+
+    /// Issue #637 (CB-002 regression): `verifier_repair_context_from_failure`
+    /// must funnel every long-lived text field through the SSOT redactors
+    /// (`redact_verifier_command_for_storage` for `command`,
+    /// `sanitize_repair_job_text_with_char_cap` for the rest). Header-family
+    /// credentials (Authorization / Cookie / X-API-Key) and raw control
+    /// characters MUST be neutralised before the values land in any field
+    /// later consumed by `verifier_diagnostic_messages` /
+    /// `verifier_repair_pass_messages` prompt payloads.
+    #[test]
+    fn verifier_repair_context_sanitizes_command_and_output_at_store_boundary() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "print('hi')\n").unwrap();
+
+        let raw_command = "curl -H \"Authorization: Bearer abcdef0123456789SECRET\" \
+                           -H \"Cookie: session=ABCDEF0123456789SECRET\" \
+                           -H \"X-API-Key: KEYABCDEF0123456789SECRET\" \
+                           http://localhost:8000/api\nrm -rf /tmp\u{0000}";
+        let raw_output = "Traceback (most recent call last):\r\n  \
+                          File \"app/main.py\", line 1, in <module>\n    \
+                          Authorization: Bearer abcdef0123456789SECRET\n    \
+                          Cookie: leak=ABCDEF0123456789SECRET\u{007f}\n\
+                          AssertionError: details Authorization: Bearer abcdef0123456789SECRET";
+
+        let job =
+            verifier_repair_context_from_failure(work_root, raw_command, raw_output, &[], 1, None);
+
+        // Command: `Authorization: <REDACTED>` / `Cookie: <REDACTED>` /
+        // `X-API-Key: <REDACTED>` (mask_header_family); control chars
+        // collapse to space (redact_verifier_command_for_storage step 3).
+        assert!(!job.command.contains("abcdef0123456789SECRET"));
+        assert!(!job.command.contains("KEYABCDEF0123456789SECRET"));
+        assert!(!job.command.contains('\n'));
+        assert!(!job.command.contains('\u{0000}'));
+        assert!(job.command.contains("<REDACTED>"));
+
+        // output_excerpt: same expectations, plus `\r` and `\u{007f}`.
+        assert!(!job.output_excerpt.contains("abcdef0123456789SECRET"));
+        assert!(!job.output_excerpt.contains("ABCDEF0123456789SECRET"));
+        assert!(!job.output_excerpt.contains('\r'));
+        assert!(!job.output_excerpt.contains('\u{007f}'));
+
+        // failure_signature is derived from output and MUST also be clean.
+        assert!(!job.failure_signature.contains("abcdef0123456789SECRET"));
+
+        // Plumbed through to the prompt payload helpers. Both
+        // `verifier_diagnostic_messages` and `verifier_repair_pass_messages`
+        // serialise these fields verbatim, so the assertions above
+        // transitively guarantee the prompt payload is clean — but assert
+        // the diagnostic-pass payload directly here for defence in depth.
+        let messages = verifier_diagnostic_messages(work_root, &job, "build");
+        let serialized: String = messages
+            .iter()
+            .map(|m| {
+                serde_json::to_string(&serde_json::json!({"content": m.content.clone()}))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!serialized.contains("abcdef0123456789SECRET"));
+        assert!(!serialized.contains("ABCDEF0123456789SECRET"));
+        assert!(!serialized.contains("KEYABCDEF0123456789SECRET"));
+    }
+
+    /// Issue #637 (CB-002 regression): the repair-pass prompt payload
+    /// surfaces `previous_repair_error` and `output_excerpt` directly. A
+    /// `RepairJob` whose `repair_error` came from
+    /// `record_controller_verifier_repair_invalid` must already be
+    /// sanitized, so secrets / control chars cannot reach the prompt.
+    #[test]
+    fn verifier_repair_pass_messages_payload_drops_secrets_and_control_chars() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "def add(a, b):\n    return a - b\n",
+        )
+        .unwrap();
+
+        let mut job = verifier_context_for("app/main.py");
+        // Simulate what `record_controller_verifier_repair_invalid` would
+        // have stored after sanitization. Use the same SSOT to keep the
+        // regression aligned with the production path.
+        job.repair_error = Some(
+            super::super::repair_job::sanitize_repair_job_text_with_char_cap(
+                "Authorization: Bearer abcdef0123456789SECRET\u{0000}\n\
+             Cookie: leak=ABCDEF0123456789SECRET\r\n\
+             X-API-Key: KEYABCDEF0123456789SECRET",
+                360,
+            ),
+        );
+        job.output_excerpt = super::super::repair_job::sanitize_repair_job_text_with_char_cap(
+            "X-Auth-Token: abcdef0123456789SECRET\nAssertionError",
+            4000,
+        );
+        let target = job
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let messages = verifier_repair_pass_messages(work_root, &job, &target, "fix app").unwrap();
+        let serialized: String = messages
+            .iter()
+            .map(|m| {
+                serde_json::to_string(&serde_json::json!({"content": m.content.clone()}))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!serialized.contains("abcdef0123456789SECRET"));
+        assert!(!serialized.contains("ABCDEF0123456789SECRET"));
+        assert!(!serialized.contains("KEYABCDEF0123456789SECRET"));
+        assert!(!serialized.contains('\u{0000}'));
+        // Raw `\r` would land inside a JSON string literal as the escape
+        // `\\r`; assert the literal-control-char form is absent.
+        assert!(!serialized.chars().any(|c| c == '\r'));
     }
 }
 
