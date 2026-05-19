@@ -10156,44 +10156,48 @@ impl Agent {
         let Some(request) = self.active_request_text() else {
             return false;
         };
-        let (label, event, files, scaffold_kind) = if policy.allow_python_deterministic_fallback {
-            if let Some(files) = deterministic::fastapi_scaffold_files(&request) {
+        // Issue #634: Python ブランチのみ experimental flag 経由で隔離。
+        // Docs ブランチ (`agent.empty_workspace.deterministic_docs`) は本 Issue で
+        // touch せず、既存 `policy.allow_docs_deterministic_fallback` 経路を維持。
+        let (label, event, files, scaffold_kind) =
+            if super::policy_allows_python_specialized_fallback(&policy, &self.config) {
+                if let Some(files) = deterministic::fastapi_scaffold_files(&request) {
+                    (
+                        "FastAPI scaffold",
+                        EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
+                        files,
+                        "FastAPI",
+                    )
+                } else {
+                    let (script_name, sample_name) =
+                        self.python_csv_names_from_request_and_anvil(&request);
+                    (
+                        "Python scaffold",
+                        EVENT_DETERMINISTIC_PYTHON_CLI,
+                        match deterministic::empty_python_cli_files_with_names(
+                            &request,
+                            script_name.as_deref(),
+                            sample_name.as_deref(),
+                        ) {
+                            Some(files) => files,
+                            None => return false,
+                        },
+                        "Python",
+                    )
+                }
+            } else if policy.allow_docs_deterministic_fallback {
                 (
-                    "FastAPI scaffold",
-                    EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
-                    files,
-                    "FastAPI",
-                )
-            } else {
-                let (script_name, sample_name) =
-                    self.python_csv_names_from_request_and_anvil(&request);
-                (
-                    "Python scaffold",
-                    EVENT_DETERMINISTIC_PYTHON_CLI,
-                    match deterministic::empty_python_cli_files_with_names(
-                        &request,
-                        script_name.as_deref(),
-                        sample_name.as_deref(),
-                    ) {
+                    "Docs scaffold",
+                    "agent.empty_workspace.deterministic_docs",
+                    match deterministic::empty_docs_files(&request) {
                         Some(files) => files,
                         None => return false,
                     },
-                    "Python",
+                    "Docs",
                 )
-            }
-        } else if policy.allow_docs_deterministic_fallback {
-            (
-                "Docs scaffold",
-                "agent.empty_workspace.deterministic_docs",
-                match deterministic::empty_docs_files(&request) {
-                    Some(files) => files,
-                    None => return false,
-                },
-                "Docs",
-            )
-        } else {
-            return false;
-        };
+            } else {
+                return false;
+            };
         if !self.workspace_appears_empty() {
             return false;
         }
@@ -10281,25 +10285,21 @@ impl Agent {
         decision: &super::task_contract::CompletionDecision,
         last_iter: usize,
     ) -> bool {
-        if !self
-            .config
-            .deterministic_fallback
-            .allows_template_completion()
-        {
+        // Issue #634: template 系特化 fallback (FastAPI scaffold) は
+        // experimental flag と `FullTemplate` の AND 条件で隔離。
+        // `policy_allows_python_specialized_fallback` が
+        // `ModePolicy::allow_python_deterministic_fallback` と
+        // `Config::specialized_template_fallback_enabled()` の AND 条件を担う。
+        if !super::policy_allows_python_specialized_fallback(
+            &self.session.mode_state.policy(),
+            &self.config,
+        ) {
             return false;
         }
         if !matches!(
             decision,
             super::task_contract::CompletionDecision::Continue { .. }
         ) {
-            return false;
-        }
-        if !self
-            .session
-            .mode_state
-            .policy()
-            .allow_python_deterministic_fallback
-        {
             return false;
         }
         if !self.workspace_appears_empty() {
