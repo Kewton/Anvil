@@ -929,7 +929,10 @@ impl Agent {
             return Ok(None);
         }
 
-        if (policy.allow_python_deterministic_fallback
+        // Issue #634: Python bypass を experimental flag 経由で隔離。
+        // Docs ブランチ (`allow_docs_deterministic_fallback`) は本 Issue では
+        // touch せず、既存挙動を維持 (OR 構造保持)。
+        if (super::policy_allows_python_specialized_fallback(&policy, &self.config)
             && deterministic_empty_python_cli_files(input).is_some()
             && Self::command_workspace_appears_empty(&self.work_root))
             || (policy.allow_docs_deterministic_fallback
