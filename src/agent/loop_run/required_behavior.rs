@@ -228,6 +228,50 @@ impl RequiredBehaviorContract {
         roles.dedup();
         roles
     }
+
+    /// Issue #636: judgement API — does `excerpt` hit any of the
+    /// operation keywords backing `self.operations`?
+    ///
+    /// Short ASCII keywords (`read`, `run`) go through the token-boundary
+    /// `keyword_hit` SSOT so `README` / `running` do not false-positive.
+    /// `KeywordMatch` / `OPERATION_KEYWORDS` stay private to this module
+    /// (DR1-005 / DR3-001 — no facade re-export). Returns `false` when
+    /// `operations` is `None` or empty.
+    pub(super) fn excerpt_hits_any_operation(&self, excerpt: &str) -> bool {
+        let Some(ops) = self.operations.as_ref() else {
+            return false;
+        };
+        if ops.is_empty() {
+            return false;
+        }
+        let lower = excerpt.to_ascii_lowercase();
+        for (needle, op, mode) in OPERATION_KEYWORDS {
+            if ops.contains(op) && keyword_hit(&lower, needle, *mode) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Issue #636: judgement API — does `excerpt` hit any of the
+    /// `domain_terms`?
+    ///
+    /// `domain_terms` are user-derived vocabulary so we match by
+    /// case-insensitive substring without applying the short-token
+    /// boundary rule (CB-004 keeps schema vs request alignment). Returns
+    /// `false` when `domain_terms` is `None` or empty.
+    pub(super) fn excerpt_hits_any_domain_term(&self, excerpt: &str) -> bool {
+        let Some(terms) = self.domain_terms.as_ref() else {
+            return false;
+        };
+        if terms.is_empty() {
+            return false;
+        }
+        let lower = excerpt.to_ascii_lowercase();
+        terms
+            .iter()
+            .any(|term| !term.is_empty() && lower.contains(&term.to_ascii_lowercase()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,5 +1330,83 @@ mod tests {
             !arts.contains(&ArtifactKind::Implementation),
             "unbacked Implementation must be dropped, got: {arts:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Group E: Issue #636 judgement APIs (5 tests)
+    // -----------------------------------------------------------------
+
+    fn contract_with_ops(ops: Vec<Operation>) -> RequiredBehaviorContract {
+        let mut c = empty_contract();
+        c.operations = Some(ops);
+        c
+    }
+
+    fn contract_with_terms(terms: Vec<String>) -> RequiredBehaviorContract {
+        let mut c = empty_contract();
+        c.domain_terms = Some(terms);
+        c
+    }
+
+    #[test]
+    fn excerpt_hits_any_operation_matches_with_token_boundary_for_short_keyword() {
+        let c = contract_with_ops(vec![Operation::Read]);
+        // `README` should NOT count as a `read` operation.
+        assert!(!c.excerpt_hits_any_operation("Update README only"));
+        // Bare `read` token boundary matches.
+        assert!(c.excerpt_hits_any_operation("we will Read the user record"));
+        // `run` token boundary
+        let c = contract_with_ops(vec![Operation::Run]);
+        assert!(!c.excerpt_hits_any_operation("the running task"));
+        assert!(c.excerpt_hits_any_operation("run the verifier"));
+    }
+
+    #[test]
+    fn excerpt_hits_any_operation_matches_substring_for_long_keyword() {
+        for op in [
+            Operation::Create,
+            Operation::Update,
+            Operation::Delete,
+            Operation::Validate,
+        ] {
+            let c = contract_with_ops(vec![op]);
+            let excerpt = match op {
+                Operation::Create => "We CREATE a new entity here",
+                Operation::Update => "Update the existing record",
+                Operation::Delete => "delete the row from storage",
+                Operation::Validate => "Validate the payload structure",
+                _ => unreachable!(),
+            };
+            assert!(
+                c.excerpt_hits_any_operation(excerpt),
+                "op {op:?} should match {excerpt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn excerpt_hits_any_operation_returns_false_when_operations_is_none() {
+        let c = empty_contract();
+        assert!(!c.excerpt_hits_any_operation("create read update delete"));
+        let mut c2 = empty_contract();
+        c2.operations = Some(Vec::new());
+        assert!(!c2.excerpt_hits_any_operation("create read update delete"));
+    }
+
+    #[test]
+    fn excerpt_hits_any_domain_term_matches_case_insensitive() {
+        let c = contract_with_terms(vec!["Task".to_string(), "api/v1".to_string()]);
+        assert!(c.excerpt_hits_any_domain_term("def list_tasks():\n    return Task.all()"));
+        assert!(c.excerpt_hits_any_domain_term("GET /api/v1/items"));
+        assert!(!c.excerpt_hits_any_domain_term("nothing relevant here"));
+    }
+
+    #[test]
+    fn excerpt_hits_any_domain_term_returns_false_when_domain_terms_is_none() {
+        let c = empty_contract();
+        assert!(!c.excerpt_hits_any_domain_term("Task api"));
+        let mut c2 = empty_contract();
+        c2.domain_terms = Some(Vec::new());
+        assert!(!c2.excerpt_hits_any_domain_term("Task api"));
     }
 }

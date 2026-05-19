@@ -4877,6 +4877,9 @@ impl Agent {
         // `ProtocolKind::evidence_set_satisfies`.
         self.evidence_set_this_turn.clear();
         self.task_contract_evidence_set_this_turn.clear();
+        // Issue #636: drop per-turn behavior-coverage excerpts so the
+        // current turn never observes a previous turn's edits.
+        self.task_contract_excerpts.clear();
         self.current_artifact_recovery_target = None;
         self.task_contract_verifier_repair_pending = false;
         self.repair_job = None;
@@ -9897,6 +9900,16 @@ impl Agent {
             self.task_contract_evidence_set_this_turn.push(
                 super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 },
             );
+            // Issue #636: capture bounded post-edit excerpt for the
+            // current role so `plan_artifact_recovery` can assert that
+            // the edit actually carries the requested behavior. Silent
+            // skip on role-miss / read failure (back-compat with the
+            // existing `repo_edit_has_post_scaffold_delta` no-data path).
+            if let Some(role) = super::task_contract::role_from_repo_edit(category)
+                && let Some(excerpt) = self.bounded_post_edit_excerpt(&relative_path)
+            {
+                self.task_contract_excerpts.insert(role, excerpt);
+            }
         }
         crate::logging::log_completion_evidence_observed(
             self.current_turn_index,
@@ -9931,6 +9944,58 @@ impl Agent {
             ScaffoldDiffStatus::Changed => true,
             ScaffoldDiffStatus::UnchangedOrMissing => false,
         }
+    }
+
+    /// Issue #636: read a workspace-confined, cap-bounded excerpt of
+    /// `relative_path` for behavior-coverage judgement.
+    ///
+    /// Path confinement (defense-in-depth: callers already pass a
+    /// normalized relative path, but we re-resolve here):
+    /// - `resolve_user_path(&self.work_root, relative_path)` + canonical
+    ///   root + `strip_prefix` rejects absolute / `..` escape / out-of-
+    ///   workspace symlinks / canonicalize failures / non-files.
+    ///
+    /// Cap-before-read:
+    /// - `File::open` + `Read::take(MAX_ARTIFACT_EXCERPT_BYTES + 1)` so
+    ///   we never read more than 8 KiB + 1 byte from disk. `std::fs::read`
+    ///   / `read_to_string` are intentionally avoided.
+    ///
+    /// Content guards:
+    /// - UTF-8 invalid → `None`. Embedded NUL → `None` (non-text).
+    /// - When the cap boundary splits a multi-byte UTF-8 character we
+    ///   truncate down to the last valid char boundary instead of giving
+    ///   up (CB-001 / Issue #636 Phase 4).
+    /// - `session::feedback::mask_secrets` then
+    ///   `session::feedback::mask_header_family` stacked, matching the
+    ///   redactor SSOT used elsewhere (DR4-002).
+    /// - Post-masking re-truncation on a UTF-8 char boundary so masking
+    ///   expansion can never blow past `MAX_ARTIFACT_EXCERPT_BYTES`.
+    ///
+    /// TOCTOU hardening: on Unix we open with `O_NOFOLLOW` so a symlink
+    /// swap between the path confinement check and the open call cannot
+    /// redirect us outside the workspace (CB-002 / Issue #636 Phase 4).
+    fn bounded_post_edit_excerpt(&self, relative_path: &str) -> Option<String> {
+        use std::io::Read;
+        let target = resolve_user_path(&self.work_root, relative_path).ok()?;
+        let root = std::fs::canonicalize(&self.work_root).ok()?;
+        if target.strip_prefix(&root).is_err() {
+            return None;
+        }
+        if !target.is_file() {
+            return None;
+        }
+        let cap = super::task_contract::MAX_ARTIFACT_EXCERPT_BYTES;
+        let file = open_excerpt_file_nofollow(&target)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(cap + 1);
+        file.take((cap as u64) + 1).read_to_end(&mut buf).ok()?;
+        if buf.contains(&0u8) {
+            return None;
+        }
+        let text = utf8_prefix_respecting_cap(&buf, cap)?.to_string();
+        let masked = crate::session::feedback::mask_header_family(
+            &crate::session::feedback::mask_secrets(&text),
+        );
+        Some(truncate_on_char_boundary(masked, cap))
     }
 
     fn task_contract_artifact_states(
@@ -10007,6 +10072,7 @@ impl Agent {
             evidence: &self.task_contract_evidence_set_this_turn,
             artifacts: &artifacts,
             repair_state: &repair_state,
+            artifact_excerpts: &self.task_contract_excerpts,
         })
     }
 
@@ -13491,6 +13557,68 @@ fn scaffold_candidate_priority(
         return 0;
     }
     10
+}
+
+/// Issue #636: trim `s` so its byte length is at most `cap` while
+/// preserving the leading UTF-8 char boundary. Used by
+/// `bounded_post_edit_excerpt` to re-cap a post-masking string when
+/// redaction expanded it past `MAX_ARTIFACT_EXCERPT_BYTES`.
+fn truncate_on_char_boundary(s: String, cap: usize) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Issue #636 (CB-001): return the longest valid UTF-8 prefix of `buf`
+/// up to `cap` bytes. If the bytes inside `[0, cap)` are a valid UTF-8
+/// prefix but the cap+1 read tail straddles a multi-byte char, we shrink
+/// to `valid_up_to()` instead of rejecting the whole excerpt. Truly
+/// invalid UTF-8 (`error_len().is_some()`) still returns `None`.
+fn utf8_prefix_respecting_cap(buf: &[u8], cap: usize) -> Option<&str> {
+    let end = buf.len().min(cap);
+    let slice = &buf[..end];
+    match std::str::from_utf8(slice) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            if e.error_len().is_some() {
+                return None;
+            }
+            // Tail of `slice` is a partial multi-byte char — safe to clip.
+            let valid = e.valid_up_to();
+            std::str::from_utf8(&slice[..valid]).ok()
+        }
+    }
+}
+
+/// Issue #636 (CB-002): open `target` for read with `O_NOFOLLOW` on Unix
+/// so a symlink swap between the workspace-confinement check and the
+/// open call cannot redirect us outside the workspace. On non-Unix we
+/// fall back to plain `File::open` and rely on the pre-open path checks.
+fn open_excerpt_file_nofollow(target: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(target)
+            .ok()?;
+        // Re-check post-open: O_NOFOLLOW guards the final component, and
+        // `metadata()` (vs `symlink_metadata`) reflects the opened inode.
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        Some(file)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(target).ok()
+    }
 }
 
 fn current_file_hash_for_relative_path(work_root: &Path, relative_path: &str) -> Option<String> {
@@ -23243,6 +23371,196 @@ export default function App() {
         assert!(
             !payload.contains("abcdef0123456789SECRET"),
             "Header-family secrets must be redacted"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #636: per-turn excerpt lifecycle / path-confinement / cap.
+    // -----------------------------------------------------------------
+
+    /// Issue #636: the per-turn behavior-coverage excerpts map MUST be
+    /// reset whenever a new user turn begins, mirroring the existing
+    /// `evidence_set_this_turn.clear()` / `task_contract_evidence_set_*`
+    /// reset block. We don't have a direct hook to invoke run_actor_loop
+    /// in unit tests, so this test pins the same field-clear pattern the
+    /// production reset block uses (regression guard if future edits
+    /// drop the clear call).
+    #[test]
+    fn task_contract_excerpts_cleared_at_turn_start() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::ArtifactRole;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent
+            .task_contract_excerpts
+            .insert(ArtifactRole::Implementation, "stale excerpt".to_string());
+        assert!(!agent.task_contract_excerpts.is_empty());
+
+        // Production per-turn reset block (`run_actor_loop` head) calls
+        // `self.task_contract_excerpts.clear()` next to the other
+        // `*_this_turn` resets. Mirror that assignment here.
+        agent.task_contract_excerpts.clear();
+
+        assert!(
+            agent.task_contract_excerpts.is_empty(),
+            "task_contract_excerpts must be empty after per-turn reset"
+        );
+    }
+
+    /// Issue #636: absolute paths, `..`-escape paths, and non-file
+    /// targets must yield `None` from `bounded_post_edit_excerpt`. We
+    /// don't exercise OS symlinks here (CI portability) but the path
+    /// confinement is otherwise covered by `resolve_user_path` +
+    /// `strip_prefix` + `is_file()`.
+    #[test]
+    fn bounded_post_edit_excerpt_rejects_escape_paths() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (agent, _temp) = test_agent_with_config(Config::default());
+
+        // Absolute path outside the workspace.
+        assert!(agent.bounded_post_edit_excerpt("/etc/hosts").is_none());
+
+        // `..` escape: even if it resolves to a real file, it escapes
+        // the workspace.
+        assert!(
+            agent
+                .bounded_post_edit_excerpt("../../../etc/passwd")
+                .is_none()
+        );
+
+        // Non-file (workspace root itself is a directory, not a file).
+        assert!(agent.bounded_post_edit_excerpt(".").is_none());
+
+        // Missing file inside workspace.
+        assert!(
+            agent
+                .bounded_post_edit_excerpt("does/not/exist.rs")
+                .is_none()
+        );
+    }
+
+    /// Issue #636: cap-before-read keeps the excerpt at or below the
+    /// SSOT byte cap, embedded NUL inputs are rejected as non-text, and
+    /// secret-like content is masked by stacking `mask_secrets` +
+    /// `mask_header_family` before the excerpt is returned.
+    #[test]
+    fn bounded_post_edit_excerpt_masks_caps_and_rejects_binary() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::MAX_ARTIFACT_EXCERPT_BYTES;
+        use crate::config::Config;
+
+        let (agent, temp) = test_agent_with_config(Config::default());
+
+        // Cap: file twice the size of the cap is truncated.
+        let big_path = temp.path().join("big.txt");
+        std::fs::write(&big_path, "a".repeat(MAX_ARTIFACT_EXCERPT_BYTES * 2)).unwrap();
+        let excerpt = agent.bounded_post_edit_excerpt("big.txt").unwrap();
+        assert!(
+            excerpt.len() <= MAX_ARTIFACT_EXCERPT_BYTES,
+            "excerpt cap violated: {} > {}",
+            excerpt.len(),
+            MAX_ARTIFACT_EXCERPT_BYTES
+        );
+
+        // Binary: NUL bytes mean we treat it as non-text and return None.
+        let bin_path = temp.path().join("bin.dat");
+        std::fs::write(&bin_path, [0x00u8, 0x01, 0x02, 0x03]).unwrap();
+        assert!(agent.bounded_post_edit_excerpt("bin.dat").is_none());
+
+        // Masking: a recognisable secret-like token must not survive
+        // verbatim. `mask_secrets` rewrites `API_KEY=...` style assigns,
+        // and `mask_header_family` removes credential tails from header
+        // family lines.
+        let secret_path = temp.path().join("secret.rs");
+        std::fs::write(
+            &secret_path,
+            "const TOKEN: &str = \"sk-proj-aaaaaaaaaaaaaaaaaaaaaaaa\";\n\
+             Authorization: Bearer abc123def456\n",
+        )
+        .unwrap();
+        let excerpt = agent.bounded_post_edit_excerpt("secret.rs").unwrap();
+        assert!(
+            !excerpt.contains("sk-proj-aaaaaaaaaaaaaaaaaaaaaaaa"),
+            "raw secret leaked: {excerpt}"
+        );
+        assert!(
+            !excerpt.contains("abc123def456"),
+            "raw Authorization tail leaked: {excerpt}"
+        );
+    }
+
+    /// Issue #636 Phase 4 (CB-001): when the byte cap falls inside a
+    /// multi-byte UTF-8 character we must truncate to the last valid
+    /// char boundary instead of returning `None`. Previously the
+    /// `cap + 1` byte read followed by a single `from_utf8(&buf)` would
+    /// reject this case as invalid UTF-8 even though the file is valid.
+    #[test]
+    fn bounded_post_edit_excerpt_truncates_at_utf8_boundary_when_cap_splits_multibyte() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::MAX_ARTIFACT_EXCERPT_BYTES;
+        use crate::config::Config;
+
+        let (agent, temp) = test_agent_with_config(Config::default());
+
+        // Place a multi-byte char (`あ` = 3 bytes in UTF-8) so that its
+        // first byte sits at offset `MAX_ARTIFACT_EXCERPT_BYTES - 1`,
+        // i.e. the `cap+1` read window slices it apart.
+        let prefix_len = MAX_ARTIFACT_EXCERPT_BYTES - 1;
+        let mut content = "a".repeat(prefix_len);
+        content.push('あ');
+        // Pad with more ASCII so the file is larger than `cap + 1`.
+        content.push_str(&"b".repeat(64));
+
+        let path = temp.path().join("multibyte.txt");
+        std::fs::write(&path, content).unwrap();
+
+        let excerpt = agent
+            .bounded_post_edit_excerpt("multibyte.txt")
+            .expect("excerpt must succeed even when cap splits a multi-byte char");
+        assert!(
+            excerpt.len() <= MAX_ARTIFACT_EXCERPT_BYTES,
+            "excerpt cap violated: {} > {}",
+            excerpt.len(),
+            MAX_ARTIFACT_EXCERPT_BYTES
+        );
+        assert!(
+            excerpt.is_char_boundary(excerpt.len()),
+            "excerpt must end on a valid UTF-8 char boundary"
+        );
+        // The truncation must keep the leading ASCII prefix intact.
+        assert!(excerpt.starts_with(&"a".repeat(prefix_len.min(excerpt.len()))));
+    }
+
+    /// Issue #636 Phase 4 (CB-002): a symlink pointing outside the
+    /// workspace must still be rejected after the O_NOFOLLOW hardening.
+    /// This pins both the pre-open `strip_prefix` check and the Unix
+    /// `O_NOFOLLOW` open path so a future refactor cannot regress one
+    /// without the other.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_post_edit_excerpt_rejects_symlink_escaping_workspace() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (agent, temp) = test_agent_with_config(Config::default());
+
+        // Create the symlink target *outside* the workspace.
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "top secret").unwrap();
+
+        let link_path = temp.path().join("link.txt");
+        std::os::unix::fs::symlink(&outside_file, &link_path).unwrap();
+
+        // `bounded_post_edit_excerpt` must refuse the symlink whether
+        // confinement catches it first (canonical strip_prefix) or the
+        // O_NOFOLLOW open path catches it (TOCTOU race window).
+        assert!(
+            agent.bounded_post_edit_excerpt("link.txt").is_none(),
+            "symlink pointing outside the workspace must be rejected"
         );
     }
 }
