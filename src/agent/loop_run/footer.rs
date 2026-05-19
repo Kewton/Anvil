@@ -1238,6 +1238,7 @@ mod tests {
             photon_no_auto_promote: false,
             photon_auto_promote_dry_run: true,
             photon_auto_promote_scrub_mode: "strict".to_string(),
+            experimental_specialized_fallback: false,
         }
     }
 

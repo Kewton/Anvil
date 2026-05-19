@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::format_model_banner;
 use crate::logging::log_llm_event;
 use crate::model_registry::RuntimeModels;
-use crate::modes::plan_act::ExecutionMode;
+use crate::modes::plan_act::{ExecutionMode, ModePolicy};
 use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
 use crate::ollama::xml_fallback::ToolCall;
 use crate::repo_graph::{
@@ -271,6 +271,15 @@ pub use quality_confirm::{
     parse_second_pass_response as parse_quality_second_pass_response, quality_confirm_disabled,
     run_quality_confirm_with_strategy, should_request_quality_confirmation,
 };
+
+/// Issue #634: Python 系特化 fallback (FastAPI / Python CLI / FizzBuzz scaffold) の
+/// AND gate。`ModePolicy::allow_python_deterministic_fallback` (既存) と
+/// `Config::specialized_template_fallback_enabled()` (Issue #634) の双方を満たす
+/// 場合に true。Docs ブランチ (`allow_docs_deterministic_fallback`) は本 Issue で
+/// touch しないため別経路で評価する。
+pub(crate) fn policy_allows_python_specialized_fallback(policy: &ModePolicy, cfg: &Config) -> bool {
+    policy.allow_python_deterministic_fallback && cfg.specialized_template_fallback_enabled()
+}
 
 const DEFAULT_KEEP_TAIL: usize = 24;
 const LATE_TURN_KEEP_TAIL: usize = 12;

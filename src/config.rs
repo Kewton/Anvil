@@ -292,6 +292,18 @@ pub struct Config {
     /// `ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE`、config key:
     /// `photon_auto_promote_scrub_mode`。
     pub photon_auto_promote_scrub_mode: String,
+    /// Issue #634: 特化 fallback (FastAPI scaffold / Python CSV / FizzBuzz /
+    /// 固定 arithmetic patch / qwen3.5 固有 deterministic edit) の experimental
+    /// gate。Default: `false`。env: `ANVIL_EXPERIMENTAL_SPECIALIZED_FALLBACK`、
+    /// config key: `experimental_specialized_fallback`、CLI:
+    /// `--experimental-specialized-fallback`。
+    ///
+    /// `DeterministicFallbackMode::FullTemplate` の意味は変えない。
+    /// template 系特化 fallback は本 flag と `FullTemplate` の AND 条件で発火
+    /// (`specialized_template_fallback_enabled()` 参照)。
+    /// edit 系 (arithmetic patch) は本 flag のみで gate
+    /// (`specialized_fallback_enabled()` 参照)。
+    pub experimental_specialized_fallback: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -340,9 +352,30 @@ pub struct PartialConfig {
     /// layer and validated only when the agent layer constructs `ScrubMode`
     /// (DR1-015 / DR1-016).
     pub photon_auto_promote_scrub_mode: Option<String>,
+    /// Issue #634: optional override for the experimental specialized fallback
+    /// gate (None = use default `false`).
+    pub experimental_specialized_fallback: Option<bool>,
 }
 
 impl Config {
+    /// Issue #634: experimental flag そのもの。edit 系特化 fallback
+    /// (固定 arithmetic patch 等) の gate に使う。call site で必要に応じて
+    /// `MinimalPatch` 以上か等の追加判定と AND する。本メソッドは agent 層
+    /// (`src/agent/loop_run/*`) のみが参照する想定 (DR3-002)。
+    pub fn specialized_fallback_enabled(&self) -> bool {
+        self.experimental_specialized_fallback
+    }
+
+    /// Issue #634: template 系特化 fallback (FastAPI / Python CLI / FizzBuzz
+    /// scaffold) が発火可能か。`experimental_specialized_fallback=true` かつ
+    /// `DeterministicFallbackMode::FullTemplate` の AND 条件で true。
+    /// `FullTemplate` の意味は変えず (後方互換)、本 flag を ON にしない限り
+    /// production 完了 path には反映されない。
+    pub fn specialized_template_fallback_enabled(&self) -> bool {
+        self.experimental_specialized_fallback
+            && self.deterministic_fallback.allows_template_completion()
+    }
+
     pub fn load(args: CliArgs) -> Result<(Self, Vec<String>), String> {
         let cwd = match args.cwd.clone() {
             Some(path) => path,
@@ -389,6 +422,8 @@ impl Config {
             photon_no_auto_promote: None,
             photon_auto_promote_dry_run: None,
             photon_auto_promote_scrub_mode: None,
+            // Issue #634: CLI flag for the experimental specialized fallback gate.
+            experimental_specialized_fallback: args.experimental_specialized_fallback,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
@@ -461,6 +496,11 @@ impl Config {
             photon_auto_promote_scrub_mode: merged
                 .photon_auto_promote_scrub_mode
                 .unwrap_or_else(|| "strict".to_string()),
+            // Issue #634: default false. Production builds keep specialized
+            // fallback paths gated unless the operator explicitly opts in.
+            experimental_specialized_fallback: merged
+                .experimental_specialized_fallback
+                .unwrap_or(false),
         };
         Ok((config, warnings))
     }
@@ -553,6 +593,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.photon_auto_promote_scrub_mode.is_some() {
             merged.photon_auto_promote_scrub_mode = config.photon_auto_promote_scrub_mode.clone();
         }
+        if config.experimental_specialized_fallback.is_some() {
+            merged.experimental_specialized_fallback = config.experimental_specialized_fallback;
+        }
     }
     merged
 }
@@ -634,6 +677,10 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
             .get("photon_auto_promote_dry_run")
             .and_then(|v| parse_bool(v)),
         photon_auto_promote_scrub_mode: map.get("photon_auto_promote_scrub_mode").cloned(),
+        // Issue #634: experimental specialized fallback opt-in.
+        experimental_specialized_fallback: map
+            .get("experimental_specialized_fallback")
+            .and_then(|v| parse_bool(v)),
     })
 }
 
@@ -727,6 +774,10 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         photon_auto_promote_scrub_mode: env::var("ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE")
             .ok()
             .filter(|v| !v.trim().is_empty()),
+        // Issue #634: experimental specialized fallback opt-in.
+        experimental_specialized_fallback: env::var("ANVIL_EXPERIMENTAL_SPECIALIZED_FALLBACK")
+            .ok()
+            .and_then(|value| parse_bool(&value)),
     }
 }
 
