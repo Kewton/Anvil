@@ -1,7 +1,7 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use crate::tools::bash::BashCommandClass;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
 pub(super) enum ArtifactRole {
     Implementation,
     Test,
@@ -302,9 +302,8 @@ impl TaskContract {
         CompletionDecision::Done
     }
 
-    pub(super) fn recovery_attempt_limit(&self) -> usize {
-        let role_budget = self.required_artifacts.len().max(1) * 2 + 2;
-        role_budget.clamp(3, 10)
+    pub(super) fn artifact_completion_attempt_limit(&self) -> usize {
+        4
     }
 }
 

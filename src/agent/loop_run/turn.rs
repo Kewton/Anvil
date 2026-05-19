@@ -69,7 +69,7 @@ use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 const LOG_ARGS_MAX_CHARS: usize = 200;
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
-const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 4;
+const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
 const VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS: u64 = 45;
 const VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS: u64 = 90;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 1_024;
@@ -110,6 +110,7 @@ struct FocusedEditPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArtifactDirectedPolicy {
     target: PathBuf,
+    target_already_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,11 +213,21 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn artifact_directed(target: PathBuf) -> Self {
+    fn artifact_directed(target: PathBuf, target_already_read: bool) -> Self {
+        let allowed_tools = if !target.is_file() {
+            vec!["Write"]
+        } else if target_already_read {
+            vec!["Write", "Edit"]
+        } else {
+            vec!["Read", "Write", "Edit"]
+        };
         Self {
-            allowed_tools: Some(vec!["Read", "Write", "Edit"]),
+            allowed_tools: Some(allowed_tools),
             focused_edit: None,
-            artifact_directed: Some(ArtifactDirectedPolicy { target }),
+            artifact_directed: Some(ArtifactDirectedPolicy {
+                target,
+                target_already_read,
+            }),
             reason: EffectiveToolPolicyReason::ArtifactDirectedRecovery,
         }
     }
@@ -1460,6 +1471,15 @@ fn task_contract_continue_requires_tool_recovery(
     ) && current_reply_tool_calls == 0
 }
 
+fn increment_artifact_completion_role_attempt(
+    attempts: &mut HashMap<super::task_contract::ArtifactRole, usize>,
+    role: super::task_contract::ArtifactRole,
+) -> usize {
+    let entry = attempts.entry(role).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
+}
+
 fn should_apply_repo_change_partial_progress_recovery(
     action_expectation: recovery::ActionExpectation,
     repo_edit_calls_made_this_turn: usize,
@@ -1637,7 +1657,7 @@ fn verifier_diagnostic_messages(
 Allowed failure_kind values: dependency_missing, local_import_contract_mismatch, compile_or_syntax_error, assertion_mismatch, runtime_error, test_bug, config_or_verifier_error, unknown.\n\
 Allowed probable_cause_role values: implementation, test, setup, usage_docs, unknown.\n\
 Schema: {{\"failure_kind\":\"...\",\"probable_cause_role\":\"...\",\"repair_targets\":[{{\"path\":\"workspace-relative existing file\",\"confidence\":0.0,\"reason\":\"short bounded reason\"}}],\"repair_plan\":[{{\"target\":\"workspace-relative existing file\",\"intent\":\"short bounded intent\",\"confidence\":0.0}}],\"secondary_targets\":[\"workspace-relative existing file\"],\"do_not_edit_tests_without_evidence\":true,\"summary\":\"short bounded summary\"}}.\n\
-Only include paths present in changed_candidates or safe_file_excerpts. For local import contract mismatches, prefer the provider/source file named by the import error before importer test frames. Use setup files only for dependency_missing or config_or_verifier_error. Payload JSON:\n{payload}"
+Only include paths present in changed_candidates or safe_file_excerpts. For local import contract mismatches, prefer the provider/source file named by the import error before importer test frames. For assertion failures, distinguish product behavior defects from generated-test defects; if the output shows state leaking across tests, order-dependent expectations, or missing setup/teardown, classify it as test_bug and target the test artifact. Use setup files only for dependency_missing or config_or_verifier_error. Payload JSON:\n{payload}"
         )),
     ]
 }
@@ -1786,6 +1806,7 @@ fn verifier_repair_pass_messages(
         "task_summary": compact_verifier_failure_text(active_request, 500),
         "command": context.command,
         "output_excerpt": context.output_excerpt,
+        "previous_repair_error": context.repair_error.as_deref(),
         "failure_signature": context.failure_signature,
         "diagnostic_assessment": assessment,
         "selected_target": {
@@ -1805,7 +1826,7 @@ fn verifier_repair_pass_messages(
             "Create a minimal complete edit set for the selected target only.\n\
 Schema A: {{\"path\":\"same workspace-relative selected_target.path\",\"old_string\":\"exact current target substring appearing once\",\"new_string\":\"replacement substring\",\"reason\":\"short bounded reason\"}}.\n\
 Schema B: {{\"path\":\"same workspace-relative selected_target.path\",\"edits\":[{{\"old_string\":\"exact current target substring\",\"new_string\":\"replacement substring\",\"replace_all\":false,\"reason\":\"short bounded reason\"}}],\"reason\":\"short bounded reason\"}}.\n\
-Use Schema B when the same verifier failure requires multiple related replacements in the same file. Edits are validated and applied sequentially in array order; each old_string must match exactly once after all previous edits have been applied. Prefer one enclosing old_string/new_string replacement when many nearby lines change; otherwise keep edits narrowly scoped and under the bounded edit count. If a short old_string can appear in multiple classes/functions/sections, include surrounding context so it is unique, or set replace_all=true only when every occurrence in the selected file should be replaced for consistency. Do not return unified diffs, patches, comments, markdown fences, or tool calls. The controller will reject edits whose old_string is missing, duplicated without replace_all, too large, unsafe, or not for selected_target.path. Payload JSON:\n{payload}"
+Use Schema B when the same verifier failure requires multiple related replacements in the same file. Edits are validated and applied sequentially in array order; each old_string must match exactly once after all previous edits have been applied. Prefer one enclosing old_string/new_string replacement when many nearby lines change; otherwise keep edits narrowly scoped and under the bounded edit count. Every new_string must differ from its old_string and must materially change the selected target. If previous_repair_error is non-null, correct that validation failure before proposing another edit. If a short old_string can appear in multiple classes/functions/sections, include surrounding context so it is unique, or set replace_all=true only when every occurrence in the selected file should be replaced for consistency. Do not return unified diffs, patches, comments, markdown fences, or tool calls. The controller will reject edits whose old_string is missing, duplicated without replace_all, too large, unsafe, or not for selected_target.path. Payload JSON:\n{payload}"
         )),
     ])
 }
@@ -1831,6 +1852,16 @@ fn verifier_repair_pass_retry_message(last_error: &str) -> String {
     } else if lower.contains("duplicate repair edit intent") {
         guidance.push_str(
             " The rejected edit repeats a previously applied repair; choose the next remaining failure in the selected target and make a different minimal edit.",
+        );
+    } else if lower.contains("old_string and new_string are identical")
+        || lower.contains("identical")
+    {
+        guidance.push_str(
+            " The rejected edit made no change. Return an old_string from the current selected target and a new_string that is different and directly addresses the verifier failure.",
+        );
+    } else if lower.contains("cheap check failed") || lower.contains("syntaxerror") {
+        guidance.push_str(
+            " The rejected edit made the target fail a cheap syntax check. Return a smaller exact replacement around the affected function or block, preserve indentation and line breaks, and do not concatenate separate statements onto one line.",
         );
     } else {
         guidance.push_str(
@@ -4852,6 +4883,8 @@ impl Agent {
         let mut verifier_repair_retries = 0usize;
         let mut focused_policy_retries = 0usize;
         let mut contract_completion_retries = 0usize;
+        let mut contract_completion_role_retries =
+            HashMap::<super::task_contract::ArtifactRole, usize>::new();
         let mut contract_verification_retries = 0usize;
         let mut contract_verifier_repair_edit_count: Option<usize> = None;
         let mut task_contract_verifier_passed_in_loop = false;
@@ -5050,9 +5083,23 @@ impl Agent {
                         );
                     }
                     VerifierRepairPassOutcome::Invalid { error } => {
-                        exit_reason = ExitReason::VerifierFailed;
-                        error_text = error;
-                        break 'outer;
+                        verifier_repair_retries = verifier_repair_retries.saturating_add(1);
+                        self.record_controller_verifier_repair_invalid(&error);
+                        if verifier_repair_retries >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
+                            exit_reason = ExitReason::VerifierFailed;
+                            error_text = error;
+                            break 'outer;
+                        }
+                        write_stdout_rendered(
+                            &format_iteration_status(
+                                last_iter,
+                                self.config.max_iterations,
+                                "Verifier repair",
+                                "Rejected invalid controller repair proposal; retrying verifier repair with validation diagnostics.",
+                                self.footer.current_cols(),
+                            ),
+                            true,
+                        );
                     }
                     VerifierRepairPassOutcome::Skipped => {}
                 }
@@ -5209,7 +5256,49 @@ impl Agent {
                     }
                     FocusedEditBatchAction::Reject(err) => {
                         let focused_retry = effective_tool_policy.focused_edit_policy().cloned();
+                        let artifact_retry =
+                            effective_tool_policy.artifact_directed_policy().cloned();
                         self.session.working_memory.note_error(err);
+                        if artifact_retry.is_some() {
+                            let role = self
+                                .current_artifact_recovery_target
+                                .as_ref()
+                                .map(|target| target.role)
+                                .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+                            let artifact_attempt = increment_artifact_completion_role_attempt(
+                                &mut contract_completion_role_retries,
+                                role,
+                            );
+                            let attempt_limit = task_contract
+                                .as_ref()
+                                .map(|contract| contract.artifact_completion_attempt_limit())
+                                .unwrap_or(4);
+                            if artifact_attempt >= attempt_limit {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = format!(
+                                    "artifact edit rejected repeatedly for required role {}",
+                                    role.label()
+                                );
+                                break 'outer;
+                            }
+                            write_stdout_rendered(
+                                &format_iteration_status(
+                                    last_iter,
+                                    self.config.max_iterations,
+                                    "Retry requested",
+                                    "Artifact completion rejected an invalid tool call before execution; asked for one allowed edit on the target.",
+                                    self.footer.current_cols(),
+                                ),
+                                true,
+                            );
+                            if !self.push_artifact_directed_recovery_note(artifact_attempt) {
+                                self.push_system_note(format!(
+                                    "[Artifact Completion] Previous tool call was rejected and was not executed. Missing role: {}. Emit exactly one allowed tool call on the current target path now. artifact_completion_attempt={artifact_attempt}/{attempt_limit}",
+                                    role.label()
+                                ));
+                            }
+                            continue;
+                        }
                         focused_policy_retries += 1;
                         if focused_retry.is_some() && focused_policy_retries >= 3 {
                             let request = self.active_request_text().unwrap_or_default();
@@ -6057,16 +6146,22 @@ impl Agent {
                             Some(action),
                             current_reply_tool_call_count,
                         ) {
-                            no_tool_retries += 1;
-                            if no_tool_retries >= 3 {
+                            contract_completion_retries =
+                                contract_completion_retries.saturating_add(1);
+                            let role = missing
+                                .first()
+                                .copied()
+                                .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+                            let artifact_attempt = increment_artifact_completion_role_attempt(
+                                &mut contract_completion_role_retries,
+                                role,
+                            );
+                            let attempt_limit = contract.artifact_completion_attempt_limit();
+                            if artifact_attempt >= attempt_limit {
                                 exit_reason = ExitReason::MissingRepoEdits;
                                 error_text = format!(
-                                    "assistant stopped before editing missing artifact(s): {}",
-                                    missing
-                                        .iter()
-                                        .map(|role| role.label())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
+                                    "assistant stopped before editing required artifact role {}",
+                                    role.label()
                                 );
                                 break 'outer;
                             }
@@ -6075,18 +6170,18 @@ impl Agent {
                                     last_iter,
                                     self.config.max_iterations,
                                     "Retry requested",
-                                    "Task contract requires a repository edit on the missing artifact target.",
+                                    "Task contract requires a repository edit on the current artifact target.",
                                     self.footer.current_cols(),
                                 ),
                                 true,
                             );
-                            if !self.push_artifact_directed_recovery_note(no_tool_retries) {
+                            if !self.push_artifact_directed_recovery_note(artifact_attempt) {
                                 self.push_system_note(
                                     super::task_contract::render_contract_recovery_note_with_hint(
                                         &decision,
                                         self.active_request_text().as_deref().unwrap_or_default(),
-                                        contract_completion_retries.saturating_add(1),
-                                        contract.recovery_attempt_limit(),
+                                        artifact_attempt,
+                                        attempt_limit,
                                         target_hint.as_ref(),
                                     ),
                                 );
@@ -6108,8 +6203,16 @@ impl Agent {
                         contract_completion_retries += 1;
                         let missing_labels =
                             missing.iter().map(|role| role.label()).collect::<Vec<_>>();
-                        let attempt_limit = contract.recovery_attempt_limit();
-                        if contract_completion_retries >= attempt_limit {
+                        let role = missing
+                            .first()
+                            .copied()
+                            .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+                        let artifact_attempt = increment_artifact_completion_role_attempt(
+                            &mut contract_completion_role_retries,
+                            role,
+                        );
+                        let attempt_limit = contract.artifact_completion_attempt_limit();
+                        if artifact_attempt >= attempt_limit {
                             exit_reason = ExitReason::MissingRepoEdits;
                             error_text = format!(
                                 "task contract incomplete; missing required artifact(s): {}",
@@ -6143,7 +6246,7 @@ impl Agent {
                             super::task_contract::render_contract_recovery_note_with_hint(
                                 &decision,
                                 self.active_request_text().as_deref().unwrap_or_default(),
-                                contract_completion_retries,
+                                artifact_attempt,
                                 attempt_limit,
                                 target_hint.as_ref(),
                             ),
@@ -8548,7 +8651,9 @@ impl Agent {
             );
         }
         if let Some(target) = self.artifact_recovery_target_path() {
-            return EffectiveToolPolicy::artifact_directed(target);
+            let target_already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            return EffectiveToolPolicy::artifact_directed(target, target_already_read);
         }
         if let Some(target) = self.focused_edit_recovery_target() {
             return self.focused_edit_policy_for_target(
@@ -9182,6 +9287,7 @@ impl Agent {
                 .any(|existing| existing == fingerprint)
         {
             context.applied_repair_intents.push(fingerprint.to_string());
+            context.repair_error = None;
         }
         log_llm_event(
             "agent.verifier_repair_pass.repo_edit_recorded",
@@ -9189,6 +9295,21 @@ impl Agent {
                 "session_id": self.session_store.session_id(),
                 "path": relative_path,
                 "role": target_hint.role.label(),
+            }),
+        );
+    }
+
+    fn record_controller_verifier_repair_invalid(&mut self, error: &str) {
+        let compact = compact_verifier_failure_text(error, 360);
+        if let Some(context) = self.verifier_repair_context.as_mut() {
+            context.repair_error = Some(compact.clone());
+        }
+        self.session.working_memory.note_error(compact.clone());
+        log_llm_event(
+            "agent.verifier_repair_pass.retryable_invalid",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "error": compact,
             }),
         );
     }
@@ -9282,8 +9403,17 @@ impl Agent {
             self.session.mode_state.active_plan_path.as_deref(),
             120,
         );
+        let allowed = effective_tool_policy
+            .allowed_tool_names_for_prompt()
+            .map(|tools| tools.join(", "))
+            .unwrap_or_else(|| "Read, Write, Edit".to_string());
+        let read_guidance = if policy.target_already_read {
+            " The target has already been read in this session, so do not call Read again."
+        } else {
+            ""
+        };
         Some(format!(
-            "[Artifact Directed Recovery] Missing role: {}. Target file: {target_display}. Allowed tools for this turn are Read, Write, and Edit on that exact target path only. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit.",
+            "[Artifact Directed Recovery] Missing role: {}. Target file: {target_display}. Allowed tools for this turn are {allowed} on that exact target path only.{read_guidance} Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit.",
             target.role.label()
         ))
     }
@@ -13117,19 +13247,45 @@ fn verifier_repair_context_from_failure(
     let repair_attempt = previous_matching_context
         .map(|context| context.repair_attempt.saturating_add(1))
         .unwrap_or(1);
-    let previous_assessment =
-        previous_matching_context.and_then(|context| context.assessment.clone());
+    let previous_repair_made_no_progress = previous_matching_context.is_some_and(|context| {
+        !context.applied_repair_intents.is_empty()
+            && matches!(
+                rerun_outcome,
+                Some(
+                    super::VerifierRepairRerunOutcome::SameFailureRemaining
+                        | super::VerifierRepairRerunOutcome::Worsened
+                )
+            )
+    });
+    let previous_assessment = if previous_repair_made_no_progress {
+        None
+    } else {
+        previous_matching_context.and_then(|context| context.assessment.clone())
+    };
     let previous_repair_target_hint = previous_matching_context
         .and_then(|context| context.repair_target_hint.clone())
         .or_else(|| {
             previous_assessment
                 .as_ref()
                 .and_then(|assessment| assessment.repair_target_hint.clone())
+        })
+        .or_else(|| {
+            previous_context.and_then(|context| {
+                if context.applied_repair_intents.is_empty() {
+                    None
+                } else {
+                    context.repair_target_hint.clone()
+                }
+            })
         });
-    let diagnostic_attempted = previous_matching_context
-        .is_some_and(|context| context.diagnostic_attempted || context.assessment.is_some());
-    let diagnostic_error =
-        previous_matching_context.and_then(|context| context.diagnostic_error.clone());
+    let diagnostic_attempted = !previous_repair_made_no_progress
+        && previous_matching_context
+            .is_some_and(|context| context.diagnostic_attempted || context.assessment.is_some());
+    let diagnostic_error = if previous_repair_made_no_progress {
+        None
+    } else {
+        previous_matching_context.and_then(|context| context.diagnostic_error.clone())
+    };
     let applied_repair_intents = previous_matching_context
         .map(|context| context.applied_repair_intents.clone())
         .unwrap_or_default();
@@ -13146,6 +13302,7 @@ fn verifier_repair_context_from_failure(
         diagnostic_attempted,
         diagnostic_unavailable: false,
         diagnostic_error,
+        repair_error: None,
         applied_repair_intents,
         target_line,
         error_kind,
@@ -14301,6 +14458,43 @@ fn verifier_repair_preferred_local_import_source(
     }
 }
 
+fn verifier_repair_stale_assertion_test_target(
+    context: &super::VerifierRepairContext,
+    selected_path: Option<&str>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    if context.failure_type != super::VerifierFailureType::AssertionFailure {
+        return None;
+    }
+    let previous_non_test_repair_was_unresolved = matches!(
+        context.rerun_outcome,
+        Some(
+            super::VerifierRepairRerunOutcome::SameFailureRemaining
+                | super::VerifierRepairRerunOutcome::Worsened
+                | super::VerifierRepairRerunOutcome::Improved
+        )
+    );
+    if !previous_non_test_repair_was_unresolved {
+        return None;
+    }
+    let previous_target = context.repair_target_hint.as_ref()?;
+    if previous_target.role == super::task_contract::ArtifactRole::Test {
+        return None;
+    }
+    if selected_path.is_some_and(|path| path != previous_target.path) {
+        return None;
+    }
+    let failure_target = context.target_hint.as_ref()?;
+    if failure_target.role != super::task_contract::ArtifactRole::Test
+        || failure_target.path == previous_target.path
+    {
+        return None;
+    }
+    Some(super::task_contract::RecoveryTargetHint {
+        reason: "same assertion failure remained after a non-test repair; inspect generated test setup or expectations".to_string(),
+        ..failure_target.clone()
+    })
+}
+
 fn model_assessment_to_verifier_repair_assessment(
     work_root: &Path,
     context: &super::VerifierRepairContext,
@@ -14362,6 +14556,12 @@ fn model_assessment_to_verifier_repair_assessment(
     if let Some(preferred) = verifier_repair_preferred_local_import_source(context) {
         repair_plan.retain(|hint| hint.path != preferred.path);
         repair_plan.insert(0, preferred);
+        repair_plan.truncate(3);
+    }
+    let selected_path = repair_plan.first().map(|hint| hint.path.as_str());
+    if let Some(test_target) = verifier_repair_stale_assertion_test_target(context, selected_path) {
+        repair_plan.retain(|hint| hint.path != test_target.path);
+        repair_plan.insert(0, test_target);
         repair_plan.truncate(3);
     }
     let needed_reads = repair_candidates
@@ -14432,6 +14632,9 @@ fn verifier_repair_target_candidate_from_output(
     let mut ordinal = 0usize;
 
     for line in output.lines() {
+        if verifier_output_line_is_non_fatal_warning(line) {
+            continue;
+        }
         for path in extract_path_like_tokens(line) {
             if let Some(candidate) =
                 verifier_repair_candidate_from_path(work_root, path, line, true, ordinal)
@@ -14541,6 +14744,17 @@ fn insert_verifier_repair_candidate(
     candidates.push(candidate);
 }
 
+fn verifier_output_line_is_non_fatal_warning(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    (lower.contains("warning") || lower.contains("warnings summary"))
+        && !lower.starts_with("error")
+        && !lower.starts_with("failed ")
+        && !lower.starts_with("e   ")
+        && !lower.starts_with("e ")
+        && !lower.starts_with("thread '")
+}
+
 fn verifier_line_number_for_path(line: &str, raw_path: &str) -> Option<usize> {
     let idx = line.find(raw_path)?;
     let rest = &line[idx + raw_path.len()..];
@@ -14564,6 +14778,9 @@ fn parse_leading_usize(input: &str) -> Option<usize> {
 }
 
 fn verifier_failure_error_kind(output: &str) -> Option<String> {
+    if let Some(failed_tests) = verifier_failed_tests_signature(output) {
+        return Some(failed_tests);
+    }
     for line in output.lines() {
         let trimmed = line.trim();
         let candidate = trimmed
@@ -14589,6 +14806,25 @@ fn verifier_failure_error_kind(output: &str) -> Option<String> {
                     || line.contains("Assertion"))
         })
         .map(|line| compact_verifier_failure_text(line, 160))
+}
+
+fn verifier_failed_tests_signature(output: &str) -> Option<String> {
+    let framework = crate::tools::test_output::detect_framework(output);
+    let failed_tests = crate::tools::test_output::parse_failed_tests(output, framework);
+    if failed_tests.raw_count == 0 || failed_tests.names.is_empty() {
+        return None;
+    }
+    let names = failed_tests
+        .names
+        .iter()
+        .take(8)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(compact_verifier_failure_text(
+        &format!("failed_tests:{}:{names}", failed_tests.raw_count),
+        220,
+    ))
 }
 
 fn verifier_failure_signature(
@@ -14686,16 +14922,6 @@ fn verifier_repair_effective_target_hint(
     None
 }
 
-fn verifier_repair_plan_has_pending_step(context: Option<&super::VerifierRepairContext>) -> bool {
-    context
-        .and_then(|context| {
-            context.assessment.as_ref().map(|assessment| {
-                context.applied_repair_intents.len() < assessment.repair_plan.len()
-            })
-        })
-        .unwrap_or(false)
-}
-
 fn verifier_repair_decision(
     pending: bool,
     context: Option<&super::VerifierRepairContext>,
@@ -14710,9 +14936,7 @@ fn verifier_repair_decision(
     if context.is_some_and(|context| context.diagnostic_unavailable) {
         return VerifierRepairDecision::DiagnosticUnavailable;
     }
-    if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count)
-        && !verifier_repair_plan_has_pending_step(context)
-    {
+    if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
         return VerifierRepairDecision::ReadyToVerify;
     }
     if context.is_some_and(|context| {
@@ -17720,6 +17944,7 @@ mod progress_tests {
             diagnostic_attempted: true,
             diagnostic_unavailable: false,
             diagnostic_error: None,
+            repair_error: None,
             applied_repair_intents: Vec::new(),
             target_line: None,
             error_kind: Some("TypeError".to_string()),
@@ -17779,7 +18004,9 @@ mod progress_tests {
             "TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nprint('hello')\n",
         )
         .unwrap();
-        let context = verifier_context_for("app/main.py");
+        let mut context = verifier_context_for("app/main.py");
+        context.repair_error =
+            Some("repair candidate cheap check failed for app/main.py: SyntaxError".to_string());
         let target = context
             .assessment
             .as_ref()
@@ -17799,6 +18026,8 @@ mod progress_tests {
         assert!(payload.contains("app/main.py"));
         assert!(payload.contains("sequentially in array order"));
         assert!(payload.contains("must match exactly once"));
+        assert!(payload.contains("previous_repair_error"));
+        assert!(payload.contains("SyntaxError"));
         assert!(!payload.contains("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
 
@@ -17812,6 +18041,27 @@ mod progress_tests {
         assert!(message.contains("surrounding class/function/section context"));
         assert!(message.contains("replace_all=true"));
         assert!(message.contains("exactly one corrected JSON object"));
+    }
+
+    #[test]
+    fn verifier_repair_pass_retry_message_guides_syntax_cheap_check_failures() {
+        let message = verifier_repair_pass_retry_message(
+            "repair candidate cheap check failed for app/main.py: SyntaxError: invalid syntax",
+        );
+
+        assert!(message.contains("cheap syntax check"));
+        assert!(message.contains("preserve indentation"));
+        assert!(message.contains("do not concatenate separate statements"));
+    }
+
+    #[test]
+    fn verifier_repair_pass_retry_message_rejects_noop_edits() {
+        let message = verifier_repair_pass_retry_message(
+            "repair intent old_string and new_string are identical",
+        );
+
+        assert!(message.contains("made no change"));
+        assert!(message.contains("new_string that is different"));
     }
 
     #[test]
@@ -18248,6 +18498,44 @@ mod progress_tests {
     }
 
     #[test]
+    fn verifier_diagnostic_prompt_mentions_test_state_isolation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let test = work_root.join("tests").join("test_health.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&app, "todos = {}\n").unwrap();
+        std::fs::write(
+            &test,
+            "def test_list_empty():\n    assert client.get('/items').json() == []\n",
+        )
+        .unwrap();
+        let context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            "tests/test_health.py:2: AssertionError\nE   assert [{'id': 1}] == []\n",
+            &[
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+            1,
+            None,
+        );
+
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build an API");
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(prompt.contains("state leaking across tests"), "{prompt}");
+        assert!(prompt.contains("test_bug"), "{prompt}");
+        assert!(prompt.contains("setup/teardown"), "{prompt}");
+    }
+
+    #[test]
     fn verifier_context_assertion_failure_waits_for_diagnostic_before_targeting() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
@@ -18297,6 +18585,86 @@ E   assert 201 == 422\n";
     }
 
     #[test]
+    fn verifier_context_refreshes_assessment_after_same_failure_remaining() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let test = work_root.join("tests").join("test_health.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&app, "todos = {}\n").unwrap();
+        std::fs::write(
+            &test,
+            "def test_list_empty():\n    assert client.get('/todos').json() == []\n",
+        )
+        .unwrap();
+        let output = "FAILED tests/test_health.py::test_list_empty\n\
+tests/test_health.py:2: AssertionError\n\
+E   assert [{'id': 1}] == []\n";
+        let mut previous = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            output,
+            &[
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+            1,
+            None,
+        );
+        let app_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "diagnostic selected implementation".to_string(),
+        };
+        previous.repair_target_hint = Some(app_hint.clone());
+        previous.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: previous.failure_type,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Implementation),
+            needed_reads: vec![app_hint.clone()],
+            repair_target_hint: Some(app_hint.clone()),
+            repair_plan: vec![app_hint],
+            summary: Some("assertion mismatch points at implementation".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+        previous.diagnostic_attempted = true;
+        previous
+            .applied_repair_intents
+            .push("applied-app-edit".to_string());
+
+        let next = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            output,
+            &[
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+            2,
+            Some(&previous),
+        );
+
+        assert_eq!(
+            next.rerun_outcome,
+            Some(super::super::VerifierRepairRerunOutcome::SameFailureRemaining)
+        );
+        assert!(next.assessment.is_none());
+        assert!(!next.diagnostic_attempted);
+        assert_eq!(next.assessment_attempts, 0);
+        assert_eq!(
+            next.repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("app/main.py")
+        );
+        assert_eq!(
+            next.applied_repair_intents,
+            vec!["applied-app-edit".to_string()]
+        );
+    }
+
+    #[test]
     fn verifier_repair_after_assessment_reads_implementation_target() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
@@ -18342,6 +18710,180 @@ E   assert 201 == 422\n";
             verifier_repair_decision(true, Some(&context), &[], &work_root, Some(1), 1),
             VerifierRepairDecision::NeedFreshRead(std::fs::canonicalize(app).unwrap())
         );
+    }
+
+    #[test]
+    fn verifier_diagnostic_stale_assertion_switches_to_test_target_after_failed_non_test_repair() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let test = work_root.join("tests").join("test_health.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&app, "todos = {}\n").unwrap();
+        std::fs::write(
+            &test,
+            "def test_list_empty():\n    assert client.get('/todos').json() == []\n",
+        )
+        .unwrap();
+        let mut context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            "tests/test_health.py:2: AssertionError\nE   assert [{'id': 1}] == []\n",
+            &[
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+            2,
+            None,
+        );
+        context.repair_target_hint = Some(super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "previous diagnostic selected implementation".to_string(),
+        });
+        context.rerun_outcome =
+            Some(super::super::VerifierRepairRerunOutcome::SameFailureRemaining);
+        context.failure_type = super::super::VerifierFailureType::AssertionFailure;
+        let parsed = super::parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"assertion_mismatch",
+                "probable_cause_role":"implementation",
+                "repair_plan":[
+                    {"target":"app/main.py","intent":"try another implementation tweak","confidence":0.95}
+                ],
+                "summary":"model still selected implementation"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment =
+            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+
+        assert_eq!(
+            assessment
+                .repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("tests/test_health.py")
+        );
+        assert_eq!(
+            assessment.repair_plan.first().map(|hint| hint.role),
+            Some(super::super::task_contract::ArtifactRole::Test)
+        );
+        assert!(
+            assessment
+                .repair_plan
+                .first()
+                .unwrap()
+                .reason
+                .contains("same assertion failure remained")
+        );
+    }
+
+    #[test]
+    fn verifier_diagnostic_stale_assertion_switches_to_test_target_after_improved_non_test_repair()
+    {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let test = work_root.join("tests").join("test_health.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&app, "todos = []\n").unwrap();
+        std::fs::write(&test, "def test_list_empty():\n    assert True\n").unwrap();
+        let mut context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            "FAILED tests/test_health.py::test_list_empty - AssertionError\n",
+            &[
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+            2,
+            None,
+        );
+        context.repair_target_hint = Some(super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "previous diagnostic selected implementation".to_string(),
+        });
+        context.rerun_outcome = Some(super::super::VerifierRepairRerunOutcome::Improved);
+        context.failure_type = super::super::VerifierFailureType::AssertionFailure;
+        let parsed = super::parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"assertion_mismatch",
+                "probable_cause_role":"implementation",
+                "repair_targets":[
+                    {"target":"app/main.py","reason":"try another implementation tweak","confidence":0.95}
+                ]
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment =
+            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+
+        assert_eq!(
+            assessment
+                .repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("tests/test_health.py")
+        );
+    }
+
+    #[test]
+    fn verifier_repair_target_ignores_warning_paths_when_failed_tests_exist() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let test = work_root.join("tests").join("test_health.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&app, "app = object()\n").unwrap();
+        std::fs::write(&test, "def test_a():\n    assert False\n").unwrap();
+
+        let target = super::verifier_repair_target_hint_from_output(
+            &work_root,
+            "FAILED tests/test_health.py::test_a - AssertionError\n\
+             app/main.py:37: DeprecationWarning: on_event is deprecated\n\
+             =========================== short test summary info ===========================\n\
+             FAILED tests/test_health.py::test_a - AssertionError\n",
+            &[
+                "app/main.py".to_string(),
+                "tests/test_health.py".to_string(),
+            ],
+        )
+        .expect("test failure should produce a target");
+
+        assert_eq!(target.role, super::super::task_contract::ArtifactRole::Test);
+        assert_eq!(target.path, "tests/test_health.py");
+    }
+
+    #[test]
+    fn verifier_failure_signature_uses_failed_test_names_not_assertion_values() {
+        let output_a = "FAILED tests/test_health.py::test_list_todos_empty - AssertionError\n\
+                        E   assert [{'id': 1, 'created_at': '2026-05-19'}] == []\n";
+        let output_b = "FAILED tests/test_health.py::test_list_todos_empty - AssertionError\n\
+                        E   assert [{'id': 4, 'created_at': '2026-05-20'}] == []\n";
+
+        let sig_a = super::verifier_failure_signature(
+            output_a,
+            Some("tests/test_health.py"),
+            None,
+            super::verifier_failure_error_kind(output_a).as_deref(),
+        );
+        let sig_b = super::verifier_failure_signature(
+            output_b,
+            Some("tests/test_health.py"),
+            None,
+            super::verifier_failure_error_kind(output_b).as_deref(),
+        );
+
+        assert_eq!(sig_a, sig_b);
+        assert!(sig_a.contains("failed_tests:1"));
+        assert!(!sig_a.contains("2026-05"));
     }
 
     #[test]
@@ -18815,7 +19357,7 @@ E   assert 201 == 422\n";
     }
 
     #[test]
-    fn verifier_repair_plan_continues_to_next_target_before_rerun() {
+    fn verifier_repair_reruns_verifier_after_each_controller_edit() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
         let app = work_root.join("app").join("main.py");
@@ -18852,7 +19394,7 @@ E   assert 201 == 422\n";
 
         assert_eq!(
             verifier_repair_decision(true, Some(&context), &[], &work_root, Some(2), 3),
-            VerifierRepairDecision::NeedFreshRead(std::fs::canonicalize(&test).unwrap())
+            VerifierRepairDecision::ReadyToVerify
         );
     }
 
@@ -19932,7 +20474,7 @@ export default function App() {
             Some("app/main.py")
         );
         assert!(context.failure_signature.contains("app/main.py:95"));
-        assert!(context.failure_signature.contains("AttributeError"));
+        assert!(context.failure_signature.contains("failed_tests:1"));
         assert_eq!(context.repair_attempt, 1);
     }
 
@@ -20331,7 +20873,7 @@ export default function App() {
         std::fs::create_dir_all(work_root.join("app")).unwrap();
         let target = work_root.join("app/main.py");
         std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
-        let policy = EffectiveToolPolicy::artifact_directed(target);
+        let policy = EffectiveToolPolicy::artifact_directed(target, false);
 
         for tool in ["Read", "Write", "Edit"] {
             assert!(
@@ -20354,7 +20896,7 @@ export default function App() {
         std::fs::create_dir_all(work_root.join("app")).unwrap();
         let target = work_root.join("app/main.py");
         std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
-        let policy = EffectiveToolPolicy::artifact_directed(target);
+        let policy = EffectiveToolPolicy::artifact_directed(target, false);
 
         let err = effective_tool_policy_error_for_call(
             &policy,
@@ -20376,6 +20918,32 @@ export default function App() {
         assert!(err.contains("target: app/main.py"), "got: {err}");
         assert!(!err.contains("secret-token"), "got: {err}");
         assert!(!err.contains("**/*"), "got: {err}");
+    }
+
+    #[test]
+    fn artifact_directed_policy_rejects_repeat_read_after_target_was_read() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
+        let policy = EffectiveToolPolicy::artifact_directed(target, true);
+
+        let err = effective_tool_policy_error_for_call(
+            &policy,
+            "Read",
+            &json!({"path":"app/main.py"}),
+            work_root,
+        )
+        .expect("expected repeated read to be rejected");
+
+        assert!(err.contains("tool policy rejected Read"), "got: {err}");
+        assert!(err.contains("allowed tools: Write, Edit"), "got: {err}");
+        assert!(
+            err.contains("reason: artifact_directed_recovery"),
+            "got: {err}"
+        );
+        assert!(err.contains("target: app/main.py"), "got: {err}");
     }
 
     #[test]
@@ -20493,7 +21061,7 @@ export default function App() {
         std::fs::create_dir_all(work_root.join("app")).unwrap();
         let target = work_root.join("app/main.py");
         std::fs::write(&target, "from fastapi import FastAPI\napp = FastAPI()\n").unwrap();
-        let policy = EffectiveToolPolicy::artifact_directed(target);
+        let policy = EffectiveToolPolicy::artifact_directed(target, false);
 
         let action = effective_tool_batch_action(
             &[

@@ -500,6 +500,7 @@ struct VerifierRepairContext {
     diagnostic_attempted: bool,
     diagnostic_unavailable: bool,
     diagnostic_error: Option<String>,
+    repair_error: Option<String>,
     applied_repair_intents: Vec<String>,
     target_line: Option<usize>,
     error_kind: Option<String>,
