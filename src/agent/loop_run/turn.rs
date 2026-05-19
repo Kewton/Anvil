@@ -12463,6 +12463,221 @@ mod tests {
             usize::MAX
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #634: 特化 fallback の experimental gate
+    // -----------------------------------------------------------------------
+
+    /// Issue #634: Config 述語の SSOT を担保。`specialized_fallback_enabled` は
+    /// flag そのもの、`specialized_template_fallback_enabled` は flag AND
+    /// `FullTemplate` のみで true。
+    #[test]
+    fn config_specialized_fallback_predicates_default_false() {
+        use crate::config::{Config, DeterministicFallbackMode};
+        let mut cfg = Config::default();
+        assert!(!cfg.specialized_fallback_enabled());
+        assert!(!cfg.specialized_template_fallback_enabled());
+
+        cfg.experimental_specialized_fallback = true;
+        assert!(cfg.specialized_fallback_enabled());
+        // FullTemplate でない限り template 系は false。
+        cfg.deterministic_fallback = DeterministicFallbackMode::MinimalPatch;
+        assert!(!cfg.specialized_template_fallback_enabled());
+
+        cfg.deterministic_fallback = DeterministicFallbackMode::FullTemplate;
+        assert!(cfg.specialized_template_fallback_enabled());
+
+        cfg.experimental_specialized_fallback = false;
+        assert!(!cfg.specialized_fallback_enabled());
+        assert!(!cfg.specialized_template_fallback_enabled());
+    }
+
+    /// Issue #634: `policy_allows_python_specialized_fallback` の AND 真偽値マトリクス。
+    /// `ModePolicy::allow_python_deterministic_fallback` と
+    /// `Config::specialized_template_fallback_enabled()` の双方が true のときのみ true。
+    #[test]
+    fn policy_allows_python_specialized_fallback_and_matrix() {
+        use crate::agent::loop_run::policy_allows_python_specialized_fallback;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+
+        let python_policy = WorkMode::Python.policy();
+        let ts_policy = WorkMode::TypeScriptUi.policy();
+        assert!(python_policy.allow_python_deterministic_fallback);
+        assert!(!ts_policy.allow_python_deterministic_fallback);
+
+        let off_cfg = Config::default();
+        let on_template_cfg = Config {
+            experimental_specialized_fallback: true,
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let on_minimal_cfg = Config {
+            experimental_specialized_fallback: true,
+            deterministic_fallback: DeterministicFallbackMode::MinimalPatch,
+            ..Config::default()
+        };
+
+        // policy true × cfg full-template+flag → true (発火可能)
+        assert!(policy_allows_python_specialized_fallback(
+            &python_policy,
+            &on_template_cfg
+        ));
+        // policy true × cfg off → false (flag off)
+        assert!(!policy_allows_python_specialized_fallback(
+            &python_policy,
+            &off_cfg
+        ));
+        // policy true × cfg flag-only (minimal) → false (FullTemplate ではない)
+        assert!(!policy_allows_python_specialized_fallback(
+            &python_policy,
+            &on_minimal_cfg
+        ));
+        // policy false × cfg on → false (policy が許可しない)
+        assert!(!policy_allows_python_specialized_fallback(
+            &ts_policy,
+            &on_template_cfg
+        ));
+        // policy false × cfg off → false
+        assert!(!policy_allows_python_specialized_fallback(
+            &ts_policy, &off_cfg
+        ));
+    }
+
+    /// Issue #634: flag off で FizzBuzz fallback (`maybe_materialize_python_test_fallback`)
+    /// は no-op (`Ok(None)`)。default Config は flag off であり、Workspace に
+    /// python ファイルがあっても発火しない。
+    #[test]
+    fn specialized_fallback_disabled_skips_python_test_fallback() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+        use crate::modes::plan_act::WorkMode;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        // Workspace に python ファイルを置く (fallback の前提条件は満たす)。
+        std::fs::write(temp.path().join("fizzbuzz.py"), "# stub\n").unwrap();
+        // Mode は Python だが flag off。
+        agent.session.mode_state.work_mode = WorkMode::Python;
+        let result = agent
+            .maybe_materialize_python_test_fallback()
+            .expect("should not error");
+        assert!(
+            result.is_none(),
+            "flag off で FizzBuzz fallback が発火してはならない"
+        );
+        // テストファイルも書かれていない。
+        assert!(!temp.path().join("test_fizzbuzz.py").exists());
+    }
+
+    /// Issue #634: flag on + FullTemplate + WorkMode::Python の組み合わせで
+    /// FizzBuzz fallback が発火する (既存挙動の reproducibility)。
+    #[test]
+    fn specialized_fallback_enabled_fires_python_test_fallback() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+
+        let cfg = Config {
+            experimental_specialized_fallback: true,
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, temp) = test_agent_with_config(cfg);
+        std::fs::write(temp.path().join("fizzbuzz.py"), "# stub\n").unwrap();
+        agent.session.mode_state.work_mode = WorkMode::Python;
+
+        let result = agent
+            .maybe_materialize_python_test_fallback()
+            .expect("should not error");
+        assert_eq!(
+            result.as_deref(),
+            Some("test_fizzbuzz.py"),
+            "flag on + FullTemplate + Python mode で fallback が発火するはず"
+        );
+        assert!(temp.path().join("test_fizzbuzz.py").exists());
+    }
+
+    /// Issue #634: flag off で `maybe_materialize_mode_deterministic_fallback`
+    /// の Python ブランチは発火しない。Docs ブランチは本 Issue で touch しないため
+    /// この test では検証しない。
+    #[test]
+    fn specialized_fallback_disabled_skips_mode_deterministic_python_branch() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+        use crate::session::store::ConversationMessage;
+
+        // 注: outer `allows_template_completion` gate もあるので、ここでは
+        // FullTemplate を有効にした上で flag off の場合に Python ブランチが
+        // 発火しないことを確認する。
+        let cfg = Config {
+            experimental_specialized_fallback: false,
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+        agent.session.mode_state.work_mode = WorkMode::Python;
+        // active request text は user message から取得される。
+        agent.session.messages.push(ConversationMessage::user(
+            "FastAPIでCRUD APIを作って".to_string(),
+        ));
+
+        let fired = agent.maybe_materialize_mode_deterministic_fallback(0);
+        assert!(!fired, "flag off で Python ブランチが発火してはならない");
+    }
+
+    /// Issue #634: flag off で `maybe_materialize_task_contract_fallback` は no-op。
+    #[test]
+    fn specialized_fallback_disabled_skips_task_contract_fallback() {
+        use super::super::task_contract::CompletionDecision;
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+        use crate::session::store::ConversationMessage;
+
+        let cfg = Config {
+            experimental_specialized_fallback: false,
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+        agent.session.mode_state.work_mode = WorkMode::Python;
+        agent.session.messages.push(ConversationMessage::user(
+            "FastAPIでCRUD APIを作って".to_string(),
+        ));
+
+        let decision = CompletionDecision::Continue {
+            missing: Vec::new(),
+        };
+        let fired = agent.maybe_materialize_task_contract_fallback(&decision, 0);
+        assert!(
+            !fired,
+            "flag off で task contract fallback が発火してはならない"
+        );
+    }
+
+    /// Issue #634: flag off で arithmetic patch
+    /// (`maybe_apply_deterministic_edit_after_format_error`) は no-op (`Ok(None)`)。
+    #[test]
+    fn specialized_fallback_disabled_skips_arithmetic_patch() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let cfg = Config {
+            experimental_specialized_fallback: false,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+        // tool-call format error をシミュレート (Truncated 文字列)。
+        let err = "Truncated tool call payload — recovery attempt needed.";
+        let result = agent
+            .maybe_apply_deterministic_edit_after_format_error(err)
+            .expect("should not error");
+        assert!(
+            result.is_none(),
+            "flag off で arithmetic patch が発火してはならない"
+        );
+    }
 }
 
 /// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
