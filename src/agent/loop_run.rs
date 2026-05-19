@@ -46,6 +46,7 @@ mod protocol;
 mod quality;
 pub(crate) mod quality_confirm;
 pub(crate) mod reminder;
+mod repair_job;
 pub mod slash_commands;
 mod spinner;
 mod success;
@@ -489,36 +490,20 @@ pub struct Agent {
     /// tool policy can choose a repair target without polluting the assistant
     /// history with long-lived diagnostic state.
     task_contract_verifier_repair_pending: bool,
-    /// Issue #625 / #627: turn-local diagnostic context for a failed task-contract
-    /// verifier. This keeps verifier output as data and lets the tool policy
-    /// focus the next repair turn on the most likely workspace repair file,
-    /// without adding framework-specific recovery rules.
-    verifier_repair_context: Option<VerifierRepairContext>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifierRepairContext {
-    command: String,
-    output_excerpt: String,
-    failure_type: VerifierFailureType,
-    target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
-    repair_target_hint: Option<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
-    changed_file_hints: Vec<crate::agent::loop_run::task_contract::RecoveryTargetHint>,
-    assessment: Option<VerifierRepairAssessment>,
-    assessment_attempts: usize,
-    diagnostic_attempted: bool,
-    diagnostic_unavailable: bool,
-    diagnostic_error: Option<String>,
-    repair_error: Option<String>,
-    applied_repair_intents: Vec<String>,
-    target_line: Option<usize>,
-    error_kind: Option<String>,
-    failure_signature: String,
-    failure_count: Option<usize>,
-    previous_failure_signature: Option<String>,
-    previous_failure_count: Option<usize>,
-    rerun_outcome: Option<VerifierRepairRerunOutcome>,
-    repair_attempt: usize,
+    /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
+    /// task-contract verifier. Renamed from `verifier_repair_context` to
+    /// `repair_job` and consolidated under `repair_job::RepairJob` so all
+    /// repair state machine field/decision logic lives in one module. This
+    /// keeps verifier output as data and lets the tool policy focus the
+    /// next repair turn on the most likely workspace repair file, without
+    /// adding framework-specific recovery rules.
+    repair_job: Option<repair_job::RepairJob>,
+    /// Issue #637: artifact recovery retry counter for the `RepairArtifact`
+    /// branch in `run_turn`. Replaces the turn-local
+    /// `verifier_repair_retries: &mut usize` plumbing. Bounded by
+    /// `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (= 3); not to be confused
+    /// with the wider `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT` (= 6).
+    repair_job_artifact_attempts: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,8 +717,19 @@ impl Agent {
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
             task_contract_verifier_repair_pending: false,
-            verifier_repair_context: None,
+            repair_job: None,
+            repair_job_artifact_attempts: 0,
         }
+    }
+
+    /// Issue #637: convenience helper for callers that previously consulted
+    /// `task_contract_verifier_repair_pending`. After the rename, the
+    /// presence of a `RepairJob` IS the pending signal; the legacy bool
+    /// is kept for now until call sites are migrated, but new code should
+    /// prefer this method.
+    #[allow(dead_code)] // forward-facing helper; call sites migrate off the legacy bool in a follow-up.
+    pub(super) fn is_verifier_repair_pending(&self) -> bool {
+        self.repair_job.is_some()
     }
 }
 
