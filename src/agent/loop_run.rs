@@ -47,6 +47,10 @@ mod quality;
 pub(crate) mod quality_confirm;
 pub(crate) mod reminder;
 mod repair_job;
+// Issue #635: deterministic RequiredBehaviorContract extractor. Module is
+// intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
+// in-crate consumer via `super::required_behavior::*`.
+mod required_behavior;
 pub mod slash_commands;
 mod spinner;
 mod success;
