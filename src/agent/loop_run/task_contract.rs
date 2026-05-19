@@ -1,4 +1,5 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
+use super::required_behavior::{self, RequiredBehaviorContract};
 use crate::tools::bash::BashCommandClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
@@ -29,12 +30,23 @@ pub(super) enum TaskIntent {
     Explain,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Issue #635: `Eq` is intentionally dropped because the new
+// `required_behavior` field carries an `f32` confidence. `PartialEq` is still
+// enough for `assert_eq!` and all existing tests; no in-tree code uses
+// `TaskContract` as a `HashMap` key. See design policy §3-3 / §7 #4 for the
+// trade-off analysis.
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct TaskContract {
     pub(super) intent: TaskIntent,
     pub(super) required_artifacts: Vec<ArtifactRole>,
     pub(super) optional_artifacts: Vec<ArtifactRole>,
     pub(super) verification_required: bool,
+    // Issue #635: deterministic behavior schema. Built once in
+    // `from_request` and stored alongside the existing artifact gates.
+    // Issue #636 will read this field; nothing in #635 mutates the
+    // existing `required_artifacts` gate based on it (non-destructive).
+    #[allow(dead_code)]
+    pub(super) required_behavior: RequiredBehaviorContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,11 +285,17 @@ impl TaskContract {
         optional.sort();
         optional.dedup();
 
+        // Issue #635: build the deterministic behavior schema. The
+        // existing `required_artifacts` gate above is the source of truth
+        // for the artifact list; behavior schema is stored alongside it
+        // as a future read-only input for #636.
+        let required_behavior = required_behavior::extract(request);
         Self {
             intent,
             required_artifacts: required,
             optional_artifacts: optional,
             verification_required: request_asks_for_verification(request, &lower),
+            required_behavior,
         }
     }
 
@@ -389,11 +407,27 @@ fn infer_intent(request: &str, lower: &str) -> TaskIntent {
     TaskIntent::Build
 }
 
-fn request_asks_for_code_work(request: &str, lower: &str) -> bool {
+/// Returns `true` when the request asks for any code-work signal
+/// (production / edit action over a recognizable code subject) **without**
+/// regard to support-artifact context.
+///
+/// This is the canonical input to [`infer_intent`]'s `Install` rule:
+///
+/// ```text
+/// Install ⇔ asks_for_setup && !request_asks_for_code_work
+/// ```
+///
+/// Equivalent to calling
+/// [`request_asks_for_implementation_artifact`] with all three support
+/// flags forced to `false`. Exposed at `pub(super)` so the behavior
+/// schema extractor (`required_behavior::extract_required_artifacts`)
+/// can use the *same* rule when deciding whether Setup is required —
+/// keeping the two paths in lockstep (CB-004).
+pub(super) fn request_asks_for_code_work(request: &str, lower: &str) -> bool {
     request_asks_for_implementation_artifact(request, lower, false, false, false)
 }
 
-fn request_asks_for_implementation_artifact(
+pub(super) fn request_asks_for_implementation_artifact(
     request: &str,
     lower: &str,
     asks_for_tests: bool,
@@ -453,7 +487,7 @@ fn request_asks_for_implementation_artifact(
     }
 }
 
-fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool {
+pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool {
     contains_any(
         lower,
         &[
@@ -471,7 +505,7 @@ fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool {
     )
 }
 
-fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
+pub(super) fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
     contains_any(
         lower,
         &[
@@ -488,7 +522,7 @@ fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
     )
 }
 
-fn request_asks_for_setup(request: &str, lower: &str) -> bool {
+pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
     contains_any(
         lower,
         &[
