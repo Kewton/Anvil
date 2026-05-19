@@ -10805,6 +10805,15 @@ impl Agent {
     }
 
     fn maybe_materialize_python_test_fallback(&mut self) -> Result<Option<String>, String> {
+        // Issue #634: 特化 fallback (FizzBuzz test scaffold) は experimental flag
+        // 配下に隔離。flag off の場合は早期 `Ok(None)` で抜け、呼出側の
+        // `python_test_retries >= 2` ブランチは MissingRepoEdits で break する。
+        if !super::policy_allows_python_specialized_fallback(
+            &self.session.mode_state.policy(),
+            &self.config,
+        ) {
+            return Ok(None);
+        }
         let request = self.active_request_text().unwrap_or_default();
         let mut python_files = std::fs::read_dir(&self.work_root)
             .map_err(|err| format!("failed to read {}: {err}", self.work_root.display()))?
@@ -10890,6 +10899,20 @@ if __name__ == "__main__":
         self.session
             .working_memory
             .note_touched_file(normalize_memory_path(&test_name, &self.work_root));
+        // Issue #634: emit dedicated event so receive-side (UAT / log grep) can
+        // assert that the specialized FizzBuzz test fallback is the path that
+        // produced the test artifact. Mirrors the other specialized events.
+        log_llm_event(
+            EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "work_mode": self.session.mode_state.work_mode.as_str(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "python_test_scaffold",
+                "target": &test_name,
+            }),
+        );
         Ok(Some(test_name))
     }
 
