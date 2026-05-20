@@ -360,17 +360,39 @@ fn normalize_consensus_text(text: &str) -> String {
     out
 }
 
-/// Issue #647 (SF1 V3.2): "verified public interface" detector that wires
-/// the existing turn-local `verifier_passed_in_loop` signal into the
-/// `SpecAuthorityInput`. This is the **real but bounded** detector
-/// referenced in S5-005: it never lies (the bit is observed, not stubbed)
-/// and it never reaches outside the current actor-loop iteration.
+/// Issue #647 (SF1 V3.2 + CB-011): "verified public interface" detector.
 ///
-/// Pure function — `hint` is the only input. Lives next to the consensus
-/// / explicit-spec detectors so a future Issue widening the history
-/// surface has a single growth point.
-pub(super) fn detect_verified_public_interface_from_history(hint: AgentHistoryHint) -> bool {
-    hint.verifier_passed_in_loop
+/// **Dead variant placeholder until artifact identity is bound** (CB-011).
+/// Earlier iterations returned `hint.verifier_passed_in_loop` directly, but
+/// the `verifier_passed_in_loop` bit is *turn-local* (S5-005) without being
+/// *artifact-specific*: it tells us "some artifact passed the verifier in
+/// this actor-loop iteration", not "the artifact implicated by the current
+/// `SemanticFailureReport` passed the verifier". The current
+/// `SemanticFailureReport` schema does not carry path / interface identifiers
+/// in `affected_cases` / `involved_artifacts` / `contract_conflict`, so there
+/// is no safe way to prove path overlap. Lifting authority on the bit alone
+/// would let an unrelated verifier success elevate `VerifiedPublicInterface`
+/// over `ImplementationContract` for a failure that has nothing to do with
+/// the verified artifact — a false-positive authority elevation.
+///
+/// We therefore keep the detector **constant `false`** in this Issue. The
+/// `VerifiedPublicInterface` variant remains in the [`SpecAuthority`] enum
+/// (DR1-005 forward-extensibility), the [`AgentHistoryHint`] struct keeps
+/// `verifier_passed_in_loop` as a placeholder field, and the production
+/// resolve path can never reach the variant. A future Issue that plumbs
+/// artifact identity (e.g. failing path / interface identifier on the
+/// `SemanticFailureReport`) into the hint will be the single growth point:
+/// it can add a `passed_artifact_paths: Vec<String>` field on
+/// `AgentHistoryHint`, take a `&SemanticFailureReport` here, and flip the
+/// return to `true` only when path overlap is provable.
+///
+/// Pure function — `hint` is currently unused but kept on the signature to
+/// preserve the call-site shape (`turn.rs::build_spec_authority_input_for_active_request`)
+/// and to make the future-extension growth point obvious.
+pub(super) fn detect_verified_public_interface_from_history(_hint: AgentHistoryHint) -> bool {
+    // CB-011: hold the line at `false` until artifact identity is bound.
+    // See doc comment for the full rationale.
+    false
 }
 
 /// Issue #647 (SF1): aggregated input passed by `turn.rs` to [`resolve`]
@@ -1356,12 +1378,68 @@ mod tests {
         assert!(!detect_verified_public_interface_from_history(hint));
     }
 
+    // CB-011: the prior `sf1_v3_verified_public_interface_true_when_verifier_passed_in_loop`
+    // test asserted the detector returned `true` when `verifier_passed_in_loop = true`.
+    // That route is now dead per CB-011 (artifact identity is not bound to the
+    // current `SemanticFailureReport`), so the new behavior is exercised by
+    // `cb011_verified_public_interface_detector_returns_false_when_artifact_identity_not_bound`
+    // immediately below — there is no replacement positive test for the
+    // pre-CB-011 path.
+
+    // -- CB-011: VerifiedPublicInterface must stay a dead variant
+    //    placeholder until artifact identity is bound to the failing
+    //    `SemanticFailureReport`. The detector must NOT lift authority
+    //    based on `verifier_passed_in_loop` alone (Issue #647 CB-011). --
+
     #[test]
-    fn sf1_v3_verified_public_interface_true_when_verifier_passed_in_loop() {
+    fn cb011_verified_public_interface_detector_returns_false_when_artifact_identity_not_bound() {
+        // CB-011: even when the turn-local verifier-passed bit is set,
+        // we have no signal proving the verified artifact matches the
+        // *current* failure (SemanticFailureReport does not carry
+        // path/interface identifiers). The detector must therefore
+        // remain a dead placeholder and never lift the bit on its own.
         let hint = AgentHistoryHint {
             verifier_passed_in_loop: true,
         };
-        assert!(detect_verified_public_interface_from_history(hint));
+        assert!(
+            !detect_verified_public_interface_from_history(hint),
+            "verifier_passed_in_loop alone must not light VerifiedPublicInterface (CB-011)"
+        );
+    }
+
+    #[test]
+    fn cb011_resolve_does_not_elect_verified_public_interface_in_production() {
+        // CB-011 integration: even if the production callsite passes a
+        // hint where `verifier_passed_in_loop = true`, the detector
+        // returns `false`, so the resulting `SpecAuthorityInput` has
+        // `has_verified_public_interface = false` and `resolve` cannot
+        // elect `VerifiedPublicInterface`. We exercise the detector +
+        // resolve chain directly here (the production builder lives in
+        // `turn.rs`; the parallel integration test lives there too).
+        let hint = AgentHistoryHint {
+            verifier_passed_in_loop: true,
+        };
+        let has_verified_public_interface = detect_verified_public_interface_from_history(hint);
+        assert!(
+            !has_verified_public_interface,
+            "production hint with verifier_passed_in_loop=true must NOT light the flag"
+        );
+        let input = SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: false,
+            has_verified_public_interface,
+            is_newly_generated_task: false,
+            consensus: None,
+        };
+        // With no other signal lit, `resolve` falls through to the
+        // ImplementationContract default — VerifiedPublicInterface is
+        // unreachable in production.
+        assert_ne!(
+            resolve(&input),
+            SpecAuthority::VerifiedPublicInterface,
+            "VerifiedPublicInterface must stay a dead variant in production (CB-011)"
+        );
+        assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
     }
 
     // -- Test detectors -- //

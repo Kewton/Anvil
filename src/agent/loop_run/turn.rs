@@ -21493,7 +21493,15 @@ E   assert [{'id': 1}] == []\n";
     /// rich inputs (explicit-spec request, a real
     /// `SemanticFailureReport` with two-vs-one consensus, and a verifier
     /// history hint), the resulting `SpecAuthorityInput` is **not**
-    /// all-neutral. At least one of the three V3 detectors must light up.
+    /// all-neutral. At least one of the V3 detectors must light up.
+    ///
+    /// CB-011 (Issue #647 iteration-4): the verifier-history detector is
+    /// pinned to `false` until artifact identity is bound to the failing
+    /// `SemanticFailureReport`. The two remaining V3 detectors
+    /// (`has_user_request_match` + `consensus`) must still light up on
+    /// this fixture so the production builder stays non-trivial; the
+    /// verifier flag is now asserted to stay `false` even when
+    /// `verifier_passed_in_loop = true` (CB-011).
     #[test]
     fn sf1_v3_production_input_is_not_all_false() {
         let request = "The API must return 404 when missing. The body must accept JSON.";
@@ -21524,16 +21532,16 @@ E   assert [{'id': 1}] == []\n";
             Some(&report),
             hint,
         );
-        // Pre-V3 production hard-coded all three to neutral. V3 must
-        // light at least one detector when real inputs exist; here all
-        // three light up.
+        // V3 must light at least one detector when real inputs exist.
+        // Post-CB-011: the user-request and consensus detectors light up,
+        // while the verifier-history detector stays a dead placeholder.
         assert!(
             input.has_user_request_match,
             "explicit-spec request must light has_user_request_match"
         );
         assert!(
-            input.has_verified_public_interface,
-            "verifier_passed_in_loop=true must light has_verified_public_interface"
+            !input.has_verified_public_interface,
+            "CB-011: verifier_passed_in_loop alone must NOT light has_verified_public_interface (dead variant placeholder)"
         );
         assert!(
             input.consensus.is_some(),
