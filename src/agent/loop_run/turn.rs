@@ -9964,6 +9964,14 @@ impl Agent {
         else {
             return;
         };
+        // Issue #646: record every successful Write/Edit observation so the
+        // ownership classifier can promote in-scope existing artifacts to
+        // `Owned`. Recording here (before the scaffold-delta gate) is
+        // deliberate — the tool call already succeeded, and the scaffold-
+        // delta gate is about completion-evidence semantics, not about
+        // whether the path was touched.
+        self.session_edited_relative_paths
+            .insert(relative_path.clone());
         let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(
             &relative_path,
         ));
@@ -10087,15 +10095,38 @@ impl Agent {
         &self,
         contract: &super::task_contract::TaskContract,
     ) -> Vec<super::task_contract::ArtifactState> {
+        let scope = self.current_workspace_scope();
         let mut states = Vec::new();
         for role in &contract.required_artifacts {
             if let Some(path) = self.scaffold_candidate_for_missing_role(*role) {
                 states.push(super::task_contract::ArtifactState::scaffold(*role, path));
             }
-            if let Some(path) = existing_workspace_candidate_for_role(&self.work_root, *role)
-                && self.repo_edit_has_post_scaffold_delta(&path)
+            // Issue #646: an existing workspace artifact only enters as
+            // `ExistsButUnverified` when ownership classification returns
+            // `Owned`. Pre-existing nested-subtree artifacts the active
+            // task did not produce stay out of the artifact-state vector
+            // and therefore cannot satisfy `artifact_ready_for_verification`.
+            if let Some(path) =
+                existing_workspace_candidate_for_role_in_scope(&self.work_root, *role, &scope)
             {
-                states.push(super::task_contract::ArtifactState::exists(*role, path));
+                let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
+                let edited_this_session = self.session_edited_relative_paths.contains(&path);
+                let ownership = super::artifact_ownership::classify_ownership(
+                    super::artifact_ownership::OwnershipInputs {
+                        work_root: &self.work_root,
+                        relative_path: &path,
+                        scope: &scope,
+                        edited_this_session,
+                        scaffold_changed,
+                        verifier_passed_in_scope: false,
+                    },
+                );
+                if matches!(
+                    ownership,
+                    super::artifact_ownership::ArtifactOwnership::Owned
+                ) {
+                    states.push(super::task_contract::ArtifactState::exists(*role, path));
+                }
             }
         }
         for evidence in self.task_contract_evidence_set_this_turn.iter() {
@@ -10109,19 +10140,47 @@ impl Agent {
         states
     }
 
+    /// Issue #646: build the active `TaskWorkspaceScope` for the current
+    /// task. Pure projection of `work_root` + the active user request; no
+    /// filesystem mutation. Called from `task_contract_artifact_states` and
+    /// `task_contract_recovery_target`; not cached because the bounded
+    /// shallow read of `work_root` is cheap and the scope is recomputed
+    /// only a handful of times per turn.
+    fn current_workspace_scope(&self) -> super::task_workspace_scope::TaskWorkspaceScope {
+        let request = self.active_request_text().unwrap_or_default();
+        super::task_workspace_scope::TaskWorkspaceScope::detect(&self.work_root, &request)
+    }
+
     fn task_contract_repair_state(
         &self,
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::VerifierRepairState {
-        match verifier_repair_decision(
+        let decision = verifier_repair_decision(
             self.task_contract_verifier_repair_pending,
             self.repair_job.as_ref(),
             &self.session.messages,
             &self.work_root,
             repair_edit_count,
             repo_edit_calls_made_this_turn,
-        ) {
+        );
+        // Issue #646 (MissingVerifierJob safeguard): when there is no real
+        // `RepairJob` (i.e. NoVerifier branch produced `pending=true` without
+        // a failure), `verifier_repair_decision` falls back to the latest
+        // successful `Read` path. A pre-session exploration `Read` of an
+        // out-of-scope subtree would otherwise drive the repair loop into
+        // that subtree. Downgrading to `None` lets `plan_artifact_recovery`
+        // fall through to the artifact-missing branch, which forces an
+        // in-scope edit before any verifier retry.
+        if self.repair_job.is_none()
+            && let Some(target) = decision_target_path(&decision)
+        {
+            let scope = self.current_workspace_scope();
+            if !target_path_in_scope(target, &self.work_root, &scope) {
+                return super::task_contract::VerifierRepairState::None;
+            }
+        }
+        match decision {
             VerifierRepairDecision::NeedDiagnostic
             | VerifierRepairDecision::NeedTargetDiscovery
             | VerifierRepairDecision::NeedFreshRead(_)
@@ -10177,7 +10236,13 @@ impl Agent {
                     .to_string(),
             });
         }
-        if let Some(path) = existing_workspace_candidate_for_role(&self.work_root, role) {
+        // Issue #646: only suggest an existing workspace artifact when it
+        // is inside the active scope. Out-of-scope nested-subtree files are
+        // never a legitimate recovery target.
+        let scope = self.current_workspace_scope();
+        if let Some(path) =
+            existing_workspace_candidate_for_role_in_scope(&self.work_root, role, &scope)
+        {
             return Some(super::task_contract::RecoveryTargetHint {
                 role,
                 path,
@@ -13724,6 +13789,12 @@ fn workspace_relative_path_for_tool_arg(work_root: &Path, raw_path: &str) -> Opt
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
+/// Legacy un-scoped lookup kept for unit-test fixtures that exercise the
+/// `scaffold_candidate_priority` ordering independently of scope detection.
+/// Production code MUST use [`existing_workspace_candidate_for_role_in_scope`]
+/// so out-of-scope nested-subtree files cannot leak into completion evidence
+/// (Issue #646).
+#[cfg(test)]
 fn existing_workspace_candidate_for_role(
     work_root: &Path,
     role: super::task_contract::ArtifactRole,
@@ -13736,6 +13807,73 @@ fn existing_workspace_candidate_for_role(
             )
             .is_some_and(|candidate| candidate == role)
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
+    });
+    candidates
+        .first()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Issue #646: project the workspace-target half of a [`VerifierRepairDecision`]
+/// so the MissingVerifierJob safeguard can re-validate the scope when no real
+/// [`RepairJob`] is attached. Returns `None` for decisions that do not carry
+/// a path (NoRepair / NeedDiagnostic / NeedTargetDiscovery / ReadyToVerify /
+/// DiagnosticUnavailable).
+fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
+    match decision {
+        VerifierRepairDecision::NeedFreshRead(path)
+        | VerifierRepairDecision::NeedWrite(path)
+        | VerifierRepairDecision::NeedEdit(path) => Some(path.as_path()),
+        VerifierRepairDecision::NoRepair
+        | VerifierRepairDecision::NeedDiagnostic
+        | VerifierRepairDecision::NeedTargetDiscovery
+        | VerifierRepairDecision::DiagnosticUnavailable
+        | VerifierRepairDecision::ReadyToVerify => None,
+    }
+}
+
+/// Issue #646: confirm that an absolute repair target lies inside the active
+/// workspace scope. The path is normalized against `work_root` and the
+/// resulting relative form is handed to [`TaskWorkspaceScope::contains`].
+/// Targets that fail to strip the prefix (escape via canonical/symlink) are
+/// treated as out-of-scope.
+fn target_path_in_scope(
+    target: &Path,
+    work_root: &Path,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+) -> bool {
+    let root_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let Ok(relative) = target_canon.strip_prefix(&root_canon) else {
+        return false;
+    };
+    scope.contains(&relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Issue #646: scope-aware variant of [`existing_workspace_candidate_for_role`].
+///
+/// Filters workspace files through `scope.contains(...)` before priority
+/// sorting so candidates inside out-of-scope nested subtrees (the
+/// fresh-session-parent-directory bug case) are never surfaced. Used by
+/// `task_contract_artifact_states` and `task_contract_recovery_target`;
+/// the legacy un-scoped function is preserved for unit-test fixtures that
+/// exercise the priority logic independently.
+pub(super) fn existing_workspace_candidate_for_role_in_scope(
+    work_root: &Path,
+    role: super::task_contract::ArtifactRole,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+) -> Option<String> {
+    let mut candidates = meaningful_workspace_files(work_root, 64)?
+        .into_iter()
+        .filter(|path| {
+            artifact_role_from_repo_edit_category(
+                super::completion_evidence::classify_repo_edit_path(path),
+            )
+            .is_some_and(|candidate| candidate == role)
+        })
+        .filter(|path| scope.contains(&path.to_string_lossy().replace('\\', "/")))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|path| {
         scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
@@ -17498,12 +17636,12 @@ mod progress_tests {
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         effective_tool_batch_action, effective_tool_policy_error_for_call,
-        existing_workspace_candidate_for_role, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_guidance_note_for_policy, focused_edit_history,
+        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
@@ -20870,6 +21008,111 @@ export default function App() {
         .unwrap();
 
         assert_eq!(target, "app/main.py");
+    }
+
+    #[test]
+    fn scope_aware_lookup_filters_out_of_scope_nested_subtree_candidates() {
+        // Issue #646 regression: fresh-session parent-directory layout with
+        // a prior project at `0517_003/*`. The scope-aware lookup must
+        // refuse those out-of-scope candidates even though the legacy
+        // `existing_workspace_candidate_for_role` happily returns them.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        std::fs::write(
+            work_root.join("0517_003/app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("0517_003/tests/test_main.py"),
+            "def test_health(): pass\n",
+        )
+        .unwrap();
+        std::fs::write(work_root.join("0517_003/README.md"), "# Old\n").unwrap();
+
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。",
+        );
+        // Pre-existing subtree is detected, no explicit mention → ambiguous parent.
+        let target = existing_workspace_candidate_for_role_in_scope(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+            &scope,
+        );
+        assert!(
+            target.is_none(),
+            "expected no in-scope implementation candidate, got {target:?}"
+        );
+
+        // Legacy lookup still returns the old subtree candidate — the safety
+        // belongs to the scope filter, not the meaningful-files walk.
+        let legacy_target = existing_workspace_candidate_for_role(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+        );
+        assert_eq!(legacy_target.as_deref(), Some("0517_003/app/main.py"));
+    }
+
+    #[test]
+    fn missing_verifier_safeguard_rejects_out_of_scope_repair_target() {
+        // Issue #646: when verifier_repair_decision falls back to the latest
+        // successful `Read`, an OOS path must NOT be accepted as the
+        // MissingVerifierJob repair target. `target_path_in_scope` is the
+        // gate consulted by `task_contract_repair_state` for this case.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        // `tests/` marker dir is what makes the prior subtree project-like.
+        std::fs::write(work_root.join("0517_003/tests/test_main.py"), "").unwrap();
+        std::fs::write(
+            work_root.join("0517_003/app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでcrudのAPIを開発してください",
+        );
+        // Sanity: scope must classify the prior subtree as out-of-scope
+        // before any safeguard check is meaningful.
+        assert!(!scope.contains("0517_003/app/main.py"));
+
+        let oos_target = work_root.join("0517_003/app/main.py");
+        assert!(!super::target_path_in_scope(&oos_target, work_root, &scope));
+
+        // A new, in-scope target at the parent root is allowed.
+        let in_scope_target = work_root.join("app/main.py");
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(&in_scope_target, "").unwrap();
+        assert!(super::target_path_in_scope(
+            &in_scope_target,
+            work_root,
+            &scope
+        ));
+    }
+
+    #[test]
+    fn scope_aware_lookup_admits_explicit_subtree_candidates() {
+        // Issue #646: user explicitly named the existing subtree, so its
+        // artifacts ARE in scope and ARE Owned.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::write(work_root.join("0517_003/app/main.py"), "").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "0517_003 配下を修正してください",
+        );
+        let target = existing_workspace_candidate_for_role_in_scope(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+            &scope,
+        );
+        assert_eq!(target.as_deref(), Some("0517_003/app/main.py"));
     }
 
     #[test]

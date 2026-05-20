@@ -937,6 +937,13 @@ mod tests {
 
     #[test]
     fn controller_runs_verifier_when_existing_candidates_cover_required_artifacts() {
+        // Issue #646: `ArtifactState::exists` admission is the planner's
+        // ownership signal — the upstream `task_contract_artifact_states`
+        // is now responsible for refusing to admit out-of-scope candidates.
+        // Once the planner sees three Owned `exists` artifacts it must still
+        // promote them to verification, matching the legacy behaviour for
+        // legitimately-owned existing files (e.g. user-explicit subtree,
+        // scaffold + post-scaffold delta).
         let contract = TaskContract::from_request(
             "ToDo管理のバックエンドをFastAPIで開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
         );
@@ -958,6 +965,36 @@ mod tests {
             }),
             ArtifactRecoveryAction::RunVerifier
         );
+    }
+
+    #[test]
+    fn controller_continues_when_no_artifact_states_are_present() {
+        // Issue #646 regression: when `task_contract_artifact_states`
+        // refused to admit any out-of-scope existing candidate, the
+        // planner must continue toward the missing roles instead of
+        // jumping into verifier execution / repair on phantom evidence.
+        let contract = TaskContract::from_request(
+            "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts: Vec<ArtifactState> = Vec::new();
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+        });
+        match action {
+            ArtifactRecoveryAction::Continue { missing, .. } => {
+                assert!(missing.contains(&ArtifactRole::Implementation));
+                assert!(missing.contains(&ArtifactRole::Test));
+                assert!(missing.contains(&ArtifactRole::UsageDocs));
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
     }
 
     #[test]

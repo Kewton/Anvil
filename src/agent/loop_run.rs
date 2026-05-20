@@ -25,6 +25,10 @@ use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
+// Issue #646: artifact ownership classification. Module is intentionally
+// *not* re-exported (DR3-001) — `turn.rs` and `task_contract.rs` are the
+// only in-crate consumers via `super::artifact_ownership::*`.
+mod artifact_ownership;
 pub(crate) mod auto_promote;
 mod auto_test;
 pub mod commands;
@@ -60,6 +64,10 @@ mod spinner;
 mod success;
 mod summary;
 mod task_contract;
+// Issue #646: task workspace scope detection. Module is intentionally
+// *not* re-exported (DR3-001) — `turn.rs` is the only in-crate consumer
+// via `super::task_workspace_scope::*`.
+mod task_workspace_scope;
 mod tester;
 mod turn;
 pub(crate) mod verifier_skill;
@@ -527,6 +535,18 @@ pub struct Agent {
     /// the behavior-coverage decision is evaluated within the same turn
     /// the excerpts were observed.
     task_contract_excerpts: task_contract::ArtifactExcerpts,
+    /// Issue #646: session-scoped set of workspace-relative paths that were
+    /// successfully written or edited during the current `Agent` lifetime
+    /// (not just the current turn). Consumed by
+    /// `artifact_ownership::classify_ownership` to gate which existing files
+    /// the active task is allowed to claim as completion evidence.
+    ///
+    /// **Lives on `Agent`, not `SessionSnapshot`** — fresh sessions deliberately
+    /// start empty so existing filesystem artifacts cannot auto-promote
+    /// themselves (Issue #646 §修正方針 2 `Owned` rules + §追加で考慮するケース
+    /// "resumed session"). A resumed session also begins with an empty set
+    /// and must re-establish ownership through fresh edits / scope mention.
+    session_edited_relative_paths: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,6 +764,7 @@ impl Agent {
             repair_job_artifact_attempts: 0,
             repair_failure_snapshot: None,
             task_contract_excerpts: task_contract::ArtifactExcerpts::new(),
+            session_edited_relative_paths: std::collections::HashSet::new(),
         }
     }
 
