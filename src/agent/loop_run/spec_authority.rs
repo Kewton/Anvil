@@ -227,24 +227,62 @@ const EXPLICIT_SPEC_MIN_DISTINCT_HITS: usize = 2;
 
 /// Issue #647 (SF1 V3.1): cheap heuristic that classifies an
 /// `active_request` as "carries an explicit specification" iff at least
-/// `EXPLICIT_SPEC_MIN_DISTINCT_HITS` distinct keywords from
-/// `EXPLICIT_SPEC_KEYWORDS` appear in the request.
+/// `EXPLICIT_SPEC_MIN_DISTINCT_HITS` distinct, **non-overlapping** keyword
+/// spans from `EXPLICIT_SPEC_KEYWORDS` appear in the request.
 ///
 /// Pure function — no I/O, no LLM dependency. Matching is case-insensitive
 /// on the ascii side; the Japanese keywords are matched verbatim (Japanese
 /// has no case fold to apply).
+///
+/// CB-010 (Issue #647 V3 iteration-4): the keyword table intentionally
+/// contains overlapping prefixes ("must " vs. "must return", "should "
+/// vs. "should return", …) so a single phrase like "must return 404" used
+/// to be counted twice and crossed the 2-hit threshold on its own — a
+/// false positive. We now collect every match position, sort by start,
+/// and greedily drop spans whose `[start, end)` overlaps the previously
+/// accepted span. The resulting count is the number of **distinct
+/// linguistic occurrences**, not the number of matching keywords.
 pub(super) fn detect_explicit_spec_in_user_request(active_request: &str) -> bool {
     if active_request.trim().is_empty() {
         return false;
     }
     let lowered = active_request.to_ascii_lowercase();
-    let mut hits = 0usize;
+
+    // CB-010: gather every keyword match as a byte-span and dedup
+    // overlapping spans so a single phrase only counts once.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     for keyword in EXPLICIT_SPEC_KEYWORDS {
-        // Ascii keywords are stored in lower-case; Japanese keywords are
-        // ascii-only-insensitive (they have no ascii letters anyway).
-        if lowered.contains(keyword) {
-            hits += 1;
-            if hits >= EXPLICIT_SPEC_MIN_DISTINCT_HITS {
+        let kw_len = keyword.len();
+        if kw_len == 0 {
+            continue;
+        }
+        // Walk non-overlapping occurrences of this single keyword.
+        // We advance by `kw_len` (safe char-boundary for ascii + multibyte
+        // because keywords are stored as whole UTF-8 sequences). Cross-
+        // keyword overlap is still caught by the span-dedup step below.
+        let mut search_from = 0;
+        while let Some(rel) = lowered[search_from..].find(keyword) {
+            let start = search_from + rel;
+            let end = start + kw_len;
+            spans.push((start, end));
+            search_from = end;
+        }
+    }
+
+    if spans.len() < EXPLICIT_SPEC_MIN_DISTINCT_HITS {
+        return false;
+    }
+
+    // Greedy non-overlapping span count: sort by start, accept a span
+    // only if its start is at or beyond the previously accepted end.
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut deduped_hits = 0usize;
+    let mut last_end = 0usize;
+    for (start, end) in spans {
+        if start >= last_end {
+            deduped_hits += 1;
+            last_end = end;
+            if deduped_hits >= EXPLICIT_SPEC_MIN_DISTINCT_HITS {
                 return true;
             }
         }
@@ -1212,6 +1250,47 @@ mod tests {
         // Two distinct Japanese prescriptive keywords are enough.
         let request = "本仕様の API は必ず 404 を返すこと。";
         assert!(detect_explicit_spec_in_user_request(request));
+    }
+
+    // -- Issue #647 CB-010: span-dedup against overlapping keyword hits -- //
+
+    #[test]
+    fn cb010_single_must_return_does_not_trigger_user_request_match() {
+        // Regression: "must " (with trailing space) and "must return" both
+        // appear in EXPLICIT_SPEC_KEYWORDS. Before span dedup, the single
+        // phrase "must return 404" produced **two** hits and crossed the
+        // 2-hit threshold — a false positive. After dedup the overlapping
+        // spans collapse to one and the detector returns `false`.
+        let request = "the endpoint must return 404 when item not found";
+        assert!(!detect_explicit_spec_in_user_request(request));
+    }
+
+    #[test]
+    fn cb010_two_distinct_keywords_still_trigger_match() {
+        // Regression guard for CB-010 fix: two **non-overlapping** keyword
+        // spans ("must " and "specification") must still cross the threshold.
+        let request = "must return 404; this is the specification";
+        assert!(detect_explicit_spec_in_user_request(request));
+    }
+
+    #[test]
+    fn cb010_overlapping_must_and_must_return_dedup_to_one_hit() {
+        // Pure span-dedup check: only "must " and "must return" overlap on
+        // a single phrase, so the detector must see exactly one distinct
+        // span and return `false`.
+        let request = "must return 200";
+        assert!(!detect_explicit_spec_in_user_request(request));
+    }
+
+    #[test]
+    fn cb010_japanese_keyword_dedup() {
+        // Japanese: "返すこと" is a substring of "返さなければならない"-style
+        // phrases is not the case here, but "返すこと" alone, plus the
+        // overlapping case where "仕様" appears only once, must not be
+        // double-counted. A single Japanese phrase containing only
+        // "返すこと" must NOT trigger the detector.
+        let request = "API は 404 を返すこと。";
+        assert!(!detect_explicit_spec_in_user_request(request));
     }
 
     // -- SF1 V3.3: consensus heuristic -- //
