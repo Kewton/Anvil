@@ -463,6 +463,170 @@ pub(super) fn task_contract_repair_state(
     }
 }
 
+// ---- Issue #647 (Phase E): cluster-based sequential repair helpers ---- //
+//
+// Phase E keeps the existing `repair_job: Option<RepairJob>` slot shape
+// (設計判断 #5, S3-010): instead of growing a `Vec<RepairJob>` queue, the
+// slot is reused for each cluster. Failed `(cluster_id, role)` pairs are
+// recorded on `RepairJob.exhausted_attempts` so the same cluster is never
+// re-attacked under the same role and so the bookkeeping survives the
+// slot reuse.
+//
+// The three helpers below are intentionally pure functions over
+// `&mut RepairJob` / `&RepairJob` / immutable cluster ids:
+//
+//   - `advance_to_next_cluster` mutates the slot.
+//   - `should_re_diagnostic` inspects the slot.
+//   - `rerun_outcome_with_cluster` wraps the legacy
+//     `verifier_repair_rerun_outcome` result without modifying it
+//     (S3-014: failure_count is still the SSOT for outcome).
+//
+// `Vec<(FailureClusterKey, RepairRole)>` is a tiny ledger (~64 bytes per
+// entry) so linear `contains` is fine — total entries are bounded by
+// `failure_clusters.len() * artifact roles in scope`.
+
+/// Issue #647 (Phase E.1): advance the `repair_job.semantic_plan` slot to
+/// the next unattempted cluster from `report.failure_clusters`.
+///
+/// Phase E behaviour (設計判断 #5 / S3-010):
+///
+/// 1. Push the current plan's `(failure_cluster_id, preferred_repair_role)`
+///    onto `exhausted_attempts` (idempotent — duplicates are skipped so
+///    repeated calls from `turn.rs` cannot grow the ledger unboundedly).
+/// 2. Walk `report.failure_clusters` in document order and pick the first
+///    cluster whose `(cluster_id, preferred_repair_role)` is **not** in
+///    `exhausted_attempts`.
+/// 3. If found, replace `semantic_plan` with a new `SemanticRepairPlan`
+///    targeting that cluster and return `true`.
+/// 4. If no cluster is available, leave `semantic_plan = None` and return
+///    `false` (caller falls back to re-diagnostic or task failure).
+///
+/// `preferred_repair_role` and `repair_hypothesis` are inherited from the
+/// report — Phase E does not re-pick a per-cluster role (the diagnostic
+/// LLM emits one role per report). `spec_authority` is re-selected via
+/// `select_authority` so the same Phase-D fallback set
+/// (`ImplementationContract` + `LlmGeneratedTest`) governs the new plan
+/// deterministically.
+///
+/// Returns `false` (and clears `semantic_plan`) when the report has no
+/// remaining clusters; callers MUST treat that as "no more clusters to
+/// attack in this report" and switch back to `re_diagnostic`.
+#[allow(dead_code)] // wired into turn.rs by a subsequent task; exercised here via unit tests.
+pub(super) fn advance_to_next_cluster(
+    repair_job: &mut RepairJob,
+    report: &SemanticFailureReport,
+) -> bool {
+    // 1. Record the current plan in the exhausted_attempts ledger before
+    //    we drop it, so slot reuse preserves history (S3-010).
+    if let Some(current_plan) = repair_job.semantic_plan.as_ref() {
+        let entry = (
+            current_plan.failure_cluster_id.clone(),
+            current_plan.preferred_repair_role,
+        );
+        if !repair_job.exhausted_attempts.contains(&entry) {
+            repair_job.exhausted_attempts.push(entry);
+        }
+    }
+
+    // 2. Find the next cluster in document order that is NOT exhausted
+    //    under the report's preferred_repair_role.
+    let role = report.preferred_repair_role;
+    let next_cluster = report.failure_clusters.iter().find(|cluster| {
+        !repair_job
+            .exhausted_attempts
+            .contains(&(cluster.cluster_key.clone(), role))
+    });
+
+    let Some(next_cluster) = next_cluster else {
+        // 3. No more clusters — clear the slot and signal no progress.
+        repair_job.semantic_plan = None;
+        return false;
+    };
+
+    // 4. Re-pick the spec authority for the new cluster using the same
+    //    Phase-D fallback candidate set so the deterministic behaviour is
+    //    preserved across slot reuse.
+    let candidates = [
+        SpecAuthority::ImplementationContract,
+        SpecAuthority::LlmGeneratedTest,
+    ];
+    let Some(spec_authority) = super::spec_authority::select_authority(&candidates, None) else {
+        // select_authority on a non-empty filtered candidate list cannot
+        // return None today, but if a future variant change makes it
+        // possible, fail closed (no plan).
+        repair_job.semantic_plan = None;
+        return false;
+    };
+
+    repair_job.semantic_plan = Some(SemanticRepairPlan {
+        semantic_cause: report.failure_kind,
+        spec_authority,
+        preferred_repair_role: role,
+        repair_hypothesis: report.repair_hypothesis.clone(),
+        failure_cluster_id: next_cluster.cluster_key.clone(),
+        expected_improvement: None,
+        semantic_report: report.clone(),
+    });
+    true
+}
+
+/// Issue #647 (Phase E.2): predicate that becomes `true` when the active
+/// `SemanticRepairPlan` targets a `(cluster_id, role)` pair that is already
+/// in `exhausted_attempts` — meaning the same repair has been tried and the
+/// caller MUST switch to the re-diagnostic path (`assessment = None,
+/// assessment_attempts += 1`, bounded by `VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT`
+/// in `turn.rs`) rather than redoing the same attack.
+///
+/// Returns `false` when:
+/// - `semantic_plan` is `None` (no active plan, nothing to compare).
+/// - The active plan's `(cluster_id, role)` pair is not yet in the ledger.
+#[allow(dead_code)] // wired into turn.rs by a subsequent task; exercised here via unit tests.
+pub(super) fn should_re_diagnostic(repair_job: &RepairJob) -> bool {
+    let Some(plan) = repair_job.semantic_plan.as_ref() else {
+        return false;
+    };
+    repair_job
+        .exhausted_attempts
+        .contains(&(plan.failure_cluster_id.clone(), plan.preferred_repair_role))
+}
+
+/// Issue #647 (Phase E.3 / S3-014): wrap the existing
+/// `verifier_repair_rerun_outcome` (which is failure_count-based and
+/// cluster-agnostic) with a cluster-id transition rule.
+///
+/// Rationale (S3-014): the legacy outcome compares `failure_count`
+/// monotonically — if the same number of failures remain after a repair,
+/// the outcome is `SameFailureRemaining` even when a completely different
+/// cluster is now failing. For Phase-E sequential repair this is
+/// misleading: an honest "new cluster surfaced" run looks identical to
+/// "same cluster still failing". This wrapper preserves the legacy outcome
+/// when the cluster id is unchanged (or unknown on either side) and
+/// upgrades it to `NewFailure` when the cluster id transitions.
+///
+/// Inputs:
+/// - `previous_cluster_id`: the `failure_cluster_id` from the prior
+///   `SemanticRepairPlan`. `None` means "no prior cluster was tracked"
+///   (e.g. legacy path that built no semantic plan).
+/// - `current_cluster_id`: the `failure_cluster_id` from the newly built
+///   `SemanticRepairPlan`. `None` means "no current cluster is tracked".
+/// - `base_outcome`: the verdict returned by
+///   `verifier_repair_rerun_outcome` for the same rerun (the legacy
+///   failure_count comparison stays the SSOT).
+///
+/// Returns `base_outcome` unchanged unless both sides are `Some(...)` and
+/// the cluster ids differ — then returns `NewFailure`.
+#[allow(dead_code)] // wired into turn.rs by a subsequent task; exercised here via unit tests.
+pub(super) fn rerun_outcome_with_cluster(
+    previous_cluster_id: Option<&FailureClusterKey>,
+    current_cluster_id: Option<&FailureClusterKey>,
+    base_outcome: VerifierRepairRerunOutcome,
+) -> VerifierRepairRerunOutcome {
+    match (previous_cluster_id, current_cluster_id) {
+        (Some(prev), Some(curr)) if prev != curr => VerifierRepairRerunOutcome::NewFailure,
+        _ => base_outcome,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,5 +854,367 @@ mod tests {
             ..a.clone()
         };
         assert_ne!(a, c);
+    }
+
+    // ---- Issue #647 (Phase E): cluster-based sequential repair ---- //
+
+    /// Helper: build a `SemanticFailureReport` with N distinct clusters by
+    /// varying the `observed` text with words that survive the
+    /// shape-normalization pass (no numeric / quoted / path / long-token
+    /// runs). Up to four clusters supported by the canned labels —
+    /// callers MUST keep `cluster_count <= 4`.
+    #[cfg(test)]
+    fn multi_cluster_report_fixture(
+        kind: VerifierDiagnosticFailureKind,
+        cluster_count: usize,
+    ) -> super::super::semantic_failure::SemanticFailureReport {
+        // Distinct word labels — bare alphabetics survive `normalize_to_shape`
+        // (no `<num>` / `<token>` / `<str>` collapse) so each cluster gets a
+        // unique `cluster_key`.
+        const LABELS: &[(&str, &str, &str, &str)] = &[
+            ("alpha", "ALPHA", "alphashape", "alphacase"),
+            ("beta", "BETA", "betashape", "betacase"),
+            ("gamma", "GAMMA", "gammashape", "gammacase"),
+            ("delta", "DELTA", "deltashape", "deltacase"),
+        ];
+        assert!(
+            cluster_count <= LABELS.len(),
+            "multi_cluster_report_fixture supports up to {} clusters",
+            LABELS.len()
+        );
+        let clusters: Vec<serde_json::Value> = LABELS
+            .iter()
+            .take(cluster_count)
+            .map(|(obs, exp, shape, case)| {
+                serde_json::json!({
+                    "observed": obs,
+                    "expected": exp,
+                    "input_shape": shape,
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation", "test"],
+                    "affected_cases": [case],
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "failure_kind": kind_label(kind),
+            "confidence": 0.8,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "multi-cluster hypothesis",
+            "failure_clusters": clusters,
+        });
+        super::super::semantic_failure::parse_semantic_failure_report(&json)
+            .expect("multi-cluster fixture parses")
+    }
+
+    /// Build a fresh `RepairJob` whose `semantic_plan` slot targets the
+    /// first cluster of `report`. Mirrors what Phase D writes during
+    /// `run_verifier_diagnostic_pass`.
+    #[cfg(test)]
+    fn job_with_first_cluster_plan(
+        report: &super::super::semantic_failure::SemanticFailureReport,
+    ) -> RepairJob {
+        let first = &report.failure_clusters[0];
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: first.cluster_key.clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: report.preferred_repair_role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        RepairJob {
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        }
+    }
+
+    /// Phase E.1 (S1-015): three-cluster sequential repair.
+    ///
+    /// Calling `advance_to_next_cluster` twice walks the slot from
+    /// cluster 1 → cluster 2 → cluster 3 deterministically, in the
+    /// document order returned by the diagnostic LLM.
+    #[test]
+    fn phase_e_advance_to_next_cluster_walks_three_clusters_in_order() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        // Sanity check: three *distinct* cluster keys (shape varies per cluster).
+        assert_eq!(cluster_ids.len(), 3);
+        assert_ne!(cluster_ids[0], cluster_ids[1]);
+        assert_ne!(cluster_ids[1], cluster_ids[2]);
+        assert_ne!(cluster_ids[0], cluster_ids[2]);
+
+        let mut job = job_with_first_cluster_plan(&report);
+        // Initial slot: cluster 1.
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[0]
+        );
+
+        // First advance: cluster 1 → cluster 2.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1]
+        );
+
+        // Second advance: cluster 2 → cluster 3.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[2]
+        );
+
+        // Third advance: no more clusters — slot cleared, return false.
+        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(job.semantic_plan.is_none());
+    }
+
+    /// Phase E.1 / S3-010: `exhausted_attempts` accumulates across slot
+    /// reuse — each advance adds the prior `(cluster_id, role)` pair and
+    /// the ledger survives slot replacement.
+    #[test]
+    fn phase_e_exhausted_attempts_ledger_preserved_across_slot_reuse() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let mut job = job_with_first_cluster_plan(&report);
+        assert!(job.exhausted_attempts.is_empty());
+
+        // Advance 1: cluster 1 → cluster 2; ledger now holds cluster 1.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert_eq!(job.exhausted_attempts.len(), 1);
+        assert_eq!(job.exhausted_attempts[0], (cluster_ids[0].clone(), role));
+        // Slot now targets cluster 2.
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1]
+        );
+
+        // Advance 2: cluster 2 → cluster 3; ledger preserves cluster 1.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert_eq!(job.exhausted_attempts.len(), 2);
+        assert_eq!(job.exhausted_attempts[0], (cluster_ids[0].clone(), role));
+        assert_eq!(job.exhausted_attempts[1], (cluster_ids[1].clone(), role));
+        // Slot now targets cluster 3.
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[2]
+        );
+
+        // Advance 3: no more clusters; slot cleared, ledger still holds
+        // both 1 and 2 (the cluster 3 attempt is recorded too because we
+        // pushed it before searching).
+        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(job.semantic_plan.is_none());
+        assert_eq!(job.exhausted_attempts.len(), 3);
+        assert_eq!(job.exhausted_attempts[2], (cluster_ids[2].clone(), role));
+    }
+
+    /// Phase E.1: `advance_to_next_cluster` is idempotent on the ledger —
+    /// calling it again after the slot is cleared does not append a
+    /// duplicate `(cluster_id, role)` entry.
+    #[test]
+    fn phase_e_advance_to_next_cluster_is_idempotent_when_no_plan_present() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 1);
+        let mut job = job_with_first_cluster_plan(&report);
+
+        // First call: no other clusters → slot cleared, false returned.
+        assert!(!advance_to_next_cluster(&mut job, &report));
+        let after_first_len = job.exhausted_attempts.len();
+        assert_eq!(after_first_len, 1);
+
+        // Second call: semantic_plan is None, so no new ledger entry.
+        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert_eq!(job.exhausted_attempts.len(), after_first_len);
+    }
+
+    /// Phase E.2 (S1-008): same `(cluster_id, role)` re-attempted →
+    /// `should_re_diagnostic` flips to `true` so the caller switches to
+    /// the re-diagnostic path instead of repeating the same attack.
+    #[test]
+    fn phase_e_should_re_diagnostic_true_when_current_plan_already_exhausted() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Build a job where exhausted_attempts already contains the first
+        // cluster, and the active plan still targets the first cluster
+        // (simulates "we tried cluster 1, the diagnostic LLM re-proposed
+        // the same cluster on retry").
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let job = RepairJob {
+            semantic_plan: Some(plan),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            ..RepairJob::new_for_test()
+        };
+        assert!(should_re_diagnostic(&job));
+
+        // Different cluster targeted → not yet exhausted → false.
+        let plan2 = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let job2 = RepairJob {
+            semantic_plan: Some(plan2),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            ..RepairJob::new_for_test()
+        };
+        assert!(!should_re_diagnostic(&job2));
+    }
+
+    /// Phase E.2: `should_re_diagnostic` returns `false` when no plan is
+    /// active (legacy fallback / SetupRepair dispatch path).
+    #[test]
+    fn phase_e_should_re_diagnostic_false_when_no_plan_present() {
+        let job = RepairJob::new_for_test();
+        assert!(!should_re_diagnostic(&job));
+    }
+
+    /// Phase E.3 (S3-014): cluster id unchanged → `rerun_outcome_with_cluster`
+    /// returns the base outcome verbatim. The legacy failure_count-based
+    /// outcome remains the SSOT.
+    #[test]
+    fn phase_e_rerun_outcome_unchanged_when_cluster_id_stable() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+
+        // Both sides Some, same id → base outcome wins.
+        for base in [
+            VerifierRepairRerunOutcome::Improved,
+            VerifierRepairRerunOutcome::SameFailureRemaining,
+            VerifierRepairRerunOutcome::NewFailure,
+            VerifierRepairRerunOutcome::Worsened,
+        ] {
+            assert_eq!(
+                rerun_outcome_with_cluster(Some(&cluster_a), Some(&cluster_a), base),
+                base,
+                "stable cluster id must keep base outcome verbatim",
+            );
+        }
+
+        // None on either side → base outcome wins (legacy fallback).
+        assert_eq!(
+            rerun_outcome_with_cluster(
+                None,
+                Some(&cluster_a),
+                VerifierRepairRerunOutcome::Improved
+            ),
+            VerifierRepairRerunOutcome::Improved,
+        );
+        assert_eq!(
+            rerun_outcome_with_cluster(
+                Some(&cluster_a),
+                None,
+                VerifierRepairRerunOutcome::SameFailureRemaining
+            ),
+            VerifierRepairRerunOutcome::SameFailureRemaining,
+        );
+        assert_eq!(
+            rerun_outcome_with_cluster(None, None, VerifierRepairRerunOutcome::NewFailure),
+            VerifierRepairRerunOutcome::NewFailure,
+        );
+    }
+
+    /// Phase E.3 (S3-014): cluster id transitioned → outcome upgraded to
+    /// `NewFailure` regardless of the base outcome. This catches the case
+    /// where failure_count stayed the same but a different cluster is now
+    /// failing — failure_count alone would mis-report `SameFailureRemaining`.
+    #[test]
+    fn phase_e_rerun_outcome_promoted_to_new_failure_on_cluster_id_change() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+        let cluster_b = report.failure_clusters[1].cluster_key.clone();
+        assert_ne!(cluster_a, cluster_b);
+
+        for base in [
+            VerifierRepairRerunOutcome::Improved,
+            VerifierRepairRerunOutcome::SameFailureRemaining,
+            VerifierRepairRerunOutcome::NewFailure,
+            VerifierRepairRerunOutcome::Worsened,
+        ] {
+            assert_eq!(
+                rerun_outcome_with_cluster(Some(&cluster_a), Some(&cluster_b), base),
+                VerifierRepairRerunOutcome::NewFailure,
+                "cluster id transition must promote to NewFailure (base={base:?})",
+            );
+        }
+    }
+
+    /// Phase E.4 (S7-005): three-cluster sequential repair stays inside
+    /// the existing retry budgets.
+    ///
+    /// `advance_to_next_cluster` does not touch `assessment_attempts` /
+    /// `repair_attempt` (those are bumped by the legacy diagnostic /
+    /// repair-pass machinery in `turn.rs`), so walking three clusters
+    /// in a single turn does not consume `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`
+    /// (= 3) or `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT` (= 6) early.
+    #[test]
+    fn phase_e_three_cluster_sequential_repair_does_not_consume_retry_budget() {
+        // The constants the test references — keep this assertion in sync
+        // with `turn.rs` so a future limit change is caught here.
+        const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
+        const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        let mut job = job_with_first_cluster_plan(&report);
+
+        // Walk all three clusters via the Phase-E helper.
+        assert!(advance_to_next_cluster(&mut job, &report)); // 1 → 2
+        assert!(advance_to_next_cluster(&mut job, &report)); // 2 → 3
+        // Third advance: no more clusters.
+        assert!(!advance_to_next_cluster(&mut job, &report));
+
+        // The Phase-E slot reuse path must not touch the legacy retry
+        // counters — they remain at their fresh-job defaults so the
+        // existing `TASK_CONTRACT_VERIFIER_*_ATTEMPT_LIMIT` budgets are
+        // fully available for downstream `turn.rs` dispatch.
+        assert_eq!(job.assessment_attempts, 0);
+        assert_eq!(job.repair_attempt, 0);
+        assert!(
+            job.assessment_attempts < TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            "assessment_attempts must stay under TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT",
+        );
+        assert!(
+            job.repair_attempt < TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
+            "repair_attempt must stay under TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT",
+        );
+        // The ledger does grow per advance — but it's an O(N_clusters)
+        // bounded list, not a retry counter.
+        assert_eq!(job.exhausted_attempts.len(), 3);
     }
 }
