@@ -674,6 +674,85 @@ pub(super) fn apply_semantic_repair_dispatch_after_rerun(
     }
 }
 
+/// Issue #647 (MF2 V3.1): assign a freshly built `SemanticRepairPlan` into
+/// the `repair_job.semantic_plan` slot **while preserving the
+/// `exhausted_attempts` ledger**.
+///
+/// Background: when the diagnostic LLM is re-run after `apply_semantic_repair_dispatch_after_rerun`
+/// has already pushed a cluster onto `exhausted_attempts`, a naive
+/// `current.semantic_plan = new_plan` overwrite throws away the progress the
+/// dispatch made — even though the dispatch deliberately recorded the
+/// already-attacked cluster so it would be skipped. This helper bridges that
+/// gap by routing the assignment through the same Phase-E
+/// `advance_to_next_cluster` machinery the rerun dispatch uses.
+///
+/// Behaviour:
+///
+/// 1. `new_plan == None` → clear the slot (`semantic_plan = None`). This is
+///    the legacy / setup-repair fallback path; no ledger mutation occurs.
+/// 2. `new_plan == Some(plan)` whose `(failure_cluster_id,
+///    preferred_repair_role)` is **not** already in `exhausted_attempts` →
+///    write the new plan verbatim. Ledger untouched.
+/// 3. `new_plan == Some(plan)` whose `(failure_cluster_id,
+///    preferred_repair_role)` **is** already in `exhausted_attempts` →
+///    assign the new plan into the slot, then immediately call
+///    `advance_to_next_cluster` with `new_report` (the report carried by the
+///    new plan) so the helper walks past the already-exhausted entry to the
+///    first unexhausted cluster of the new report. If no cluster remains,
+///    the slot ends up as `None` (caller falls back to re-diagnostic /
+///    legacy mode — same posture as `advance_to_next_cluster` returning
+///    `false`).
+///
+/// `new_report` is accepted as a separate argument so callers that have a
+/// fresh report (e.g. after a re-diagnostic produced a new
+/// `SemanticFailureReport`) can pass it explicitly. When `new_plan` is
+/// `Some`, the report embedded in `new_plan.semantic_report` is used as the
+/// authoritative source for cluster walking; `new_report` is consulted only
+/// when the embedded report disagrees with the caller's intent — current
+/// callers should pass the same report instance as a defensive precondition.
+///
+/// The helper deliberately does **not** touch `assessment` /
+/// `assessment_attempts` / `repair_attempt` — those remain governed by the
+/// legacy diagnostic / repair-pass machinery (mirrors the S7-005 boundary
+/// in `apply_semantic_repair_dispatch_after_rerun`).
+pub(super) fn assign_semantic_plan_preserving_exhausted(
+    repair_job: &mut RepairJob,
+    new_plan: Option<SemanticRepairPlan>,
+    new_report: Option<&SemanticFailureReport>,
+) {
+    let Some(plan) = new_plan else {
+        // Legacy fallback / setup-repair path: clear the slot, leave the
+        // ledger and other fields untouched (matches the pre-MF2-V3
+        // overwrite semantics for the `None` case).
+        repair_job.semantic_plan = None;
+        return;
+    };
+
+    let role = plan.preferred_repair_role;
+    let cluster_id = plan.failure_cluster_id.clone();
+    let already_exhausted = repair_job.exhausted_attempts.contains(&(cluster_id, role));
+
+    // Assign the plan into the slot first. The embedded `semantic_report`
+    // becomes the authoritative source for cluster walking when we need to
+    // skip an already-exhausted entry.
+    let embedded_report = plan.semantic_report.clone();
+    repair_job.semantic_plan = Some(plan);
+
+    if !already_exhausted {
+        return;
+    }
+
+    // The newly proposed plan targets an already-exhausted (cluster, role)
+    // pair → ask the Phase-E walker to skip ahead. Prefer the embedded
+    // report (it travels with the plan); fall back to the caller-supplied
+    // `new_report` only if the caller explicitly passes a different one.
+    let report = new_report.cloned().unwrap_or(embedded_report);
+    advance_to_next_cluster(repair_job, &report);
+    // `advance_to_next_cluster` already mutates `semantic_plan`
+    // (either to the next unexhausted cluster or to `None`) and updates the
+    // ledger — no further bookkeeping required here.
+}
+
 /// Issue #647 (Phase E.3 / S3-014): wrap the existing
 /// `verifier_repair_rerun_outcome` (which is failure_count-based and
 /// cluster-agnostic) with a cluster-id transition rule.
@@ -1525,6 +1604,331 @@ mod tests {
         // repair_attempt is owned by the diagnostic / repair machinery and
         // is not touched by this dispatch helper.
         assert_eq!(job.repair_attempt, 0);
+    }
+
+    // ---- Issue #647 (MF2 V3): assign_semantic_plan_preserving_exhausted ---- //
+
+    /// MF2 V3.1: legacy / setup-repair fallback — `new_plan = None` clears the
+    /// slot without disturbing the `exhausted_attempts` ledger. This matches
+    /// the pre-V3 overwrite behaviour for the `None` case (turn.rs:9416).
+    #[test]
+    fn assign_semantic_plan_preserving_exhausted_none_clears_slot_only() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let mut job = job_with_first_cluster_plan(&report);
+        job.exhausted_attempts = vec![(cluster_ids[0].clone(), role)];
+
+        assign_semantic_plan_preserving_exhausted(&mut job, None, None);
+
+        assert!(job.semantic_plan.is_none(), "None must clear the slot");
+        // Ledger preserved verbatim — legacy fallback never mutates it.
+        assert_eq!(job.exhausted_attempts, vec![(cluster_ids[0].clone(), role)]);
+    }
+
+    /// MF2 V3.1: when the new plan's `(cluster_id, role)` pair is NOT in the
+    /// ledger, the helper writes the plan verbatim. No ledger mutation.
+    #[test]
+    fn assign_semantic_plan_preserving_exhausted_writes_unexhausted_plan_verbatim() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Job state: no plan yet, empty ledger.
+        let mut job = RepairJob::new_for_test();
+        let new_plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(new_plan), Some(&report));
+
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[0],
+            "unexhausted plan must be written verbatim",
+        );
+        assert!(job.exhausted_attempts.is_empty(), "ledger untouched");
+    }
+
+    /// MF2 V3.1 (core): when the new plan targets an already-exhausted
+    /// `(cluster_id, role)` pair, the helper walks to the next unexhausted
+    /// cluster instead of overwriting the slot with the doomed plan.
+    /// This is the SSOT defence against the turn.rs:9416 regression where
+    /// re-diagnostic could revive an already-burned cluster.
+    #[test]
+    fn assign_semantic_plan_preserving_exhausted_skips_to_next_when_proposed_is_exhausted() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Ledger already contains cluster A (we burned it on a prior turn).
+        let mut job = RepairJob {
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            ..RepairJob::new_for_test()
+        };
+        // Re-diagnostic proposes cluster A again (LLM duplicated the cluster
+        // it can no longer fix).
+        let doomed_plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(doomed_plan), Some(&report));
+
+        // Walked past cluster A → slot targets cluster B.
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1],
+            "slot must walk past the already-exhausted cluster to the next cluster",
+        );
+    }
+
+    /// MF2 V3.1: when ALL clusters in the new report are already exhausted,
+    /// the helper clears the slot (`semantic_plan = None`) so the caller can
+    /// fall back to the re-diagnostic / legacy path.
+    #[test]
+    fn assign_semantic_plan_preserving_exhausted_clears_slot_when_all_clusters_exhausted() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Ledger already contains BOTH clusters (the whole report is burnt).
+        let mut job = RepairJob {
+            exhausted_attempts: vec![
+                (cluster_ids[0].clone(), role),
+                (cluster_ids[1].clone(), role),
+            ],
+            ..RepairJob::new_for_test()
+        };
+        let any_plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(any_plan), Some(&report));
+
+        assert!(
+            job.semantic_plan.is_none(),
+            "fully exhausted report must clear the slot (caller falls back to re-diagnostic)",
+        );
+    }
+
+    /// MF2 V3.1: helper does NOT touch legacy retry counters
+    /// (`assessment_attempts`, `repair_attempt`). Mirrors the S7-005 boundary
+    /// on `apply_semantic_repair_dispatch_after_rerun`.
+    #[test]
+    fn assign_semantic_plan_preserving_exhausted_never_bumps_retry_counters() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let mut job = RepairJob {
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment_attempts: 1,
+            repair_attempt: 2,
+            ..RepairJob::new_for_test()
+        };
+        let doomed = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(doomed), Some(&report));
+
+        // Counters untouched even though we walked clusters.
+        assert_eq!(job.assessment_attempts, 1);
+        assert_eq!(job.repair_attempt, 2);
+    }
+
+    /// MF2 V3.4 (production integration scenario #1):
+    /// `mf2_v3_cluster_a_exhausted_after_no_progress_leads_to_cluster_b`.
+    ///
+    /// Simulates the failing production flow end-to-end at the helper layer:
+    ///   1. Diagnostic produces a plan targeting cluster A.
+    ///   2. Repair runs; rerun returns `SameFailureRemaining` (no progress).
+    ///   3. `apply_semantic_repair_dispatch_after_rerun` pushes A into the
+    ///      ledger and advances the slot to cluster B (legacy behaviour).
+    ///   4. The next turn's diagnostic re-proposes cluster A (the LLM has no
+    ///      memory of the previous turn) → without MF2 V3.1 this would
+    ///      overwrite cluster B with cluster A and burn the entire
+    ///      previous-turn progress.
+    ///   5. `assign_semantic_plan_preserving_exhausted` recognises cluster A
+    ///      is exhausted and walks back to cluster B — progress preserved.
+    #[test]
+    fn mf2_v3_cluster_a_exhausted_after_no_progress_leads_to_cluster_b() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // (1) Initial diagnostic → plan targets cluster A.
+        let mut job = job_with_first_cluster_plan(&report);
+        let preserved_assessment = super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(role),
+            needed_reads: Vec::new(),
+            repair_target_hint: None,
+            repair_plan: Vec::new(),
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        };
+        job.assessment = Some(preserved_assessment.clone());
+
+        // (2/3) Repair → rerun SameFailureRemaining → dispatch advances to B.
+        job.rerun_outcome = Some(VerifierRepairRerunOutcome::SameFailureRemaining);
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1],
+            "dispatch must advance to cluster B after no-progress rerun",
+        );
+        assert_eq!(
+            job.exhausted_attempts,
+            vec![(cluster_ids[0].clone(), role)],
+            "ledger must record cluster A as exhausted",
+        );
+
+        // (4) New diagnostic produces a fresh plan that targets cluster A
+        // again (LLM doesn't remember cluster A is doomed).
+        let re_diagnostic_plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+
+        // (5) MF2 V3.1 router → must skip A and land on B.
+        assign_semantic_plan_preserving_exhausted(
+            &mut job,
+            Some(re_diagnostic_plan),
+            Some(&report),
+        );
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1],
+            "MF2 V3.1 must preserve cluster-B progress when re-diagnostic re-proposes cluster A",
+        );
+        // Ledger still records A as exhausted.
+        assert!(
+            job.exhausted_attempts
+                .contains(&(cluster_ids[0].clone(), role)),
+            "cluster A must remain in exhausted_attempts ledger after re-diagnostic",
+        );
+    }
+
+    /// MF2 V3.4 (production integration scenario #2):
+    /// `mf2_v3_exhausted_a_persists_after_re_diagnostic`.
+    ///
+    /// Stronger variant: after several re-diagnostic rounds that all
+    /// re-propose cluster A, the exhausted-A entry must persist and the
+    /// slot must continue to advance to cluster B (never regressing).
+    #[test]
+    fn mf2_v3_exhausted_a_persists_after_re_diagnostic() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Job state mirrors the snapshot after dispatch advanced once:
+        // cluster A in ledger, cluster B in slot.
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            ..RepairJob::new_for_test()
+        };
+
+        // Re-diagnostic loop: 3 successive calls all propose cluster A.
+        for _ in 0..3 {
+            let re_diag_plan = SemanticRepairPlan {
+                semantic_report: report.clone(),
+                failure_cluster_id: cluster_ids[0].clone(),
+                semantic_cause: report.failure_kind,
+                spec_authority: SpecAuthority::ImplementationContract,
+                preferred_repair_role: role,
+                repair_hypothesis: report.repair_hypothesis.clone(),
+                expected_improvement: None,
+            };
+            assign_semantic_plan_preserving_exhausted(&mut job, Some(re_diag_plan), Some(&report));
+            // After every router call, A remains exhausted; B is the slot.
+            assert!(
+                job.exhausted_attempts
+                    .contains(&(cluster_ids[0].clone(), role)),
+                "cluster A must persist in exhausted_attempts ledger across re-diagnostics",
+            );
+            assert_eq!(
+                job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+                cluster_ids[1],
+                "slot must remain on cluster B (never regress to A)",
+            );
+        }
     }
 
     // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //

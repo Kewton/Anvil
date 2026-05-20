@@ -9413,7 +9413,26 @@ impl Agent {
             // SemanticRepairPlan slot. `None` is the legacy-compatible
             // value when semantic parse failed or dispatch routed to
             // setup repair (D.3).
-            current.semantic_plan = semantic_plan;
+            //
+            // Issue #647 (MF2 V3.1): route the assignment through the
+            // exhausted-aware helper so re-diagnostic cannot revive a
+            // cluster that the previous turn already pushed onto
+            // `exhausted_attempts`. Without this, every fresh diagnostic
+            // would blindly overwrite the slot with whatever cluster the
+            // LLM picked first — discarding the dispatch helper's progress
+            // (`apply_semantic_repair_dispatch_after_rerun` in
+            // `drive_task_contract_verifier`) and forcing the same doomed
+            // cluster to be re-attacked. The new helper skips ahead to the
+            // next unexhausted cluster of the embedded report (or clears
+            // the slot for legacy fallback when none remain).
+            let new_report = semantic_plan
+                .as_ref()
+                .map(|plan| plan.semantic_report.clone());
+            super::repair_job::assign_semantic_plan_preserving_exhausted(
+                current,
+                semantic_plan,
+                new_report.as_ref(),
+            );
         }
         log_llm_event(
             "agent.verifier_diagnostic.completed",
