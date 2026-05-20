@@ -9347,7 +9347,21 @@ impl Agent {
         // below is **not** disturbed.
         let semantic_report = parse_semantic_failure_report_from_reply(&reply.content)
             .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &context));
-        let semantic_plan = semantic_report.and_then(build_semantic_repair_plan_from_report);
+        // Issue #647 (SF1): build the `SpecAuthorityInput` from the active
+        // request's `RequiredBehaviorContract` (when actionable signal is
+        // present, the resolver elects `BehaviorContract`). All other
+        // detectors (`has_user_request_match`, consensus) are still default
+        // until later Issues wire them in; `is_newly_generated_task` is
+        // initialized to `true` per the SF1 acceptance until a real
+        // newly-generated detector lands.
+        let authority_input =
+            build_spec_authority_input_for_active_request(self.active_request_text().as_deref());
+        let semantic_plan = semantic_report.and_then(|report| {
+            build_semantic_repair_plan_from_report_with_authority_input(
+                report,
+                authority_input.clone(),
+            )
+        });
         // Issue #647 (§5.1 SSOT plumbing): build the path-local admission
         // context from the agent's current scope + edit signals so every
         // hint promoted by `model_assessment_to_verifier_repair_assessment`
@@ -15677,8 +15691,82 @@ fn build_semantic_failure_report_from_legacy(
 ///
 /// `expected_improvement` is initialized to `None` — Phase E fills it after
 /// the verifier rerun.
+/// Issue #647 (SF1): construct a `SpecAuthorityInput` for the production
+/// diagnostic pass by inspecting `active_request` for actionable behavior
+/// signal. When the request yields a `RequiredBehaviorContract` with
+/// operations / domain_terms, the resolver will elect `BehaviorContract`;
+/// otherwise we fall through to the newly-generated-task path (which
+/// returns `LlmGeneratedTest`, suppressing test edits on a brand-new
+/// task — see [`spec_authority::resolve`]).
+///
+/// The helper lives here (not in `spec_authority.rs`) because it crosses
+/// the `task_contract` / `spec_authority` module boundary; the resolver
+/// itself stays input-only and decoupled from `TaskContract`.
+fn build_spec_authority_input_for_active_request(
+    active_request: Option<&str>,
+) -> super::spec_authority::SpecAuthorityInput {
+    let has_behavior_contract = active_request
+        .map(|request| {
+            let contract = super::task_contract::TaskContract::from_request(request);
+            contract.required_behavior.operations.is_some()
+                || contract.required_behavior.domain_terms.is_some()
+        })
+        .unwrap_or(false);
+    super::spec_authority::SpecAuthorityInput {
+        has_user_request_match: false,
+        has_behavior_contract,
+        has_verified_public_interface: false,
+        is_newly_generated_task: true,
+        consensus: None,
+    }
+}
+
+/// Issue #647 (SF1): test-only wrapper that builds the plan with the
+/// default `SpecAuthorityInput`. Production code passes its own
+/// `SpecAuthorityInput` directly to
+/// [`build_semantic_repair_plan_from_report_with_authority_input`] (so the
+/// `has_behavior_contract` flag can be derived from the active request);
+/// the test suite uses this convenience wrapper to keep older test
+/// fixtures unchanged.
+#[cfg(test)]
 fn build_semantic_repair_plan_from_report(
     report: super::semantic_failure::SemanticFailureReport,
+) -> Option<super::repair_job::SemanticRepairPlan> {
+    build_semantic_repair_plan_from_report_with_authority_input(
+        report,
+        default_spec_authority_input(),
+    )
+}
+
+/// Issue #647 (SF1): production default for `SpecAuthorityInput` when the
+/// build helper is called without explicit caller context.
+///
+/// - `has_user_request_match`: `false` (detection is a future Issue).
+/// - `has_behavior_contract`: `false` (the caller that has the
+///   `TaskContract` will pass an overridden input via
+///   `build_semantic_repair_plan_from_report_with_authority_input`).
+/// - `has_verified_public_interface`: `false` (S5-005 dead variant).
+/// - `is_newly_generated_task`: `true` — Issue acceptance treats every
+///   turn as "newly generated" until a future Issue plumbs a real
+///   detector.
+/// - `consensus`: `None` — consensus detection is a future Issue.
+#[cfg(test)]
+fn default_spec_authority_input() -> super::spec_authority::SpecAuthorityInput {
+    super::spec_authority::SpecAuthorityInput {
+        has_user_request_match: false,
+        has_behavior_contract: false,
+        has_verified_public_interface: false,
+        is_newly_generated_task: true,
+        consensus: None,
+    }
+}
+
+/// Issue #647 (SF1): variant that lets the caller pass an explicit
+/// `SpecAuthorityInput` (so a future Issue can wire the actual
+/// `RequiredBehaviorContract` / consensus detection signals).
+fn build_semantic_repair_plan_from_report_with_authority_input(
+    report: super::semantic_failure::SemanticFailureReport,
+    authority_input: super::spec_authority::SpecAuthorityInput,
 ) -> Option<super::repair_job::SemanticRepairPlan> {
     // D.3: DependencyMissing / ConfigOrVerifierError → setup repair path,
     // no semantic plan.
@@ -15691,15 +15779,13 @@ fn build_semantic_repair_plan_from_report(
     // as the attack target; if no clusters were reported, the plan cannot
     // be built (caller keeps `semantic_plan = None`).
     let failure_cluster_id = report.failure_clusters.first()?.cluster_key.clone();
-    // SpecAuthority candidates: Phase D wires the fallback set
-    // (ImplementationContract + LlmGeneratedTest) — a future Issue will pass
-    // BehaviorContract when a RequiredBehaviorContract is in scope. The
-    // result is deterministic (smaller variant index wins).
-    let candidates = [
-        super::spec_authority::SpecAuthority::ImplementationContract,
-        super::spec_authority::SpecAuthority::LlmGeneratedTest,
-    ];
-    let spec_authority = super::spec_authority::select_authority(&candidates, None)?;
+    // Issue #647 (SF1): SpecAuthority is now resolved through the
+    // structured `resolve()` SSOT so impl/test/README are treated as
+    // equally authoritative on newly generated tasks. Pre-SF1 the
+    // candidate set was hard-coded to `[ImplementationContract,
+    // LlmGeneratedTest]`, which always elected ImplementationContract and
+    // let the repair editor rewrite tests to match buggy impl.
+    let spec_authority = super::spec_authority::resolve(&authority_input);
     Some(super::repair_job::SemanticRepairPlan {
         semantic_cause: report.failure_kind,
         spec_authority,
@@ -21070,6 +21156,90 @@ E   assert [{'id': 1}] == []\n";
         );
         assert!(plan.repair_hypothesis.contains("returns 200"));
         assert!(plan.expected_improvement.is_none());
+    }
+
+    /// SF1-production-uses-resolve (Issue #647): the production builder
+    /// flows through `spec_authority::resolve` — verified end-to-end by
+    /// (a) the default-input wrapper electing `LlmGeneratedTest` on a
+    /// newly-generated task with no consensus, and (b) an explicit
+    /// `has_behavior_contract = true` input electing `BehaviorContract`.
+    /// Pre-SF1 the builder was hard-coded to `ImplementationContract`
+    /// regardless of input, so this asserts the new wiring.
+    #[test]
+    fn sf1_production_build_semantic_repair_plan_uses_resolve() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.91,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"impl returns 200, test expects 201",
+            "failure_clusters":[
+                {
+                    "observed":"200 OK",
+                    "expected":"201 Created",
+                    "input_shape":"POST /todos",
+                    "assertion_shape":"AssertEq",
+                    "involved_artifacts":["implementation","test"],
+                    "affected_cases":["test_create_todo"]
+                }
+            ]
+        }"#;
+        // Default-input path (newly-generated task, no consensus,
+        // no behavior contract) → resolve elects LlmGeneratedTest.
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        let plan = super::build_semantic_repair_plan_from_report(report)
+            .expect("plan should be built for AssertionMismatch with clusters");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::LlmGeneratedTest,
+            "newly-generated task with no consensus must elect LlmGeneratedTest (SF1)"
+        );
+
+        // Explicit-input path with has_behavior_contract=true → resolve
+        // elects BehaviorContract, proving the production builder honors
+        // the resolver's decision rules end-to-end.
+        let report2 = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan2 =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report2, input)
+                .expect("plan should be built");
+        assert_eq!(
+            plan2.spec_authority,
+            super::super::spec_authority::SpecAuthority::BehaviorContract,
+            "has_behavior_contract=true must elect BehaviorContract via resolve()"
+        );
+    }
+
+    /// SF1: the production callsite helper
+    /// `build_spec_authority_input_for_active_request` flips
+    /// `has_behavior_contract` when the active request yields a
+    /// `RequiredBehaviorContract` with actionable signal.
+    #[test]
+    fn sf1_build_spec_authority_input_detects_behavior_contract_in_request() {
+        // A request that names an operation keyword ("create") + a domain
+        // term should yield `has_behavior_contract: true`. The exact
+        // detection is owned by `task_contract::TaskContract::from_request`
+        // — we only assert the routing here.
+        let request = "Create a TODO API: implement POST /todos to create a new todo item, then add a pytest that POSTs and asserts 201.";
+        let input = super::build_spec_authority_input_for_active_request(Some(request));
+        assert!(
+            input.has_behavior_contract,
+            "actionable request must set has_behavior_contract=true"
+        );
+        assert!(!input.has_user_request_match);
+        assert!(!input.has_verified_public_interface);
+        assert!(input.is_newly_generated_task);
+        assert!(input.consensus.is_none());
+
+        // Empty / missing request → behavior contract flag stays false.
+        let empty_input = super::build_spec_authority_input_for_active_request(None);
+        assert!(!empty_input.has_behavior_contract);
+        assert!(empty_input.is_newly_generated_task);
     }
 
     /// Phase D / D.3 (S1-010): `DependencyMissing` dispatches to the

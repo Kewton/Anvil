@@ -161,6 +161,85 @@ pub(super) fn select_authority(
     Some(top)
 }
 
+/// Issue #647 (SF1): aggregated input passed by `turn.rs` to [`resolve`]
+/// when constructing a `SemanticRepairPlan`. Each flag is computed by the
+/// caller from a different source (the user request, the
+/// `RequiredBehaviorContract`, the turn-local task state, etc.); collecting
+/// them in a single struct lets the resolution rules stay declarative and
+/// keeps the production callsite a single line.
+///
+/// Fields:
+/// - `has_user_request_match`: the failing artifact lines up with an
+///   *explicit* spec in the user request (detection is a future Issue —
+///   today the caller passes `false`).
+/// - `has_behavior_contract`: a `RequiredBehaviorContract` has actionable
+///   signal in scope (operations / domain_terms / etc.).
+/// - `has_verified_public_interface`: a public interface that already
+///   passed verification is in scope. **Dead variant** (S5-005); the
+///   production caller passes `false`.
+/// - `is_newly_generated_task`: this turn produced new implementation /
+///   test / README artifacts. When `true` and no `consensus` exists, the
+///   resolution returns `LlmGeneratedTest` so test edits get suppressed
+///   (test cannot be the lone source of truth on a brand-new task).
+/// - `consensus`: optional 2-vs-1 agreement signal across the three
+///   artifacts. When present, [`select_authority`] handles tie-break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SpecAuthorityInput {
+    pub(super) has_user_request_match: bool,
+    pub(super) has_behavior_contract: bool,
+    pub(super) has_verified_public_interface: bool,
+    pub(super) is_newly_generated_task: bool,
+    pub(super) consensus: Option<ArtifactConsensus>,
+}
+
+/// Resolve a [`SpecAuthority`] from `input`.
+///
+/// Decision order (Issue #647 acceptance):
+/// 1. `has_user_request_match` → [`SpecAuthority::UserRequest`] (highest).
+/// 2. `has_behavior_contract` → [`SpecAuthority::BehaviorContract`].
+/// 3. `has_verified_public_interface` →
+///    [`SpecAuthority::VerifiedPublicInterface`]. **Dead variant** in this
+///    Issue — the production caller passes `false`, so this branch is only
+///    reachable from in-module unit tests.
+/// 4. `is_newly_generated_task && consensus.is_none()` →
+///    [`SpecAuthority::LlmGeneratedTest`] (the *lowest* authority). Issue
+///    acceptance treats impl/test/README as equally authoritative on a
+///    brand-new task, but if we elected `ImplementationContract` here the
+///    repair editor would happily rewrite the test to match buggy impl.
+///    Returning the lowest authority instead is the safe default — the
+///    weakening detectors get a chance to block test edits before we
+///    decide impl is the source of truth.
+/// 5. `consensus.is_some()` → delegate to [`select_authority`] with the
+///    full candidate set so 2-vs-1 tie-break logic applies.
+/// 6. Default fallback → [`SpecAuthority::ImplementationContract`].
+pub(super) fn resolve(input: &SpecAuthorityInput) -> SpecAuthority {
+    if input.has_user_request_match {
+        return SpecAuthority::UserRequest;
+    }
+    if input.has_behavior_contract {
+        return SpecAuthority::BehaviorContract;
+    }
+    if input.has_verified_public_interface {
+        return SpecAuthority::VerifiedPublicInterface;
+    }
+    if input.is_newly_generated_task && input.consensus.is_none() {
+        return SpecAuthority::LlmGeneratedTest;
+    }
+    if let Some(consensus) = input.consensus.as_ref() {
+        // Pass the full candidate set so `select_authority` can apply its
+        // tie-break logic. We include `ImplementationContract` and
+        // `LlmGeneratedTest` as the default candidate base.
+        let candidates = [
+            SpecAuthority::ImplementationContract,
+            SpecAuthority::LlmGeneratedTest,
+        ];
+        if let Some(picked) = select_authority(&candidates, Some(consensus)) {
+            return picked;
+        }
+    }
+    SpecAuthority::ImplementationContract
+}
+
 /// Map an `ArtifactConsensus` to the spec authority that the agreeing roles
 /// imply. Implementation-agreeing → `ImplementationContract`; otherwise the
 /// consensus alone is not enough to elect a higher authority and we return
@@ -712,6 +791,117 @@ mod tests {
     #[test]
     fn select_authority_returns_none_for_empty_input() {
         assert_eq!(select_authority(&[], None), None);
+    }
+
+    // -- SF1: resolve() unit tests (Issue #647) -- //
+
+    /// Helper: build a `SpecAuthorityInput` with all flags off and no
+    /// consensus, so individual tests can flip exactly one field.
+    fn empty_input() -> SpecAuthorityInput {
+        SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: false,
+            has_verified_public_interface: false,
+            is_newly_generated_task: false,
+            consensus: None,
+        }
+    }
+
+    #[test]
+    fn sf1_resolve_user_request_wins_when_request_matches() {
+        // SF1-resolve-user-request: any user-request match short-circuits
+        // to the highest authority, even when other flags are on.
+        let input = SpecAuthorityInput {
+            has_user_request_match: true,
+            has_behavior_contract: true,
+            has_verified_public_interface: true,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        assert_eq!(resolve(&input), SpecAuthority::UserRequest);
+    }
+
+    #[test]
+    fn sf1_resolve_behavior_contract_when_only_contract_present() {
+        // SF1-resolve-behavior-contract: BehaviorContract wins when only it
+        // is set (user_request flag off).
+        let input = SpecAuthorityInput {
+            has_behavior_contract: true,
+            ..empty_input()
+        };
+        assert_eq!(resolve(&input), SpecAuthority::BehaviorContract);
+    }
+
+    #[test]
+    fn sf1_resolve_newly_generated_with_no_consensus_returns_llm_generated_test() {
+        // SF1-resolve-newly-generated-equality: a brand-new task with no
+        // consensus must NOT promote ImplementationContract — we elect the
+        // lowest authority (LlmGeneratedTest) so the repair editor's
+        // weakening detectors get to suppress test edits before impl wins.
+        let input = SpecAuthorityInput {
+            is_newly_generated_task: true,
+            ..empty_input()
+        };
+        assert_eq!(resolve(&input), SpecAuthority::LlmGeneratedTest);
+    }
+
+    #[test]
+    fn sf1_resolve_implementation_default_when_nothing_set() {
+        // SF1-resolve-implementation-default: the empty fallback path
+        // returns ImplementationContract (pre-SF1 production behavior).
+        let input = empty_input();
+        assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
+    }
+
+    #[test]
+    fn sf1_resolve_consensus_tiebreak_when_consensus_present() {
+        // SF1-resolve-consensus-tiebreak: when consensus is present (and the
+        // newly-generated short-circuit does not fire), resolution delegates
+        // to select_authority. Implementation-agreeing consensus elects
+        // ImplementationContract via that path.
+        let consensus = ArtifactConsensus::new(
+            vec![ArtifactRole::Implementation, ArtifactRole::UsageDocs],
+            vec![ArtifactRole::Test],
+            "impl and docs agree",
+        );
+        let input = SpecAuthorityInput {
+            consensus: Some(consensus),
+            ..empty_input()
+        };
+        assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
+    }
+
+    #[test]
+    fn sf1_resolve_verified_public_interface_when_only_that_flag_set() {
+        // Forward-extensibility: even though the production caller passes
+        // `false` for `has_verified_public_interface` (S5-005 dead-variant
+        // policy), the resolver itself must respect the flag so a future
+        // Issue wiring the session/turn-local cache can flip it.
+        let input = SpecAuthorityInput {
+            has_verified_public_interface: true,
+            ..empty_input()
+        };
+        assert_eq!(resolve(&input), SpecAuthority::VerifiedPublicInterface);
+    }
+
+    #[test]
+    fn sf1_resolve_newly_generated_short_circuits_before_consensus_only_when_consensus_absent() {
+        // Boundary: newly_generated_task takes effect only when consensus
+        // is None. If consensus is provided, we fall through to the
+        // select_authority tie-break.
+        let consensus = ArtifactConsensus::new(
+            vec![ArtifactRole::Implementation],
+            vec![ArtifactRole::Test],
+            "impl alone",
+        );
+        let input = SpecAuthorityInput {
+            is_newly_generated_task: true,
+            consensus: Some(consensus),
+            ..empty_input()
+        };
+        // Consensus is present → resolve() takes the tie-break path and
+        // elects ImplementationContract, *not* LlmGeneratedTest.
+        assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
     }
 
     #[test]
