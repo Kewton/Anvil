@@ -1699,6 +1699,10 @@ fn verifier_diagnostic_messages(
 Allowed failure_kind values: dependency_missing, local_import_contract_mismatch, compile_or_syntax_error, assertion_mismatch, runtime_error, test_bug, config_or_verifier_error, unknown.\n\
 Allowed probable_cause_role values: implementation, test, setup, usage_docs, unknown.\n\
 Schema: {{\"failure_kind\":\"...\",\"probable_cause_role\":\"...\",\"repair_targets\":[{{\"path\":\"workspace-relative existing file\",\"confidence\":0.0,\"reason\":\"short bounded reason\"}}],\"repair_plan\":[{{\"target\":\"workspace-relative existing file\",\"intent\":\"short bounded intent\",\"confidence\":0.0}}],\"secondary_targets\":[\"workspace-relative existing file\"],\"do_not_edit_tests_without_evidence\":true,\"summary\":\"short bounded summary\"}}.\n\
+Issue #647 (MF1) — additionally return a SemanticFailureReport in the SAME JSON object so the agent can plan a semantic repair. Add these top-level fields next to the legacy fields above (do not nest under a wrapper key, do not omit the legacy fields):\n\
+SemanticFailureReport schema (extra fields, same object):\n\
+{{\"failure_clusters\":[{{\"observed\":\"short bounded observed text\",\"expected\":\"short bounded expected text\",\"input_shape\":\"short bounded input shape\",\"assertion_shape\":\"short bounded assertion shape\",\"affected_cases\":[\"short bounded case id\"],\"involved_artifacts\":[\"implementation|test|usage_docs|setup\"]}}],\"contract_conflict\":{{\"implementation\":\"short bounded view\",\"test\":\"short bounded view\",\"usage_docs\":\"short bounded view\"}},\"preferred_repair_role\":\"implementation|test|setup|usage_docs\",\"repair_hypothesis\":\"<= 240 chars, single sentence\",\"confidence\":0.0}}.\n\
+Rules for the SemanticFailureReport fields: confidence MUST be a finite number in [0.0, 1.0]; repair_hypothesis MUST be <= 240 characters; do NOT set cluster_key (the agent computes it locally); preferred_repair_role must agree with probable_cause_role above.\n\
 Only include paths present in changed_candidates or safe_file_excerpts. For local import contract mismatches, prefer the provider/source file named by the import error before importer test frames. For assertion failures, distinguish product behavior defects from generated-test defects; if the output shows state leaking across tests, order-dependent expectations, or missing setup/teardown, classify it as test_bug and target the test artifact. Use setup files only for dependency_missing or config_or_verifier_error. Payload JSON:\n{payload}"
         )),
     ]
@@ -9315,11 +9319,16 @@ impl Agent {
             );
         };
         // Issue #647 (Phase D / D.1 / DR3-005): independently parse the
-        // semantic-failure report from the *same* reply. A `None` here
-        // collapses to `semantic_plan = None` (legacy fallback) without
-        // disturbing the legacy `ParsedVerifierRepairAssessment` /
-        // `VerifierRepairAssessment` flow above.
-        let semantic_report = parse_semantic_failure_report_from_reply(&reply.content);
+        // semantic-failure report from the *same* reply. When the LLM omits
+        // the extended SemanticFailureReport fields (MF1: production LLMs
+        // historically returned only the legacy schema), we deterministically
+        // synthesize a SemanticFailureReport from the legacy parsed result so
+        // semantic repair planning fires on every diagnostic pass — not only
+        // when the LLM volunteered the extended schema. The legacy
+        // `ParsedVerifierRepairAssessment` / `VerifierRepairAssessment` flow
+        // below is **not** disturbed.
+        let semantic_report = parse_semantic_failure_report_from_reply(&reply.content)
+            .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &context));
         let semantic_plan = semantic_report.and_then(build_semantic_repair_plan_from_report);
         // Issue #647 (§5.1 SSOT plumbing): build the path-local admission
         // context from the agent's current scope + edit signals so every
@@ -15498,6 +15507,113 @@ fn parse_semantic_failure_report_from_reply(
     super::semantic_failure::parse_semantic_failure_report(&value)
 }
 
+/// Issue #647 (MF1): deterministic fallback that synthesizes a
+/// [`super::semantic_failure::SemanticFailureReport`] from a legacy
+/// [`ParsedVerifierRepairAssessment`] and the surrounding [`RepairJob`].
+///
+/// MF1 production motivation: most LLMs today emit only the legacy fields
+/// (`probable_cause_role` / `failure_kind` / `repair_plan` / `summary`), so
+/// `parse_semantic_failure_report_from_reply` returns `None` and the
+/// `semantic_plan` slot stays empty in production. This helper recovers a
+/// usable `SemanticFailureReport` from the legacy parse so semantic repair
+/// planning kicks in for every diagnostic pass, not only when the LLM
+/// volunteered the extended schema.
+///
+/// Determinism contract: same `(parsed, repair_job)` input MUST produce the
+/// same `SemanticFailureReport`. No randomness, no clock, no LLM-derived
+/// confidence — `confidence` is fixed at the deterministic legacy default
+/// (`LEGACY_FALLBACK_CONFIDENCE`).
+///
+/// Returns `None` only when the legacy parsed result cannot produce a
+/// meaningful failure cluster (e.g. `failure_signature` is empty AND
+/// `output_excerpt` is empty AND there is no summary text). In practice the
+/// caller passes a `RepairJob` with at least a non-empty `failure_signature`
+/// (built by `verifier_repair_context_from_failure`), so the helper returns
+/// `Some` for every realistic production input.
+fn build_semantic_failure_report_from_legacy(
+    parsed: &ParsedVerifierRepairAssessment,
+    repair_job: &super::repair_job::RepairJob,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    use super::semantic_failure::{
+        ContractConflict, MAX_CLUSTER_TEXT_CHARS, MAX_REPAIR_HYPOTHESIS_CHARS,
+        build_failure_cluster_from_observation,
+    };
+
+    // Map legacy probable_cause_role → preferred_repair_role; default to
+    // Implementation (deterministic) when the LLM did not supply one.
+    let preferred_repair_role = parsed
+        .probable_cause_role
+        .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+
+    // Build a single failure cluster from the legacy RepairJob signal. The
+    // cluster_key is generated locally via the SSOT cluster builder, so it
+    // never depends on attacker-controlled text.
+    let observed = if !repair_job.failure_signature.is_empty() {
+        repair_job.failure_signature.as_str()
+    } else {
+        repair_job.output_excerpt.as_str()
+    };
+    let expected = parsed.summary.as_deref().unwrap_or("");
+    // input_shape / assertion_shape are not surfaced by the legacy schema;
+    // we leave them empty so the SSOT shape-normalizer collapses them
+    // identically across legacy inputs (deterministic cluster key).
+    let cluster = build_failure_cluster_from_observation(
+        observed,
+        expected,
+        "",
+        "",
+        &[preferred_repair_role],
+    );
+
+    // contract_conflict is sourced from the legacy summary — it lives in the
+    // `implementation` slot because the legacy summary historically described
+    // implementation-side findings. The other two slots are empty so the
+    // schema's invariant ("each side sanitized to MAX_CLUSTER_TEXT_CHARS")
+    // still holds without us inventing test / docs content.
+    let contract_conflict = ContractConflict {
+        implementation: super::repair_job::sanitize_repair_job_text_with_char_cap(
+            parsed.summary.as_deref().unwrap_or(""),
+            MAX_CLUSTER_TEXT_CHARS,
+        ),
+        test: String::new(),
+        usage_docs: String::new(),
+    };
+
+    // repair_hypothesis: first entry of the legacy repair_plan (intent +
+    // path), truncated by the SSOT sanitize entry. Falls back to the legacy
+    // summary when the plan is empty.
+    let raw_hypothesis = parsed
+        .repair_plan
+        .first()
+        .map(|target| {
+            if target.reason.is_empty() {
+                target.path.clone()
+            } else {
+                format!("{}: {}", target.path, target.reason)
+            }
+        })
+        .or_else(|| parsed.summary.clone())
+        .unwrap_or_default();
+    let repair_hypothesis = super::repair_job::sanitize_repair_job_text_with_char_cap(
+        &raw_hypothesis,
+        MAX_REPAIR_HYPOTHESIS_CHARS,
+    );
+
+    /// Deterministic legacy default — never LLM-supplied. Chosen as 0.5 so
+    /// downstream consumers can distinguish "fallback" reports from
+    /// "LLM-supplied" reports by checking for the midpoint value.
+    const LEGACY_FALLBACK_CONFIDENCE: f32 = 0.5;
+
+    Some(super::semantic_failure::SemanticFailureReport {
+        failure_kind: parsed.failure_kind,
+        failure_clusters: vec![cluster],
+        contract_conflict,
+        preferred_repair_role,
+        repair_hypothesis,
+        confidence: LEGACY_FALLBACK_CONFIDENCE,
+    })
+}
+
 /// Issue #647 (Phase D / D.2 + D.3): build a [`super::repair_job::SemanticRepairPlan`]
 /// from a parsed [`super::semantic_failure::SemanticFailureReport`].
 ///
@@ -20881,6 +20997,233 @@ E   assert [{'id': 1}] == []\n";
         assert!(
             user_text.contains("\\\"semantic_plan\\\":null"),
             "legacy path must emit semantic_plan: null in payload: {user_text}",
+        );
+    }
+
+    // ---- Issue #647 (MF1): diagnostic prompt embeds semantic schema + ---- //
+    // ---- legacy → semantic fallback so production emits SemanticRepairPlan ---- //
+
+    /// MF1-a: the diagnostic prompt MUST advertise the `SemanticFailureReport`
+    /// schema so LLMs return the new fields (`failure_clusters`,
+    /// `contract_conflict`, `preferred_repair_role`, `repair_hypothesis`,
+    /// `confidence`) alongside the legacy fields. Without these field names
+    /// in the prompt, `parse_semantic_failure_report` never gets a payload to
+    /// parse and `semantic_plan` stays `None` in production.
+    #[test]
+    fn mf1_a_diagnostic_prompt_includes_semantic_schema() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def f():\n    return 1\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build api");
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for needle in [
+            "SemanticFailureReport",
+            "failure_clusters",
+            "contract_conflict",
+            "preferred_repair_role",
+            "repair_hypothesis",
+            "confidence",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "diagnostic prompt must mention semantic field {needle:?}: {prompt}",
+            );
+        }
+    }
+
+    /// MF1-b: the deterministic legacy-fallback helper MUST produce a
+    /// `SemanticFailureReport` from a `ParsedVerifierRepairAssessment` even
+    /// when the LLM returned only legacy fields (so
+    /// `parse_semantic_failure_report` returned `None`).
+    #[test]
+    fn mf1_b_legacy_fallback_builds_semantic_report() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"return 201 not 200","confidence":0.9}],
+            "summary":"impl returns 200 but test expects 201"
+        }"#;
+        // Confirm pre-condition: the semantic parse fails on this legacy reply.
+        assert!(super::parse_semantic_failure_report_from_reply(legacy_reply).is_none());
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "tests/test_health.py::test_create_validation AssertionError"
+                .to_string(),
+            output_excerpt:
+                "FAILED tests/test_health.py::test_create_validation - assert 200 == 201"
+                    .to_string(),
+            ..RepairJob::new_for_test()
+        };
+
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        // Deterministic legacy default — never LLM-supplied.
+        assert!((report.confidence - 0.5).abs() < f32::EPSILON);
+        // The fallback re-uses the legacy `repair_plan` first item as the
+        // repair_hypothesis, truncated by the SSOT sanitize entry.
+        assert!(
+            !report.repair_hypothesis.is_empty(),
+            "repair_hypothesis must be populated from legacy result",
+        );
+        // preferred_repair_role is mapped from probable_cause_role.
+        assert_eq!(
+            report.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+    }
+
+    /// MF1-b: the legacy fallback constructs exactly one failure cluster
+    /// derived from `RepairJob.failure_signature` / `output_excerpt`, and the
+    /// cluster's `involved_artifacts` reflects the legacy `probable_cause_role`.
+    #[test]
+    fn mf1_b_legacy_fallback_constructs_one_failure_cluster() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"runtime_error",
+            "probable_cause_role":"test",
+            "repair_plan":[{"target":"tests/test_health.py","intent":"fix fixture","confidence":0.8}]
+        }"#;
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "tests/test_health.py KeyError".to_string(),
+            output_excerpt: "KeyError: 'missing_fixture'".to_string(),
+            ..RepairJob::new_for_test()
+        };
+
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::RuntimeError
+        );
+        assert_eq!(
+            report.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Test
+        );
+        let cluster = &report.failure_clusters[0];
+        assert!(
+            cluster
+                .involved_artifacts
+                .contains(&super::super::task_contract::ArtifactRole::Test),
+            "cluster must record the probable_cause_role as an involved artifact",
+        );
+    }
+
+    /// MF1-b: the legacy fallback is deterministic — the same
+    /// `(ParsedVerifierRepairAssessment, RepairJob)` input MUST yield the same
+    /// `SemanticFailureReport` (cluster keys identical, confidence fixed).
+    #[test]
+    fn mf1_b_legacy_fallback_is_deterministic() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"return 201","confidence":0.9}]
+        }"#;
+        let parsed_a = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let parsed_b = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "sig".to_string(),
+            output_excerpt: "FAILED assert 200 == 201".to_string(),
+            ..RepairJob::new_for_test()
+        };
+
+        let report_a = super::build_semantic_failure_report_from_legacy(&parsed_a, &job)
+            .expect("fallback report a");
+        let report_b = super::build_semantic_failure_report_from_legacy(&parsed_b, &job)
+            .expect("fallback report b");
+        assert_eq!(
+            report_a.failure_clusters[0].cluster_key,
+            report_b.failure_clusters[0].cluster_key,
+        );
+        assert_eq!(report_a.confidence, report_b.confidence);
+        assert_eq!(report_a.repair_hypothesis, report_b.repair_hypothesis);
+    }
+
+    /// MF1-b: `DependencyMissing` / `ConfigOrVerifierError` legacy replies
+    /// still route to setup repair after the fallback — the helper produces a
+    /// report, but `build_semantic_repair_plan_from_report` returns `None`,
+    /// so the existing setup-repair pipeline keeps owning those failure kinds.
+    #[test]
+    fn mf1_b_legacy_fallback_routes_dependency_missing_to_setup() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"dependency_missing",
+            "probable_cause_role":"setup",
+            "repair_plan":[{"target":"requirements.txt","intent":"add requests","confidence":0.95}]
+        }"#;
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "ModuleNotFoundError requests".to_string(),
+            output_excerpt: "ModuleNotFoundError: No module named 'requests'".to_string(),
+            ..RepairJob::new_for_test()
+        };
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        // Even though we build a report for the dependency_missing kind, the
+        // dispatch_target → setup-repair contract keeps `semantic_plan = None`.
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// MF1 production flow integration: when the LLM reply returns only
+    /// legacy fields, the semantic parse returns `None`, but the fallback
+    /// kicks in and a `SemanticRepairPlan` is built end-to-end via
+    /// `build_semantic_failure_report_from_legacy` →
+    /// `build_semantic_repair_plan_from_report`.
+    #[test]
+    fn mf1_legacy_reply_yields_semantic_plan_via_fallback() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"return 201","confidence":0.9}]
+        }"#;
+        // pre-condition: pure semantic parse returns None.
+        assert!(super::parse_semantic_failure_report_from_reply(legacy_reply).is_none());
+
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "app/main.py AssertionError".to_string(),
+            output_excerpt: "assert 200 == 201".to_string(),
+            ..RepairJob::new_for_test()
+        };
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield report");
+        let plan = super::build_semantic_repair_plan_from_report(report)
+            .expect("semantic plan must be built from legacy fallback report");
+        assert_eq!(
+            plan.semantic_cause,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        assert_eq!(
+            plan.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
         );
     }
 
