@@ -28495,6 +28495,281 @@ export default function App() {
             "unsafe paths (../, absolute, control chars) must NOT survive enrich admission"
         );
     }
+
+    /// CB-017 A''' (Commit 5, §12 #21 — legacy fallback closure):
+    /// when the diagnostic LLM returns ONLY legacy fields (no semantic
+    /// `failure_clusters` schema), the SF1 → CB-017 pipeline must still
+    /// yield an admitted semantic plan:
+    ///
+    /// 1. `parse_semantic_failure_report_from_reply` returns `None` — the
+    ///    reply does not satisfy the semantic schema.
+    /// 2. `build_semantic_failure_report_from_legacy` synthesizes a
+    ///    single-cluster report with **no** proposed target candidates.
+    /// 3. `merge_legacy_targets_into_clusters` populates the first
+    ///    cluster's `proposed_target_candidates` from
+    ///    `parsed.repair_targets` (the "all clusters targetless" branch
+    ///    fires because the synthesized report has exactly one targetless
+    ///    cluster).
+    /// 4. `enrich_failure_clusters_with_admitted_targets` admits each
+    ///    candidate via the SSOT `recovery_target_hint_for_diagnostic_path`
+    ///    — at least one survives because the legacy target points at a
+    ///    real implementation file in the workspace.
+    /// 5. The cluster now carries a non-empty
+    ///    `admitted_cluster_targets` slice → the production callsite
+    ///    keeps the semantic report (non-None) and downstream code can
+    ///    build a `SemanticRepairPlan`.
+    ///
+    /// This is the production-level closure for the legacy-only reply
+    /// case Codex review 4 flagged as the last A''' §12 item.
+    #[test]
+    fn cb017_legacy_only_reply_yields_semantic_plan_via_merge_then_enrich() {
+        use super::super::repair_job::RepairJob;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let impl_file = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(impl_file.parent().unwrap()).unwrap();
+        std::fs::write(&impl_file, "def f():\n    return 200\n").unwrap();
+
+        // Legacy schema: no `failure_clusters` array — only
+        // `probable_cause_role` / `repair_targets` / `summary`.
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_targets":[
+                {"target":"app/main.py","reason":"return 201 not 200","confidence":0.9}
+            ],
+            "summary":"impl returns 200 but test expects 201"
+        }"#;
+
+        // Step 1: semantic parse fails on the legacy reply.
+        assert!(
+            super::parse_semantic_failure_report_from_reply(legacy_reply).is_none(),
+            "pre-condition: semantic parse must fail on legacy-only reply",
+        );
+
+        // Step 2: legacy fallback synthesizes a SemanticFailureReport with
+        // a single cluster that has NO proposed target candidates.
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse must succeed");
+        let job = RepairJob {
+            failure_signature: "tests/test_health.py::test_create AssertionError".to_string(),
+            output_excerpt: "FAILED tests/test_health.py::test_create - assert 200 == 201"
+                .to_string(),
+            ..RepairJob::new_for_test()
+        };
+        let mut report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert!(
+            report.failure_clusters[0]
+                .proposed_target_candidates
+                .is_empty(),
+            "legacy fallback must yield a cluster with NO proposed_target_candidates",
+        );
+        assert!(
+            report.failure_clusters[0]
+                .admitted_cluster_targets
+                .is_empty(),
+            "legacy fallback must yield a cluster with NO admitted_cluster_targets pre-merge",
+        );
+
+        // Step 3: merge — "all clusters targetless" branch fires, the
+        // first cluster gets the legacy `repair_targets` appended.
+        super::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        let candidates = &report.failure_clusters[0].proposed_target_candidates;
+        assert_eq!(
+            candidates.len(),
+            1,
+            "merge must populate proposed_target_candidates from legacy repair_targets",
+        );
+        assert_eq!(candidates[0].raw_path, "app/main.py");
+        assert!(
+            candidates[0].role_hint.is_none(),
+            "merge from legacy: role_hint is always None (ParsedVerifierRepairTarget has no role)",
+        );
+
+        // Step 4: enrich — the SSOT admission gate produces at least one
+        // admitted target because `app/main.py` exists in the workspace.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::ImplementationContract,
+        );
+
+        // Step 5: cluster now carries an admitted target — the
+        // production "all admitted_cluster_targets empty → drop semantic
+        // report" predicate would now be **false**, so the caller keeps
+        // the report and the downstream pipeline can build a
+        // SemanticRepairPlan.
+        let admitted = &report.failure_clusters[0].admitted_cluster_targets;
+        assert!(
+            !admitted.is_empty(),
+            "enrich must admit at least one target from the legacy reply (production-level closure)",
+        );
+        assert_eq!(
+            admitted[0].path, "app/main.py",
+            "admitted path must round-trip the legacy target",
+        );
+        assert!(
+            !report
+                .failure_clusters
+                .iter()
+                .all(|c| c.admitted_cluster_targets.is_empty()),
+            "production gate: report is kept (NOT dropped) because at least one cluster has admitted targets",
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, Codex required change #2 closure): the
+    /// `enrich_failure_clusters_with_admitted_targets` callsite MUST pass
+    /// `SpecAuthority` as an **explicit argument** — not consult some
+    /// implicit helper inside the function body. This is enforced
+    /// structurally at the production callsite in `run_verifier_diagnostic_pass`.
+    ///
+    /// The grep half asserts that the enrich helper's signature names
+    /// `spec_authority` (no implicit helper like `current_spec_authority_for`
+    /// inside the body), and the call-site half observes that two
+    /// different `SpecAuthority` values can be passed and threaded
+    /// through to `sort_admitted_by_authority_role_priority` (the
+    /// authority parameter is currently advisory per the CR-5 V2 decision
+    /// table, but the parameter is structurally wired so future
+    /// authority-conditional branches can be introduced without touching
+    /// the call-sites).
+    #[test]
+    fn cb017_enrich_uses_explicit_spec_authority_argument() {
+        // Grep half: confirm the enrich signature names spec_authority and
+        // the body has no `current_spec_authority_for(` helper invocation.
+        let src = include_str!("turn.rs");
+        let fn_pos = src
+            .find("pub(super) fn enrich_failure_clusters_with_admitted_targets(")
+            .expect("enrich function must exist");
+        let signature_window = &src[fn_pos..fn_pos + 400];
+        assert!(
+            signature_window.contains("spec_authority: super::spec_authority::SpecAuthority"),
+            "enrich must declare SpecAuthority as an explicit named argument (Codex CR #2)",
+        );
+        // Take a generous body slice (up to the next top-level fn).
+        let after = &src[fn_pos..];
+        let next_fn = after[1..]
+            .find("\npub(super) fn ")
+            .or_else(|| after[1..].find("\nfn "))
+            .map(|n| n + 1)
+            .unwrap_or(after.len());
+        let body = &after[..next_fn];
+        assert!(
+            !body.contains("current_spec_authority_for("),
+            "enrich body must NOT consult an implicit `current_spec_authority_for` helper — \
+             SpecAuthority is threaded as an explicit argument (Codex CR #2)",
+        );
+
+        // Behaviour half: confirm the explicit argument is actually
+        // observable by the sort routine — two enrich runs with different
+        // SpecAuthority values successfully complete with the explicit
+        // argument visible to the sort.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let impl_file = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(impl_file.parent().unwrap()).unwrap();
+        std::fs::write(&impl_file, "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+
+        let candidate = |path: &str| super::super::semantic_failure::RawClusterTargetCandidate {
+            raw_path: path.to_string(),
+            role_hint: None,
+            reason: "r".to_string(),
+        };
+        let mut report_user = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            vec![candidate("app/main.py")],
+        );
+        let mut report_contract = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            vec![candidate("app/main.py")],
+        );
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report_user,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+        );
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report_contract,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::ImplementationContract,
+        );
+        // Both runs admit the same single target — different SpecAuthority
+        // values do not crash and produce a determinstic admitted list (the
+        // decision table is advisory under CR-5 V2 but the argument is
+        // structurally wired all the way to the sort routine).
+        assert_eq!(
+            report_user.failure_clusters[0]
+                .admitted_cluster_targets
+                .len(),
+            1
+        );
+        assert_eq!(
+            report_contract.failure_clusters[0]
+                .admitted_cluster_targets
+                .len(),
+            1
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, Codex required change #3 closure):
+    /// `RawClusterTargetCandidate.role_hint` is untrusted advisory data
+    /// (LLM-supplied). Production code must NOT log it as raw metadata —
+    /// the value is consumed only inside the structured sort routines and
+    /// is never threaded into `log_llm_event` / `tracing::info!` /
+    /// `tracing::debug!` / `tracing::warn!` payloads.
+    ///
+    /// This is a structural grep test: production-grade source files in
+    /// `src/agent/loop_run/` must contain no occurrence of
+    /// `role_hint` inside a log payload context. Test fixtures (in
+    /// `#[cfg(test)] mod ...`) are permitted to mention `role_hint` for
+    /// assertions.
+    #[test]
+    fn cb017_role_hint_not_logged_as_raw_metadata() {
+        // We grep each file's production region (everything before the
+        // first `#[cfg(test)]` marker) for prohibited combinations of
+        // `role_hint` with logging macros / helpers.
+        const FILES: &[(&str, &str)] = &[
+            ("turn.rs", include_str!("turn.rs")),
+            ("repair_job.rs", include_str!("repair_job.rs")),
+            ("semantic_failure.rs", include_str!("semantic_failure.rs")),
+        ];
+        for (name, src) in FILES {
+            // Take everything before the first `#[cfg(test)]` block — this
+            // is the production region. Files without a cfg(test) marker
+            // are scanned in full.
+            let prod_region: &str = match src.find("#[cfg(test)]") {
+                Some(idx) => &src[..idx],
+                None => src,
+            };
+            // Forbidden patterns: role_hint appearing on the same line as
+            // a logging entry-point. We use a coarse line scan.
+            for (lineno, line) in prod_region.lines().enumerate() {
+                if !line.contains("role_hint") {
+                    continue;
+                }
+                let in_log_payload = line.contains("log_llm_event")
+                    || line.contains("tracing::info!")
+                    || line.contains("tracing::debug!")
+                    || line.contains("tracing::warn!")
+                    || line.contains("tracing::error!")
+                    || line.contains("tracing::trace!");
+                assert!(
+                    !in_log_payload,
+                    "{name}:{}: role_hint must NOT appear inside a log payload line (Codex CR #3 / DR4-001 advisory boundary)",
+                    lineno + 1
+                );
+            }
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

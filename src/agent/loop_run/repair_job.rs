@@ -3073,6 +3073,20 @@ mod tests {
     /// `NeedDiagnostic`. That would be a livelock: we just finished a
     /// fresh diagnostic, and routing back would consume the diagnostic
     /// budget for nothing.
+    ///
+    /// CB-017 A''' (Commit 5): natural-flow variant. Earlier revisions of
+    /// this test hand-tuned `assessment.repair_target_hint` to a cluster B
+    /// path so the post-advance `verifier_repair_decision` could resolve a
+    /// target file on disk. Commit 4 introduced
+    /// `rebind_legacy_assessment_to_current_cluster`, which is now invoked
+    /// at the production `DiagnosticSkip` callsite immediately after the
+    /// preserve-exhausted helper. The rebind transparently overwrites the
+    /// assessment slice with cluster B's `admitted_cluster_targets`, so
+    /// the test no longer needs to seed the cluster B path manually —
+    /// removing the "manual B target" blind spot the Codex review called
+    /// out. The test now drives the production sequence verbatim
+    /// (preserve-exhausted → rebind) and asserts that the assessment ends
+    /// up aligned with cluster B's fixture-admitted target (`app/main_1.py`).
     #[test]
     fn cb016_diagnostic_skip_advance_produces_fresh_plan() {
         use tempfile::tempdir;
@@ -3088,14 +3102,14 @@ mod tests {
             .collect();
         let role = report.preferred_repair_role;
 
-        // The work_root needs a file for `verifier_repair_context_target_path`
-        // / `latest_successful_read_existing_path` to resolve to it; we
-        // construct one matching the fresh repair_target_hint we will set
-        // on the assessment below. The essential CB-016.1 invariant is
-        // that the decision is NOT `NeedDiagnostic` / `DiagnosticUnavailable`
-        // post-advance.
-        let fresh_target = "app/cluster_b.py";
-        let fresh_target_path = work_root.join(fresh_target);
+        // The fixture seeds every cluster with a synthetic admitted target
+        // at `app/main_{idx}.py`. After the natural rebind, cluster B's
+        // assessment slot will point at `app/main_1.py` — we materialise
+        // that file on disk so `verifier_repair_context_target_path` can
+        // resolve a real path for the decision check below. NO manual
+        // assessment.repair_target_hint setting (CB-017 A''' natural flow).
+        let cluster_b_fixture_target = "app/main_1.py";
+        let fresh_target_path = work_root.join(cluster_b_fixture_target);
         if let Some(parent) = fresh_target_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -3104,12 +3118,14 @@ mod tests {
         // Job posture: cluster A exhausted (verifier rerun no-progress
         // pushed it onto the ledger and walked to cluster B on a prior
         // turn). The fresh diagnostic just ran and bumped the assessment
-        // generation to 2. The assessment now corresponds to the freshly
-        // diagnosed (still) cluster A — the LLM re-proposed it.
-        let fresh_hint = super::super::task_contract::RecoveryTargetHint {
+        // generation to 2. The assessment slot still carries cluster A's
+        // **stale** target (no manual cluster B seeding) — the rebind
+        // helper will realign it to cluster B's admitted target during
+        // the production sequence below.
+        let stale_cluster_a_hint = super::super::task_contract::RecoveryTargetHint {
             role: super::super::task_contract::ArtifactRole::Implementation,
-            path: fresh_target.to_string(),
-            reason: "fresh diagnostic re-proposed cluster A".to_string(),
+            path: "app/main_0.py".to_string(),
+            reason: "stale cluster A target — rebind must overwrite this".to_string(),
         };
         let plan_b_before = SemanticRepairPlan {
             semantic_report: report.clone(),
@@ -3131,13 +3147,15 @@ mod tests {
                 failure_type: VerifierFailureType::Unknown,
                 probable_cause_role: Some(role),
                 needed_reads: Vec::new(),
-                repair_target_hint: Some(fresh_hint.clone()),
-                repair_plan: vec![fresh_hint],
+                repair_target_hint: Some(stale_cluster_a_hint.clone()),
+                repair_plan: vec![stale_cluster_a_hint],
                 summary: None,
                 source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
             }),
             // Fresh diagnostic just landed → assessment_generation bumped to 2.
             assessment_generation: 2,
+            // Prior bind: cluster A (transition to B will land via rebind).
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
             ..RepairJob::new_for_test()
         };
 
@@ -3161,9 +3179,14 @@ mod tests {
             assessment_generation_at_creation: 1,
         };
 
-        // DiagnosticSkip path: the helper recognises cluster A is exhausted
-        // and walks to cluster B with the fresh assessment in hand.
+        // Mirror the production sequence in run_verifier_diagnostic_pass:
+        //   1. assign_semantic_plan_preserving_exhausted (DiagnosticSkip)
+        //      walks past cluster A to cluster B.
+        //   2. rebind_legacy_assessment_to_current_cluster realigns the
+        //      assessment slice to cluster B's admitted targets — NO
+        //      manual cluster B seeding required (CB-017 A''' blind-spot fix).
         assign_semantic_plan_preserving_exhausted(&mut job, Some(proposed_plan_a), Some(&report));
+        rebind_legacy_assessment_to_current_cluster(&mut job);
 
         let advanced = job
             .semantic_plan
@@ -3172,6 +3195,45 @@ mod tests {
         assert_eq!(
             advanced.failure_cluster_id, cluster_ids[1],
             "DiagnosticSkip must walk past exhausted cluster A to cluster B",
+        );
+        // CB-017 A''' natural flow: the rebind helper automatically
+        // realigned the assessment slot to cluster B's fixture-admitted
+        // target. No manual cluster B seeding was performed on the
+        // assessment — the test would have failed under the pre-Commit-4
+        // implementation that left assessment.repair_target_hint stuck on
+        // cluster A.
+        let assessment = job
+            .assessment
+            .as_ref()
+            .expect("rebind preserves assessment");
+        let cluster_b_admitted = report.failure_clusters[1].admitted_cluster_targets[0].clone();
+        assert_eq!(
+            assessment.repair_target_hint.as_ref(),
+            Some(&cluster_b_admitted),
+            "CB-017 A''' natural flow: rebind must point repair_target_hint at cluster B's admitted target without manual seeding",
+        );
+        assert_eq!(
+            assessment
+                .repair_target_hint
+                .as_ref()
+                .map(|h| h.path.as_str()),
+            Some(cluster_b_fixture_target),
+            "CB-017 A''' natural flow: cluster B fixture target path is app/main_1.py — not a manually injected app/cluster_b.py",
+        );
+        assert_eq!(
+            assessment.repair_plan,
+            vec![cluster_b_admitted.clone()],
+            "rebind must overwrite repair_plan with cluster B targets clone",
+        );
+        assert_eq!(
+            assessment.needed_reads,
+            vec![cluster_b_admitted],
+            "rebind must overwrite needed_reads with cluster B targets clone",
+        );
+        assert_eq!(
+            job.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_ids[1]),
+            "bound id must transition to cluster B after rebind",
         );
         // CB-016 core invariant: the new plan looks fresh
         // (plan.gen < job.gen) so the stale predicate does NOT fire.
@@ -3898,6 +3960,117 @@ mod tests {
         assert!(
             job2.assessment_bound_cluster_id.is_none(),
             "no-more-clusters fallback must reset bound id to None",
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, CR-4 V2 lifecycle): `assessment_bound_cluster_id`
+    /// must be reset to `None` on every dispatch path that drops
+    /// `assessment` to `None`. This fixes the bound id and `assessment`
+    /// option in lock-step so the next diagnostic-pass rebind treats the
+    /// new assessment as a "new bind" (transition → clears
+    /// `applied_repair_intents`).
+    ///
+    /// Complements `cb017_assessment_bound_cluster_id_reset_on_dispatch_re_diagnostic`
+    /// by isolating the invariant "whenever assessment falls to None, the
+    /// bound id falls to None too" — explicitly required by Codex review 4.
+    #[test]
+    fn cb017_assessment_bound_cluster_id_reset_when_assessment_falls_to_none() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 1);
+        let only_cluster = report.failure_clusters[0].cluster_key.clone();
+        let role = report.preferred_repair_role;
+
+        // Construct a job that is in the "rerun bad, plan exhausted" posture
+        // — should_re_diagnostic = true → dispatch will null the
+        // assessment AND must null the bound id in lock-step.
+        let plan_only = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: only_cluster.clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_only),
+            exhausted_attempts: vec![(only_cluster.clone(), role)],
+            assessment: Some(assessment_with_targets(
+                Some(impl_hint("app/main_0.py")),
+                vec![impl_hint("app/main_0.py")],
+                vec![impl_hint("app/main_0.py")],
+            )),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            assessment_bound_cluster_id: Some(only_cluster.clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&only_cluster));
+
+        // Invariant: assessment-None ↔ bound-id-None (lock-step reset).
+        assert!(
+            job.assessment.is_none(),
+            "dispatch must clear assessment when re-diagnostic is needed",
+        );
+        assert!(
+            job.assessment_bound_cluster_id.is_none(),
+            "CR-4 V2: assessment-None implies bound-id-None (lock-step lifecycle)",
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, CR-4 V2 lifecycle): the legacy path
+    /// (`semantic_plan = None`) must not touch `assessment_bound_cluster_id`.
+    /// `rebind_legacy_assessment_to_current_cluster` is a complete no-op in
+    /// this case — including leaving the bound id untouched (whatever it
+    /// was — `Some(...)` or `None` — before the call must match after).
+    ///
+    /// This explicitly locks the invariant Codex review 4 called out:
+    /// "legacy 経路 (semantic_plan = None) では bound は変更されない".
+    /// Complements `cb017_rebind_no_op_when_semantic_plan_none` (which
+    /// fixes the entire job equality) by naming the bound-id invariant
+    /// directly.
+    #[test]
+    fn cb017_assessment_bound_cluster_id_unaffected_when_semantic_plan_is_none() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 1);
+        let stale_bound = report.failure_clusters[0].cluster_key.clone();
+
+        // Bound id was Some(...) before — must stay Some(...) (unchanged)
+        // when the rebind sees semantic_plan = None.
+        let mut job_with_some_bound = RepairJob {
+            semantic_plan: None,
+            assessment: Some(assessment_with_targets(
+                Some(impl_hint("app/legacy.py")),
+                vec![impl_hint("app/legacy.py")],
+                vec![impl_hint("app/legacy.py")],
+            )),
+            assessment_bound_cluster_id: Some(stale_bound.clone()),
+            ..RepairJob::new_for_test()
+        };
+        rebind_legacy_assessment_to_current_cluster(&mut job_with_some_bound);
+        assert_eq!(
+            job_with_some_bound.assessment_bound_cluster_id.as_ref(),
+            Some(&stale_bound),
+            "legacy path (semantic_plan=None): bound id Some(_) must remain unchanged",
+        );
+
+        // Bound id was None before — must stay None when the rebind sees
+        // semantic_plan = None.
+        let mut job_with_none_bound = RepairJob {
+            semantic_plan: None,
+            assessment: Some(assessment_with_targets(
+                Some(impl_hint("app/legacy.py")),
+                vec![impl_hint("app/legacy.py")],
+                vec![impl_hint("app/legacy.py")],
+            )),
+            assessment_bound_cluster_id: None,
+            ..RepairJob::new_for_test()
+        };
+        rebind_legacy_assessment_to_current_cluster(&mut job_with_none_bound);
+        assert!(
+            job_with_none_bound.assessment_bound_cluster_id.is_none(),
+            "legacy path (semantic_plan=None): bound id None must remain None",
         );
     }
 
