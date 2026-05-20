@@ -535,6 +535,12 @@ pub struct Agent {
     /// the behavior-coverage decision is evaluated within the same turn
     /// the excerpts were observed.
     task_contract_excerpts: task_contract::ArtifactExcerpts,
+    /// Issue #646 (C2 / A4): turn-scoped map of pre-tool file hashes captured
+    /// immediately before each Write/Edit execution. Consumed by
+    /// `observe_evidence_from_repo_edit` to detect no-op writes (content
+    /// unchanged → no `Owned` promotion). `None` means the file did not exist
+    /// prior to the tool call. Reset at the `handle_user_message` head.
+    turn_pre_tool_file_hashes: std::collections::HashMap<String, Option<String>>,
     /// Issue #646 (A1): turn-scoped first-class state for "verifier is
     /// missing". Set by `drive_task_contract_verifier::NoVerifier`, cleared
     /// at `handle_user_message` head and on verifier success. While
@@ -772,6 +778,7 @@ impl Agent {
             repair_failure_snapshot: None,
             task_contract_excerpts: task_contract::ArtifactExcerpts::new(),
             missing_verifier_job: None,
+            turn_pre_tool_file_hashes: std::collections::HashMap::new(),
             turn_edited_relative_paths: std::collections::HashSet::new(),
         }
     }

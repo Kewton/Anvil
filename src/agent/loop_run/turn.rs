@@ -3486,8 +3486,11 @@ impl Agent {
         // Issue #646 (C1): per-turn ownership reset. Each user turn starts a
         // fresh task — prior-turn edits do NOT auto-confer ownership on the
         // new task. Clearing here also wipes the MissingVerifierJob so
-        // verifier retry budgets restart per task.
+        // verifier retry budgets restart per task, and the
+        // `turn_pre_tool_file_hashes` capture cache so stale baselines from
+        // a prior turn cannot mask the next turn's first write.
         self.turn_edited_relative_paths.clear();
+        self.turn_pre_tool_file_hashes.clear();
         self.missing_verifier_job = None;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
@@ -5328,10 +5331,16 @@ impl Agent {
                 .allowed_tool_names_for_prompt()
                 .is_some()
             {
-                match effective_tool_batch_action(
+                let batch_scope = if self.missing_verifier_job.is_some() {
+                    Some(self.current_workspace_scope())
+                } else {
+                    None
+                };
+                match effective_tool_batch_action_with_scope(
                     &prepared_tool_calls,
                     &effective_tool_policy,
                     &self.work_root,
+                    batch_scope.as_ref(),
                 ) {
                     FocusedEditBatchAction::Accept => {}
                     FocusedEditBatchAction::TruncateToFirst => {
@@ -7602,15 +7611,30 @@ impl Agent {
                     Some(args.repo_edit_calls_made_this_turn);
                 self.task_contract_verifier_repair_pending = true;
                 self.repair_job = None;
-                // Issue #646 (A1): raise a first-class MissingVerifierJob so
-                // the planner suppresses `RunVerifier` until an in-scope edit
-                // lands (B2). The retry budget mirrors the legacy
-                // `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (3) but is owned by
-                // the job itself, decoupled from the failure-driven counter.
-                self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
-                    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
-                    args.repo_edit_calls_made_this_turn,
-                ));
+                // Issue #646 (A1): raise / advance the first-class
+                // MissingVerifierJob. The job persists across NoVerifier
+                // transitions within the same user turn so its retry budget
+                // (`record_retry`) is the authoritative ceiling; the legacy
+                // `contract_verification_retries` counter remains as a
+                // belt-and-braces guard.
+                if self.missing_verifier_job.is_none() {
+                    self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
+                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
+                        args.repo_edit_calls_made_this_turn,
+                    ));
+                }
+                let budget_exhausted = self
+                    .missing_verifier_job
+                    .as_mut()
+                    .is_some_and(|job| !job.record_retry());
+                if budget_exhausted {
+                    return TaskContractVerifierFlowOutcome::Exit {
+                        reason: ExitReason::MissingVerification,
+                        error_text:
+                            "task contract requires verification, but the MissingVerifierJob retry budget is exhausted"
+                                .to_string(),
+                    };
+                }
                 *args.repo_change_retries = 0;
                 *args.verifier_repair_retries = 0;
                 // Issue #637 (CB-001): transitioning to NoVerifier resets the
@@ -9795,8 +9819,23 @@ impl Agent {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
         }
+        // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
+        // active, hand the active workspace scope to the policy gate so
+        // out-of-scope `Write`/`Edit` paths are rejected even when the
+        // restricted whitelist would otherwise admit them.
+        let scope_for_policy = if self.missing_verifier_job.is_some() {
+            Some(self.current_workspace_scope())
+        } else {
+            None
+        };
         let effective_policy_error = if let Some(policy) = effective_tool_policy {
-            effective_tool_policy_error_for_call(policy, name, arguments, &self.work_root)
+            effective_tool_policy_error_for_call_with_scope(
+                policy,
+                name,
+                arguments,
+                &self.work_root,
+                scope_for_policy.as_ref(),
+            )
         } else {
             self.effective_tool_policy_error(name, arguments)
         };
@@ -9894,6 +9933,16 @@ impl Agent {
             };
         }
 
+        // Issue #646 (C2 / A4): capture pre-tool hash so
+        // `observe_evidence_from_repo_edit` can detect no-op Write/Edit
+        // calls (content unchanged → no `Owned` promotion).
+        if matches!(name, "Write" | "Edit")
+            && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
+            && let Some(rel) = workspace_relative_path_for_tool_arg(&self.work_root, raw_path)
+        {
+            let pre_hash = current_file_hash_for_relative_path(&self.work_root, &rel);
+            self.turn_pre_tool_file_hashes.insert(rel, pre_hash);
+        }
         match self.tool_registry.execute(name, arguments, &context) {
             Ok(result) => {
                 if matches!(name, "Write" | "Edit")
@@ -10044,10 +10093,36 @@ impl Agent {
             );
             return;
         }
-        // Issue #646 (C2): record the edited path AFTER the scaffold-delta
-        // gate so a no-op Write/Edit (writing the same scaffold body back)
-        // never promotes the file to `Owned`. Only substantive changes
-        // contribute to ownership.
+        // Issue #646 (C2 / A4): even after the scaffold-delta gate, a
+        // Write/Edit can be a content no-op for a NON-scaffold file (e.g.
+        // model writes the same body back, or `Edit` whose `old_string`
+        // equals `new_string`). Compare the pre-tool hash captured in
+        // `execute_tool_call` against the current on-disk hash. Identical
+        // hashes mean the file did not actually change — bail out so the
+        // path does NOT enter `turn_edited_relative_paths` and does NOT
+        // contribute completion evidence. The pre-tool entry is removed in
+        // either branch to keep the cache turn-local and bounded.
+        let pre_tool_hash = self.turn_pre_tool_file_hashes.remove(&relative_path);
+        let current_hash = current_file_hash_for_relative_path(&self.work_root, &relative_path);
+        if is_repo_edit_no_op(
+            pre_tool_hash.as_ref().and_then(Option::as_deref),
+            current_hash.as_deref(),
+        ) {
+            crate::logging::log_completion_evidence_observed(
+                self.current_turn_index,
+                0,
+                "repo_edit_no_op",
+                serde_json::json!({
+                    "category": format!("{:?}", category),
+                    "path": relative_path,
+                }),
+            );
+            return;
+        }
+        // Issue #646 (C2): record the edited path AFTER both the scaffold-
+        // delta gate AND the no-op hash check so a content-unchanged
+        // Write/Edit (scaffold body re-written, or `Edit` with
+        // `old_string == new_string`) never promotes the file to `Owned`.
         self.turn_edited_relative_paths
             .insert(relative_path.clone());
         // Issue #646 (A1/B2): once an in-scope edit has landed, the
@@ -10450,11 +10525,17 @@ impl Agent {
         arguments: &serde_json::Value,
     ) -> Option<String> {
         let effective_tool_policy = self.effective_tool_policy();
-        effective_tool_policy_error_for_call(
+        let scope = if self.missing_verifier_job.is_some() {
+            Some(self.current_workspace_scope())
+        } else {
+            None
+        };
+        effective_tool_policy_error_for_call_with_scope(
             &effective_tool_policy,
             name,
             arguments,
             &self.work_root,
+            scope.as_ref(),
         )
     }
 
@@ -16373,11 +16454,32 @@ fn focused_edit_tool_policy_error(
     }
 }
 
+/// Legacy non-scope wrapper kept for unit tests and tests-only re-exports.
+/// Production code MUST use [`effective_tool_policy_error_for_call_with_scope`]
+/// so the MissingVerifierJob scope gate fires (Issue #646 A1/A3).
+#[cfg(test)]
 fn effective_tool_policy_error_for_call(
     policy: &EffectiveToolPolicy,
     name: &str,
     arguments: &serde_json::Value,
     work_root: &Path,
+) -> Option<String> {
+    effective_tool_policy_error_for_call_with_scope(policy, name, arguments, work_root, None)
+}
+
+/// Issue #646 (A1/A3): scope-aware variant. When `scope` is provided and the
+/// policy is a `VerifierRepair`-reasoned restricted policy WITHOUT a
+/// focused-edit or artifact-directed target (i.e. the MissingVerifierJob
+/// fallback whitelist), the file-targeting tool calls must additionally pass
+/// `scope.contains(...)` on the resolved path argument. Out-of-scope writes
+/// are rejected even though `Write`/`Edit`/`Bash` would otherwise satisfy
+/// the tool-name whitelist.
+fn effective_tool_policy_error_for_call_with_scope(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    scope: Option<&super::task_workspace_scope::TaskWorkspaceScope>,
 ) -> Option<String> {
     if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt()
         && !allowed_tools.contains(&name)
@@ -16404,7 +16506,51 @@ fn effective_tool_policy_error_for_call(
         return artifact_directed_tool_policy_error(name, arguments, &artifact.target, work_root);
     }
 
+    // Issue #646 (A1/A3): MissingVerifierJob fallback scope enforcement.
+    if policy.reason() == EffectiveToolPolicyReason::VerifierRepair
+        && let Some(scope) = scope
+        && let Some(err) = missing_verifier_scope_policy_error(name, arguments, work_root, scope)
+    {
+        return Some(err);
+    }
+
     None
+}
+
+/// Issue #646 (C2 / A4): no-op repo-edit detector. Compares the pre-tool
+/// content hash captured in `execute_tool_call` against the post-tool
+/// content hash. When both are `Some(x)` with equal values the Write/Edit
+/// did not modify the file and MUST NOT promote the path to `Owned`.
+///
+/// Returns `false` whenever the pre-tool hash is missing (first observation
+/// in the turn) or `None` (file didn't exist before the tool call), since
+/// those are real edits.
+fn is_repo_edit_no_op(pre_tool_hash: Option<&str>, current_hash: Option<&str>) -> bool {
+    matches!((pre_tool_hash, current_hash), (Some(p), Some(c)) if p == c)
+}
+
+/// Issue #646 (A1/A3): rejects file-targeting tool calls whose resolved path
+/// argument falls outside the active `TaskWorkspaceScope`. Applies only when
+/// the policy reason is `VerifierRepair` and the policy carries no specific
+/// target (i.e. the MissingVerifierJob whitelist case).
+fn missing_verifier_scope_policy_error(
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+) -> Option<String> {
+    if !matches!(name, "Write" | "Edit") {
+        return None;
+    }
+    let raw_path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+    let relative = workspace_relative_path_for_tool_arg(work_root, raw_path)?;
+    if scope.contains(&relative) {
+        return None;
+    }
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    Some(format!(
+        "MissingVerifierJob policy rejected {rejected_tool}; path {relative} is outside the active workspace scope"
+    ))
 }
 
 fn artifact_directed_tool_policy_error(
@@ -16542,20 +16688,36 @@ fn focused_edit_tool_batch_action(
     }
 }
 
+/// Legacy non-scope wrapper kept for unit tests and tests-only re-exports.
+/// Production code MUST use [`effective_tool_batch_action_with_scope`].
+#[cfg(test)]
 fn effective_tool_batch_action(
     tool_calls: &[ToolCall],
     policy: &EffectiveToolPolicy,
     work_root: &Path,
 ) -> FocusedEditBatchAction {
+    effective_tool_batch_action_with_scope(tool_calls, policy, work_root, None)
+}
+
+/// Issue #646 (A1/A3): scope-aware variant of [`effective_tool_batch_action`].
+/// Forwarded scope is consulted only by the MissingVerifierJob fallback
+/// branch inside `effective_tool_policy_error_for_call_with_scope`.
+fn effective_tool_batch_action_with_scope(
+    tool_calls: &[ToolCall],
+    policy: &EffectiveToolPolicy,
+    work_root: &Path,
+    scope: Option<&super::task_workspace_scope::TaskWorkspaceScope>,
+) -> FocusedEditBatchAction {
     let Some(first_tool_call) = tool_calls.first() else {
         return FocusedEditBatchAction::Accept;
     };
 
-    if let Some(err) = effective_tool_policy_error_for_call(
+    if let Some(err) = effective_tool_policy_error_for_call_with_scope(
         policy,
         &first_tool_call.name,
         &first_tool_call.arguments,
         work_root,
+        scope,
     ) {
         return FocusedEditBatchAction::Reject(err);
     }
@@ -17707,12 +17869,13 @@ mod progress_tests {
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         effective_tool_batch_action, effective_tool_policy_error_for_call,
-        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
-        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
-        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
-        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
-        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
+        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
+        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
+        first_existing_impl_target, focused_edit_compact_anchor_note,
+        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
+        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
+        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
+        focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
@@ -17720,8 +17883,8 @@ mod progress_tests {
         focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
-        has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
-        last_read_tool_path, latest_page_copy_block_from_read,
+        has_successful_repo_edit, implementation_quality_issue_for_request, is_repo_edit_no_op,
+        is_utf8_locale, last_read_tool_path, latest_page_copy_block_from_read,
         latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
         parse_verifier_repair_assessment_reply, parse_verifier_repair_intent_reply,
         parse_verifier_repair_intents_reply, post_scaffold_continuation_active,
@@ -21164,6 +21327,126 @@ export default function App() {
             work_root,
             &scope
         ));
+    }
+
+    #[test]
+    fn no_op_repo_edit_detector_returns_true_only_for_matching_hashes() {
+        // Issue #646 (A4 / C2): the pure helper guarding
+        // `observe_evidence_from_repo_edit` against no-op Write/Edit calls.
+        // Identical pre/post hashes → no-op; any difference, or a None on
+        // either side, → real edit (insertion + evidence flow proceeds).
+        assert!(is_repo_edit_no_op(Some("abc"), Some("abc")));
+        assert!(!is_repo_edit_no_op(Some("abc"), Some("def")));
+        assert!(!is_repo_edit_no_op(None, Some("abc"))); // file didn't exist before
+        assert!(!is_repo_edit_no_op(Some("abc"), None)); // file deleted (treat as edit)
+        assert!(!is_repo_edit_no_op(None, None));
+    }
+
+    #[test]
+    fn missing_verifier_policy_rejects_out_of_scope_write() {
+        // Issue #646 (A1/A3): the MissingVerifierJob fallback policy is a
+        // `restricted(VerifierRepair, ["Write","Edit","Bash"])`. Without
+        // the scope gate, `Write` on `0517_003/app/main.py` would silently
+        // pass — exactly the codex finding. The scope-aware policy gate
+        // must reject the call with a MissingVerifierJob-flavoured error.
+        let dir = tempdir().unwrap();
+        let work_root = dir.path();
+        // Make `0517_003/` project-like so it sits in AmbiguousParent scope.
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        std::fs::write(work_root.join("0517_003/tests/test_main.py"), "").unwrap();
+        std::fs::write(work_root.join("0517_003/app/main.py"), "").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでCRUDのAPIを開発してください",
+        );
+        assert!(!scope.contains("0517_003/app/main.py"));
+
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write", "Edit", "Bash"],
+        );
+        let arguments = serde_json::json!({
+            "path": "0517_003/app/main.py",
+            "content": "from fastapi import FastAPI\napp = FastAPI()\n",
+        });
+        let err = effective_tool_policy_error_for_call_with_scope(
+            &policy,
+            "Write",
+            &arguments,
+            work_root,
+            Some(&scope),
+        )
+        .expect("OOS write must be rejected by MissingVerifierJob scope gate");
+        assert!(
+            err.contains("MissingVerifierJob policy rejected"),
+            "got: {err}"
+        );
+        assert!(err.contains("0517_003/app/main.py"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_verifier_policy_admits_in_scope_write() {
+        // Issue #646: the same scope gate must NOT reject an in-scope path.
+        let dir = tempdir().unwrap();
+        let work_root = dir.path();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        std::fs::write(work_root.join("0517_003/tests/test_main.py"), "").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでCRUDのAPIを開発してください",
+        );
+        // Sanity: a fresh root-level path is in scope under AmbiguousParent.
+        assert!(scope.contains("app/main.py"));
+
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write", "Edit", "Bash"],
+        );
+        let arguments = serde_json::json!({
+            "path": "app/main.py",
+            "content": "from fastapi import FastAPI\napp = FastAPI()\n",
+        });
+        assert!(
+            effective_tool_policy_error_for_call_with_scope(
+                &policy,
+                "Write",
+                &arguments,
+                work_root,
+                Some(&scope),
+            )
+            .is_none(),
+            "in-scope write must pass under MissingVerifierJob scope gate"
+        );
+    }
+
+    #[test]
+    fn missing_verifier_policy_lets_bash_through_irrespective_of_path_arg() {
+        // Bash has no `path` argument; the scope gate intentionally only
+        // restricts file-targeting tools (Write/Edit). Bash is the
+        // verifier-run / dependency-install lifeline and must not be
+        // blocked by this gate.
+        let dir = tempdir().unwrap();
+        let work_root = dir.path();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでCRUDのAPIを開発してください",
+        );
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write", "Edit", "Bash"],
+        );
+        let arguments = serde_json::json!({"command": "pytest -q"});
+        assert!(
+            effective_tool_policy_error_for_call_with_scope(
+                &policy,
+                "Bash",
+                &arguments,
+                work_root,
+                Some(&scope),
+            )
+            .is_none()
+        );
     }
 
     #[test]
