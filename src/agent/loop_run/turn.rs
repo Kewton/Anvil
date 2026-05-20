@@ -9292,8 +9292,27 @@ impl Agent {
                 attempt_spec.role,
             );
         };
-        let assessment =
-            model_assessment_to_verifier_repair_assessment(&self.work_root, &context, parsed);
+        // Issue #647 (§5.1 SSOT plumbing): build the path-local admission
+        // context from the agent's current scope + edit signals so every
+        // hint promoted by `model_assessment_to_verifier_repair_assessment`
+        // (and its sibling helpers) routes through `admit_repair_target_hint`
+        // for the *hint's own path*, not a turn-global signal.
+        let scope = self.current_workspace_scope();
+        let turn_edited = self.turn_edited_relative_paths.clone();
+        let edited_predicate = |path: &str| turn_edited.contains(path);
+        let scaffold_predicate = |path: &str| self.repo_edit_has_post_scaffold_delta(path);
+        let admission = RepairTargetAdmissionContext {
+            work_root: &self.work_root,
+            scope: &scope,
+            edited_this_session_for: &edited_predicate,
+            scaffold_changed_for: &scaffold_predicate,
+        };
+        let assessment = model_assessment_to_verifier_repair_assessment(
+            &self.work_root,
+            &context,
+            parsed,
+            &admission,
+        );
         let has_target = assessment.repair_target_hint.is_some();
         if !has_target {
             return self.handle_verifier_diagnostic_failure(
@@ -15177,18 +15196,95 @@ fn recovery_target_hint_for_existing_path(
     })
 }
 
+/// Issue #647 (Phase C, §4.4 / §5.1): Owned admission context for every
+/// `RecoveryTargetHint` promotion path. Path-local predicates (DR3-001) so
+/// the SSOT gate evaluates `turn_edited_relative_paths.contains(path)` /
+/// `repo_edit_has_post_scaffold_delta(path)` for *the hint's own path*, not
+/// a turn-global signal that would falsely promote unrelated files.
+///
+/// `verifier_passed_in_scope` is omitted from the context per DR1-006:
+/// every callsite in this Issue is "trying to repair a hint" — by
+/// construction the verifier has not yet passed for the active scope, so
+/// `admit_repair_target_hint` fixes that flag to `false` literally. When a
+/// future Issue introduces post-success repair paths the field can be
+/// re-introduced on this struct without touching the SSOT function shape.
+pub(super) struct RepairTargetAdmissionContext<'a> {
+    pub(super) work_root: &'a Path,
+    pub(super) scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
+    pub(super) edited_this_session_for: &'a dyn Fn(&str) -> bool,
+    pub(super) scaffold_changed_for: &'a dyn Fn(&str) -> bool,
+}
+
+#[cfg(test)]
+fn admission_always_true(_: &str) -> bool {
+    true
+}
+
+#[cfg(test)]
+fn admission_always_false(_: &str) -> bool {
+    false
+}
+
+impl<'a> RepairTargetAdmissionContext<'a> {
+    /// Test-only helper: build an admission context whose predicates always
+    /// promote the hint to `Owned` (edited_this_session=true). Lets fixtures
+    /// keep their existing repair-target assertions while still routing
+    /// through the SSOT gate (S7-004 / DR2-001).
+    #[cfg(test)]
+    pub(super) fn owned_for_test(
+        work_root: &'a Path,
+        scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
+    ) -> Self {
+        Self {
+            work_root,
+            scope,
+            edited_this_session_for: &admission_always_true,
+            scaffold_changed_for: &admission_always_false,
+        }
+    }
+}
+
+/// Issue #647 (Phase C, §5.1 SSOT): Owned admission gate for any
+/// `RecoveryTargetHint` heading downstream into the repair-job pipeline.
+/// Every hint-promotion source category (6 categories in §5.1) routes
+/// through this single function so the `OwnershipInputs` invariants stay
+/// consistent (path-local predicates evaluated against `hint.path`,
+/// `verifier_passed_in_scope` fixed to `false` per DR1-006).
+pub(super) fn admit_repair_target_hint(
+    hint: super::task_contract::RecoveryTargetHint,
+    ctx: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    let path = hint.path.clone();
+    let inputs = super::artifact_ownership::OwnershipInputs {
+        work_root: ctx.work_root,
+        relative_path: &path,
+        scope: ctx.scope,
+        edited_this_session: (ctx.edited_this_session_for)(&path),
+        scaffold_changed: (ctx.scaffold_changed_for)(&path),
+        verifier_passed_in_scope: false,
+    };
+    match super::artifact_ownership::classify_ownership(inputs) {
+        super::artifact_ownership::ArtifactOwnership::Owned => Some(hint),
+        super::artifact_ownership::ArtifactOwnership::CandidateOnly
+        | super::artifact_ownership::ArtifactOwnership::OutOfScope => None,
+    }
+}
+
 fn recovery_target_hint_for_diagnostic_path(
     work_root: &Path,
     raw_path: &str,
     reason: &str,
     failure_kind: super::VerifierDiagnosticFailureKind,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     let hint = recovery_target_hint_for_existing_path(work_root, raw_path, reason)?;
     if hint.role == super::task_contract::ArtifactRole::Setup && !failure_kind.allows_setup_target()
     {
         return None;
     }
-    Some(hint)
+    // Issue #647 (§5.1 stage 2): Owned admission gate at the function exit.
+    // Path 1 of the 6 source categories: diagnostic LLM-proposed paths.
+    admit_repair_target_hint(hint, admission)
 }
 
 fn diagnostic_target_allowed_by_confidence(
@@ -15227,6 +15323,7 @@ fn verifier_repair_preferred_local_import_source(
     // after the parser scope reduction in Task 1.2). Production callers MUST pass
     // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
     derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     if derived_failure_type != super::VerifierFailureType::ImportOrDependency {
         return None;
@@ -15241,14 +15338,17 @@ fn verifier_repair_preferred_local_import_source(
         return None;
     }
     let hint = context.target_hint.as_ref()?;
-    if hint.role == super::task_contract::ArtifactRole::Implementation {
+    let promoted = if hint.role == super::task_contract::ArtifactRole::Implementation {
         Some(super::task_contract::RecoveryTargetHint {
             reason: "local import contract mismatch names this provider/source file".to_string(),
             ..hint.clone()
         })
     } else {
         None
-    }
+    }?;
+    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 4 of the
+    // 6 source categories: local-import-contract-derived hints.
+    admit_repair_target_hint(promoted, admission)
 }
 
 fn verifier_repair_stale_assertion_test_target(
@@ -15259,6 +15359,7 @@ fn verifier_repair_stale_assertion_test_target(
     // after the parser scope reduction in Task 1.2). Production callers MUST pass
     // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
     derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     if derived_failure_type != super::VerifierFailureType::AssertionFailure {
         return None;
@@ -15287,16 +15388,20 @@ fn verifier_repair_stale_assertion_test_target(
     {
         return None;
     }
-    Some(super::task_contract::RecoveryTargetHint {
+    let promoted = super::task_contract::RecoveryTargetHint {
         reason: "same assertion failure remained after a non-test repair; inspect generated test setup or expectations".to_string(),
         ..failure_target.clone()
-    })
+    };
+    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
+    // 6 source categories: stale-assertion test re-target.
+    admit_repair_target_hint(promoted, admission)
 }
 
 fn model_assessment_to_verifier_repair_assessment(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     parsed: ParsedVerifierRepairAssessment,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> super::VerifierRepairAssessment {
     let failure_kind = parsed.failure_kind;
     let failure_type =
@@ -15310,6 +15415,7 @@ fn model_assessment_to_verifier_repair_assessment(
                 &target.path,
                 &target.reason,
                 failure_kind,
+                admission,
             )
             .filter(|hint| {
                 diagnostic_target_allowed_by_confidence(
@@ -15332,6 +15438,7 @@ fn model_assessment_to_verifier_repair_assessment(
                 &target.path,
                 &target.reason,
                 failure_kind,
+                admission,
             )
             .filter(|hint| {
                 diagnostic_target_allowed_by_confidence(
@@ -15354,14 +15461,16 @@ fn model_assessment_to_verifier_repair_assessment(
     // Issue #638 (設計判断 #3): pass assessment-derived failure_type to helpers so
     // they gate on the diagnostic classification, not on context.failure_type
     // (which is Unknown after the parser scope reduction).
-    if let Some(preferred) = verifier_repair_preferred_local_import_source(context, failure_type) {
+    if let Some(preferred) =
+        verifier_repair_preferred_local_import_source(context, failure_type, admission)
+    {
         repair_plan.retain(|hint| hint.path != preferred.path);
         repair_plan.insert(0, preferred);
         repair_plan.truncate(3);
     }
     let selected_path = repair_plan.first().map(|hint| hint.path.as_str());
     if let Some(test_target) =
-        verifier_repair_stale_assertion_test_target(context, selected_path, failure_type)
+        verifier_repair_stale_assertion_test_target(context, selected_path, failure_type, admission)
     {
         repair_plan.retain(|hint| hint.path != test_target.path);
         repair_plan.insert(0, test_target);
@@ -15377,6 +15486,7 @@ fn model_assessment_to_verifier_repair_assessment(
                 path,
                 "diagnostic LLM suggested this secondary target",
                 failure_kind,
+                admission,
             )
         }))
         .take(3)
@@ -15391,6 +15501,13 @@ fn model_assessment_to_verifier_repair_assessment(
                 .map(|(hint, _)| hint.clone())
         })
         .or_else(|| {
+            // Issue #647 (§5.1): path 6 — `repair_target_hint` fallback from
+            // `probable_cause_role`. The candidates here come from
+            // `context.changed_file_hints` (path 3) and `needed_reads` (which
+            // were themselves already admitted via paths 1/4/5 above). Apply
+            // `admit_repair_target_hint` explicitly so the changed-file-hint
+            // branch is gated by the SSOT even when the inputs were copied
+            // straight off `RepairJob`.
             parsed.probable_cause_role.and_then(|role| {
                 needed_reads
                     .iter()
@@ -15401,6 +15518,7 @@ fn model_assessment_to_verifier_repair_assessment(
                                 || failure_kind.allows_setup_target())
                     })
                     .cloned()
+                    .and_then(|hint| admit_repair_target_hint(hint, admission))
             })
         });
 
@@ -19613,8 +19731,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19677,8 +19798,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19772,8 +19896,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19816,8 +19943,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19856,8 +19986,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19901,8 +20034,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19985,8 +20121,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert!(assessment.repair_target_hint.is_none());
         assert!(assessment.needed_reads.is_empty());
@@ -20014,8 +20153,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert!(assessment.repair_target_hint.is_none());
     }
@@ -21607,8 +21749,11 @@ export default function App() {
             }"#,
         )
         .expect("diagnostic json should parse");
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            work_root, &context, parsed, &admission,
+        );
 
         // Issue #638 (設計判断 #3): LocalImportContractMismatch → ImportOrDependency,
         // so verifier_repair_preferred_local_import_source fires and promotes
@@ -23553,12 +23698,15 @@ export default function App() {
             repair_attempt: 1,
             ..super::super::repair_job::RepairJob::new_for_test()
         };
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
 
         // With Unknown (parser-only), the helper must NOT fire.
         assert!(
             verifier_repair_preferred_local_import_source(
                 &context,
-                super::super::VerifierFailureType::Unknown
+                super::super::VerifierFailureType::Unknown,
+                &admission,
             )
             .is_none(),
             "helper must early-return for Unknown derived_failure_type"
@@ -23569,6 +23717,7 @@ export default function App() {
         let preferred = verifier_repair_preferred_local_import_source(
             &context,
             super::super::VerifierFailureType::ImportOrDependency,
+            &admission,
         );
         assert!(
             preferred.is_some(),
@@ -23583,6 +23732,7 @@ export default function App() {
         let preferred2 = verifier_repair_preferred_local_import_source(
             &context,
             super::super::VerifierFailureType::ImportOrDependency,
+            &admission,
         );
         assert!(preferred2.is_some());
     }
@@ -23606,11 +23756,16 @@ export default function App() {
             repair_attempt: 1,
             ..super::super::repair_job::RepairJob::new_for_test()
         };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
         // parser-origin Unknown → both helpers must early-return
         assert!(
             verifier_repair_preferred_local_import_source(
                 &context,
-                super::super::VerifierFailureType::Unknown
+                super::super::VerifierFailureType::Unknown,
+                &admission,
             )
             .is_none()
         );
@@ -23618,7 +23773,8 @@ export default function App() {
             verifier_repair_stale_assertion_test_target(
                 &context,
                 None,
-                super::super::VerifierFailureType::Unknown
+                super::super::VerifierFailureType::Unknown,
+                &admission,
             )
             .is_none()
         );
@@ -24153,6 +24309,395 @@ export default function App() {
         assert!(
             agent.bounded_post_edit_excerpt("link.txt").is_none(),
             "symlink pointing outside the workspace must be rejected"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Issue #647 (Phase C, §4.4 / §5.1): `admit_repair_target_hint`
+    // SSOT unit & integration tests. Every hint promotion path must
+    // pass through the SSOT gate; only `Owned` hints are admitted.
+    // ───────────────────────────────────────────────────────────────
+
+    /// SSOT: an `Owned` hint passes through `admit_repair_target_hint`.
+    #[test]
+    fn admit_repair_target_hint_returns_owned_hint() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "test".to_string(),
+        };
+        let admitted = super::admit_repair_target_hint(hint.clone(), &admission);
+        assert_eq!(admitted, Some(hint));
+    }
+
+    /// SSOT: a `CandidateOnly` hint (in-scope, no edit/scaffold/explicit
+    /// signal) is rejected (S1-002 / S7-002).
+    #[test]
+    fn admit_repair_target_hint_rejects_candidate_only() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::write(work_root.join("README.md"), "# pre-existing\n").unwrap();
+        // SingleProjectRoot scope without explicit subtree → CandidateOnly
+        // when no edit signal is set on the predicate.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::UsageDocs,
+            path: "README.md".to_string(),
+            reason: "test".to_string(),
+        };
+        let admitted = super::admit_repair_target_hint(hint, &admission);
+        assert_eq!(admitted, None);
+    }
+
+    /// SSOT: an `OutOfScope` hint (path traversal) is rejected (S7-002).
+    #[test]
+    fn admit_repair_target_hint_rejects_out_of_scope_traversal() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "../sibling/escape.py".to_string(),
+            reason: "test".to_string(),
+        };
+        assert_eq!(super::admit_repair_target_hint(hint, &admission), None);
+    }
+
+    /// DR3-001: edited_this_session is evaluated **per-path**, so an edit
+    /// signal on path A must not promote a separate path B to Owned.
+    #[test]
+    fn admit_repair_target_hint_path_local_edited_signal() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/edited.py"), "x = 1\n").unwrap();
+        std::fs::write(work_root.join("app/untouched.py"), "y = 2\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let edited_for = |p: &str| p == "app/edited.py";
+        let scaffold_for = |_: &str| false;
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &edited_for,
+            scaffold_changed_for: &scaffold_for,
+        };
+
+        let edited_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/edited.py".to_string(),
+            reason: "edited".to_string(),
+        };
+        let untouched_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/untouched.py".to_string(),
+            reason: "not edited".to_string(),
+        };
+
+        assert!(super::admit_repair_target_hint(edited_hint.clone(), &admission).is_some());
+        assert!(
+            super::admit_repair_target_hint(untouched_hint, &admission).is_none(),
+            "path-local edited signal must not promote a sibling path"
+        );
+    }
+
+    /// Integration: path 1 — diagnostic LLM-derived hints route through
+    /// `recovery_target_hint_for_diagnostic_path` → admission gate. A
+    /// CandidateOnly hint must drop out of the resulting assessment.
+    #[test]
+    fn model_assessment_paths_rejects_candidate_only_diagnostic_hint() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        // SingleProjectRoot + no edit/scaffold signal → CandidateOnly.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        let context = verifier_context_for("app/main.py");
+        let parsed = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"assertion_mismatch",
+                "probable_cause_role":"implementation",
+                "repair_targets":[
+                    {"path":"app/main.py","confidence":0.95,"reason":"diagnostic LLM picked this"}
+                ],
+                "summary":"diagnostic"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+
+        assert!(
+            assessment.repair_target_hint.is_none(),
+            "CandidateOnly diagnostic hint must not become a repair target"
+        );
+        assert!(
+            assessment.repair_plan.is_empty(),
+            "CandidateOnly diagnostic hint must not appear in repair_plan"
+        );
+    }
+
+    /// Integration: paths 2-3 — `context.target_hint` / `changed_file_hints`
+    /// surface into the fallback `repair_target_hint`. When admission is
+    /// CandidateOnly, the fallback must drop them too.
+    #[test]
+    fn model_assessment_paths_rejects_candidate_only_changed_file_fallback() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        // context.changed_file_hints carries app/main.py (path 3).
+        let context = verifier_context_for("app/main.py");
+        // Parsed JSON has *no* repair_targets / repair_plan, so the
+        // fallback at the end of model_assessment must fire.
+        let parsed = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"unknown",
+                "probable_cause_role":"implementation",
+                "summary":"no diagnostic targets"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+
+        assert!(
+            assessment.repair_target_hint.is_none(),
+            "fallback must not promote a CandidateOnly changed_file_hint"
+        );
+    }
+
+    /// Integration: path 4 — `verifier_repair_preferred_local_import_source`
+    /// must apply admission gate at its exit. A CandidateOnly target hint
+    /// must not be promoted even when the local-import-mismatch pattern
+    /// fires.
+    #[test]
+    fn model_assessment_paths_path_4_admits_only_owned_local_import_source() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        // Build a context whose target_hint resolves to app/main.py and
+        // whose output looks like a local import mismatch.
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "provider".to_string(),
+        };
+        let context = super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "ImportError: cannot import name 'store' from 'app.main'".to_string(),
+            target_hint: Some(hint),
+            failure_signature: "app/main.py import_error".to_string(),
+            failure_count: Some(1),
+            repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        // CandidateOnly: no edit / scaffold signal.
+        let candidate_only = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        assert!(
+            verifier_repair_preferred_local_import_source(
+                &context,
+                super::super::VerifierFailureType::ImportOrDependency,
+                &candidate_only,
+            )
+            .is_none(),
+            "CandidateOnly local-import target must be rejected by SSOT gate"
+        );
+
+        // Owned: helper fires.
+        let owned = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        assert!(
+            verifier_repair_preferred_local_import_source(
+                &context,
+                super::super::VerifierFailureType::ImportOrDependency,
+                &owned,
+            )
+            .is_some(),
+            "Owned local-import target must pass the SSOT gate"
+        );
+    }
+
+    /// Integration: path 5 — `verifier_repair_stale_assertion_test_target`
+    /// must apply admission gate at its exit.
+    #[test]
+    fn model_assessment_paths_path_5_admits_only_owned_stale_assertion_target() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        std::fs::write(
+            work_root.join("tests/test_health.py"),
+            "def test_x(): assert False\n",
+        )
+        .unwrap();
+
+        let app_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "impl".to_string(),
+        };
+        let test_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_health.py".to_string(),
+            reason: "test".to_string(),
+        };
+        let context = super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "AssertionError".to_string(),
+            target_hint: Some(test_hint),
+            repair_target_hint: Some(app_hint),
+            failure_signature: "stale-assertion".to_string(),
+            failure_count: Some(1),
+            repair_attempt: 2,
+            rerun_outcome: Some(super::super::VerifierRepairRerunOutcome::SameFailureRemaining),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let candidate_only = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        assert!(
+            verifier_repair_stale_assertion_test_target(
+                &context,
+                None,
+                super::super::VerifierFailureType::AssertionFailure,
+                &candidate_only,
+            )
+            .is_none(),
+            "CandidateOnly stale-assertion test target must be rejected by SSOT gate"
+        );
+        let owned = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        assert!(
+            verifier_repair_stale_assertion_test_target(
+                &context,
+                None,
+                super::super::VerifierFailureType::AssertionFailure,
+                &owned,
+            )
+            .is_some(),
+            "Owned stale-assertion test target must pass the SSOT gate"
+        );
+    }
+
+    /// Integration: path 6 — `repair_target_hint` fallback from
+    /// `probable_cause_role`. When the only candidate is CandidateOnly
+    /// (changed_file_hint surfaced by `verifier_repair_context_from_failure`
+    /// but never edited / scaffolded this session), the fallback must not
+    /// promote it.
+    #[test]
+    fn model_assessment_paths_path_6_fallback_admits_only_owned() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        // verifier_context_for() seeds context.changed_file_hints with
+        // app/main.py and provides a probable_cause_role-style match below.
+        let context = verifier_context_for("app/main.py");
+        // No repair_targets/plan → forces fallback. probable_cause_role
+        // is set so the role-filter branch runs.
+        let parsed = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"unknown",
+                "probable_cause_role":"implementation",
+                "summary":"force path 6 fallback"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+        assert!(
+            assessment.repair_target_hint.is_none(),
+            "path 6 fallback must drop CandidateOnly probable_cause_role hint"
+        );
+
+        // Same context with Owned admission → fallback promotes the hint.
+        let owned_admission =
+            super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let parsed_owned = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"unknown",
+                "probable_cause_role":"implementation",
+                "summary":"force path 6 fallback owned"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+        let assessment_owned = super::model_assessment_to_verifier_repair_assessment(
+            &work_root,
+            &context,
+            parsed_owned,
+            &owned_admission,
+        );
+        assert_eq!(
+            assessment_owned
+                .repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("app/main.py"),
+            "Owned admission must allow path 6 fallback to promote the hint"
         );
     }
 }
