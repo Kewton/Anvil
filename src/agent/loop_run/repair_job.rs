@@ -1217,4 +1217,77 @@ mod tests {
         // bounded list, not a retry counter.
         assert_eq!(job.exhausted_attempts.len(), 3);
     }
+
+    // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
+
+    /// Helper: split the module source into the production prefix
+    /// (everything before `#[cfg(test)]\nmod tests` at column 0).
+    fn production_source() -> &'static str {
+        let source = include_str!("repair_job.rs");
+        match source.find("\n#[cfg(test)]\nmod tests") {
+            Some(idx) => &source[..idx],
+            None => source,
+        }
+    }
+
+    #[test]
+    fn no_framework_literal_in_repair_job_production_code() {
+        // S1-012 (拡張): production code (everything before `mod tests`)
+        // must not embed framework-specific literals. Test-only literals
+        // (e.g. `command: "pytest"` inside #[cfg(test)] fixtures) are
+        // explicitly exempt.
+        let prod = production_source();
+        for lit in &[
+            "\"422\"",
+            "\"404\"",
+            "/items/nonexistent",
+            "FastAPI",
+            "\"pytest\"",
+        ] {
+            assert!(
+                !prod.contains(lit),
+                "repair_job.rs production code must not contain framework literal {lit:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn no_unsafe_in_repair_job_production_code() {
+        // DR4-003: no unsafe / FFI in new production code.
+        let prod = production_source();
+        assert!(
+            !prod.contains("unsafe "),
+            "repair_job.rs production code must not contain `unsafe `",
+        );
+        assert!(
+            !prod.contains("extern \"C\""),
+            "repair_job.rs production code must not declare FFI",
+        );
+    }
+
+    #[test]
+    fn session_store_does_not_serialize_semantic_failure_report() {
+        // S1-011 / S3-006 / DR3-002: SemanticFailureReport &
+        // FailureCluster are turn-local — they must not appear in the
+        // session persistence layer. If a future Issue moves them into
+        // `session::store`, this test forces an explicit review of the
+        // serialization + masking SSOT path.
+        let store_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/store.rs");
+        let body = std::fs::read_to_string(&store_path)
+            .unwrap_or_else(|e| panic!("read {store_path:?}: {e}"));
+        for forbidden in &[
+            "SemanticFailureReport",
+            "FailureCluster",
+            "FailureClusterKey",
+            "SpecAuthority",
+            "SemanticRepairPlan",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "src/session/store.rs must not reference turn-local type {forbidden:?} \
+                 (S1-011 / S3-006: SemanticFailureReport is turn-local)",
+            );
+        }
+    }
 }

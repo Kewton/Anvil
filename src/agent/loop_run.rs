@@ -951,4 +951,69 @@ mod tests {
         assert!(should_compact_late_turn(&messages, 24_000, 4, 1));
         assert!(!should_compact_late_turn(&messages[..8], 24_000, 1, 0));
     }
+
+    // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
+
+    #[test]
+    fn no_pub_use_for_semantic_failure_or_spec_authority() {
+        // S1-003 / DR3-001: `semantic_failure` and `spec_authority` are
+        // private modules of `loop_run`. They must NOT be widened via
+        // `pub use` re-exports — only the `turn.rs` / `repair_job.rs`
+        // in-crate consumers may access them through `super::`.
+        let source = include_str!("loop_run.rs");
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            // `//` comments / `///` doc comments / `//!` module docs are
+            // allowed to mention the names for documentation purposes.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("pub use") {
+                assert!(
+                    !line.contains("semantic_failure"),
+                    "DR3-001 violated: `pub use` referencing `semantic_failure` found: {line:?}",
+                );
+                assert!(
+                    !line.contains("spec_authority"),
+                    "DR3-001 violated: `pub use` referencing `spec_authority` found: {line:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verifier_diagnostic_failure_kind_has_8_variants() {
+        // S1-001: SemanticFailureReport is an upper-layer wrapper that
+        // **reuses** the existing 8-variant `VerifierDiagnosticFailureKind`
+        // enum. Adding or removing a variant breaks the SSOT invariant
+        // — this test fails to compile (non-exhaustive match) if the
+        // enum surface drifts.
+        use super::VerifierDiagnosticFailureKind as K;
+        let all = [
+            K::DependencyMissing,
+            K::LocalImportContractMismatch,
+            K::CompileOrSyntaxError,
+            K::AssertionMismatch,
+            K::RuntimeError,
+            K::TestBug,
+            K::ConfigOrVerifierError,
+            K::Unknown,
+        ];
+        for v in &all {
+            // Exhaustive match — extension of the enum forces this to
+            // be updated (compile-time lock).
+            let label: &'static str = match v {
+                K::DependencyMissing => "dependency_missing",
+                K::LocalImportContractMismatch => "local_import_contract_mismatch",
+                K::CompileOrSyntaxError => "compile_or_syntax_error",
+                K::AssertionMismatch => "assertion_mismatch",
+                K::RuntimeError => "runtime_error",
+                K::TestBug => "test_bug",
+                K::ConfigOrVerifierError => "config_or_verifier_error",
+                K::Unknown => "unknown",
+            };
+            assert!(!label.is_empty());
+        }
+        assert_eq!(all.len(), 8);
+    }
 }

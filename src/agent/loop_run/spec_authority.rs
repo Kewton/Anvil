@@ -1064,4 +1064,113 @@ mod tests {
         let a: ArtifactRole = r;
         assert_eq!(a, ArtifactRole::Implementation);
     }
+
+    // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
+
+    /// Helper: split the module source into the production prefix
+    /// (everything before `#[cfg(test)]\nmod tests`).
+    fn production_source() -> &'static str {
+        let source = include_str!("spec_authority.rs");
+        match source.find("#[cfg(test)]\nmod tests") {
+            Some(idx) => &source[..idx],
+            None => source,
+        }
+    }
+
+    #[test]
+    fn spec_authority_enum_has_exactly_5_variants() {
+        // S1-005: SpecAuthority is fixed to 5 variants — adding a sixth
+        // variant must be a deliberate design decision and force this
+        // test to be updated (which serves as a review trigger).
+        let all = [
+            SpecAuthority::UserRequest,
+            SpecAuthority::BehaviorContract,
+            SpecAuthority::VerifiedPublicInterface,
+            SpecAuthority::ImplementationContract,
+            SpecAuthority::LlmGeneratedTest,
+        ];
+        // Each variant matches exactly itself — exhaustive `match` here
+        // is the structural lock: if a 6th variant is added, the `match`
+        // below becomes non-exhaustive and the test fails to compile.
+        for v in &all {
+            let label: &'static str = match v {
+                SpecAuthority::UserRequest => "user_request",
+                SpecAuthority::BehaviorContract => "behavior_contract",
+                SpecAuthority::VerifiedPublicInterface => "verified_public_interface",
+                SpecAuthority::ImplementationContract => "implementation_contract",
+                SpecAuthority::LlmGeneratedTest => "llm_generated_test",
+            };
+            assert!(!label.is_empty());
+        }
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn no_framework_literal_in_spec_authority_module() {
+        // S1-012 (拡張): new production code must not embed
+        // framework-specific literals.
+        let prod = production_source();
+        for lit in &["\"422\"", "\"404\"", "/items/nonexistent", "FastAPI"] {
+            assert!(
+                !prod.contains(lit),
+                "spec_authority.rs production code must not contain framework literal {lit:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn no_unsafe_in_spec_authority_module() {
+        // DR4-003: no unsafe / FFI in new production code.
+        let prod = production_source();
+        assert!(
+            !prod.contains("unsafe "),
+            "spec_authority.rs production code must not contain `unsafe `",
+        );
+        assert!(
+            !prod.contains("extern \"C\""),
+            "spec_authority.rs production code must not declare FFI",
+        );
+    }
+
+    #[test]
+    fn photon_layer_does_not_import_semantic_repair_types() {
+        // DR3-002: photon → session → agent is the only allowed direction.
+        // The semantic-repair planner lives in `agent/loop_run/` and must
+        // never leak into the photon sidecar layer.
+        let photon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/photon");
+        assert!(
+            photon_dir.is_dir(),
+            "src/photon must exist for DR3-002 to be meaningful",
+        );
+        let mut visited_files = 0usize;
+        let entries =
+            std::fs::read_dir(&photon_dir).expect("read_dir src/photon for DR3-002 grep test");
+        for entry in entries {
+            let entry = entry.expect("photon dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let body =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            for forbidden in &[
+                "SemanticFailureReport",
+                "SpecAuthority",
+                "FailureCluster",
+                "FailureClusterKey",
+                "semantic_failure",
+                "spec_authority",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "DR3-002 violated: {path:?} contains forbidden symbol {forbidden:?}",
+                );
+            }
+            visited_files += 1;
+        }
+        assert!(
+            visited_files > 0,
+            "photon layer scan must visit at least one .rs file"
+        );
+    }
 }

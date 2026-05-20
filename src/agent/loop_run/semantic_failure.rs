@@ -1065,4 +1065,46 @@ mod tests {
         );
         assert_ne!(assertion_failure.cluster_key, runtime_failure.cluster_key);
     }
+
+    // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
+
+    /// Helper: split the module source into the production prefix
+    /// (everything before `#[cfg(test)]\nmod tests`). Phase G grep tests
+    /// scrutinize production code only — test-only literals are exempt.
+    fn production_source() -> &'static str {
+        let source = include_str!("semantic_failure.rs");
+        // Match the canonical opener of this file's test module.
+        match source.find("#[cfg(test)]\nmod tests") {
+            Some(idx) => &source[..idx],
+            None => source,
+        }
+    }
+
+    #[test]
+    fn no_framework_literal_in_semantic_failure_module() {
+        // S1-012 (拡張): new production code must not embed
+        // framework-specific literals — those belong to evaluation
+        // fixtures, not the semantic repair planner.
+        let prod = production_source();
+        for lit in &["\"422\"", "\"404\"", "/items/nonexistent", "FastAPI"] {
+            assert!(
+                !prod.contains(lit),
+                "semantic_failure.rs production code must not contain framework literal {lit:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn no_unsafe_in_semantic_failure_module() {
+        // DR4-003: no unsafe / FFI in new production code.
+        let prod = production_source();
+        assert!(
+            !prod.contains("unsafe "),
+            "semantic_failure.rs production code must not contain `unsafe `",
+        );
+        assert!(
+            !prod.contains("extern \"C\""),
+            "semantic_failure.rs production code must not declare FFI",
+        );
+    }
 }
