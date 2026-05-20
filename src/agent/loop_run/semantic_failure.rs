@@ -54,6 +54,7 @@
 use super::VerifierDiagnosticFailureKind;
 use super::repair_job::sanitize_repair_job_text_with_char_cap;
 use super::task_contract::ArtifactRole;
+use super::task_contract::RecoveryTargetHint;
 
 /// Upper bound for `repair_hypothesis` after sanitize (chars, not bytes).
 /// Mirrors the diagnostic summary cap used elsewhere in the agent loop.
@@ -65,6 +66,40 @@ pub(super) const MAX_AFFECTED_CASES: usize = 16;
 /// Upper bound (chars) for shape-normalized cluster text fields
 /// (`observed`, `expected`, `affected_cases[*]`, `ContractConflict.*`).
 pub(super) const MAX_CLUSTER_TEXT_CHARS: usize = 240;
+
+/// CB-017 A''': upper bound on the number of LLM-supplied raw target
+/// candidates retained per cluster after parse. Anything beyond this is
+/// truncated at the parse boundary so the rest of the pipeline operates on
+/// a bounded list.
+pub(super) const MAX_PROPOSED_TARGETS_PER_CLUSTER: usize = 8;
+
+/// CB-017 A''': char-cap applied to each `RawClusterTargetCandidate.raw_path`
+/// and `RawClusterTargetCandidate.reason` at the parse boundary via the
+/// SSOT `sanitize_repair_job_text_with_char_cap` entry.
+pub(super) const MAX_RAW_PATH_CHARS: usize = 240;
+
+/// CB-017 A''': parse-stage advisory record for one LLM-proposed repair
+/// target. Sanitized to bounded char caps but **not** Owned-validated — the
+/// downstream `recovery_target_hint_for_diagnostic_path` SSOT decides
+/// admission and is the source of truth for the resolved role.
+///
+/// `role_hint` is advisory only: it may be used as a tie-breaker in the
+/// admission sort, or as debug/log metadata, but it never overrides the
+/// path-classification role of an admitted hint (Invariant 2 in the design
+/// policy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RawClusterTargetCandidate {
+    /// LLM-supplied `target_path` (sanitized, char-capped to
+    /// `MAX_RAW_PATH_CHARS`; Owned admission is decided downstream).
+    pub(super) raw_path: String,
+    /// LLM-supplied `role`. Advisory only — admitted hint role is decided
+    /// by `recovery_target_hint_for_existing_path` path classification.
+    pub(super) role_hint: Option<ArtifactRole>,
+    /// LLM-supplied raw diagnostic `reason` (sanitized + char-capped to
+    /// `MAX_RAW_PATH_CHARS`). Must not be conflated with cluster id / role /
+    /// authority strings.
+    pub(super) reason: String,
+}
 
 /// Bounded, sanitized representation of a diagnostic LLM failure report.
 ///
@@ -87,6 +122,15 @@ pub(super) struct SemanticFailureReport {
 
 /// Shape-normalized, role-tagged grouping of failure observations that share
 /// the same root cause. Cluster identity is encoded in `cluster_key`.
+///
+/// CB-017 A''' adds two `pub(super)` fields:
+///   * `proposed_target_candidates` — parse-stage raw advisory candidates
+///     (Owned-unvalidated). DR1-010: **not** included in the `cluster_key`
+///     hash input.
+///   * `admitted_cluster_targets` — Owned-validated `RecoveryTargetHint`s
+///     produced by the turn.rs admission enrich step. Always empty at parse
+///     time (`Vec::new()`); the turn.rs boundary fills this after
+///     `recovery_target_hint_for_diagnostic_path` admission.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct FailureCluster {
     pub(super) cluster_key: FailureClusterKey,
@@ -94,6 +138,13 @@ pub(super) struct FailureCluster {
     pub(super) expected: String,
     pub(super) affected_cases: Vec<String>,
     pub(super) involved_artifacts: Vec<ArtifactRole>,
+    /// CB-017 A''': LLM-supplied raw target candidates (advisory).
+    /// **Excluded from `cluster_key` hash input** (DR1-010).
+    pub(super) proposed_target_candidates: Vec<RawClusterTargetCandidate>,
+    /// CB-017 A''': admitted, Owned-validated targets filled in by the
+    /// turn.rs enrich boundary. **Always empty at parse time**; downstream
+    /// admission writes path-classification-derived roles here.
+    pub(super) admitted_cluster_targets: Vec<RecoveryTargetHint>,
 }
 
 /// Deterministic 16-hex (sha256 short) identifier for a failure cluster.
@@ -183,6 +234,7 @@ pub(super) fn build_failure_cluster_from_observation(
     raw_input_shape: &str,
     assertion_shape: &str,
     artifact_role_set: &[ArtifactRole],
+    proposed_target_candidates: Vec<RawClusterTargetCandidate>,
 ) -> FailureCluster {
     let observed = sanitize_repair_job_text_with_char_cap(raw_observed, MAX_CLUSTER_TEXT_CHARS);
     let expected = sanitize_repair_job_text_with_char_cap(raw_expected, MAX_CLUSTER_TEXT_CHARS);
@@ -194,6 +246,10 @@ pub(super) fn build_failure_cluster_from_observation(
     // CB-002: hash inputs are normalized to coarse shape so secret-like or
     // identifier-like literals never form a stable fingerprint and don't
     // fragment clusters that share the same shape.
+    //
+    // DR1-010 (CB-017 A'''): `proposed_target_candidates` are **not** fed
+    // into `cluster_key` — cluster identity stays a pure function of the
+    // shape-normalized observation, not LLM-supplied advisory paths.
     let observed_shape = normalize_to_shape(&observed);
     let expected_shape = normalize_to_shape(&expected);
     let input_shape_shape = normalize_to_shape(&input_shape_signature);
@@ -217,6 +273,10 @@ pub(super) fn build_failure_cluster_from_observation(
         expected,
         affected_cases: Vec::new(),
         involved_artifacts,
+        // CB-017 A''': proposed candidates flow through as-is (advisory);
+        // admitted targets are filled by the turn.rs enrich boundary.
+        proposed_target_candidates,
+        admitted_cluster_targets: Vec::new(),
     }
 }
 
@@ -495,12 +555,47 @@ pub(super) fn parse_semantic_failure_report(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            // CB-017 A''': extract LLM-supplied `target_paths` advisory list.
+            // Sanitized + char-capped + bounded-count at the parse boundary.
+            // `admitted_cluster_targets` stays empty here — it is filled by
+            // the turn.rs enrich step which is the SSOT for Owned admission.
+            let proposed_target_candidates: Vec<RawClusterTargetCandidate> = cluster_obj
+                .get("target_paths")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|entry| entry.as_object())
+                        .take(MAX_PROPOSED_TARGETS_PER_CLUSTER)
+                        .map(|entry| {
+                            let raw_path = sanitize_repair_job_text_with_char_cap(
+                                entry.get("path").and_then(|v| v.as_str()).unwrap_or(""),
+                                MAX_RAW_PATH_CHARS,
+                            );
+                            let role_hint = entry
+                                .get("role")
+                                .and_then(|v| v.as_str())
+                                .and_then(parse_artifact_role);
+                            let reason = sanitize_repair_job_text_with_char_cap(
+                                entry.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                                MAX_RAW_PATH_CHARS,
+                            );
+                            RawClusterTargetCandidate {
+                                raw_path,
+                                role_hint,
+                                reason,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let mut rebuilt = build_failure_cluster_from_observation(
                 raw_observed,
                 raw_expected,
                 raw_input_shape,
                 raw_assertion_shape,
                 &involved_artifacts,
+                proposed_target_candidates,
             );
             rebuilt.affected_cases = affected_cases;
             failure_clusters.push(rebuilt);
@@ -589,6 +684,7 @@ mod tests {
             "input shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test, ArtifactRole::Implementation]),
+            Vec::new(),
         );
         let b = build_failure_cluster_from_observation(
             "observed text",
@@ -596,6 +692,7 @@ mod tests {
             "input shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Implementation, ArtifactRole::Test]),
+            Vec::new(),
         );
         assert_eq!(a.cluster_key, b.cluster_key);
         assert_eq!(a.cluster_key.as_str().len(), 16);
@@ -609,6 +706,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         let b = build_failure_cluster_from_observation(
             "observed",
@@ -616,6 +714,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         assert_ne!(a.cluster_key, b.cluster_key);
     }
@@ -631,6 +730,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         // The sanitized observed text should not be byte-for-byte identical
         // to the raw secret-bearing input (mask_header_family / mask_secrets
@@ -649,6 +749,7 @@ mod tests {
             "s",
             "AssertEq",
             &role_set(&[ArtifactRole::UsageDocs, ArtifactRole::Implementation]),
+            Vec::new(),
         )
         .cluster_key;
         let key_b = build_failure_cluster_from_observation(
@@ -657,6 +758,7 @@ mod tests {
             "s",
             "AssertEq",
             &role_set(&[ArtifactRole::Implementation, ArtifactRole::UsageDocs]),
+            Vec::new(),
         )
         .cluster_key;
         assert_eq!(key_a, key_b);
@@ -795,6 +897,7 @@ mod tests {
             "s",
             "AssertEq",
             &[ArtifactRole::Test],
+            Vec::new(),
         );
         assert_eq!(
             parsed.failure_clusters[0].cluster_key,
@@ -1013,6 +1116,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         let b = build_failure_cluster_from_observation(
             "auth failed for tok_abc123def456ghi789 on /users/67890",
@@ -1020,6 +1124,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         assert_eq!(
             a.cluster_key, b.cluster_key,
@@ -1037,6 +1142,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         // Hex key is 16 chars — verify it's not a substring of the secret
         // and the secret is not a substring of the hash inputs by
@@ -1055,6 +1161,7 @@ mod tests {
             "shape",
             "AssertEq",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         let runtime_failure = build_failure_cluster_from_observation(
             "panic: divide by zero",
@@ -1062,8 +1169,277 @@ mod tests {
             "shape",
             "Panic",
             &role_set(&[ArtifactRole::Test]),
+            Vec::new(),
         );
         assert_ne!(assertion_failure.cluster_key, runtime_failure.cluster_key);
+    }
+
+    // ---- CB-017 A''' (Commit 2): RawClusterTargetCandidate schema ---- //
+
+    #[test]
+    fn cb017_failure_cluster_carries_proposed_target_candidates() {
+        // The constructor accepts a Vec<RawClusterTargetCandidate> at parse
+        // time. `admitted_cluster_targets` stays empty until the turn.rs
+        // enrich step runs (Commit 3).
+        let candidates = vec![
+            RawClusterTargetCandidate {
+                raw_path: "src/main.rs".to_string(),
+                role_hint: Some(ArtifactRole::Implementation),
+                reason: "fix null check".to_string(),
+            },
+            RawClusterTargetCandidate {
+                raw_path: "tests/integration.rs".to_string(),
+                role_hint: Some(ArtifactRole::Test),
+                reason: "update fixture".to_string(),
+            },
+        ];
+        let cluster = build_failure_cluster_from_observation(
+            "observed",
+            "expected",
+            "shape",
+            "AssertEq",
+            &role_set(&[ArtifactRole::Implementation]),
+            candidates.clone(),
+        );
+        assert_eq!(cluster.proposed_target_candidates, candidates);
+        // Commit 2 invariant: admission is the turn.rs boundary's job.
+        assert!(
+            cluster.admitted_cluster_targets.is_empty(),
+            "admitted_cluster_targets must be empty at parse time",
+        );
+    }
+
+    #[test]
+    fn cb017_parse_extracts_target_paths_from_cluster_json() {
+        let v = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "o",
+                    "expected": "e",
+                    "input_shape": "s",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": [],
+                    "target_paths": [
+                        {
+                            "path": "src/main.rs",
+                            "role": "implementation",
+                            "reason": "fix null check",
+                        }
+                    ],
+                }
+            ],
+        });
+        let parsed = parse_semantic_failure_report(&v).expect("parses");
+        assert_eq!(parsed.failure_clusters.len(), 1);
+        let candidates = &parsed.failure_clusters[0].proposed_target_candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].raw_path, "src/main.rs");
+        assert_eq!(candidates[0].role_hint, Some(ArtifactRole::Implementation));
+        assert_eq!(candidates[0].reason, "fix null check");
+        // Commit 2 invariant.
+        assert!(
+            parsed.failure_clusters[0]
+                .admitted_cluster_targets
+                .is_empty(),
+            "parse must not populate admitted_cluster_targets",
+        );
+    }
+
+    #[test]
+    fn cb017_parse_truncates_target_paths_above_max() {
+        // 9 entries → truncated to MAX_PROPOSED_TARGETS_PER_CLUSTER = 8.
+        let entries: Vec<_> = (0..9)
+            .map(|i| {
+                serde_json::json!({
+                    "path": format!("src/file_{}.rs", i),
+                    "role": "implementation",
+                    "reason": "r",
+                })
+            })
+            .collect();
+        let v = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "o",
+                    "expected": "e",
+                    "input_shape": "s",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": [],
+                    "target_paths": entries,
+                }
+            ],
+        });
+        let parsed = parse_semantic_failure_report(&v).expect("parses");
+        assert_eq!(
+            parsed.failure_clusters[0].proposed_target_candidates.len(),
+            MAX_PROPOSED_TARGETS_PER_CLUSTER,
+            "parse must truncate to MAX_PROPOSED_TARGETS_PER_CLUSTER",
+        );
+    }
+
+    #[test]
+    fn cb017_parse_role_hint_invalid_returns_none() {
+        let v = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "o",
+                    "expected": "e",
+                    "input_shape": "s",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": [],
+                    "target_paths": [
+                        {
+                            "path": "src/main.rs",
+                            "role": "garbage",
+                            "reason": "r",
+                        }
+                    ],
+                }
+            ],
+        });
+        let parsed = parse_semantic_failure_report(&v).expect("parses");
+        let cand = &parsed.failure_clusters[0].proposed_target_candidates[0];
+        assert_eq!(cand.role_hint, None);
+        // raw_path / reason are still sanitized + retained.
+        assert_eq!(cand.raw_path, "src/main.rs");
+        assert_eq!(cand.reason, "r");
+    }
+
+    #[test]
+    fn cb017_parse_target_paths_absent_yields_empty() {
+        // No `target_paths` field at all → proposed_target_candidates empty,
+        // existing cluster fields preserved.
+        let v = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "o",
+                    "expected": "e",
+                    "input_shape": "s",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": [],
+                }
+            ],
+        });
+        let parsed = parse_semantic_failure_report(&v).expect("parses");
+        assert!(
+            parsed.failure_clusters[0]
+                .proposed_target_candidates
+                .is_empty(),
+            "absent target_paths must yield empty candidates",
+        );
+        assert!(
+            parsed.failure_clusters[0]
+                .admitted_cluster_targets
+                .is_empty(),
+            "admitted_cluster_targets must be empty at parse time",
+        );
+    }
+
+    #[test]
+    fn cb017_cluster_key_unchanged_by_target_candidates() {
+        // DR1-010: cluster_key hash inputs must not include
+        // proposed_target_candidates. Two clusters with identical
+        // observed/expected/role but different candidate lists must share a
+        // cluster_key.
+        let with_a = build_failure_cluster_from_observation(
+            "o",
+            "e",
+            "s",
+            "AssertEq",
+            &role_set(&[ArtifactRole::Implementation]),
+            vec![RawClusterTargetCandidate {
+                raw_path: "src/a.rs".to_string(),
+                role_hint: Some(ArtifactRole::Implementation),
+                reason: "r".to_string(),
+            }],
+        );
+        let with_b = build_failure_cluster_from_observation(
+            "o",
+            "e",
+            "s",
+            "AssertEq",
+            &role_set(&[ArtifactRole::Implementation]),
+            vec![RawClusterTargetCandidate {
+                raw_path: "src/b.rs".to_string(),
+                role_hint: Some(ArtifactRole::Test),
+                reason: "different".to_string(),
+            }],
+        );
+        assert_eq!(
+            with_a.cluster_key, with_b.cluster_key,
+            "cluster_key must be independent of proposed_target_candidates (DR1-010)",
+        );
+        let empty = build_failure_cluster_from_observation(
+            "o",
+            "e",
+            "s",
+            "AssertEq",
+            &role_set(&[ArtifactRole::Implementation]),
+            Vec::new(),
+        );
+        assert_eq!(
+            with_a.cluster_key, empty.cluster_key,
+            "cluster_key must be invariant when candidates are added",
+        );
+    }
+
+    #[test]
+    fn cb017_raw_path_sanitized_and_capped() {
+        // A 250-char raw_path is truncated to MAX_RAW_PATH_CHARS (240) at
+        // parse, via the SSOT sanitize entry (with trailing ellipsis ≤ +3).
+        let long_path: String = "a".repeat(250);
+        let v = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "o",
+                    "expected": "e",
+                    "input_shape": "s",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": [],
+                    "target_paths": [
+                        {
+                            "path": long_path,
+                            "role": "implementation",
+                            "reason": "r",
+                        }
+                    ],
+                }
+            ],
+        });
+        let parsed = parse_semantic_failure_report(&v).expect("parses");
+        let cand = &parsed.failure_clusters[0].proposed_target_candidates[0];
+        let n = cand.raw_path.chars().count();
+        assert!(
+            n <= MAX_RAW_PATH_CHARS + 3,
+            "raw_path must be capped to MAX_RAW_PATH_CHARS (+ optional ellipsis); got {n}",
+        );
+        // No control chars leaked.
+        assert!(!cand.raw_path.chars().any(|c| (c as u32) < 0x20));
     }
 
     // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //

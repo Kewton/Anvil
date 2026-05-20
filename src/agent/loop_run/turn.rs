@@ -15745,6 +15745,11 @@ fn build_semantic_failure_report_from_legacy(
         "",
         "",
         &[preferred_repair_role],
+        // CB-017 A''' (Commit 2): legacy fallback synthesizes a cluster with
+        // **no** proposed target candidates; the merge step (Commit 3) will
+        // append legacy `parsed.repair_targets` here under the all-empty
+        // policy. Keep `Vec::new()` to preserve existing behavior.
+        Vec::new(),
     );
 
     // contract_conflict is sourced from the legacy summary — it lives in the
@@ -20060,6 +20065,7 @@ mod progress_tests {
             "shape",
             "AssertEq",
             &[super::super::task_contract::ArtifactRole::Test],
+            Vec::new(),
         );
         let cluster_id = cluster.cluster_key.clone();
         let report = super::super::semantic_failure::SemanticFailureReport {
@@ -22061,6 +22067,7 @@ E   assert [{'id': 1}] == []\n";
                 super::super::task_contract::ArtifactRole::Implementation,
                 super::super::task_contract::ArtifactRole::Test,
             ],
+            Vec::new(),
         );
         let cluster_id = cluster.cluster_key.clone();
         let report = SemanticFailureReport {
@@ -22880,6 +22887,7 @@ E   assert [{'id': 1}] == []\n";
             "POST /todos",
             "AssertEq",
             &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
         );
         let cluster_b = build_failure_cluster_from_observation(
             "missing field",
@@ -22887,6 +22895,7 @@ E   assert [{'id': 1}] == []\n";
             "GET /todos",
             "AssertContains",
             &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
         );
         let cluster_a_id = cluster_a.cluster_key.clone();
         let cluster_b_id = cluster_b.cluster_key.clone();
@@ -22978,6 +22987,7 @@ E   assert [{'id': 1}] == []\n";
             "POST /todos",
             "AssertEq",
             &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
         );
         let cluster_a_id = cluster_a.cluster_key.clone();
         let report = SemanticFailureReport {
