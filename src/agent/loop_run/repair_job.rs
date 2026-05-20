@@ -411,22 +411,35 @@ pub(super) fn verifier_repair_decision(
     if job.is_some_and(|job| job.assessment.is_none()) {
         return VerifierRepairDecision::DiagnosticUnavailable;
     }
-    // Issue #647 (CB-012): When semantic_plan is active but the
-    // assessment was constructed before exhausted_attempts grew (= the
-    // hint guard in `verifier_repair_context_target_path` returns
-    // `None` because exhausted_attempts is non-empty), do NOT fall
-    // through to `latest_successful_read_existing_path`. That fallback
-    // would route the repair pass to an unrelated turn-local read
-    // target. Force a fresh diagnostic instead so the next assessment
-    // reflects the advanced cluster.
+    // Issue #647 (CB-012 / CB-014): When semantic_plan is active but
+    // the assessment was constructed before exhausted_attempts grew
+    // (= the hint guard in `verifier_repair_context_target_path`
+    // returns `None` because exhausted_attempts is non-empty), the
+    // assessment is **stale**. Two branches:
+    //
+    //   * **CB-012** (attempts remain): force a fresh diagnostic so
+    //     the next assessment reflects the advanced cluster. Without
+    //     this branch we would fall through to
+    //     `latest_successful_read_existing_path` and route the repair
+    //     pass to an unrelated turn-local read target.
+    //   * **CB-014** (attempts exhausted): fail closed with
+    //     `DiagnosticUnavailable`. Without this branch the same
+    //     stale-target fallback path reopens at the diagnostic budget
+    //     boundary because `assessment.is_some()` keeps the earlier
+    //     `assessment.is_none() -> DiagnosticUnavailable` arm from
+    //     firing.
     if job.is_some_and(|job| {
         job.semantic_plan.is_some()
             && !job.exhausted_attempts.is_empty()
             && super::turn::verifier_repair_context_target_path(work_root, job).is_none()
-            && job.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
     }) {
-        return VerifierRepairDecision::NeedDiagnostic;
+        if job.is_some_and(|job| {
+            job.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+        }) {
+            return VerifierRepairDecision::NeedDiagnostic;
+        }
+        return VerifierRepairDecision::DiagnosticUnavailable;
     }
     let target = job
         .and_then(|job| super::turn::verifier_repair_context_target_path(work_root, job))

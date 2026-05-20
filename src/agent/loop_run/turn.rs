@@ -20768,6 +20768,88 @@ mod progress_tests {
         );
     }
 
+    /// Issue #647 (CB-014): the stale advanced-semantic-plan state must
+    /// fail closed when `assessment_attempts` reaches the diagnostic
+    /// budget limit. Without this branch the same stale state bypasses
+    /// `NeedDiagnostic` (limit-gated) and falls through to
+    /// `latest_successful_read_existing_path` / `NeedTargetDiscovery`,
+    /// reopening the stale-target fallback at the budget boundary.
+    #[test]
+    fn cb014_stale_advanced_semantic_plan_at_budget_limit_returns_diagnostic_unavailable() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Pre-populate an unrelated read-existing file so the
+        // `latest_successful_read_existing_path` fallback *could* match
+        // if the CB-014 guard fails to fire.
+        let unrelated = work_root.join("unrelated.txt");
+        std::fs::write(&unrelated, "irrelevant\n").unwrap();
+
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        assert!(context.assessment.is_some(), "fixture invariant");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        let any_cluster_id = context
+            .semantic_plan
+            .as_ref()
+            .unwrap()
+            .failure_cluster_id
+            .clone();
+        context.exhausted_attempts.push((
+            any_cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        // **Budget exhausted**: assessment_attempts == LIMIT.
+        context.assessment_attempts = VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        context.diagnostic_attempted = true;
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::DiagnosticUnavailable,
+            "CB-014: stale advanced semantic_plan with exhausted diagnostic budget must fail closed"
+        );
+    }
+
+    /// Issue #647 (CB-014): the stale advanced-semantic-plan state must
+    /// still return `NeedDiagnostic` while attempts remain under the
+    /// budget (= CB-012 behavior unchanged for under-budget). Pins the
+    /// split between CB-012 (under-budget) and CB-014 (at-budget).
+    #[test]
+    fn cb014_stale_advanced_semantic_plan_under_budget_still_returns_need_diagnostic() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        assert!(context.assessment.is_some(), "fixture invariant");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        let any_cluster_id = context
+            .semantic_plan
+            .as_ref()
+            .unwrap()
+            .failure_cluster_id
+            .clone();
+        context.exhausted_attempts.push((
+            any_cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        // **Budget remaining**: attempts strictly below LIMIT.
+        const _: () = assert!(VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT >= 1);
+        context.assessment_attempts = VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT - 1;
+        context.diagnostic_attempted = true;
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-014 boundary: attempts < LIMIT must still elect NeedDiagnostic"
+        );
+    }
+
     /// Issue #647 (CB-013): production-level integration test.
     ///
     /// When `run_verifier_diagnostic_pass` is invoked with the same
