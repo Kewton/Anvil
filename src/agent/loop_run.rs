@@ -59,7 +59,17 @@ mod repair_job;
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
 mod required_behavior;
+// Issue #647 (Phase A.1): semantic repair planning — bounded failure-report
+// schema and deterministic cluster-key generation. Module is intentionally
+// *not* re-exported (DR3-001) — future consumers (`turn.rs`, `repair_job.rs`)
+// reach in via `super::semantic_failure::*`.
+mod semantic_failure;
 pub mod slash_commands;
+// Issue #647 (Phase A.2): spec-authority enum + tie-break scoring + test/impl
+// weakening detectors. Module is intentionally *not* re-exported (DR3-001) —
+// future consumers (`turn.rs`, `repair_job.rs`) reach in via
+// `super::spec_authority::*`.
+mod spec_authority;
 mod spinner;
 mod success;
 mod summary;
