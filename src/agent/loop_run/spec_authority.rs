@@ -161,6 +161,180 @@ pub(super) fn select_authority(
     Some(top)
 }
 
+/// Issue #647 (SF1 V3): minimal cross-turn history hint that the
+/// `SpecAuthorityInput` builder can read to decide whether
+/// `has_verified_public_interface` should fire.
+///
+/// Kept deliberately small (one bool) — wider session-store history is out
+/// of scope for SF1 V3 (S5-005 dead-variant policy still applies on the
+/// resolver side). When future Issues plumb richer history, this struct is
+/// the only growth point for the builder signature.
+///
+/// `Default::default()` is the safe production fallback when no caller
+/// context is available (e.g. test wrappers or fresh sessions).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct AgentHistoryHint {
+    /// True iff the agent already observed a verifier success for the
+    /// active task *within this run-actor-loop iteration*. Mirrors the
+    /// local `task_contract_verifier_passed_in_loop` flag in
+    /// `Agent::handle_user_message`.
+    pub(super) verifier_passed_in_loop: bool,
+}
+
+/// Issue #647 (SF1 V3.1): explicit-spec keyword set used by
+/// [`detect_explicit_spec_in_user_request`]. Ascii + Japanese kept in one
+/// table so the detector is a pure-string match. Each entry encodes a
+/// determinate, prescriptive expression — vague guidance (e.g. "please",
+/// "could you") is intentionally excluded.
+const EXPLICIT_SPEC_KEYWORDS: &[&str] = &[
+    // Ascii: prescriptive modal verbs and contract phrasing.
+    "must ",
+    "must return",
+    "must accept",
+    "must raise",
+    "must not",
+    "should ",
+    "should return",
+    "should accept",
+    "should not",
+    "shall ",
+    "shall return",
+    "specification",
+    "spec:",
+    "expects exactly",
+    "expects:",
+    "api contract",
+    "contract:",
+    // Japanese: prescriptive phrasing.
+    "仕様",
+    "必須",
+    "必ず",
+    "返却すること",
+    "返すこと",
+    "返さなければならない",
+    "してはならない",
+    "とすること",
+];
+
+/// Minimum count of distinct explicit-spec keywords that must appear in
+/// `active_request` for the detector to declare a "user-request match".
+///
+/// SF1 V3 design judgment: a single occurrence of "should" is too noisy
+/// (it often appears in conversational filler). Two distinct hits raise
+/// the bar high enough that the request is plausibly *prescriptive*
+/// without forcing the user to write a formal grammar.
+const EXPLICIT_SPEC_MIN_DISTINCT_HITS: usize = 2;
+
+/// Issue #647 (SF1 V3.1): cheap heuristic that classifies an
+/// `active_request` as "carries an explicit specification" iff at least
+/// `EXPLICIT_SPEC_MIN_DISTINCT_HITS` distinct keywords from
+/// `EXPLICIT_SPEC_KEYWORDS` appear in the request.
+///
+/// Pure function — no I/O, no LLM dependency. Matching is case-insensitive
+/// on the ascii side; the Japanese keywords are matched verbatim (Japanese
+/// has no case fold to apply).
+pub(super) fn detect_explicit_spec_in_user_request(active_request: &str) -> bool {
+    if active_request.trim().is_empty() {
+        return false;
+    }
+    let lowered = active_request.to_ascii_lowercase();
+    let mut hits = 0usize;
+    for keyword in EXPLICIT_SPEC_KEYWORDS {
+        // Ascii keywords are stored in lower-case; Japanese keywords are
+        // ascii-only-insensitive (they have no ascii letters anyway).
+        if lowered.contains(keyword) {
+            hits += 1;
+            if hits >= EXPLICIT_SPEC_MIN_DISTINCT_HITS {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Issue #647 (SF1 V3.3): consensus heuristic computed from the
+/// `ContractConflict` fields of a `SemanticFailureReport`. Returns
+/// `Some(ArtifactConsensus { agreeing, dissenting, reason })` when exactly
+/// two of the three roles agree (after normalization) and the third
+/// disagrees; otherwise returns `None` (covers both "all three agree" and
+/// "all three differ").
+///
+/// Normalization is intentionally cheap: lower-case + collapsed-whitespace
+/// trim. The Issue spec explicitly forbids NLP — this stays a pure string
+/// match.
+pub(super) fn detect_consensus_from_contract_conflict(
+    implementation: &str,
+    test: &str,
+    usage_docs: &str,
+) -> Option<ArtifactConsensus> {
+    let impl_norm = normalize_consensus_text(implementation);
+    let test_norm = normalize_consensus_text(test);
+    let docs_norm = normalize_consensus_text(usage_docs);
+    if impl_norm.is_empty() || test_norm.is_empty() || docs_norm.is_empty() {
+        return None;
+    }
+    let impl_test = impl_norm == test_norm;
+    let impl_docs = impl_norm == docs_norm;
+    let test_docs = test_norm == docs_norm;
+    // Exactly two roles agree → tie-break consensus.
+    match (impl_test, impl_docs, test_docs) {
+        (true, false, false) => Some(ArtifactConsensus::new(
+            vec![ArtifactRole::Implementation, ArtifactRole::Test],
+            vec![ArtifactRole::UsageDocs],
+            "impl and test agree; usage_docs dissents",
+        )),
+        (false, true, false) => Some(ArtifactConsensus::new(
+            vec![ArtifactRole::Implementation, ArtifactRole::UsageDocs],
+            vec![ArtifactRole::Test],
+            "impl and usage_docs agree; test dissents",
+        )),
+        (false, false, true) => Some(ArtifactConsensus::new(
+            vec![ArtifactRole::Test, ArtifactRole::UsageDocs],
+            vec![ArtifactRole::Implementation],
+            "test and usage_docs agree; impl dissents",
+        )),
+        // All three agree, or all three differ → no usable tie-break.
+        _ => None,
+    }
+}
+
+/// Normalize a `ContractConflict` field for consensus comparison.
+///
+/// Lower-case + collapse all whitespace runs to a single space + trim.
+fn normalize_consensus_text(text: &str) -> String {
+    let lowered = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(lowered.len());
+    let mut last_was_ws = true; // suppress leading whitespace
+    for ch in lowered.chars() {
+        if ch.is_whitespace() {
+            if !last_was_ws {
+                out.push(' ');
+                last_was_ws = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_ws = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Issue #647 (SF1 V3.2): "verified public interface" detector that wires
+/// the existing turn-local `verifier_passed_in_loop` signal into the
+/// `SpecAuthorityInput`. This is the **real but bounded** detector
+/// referenced in S5-005: it never lies (the bit is observed, not stubbed)
+/// and it never reaches outside the current actor-loop iteration.
+///
+/// Pure function — `hint` is the only input. Lives next to the consensus
+/// / explicit-spec detectors so a future Issue widening the history
+/// surface has a single growth point.
+pub(super) fn detect_verified_public_interface_from_history(hint: AgentHistoryHint) -> bool {
+    hint.verifier_passed_in_loop
+}
+
 /// Issue #647 (SF1): aggregated input passed by `turn.rs` to [`resolve`]
 /// when constructing a `SemanticRepairPlan`. Each flag is computed by the
 /// caller from a different source (the user request, the
@@ -923,6 +1097,108 @@ mod tests {
         let raw = "x".repeat(MAX_CONSENSUS_REASON_CHARS + 50);
         let c = ArtifactConsensus::new(vec![ArtifactRole::Implementation], vec![], &raw);
         assert!(c.reason.chars().count() <= MAX_CONSENSUS_REASON_CHARS + 3); // +"..."
+    }
+
+    // -- SF1 V3.1: explicit-spec detector -- //
+
+    #[test]
+    fn sf1_v3_explicit_spec_positive_two_distinct_keywords() {
+        // Two distinct prescriptive keywords ("must return", "should")
+        // → user-request match fires.
+        let request = "The endpoint must return 404 when the item is missing. \
+                       The response should also include a JSON error body.";
+        assert!(detect_explicit_spec_in_user_request(request));
+    }
+
+    #[test]
+    fn sf1_v3_explicit_spec_negative_single_should() {
+        // A single "should" hit is below the threshold (2 distinct hits).
+        let request = "You should probably add a test for the create flow.";
+        assert!(!detect_explicit_spec_in_user_request(request));
+    }
+
+    #[test]
+    fn sf1_v3_explicit_spec_negative_empty_request() {
+        assert!(!detect_explicit_spec_in_user_request(""));
+        assert!(!detect_explicit_spec_in_user_request("   \n  "));
+    }
+
+    #[test]
+    fn sf1_v3_explicit_spec_positive_japanese_keywords() {
+        // Two distinct Japanese prescriptive keywords are enough.
+        let request = "本仕様の API は必ず 404 を返すこと。";
+        assert!(detect_explicit_spec_in_user_request(request));
+    }
+
+    // -- SF1 V3.3: consensus heuristic -- //
+
+    #[test]
+    fn sf1_v3_consensus_impl_and_docs_agree_test_dissents() {
+        let consensus = detect_consensus_from_contract_conflict(
+            "returns 404 when missing",
+            "expects 200",
+            "Returns 404 when missing",
+        );
+        let consensus = consensus.expect("two-vs-one agreement must yield consensus");
+        assert!(consensus.agreeing.contains(&ArtifactRole::Implementation));
+        assert!(consensus.agreeing.contains(&ArtifactRole::UsageDocs));
+        assert_eq!(consensus.dissenting, vec![ArtifactRole::Test]);
+    }
+
+    #[test]
+    fn sf1_v3_consensus_test_and_docs_agree_impl_dissents() {
+        let consensus =
+            detect_consensus_from_contract_conflict("returns 200", "expects 404", "expects 404");
+        let consensus = consensus.expect("two-vs-one agreement must yield consensus");
+        assert_eq!(consensus.dissenting, vec![ArtifactRole::Implementation]);
+        assert!(consensus.agreeing.contains(&ArtifactRole::Test));
+        assert!(consensus.agreeing.contains(&ArtifactRole::UsageDocs));
+    }
+
+    #[test]
+    fn sf1_v3_consensus_all_three_agree_returns_none() {
+        // Full agreement is not a tie-break signal.
+        let consensus = detect_consensus_from_contract_conflict("foo", "foo", "foo");
+        assert!(consensus.is_none());
+    }
+
+    #[test]
+    fn sf1_v3_consensus_all_three_differ_returns_none() {
+        let consensus = detect_consensus_from_contract_conflict("alpha", "beta", "gamma");
+        assert!(consensus.is_none());
+    }
+
+    #[test]
+    fn sf1_v3_consensus_empty_field_returns_none() {
+        // If any field is empty after normalize, consensus can't fire.
+        let consensus = detect_consensus_from_contract_conflict("foo", "foo", "");
+        assert!(consensus.is_none());
+    }
+
+    #[test]
+    fn sf1_v3_consensus_whitespace_and_case_insensitive() {
+        // Normalize: lower-case + whitespace collapse → still agreement.
+        let consensus =
+            detect_consensus_from_contract_conflict("Returns   404", "expects 200", "returns 404");
+        let consensus = consensus.expect("normalize must allow case/ws-tolerant match");
+        assert!(consensus.agreeing.contains(&ArtifactRole::Implementation));
+        assert!(consensus.agreeing.contains(&ArtifactRole::UsageDocs));
+    }
+
+    // -- SF1 V3.2: verified-public-interface from history -- //
+
+    #[test]
+    fn sf1_v3_verified_public_interface_false_by_default() {
+        let hint = AgentHistoryHint::default();
+        assert!(!detect_verified_public_interface_from_history(hint));
+    }
+
+    #[test]
+    fn sf1_v3_verified_public_interface_true_when_verifier_passed_in_loop() {
+        let hint = AgentHistoryHint {
+            verifier_passed_in_loop: true,
+        };
+        assert!(detect_verified_public_interface_from_history(hint));
     }
 
     // -- Test detectors -- //

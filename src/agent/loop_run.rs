@@ -516,6 +516,18 @@ pub struct Agent {
     /// tool policy can choose a repair target without polluting the assistant
     /// history with long-lived diagnostic state.
     task_contract_verifier_repair_pending: bool,
+    /// Issue #647 (SF1 V3.2): mirror of the local
+    /// `task_contract_verifier_passed_in_loop` bool in
+    /// `handle_user_message`. Lives on `Agent` so methods invoked from
+    /// inside the actor-loop (e.g. `run_verifier_diagnostic_pass`) can read
+    /// the same "has the verifier already passed once in this run-actor-loop
+    /// iteration?" signal that the local variable carries — without
+    /// plumbing yet another `&mut bool` through six call sites. Reset at
+    /// the head of every `handle_user_message`; flipped to `true` from
+    /// `drive_task_contract_verifier` whenever the verifier classifies a
+    /// run as Passed. **Read-only** consumer in this Issue: the
+    /// `SpecAuthorityInput` builder.
+    pub(super) task_contract_verifier_passed_this_actor_loop: bool,
     /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
     /// task-contract verifier. Renamed from `verifier_repair_context` to
     /// `repair_job` and consolidated under `repair_job::RepairJob` so all
@@ -783,6 +795,7 @@ impl Agent {
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
             task_contract_verifier_repair_pending: false,
+            task_contract_verifier_passed_this_actor_loop: false,
             repair_job: None,
             repair_job_artifact_attempts: 0,
             repair_failure_snapshot: None,

@@ -4959,6 +4959,13 @@ impl Agent {
         self.task_contract_excerpts.clear();
         self.current_artifact_recovery_target = None;
         self.task_contract_verifier_repair_pending = false;
+        // Issue #647 (SF1 V3.2): mirror reset for the verifier-passed
+        // hint that backs `SpecAuthorityInput.has_verified_public_interface`.
+        // Lives at the same per-turn reset boundary as the
+        // `task_contract_verifier_repair_pending` flag so a previous turn's
+        // verifier success cannot leak into the current turn's
+        // SpecAuthority resolution.
+        self.task_contract_verifier_passed_this_actor_loop = false;
         self.repair_job = None;
         // Issue #637 (CB-001): reset the artifact-recovery retry counter at
         // the same per-turn boundary as `repair_job` so a previous turn's
@@ -7553,6 +7560,12 @@ impl Agent {
                 // cycle restarts at 1/3.
                 self.repair_job_artifact_attempts = 0;
                 *args.task_contract_verifier_passed_in_loop = true;
+                // Issue #647 (SF1 V3.2): mirror the local flag onto the
+                // Agent so `run_verifier_diagnostic_pass` (called later
+                // in the same actor-loop iteration on re-failure) can
+                // wire `has_verified_public_interface = true` into the
+                // SpecAuthorityInput.
+                self.task_contract_verifier_passed_this_actor_loop = true;
                 TaskContractVerifierFlowOutcome::Done {
                     final_prose: format!(
                         "Completed requested repository changes and verified them with `{safe_command}`."
@@ -9356,15 +9369,24 @@ impl Agent {
         // responsibility split.
         let semantic_report = parse_semantic_failure_report_from_reply(&reply.content)
             .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &context));
-        // Issue #647 (SF1): build the `SpecAuthorityInput` from the active
-        // request's `RequiredBehaviorContract` (when actionable signal is
-        // present, the resolver elects `BehaviorContract`). All other
-        // detectors (`has_user_request_match`, consensus) are still default
-        // until later Issues wire them in; `is_newly_generated_task` is
-        // initialized to `true` per the SF1 acceptance until a real
-        // newly-generated detector lands.
-        let authority_input =
-            build_spec_authority_input_for_active_request(self.active_request_text().as_deref());
+        // Issue #647 (SF1 / V3): build the `SpecAuthorityInput` from the
+        // four real detectors wired in V3:
+        //   * BehaviorContract — from `TaskContract::from_request`.
+        //   * UserRequest match — from the explicit-spec keyword detector.
+        //   * VerifiedPublicInterface — from the turn-local
+        //     `task_contract_verifier_passed_this_actor_loop` flag
+        //     (S5-005: real-but-bounded detector).
+        //   * Consensus — from the V3.3 contract-conflict heuristic over
+        //     the just-parsed `SemanticFailureReport`.
+        // `is_newly_generated_task` stays `true` per the SF1 acceptance.
+        let agent_history_hint = super::spec_authority::AgentHistoryHint {
+            verifier_passed_in_loop: self.task_contract_verifier_passed_this_actor_loop,
+        };
+        let authority_input = build_spec_authority_input_for_active_request(
+            self.active_request_text().as_deref(),
+            semantic_report.as_ref(),
+            agent_history_hint,
+        );
         let semantic_plan = semantic_report.and_then(|report| {
             build_semantic_repair_plan_from_report_with_authority_input(
                 report,
@@ -15723,19 +15745,38 @@ fn build_semantic_failure_report_from_legacy(
 ///
 /// `expected_improvement` is initialized to `None` — Phase E fills it after
 /// the verifier rerun.
-/// Issue #647 (SF1): construct a `SpecAuthorityInput` for the production
-/// diagnostic pass by inspecting `active_request` for actionable behavior
-/// signal. When the request yields a `RequiredBehaviorContract` with
-/// operations / domain_terms, the resolver will elect `BehaviorContract`;
-/// otherwise we fall through to the newly-generated-task path (which
-/// returns `LlmGeneratedTest`, suppressing test edits on a brand-new
-/// task — see [`spec_authority::resolve`]).
+/// Issue #647 (SF1 / V3): construct a `SpecAuthorityInput` for the
+/// production diagnostic pass by funneling four independent signals into
+/// the resolver:
+///
+/// 1. `has_behavior_contract` — derived from
+///    `task_contract::TaskContract::from_request` on the active request.
+/// 2. `has_user_request_match` — derived from the SF1 V3.1 explicit-spec
+///    keyword detector ([`spec_authority::detect_explicit_spec_in_user_request`]).
+/// 3. `has_verified_public_interface` — derived from the SF1 V3.2
+///    history hint detector
+///    ([`spec_authority::detect_verified_public_interface_from_history`]),
+///    which today reads the turn-local "verifier already passed once"
+///    bit and never reaches outside the current actor-loop iteration.
+/// 4. `consensus` — derived from the SF1 V3.3 string-match heuristic
+///    ([`spec_authority::detect_consensus_from_contract_conflict`]) over
+///    the parsed `SemanticFailureReport.contract_conflict` fields. `None`
+///    when no report is available yet (e.g. legacy parse).
+///
+/// `is_newly_generated_task` stays `true` per the SF1 acceptance — Issue
+/// #647 treats every turn as "newly generated" until a future Issue
+/// plumbs a real detector. The resolver's newly-generated short-circuit
+/// only fires when `consensus` is `None`, so the V3.3 detector
+/// automatically demotes the short-circuit when a real tie-break exists.
 ///
 /// The helper lives here (not in `spec_authority.rs`) because it crosses
-/// the `task_contract` / `spec_authority` module boundary; the resolver
-/// itself stays input-only and decoupled from `TaskContract`.
+/// the `task_contract` / `spec_authority` / `semantic_failure` module
+/// boundaries; the resolver itself stays input-only and decoupled from
+/// `TaskContract` and `SemanticFailureReport`.
 fn build_spec_authority_input_for_active_request(
     active_request: Option<&str>,
+    semantic_report: Option<&super::semantic_failure::SemanticFailureReport>,
+    agent_history_hint: super::spec_authority::AgentHistoryHint,
 ) -> super::spec_authority::SpecAuthorityInput {
     let has_behavior_contract = active_request
         .map(|request| {
@@ -15744,12 +15785,24 @@ fn build_spec_authority_input_for_active_request(
                 || contract.required_behavior.domain_terms.is_some()
         })
         .unwrap_or(false);
+    let has_user_request_match = active_request
+        .map(super::spec_authority::detect_explicit_spec_in_user_request)
+        .unwrap_or(false);
+    let has_verified_public_interface =
+        super::spec_authority::detect_verified_public_interface_from_history(agent_history_hint);
+    let consensus = semantic_report.and_then(|report| {
+        super::spec_authority::detect_consensus_from_contract_conflict(
+            &report.contract_conflict.implementation,
+            &report.contract_conflict.test,
+            &report.contract_conflict.usage_docs,
+        )
+    });
     super::spec_authority::SpecAuthorityInput {
-        has_user_request_match: false,
+        has_user_request_match,
         has_behavior_contract,
-        has_verified_public_interface: false,
+        has_verified_public_interface,
         is_newly_generated_task: true,
-        consensus: None,
+        consensus,
     }
 }
 
@@ -21289,9 +21342,16 @@ E   assert [{'id': 1}] == []\n";
         // A request that names an operation keyword ("create") + a domain
         // term should yield `has_behavior_contract: true`. The exact
         // detection is owned by `task_contract::TaskContract::from_request`
-        // — we only assert the routing here.
+        // — we only assert the routing here. (V3) We also pass
+        // `semantic_report = None` and a default history hint so the new
+        // V3 detectors stay neutral and we exercise the same routing as
+        // pre-V3 production.
         let request = "Create a TODO API: implement POST /todos to create a new todo item, then add a pytest that POSTs and asserts 201.";
-        let input = super::build_spec_authority_input_for_active_request(Some(request));
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
         assert!(
             input.has_behavior_contract,
             "actionable request must set has_behavior_contract=true"
@@ -21302,9 +21362,200 @@ E   assert [{'id': 1}] == []\n";
         assert!(input.consensus.is_none());
 
         // Empty / missing request → behavior contract flag stays false.
-        let empty_input = super::build_spec_authority_input_for_active_request(None);
+        let empty_input = super::build_spec_authority_input_for_active_request(
+            None,
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
         assert!(!empty_input.has_behavior_contract);
         assert!(empty_input.is_newly_generated_task);
+    }
+
+    // -- SF1 V3 production integration tests (Issue #647 / SF1 V3.5) -- //
+    //
+    // These tests close the Codex SF1 V3 finding: prior to V3 the
+    // production builder hard-coded `has_user_request_match`, `consensus`,
+    // and `has_verified_public_interface` to neutral values regardless of
+    // input. V3 wires three real detectors plus the
+    // `SemanticFailureReport` + `AgentHistoryHint` parameters; the tests
+    // below exercise each detector through the production helper.
+
+    /// SF1 V3.1: an active request that carries two or more distinct
+    /// explicit-spec keywords (e.g. "must return 404", "must accept")
+    /// must flip `has_user_request_match = true` via the production
+    /// builder.
+    #[test]
+    fn sf1_v3_user_request_match_detected_from_explicit_spec_keywords() {
+        let request = "The endpoint must return 404 when the item is missing. \
+                       The handler must accept a JSON body with an `id` field.";
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        assert!(
+            input.has_user_request_match,
+            "explicit-spec keywords (>=2 distinct hits) must flip has_user_request_match"
+        );
+
+        // Conversational guidance (one "should") must NOT trip the detector.
+        let conversational = "You should maybe add a test here.";
+        let input2 = super::build_spec_authority_input_for_active_request(
+            Some(conversational),
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        assert!(
+            !input2.has_user_request_match,
+            "single-keyword conversational request must NOT flip the flag"
+        );
+    }
+
+    /// SF1 V3.3: when the `SemanticFailureReport.contract_conflict` shows
+    /// two roles agreeing and one dissenting, the production builder must
+    /// surface a non-`None` `consensus` value (with the right agreeing /
+    /// dissenting role layout).
+    #[test]
+    fn sf1_v3_consensus_detected_when_two_artifacts_agree() {
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["read missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 404 when missing",
+                "test": "expects 200",
+                "usage_docs": "Returns 404 when missing"
+            },
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "test expects the pre-spec 200 response",
+            "confidence": 0.8
+        }"#;
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("sample report parses");
+        let input = super::build_spec_authority_input_for_active_request(
+            None,
+            Some(&report),
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        let consensus = input
+            .consensus
+            .as_ref()
+            .expect("two-vs-one agreement in contract_conflict must surface a consensus");
+        assert!(
+            consensus
+                .agreeing
+                .contains(&super::super::task_contract::ArtifactRole::Implementation),
+            "impl/docs agreed in the fixture"
+        );
+        assert!(
+            consensus
+                .agreeing
+                .contains(&super::super::task_contract::ArtifactRole::UsageDocs),
+            "impl/docs agreed in the fixture"
+        );
+        assert_eq!(
+            consensus.dissenting,
+            vec![super::super::task_contract::ArtifactRole::Test],
+            "test was the dissenting role"
+        );
+    }
+
+    /// SF1 V3 acceptance: when the production builder is called with
+    /// rich inputs (explicit-spec request, a real
+    /// `SemanticFailureReport` with two-vs-one consensus, and a verifier
+    /// history hint), the resulting `SpecAuthorityInput` is **not**
+    /// all-neutral. At least one of the three V3 detectors must light up.
+    #[test]
+    fn sf1_v3_production_input_is_not_all_false() {
+        let request = "The API must return 404 when missing. The body must accept JSON.";
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 404 when missing",
+                "test": "expects 200",
+                "usage_docs": "returns 404 when missing"
+            },
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "stale test assertion",
+            "confidence": 0.9
+        }"#;
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("sample report parses");
+        let hint = super::super::spec_authority::AgentHistoryHint {
+            verifier_passed_in_loop: true,
+        };
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            Some(&report),
+            hint,
+        );
+        // Pre-V3 production hard-coded all three to neutral. V3 must
+        // light at least one detector when real inputs exist; here all
+        // three light up.
+        assert!(
+            input.has_user_request_match,
+            "explicit-spec request must light has_user_request_match"
+        );
+        assert!(
+            input.has_verified_public_interface,
+            "verifier_passed_in_loop=true must light has_verified_public_interface"
+        );
+        assert!(
+            input.consensus.is_some(),
+            "two-vs-one contract_conflict must surface a consensus"
+        );
+    }
+
+    /// SF1 V3 acceptance end-to-end: an explicit-spec user request flows
+    /// all the way through the production builder + `resolve()` and
+    /// elects `SpecAuthority::UserRequest` on the resulting plan.
+    #[test]
+    fn sf1_v3_resolver_elects_user_request_when_match_detected() {
+        let request = "The API must return 404 when missing. The body must accept JSON.";
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 200",
+                "test": "expects 404",
+                "usage_docs": "returns 404"
+            },
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "impl returns the wrong status",
+            "confidence": 0.85
+        }"#;
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("sample report parses");
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            Some(&report),
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        let plan = super::build_semantic_repair_plan_from_report_with_authority_input(
+            report.clone(),
+            input,
+        )
+        .expect("plan must build for assertion_mismatch");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            "an explicit-spec user request must dominate downstream authority resolution"
+        );
     }
 
     /// Phase D / D.3 (S1-010): `DependencyMissing` dispatches to the
