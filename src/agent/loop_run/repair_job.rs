@@ -590,6 +590,90 @@ pub(super) fn should_re_diagnostic(repair_job: &RepairJob) -> bool {
         .contains(&(plan.failure_cluster_id.clone(), plan.preferred_repair_role))
 }
 
+/// Issue #647 (MF2.3): production dispatch helper that wires the Phase-E
+/// cluster-aware helpers into the rerun-handling path.
+///
+/// Called from `turn.rs::drive_task_contract_verifier` after a fresh
+/// `RepairJob` has been built by `verifier_repair_context_from_failure`
+/// (which carries `semantic_plan` / `exhausted_attempts` over from the
+/// previous turn via MF2.1). Drives the cluster-aware sequential repair
+/// state machine:
+///
+/// 1. If the active `semantic_plan`'s `(cluster_id, role)` is already in
+///    `exhausted_attempts` (`should_re_diagnostic` = true — the diagnostic
+///    LLM has re-proposed an already-attacked cluster), reset to the
+///    re-diagnostic path: `assessment = None`, `assessment_attempts += 1`.
+/// 2. Else, if `rerun_outcome` indicates the repair did not help
+///    (`SameFailureRemaining` / `Worsened`) AND a `semantic_plan` is
+///    active, attempt to walk to the next cluster via
+///    `advance_to_next_cluster`.
+///    - If a next cluster was found, wrap the rerun outcome via
+///      `rerun_outcome_with_cluster` so a cluster-id transition surfaces
+///      as `NewFailure` to downstream consumers.
+///    - If no next cluster is available, the report is exhausted: reset
+///      to the re-diagnostic path so a fresh diagnostic LLM call can
+///      identify a new cluster set.
+///
+/// `previous_cluster_id` is the `failure_cluster_id` carried over from the
+/// previous turn's `RepairJob.semantic_plan` (the source of truth for the
+/// "what cluster did we just attack" question). The helper does NOT touch
+/// `repair_attempt` or `applied_repair_intents` — those remain governed by
+/// the legacy diagnostic / repair-pass machinery (S7-005).
+pub(super) fn apply_semantic_repair_dispatch_after_rerun(
+    repair_job: &mut RepairJob,
+    previous_cluster_id: Option<&FailureClusterKey>,
+) {
+    // 1. Active plan is already exhausted → switch to re-diagnostic.
+    if should_re_diagnostic(repair_job) {
+        repair_job.assessment = None;
+        repair_job.assessment_attempts = repair_job.assessment_attempts.saturating_add(1);
+        return;
+    }
+
+    // 2. Only walk to the next cluster when the rerun outcome indicates the
+    //    repair did not progress (legacy failure_count-based outcome is the
+    //    SSOT here, S3-014).
+    let needs_advance = matches!(
+        repair_job.rerun_outcome,
+        Some(
+            VerifierRepairRerunOutcome::SameFailureRemaining | VerifierRepairRerunOutcome::Worsened
+        )
+    ) && repair_job.semantic_plan.is_some();
+    if !needs_advance {
+        return;
+    }
+
+    let Some(base_outcome) = repair_job.rerun_outcome else {
+        return;
+    };
+    let report = repair_job
+        .semantic_plan
+        .as_ref()
+        .map(|plan| plan.semantic_report.clone());
+    let Some(report) = report else {
+        return;
+    };
+
+    let advanced = advance_to_next_cluster(repair_job, &report);
+
+    if advanced {
+        // Cluster transition → upgrade the outcome via the SSOT wrapper.
+        let new_cluster_id = repair_job
+            .semantic_plan
+            .as_ref()
+            .map(|plan| &plan.failure_cluster_id);
+        repair_job.rerun_outcome = Some(rerun_outcome_with_cluster(
+            previous_cluster_id,
+            new_cluster_id,
+            base_outcome,
+        ));
+    } else {
+        // No remaining clusters in the report → fall back to re-diagnostic.
+        repair_job.assessment = None;
+        repair_job.assessment_attempts = repair_job.assessment_attempts.saturating_add(1);
+    }
+}
+
 /// Issue #647 (Phase E.3 / S3-014): wrap the existing
 /// `verifier_repair_rerun_outcome` (which is failure_count-based and
 /// cluster-agnostic) with a cluster-id transition rule.
@@ -1216,6 +1300,231 @@ mod tests {
         // The ledger does grow per advance — but it's an O(N_clusters)
         // bounded list, not a retry counter.
         assert_eq!(job.exhausted_attempts.len(), 3);
+    }
+
+    // ---- Issue #647 (MF2): production dispatch wiring ---- //
+
+    /// MF2.3: after carryover, when rerun outcome is bad (SameFailureRemaining)
+    /// and there is a next cluster, dispatch advances to the next cluster and
+    /// promotes rerun_outcome to NewFailure via `rerun_outcome_with_cluster`.
+    /// `assessment` is preserved (we have a plan; do not re-diagnostic yet).
+    #[test]
+    fn mf2_dispatch_advances_to_next_cluster_on_same_failure_remaining() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let mut job = job_with_first_cluster_plan(&report);
+        // Simulate a non-empty prior assessment that survived carryover.
+        let preserved_assessment = super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: None,
+            repair_plan: Vec::new(),
+            summary: Some("preserved".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        };
+        job.assessment = Some(preserved_assessment);
+        job.rerun_outcome = Some(VerifierRepairRerunOutcome::SameFailureRemaining);
+
+        let previous_cluster = Some(cluster_ids[0].clone());
+        apply_semantic_repair_dispatch_after_rerun(&mut job, previous_cluster.as_ref());
+
+        // Slot walked to the next cluster.
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1]
+        );
+        // Outcome promoted to NewFailure via cluster transition wrap.
+        assert_eq!(
+            job.rerun_outcome,
+            Some(VerifierRepairRerunOutcome::NewFailure)
+        );
+        // assessment preserved — caller proceeds to repair the new cluster
+        // without burning the diagnostic budget.
+        assert!(job.assessment.is_some());
+        assert_eq!(job.assessment_attempts, 0);
+    }
+
+    /// MF2.3: when the active plan's (cluster_id, role) is already in the
+    /// exhausted ledger (LLM re-proposed the same cluster), dispatch must
+    /// switch to the re-diagnostic path (assessment cleared, attempts bumped).
+    #[test]
+    fn mf2_dispatch_resets_for_re_diagnostic_when_plan_already_exhausted() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Job state: plan still targets cluster A, but cluster A is already
+        // in the ledger (= we've burned cluster A; diagnostic re-proposed it).
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: None,
+                repair_plan: Vec::new(),
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            ..RepairJob::new_for_test()
+        };
+
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+
+        // Re-diagnostic switch: assessment cleared, attempts bumped.
+        assert!(job.assessment.is_none());
+        assert_eq!(job.assessment_attempts, 1);
+    }
+
+    /// MF2.3: when the rerun-outcome is bad but the report has no remaining
+    /// clusters, advance returns false and we fall back to re-diagnostic.
+    #[test]
+    fn mf2_dispatch_falls_back_to_re_diagnostic_when_no_more_clusters() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 1);
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let mut job = job_with_first_cluster_plan(&report);
+        job.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(report.preferred_repair_role),
+            needed_reads: Vec::new(),
+            repair_target_hint: None,
+            repair_plan: Vec::new(),
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+        job.rerun_outcome = Some(VerifierRepairRerunOutcome::Worsened);
+
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_id));
+
+        // No more clusters → plan cleared, re-diagnostic path armed.
+        assert!(job.semantic_plan.is_none());
+        assert!(job.assessment.is_none());
+        assert_eq!(job.assessment_attempts, 1);
+    }
+
+    /// MF2.3: when the rerun outcome shows progress (Improved / NewFailure),
+    /// dispatch does NOT advance — the next cycle handles the new state.
+    #[test]
+    fn mf2_dispatch_is_noop_when_rerun_outcome_indicates_progress() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let mut job = job_with_first_cluster_plan(&report);
+        let preserved_assessment = super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(report.preferred_repair_role),
+            needed_reads: Vec::new(),
+            repair_target_hint: None,
+            repair_plan: Vec::new(),
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        };
+        job.assessment = Some(preserved_assessment.clone());
+
+        for base in [
+            VerifierRepairRerunOutcome::Improved,
+            VerifierRepairRerunOutcome::NewFailure,
+        ] {
+            job.rerun_outcome = Some(base);
+            apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+            // Plan, ledger, assessment all unchanged.
+            assert_eq!(
+                job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+                cluster_ids[0]
+            );
+            assert!(job.exhausted_attempts.is_empty());
+            assert!(job.assessment.is_some());
+            assert_eq!(job.rerun_outcome, Some(base));
+        }
+    }
+
+    /// MF2.3 + MF2.budget: a 3-cluster sequential repair walks all clusters
+    /// via dispatch + advance without ever incrementing the legacy retry
+    /// counters (`assessment_attempts` / `repair_attempt`). Re-diagnostic
+    /// fires only after the LAST cluster is exhausted.
+    #[test]
+    fn mf2_three_cluster_sequential_repair_walks_without_burning_budget() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let mut job = job_with_first_cluster_plan(&report);
+        let preserved_assessment = super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(report.preferred_repair_role),
+            needed_reads: Vec::new(),
+            repair_target_hint: None,
+            repair_plan: Vec::new(),
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        };
+        job.assessment = Some(preserved_assessment);
+
+        // Turn 1: cluster A fails again → advance to B.
+        job.rerun_outcome = Some(VerifierRepairRerunOutcome::SameFailureRemaining);
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1]
+        );
+        assert_eq!(job.assessment_attempts, 0);
+        assert!(job.assessment.is_some());
+
+        // Turn 2: cluster B fails → advance to C.
+        job.rerun_outcome = Some(VerifierRepairRerunOutcome::SameFailureRemaining);
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[1]));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[2]
+        );
+        assert_eq!(job.assessment_attempts, 0);
+        assert!(job.assessment.is_some());
+
+        // Turn 3: cluster C fails → no more clusters → re-diagnostic.
+        job.rerun_outcome = Some(VerifierRepairRerunOutcome::SameFailureRemaining);
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[2]));
+        assert!(job.semantic_plan.is_none());
+        assert!(job.assessment.is_none());
+        // Only ONE bump for the entire 3-cluster walk (only on final exhaust).
+        assert_eq!(job.assessment_attempts, 1);
+        // repair_attempt is owned by the diagnostic / repair machinery and
+        // is not touched by this dispatch helper.
+        assert_eq!(job.repair_attempt, 0);
     }
 
     // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //

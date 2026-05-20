@@ -7561,7 +7561,7 @@ impl Agent {
             }
             TaskContractVerifierOutcome::Failed { command, output } => {
                 *args.contract_verification_retries += 1;
-                let repair_context = verifier_repair_context_from_failure(
+                let mut repair_context = verifier_repair_context_from_failure(
                     &self.work_root,
                     &command,
                     &output,
@@ -7581,6 +7581,24 @@ impl Agent {
                         ),
                     };
                 }
+                // Issue #647 (MF2.2 / MF2.3): drive the cluster-aware
+                // sequential repair state machine after the new
+                // `RepairJob` is built (MF2.1 already carried the semantic
+                // plan and exhausted ledger over). `previous_cluster_id`
+                // is the failure_cluster_id from the previous turn — the
+                // dispatch wraps the base rerun outcome via
+                // `rerun_outcome_with_cluster` and advances to the next
+                // cluster (or falls back to re-diagnostic) accordingly.
+                // S7-005: the dispatch never touches the legacy retry
+                // counters (`repair_attempt`).
+                let previous_cluster_id = previous_repair_context
+                    .as_ref()
+                    .and_then(|context| context.semantic_plan.as_ref())
+                    .map(|plan| plan.failure_cluster_id.clone());
+                super::repair_job::apply_semantic_repair_dispatch_after_rerun(
+                    &mut repair_context,
+                    previous_cluster_id.as_ref(),
+                );
                 *args.contract_verifier_repair_edit_count =
                     Some(args.repo_edit_calls_made_this_turn);
                 self.task_contract_verifier_repair_pending = true;
@@ -14228,14 +14246,19 @@ fn verifier_repair_context_from_failure(
         previous_failure_count,
         rerun_outcome,
         repair_attempt,
-        // Issue #647 (Phase B): semantic-repair planning fields are populated
-        // by Phase D (`model_assessment_to_verifier_repair_assessment` end).
-        // At this construction point we have not yet parsed the diagnostic
-        // LLM payload into a `SemanticFailureReport`, so both slots start
-        // empty. `exhausted_attempts` is the per-job ledger that survives
-        // slot reuse — it has no prior entries when the job is first built.
-        semantic_plan: None,
-        exhausted_attempts: Vec::new(),
+        // Issue #647 (Phase B / MF2.1): carry `semantic_plan` and
+        // `exhausted_attempts` over from the previous turn so cluster-aware
+        // sequential repair survives slot reuse. The Phase-D diagnostic
+        // populates these slots — without the carryover, every new verifier
+        // failure would discard the active cluster plan and the per-job
+        // ledger, forcing a fresh diagnostic round-trip and defeating the
+        // sequential-repair design (設計判断 #5, S3-010). The post-rerun
+        // dispatch in `drive_task_contract_verifier` (MF2.2 / MF2.3) walks
+        // these carried-over slots via the Phase-E helpers.
+        semantic_plan: previous_context.and_then(|context| context.semantic_plan.clone()),
+        exhausted_attempts: previous_context
+            .map(|context| context.exhausted_attempts.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -23164,6 +23187,96 @@ export default function App() {
 
         assert!(
             verifier_repair_target_candidate_from_output(work_root, output, &changed).is_none()
+        );
+    }
+
+    /// Issue #647 (MF2.1): `verifier_repair_context_from_failure` must carry
+    /// over `semantic_plan` and `exhausted_attempts` from the previous turn's
+    /// `RepairJob`. Without this, every new verifier failure would drop the
+    /// Phase-D semantic plan and force a fresh diagnostic round-trip, which
+    /// in turn defeats sequential cluster repair (the slot reuse design).
+    #[test]
+    fn verifier_repair_context_carries_over_semantic_plan_and_exhausted_attempts() {
+        use super::super::repair_job::SemanticRepairPlan;
+        use super::super::semantic_failure::parse_semantic_failure_report;
+        use super::super::spec_authority::SpecAuthority;
+        use super::super::task_contract::ArtifactRole;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def create_todo(): pass\n").unwrap();
+        let changed = vec!["app/main.py".to_string()];
+        let output = "FAILED tests/test_api.py::test_create - AssertionError\n1 failed";
+
+        // Build a multi-cluster SemanticFailureReport via the SSOT parser.
+        let report_json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "carryover hypothesis",
+            "failure_clusters": [
+                {
+                    "observed": "alpha",
+                    "expected": "ALPHA",
+                    "input_shape": "alphashape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation", "test"],
+                    "affected_cases": ["alphacase"],
+                },
+                {
+                    "observed": "beta",
+                    "expected": "BETA",
+                    "input_shape": "betashape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation", "test"],
+                    "affected_cases": ["betacase"],
+                },
+            ],
+        });
+        let report = parse_semantic_failure_report(&report_json).expect("report parses");
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+        let cluster_b = report.failure_clusters[1].cluster_key.clone();
+
+        // Build a previous-turn RepairJob with a semantic plan + a non-empty
+        // ledger (simulating "we already burned cluster A").
+        let prev_plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_b.clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: report.preferred_repair_role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let mut previous = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        previous.semantic_plan = Some(prev_plan);
+        previous.exhausted_attempts = vec![(cluster_a.clone(), ArtifactRole::Implementation)];
+
+        // Run a second cycle. The new context must carry both fields over.
+        let next = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&previous),
+        );
+
+        // semantic_plan was carried over.
+        let next_plan = next.semantic_plan.expect("plan carried over");
+        assert_eq!(next_plan.failure_cluster_id, cluster_b);
+        // exhausted_attempts ledger was carried over.
+        assert_eq!(
+            next.exhausted_attempts,
+            vec![(cluster_a.clone(), ArtifactRole::Implementation)]
         );
     }
 
