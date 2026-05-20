@@ -1849,6 +1849,27 @@ fn verifier_repair_pass_messages(
             "summary": assessment.summary,
         })
     });
+    // Issue #647 (Phase D / D.4 / DR4-002): pass `SemanticRepairPlan` to the
+    // repair editor as a structured JSON data field. The semantic_plan
+    // content is serialized via `serde_json::json!` (same envelope as the
+    // other untrusted-data fields) and never concatenated into system /
+    // developer instruction text or any shell command — the system message
+    // already declares verifier output as untrusted data.
+    let semantic_plan_payload = context.semantic_plan.as_ref().map(|plan| {
+        serde_json::json!({
+            "failure_cluster_id": plan.failure_cluster_id.as_str(),
+            "semantic_cause": plan.semantic_cause.as_str(),
+            "spec_authority": format!("{:?}", plan.spec_authority),
+            "preferred_repair_role": plan.preferred_repair_role.label(),
+            "repair_hypothesis": plan.repair_hypothesis,
+            "confidence": plan.semantic_report.confidence,
+            "contract_conflict": {
+                "implementation": plan.semantic_report.contract_conflict.implementation,
+                "test": plan.semantic_report.contract_conflict.test,
+                "usage_docs": plan.semantic_report.contract_conflict.usage_docs,
+            },
+        })
+    });
     let payload = serde_json::json!({
         "task_summary": compact_verifier_failure_text(active_request, 500),
         "command": context.command,
@@ -1856,6 +1877,7 @@ fn verifier_repair_pass_messages(
         "previous_repair_error": context.repair_error.as_deref(),
         "failure_signature": context.failure_signature,
         "diagnostic_assessment": assessment,
+        "semantic_plan": semantic_plan_payload,
         "selected_target": {
             "path": target_hint.path,
             "role": target_hint.role.label(),
@@ -9292,6 +9314,13 @@ impl Agent {
                 attempt_spec.role,
             );
         };
+        // Issue #647 (Phase D / D.1 / DR3-005): independently parse the
+        // semantic-failure report from the *same* reply. A `None` here
+        // collapses to `semantic_plan = None` (legacy fallback) without
+        // disturbing the legacy `ParsedVerifierRepairAssessment` /
+        // `VerifierRepairAssessment` flow above.
+        let semantic_report = parse_semantic_failure_report_from_reply(&reply.content);
+        let semantic_plan = semantic_report.and_then(build_semantic_repair_plan_from_report);
         // Issue #647 (§5.1 SSOT plumbing): build the path-local admission
         // context from the agent's current scope + edit signals so every
         // hint promoted by `model_assessment_to_verifier_repair_assessment`
@@ -9326,6 +9355,11 @@ impl Agent {
             current.diagnostic_error = None;
             current.diagnostic_unavailable = false;
             current.assessment = Some(assessment);
+            // Issue #647 (Phase D / D.2 / DR3-005): write the
+            // SemanticRepairPlan slot. `None` is the legacy-compatible
+            // value when semantic parse failed or dispatch routed to
+            // setup repair (D.3).
+            current.semantic_plan = semantic_plan;
         }
         log_llm_event(
             "agent.verifier_diagnostic.completed",
@@ -15397,6 +15431,92 @@ fn verifier_repair_stale_assertion_test_target(
     admit_repair_target_hint(promoted, admission)
 }
 
+/// Issue #647 (Phase D): extract the JSON object value from a diagnostic LLM
+/// reply, mirroring the SSOT preamble used by
+/// [`parse_verifier_repair_assessment_reply`] (strip `<think>` tags →
+/// trim/truncate → find the outermost `{ … }`). Returns `None` on any
+/// extraction or `serde_json` parse failure.
+///
+/// Phase D wires this helper into `run_verifier_diagnostic_pass` so the
+/// existing `ParsedVerifierRepairAssessment` parse and the new
+/// `parse_semantic_failure_report` parse share an identical JSON-extraction
+/// boundary. Keeping the extraction logic colocated avoids drift between
+/// the two parse paths.
+fn extract_diagnostic_reply_json_value(reply: &str) -> Option<serde_json::Value> {
+    let stripped = strip_think_tags(reply);
+    let trimmed = truncate(stripped.trim(), VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES);
+    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed.clone()
+    } else {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        trimmed[start..=end].to_string()
+    };
+    serde_json::from_str(&json_text).ok()
+}
+
+/// Issue #647 (Phase D / D.1): parse a diagnostic LLM reply into an
+/// [`super::semantic_failure::SemanticFailureReport`]. Independent of the
+/// legacy `ParsedVerifierRepairAssessment` parse — a failure here returns
+/// `None` and the caller proceeds with `semantic_plan = None` (DR3-005), so
+/// the existing `VerifierRepairAssessment` / legacy repair-target selection
+/// is **not** disturbed.
+fn parse_semantic_failure_report_from_reply(
+    reply: &str,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    let value = extract_diagnostic_reply_json_value(reply)?;
+    super::semantic_failure::parse_semantic_failure_report(&value)
+}
+
+/// Issue #647 (Phase D / D.2 + D.3): build a [`super::repair_job::SemanticRepairPlan`]
+/// from a parsed [`super::semantic_failure::SemanticFailureReport`].
+///
+/// Returns `None` when:
+/// - `dispatch_target(report) == SetupRepair` (D.3): DependencyMissing /
+///   ConfigOrVerifierError are routed to the existing setup-repair /
+///   `MissingVerifierJob` pipeline; no SemanticRepairPlan is constructed.
+/// - `report.failure_clusters` is empty (no cluster to attack; the caller
+///   keeps `semantic_plan = None`).
+///
+/// `expected_improvement` is initialized to `None` — Phase E fills it after
+/// the verifier rerun.
+fn build_semantic_repair_plan_from_report(
+    report: super::semantic_failure::SemanticFailureReport,
+) -> Option<super::repair_job::SemanticRepairPlan> {
+    // D.3: DependencyMissing / ConfigOrVerifierError → setup repair path,
+    // no semantic plan.
+    if super::semantic_failure::dispatch_target(&report)
+        == super::semantic_failure::SemanticDispatchTarget::SetupRepair
+    {
+        return None;
+    }
+    // 1 RepairJob = 1 cluster (slot reuse, Phase E). Pick the first cluster
+    // as the attack target; if no clusters were reported, the plan cannot
+    // be built (caller keeps `semantic_plan = None`).
+    let failure_cluster_id = report.failure_clusters.first()?.cluster_key.clone();
+    // SpecAuthority candidates: Phase D wires the fallback set
+    // (ImplementationContract + LlmGeneratedTest) — a future Issue will pass
+    // BehaviorContract when a RequiredBehaviorContract is in scope. The
+    // result is deterministic (smaller variant index wins).
+    let candidates = [
+        super::spec_authority::SpecAuthority::ImplementationContract,
+        super::spec_authority::SpecAuthority::LlmGeneratedTest,
+    ];
+    let spec_authority = super::spec_authority::select_authority(&candidates, None)?;
+    Some(super::repair_job::SemanticRepairPlan {
+        semantic_cause: report.failure_kind,
+        spec_authority,
+        preferred_repair_role: report.preferred_repair_role,
+        repair_hypothesis: report.repair_hypothesis.clone(),
+        failure_cluster_id,
+        expected_improvement: None,
+        semantic_report: report,
+    })
+}
+
 fn model_assessment_to_verifier_repair_assessment(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -19959,6 +20079,335 @@ E   assert [{'id': 1}] == []\n";
         assert_eq!(
             assessment.repair_target_hint.as_ref().map(|hint| hint.role),
             Some(super::super::task_contract::ArtifactRole::Setup)
+        );
+    }
+
+    // ---- Issue #647 (Phase D): diagnostic 経路統合 ---- //
+
+    /// Phase D / D.1 (S1-009): a diagnostic reply that **does** carry a
+    /// well-formed semantic-failure payload parses into
+    /// `Some(SemanticFailureReport)` via the shared extraction boundary.
+    /// This is the positive path that gates D.2 plan construction.
+    #[test]
+    fn phase_d_parse_semantic_failure_report_from_diagnostic_reply_succeeds() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.84,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"todos list initialized incorrectly",
+            "failure_clusters":[
+                {
+                    "observed":"got 200 want 201",
+                    "expected":"201 Created",
+                    "input_shape":"POST /todos",
+                    "assertion_shape":"AssertEq",
+                    "involved_artifacts":["implementation","test"],
+                    "affected_cases":["test_create_todo"]
+                }
+            ],
+            "contract_conflict":{
+                "implementation":"returns 200",
+                "test":"expects 201",
+                "usage_docs":"unspecified"
+            },
+            "probable_cause_role":"implementation",
+            "summary":"http status mismatch"
+        }"#;
+
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("semantic parse ok");
+
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert_eq!(
+            report.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+        assert!(report.repair_hypothesis.starts_with("todos list"));
+    }
+
+    /// Phase D / D.1 (S1-009 / DR3-005): a legacy diagnostic reply that
+    /// lacks the semantic-failure schema (no `confidence` /
+    /// `preferred_repair_role`) collapses to `None` at the semantic parse
+    /// boundary. The caller will leave `RepairJob.semantic_plan = None`
+    /// without disturbing the legacy `ParsedVerifierRepairAssessment`
+    /// parse — verified by the parallel `parse_verifier_repair_assessment_reply`
+    /// call.
+    #[test]
+    fn phase_d_legacy_reply_yields_none_semantic_report_but_legacy_parse_holds() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"fix","confidence":0.9}]
+        }"#;
+
+        // Semantic parse returns None — no confidence / preferred_repair_role.
+        assert!(super::parse_semantic_failure_report_from_reply(reply).is_none());
+        // Legacy parse still succeeds — DR3-005: independent paths.
+        let legacy = super::parse_verifier_repair_assessment_reply(reply)
+            .expect("legacy parse must still succeed");
+        assert_eq!(
+            legacy.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+    }
+
+    /// Phase D / D.1 (DR3-005): the diagnostic reply guard at
+    /// `run_verifier_diagnostic_pass` short-circuits on `tool_calls`
+    /// before the parsers run, so neither semantic nor legacy parse ever
+    /// sees the payload. We mirror that behavior at the parser level by
+    /// confirming that a non-JSON / unparseable reply yields `None` from
+    /// the semantic parse boundary without panicking.
+    #[test]
+    fn phase_d_semantic_parse_returns_none_for_unparseable_reply() {
+        // Empty / non-JSON / no braces.
+        assert!(super::parse_semantic_failure_report_from_reply("").is_none());
+        assert!(super::parse_semantic_failure_report_from_reply("not json at all").is_none());
+        // Malformed JSON.
+        assert!(super::parse_semantic_failure_report_from_reply(r#"{"failure_kind":"#).is_none());
+    }
+
+    /// Phase D / D.2: a positive-path semantic report produces a
+    /// `SemanticRepairPlan` whose fields are wired from the report
+    /// (cluster id from `failure_clusters[0]`, `semantic_cause = failure_kind`,
+    /// `repair_hypothesis` from the report, `expected_improvement = None`).
+    /// `spec_authority` falls back to `ImplementationContract` per the
+    /// Phase-D candidate set (D.2 design).
+    #[test]
+    fn phase_d_build_semantic_repair_plan_wires_report_into_plan_slot() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.91,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"impl returns 200, test expects 201",
+            "failure_clusters":[
+                {
+                    "observed":"200 OK",
+                    "expected":"201 Created",
+                    "input_shape":"POST /todos",
+                    "assertion_shape":"AssertEq",
+                    "involved_artifacts":["implementation","test"],
+                    "affected_cases":["test_create_todo"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = super::build_semantic_repair_plan_from_report(report)
+            .expect("plan should be built for AssertionMismatch with clusters");
+
+        assert_eq!(
+            plan.semantic_cause,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        assert_eq!(plan.failure_cluster_id, cluster_id);
+        assert_eq!(
+            plan.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+        assert!(plan.repair_hypothesis.contains("returns 200"));
+        assert!(plan.expected_improvement.is_none());
+    }
+
+    /// Phase D / D.3 (S1-010): `DependencyMissing` dispatches to the
+    /// setup-repair / `MissingVerifierJob` path; no `SemanticRepairPlan`
+    /// is constructed (slot stays `None`).
+    #[test]
+    fn phase_d_dependency_missing_routes_to_setup_with_no_semantic_plan() {
+        let reply = r#"{
+            "failure_kind":"dependency_missing",
+            "confidence":0.97,
+            "preferred_repair_role":"setup",
+            "repair_hypothesis":"pytest cannot import requests",
+            "failure_clusters":[
+                {
+                    "observed":"ModuleNotFoundError: requests",
+                    "expected":"requests importable",
+                    "input_shape":"pytest collection",
+                    "assertion_shape":"ImportError",
+                    "involved_artifacts":["setup"],
+                    "affected_cases":["test_health"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// Phase D / D.3: `ConfigOrVerifierError` likewise routes to setup
+    /// repair — no `SemanticRepairPlan` is constructed.
+    #[test]
+    fn phase_d_config_or_verifier_error_routes_to_setup_with_no_semantic_plan() {
+        let reply = r#"{
+            "failure_kind":"config_or_verifier_error",
+            "confidence":0.80,
+            "preferred_repair_role":"setup",
+            "repair_hypothesis":"pytest config malformed",
+            "failure_clusters":[
+                {
+                    "observed":"ERROR: pytest.ini malformed",
+                    "expected":"pytest.ini parseable",
+                    "input_shape":"pytest startup",
+                    "assertion_shape":"ConfigError",
+                    "involved_artifacts":["setup"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// Phase D / D.2: an `AssertionMismatch` report with **no** clusters
+    /// cannot identify a cluster to attack — the plan slot stays `None`
+    /// (1 RepairJob = 1 cluster, slot reuse is a Phase E concern).
+    #[test]
+    fn phase_d_assertion_mismatch_with_no_clusters_yields_no_plan() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.75,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"hypothesis without clusters",
+            "failure_clusters":[]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// Phase D / D.4 (DR4-002): the repair editor prompt carries the
+    /// `SemanticRepairPlan` as a structured JSON data field. The plan is
+    /// **never** concatenated into the system / developer instruction
+    /// text — the system message still declares verifier output as
+    /// untrusted data, and the plan fields appear only inside the JSON
+    /// payload.
+    #[test]
+    fn phase_d_repair_editor_prompt_carries_semantic_plan_as_json_data() {
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use super::super::semantic_failure::{
+            ContractConflict, FailureCluster, SemanticFailureReport,
+            build_failure_cluster_from_observation,
+        };
+        use super::super::spec_authority::SpecAuthority;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def todos():\n    return []\n").unwrap();
+
+        let cluster: FailureCluster = build_failure_cluster_from_observation(
+            "200 OK",
+            "201 Created",
+            "POST /todos",
+            "AssertEq",
+            &[
+                super::super::task_contract::ArtifactRole::Implementation,
+                super::super::task_contract::ArtifactRole::Test,
+            ],
+        );
+        let cluster_id = cluster.cluster_key.clone();
+        let report = SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster],
+            contract_conflict: ContractConflict {
+                implementation: "returns 200".to_string(),
+                test: "expects 201".to_string(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl returns 200; test expects 201".to_string(),
+            confidence: 0.91,
+        };
+        let plan = SemanticRepairPlan {
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl returns 200; test expects 201".to_string(),
+            failure_cluster_id: cluster_id.clone(),
+            expected_improvement: None,
+            semantic_report: report,
+        };
+
+        let target_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "fix impl".to_string(),
+        };
+
+        let job = RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "FAILED".to_string(),
+            failure_type: super::super::VerifierFailureType::AssertionFailure,
+            target_hint: Some(target_hint.clone()),
+            repair_target_hint: Some(target_hint.clone()),
+            failure_signature: "sig".to_string(),
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+        let messages = super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task")
+            .expect("messages built");
+        assert_eq!(messages.len(), 2);
+
+        // The system message must NOT contain semantic-plan fields — those
+        // are untrusted data, not instructions.
+        let system_text = format!("{:?}", messages[0]);
+        assert!(
+            !system_text.contains("impl returns 200"),
+            "semantic_plan must not leak into system instruction: {system_text}",
+        );
+        assert!(
+            !system_text.contains(cluster_id.as_str()),
+            "cluster_id must not leak into system instruction: {system_text}",
+        );
+
+        // The user message JSON payload must carry the plan under
+        // `semantic_plan` as structured data, not as free-form prose.
+        let user_text = format!("{:?}", messages[1]);
+        assert!(
+            user_text.contains("\\\"semantic_plan\\\""),
+            "user payload must include semantic_plan key: {user_text}",
+        );
+        assert!(
+            user_text.contains(cluster_id.as_str()),
+            "user payload must include the cluster id: {user_text}",
+        );
+        assert!(
+            user_text.contains("failure_cluster_id"),
+            "user payload must include failure_cluster_id field",
+        );
+    }
+
+    /// Phase D / D.4 (DR4-002): when `semantic_plan = None` (legacy
+    /// fallback / SetupRepair dispatch), the prompt still builds and
+    /// carries `semantic_plan: null` — the field is present but empty so
+    /// the JSON shape is stable across legacy / semantic runs.
+    #[test]
+    fn phase_d_repair_editor_prompt_carries_null_semantic_plan_for_legacy_path() {
+        use super::super::repair_job::RepairJob;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def f():\n    return 1\n").unwrap();
+        let target_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "fix impl".to_string(),
+        };
+        let job = RepairJob {
+            failure_signature: "sig".to_string(),
+            target_hint: Some(target_hint.clone()),
+            semantic_plan: None,
+            ..RepairJob::new_for_test()
+        };
+        let messages = super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task")
+            .expect("messages built");
+        let user_text = format!("{:?}", messages[1]);
+        assert!(
+            user_text.contains("\\\"semantic_plan\\\":null"),
+            "legacy path must emit semantic_plan: null in payload: {user_text}",
         );
     }
 
