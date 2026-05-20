@@ -503,10 +503,19 @@ pub(super) fn task_contract_repair_state(
 ///
 /// `preferred_repair_role` and `repair_hypothesis` are inherited from the
 /// report — Phase E does not re-pick a per-cluster role (the diagnostic
-/// LLM emits one role per report). `spec_authority` is re-selected via
-/// `select_authority` so the same Phase-D fallback set
-/// (`ImplementationContract` + `LlmGeneratedTest`) governs the new plan
-/// deterministically.
+/// LLM emits one role per report).
+///
+/// `spec_authority` is **carried forward** verbatim from the current plan
+/// (Codex CB-009): the authority was already elected for the active report
+/// — typically by `resolve()` at the diagnostic boundary — and slot reuse
+/// only changes *which cluster* we are attacking, not *which spec source*
+/// governs the repair. The previous implementation re-ran
+/// `select_authority(&[ImplementationContract, LlmGeneratedTest], None)`
+/// inside the helper, which silently demoted higher-authority elections
+/// (`UserRequest` / `BehaviorContract`) to `ImplementationContract` every
+/// time we walked to a new cluster. When no current plan is present
+/// (initial fixture / defensive path), we still fall back to the
+/// `ImplementationContract` default so the helper remains total.
 ///
 /// Returns `false` (and clears `semantic_plan`) when the report has no
 /// remaining clusters; callers MUST treat that as "no more clusters to
@@ -517,16 +526,16 @@ pub(super) fn advance_to_next_cluster(
     report: &SemanticFailureReport,
 ) -> bool {
     // 1. Record the current plan in the exhausted_attempts ledger before
-    //    we drop it, so slot reuse preserves history (S3-010).
-    if let Some(current_plan) = repair_job.semantic_plan.as_ref() {
-        let entry = (
-            current_plan.failure_cluster_id.clone(),
-            current_plan.preferred_repair_role,
-        );
+    //    we drop it, so slot reuse preserves history (S3-010). At the same
+    //    time, capture the current plan's `spec_authority` so we can carry
+    //    it forward into the next cluster's plan (CB-009).
+    let carried_authority = repair_job.semantic_plan.as_ref().map(|plan| {
+        let entry = (plan.failure_cluster_id.clone(), plan.preferred_repair_role);
         if !repair_job.exhausted_attempts.contains(&entry) {
             repair_job.exhausted_attempts.push(entry);
         }
-    }
+        plan.spec_authority
+    });
 
     // 2. Find the next cluster in document order that is NOT exhausted
     //    under the report's preferred_repair_role.
@@ -543,20 +552,14 @@ pub(super) fn advance_to_next_cluster(
         return false;
     };
 
-    // 4. Re-pick the spec authority for the new cluster using the same
-    //    Phase-D fallback candidate set so the deterministic behaviour is
-    //    preserved across slot reuse.
-    let candidates = [
-        SpecAuthority::ImplementationContract,
-        SpecAuthority::LlmGeneratedTest,
-    ];
-    let Some(spec_authority) = super::spec_authority::select_authority(&candidates, None) else {
-        // select_authority on a non-empty filtered candidate list cannot
-        // return None today, but if a future variant change makes it
-        // possible, fail closed (no plan).
-        repair_job.semantic_plan = None;
-        return false;
-    };
+    // 4. CB-009: carry the elected authority forward across slot reuse.
+    //    Only `failure_cluster_id` (and the per-cluster fields derived
+    //    from `next_cluster` / `report`) change; the spec source that
+    //    elected this report's repair plan is preserved verbatim. When
+    //    no current plan exists (defensive path), fall back to
+    //    `ImplementationContract` — the same neutral default `resolve()`
+    //    uses when no higher-authority signal fires.
+    let spec_authority = carried_authority.unwrap_or(SpecAuthority::ImplementationContract);
 
     repair_job.semantic_plan = Some(SemanticRepairPlan {
         semantic_cause: report.failure_kind,
@@ -1929,6 +1932,156 @@ mod tests {
                 "slot must remain on cluster B (never regress to A)",
             );
         }
+    }
+
+    // ---- Issue #647 (CB-009): advance_to_next_cluster carries forward SpecAuthority ---- //
+
+    /// CB-009.3 (regression #1): when the current `SemanticRepairPlan` was
+    /// elected with `SpecAuthority::UserRequest` (e.g. the user explicitly
+    /// described the contract), advancing to the next cluster of the same
+    /// report must **preserve** the `UserRequest` authority — only the
+    /// `failure_cluster_id` and per-cluster fields change. The previous
+    /// implementation re-ran `select_authority(&[Impl, LlmGenTest], None)`
+    /// and silently demoted `UserRequest` → `ImplementationContract`
+    /// (Codex CB-009).
+    #[test]
+    fn cb009_advance_to_next_cluster_carries_forward_user_request_authority() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Initial plan: cluster A under UserRequest authority.
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::UserRequest,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+
+        assert!(advance_to_next_cluster(&mut job, &report));
+
+        let advanced = job.semantic_plan.as_ref().expect("slot now holds plan B");
+        assert_eq!(
+            advanced.failure_cluster_id, cluster_ids[1],
+            "advance must move the slot to the next cluster",
+        );
+        assert_eq!(
+            advanced.spec_authority,
+            SpecAuthority::UserRequest,
+            "CB-009: UserRequest authority must be carried forward across slot reuse",
+        );
+    }
+
+    /// CB-009.3 (regression #2): same invariant for `SpecAuthority::BehaviorContract`
+    /// — when the initial plan was elected via the deterministic
+    /// `RequiredBehaviorContract`, that authority must survive cluster
+    /// transitions intact (no demotion to ImplementationContract).
+    #[test]
+    fn cb009_advance_to_next_cluster_carries_forward_behavior_contract() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+
+        assert!(advance_to_next_cluster(&mut job, &report));
+
+        let advanced = job.semantic_plan.as_ref().expect("slot now holds plan B");
+        assert_eq!(advanced.failure_cluster_id, cluster_ids[1]);
+        assert_eq!(
+            advanced.spec_authority,
+            SpecAuthority::BehaviorContract,
+            "CB-009: BehaviorContract authority must be carried forward across slot reuse",
+        );
+    }
+
+    /// CB-009.3 (regression #3): when the initial plan's authority was
+    /// elected via consensus (here represented by a `BehaviorContract`
+    /// outcome — the test/usage-docs vs impl tie-break path in
+    /// `consensus_to_authority_for_resolve`, see CB-008), advancing to the
+    /// next cluster must keep that consensus-decided authority intact —
+    /// `advance_to_next_cluster` is **not** allowed to re-derive a new
+    /// authority from a fixed candidate base, because the candidate base
+    /// does not include `BehaviorContract` and would silently overwrite it.
+    #[test]
+    fn cb009_advance_to_next_cluster_carries_forward_consensus_decided_authority() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Plan elected via consensus → BehaviorContract on cluster A.
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+
+        // First advance: A → B. Authority must remain BehaviorContract.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1],
+        );
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().spec_authority,
+            SpecAuthority::BehaviorContract,
+            "CB-009: consensus-decided BehaviorContract must persist after first advance",
+        );
+
+        // Second advance: B → C. Authority must STILL remain BehaviorContract
+        // (carry-forward survives chained slot reuse).
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[2],
+        );
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().spec_authority,
+            SpecAuthority::BehaviorContract,
+            "CB-009: consensus-decided BehaviorContract must persist across chained advances",
+        );
     }
 
     // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
