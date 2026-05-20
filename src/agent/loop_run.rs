@@ -59,7 +59,17 @@ mod repair_job;
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
 mod required_behavior;
+// Issue #647 (Phase A.1): semantic repair planning — bounded failure-report
+// schema and deterministic cluster-key generation. Module is intentionally
+// *not* re-exported (DR3-001) — future consumers (`turn.rs`, `repair_job.rs`)
+// reach in via `super::semantic_failure::*`.
+mod semantic_failure;
 pub mod slash_commands;
+// Issue #647 (Phase A.2): spec-authority enum + tie-break scoring + test/impl
+// weakening detectors. Module is intentionally *not* re-exported (DR3-001) —
+// future consumers (`turn.rs`, `repair_job.rs`) reach in via
+// `super::spec_authority::*`.
+mod spec_authority;
 mod spinner;
 mod success;
 mod summary;
@@ -506,6 +516,18 @@ pub struct Agent {
     /// tool policy can choose a repair target without polluting the assistant
     /// history with long-lived diagnostic state.
     task_contract_verifier_repair_pending: bool,
+    /// Issue #647 (SF1 V3.2): mirror of the local
+    /// `task_contract_verifier_passed_in_loop` bool in
+    /// `handle_user_message`. Lives on `Agent` so methods invoked from
+    /// inside the actor-loop (e.g. `run_verifier_diagnostic_pass`) can read
+    /// the same "has the verifier already passed once in this run-actor-loop
+    /// iteration?" signal that the local variable carries — without
+    /// plumbing yet another `&mut bool` through six call sites. Reset at
+    /// the head of every `handle_user_message`; flipped to `true` from
+    /// `drive_task_contract_verifier` whenever the verifier classifies a
+    /// run as Passed. **Read-only** consumer in this Issue: the
+    /// `SpecAuthorityInput` builder.
+    pub(super) task_contract_verifier_passed_this_actor_loop: bool,
     /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
     /// task-contract verifier. Renamed from `verifier_repair_context` to
     /// `repair_job` and consolidated under `repair_job::RepairJob` so all
@@ -773,6 +795,7 @@ impl Agent {
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
             task_contract_verifier_repair_pending: false,
+            task_contract_verifier_passed_this_actor_loop: false,
             repair_job: None,
             repair_job_artifact_attempts: 0,
             repair_failure_snapshot: None,
@@ -940,5 +963,70 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(should_compact_late_turn(&messages, 24_000, 4, 1));
         assert!(!should_compact_late_turn(&messages[..8], 24_000, 1, 0));
+    }
+
+    // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
+
+    #[test]
+    fn no_pub_use_for_semantic_failure_or_spec_authority() {
+        // S1-003 / DR3-001: `semantic_failure` and `spec_authority` are
+        // private modules of `loop_run`. They must NOT be widened via
+        // `pub use` re-exports — only the `turn.rs` / `repair_job.rs`
+        // in-crate consumers may access them through `super::`.
+        let source = include_str!("loop_run.rs");
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            // `//` comments / `///` doc comments / `//!` module docs are
+            // allowed to mention the names for documentation purposes.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("pub use") {
+                assert!(
+                    !line.contains("semantic_failure"),
+                    "DR3-001 violated: `pub use` referencing `semantic_failure` found: {line:?}",
+                );
+                assert!(
+                    !line.contains("spec_authority"),
+                    "DR3-001 violated: `pub use` referencing `spec_authority` found: {line:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verifier_diagnostic_failure_kind_has_8_variants() {
+        // S1-001: SemanticFailureReport is an upper-layer wrapper that
+        // **reuses** the existing 8-variant `VerifierDiagnosticFailureKind`
+        // enum. Adding or removing a variant breaks the SSOT invariant
+        // — this test fails to compile (non-exhaustive match) if the
+        // enum surface drifts.
+        use super::VerifierDiagnosticFailureKind as K;
+        let all = [
+            K::DependencyMissing,
+            K::LocalImportContractMismatch,
+            K::CompileOrSyntaxError,
+            K::AssertionMismatch,
+            K::RuntimeError,
+            K::TestBug,
+            K::ConfigOrVerifierError,
+            K::Unknown,
+        ];
+        for v in &all {
+            // Exhaustive match — extension of the enum forces this to
+            // be updated (compile-time lock).
+            let label: &'static str = match v {
+                K::DependencyMissing => "dependency_missing",
+                K::LocalImportContractMismatch => "local_import_contract_mismatch",
+                K::CompileOrSyntaxError => "compile_or_syntax_error",
+                K::AssertionMismatch => "assertion_mismatch",
+                K::RuntimeError => "runtime_error",
+                K::TestBug => "test_bug",
+                K::ConfigOrVerifierError => "config_or_verifier_error",
+                K::Unknown => "unknown",
+            };
+            assert!(!label.is_empty());
+        }
+        assert_eq!(all.len(), 8);
     }
 }

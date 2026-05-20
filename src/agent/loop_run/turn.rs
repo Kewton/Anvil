@@ -1699,6 +1699,10 @@ fn verifier_diagnostic_messages(
 Allowed failure_kind values: dependency_missing, local_import_contract_mismatch, compile_or_syntax_error, assertion_mismatch, runtime_error, test_bug, config_or_verifier_error, unknown.\n\
 Allowed probable_cause_role values: implementation, test, setup, usage_docs, unknown.\n\
 Schema: {{\"failure_kind\":\"...\",\"probable_cause_role\":\"...\",\"repair_targets\":[{{\"path\":\"workspace-relative existing file\",\"confidence\":0.0,\"reason\":\"short bounded reason\"}}],\"repair_plan\":[{{\"target\":\"workspace-relative existing file\",\"intent\":\"short bounded intent\",\"confidence\":0.0}}],\"secondary_targets\":[\"workspace-relative existing file\"],\"do_not_edit_tests_without_evidence\":true,\"summary\":\"short bounded summary\"}}.\n\
+Issue #647 (MF1) — additionally return a SemanticFailureReport in the SAME JSON object so the agent can plan a semantic repair. Add these top-level fields next to the legacy fields above (do not nest under a wrapper key, do not omit the legacy fields):\n\
+SemanticFailureReport schema (extra fields, same object):\n\
+{{\"failure_clusters\":[{{\"observed\":\"short bounded observed text\",\"expected\":\"short bounded expected text\",\"input_shape\":\"short bounded input shape\",\"assertion_shape\":\"short bounded assertion shape\",\"affected_cases\":[\"short bounded case id\"],\"involved_artifacts\":[\"implementation|test|usage_docs|setup\"]}}],\"contract_conflict\":{{\"implementation\":\"short bounded view\",\"test\":\"short bounded view\",\"usage_docs\":\"short bounded view\"}},\"preferred_repair_role\":\"implementation|test|setup|usage_docs\",\"repair_hypothesis\":\"<= 240 chars, single sentence\",\"confidence\":0.0}}.\n\
+Rules for the SemanticFailureReport fields: confidence MUST be a finite number in [0.0, 1.0]; repair_hypothesis MUST be <= 240 characters; do NOT set cluster_key (the agent computes it locally); preferred_repair_role must agree with probable_cause_role above.\n\
 Only include paths present in changed_candidates or safe_file_excerpts. For local import contract mismatches, prefer the provider/source file named by the import error before importer test frames. For assertion failures, distinguish product behavior defects from generated-test defects; if the output shows state leaking across tests, order-dependent expectations, or missing setup/teardown, classify it as test_bug and target the test artifact. Use setup files only for dependency_missing or config_or_verifier_error. Payload JSON:\n{payload}"
         )),
     ]
@@ -1849,6 +1853,27 @@ fn verifier_repair_pass_messages(
             "summary": assessment.summary,
         })
     });
+    // Issue #647 (Phase D / D.4 / DR4-002): pass `SemanticRepairPlan` to the
+    // repair editor as a structured JSON data field. The semantic_plan
+    // content is serialized via `serde_json::json!` (same envelope as the
+    // other untrusted-data fields) and never concatenated into system /
+    // developer instruction text or any shell command — the system message
+    // already declares verifier output as untrusted data.
+    let semantic_plan_payload = context.semantic_plan.as_ref().map(|plan| {
+        serde_json::json!({
+            "failure_cluster_id": plan.failure_cluster_id.as_str(),
+            "semantic_cause": plan.semantic_cause.as_str(),
+            "spec_authority": format!("{:?}", plan.spec_authority),
+            "preferred_repair_role": plan.preferred_repair_role.label(),
+            "repair_hypothesis": plan.repair_hypothesis,
+            "confidence": plan.semantic_report.confidence,
+            "contract_conflict": {
+                "implementation": plan.semantic_report.contract_conflict.implementation,
+                "test": plan.semantic_report.contract_conflict.test,
+                "usage_docs": plan.semantic_report.contract_conflict.usage_docs,
+            },
+        })
+    });
     let payload = serde_json::json!({
         "task_summary": compact_verifier_failure_text(active_request, 500),
         "command": context.command,
@@ -1856,6 +1881,7 @@ fn verifier_repair_pass_messages(
         "previous_repair_error": context.repair_error.as_deref(),
         "failure_signature": context.failure_signature,
         "diagnostic_assessment": assessment,
+        "semantic_plan": semantic_plan_payload,
         "selected_target": {
             "path": target_hint.path,
             "role": target_hint.role.label(),
@@ -4933,6 +4959,13 @@ impl Agent {
         self.task_contract_excerpts.clear();
         self.current_artifact_recovery_target = None;
         self.task_contract_verifier_repair_pending = false;
+        // Issue #647 (SF1 V3.2): mirror reset for the verifier-passed
+        // hint that backs `SpecAuthorityInput.has_verified_public_interface`.
+        // Lives at the same per-turn reset boundary as the
+        // `task_contract_verifier_repair_pending` flag so a previous turn's
+        // verifier success cannot leak into the current turn's
+        // SpecAuthority resolution.
+        self.task_contract_verifier_passed_this_actor_loop = false;
         self.repair_job = None;
         // Issue #637 (CB-001): reset the artifact-recovery retry counter at
         // the same per-turn boundary as `repair_job` so a previous turn's
@@ -7527,6 +7560,12 @@ impl Agent {
                 // cycle restarts at 1/3.
                 self.repair_job_artifact_attempts = 0;
                 *args.task_contract_verifier_passed_in_loop = true;
+                // Issue #647 (SF1 V3.2): mirror the local flag onto the
+                // Agent so `run_verifier_diagnostic_pass` (called later
+                // in the same actor-loop iteration on re-failure) can
+                // wire `has_verified_public_interface = true` into the
+                // SpecAuthorityInput.
+                self.task_contract_verifier_passed_this_actor_loop = true;
                 TaskContractVerifierFlowOutcome::Done {
                     final_prose: format!(
                         "Completed requested repository changes and verified them with `{safe_command}`."
@@ -7535,7 +7574,7 @@ impl Agent {
             }
             TaskContractVerifierOutcome::Failed { command, output } => {
                 *args.contract_verification_retries += 1;
-                let repair_context = verifier_repair_context_from_failure(
+                let mut repair_context = verifier_repair_context_from_failure(
                     &self.work_root,
                     &command,
                     &output,
@@ -7555,6 +7594,24 @@ impl Agent {
                         ),
                     };
                 }
+                // Issue #647 (MF2.2 / MF2.3): drive the cluster-aware
+                // sequential repair state machine after the new
+                // `RepairJob` is built (MF2.1 already carried the semantic
+                // plan and exhausted ledger over). `previous_cluster_id`
+                // is the failure_cluster_id from the previous turn — the
+                // dispatch wraps the base rerun outcome via
+                // `rerun_outcome_with_cluster` and advances to the next
+                // cluster (or falls back to re-diagnostic) accordingly.
+                // S7-005: the dispatch never touches the legacy retry
+                // counters (`repair_attempt`).
+                let previous_cluster_id = previous_repair_context
+                    .as_ref()
+                    .and_then(|context| context.semantic_plan.as_ref())
+                    .map(|plan| plan.failure_cluster_id.clone());
+                super::repair_job::apply_semantic_repair_dispatch_after_rerun(
+                    &mut repair_context,
+                    previous_cluster_id.as_ref(),
+                );
                 *args.contract_verifier_repair_edit_count =
                     Some(args.repo_edit_calls_made_this_turn);
                 self.task_contract_verifier_repair_pending = true;
@@ -9237,6 +9294,30 @@ impl Agent {
     }
 
     fn run_verifier_diagnostic_pass(&mut self) -> VerifierDiagnosticPassOutcome {
+        // Issue #647 (CB-013): before the Skipped short-circuit consults
+        // `context.assessment.is_some()`, detect the "advanced semantic_plan
+        // + stale assessment" state that CB-012 catches at the decision
+        // layer. If we are in that state, clear the stale assessment so the
+        // diagnostic actually runs — otherwise the Skipped short-circuit
+        // below would fire and neutralize the CB-012 fix at the production
+        // layer (the decision layer returns NeedDiagnostic, but this runner
+        // refuses to actually run because the stale assessment is still
+        // present).
+        //
+        // We deliberately do NOT touch `assessment_attempts` here — the
+        // existing diagnostic runner logic below increments it via the
+        // `current.assessment_attempts = current.assessment_attempts.saturating_add(1)`
+        // line after `verifier_diagnostic_attempt_spec` resolves. We only
+        // clear the stale assessment + flip `diagnostic_attempted` back to
+        // `false` so a fresh diagnostic pass is permitted under the same
+        // attempt budget.
+        let stale_advance = self.repair_job.as_ref().is_some_and(|job| {
+            super::repair_job::has_stale_assessment_after_cluster_advance(job, &self.work_root)
+        });
+        if stale_advance && let Some(current) = self.repair_job.as_mut() {
+            current.assessment = None;
+            current.diagnostic_attempted = false;
+        }
         let Some(context) = self.repair_job.clone() else {
             return VerifierDiagnosticPassOutcome::Skipped;
         };
@@ -9292,8 +9373,112 @@ impl Agent {
                 attempt_spec.role,
             );
         };
-        let assessment =
-            model_assessment_to_verifier_repair_assessment(&self.work_root, &context, parsed);
+        // Issue #647 (Phase D / D.1 / DR3-005): independently parse the
+        // semantic-failure report from the *same* reply. When the LLM omits
+        // the extended SemanticFailureReport fields (MF1: production LLMs
+        // historically returned only the legacy schema), we deterministically
+        // synthesize a SemanticFailureReport from the legacy parsed result so
+        // semantic repair planning fires on every diagnostic pass — not only
+        // when the LLM volunteered the extended schema. The legacy
+        // `ParsedVerifierRepairAssessment` / `VerifierRepairAssessment` flow
+        // below is **not** disturbed.
+        //
+        // -------- BEGIN semantic-boundary (Issue #647 / S3-005 / SF3) --------
+        // Everything between this marker and END semantic-boundary is
+        // *outside* the legacy assessment pipeline. The legacy struct-literal
+        // callsites for `super::VerifierRepairAssessment`
+        // (turn.rs:15399 / 18785 / 19477 / 19553 / 20230 / 23108 / 23133)
+        // remain unchanged by Issue #647. See the doc comment on
+        // `model_assessment_to_verifier_repair_assessment` for the full
+        // responsibility split.
+        let semantic_report = parse_semantic_failure_report_from_reply(&reply.content)
+            .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &context));
+        // Issue #647 (SF1 / V3): build the `SpecAuthorityInput` from the
+        // four real detectors wired in V3:
+        //   * BehaviorContract — from `TaskContract::from_request`.
+        //   * UserRequest match — from the explicit-spec keyword detector.
+        //   * VerifiedPublicInterface — from the turn-local
+        //     `task_contract_verifier_passed_this_actor_loop` flag
+        //     (S5-005: real-but-bounded detector).
+        //   * Consensus — from the V3.3 contract-conflict heuristic over
+        //     the just-parsed `SemanticFailureReport`.
+        // `is_newly_generated_task` stays `true` per the SF1 acceptance.
+        let agent_history_hint = super::spec_authority::AgentHistoryHint {
+            verifier_passed_in_loop: self.task_contract_verifier_passed_this_actor_loop,
+        };
+        let authority_input = build_spec_authority_input_for_active_request(
+            self.active_request_text().as_deref(),
+            semantic_report.as_ref(),
+            agent_history_hint,
+        );
+        // Issue #647 / CB-017 A''' (Commit 3): build the path-local admission
+        // context **before** semantic enrich so `enrich_failure_clusters_with_admitted_targets`
+        // can route every LLM-supplied target_path through the SSOT
+        // `recovery_target_hint_for_diagnostic_path` (syntactic safety +
+        // Owned admission). This is the same admission context used by the
+        // legacy `model_assessment_to_verifier_repair_assessment` below.
+        let scope = self.current_workspace_scope();
+        let turn_edited = self.turn_edited_relative_paths.clone();
+        let edited_predicate = |path: &str| turn_edited.contains(path);
+        let scaffold_predicate = |path: &str| self.repo_edit_has_post_scaffold_delta(path);
+        let admission = RepairTargetAdmissionContext {
+            work_root: &self.work_root,
+            scope: &scope,
+            edited_this_session_for: &edited_predicate,
+            scaffold_changed_for: &scaffold_predicate,
+        };
+        // CB-017 A''' (Commit 3): merge + enrich each report so every cluster
+        // carries `admitted_cluster_targets` derived from the SSOT admission
+        // gate. If every cluster ends up targetless, drop the semantic report
+        // so the legacy assessment path is used unchanged.
+        let semantic_report = semantic_report.and_then(|mut report| {
+            merge_legacy_targets_into_clusters(&mut report, &parsed);
+            let spec_authority = super::spec_authority::resolve(&authority_input);
+            enrich_failure_clusters_with_admitted_targets(
+                &mut report,
+                &self.work_root,
+                &admission,
+                spec_authority,
+            );
+            if report
+                .failure_clusters
+                .iter()
+                .all(|c| c.admitted_cluster_targets.is_empty())
+            {
+                None
+            } else {
+                Some(report)
+            }
+        });
+        // Issue #647 (CB-015): the new plan's generation snapshot uses the
+        // **pre-bump** `assessment_generation`. The live `RepairJob.assessment_generation`
+        // is incremented below in lock-step with the new assessment landing
+        // in the slot, so after the bump:
+        //   plan.assessment_generation_at_creation == pre_bump_gen
+        //   job.assessment_generation              == pre_bump_gen + 1
+        // → `plan.gen < job.gen` → `semantic_plan_is_stale` returns `false`
+        // (fresh). This is the SSOT signal that the assessment in the slot
+        // is the one this plan was built against — the controller can route
+        // to NeedFreshRead/NeedEdit instead of looping back to
+        // NeedDiagnostic on the same cluster.
+        let pre_bump_assessment_generation = context.assessment_generation;
+        let semantic_plan = semantic_report.and_then(|report| {
+            build_semantic_repair_plan_from_report_with_authority_input(
+                report,
+                authority_input.clone(),
+                pre_bump_assessment_generation,
+            )
+        });
+        // -------- END semantic-boundary (Issue #647 / S3-005 / SF3) --------
+        // Re-entering the legacy assessment pipeline: the call below builds
+        // `super::VerifierRepairAssessment` only. `semantic_plan` lives on
+        // the `RepairJob` it never touches.
+        let assessment = model_assessment_to_verifier_repair_assessment(
+            &self.work_root,
+            &context,
+            parsed,
+            &admission,
+        );
         let has_target = assessment.repair_target_hint.is_some();
         if !has_target {
             return self.handle_verifier_diagnostic_failure(
@@ -9307,6 +9492,62 @@ impl Agent {
             current.diagnostic_error = None;
             current.diagnostic_unavailable = false;
             current.assessment = Some(assessment);
+            // Issue #647 (CB-015): bump `assessment_generation` in lock-step
+            // with the new assessment landing in the slot. Combined with the
+            // pre-bump generation threaded into the semantic plan above:
+            //   * stale (post-advance, pre-re-diagnostic):
+            //     `plan.assessment_generation_at_creation ==
+            //     job.assessment_generation` AND `exhausted_attempts`
+            //     non-empty → `semantic_plan_is_stale` = true →
+            //     CB-007/CB-012/CB-014 force re-diagnostic.
+            //   * fresh (post-re-diagnostic, ready to repair the new cluster):
+            //     `plan.assessment_generation_at_creation <
+            //     job.assessment_generation` →
+            //     `semantic_plan_is_stale` = false → controller routes to
+            //     NeedFreshRead/NeedEdit on the current cluster (closing the
+            //     liveness gap where the stale predicate kept looping back
+            //     to NeedDiagnostic after a cluster advance).
+            current.assessment_generation = pre_bump_assessment_generation.saturating_add(1);
+            // Issue #647 (Phase D / D.2 / DR3-005): write the
+            // SemanticRepairPlan slot. `None` is the legacy-compatible
+            // value when semantic parse failed or dispatch routed to
+            // setup repair (D.3).
+            //
+            // Issue #647 (MF2 V3.1): route the assignment through the
+            // exhausted-aware helper so re-diagnostic cannot revive a
+            // cluster that the previous turn already pushed onto
+            // `exhausted_attempts`. Without this, every fresh diagnostic
+            // would blindly overwrite the slot with whatever cluster the
+            // LLM picked first — discarding the dispatch helper's progress
+            // (`apply_semantic_repair_dispatch_after_rerun` in
+            // `drive_task_contract_verifier`) and forcing the same doomed
+            // cluster to be re-attacked. The new helper skips ahead to the
+            // next unexhausted cluster of the embedded report (or clears
+            // the slot for legacy fallback when none remain).
+            let new_report = semantic_plan
+                .as_ref()
+                .map(|plan| plan.semantic_report.clone());
+            super::repair_job::assign_semantic_plan_preserving_exhausted(
+                current,
+                semantic_plan,
+                new_report.as_ref(),
+            );
+            // CB-017 A''': immediately rebind the freshly-landed legacy
+            // assessment to the current semantic-plan cluster so the
+            // controller routes to the new cluster's admitted targets —
+            // not the previous cluster's stale paths surfaced by
+            // `needed_reads` / `repair_plan`. The rebind helper is a no-op
+            // when `semantic_plan = None` (legacy fallback) or when the
+            // current cluster is targetless (caller already skipped it via
+            // `first_repairable_cluster` / `next_repairable_cluster`).
+            //
+            // Path-coverage: this is the `DiagnosticSkip` callsite when
+            // `assign_semantic_plan_preserving_exhausted` walked past an
+            // already-exhausted cluster; for the "new bind" path it
+            // realigns the assessment to the freshly-elected first
+            // cluster. Either way `applied_repair_intents` only clears
+            // on actual cluster-id transition.
+            super::repair_job::rebind_legacy_assessment_to_current_cluster(current);
         }
         log_llm_event(
             "agent.verifier_diagnostic.completed",
@@ -14166,6 +14407,37 @@ fn verifier_repair_context_from_failure(
         previous_failure_count,
         rerun_outcome,
         repair_attempt,
+        // Issue #647 (Phase B / MF2.1): carry `semantic_plan` and
+        // `exhausted_attempts` over from the previous turn so cluster-aware
+        // sequential repair survives slot reuse. The Phase-D diagnostic
+        // populates these slots — without the carryover, every new verifier
+        // failure would discard the active cluster plan and the per-job
+        // ledger, forcing a fresh diagnostic round-trip and defeating the
+        // sequential-repair design (設計判断 #5, S3-010). The post-rerun
+        // dispatch in `drive_task_contract_verifier` (MF2.2 / MF2.3) walks
+        // these carried-over slots via the Phase-E helpers.
+        semantic_plan: previous_context.and_then(|context| context.semantic_plan.clone()),
+        exhausted_attempts: previous_context
+            .map(|context| context.exhausted_attempts.clone())
+            .unwrap_or_default(),
+        // Issue #647 (CB-015): carry `assessment_generation` over so the
+        // stale↔fresh distinction survives turn boundaries. The generation
+        // is monotonic across the job lifetime — every successful
+        // diagnostic write bumps it; cluster advances do not touch it.
+        // A new failure that builds a fresh `RepairJob` (no previous_context)
+        // resets the generation to 0, mirroring the `semantic_plan = None /
+        // exhausted_attempts = empty` defaults applied above.
+        assessment_generation: previous_context
+            .map(|context| context.assessment_generation)
+            .unwrap_or(0),
+        // Issue #647 / CB-017 A''' (CR-4 V2): carry over the cluster-key bind
+        // so `rebind_legacy_assessment_to_current_cluster` can detect cluster
+        // transitions across turn boundaries. A new failure that builds a
+        // fresh `RepairJob` (no previous_context) starts with `None` —
+        // matching the "no semantic plan yet" defaults applied above so the
+        // first rebind after a fresh diagnostic is treated as a new bind.
+        assessment_bound_cluster_id: previous_context
+            .and_then(|context| context.assessment_bound_cluster_id.clone()),
     }
 }
 
@@ -14301,21 +14573,21 @@ fn verifier_repair_changed_file_hints(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ParsedVerifierRepairAssessment {
-    failure_kind: super::VerifierDiagnosticFailureKind,
-    probable_cause_role: Option<super::task_contract::ArtifactRole>,
-    repair_targets: Vec<ParsedVerifierRepairTarget>,
-    repair_plan: Vec<ParsedVerifierRepairTarget>,
-    secondary_targets: Vec<String>,
-    do_not_edit_tests_without_evidence: bool,
-    summary: Option<String>,
+pub(super) struct ParsedVerifierRepairAssessment {
+    pub(super) failure_kind: super::VerifierDiagnosticFailureKind,
+    pub(super) probable_cause_role: Option<super::task_contract::ArtifactRole>,
+    pub(super) repair_targets: Vec<ParsedVerifierRepairTarget>,
+    pub(super) repair_plan: Vec<ParsedVerifierRepairTarget>,
+    pub(super) secondary_targets: Vec<String>,
+    pub(super) do_not_edit_tests_without_evidence: bool,
+    pub(super) summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ParsedVerifierRepairTarget {
-    path: String,
-    confidence: f64,
-    reason: String,
+pub(super) struct ParsedVerifierRepairTarget {
+    pub(super) path: String,
+    pub(super) confidence: f64,
+    pub(super) reason: String,
 }
 
 fn parse_verifier_repair_assessment_reply(reply: &str) -> Option<ParsedVerifierRepairAssessment> {
@@ -14638,6 +14910,61 @@ fn validate_verifier_repair_intents(
             used_whitespace_fallback |= result.used_whitespace_fallback;
             result.updated_contents
         };
+    }
+    // Issue #647 (MF3 / codex final review): SemanticRepairPlan gate for test
+    // edits. Test files (`is_test_file`) may only be edited when the
+    // RepairJob carries a `SemanticRepairPlan` with both a determined
+    // `spec_authority` (enum closed set, never None) and a non-empty
+    // `repair_hypothesis`. Issue 受入条件: "test edit is allowed only when
+    // SpecAuthority and RepairHypothesis exist" / "test edit must preserve
+    // verification intent". This pre-gate runs before the weakening detector
+    // so that semantic_plan = None always rejects regardless of whether the
+    // edit text itself appears benign. Impl edits remain unaffected (impl
+    // repair has wider latitude — only test edits are gated here).
+    let relative_path_classified = Path::new(&relative_path);
+    if is_test_file(relative_path_classified) {
+        let plan = context.semantic_plan.as_ref().ok_or_else(|| {
+            CheapCheckOutcome::Failed(
+                "repair intent rejected: test edit requires SemanticRepairPlan \
+                 (spec_authority + repair_hypothesis); none was constructed"
+                    .to_string(),
+            )
+        })?;
+        if plan.repair_hypothesis.trim().is_empty() {
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent rejected: test edit requires a non-empty \
+                 repair_hypothesis in the SemanticRepairPlan"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): apply the deterministic
+    // test/impl weakening detectors at the repair editor's admission
+    // boundary. `original_contents` is the pre-edit `before` snapshot and
+    // `contents` is the post-edit `after`. Both are simultaneously available
+    // here (DR3-002), unlike inside `apply_validated_verifier_repair_edit`
+    // which only sees pre/post hashes. Test-side and impl-side detectors are
+    // dispatched by `file_classify` so each path is judged by the relevant
+    // closed pattern list (5 test patterns / 4 impl patterns). A non-empty
+    // pattern vec rejects the intent — this implements the AND coupling with
+    // the legacy `do_not_edit_tests_without_evidence` reject (which lives
+    // separately at hint admission via `diagnostic_target_allowed_by_confidence`):
+    // any weakening detected here is rejected unconditionally, while the
+    // evidence-required gate remains the independent first line of defence.
+    let weakening_path = Path::new(&relative_path);
+    let weakening = if is_test_file(weakening_path) {
+        super::spec_authority::detect_test_weakening(&relative_path, &original_contents, &contents)
+    } else if is_implementation_file(weakening_path) {
+        super::spec_authority::detect_impl_weakening(&relative_path, &original_contents, &contents)
+    } else {
+        Vec::new()
+    };
+    if !weakening.is_empty() {
+        return Err(CheapCheckOutcome::Failed(format!(
+            "repair intent rejected: test/impl weakening detected ({:?})",
+            weakening
+        )));
     }
     validate_verifier_repair_candidate_contents(
         &relative_path,
@@ -15169,18 +15496,288 @@ fn recovery_target_hint_for_existing_path(
     })
 }
 
+/// Issue #647 (Phase C, §4.4 / §5.1): Owned admission context for every
+/// `RecoveryTargetHint` promotion path. Path-local predicates (DR3-001) so
+/// the SSOT gate evaluates `turn_edited_relative_paths.contains(path)` /
+/// `repo_edit_has_post_scaffold_delta(path)` for *the hint's own path*, not
+/// a turn-global signal that would falsely promote unrelated files.
+///
+/// `verifier_passed_in_scope` is omitted from the context per DR1-006:
+/// every callsite in this Issue is "trying to repair a hint" — by
+/// construction the verifier has not yet passed for the active scope, so
+/// `admit_repair_target_hint` fixes that flag to `false` literally. When a
+/// future Issue introduces post-success repair paths the field can be
+/// re-introduced on this struct without touching the SSOT function shape.
+pub(super) struct RepairTargetAdmissionContext<'a> {
+    pub(super) work_root: &'a Path,
+    pub(super) scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
+    pub(super) edited_this_session_for: &'a dyn Fn(&str) -> bool,
+    pub(super) scaffold_changed_for: &'a dyn Fn(&str) -> bool,
+}
+
+#[cfg(test)]
+fn admission_always_true(_: &str) -> bool {
+    true
+}
+
+#[cfg(test)]
+fn admission_always_false(_: &str) -> bool {
+    false
+}
+
+impl<'a> RepairTargetAdmissionContext<'a> {
+    /// Test-only helper: build an admission context whose predicates always
+    /// promote the hint to `Owned` (edited_this_session=true). Lets fixtures
+    /// keep their existing repair-target assertions while still routing
+    /// through the SSOT gate (S7-004 / DR2-001).
+    #[cfg(test)]
+    pub(super) fn owned_for_test(
+        work_root: &'a Path,
+        scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
+    ) -> Self {
+        Self {
+            work_root,
+            scope,
+            edited_this_session_for: &admission_always_true,
+            scaffold_changed_for: &admission_always_false,
+        }
+    }
+}
+
+/// Issue #647 (Phase C, §5.1 SSOT): Owned admission gate for any
+/// `RecoveryTargetHint` heading downstream into the repair-job pipeline.
+/// Every hint-promotion source category (6 categories in §5.1) routes
+/// through this single function so the `OwnershipInputs` invariants stay
+/// consistent (path-local predicates evaluated against `hint.path`,
+/// `verifier_passed_in_scope` fixed to `false` per DR1-006).
+pub(super) fn admit_repair_target_hint(
+    hint: super::task_contract::RecoveryTargetHint,
+    ctx: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    let path = hint.path.clone();
+    let inputs = super::artifact_ownership::OwnershipInputs {
+        work_root: ctx.work_root,
+        relative_path: &path,
+        scope: ctx.scope,
+        edited_this_session: (ctx.edited_this_session_for)(&path),
+        scaffold_changed: (ctx.scaffold_changed_for)(&path),
+        verifier_passed_in_scope: false,
+    };
+    match super::artifact_ownership::classify_ownership(inputs) {
+        super::artifact_ownership::ArtifactOwnership::Owned => Some(hint),
+        super::artifact_ownership::ArtifactOwnership::CandidateOnly
+        | super::artifact_ownership::ArtifactOwnership::OutOfScope => None,
+    }
+}
+
 fn recovery_target_hint_for_diagnostic_path(
     work_root: &Path,
     raw_path: &str,
     reason: &str,
     failure_kind: super::VerifierDiagnosticFailureKind,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     let hint = recovery_target_hint_for_existing_path(work_root, raw_path, reason)?;
     if hint.role == super::task_contract::ArtifactRole::Setup && !failure_kind.allows_setup_target()
     {
         return None;
     }
-    Some(hint)
+    // Issue #647 (§5.1 stage 2): Owned admission gate at the function exit.
+    // Path 1 of the 6 source categories: diagnostic LLM-proposed paths.
+    admit_repair_target_hint(hint, admission)
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-2 V2): merge legacy
+/// `ParsedVerifierRepairAssessment` targets into the first cluster of a
+/// `SemanticFailureReport` **only when every cluster is targetless**.
+///
+/// Policy (all-or-nothing): partial output (some clusters target_paths, some
+/// not) is never merged — targetless clusters are skipped downstream by
+/// `first_repairable_cluster` / `next_repairable_cluster`. Merging into a
+/// random "first" cluster on partial output would break the LLM-supplied
+/// cluster ↔ path binding.
+///
+/// `role_hint` is always `None` because `ParsedVerifierRepairTarget` does
+/// not carry a role; the admitted hint's role is decided later by
+/// `recovery_target_hint_for_existing_path` (CR-3 V2). Each appended
+/// candidate's `raw_path` / `reason` is sanitized via
+/// `sanitize_repair_job_text_with_char_cap` so the parse-boundary invariant
+/// (same SSOT as `parse_semantic_failure_report`) holds.
+pub(super) fn merge_legacy_targets_into_clusters(
+    report: &mut super::semantic_failure::SemanticFailureReport,
+    parsed: &ParsedVerifierRepairAssessment,
+) {
+    let all_empty = report
+        .failure_clusters
+        .iter()
+        .all(|c| c.proposed_target_candidates.is_empty());
+    if !all_empty {
+        return;
+    }
+    let Some(first_cluster) = report.failure_clusters.first_mut() else {
+        return;
+    };
+    for target in &parsed.repair_targets {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &target.path,
+                    super::semantic_failure::MAX_RAW_PATH_CHARS,
+                ),
+                role_hint: None,
+                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &target.reason,
+                    240,
+                ),
+            },
+        );
+    }
+    for entry in &parsed.repair_plan {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        // Dedup-by-path: a path already appended via `repair_targets` is not
+        // re-appended via `repair_plan`. We compare against the sanitized
+        // entry that was pushed (the same SSOT is applied to the new entry
+        // below) so a path string that differs only in trailing whitespace /
+        // control chars still dedupes correctly.
+        let sanitized_path = super::repair_job::sanitize_repair_job_text_with_char_cap(
+            &entry.path,
+            super::semantic_failure::MAX_RAW_PATH_CHARS,
+        );
+        if first_cluster
+            .proposed_target_candidates
+            .iter()
+            .any(|c| c.raw_path == sanitized_path)
+        {
+            continue;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: sanitized_path,
+                role_hint: None,
+                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &entry.reason,
+                    240,
+                ),
+            },
+        );
+    }
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-1 V2 / CR-3 V2 / CR-5):
+/// for every failure cluster, admit each `proposed_target_candidate` via
+/// the SSOT `recovery_target_hint_for_diagnostic_path` (which composes
+/// syntactic safety + Owned admission + setup-target gating), dedup the
+/// admitted hints by `(role, path)`, and sort them with the
+/// authority/failure-kind decision table in
+/// [`sort_admitted_by_authority_role_priority`].
+///
+/// CR-3 V2: `candidate.role_hint` is **advisory only** — it is never passed
+/// to the admission helper. The admitted hint's role is decided by
+/// `recovery_target_hint_for_existing_path`'s path classification.
+///
+/// CR-1 V2: the admission SSOT is invoked exactly once per candidate. We do
+/// NOT additionally call `admit_repair_target_hint` after the fact (that
+/// would double-gate Owned).
+pub(super) fn enrich_failure_clusters_with_admitted_targets(
+    report: &mut super::semantic_failure::SemanticFailureReport,
+    work_root: &Path,
+    admission_ctx: &RepairTargetAdmissionContext<'_>,
+    spec_authority: super::spec_authority::SpecAuthority,
+) {
+    let failure_kind = report.failure_kind;
+    for cluster in report.failure_clusters.iter_mut() {
+        let mut admitted: Vec<super::task_contract::RecoveryTargetHint> = Vec::new();
+        for candidate in cluster.proposed_target_candidates.iter() {
+            // recovery_target_hint_for_diagnostic_path is the SSOT — it
+            // composes syntactic safety + Owned admission via
+            // admit_repair_target_hint. role_hint is intentionally not
+            // forwarded (CR-3 V2).
+            if let Some(hint) = recovery_target_hint_for_diagnostic_path(
+                work_root,
+                &candidate.raw_path,
+                &candidate.reason,
+                failure_kind,
+                admission_ctx,
+            ) {
+                admitted.push(hint);
+            }
+        }
+        // (role, path) dedup — Codex nice-to-have 2.
+        admitted.sort_by(|a, b| (a.role, &a.path).cmp(&(b.role, &b.path)));
+        admitted.dedup_by(|a, b| a.role == b.role && a.path == b.path);
+        // Role priority sort (TestBug override / SetupRepair defensive /
+        // default impl-first). Stable sort with (rank, path) tie-breaker.
+        sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
+        cluster.admitted_cluster_targets = admitted;
+    }
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-5 V2): stable role-priority sort
+/// for an `admitted_cluster_targets` slice.
+///
+/// Decision table:
+///
+/// | `failure_kind`                                            | Order                                          |
+/// |-----------------------------------------------------------|------------------------------------------------|
+/// | `TestBug` (override)                                      | Test > Impl > UsageDocs > Setup                |
+/// | `DependencyMissing` / `ConfigOrVerifierError` (defensive) | Setup > Impl > UsageDocs > Test                |
+/// | everything else                                           | Impl > UsageDocs > Setup > Test (test suppress)|
+///
+/// `spec_authority` is currently advisory at this layer — the table above
+/// is independent of authority. The parameter is retained for forward
+/// compatibility (a future Issue may introduce authority-conditional
+/// branches without touching the call sites).
+///
+/// The sort is stable and uses `(rank, path)` as the sort key so ties (two
+/// targets of the same role) resolve in deterministic path order.
+pub(super) fn sort_admitted_by_authority_role_priority(
+    admitted: &mut [super::task_contract::RecoveryTargetHint],
+    spec_authority: super::spec_authority::SpecAuthority,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+) {
+    let _ = spec_authority; // explicit no-op for clarity (CR-5 V2 decision table).
+    let primary_rank_for = |role: super::task_contract::ArtifactRole| -> u8 {
+        if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug) {
+            return match role {
+                super::task_contract::ArtifactRole::Test => 0,
+                super::task_contract::ArtifactRole::Implementation => 1,
+                super::task_contract::ArtifactRole::UsageDocs => 2,
+                super::task_contract::ArtifactRole::Setup => 3,
+            };
+        }
+        if matches!(
+            failure_kind,
+            super::VerifierDiagnosticFailureKind::DependencyMissing
+                | super::VerifierDiagnosticFailureKind::ConfigOrVerifierError
+        ) {
+            return match role {
+                super::task_contract::ArtifactRole::Setup => 0,
+                super::task_contract::ArtifactRole::Implementation => 1,
+                super::task_contract::ArtifactRole::UsageDocs => 2,
+                super::task_contract::ArtifactRole::Test => 3,
+            };
+        }
+        match role {
+            super::task_contract::ArtifactRole::Implementation => 0,
+            super::task_contract::ArtifactRole::UsageDocs => 1,
+            super::task_contract::ArtifactRole::Setup => 2,
+            super::task_contract::ArtifactRole::Test => 3,
+        }
+    };
+    admitted.sort_by(|a, b| {
+        let pa = primary_rank_for(a.role);
+        let pb = primary_rank_for(b.role);
+        pa.cmp(&pb).then_with(|| a.path.cmp(&b.path))
+    });
 }
 
 fn diagnostic_target_allowed_by_confidence(
@@ -15219,6 +15816,7 @@ fn verifier_repair_preferred_local_import_source(
     // after the parser scope reduction in Task 1.2). Production callers MUST pass
     // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
     derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     if derived_failure_type != super::VerifierFailureType::ImportOrDependency {
         return None;
@@ -15233,14 +15831,17 @@ fn verifier_repair_preferred_local_import_source(
         return None;
     }
     let hint = context.target_hint.as_ref()?;
-    if hint.role == super::task_contract::ArtifactRole::Implementation {
+    let promoted = if hint.role == super::task_contract::ArtifactRole::Implementation {
         Some(super::task_contract::RecoveryTargetHint {
             reason: "local import contract mismatch names this provider/source file".to_string(),
             ..hint.clone()
         })
     } else {
         None
-    }
+    }?;
+    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 4 of the
+    // 6 source categories: local-import-contract-derived hints.
+    admit_repair_target_hint(promoted, admission)
 }
 
 fn verifier_repair_stale_assertion_test_target(
@@ -15251,6 +15852,7 @@ fn verifier_repair_stale_assertion_test_target(
     // after the parser scope reduction in Task 1.2). Production callers MUST pass
     // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
     derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     if derived_failure_type != super::VerifierFailureType::AssertionFailure {
         return None;
@@ -15279,16 +15881,372 @@ fn verifier_repair_stale_assertion_test_target(
     {
         return None;
     }
-    Some(super::task_contract::RecoveryTargetHint {
+    let promoted = super::task_contract::RecoveryTargetHint {
         reason: "same assertion failure remained after a non-test repair; inspect generated test setup or expectations".to_string(),
         ..failure_target.clone()
+    };
+    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
+    // 6 source categories: stale-assertion test re-target.
+    admit_repair_target_hint(promoted, admission)
+}
+
+/// Issue #647 (Phase D): extract the JSON object value from a diagnostic LLM
+/// reply, mirroring the SSOT preamble used by
+/// [`parse_verifier_repair_assessment_reply`] (strip `<think>` tags →
+/// trim/truncate → find the outermost `{ … }`). Returns `None` on any
+/// extraction or `serde_json` parse failure.
+///
+/// Phase D wires this helper into `run_verifier_diagnostic_pass` so the
+/// existing `ParsedVerifierRepairAssessment` parse and the new
+/// `parse_semantic_failure_report` parse share an identical JSON-extraction
+/// boundary. Keeping the extraction logic colocated avoids drift between
+/// the two parse paths.
+fn extract_diagnostic_reply_json_value(reply: &str) -> Option<serde_json::Value> {
+    let stripped = strip_think_tags(reply);
+    let trimmed = truncate(stripped.trim(), VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES);
+    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed.clone()
+    } else {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        trimmed[start..=end].to_string()
+    };
+    serde_json::from_str(&json_text).ok()
+}
+
+/// Issue #647 (Phase D / D.1): parse a diagnostic LLM reply into an
+/// [`super::semantic_failure::SemanticFailureReport`]. Independent of the
+/// legacy `ParsedVerifierRepairAssessment` parse — a failure here returns
+/// `None` and the caller proceeds with `semantic_plan = None` (DR3-005), so
+/// the existing `VerifierRepairAssessment` / legacy repair-target selection
+/// is **not** disturbed.
+fn parse_semantic_failure_report_from_reply(
+    reply: &str,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    let value = extract_diagnostic_reply_json_value(reply)?;
+    super::semantic_failure::parse_semantic_failure_report(&value)
+}
+
+/// Issue #647 (MF1): deterministic fallback that synthesizes a
+/// [`super::semantic_failure::SemanticFailureReport`] from a legacy
+/// [`ParsedVerifierRepairAssessment`] and the surrounding [`RepairJob`].
+///
+/// MF1 production motivation: most LLMs today emit only the legacy fields
+/// (`probable_cause_role` / `failure_kind` / `repair_plan` / `summary`), so
+/// `parse_semantic_failure_report_from_reply` returns `None` and the
+/// `semantic_plan` slot stays empty in production. This helper recovers a
+/// usable `SemanticFailureReport` from the legacy parse so semantic repair
+/// planning kicks in for every diagnostic pass, not only when the LLM
+/// volunteered the extended schema.
+///
+/// Determinism contract: same `(parsed, repair_job)` input MUST produce the
+/// same `SemanticFailureReport`. No randomness, no clock, no LLM-derived
+/// confidence — `confidence` is fixed at the deterministic legacy default
+/// (`LEGACY_FALLBACK_CONFIDENCE`).
+///
+/// Returns `None` only when the legacy parsed result cannot produce a
+/// meaningful failure cluster (e.g. `failure_signature` is empty AND
+/// `output_excerpt` is empty AND there is no summary text). In practice the
+/// caller passes a `RepairJob` with at least a non-empty `failure_signature`
+/// (built by `verifier_repair_context_from_failure`), so the helper returns
+/// `Some` for every realistic production input.
+fn build_semantic_failure_report_from_legacy(
+    parsed: &ParsedVerifierRepairAssessment,
+    repair_job: &super::repair_job::RepairJob,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    use super::semantic_failure::{
+        ContractConflict, MAX_CLUSTER_TEXT_CHARS, MAX_REPAIR_HYPOTHESIS_CHARS,
+        build_failure_cluster_from_observation,
+    };
+
+    // Map legacy probable_cause_role → preferred_repair_role; default to
+    // Implementation (deterministic) when the LLM did not supply one.
+    let preferred_repair_role = parsed
+        .probable_cause_role
+        .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+
+    // Build a single failure cluster from the legacy RepairJob signal. The
+    // cluster_key is generated locally via the SSOT cluster builder, so it
+    // never depends on attacker-controlled text.
+    let observed = if !repair_job.failure_signature.is_empty() {
+        repair_job.failure_signature.as_str()
+    } else {
+        repair_job.output_excerpt.as_str()
+    };
+    let expected = parsed.summary.as_deref().unwrap_or("");
+    // input_shape / assertion_shape are not surfaced by the legacy schema;
+    // we leave them empty so the SSOT shape-normalizer collapses them
+    // identically across legacy inputs (deterministic cluster key).
+    let cluster = build_failure_cluster_from_observation(
+        observed,
+        expected,
+        "",
+        "",
+        &[preferred_repair_role],
+        // CB-017 A''' (Commit 2): legacy fallback synthesizes a cluster with
+        // **no** proposed target candidates; the merge step (Commit 3) will
+        // append legacy `parsed.repair_targets` here under the all-empty
+        // policy. Keep `Vec::new()` to preserve existing behavior.
+        Vec::new(),
+    );
+
+    // contract_conflict is sourced from the legacy summary — it lives in the
+    // `implementation` slot because the legacy summary historically described
+    // implementation-side findings. The other two slots are empty so the
+    // schema's invariant ("each side sanitized to MAX_CLUSTER_TEXT_CHARS")
+    // still holds without us inventing test / docs content.
+    let contract_conflict = ContractConflict {
+        implementation: super::repair_job::sanitize_repair_job_text_with_char_cap(
+            parsed.summary.as_deref().unwrap_or(""),
+            MAX_CLUSTER_TEXT_CHARS,
+        ),
+        test: String::new(),
+        usage_docs: String::new(),
+    };
+
+    // repair_hypothesis: first entry of the legacy repair_plan (intent +
+    // path), truncated by the SSOT sanitize entry. Falls back to the legacy
+    // summary when the plan is empty.
+    let raw_hypothesis = parsed
+        .repair_plan
+        .first()
+        .map(|target| {
+            if target.reason.is_empty() {
+                target.path.clone()
+            } else {
+                format!("{}: {}", target.path, target.reason)
+            }
+        })
+        .or_else(|| parsed.summary.clone())
+        .unwrap_or_default();
+    let repair_hypothesis = super::repair_job::sanitize_repair_job_text_with_char_cap(
+        &raw_hypothesis,
+        MAX_REPAIR_HYPOTHESIS_CHARS,
+    );
+
+    /// Deterministic legacy default — never LLM-supplied. Chosen as 0.5 so
+    /// downstream consumers can distinguish "fallback" reports from
+    /// "LLM-supplied" reports by checking for the midpoint value.
+    const LEGACY_FALLBACK_CONFIDENCE: f32 = 0.5;
+
+    Some(super::semantic_failure::SemanticFailureReport {
+        failure_kind: parsed.failure_kind,
+        failure_clusters: vec![cluster],
+        contract_conflict,
+        preferred_repair_role,
+        repair_hypothesis,
+        confidence: LEGACY_FALLBACK_CONFIDENCE,
     })
 }
 
+/// Issue #647 (Phase D / D.2 + D.3): build a [`super::repair_job::SemanticRepairPlan`]
+/// from a parsed [`super::semantic_failure::SemanticFailureReport`].
+///
+/// Returns `None` when:
+/// - `dispatch_target(report) == SetupRepair` (D.3): DependencyMissing /
+///   ConfigOrVerifierError are routed to the existing setup-repair /
+///   `MissingVerifierJob` pipeline; no SemanticRepairPlan is constructed.
+/// - `report.failure_clusters` is empty (no cluster to attack; the caller
+///   keeps `semantic_plan = None`).
+///
+/// `expected_improvement` is initialized to `None` — Phase E fills it after
+/// the verifier rerun.
+/// Issue #647 (SF1 / V3): construct a `SpecAuthorityInput` for the
+/// production diagnostic pass by funneling four independent signals into
+/// the resolver:
+///
+/// 1. `has_behavior_contract` — derived from
+///    `task_contract::TaskContract::from_request` on the active request.
+/// 2. `has_user_request_match` — derived from the SF1 V3.1 explicit-spec
+///    keyword detector ([`spec_authority::detect_explicit_spec_in_user_request`]).
+/// 3. `has_verified_public_interface` — derived from the SF1 V3.2
+///    history hint detector
+///    ([`spec_authority::detect_verified_public_interface_from_history`]),
+///    which today reads the turn-local "verifier already passed once"
+///    bit and never reaches outside the current actor-loop iteration.
+/// 4. `consensus` — derived from the SF1 V3.3 string-match heuristic
+///    ([`spec_authority::detect_consensus_from_contract_conflict`]) over
+///    the parsed `SemanticFailureReport.contract_conflict` fields. `None`
+///    when no report is available yet (e.g. legacy parse).
+///
+/// `is_newly_generated_task` stays `true` per the SF1 acceptance — Issue
+/// #647 treats every turn as "newly generated" until a future Issue
+/// plumbs a real detector. The resolver's newly-generated short-circuit
+/// only fires when `consensus` is `None`, so the V3.3 detector
+/// automatically demotes the short-circuit when a real tie-break exists.
+///
+/// The helper lives here (not in `spec_authority.rs`) because it crosses
+/// the `task_contract` / `spec_authority` / `semantic_failure` module
+/// boundaries; the resolver itself stays input-only and decoupled from
+/// `TaskContract` and `SemanticFailureReport`.
+fn build_spec_authority_input_for_active_request(
+    active_request: Option<&str>,
+    semantic_report: Option<&super::semantic_failure::SemanticFailureReport>,
+    agent_history_hint: super::spec_authority::AgentHistoryHint,
+) -> super::spec_authority::SpecAuthorityInput {
+    let has_behavior_contract = active_request
+        .map(|request| {
+            let contract = super::task_contract::TaskContract::from_request(request);
+            contract.required_behavior.operations.is_some()
+                || contract.required_behavior.domain_terms.is_some()
+        })
+        .unwrap_or(false);
+    let has_user_request_match = active_request
+        .map(super::spec_authority::detect_explicit_spec_in_user_request)
+        .unwrap_or(false);
+    let has_verified_public_interface =
+        super::spec_authority::detect_verified_public_interface_from_history(agent_history_hint);
+    let consensus = semantic_report.and_then(|report| {
+        super::spec_authority::detect_consensus_from_contract_conflict(
+            &report.contract_conflict.implementation,
+            &report.contract_conflict.test,
+            &report.contract_conflict.usage_docs,
+        )
+    });
+    super::spec_authority::SpecAuthorityInput {
+        has_user_request_match,
+        has_behavior_contract,
+        has_verified_public_interface,
+        is_newly_generated_task: true,
+        consensus,
+    }
+}
+
+/// Issue #647 (SF1): test-only wrapper that builds the plan with the
+/// default `SpecAuthorityInput`. Production code passes its own
+/// `SpecAuthorityInput` directly to
+/// [`build_semantic_repair_plan_from_report_with_authority_input`] (so the
+/// `has_behavior_contract` flag can be derived from the active request);
+/// the test suite uses this convenience wrapper to keep older test
+/// fixtures unchanged.
+#[cfg(test)]
+fn build_semantic_repair_plan_from_report(
+    report: super::semantic_failure::SemanticFailureReport,
+) -> Option<super::repair_job::SemanticRepairPlan> {
+    // Issue #647 (CB-015): test-only wrapper threads `0` as the
+    // generation snapshot — tests that pre-date CB-015 model a
+    // first-build "no prior re-diagnostic" state where the plan was
+    // created against generation 0.
+    build_semantic_repair_plan_from_report_with_authority_input(
+        report,
+        default_spec_authority_input(),
+        0,
+    )
+}
+
+/// Issue #647 (SF1): production default for `SpecAuthorityInput` when the
+/// build helper is called without explicit caller context.
+///
+/// - `has_user_request_match`: `false` (detection is a future Issue).
+/// - `has_behavior_contract`: `false` (the caller that has the
+///   `TaskContract` will pass an overridden input via
+///   `build_semantic_repair_plan_from_report_with_authority_input`).
+/// - `has_verified_public_interface`: `false` (S5-005 dead variant).
+/// - `is_newly_generated_task`: `true` — Issue acceptance treats every
+///   turn as "newly generated" until a future Issue plumbs a real
+///   detector.
+/// - `consensus`: `None` — consensus detection is a future Issue.
+#[cfg(test)]
+fn default_spec_authority_input() -> super::spec_authority::SpecAuthorityInput {
+    super::spec_authority::SpecAuthorityInput {
+        has_user_request_match: false,
+        has_behavior_contract: false,
+        has_verified_public_interface: false,
+        is_newly_generated_task: true,
+        consensus: None,
+    }
+}
+
+/// Issue #647 (SF1): variant that lets the caller pass an explicit
+/// `SpecAuthorityInput` (so a future Issue can wire the actual
+/// `RequiredBehaviorContract` / consensus detection signals).
+fn build_semantic_repair_plan_from_report_with_authority_input(
+    report: super::semantic_failure::SemanticFailureReport,
+    authority_input: super::spec_authority::SpecAuthorityInput,
+    assessment_generation: u32,
+) -> Option<super::repair_job::SemanticRepairPlan> {
+    // D.3: DependencyMissing / ConfigOrVerifierError → setup repair path,
+    // no semantic plan.
+    if super::semantic_failure::dispatch_target(&report)
+        == super::semantic_failure::SemanticDispatchTarget::SetupRepair
+    {
+        return None;
+    }
+    // 1 RepairJob = 1 cluster (slot reuse, Phase E). Pick the first
+    // **repairable** cluster — CB-017 A''' (Commit 3, CR-6 V2) skips
+    // targetless clusters (admitted_cluster_targets empty) so the plan is
+    // always anchored to a cluster the controller can actually attack.
+    // When tests build a fixture report *without* running the enrich step,
+    // every cluster looks targetless; fall back to the legacy "first cluster"
+    // behavior in that case so the existing test suite stays green.
+    let failure_cluster_id = super::repair_job::first_repairable_cluster(&report)
+        .or_else(|| report.failure_clusters.first())?
+        .cluster_key
+        .clone();
+    // Issue #647 (SF1): SpecAuthority is now resolved through the
+    // structured `resolve()` SSOT so impl/test/README are treated as
+    // equally authoritative on newly generated tasks. Pre-SF1 the
+    // candidate set was hard-coded to `[ImplementationContract,
+    // LlmGeneratedTest]`, which always elected ImplementationContract and
+    // let the repair editor rewrite tests to match buggy impl.
+    let spec_authority = super::spec_authority::resolve(&authority_input);
+    Some(super::repair_job::SemanticRepairPlan {
+        semantic_cause: report.failure_kind,
+        spec_authority,
+        preferred_repair_role: report.preferred_repair_role,
+        repair_hypothesis: report.repair_hypothesis.clone(),
+        failure_cluster_id,
+        expected_improvement: None,
+        semantic_report: report,
+        // Issue #647 (CB-015): coil the caller-provided generation. The
+        // production callsite in `run_verifier_diagnostic_pass` passes the
+        // RepairJob's pre-bump generation so this plan is fresh relative
+        // to the assessment we are about to write into the slot.
+        assessment_generation_at_creation: assessment_generation,
+    })
+}
+
+/// Boundary helper that converts a parsed diagnostic reply into the
+/// legacy `super::VerifierRepairAssessment` value used by the rest of the
+/// verifier-repair pipeline.
+///
+/// # Responsibility boundary (Issue #647 / S3-005 / SF3)
+///
+/// This function is **the** SSOT boundary for legacy-side assessment
+/// construction. The Issue #647 semantic-repair planning lives outside
+/// this boundary on purpose:
+///
+///   * **Legacy boundary (this function)**: builds
+///     `VerifierRepairAssessment { failure_kind, failure_type,
+///     probable_cause_role, needed_reads, repair_target_hint,
+///     repair_plan, summary, source }` only. The 7 existing
+///     `VerifierRepairAssessment` struct-literal callsites
+///     (turn.rs:15399 / 18785 / 19477 / 19553 / 20230 / 23108 / 23133)
+///     are unchanged by Issue #647 — none of them call into the
+///     semantic-repair helpers.
+///   * **Semantic boundary (outside this function, in
+///     [`run_verifier_diagnostic_pass`])**: after this function returns
+///     the legacy assessment, the caller separately runs:
+///       1. [`parse_semantic_failure_report_from_reply`] on the raw reply
+///       2. [`build_semantic_failure_report_from_legacy`] as a
+///          deterministic fallback (MF1) when (1) returns `None`
+///       3. [`build_semantic_repair_plan_from_report_with_authority_input`]
+///          to construct the `SemanticRepairPlan` and write it into
+///          `RepairJob.semantic_plan`
+///
+/// The two boundaries are intentionally kept separate so that:
+///   * existing tests pinning the legacy 7 struct-literal callsites
+///     remain unaffected (S3-005 unchanged-callsites invariant);
+///   * the semantic-repair pipeline can be evolved (new fallback paths,
+///     consensus detection, ...) without touching this function.
 fn model_assessment_to_verifier_repair_assessment(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     parsed: ParsedVerifierRepairAssessment,
+    admission: &RepairTargetAdmissionContext<'_>,
 ) -> super::VerifierRepairAssessment {
     let failure_kind = parsed.failure_kind;
     let failure_type =
@@ -15302,6 +16260,7 @@ fn model_assessment_to_verifier_repair_assessment(
                 &target.path,
                 &target.reason,
                 failure_kind,
+                admission,
             )
             .filter(|hint| {
                 diagnostic_target_allowed_by_confidence(
@@ -15324,6 +16283,7 @@ fn model_assessment_to_verifier_repair_assessment(
                 &target.path,
                 &target.reason,
                 failure_kind,
+                admission,
             )
             .filter(|hint| {
                 diagnostic_target_allowed_by_confidence(
@@ -15346,14 +16306,16 @@ fn model_assessment_to_verifier_repair_assessment(
     // Issue #638 (設計判断 #3): pass assessment-derived failure_type to helpers so
     // they gate on the diagnostic classification, not on context.failure_type
     // (which is Unknown after the parser scope reduction).
-    if let Some(preferred) = verifier_repair_preferred_local_import_source(context, failure_type) {
+    if let Some(preferred) =
+        verifier_repair_preferred_local_import_source(context, failure_type, admission)
+    {
         repair_plan.retain(|hint| hint.path != preferred.path);
         repair_plan.insert(0, preferred);
         repair_plan.truncate(3);
     }
     let selected_path = repair_plan.first().map(|hint| hint.path.as_str());
     if let Some(test_target) =
-        verifier_repair_stale_assertion_test_target(context, selected_path, failure_type)
+        verifier_repair_stale_assertion_test_target(context, selected_path, failure_type, admission)
     {
         repair_plan.retain(|hint| hint.path != test_target.path);
         repair_plan.insert(0, test_target);
@@ -15369,6 +16331,7 @@ fn model_assessment_to_verifier_repair_assessment(
                 path,
                 "diagnostic LLM suggested this secondary target",
                 failure_kind,
+                admission,
             )
         }))
         .take(3)
@@ -15383,6 +16346,13 @@ fn model_assessment_to_verifier_repair_assessment(
                 .map(|(hint, _)| hint.clone())
         })
         .or_else(|| {
+            // Issue #647 (§5.1): path 6 — `repair_target_hint` fallback from
+            // `probable_cause_role`. The candidates here come from
+            // `context.changed_file_hints` (path 3) and `needed_reads` (which
+            // were themselves already admitted via paths 1/4/5 above). Apply
+            // `admit_repair_target_hint` explicitly so the changed-file-hint
+            // branch is gated by the SSOT even when the inputs were copied
+            // straight off `RepairJob`.
             parsed.probable_cause_role.and_then(|role| {
                 needed_reads
                     .iter()
@@ -15393,6 +16363,7 @@ fn model_assessment_to_verifier_repair_assessment(
                                 || failure_kind.allows_setup_target())
                     })
                     .cloned()
+                    .and_then(|hint| admit_repair_target_hint(hint, admission))
             })
         });
 
@@ -15705,6 +16676,34 @@ pub(super) fn verifier_repair_context_target_path(
 pub(super) fn verifier_repair_effective_target_hint(
     context: &super::repair_job::RepairJob,
 ) -> Option<&super::task_contract::RecoveryTargetHint> {
+    // Issue #647 (CB-007 / CB-015): when a `SemanticRepairPlan` is active
+    // and the job is in the stale state (per `semantic_plan_is_stale`), the
+    // freshly re-built `assessment.repair_target_hint` can be stale — the
+    // re-diagnostic LLM commonly re-proposes the just-exhausted cluster
+    // because the same failure text is still visible. `assign_semantic_plan_preserving_exhausted`
+    // walks the new plan past the exhausted entry, but nothing rebuilds
+    // the assessment hint to follow that walk. Returning the stale hint
+    // would make the repair editor keep attacking the exhausted cluster.
+    //
+    // We deliberately do NOT try to map `assessment.repair_target_hint.path`
+    // to a `FailureClusterKey` (no such mapping is recorded by the parser),
+    // and we keep the legacy `semantic_plan = None` path bit-for-bit
+    // identical so SetupRepair / pre-semantic flows are unaffected
+    // (DR3-001 / "semantic_plan = None 経路は既存挙動" constraint).
+    //
+    // The CB-015 generation-aware rule (subsumes the legacy
+    // `semantic_plan.is_some() && !exhausted_attempts.is_empty()`):
+    //   stale (plan.gen >= job.gen, exhausted non-empty)
+    //     → return None (force re-diagnostic against the current cluster).
+    //   fresh (plan.gen < job.gen, post-re-diagnostic)
+    //     → assessment has been refreshed for the current cluster; legacy
+    //       behaviour stands and the controller can route to NeedFreshRead /
+    //       NeedEdit.
+    //   semantic_plan = None
+    //     → legacy behaviour (unchanged).
+    if super::repair_job::semantic_plan_is_stale(context) {
+        return None;
+    }
     if let Some(assessment) = context.assessment.as_ref() {
         if let Some(next) = assessment
             .repair_plan
@@ -17871,14 +18870,14 @@ mod progress_tests {
         classify_verifier_failure_type, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
-        effective_tool_batch_action, effective_tool_policy_error_for_call,
-        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
-        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_guidance_note_for_policy, focused_edit_history,
+        diagnostic_target_allowed_by_confidence, effective_tool_batch_action,
+        effective_tool_policy_error_for_call, effective_tool_policy_error_for_call_with_scope,
+        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
@@ -18794,20 +19793,12 @@ mod progress_tests {
                 summary: Some("test helper assessment".to_string()),
                 source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
             }),
-            assessment_attempts: 0,
             diagnostic_attempted: true,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: Vec::new(),
-            target_line: None,
             error_kind: Some("TypeError".to_string()),
             failure_signature: format!("{path} TypeError"),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         }
     }
 
@@ -19306,6 +20297,674 @@ mod progress_tests {
         assert!(err.contains("duplicate"));
     }
 
+    // ---- Issue #647 (Phase F): weakening detector at validate_verifier_repair_intents ---- //
+
+    /// Issue #647 (MF3): build a valid `SemanticRepairPlan` for test-path
+    /// fixtures. Existing weakening tests target test files, which now go
+    /// through the MF3 admission gate before the weakening detector — so the
+    /// fixture must carry a non-empty `repair_hypothesis` and a determined
+    /// `SpecAuthority` for those tests to keep exercising the weakening
+    /// detector path.
+    fn semantic_plan_for_test_fixture() -> super::super::repair_job::SemanticRepairPlan {
+        use super::super::semantic_failure::build_failure_cluster_from_observation;
+        let cluster = build_failure_cluster_from_observation(
+            "obs",
+            "exp",
+            "shape",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Test],
+            Vec::new(),
+        );
+        let cluster_id = cluster.cluster_key.clone();
+        let report = super::super::semantic_failure::SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Test,
+            repair_hypothesis: "test fixture hypothesis".to_string(),
+            confidence: 0.8,
+        };
+        super::super::repair_job::SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: super::super::spec_authority::SpecAuthority::UserRequest,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Test,
+            repair_hypothesis: "test fixture hypothesis".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        }
+    }
+
+    /// Helper: build a test-targeting `RepairJob` whose `target_hint` /
+    /// `assessment.repair_target_hint` point at a test-file path (so
+    /// `verifier_repair_path_input_is_safe` accepts it and the hint role is
+    /// coherent with the test path that `is_test_file` will classify).
+    ///
+    /// Issue #647 (MF3): the fixture attaches a valid `SemanticRepairPlan`
+    /// by default so weakening tests continue to reach the weakening
+    /// detector (the MF3 admission gate rejects test edits whose RepairJob
+    /// has no semantic plan, before the weakening detector ever runs).
+    fn verifier_test_context_for(path: &str) -> super::super::repair_job::RepairJob {
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: path.to_string(),
+            reason: "test".to_string(),
+        };
+        super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "failure".to_string(),
+            failure_type: super::super::VerifierFailureType::AssertionFailure,
+            target_hint: Some(hint.clone()),
+            repair_target_hint: Some(hint.clone()),
+            changed_file_hints: vec![hint.clone()],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: super::super::VerifierFailureType::AssertionFailure,
+                probable_cause_role: Some(super::super::task_contract::ArtifactRole::Test),
+                needed_reads: vec![hint.clone()],
+                repair_target_hint: Some(hint.clone()),
+                repair_plan: vec![hint.clone()],
+                summary: Some("test helper assessment".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            diagnostic_attempted: true,
+            error_kind: Some("AssertionError".to_string()),
+            failure_signature: format!("{path} AssertionError"),
+            failure_count: Some(1),
+            repair_attempt: 1,
+            semantic_plan: Some(semantic_plan_for_test_fixture()),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        }
+    }
+
+    /// S1-004: any of the 5 closed test-side weakening patterns detected on a
+    /// path classified as a test file by `is_test_file` must reject the
+    /// intent at `validate_verifier_repair_intents`.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_assertion_deletion_in_test() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n    do_setup()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Deleting the `assert foo() == 1` line is AssertionDeleted.
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert foo() == 1\n    do_setup()\n".to_string(),
+            new_string: "    do_setup()\n".to_string(),
+            reason: "remove failing assert".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(
+            err.contains("weakening detected"),
+            "expected weakening rejection, got: {err}"
+        );
+        assert!(err.contains("AssertionDeleted"), "got: {err}");
+        // File on disk must remain untouched.
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("tests/test_main.py")).unwrap(),
+            original
+        );
+    }
+
+    /// S1-004 / SkipMarkerAdded.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_skip_marker_added_in_test() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "def test_x():\n    assert foo()\n".to_string(),
+            new_string: "@pytest.mark.skip\ndef test_x():\n    assert foo()\n".to_string(),
+            reason: "skip failing test".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("SkipMarkerAdded"), "got: {err}");
+    }
+
+    /// S1-004 / AssertTrueWeakening.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_assert_true_weakening_in_test() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert foo() == 1\n".to_string(),
+            new_string: "    assert True\n".to_string(),
+            reason: "bypass assert".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("AssertTrueWeakening"), "got: {err}");
+    }
+
+    /// S1-004 / TestFunctionDeleted.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_test_function_deleted() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo()\n\ndef test_y():\n    assert bar()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "\ndef test_y():\n    assert bar()\n".to_string(),
+            new_string: "".to_string(),
+            reason: "drop failing test".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("TestFunctionDeleted"), "got: {err}");
+    }
+
+    /// S1-004 / LiteralOnlyExpectedChange.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_literal_only_expected_change() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    x = compute()\n    assert x == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert x == 1\n".to_string(),
+            new_string: "    assert x == 99\n".to_string(),
+            reason: "move goalposts".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("LiteralOnlyExpectedChange"), "got: {err}");
+    }
+
+    /// S1-007 / ValidatorDeleted (impl-side, `assert!` deletion in Rust).
+    #[test]
+    fn validate_verifier_repair_intents_rejects_validator_deleted_in_impl() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "fn run(x: i32) -> i32 {\n    assert!(x > 0);\n    x * 2\n}\n";
+        std::fs::write(work_root.join("app/lib.rs"), original).unwrap();
+        let context = verifier_context_for("app/lib.rs");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/lib.rs".to_string(),
+            old_string: "    assert!(x > 0);\n    x * 2\n".to_string(),
+            new_string: "    x * 2\n".to_string(),
+            reason: "remove guard".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("ValidatorDeleted"), "got: {err}");
+    }
+
+    /// S1-007 / ErrorSwallowed (impl-side).
+    #[test]
+    fn validate_verifier_repair_intents_rejects_error_swallowed_in_impl() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    do_thing()\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "def run():\n    do_thing()\n".to_string(),
+            new_string: "def run():\n    try:\n        do_thing()\n    except: pass\n".to_string(),
+            reason: "swallow errors".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("ErrorSwallowed"), "got: {err}");
+    }
+
+    /// S1-007 / EarlyReturnBypass (impl-side).
+    #[test]
+    fn validate_verifier_repair_intents_rejects_early_return_bypass_in_impl() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "fn run(flag: bool) -> i32 {\n    let x = compute();\n    x\n}\n";
+        std::fs::write(work_root.join("app/lib.rs"), original).unwrap();
+        let context = verifier_context_for("app/lib.rs");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/lib.rs".to_string(),
+            old_string: "fn run(flag: bool) -> i32 {\n    let x = compute();\n    x\n}\n"
+                .to_string(),
+            new_string: "fn run(flag: bool) -> i32 {\n    return Ok(());\n    let x = compute();\n    x\n}\n"
+                .to_string(),
+            reason: "early return".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("EarlyReturnBypass"), "got: {err}");
+    }
+
+    /// DR3-002 + false-positive guard: a benign refactor on an impl file
+    /// (renaming a local) must NOT be classified as weakening.
+    #[test]
+    fn validate_verifier_repair_intents_accepts_benign_impl_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    value = 1\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n    return value\n".to_string(),
+            new_string: "    value = 2\n    return value\n".to_string(),
+            reason: "fix constant".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
+        assert!(edit.updated_contents.contains("value = 2"));
+    }
+
+    /// DR3-002: non-test / non-impl file paths (e.g. JSON) must not invoke
+    /// either detector and must pass cleanly.
+    #[test]
+    fn validate_verifier_repair_intents_skips_detector_for_non_code_paths() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "{\n  \"a\": 1\n}\n";
+        std::fs::write(work_root.join("app/data.json"), original).unwrap();
+        let context = verifier_context_for("app/data.json");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Mimic a literal-value change that *would* fire `LiteralOnlyExpectedChange`
+        // on a `.py` file because of the leading `assert`-like prefix — but on a
+        // JSON path neither detector runs.
+        let intent = VerifierRepairIntent {
+            path: "app/data.json".to_string(),
+            old_string: "  \"a\": 1\n".to_string(),
+            new_string: "  \"a\": 2\n".to_string(),
+            reason: "tweak data".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
+        assert!(edit.updated_contents.contains("\"a\": 2"));
+    }
+
+    /// S3-011: AND coupling — when `do_not_edit_tests_without_evidence` is
+    /// asserted, weakening detection at `validate_verifier_repair_intents`
+    /// still rejects unconditionally. The evidence-required gate lives at
+    /// hint admission (`diagnostic_target_allowed_by_confidence`) and stays
+    /// independent. This test pins both halves: the weakening reject fires
+    /// here, while `diagnostic_target_allowed_by_confidence` continues to
+    /// gate hint admission via confidence.
+    #[test]
+    fn validate_verifier_repair_intents_weakening_reject_compounds_evidence_gate() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Weakening edit (assert True replacement) must reject regardless of
+        // how the evidence flag would have ruled at hint admission.
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert foo() == 1\n".to_string(),
+            new_string: "    assert True\n".to_string(),
+            reason: "bypass".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("weakening detected"), "got: {err}");
+
+        // Independent half: with evidence required + Test hint, low-confidence
+        // hint admission is rejected by the legacy gate.
+        let evidence_required = true;
+        let test_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_main.py".to_string(),
+            reason: "low-conf test edit".to_string(),
+        };
+        assert!(!diagnostic_target_allowed_by_confidence(
+            &test_hint,
+            0.10,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            Some(super::super::task_contract::ArtifactRole::Test),
+            evidence_required,
+        ));
+    }
+
+    /// DR3-002: detector input is `(original_contents, post-edit contents)`.
+    /// A weakening pattern that only emerges when **two** edits are applied
+    /// in sequence (each individually benign) must still fire because the
+    /// detector runs after the full intent list is applied to `contents`.
+    #[test]
+    fn validate_verifier_repair_intents_detects_weakening_across_multi_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        // Two asserts. Edit 1 deletes assert #1, edit 2 deletes assert #2.
+        // Neither in isolation is the only edit visible to the detector —
+        // it sees `before` vs `after-everything-applied`.
+        let original = "def test_x():\n    assert a == 1\n    assert b == 2\n    do_more()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let err = validate_verifier_repair_intents(
+            work_root,
+            &context,
+            &target,
+            vec![
+                VerifierRepairIntent {
+                    path: "tests/test_main.py".to_string(),
+                    old_string: "    assert a == 1\n".to_string(),
+                    new_string: "".to_string(),
+                    reason: "drop assert a".to_string(),
+                    replace_all: false,
+                },
+                VerifierRepairIntent {
+                    path: "tests/test_main.py".to_string(),
+                    old_string: "    assert b == 2\n".to_string(),
+                    new_string: "".to_string(),
+                    reason: "drop assert b".to_string(),
+                    replace_all: false,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("AssertionDeleted"), "got: {err}");
+    }
+
+    // ---- Issue #647 (MF3): SemanticRepairPlan gate for test edits ---- //
+
+    /// MF3-test-edit-without-plan: a benign (non-weakening) edit on a test
+    /// file must be rejected by `validate_verifier_repair_intents` when the
+    /// RepairJob carries `semantic_plan = None`. Without a SemanticRepairPlan
+    /// the agent cannot identify SpecAuthority / RepairHypothesis, so test
+    /// edits are categorically refused (Issue 受入条件: "test edit は
+    /// SpecAuthority と RepairHypothesis がある場合のみ許可").
+    #[test]
+    fn mf3_test_edit_without_semantic_plan_is_rejected() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n    assert bar() == 2\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        // Start from the (now plan-bearing) test fixture and clear the
+        // semantic_plan slot — this mirrors the pre-MF1 legacy null case.
+        let mut context = verifier_test_context_for("tests/test_main.py");
+        context.semantic_plan = None;
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Benign edit: append a new assertion (NOT a weakening). With no
+        // semantic plan, the MF3 admission gate must still reject.
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert bar() == 2\n".to_string(),
+            new_string: "    assert bar() == 2\n    assert baz() == 3\n".to_string(),
+            reason: "add coverage".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(
+            err.contains("SemanticRepairPlan"),
+            "expected MF3 rejection for missing semantic plan, got: {err}"
+        );
+        // The on-disk file must remain untouched.
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("tests/test_main.py")).unwrap(),
+            original
+        );
+    }
+
+    /// MF3-test-edit-without-hypothesis: a SemanticRepairPlan is present but
+    /// its `repair_hypothesis` is empty (whitespace only). The MF3 gate must
+    /// reject because "test edit must preserve verification intent", which
+    /// requires an articulated hypothesis.
+    #[test]
+    fn mf3_test_edit_with_empty_hypothesis_is_rejected() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n    assert bar() == 2\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let mut context = verifier_test_context_for("tests/test_main.py");
+        // Replace the fixture plan with one whose repair_hypothesis is empty.
+        let mut empty_hyp_plan = semantic_plan_for_test_fixture();
+        empty_hyp_plan.repair_hypothesis = "   ".to_string();
+        context.semantic_plan = Some(empty_hyp_plan);
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert bar() == 2\n".to_string(),
+            new_string: "    assert bar() == 2\n    assert baz() == 3\n".to_string(),
+            reason: "add coverage".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(
+            err.contains("repair_hypothesis"),
+            "expected MF3 rejection for empty hypothesis, got: {err}"
+        );
+    }
+
+    /// MF3-impl-edit-allowed-without-plan: the MF3 admission gate must NOT
+    /// fire on implementation paths. Impl repair has wider latitude (it can
+    /// reason from compile errors, runtime traces, etc.) and is gated only
+    /// by the weakening detector. A benign impl edit with `semantic_plan
+    /// = None` must therefore still pass admission.
+    #[test]
+    fn mf3_impl_edit_without_semantic_plan_is_accepted() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    value = 1\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let mut context = verifier_context_for("app/main.py");
+        // Explicitly assert the pre-condition: impl fixture has no plan.
+        assert!(context.semantic_plan.is_none());
+        // Belt-and-suspenders: drop any incidental plan a future refactor
+        // might attach to the impl fixture.
+        context.semantic_plan = None;
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n    return value\n".to_string(),
+            new_string: "    value = 2\n    return value\n".to_string(),
+            reason: "fix constant".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent)
+            .expect("impl edit must pass without a semantic plan");
+        assert!(edit.updated_contents.contains("value = 2"));
+    }
+
+    /// MF3-test-edit-with-full-plan: a test edit must pass admission when
+    /// the RepairJob carries a SemanticRepairPlan with a determined
+    /// `SpecAuthority::UserRequest` and a non-empty `repair_hypothesis`, and
+    /// the edit itself does not trigger the weakening detector. This is the
+    /// positive path the MF3 gate guards — it must not over-reject benign
+    /// test additions that strengthen verification intent.
+    #[test]
+    fn mf3_test_edit_with_full_semantic_plan_is_accepted() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        // The repair adds a brand-new test function — strictly strengthens,
+        // and weakening detectors stay silent because pre-existing asserts /
+        // non-asserts are untouched.
+        let original = "def test_x():\n    assert foo() == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        // Pre-condition: the fixture attaches a full plan (MF3 admission
+        // input). Spot-check the SpecAuthority / repair_hypothesis fields
+        // since they are the gate's explicit inputs.
+        let plan = context.semantic_plan.as_ref().expect("fixture has plan");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::UserRequest
+        );
+        assert!(!plan.repair_hypothesis.trim().is_empty());
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "def test_x():\n    assert foo() == 1\n".to_string(),
+            new_string:
+                "def test_x():\n    assert foo() == 1\n\ndef test_y():\n    assert bar() == 2\n"
+                    .to_string(),
+            reason: "add new test case".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent)
+            .expect("test edit with full plan and no weakening must pass");
+        assert!(edit.updated_contents.contains("def test_y()"));
+        assert!(edit.updated_contents.contains("assert bar() == 2"));
+    }
+
     #[test]
     fn verifier_repair_decision_requests_diagnostic_before_targeting() {
         let temp = tempdir().unwrap();
@@ -19327,6 +20986,303 @@ mod progress_tests {
                 .allowed_tool_names_for_prompt()
                 .expect("restricted")
                 .is_empty()
+        );
+    }
+
+    /// Issue #647 (CB-012): when `semantic_plan` is active and
+    /// `exhausted_attempts` is non-empty, the `verifier_repair_effective_target_hint`
+    /// guard returns `None` for stale assessments. The repair-decision
+    /// state machine must then return `NeedDiagnostic` instead of
+    /// falling through to `latest_successful_read_existing_path` / a
+    /// `NeedTargetDiscovery` fallback that would route the repair pass
+    /// to an unrelated turn-local read target.
+    #[test]
+    fn cb012_advanced_semantic_plan_with_stale_assessment_forces_need_diagnostic() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Create an unrelated file so `latest_successful_read_existing_path`
+        // *could* return a fallback target. Without CB-012 the decision
+        // would route to that fallback; with CB-012 it must force a
+        // fresh diagnostic instead.
+        let unrelated = work_root.join("unrelated.txt");
+        std::fs::write(&unrelated, "irrelevant\n").unwrap();
+
+        // Build a RepairJob in the "advanced semantic_plan + stale
+        // assessment" state: semantic_plan is Some (= we have an
+        // active cluster B), exhausted_attempts is non-empty (= cluster
+        // A is already exhausted), and `assessment` still points at the
+        // stale cluster-A hint via `repair_target_hint`. The CB-007
+        // guard makes `verifier_repair_context_target_path` return None
+        // for this state; CB-012 must then return `NeedDiagnostic`.
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        // The stale assessment must exist (assessment.is_some()) — that
+        // is the precondition where CB-012 fires.
+        assert!(context.assessment.is_some(), "fixture invariant");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        // One exhausted (cluster_id, role) tuple is enough to trigger
+        // the guard.
+        let any_cluster_id = context
+            .semantic_plan
+            .as_ref()
+            .unwrap()
+            .failure_cluster_id
+            .clone();
+        context.exhausted_attempts.push((
+            any_cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        context.assessment_attempts = 0;
+        context.diagnostic_attempted = true;
+        // No pending read target message — `latest_successful_read_existing_path`
+        // would still walk message history; with CB-012 we bypass it.
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-012: advanced semantic_plan with stale assessment must force NeedDiagnostic"
+        );
+    }
+
+    /// Issue #647 (CB-012): the new guard must NOT fire when
+    /// `exhausted_attempts` is empty — i.e., legacy / fresh diagnostic
+    /// flow is unaffected.
+    #[test]
+    fn cb012_advanced_semantic_plan_without_exhausted_attempts_is_unaffected() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app_dir = work_root.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("main.py"), "def main():\n    return 1\n").unwrap();
+
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        // No exhausted attempts → CB-012 must NOT engage.
+        assert!(context.exhausted_attempts.is_empty(), "fixture invariant");
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        // Fresh state should route to NeedFreshRead/NeedEdit (target
+        // resolves), not the new NeedDiagnostic shortcut.
+        assert_ne!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-012: guard must NOT fire when exhausted_attempts is empty"
+        );
+    }
+
+    /// Issue #647 (CB-014): the stale advanced-semantic-plan state must
+    /// fail closed when `assessment_attempts` reaches the diagnostic
+    /// budget limit. Without this branch the same stale state bypasses
+    /// `NeedDiagnostic` (limit-gated) and falls through to
+    /// `latest_successful_read_existing_path` / `NeedTargetDiscovery`,
+    /// reopening the stale-target fallback at the budget boundary.
+    #[test]
+    fn cb014_stale_advanced_semantic_plan_at_budget_limit_returns_diagnostic_unavailable() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Pre-populate an unrelated read-existing file so the
+        // `latest_successful_read_existing_path` fallback *could* match
+        // if the CB-014 guard fails to fire.
+        let unrelated = work_root.join("unrelated.txt");
+        std::fs::write(&unrelated, "irrelevant\n").unwrap();
+
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        assert!(context.assessment.is_some(), "fixture invariant");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        let any_cluster_id = context
+            .semantic_plan
+            .as_ref()
+            .unwrap()
+            .failure_cluster_id
+            .clone();
+        context.exhausted_attempts.push((
+            any_cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        // **Budget exhausted**: assessment_attempts == LIMIT.
+        context.assessment_attempts = VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        context.diagnostic_attempted = true;
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::DiagnosticUnavailable,
+            "CB-014: stale advanced semantic_plan with exhausted diagnostic budget must fail closed"
+        );
+    }
+
+    /// Issue #647 (CB-014): the stale advanced-semantic-plan state must
+    /// still return `NeedDiagnostic` while attempts remain under the
+    /// budget (= CB-012 behavior unchanged for under-budget). Pins the
+    /// split between CB-012 (under-budget) and CB-014 (at-budget).
+    #[test]
+    fn cb014_stale_advanced_semantic_plan_under_budget_still_returns_need_diagnostic() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        assert!(context.assessment.is_some(), "fixture invariant");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        let any_cluster_id = context
+            .semantic_plan
+            .as_ref()
+            .unwrap()
+            .failure_cluster_id
+            .clone();
+        context.exhausted_attempts.push((
+            any_cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        // **Budget remaining**: attempts strictly below LIMIT.
+        const _: () = assert!(VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT >= 1);
+        context.assessment_attempts = VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT - 1;
+        context.diagnostic_attempted = true;
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-014 boundary: attempts < LIMIT must still elect NeedDiagnostic"
+        );
+    }
+
+    /// Issue #647 (CB-013): production-level integration test.
+    ///
+    /// When `run_verifier_diagnostic_pass` is invoked with the same
+    /// "advanced semantic_plan + stale assessment" state that the CB-012
+    /// decision layer routes through `NeedDiagnostic`, the runner MUST
+    /// clear the stale assessment before its own `assessment.is_some()`
+    /// Skipped short-circuit fires — otherwise the CB-012 fix is
+    /// neutralized at the production layer.
+    ///
+    /// We assert two production invariants:
+    ///   1. The outcome is NOT `Skipped` — diagnostic actually ran.
+    ///   2. `repair_job.assessment_attempts` was incremented (>= 1),
+    ///      proving the diagnostic runner's body executed past the
+    ///      Skipped short-circuit.
+    ///
+    /// The ollama call inside the runner will fail (the test agent's
+    /// host points at a fake endpoint), but that is intentional —
+    /// `Failed`/`Unavailable`/`RetryPending` are all acceptable; the
+    /// essential signal is that we left `Skipped` behind.
+    #[test]
+    fn cb013_stale_advanced_semantic_plan_actually_runs_diagnostic() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+
+        // Build the stale-state RepairJob: semantic_plan = Some,
+        // exhausted_attempts non-empty, assessment = Some (stale cluster A).
+        let mut job: RepairJob = verifier_context_for("app/main.py");
+        assert!(
+            job.assessment.is_some(),
+            "fixture invariant: assessment must be Some so CB-013 has something to clear"
+        );
+        let plan: SemanticRepairPlan = semantic_plan_for_test_fixture();
+        let cluster_id = plan.failure_cluster_id.clone();
+        job.semantic_plan = Some(plan);
+        job.exhausted_attempts.push((
+            cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        job.assessment_attempts = 0;
+        job.diagnostic_attempted = true;
+        agent.repair_job = Some(job);
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Sanity check: the decision layer (CB-012) would route this state
+        // through NeedDiagnostic. CB-013's job is to make sure the
+        // diagnostic runner honors that intent in production.
+        assert!(
+            super::super::repair_job::has_stale_assessment_after_cluster_advance(
+                agent.repair_job.as_ref().unwrap(),
+                &agent.work_root,
+            ),
+            "CB-013 fixture must satisfy the stale-state predicate"
+        );
+
+        let outcome = agent.run_verifier_diagnostic_pass();
+        assert!(
+            !matches!(outcome, super::VerifierDiagnosticPassOutcome::Skipped),
+            "CB-013: diagnostic must NOT short-circuit to Skipped when the \
+             stale-advance state holds; got {outcome:?}"
+        );
+
+        let attempts = agent
+            .repair_job
+            .as_ref()
+            .map(|job| job.assessment_attempts)
+            .unwrap_or(0);
+        assert!(
+            attempts >= 1,
+            "CB-013: assessment_attempts must be incremented after the \
+             diagnostic runner clears the stale assessment and proceeds \
+             past Skipped (got {attempts})"
+        );
+    }
+
+    /// Issue #647 (CB-013) regression: when `semantic_plan` is `None` (=
+    /// legacy / SetupRepair path), the existing Skipped short-circuit on
+    /// `assessment.is_some()` must remain intact. CB-013 only bypasses
+    /// Skipped for the narrow stale-advance state.
+    #[test]
+    fn cb013_fresh_state_with_assessment_still_skips() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::repair_job::RepairJob;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+
+        // Legacy state: no semantic_plan, no exhausted_attempts, but
+        // assessment is Some. CB-013 must NOT fire — Skipped wins.
+        let mut job: RepairJob = verifier_context_for("app/main.py");
+        assert!(job.assessment.is_some(), "fixture invariant");
+        assert!(job.semantic_plan.is_none(), "fixture invariant");
+        assert!(job.exhausted_attempts.is_empty(), "fixture invariant");
+        job.assessment_attempts = 0;
+        agent.repair_job = Some(job);
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Confirm CB-013 predicate does not fire for legacy state.
+        assert!(
+            !super::super::repair_job::has_stale_assessment_after_cluster_advance(
+                agent.repair_job.as_ref().unwrap(),
+                &agent.work_root,
+            ),
+            "CB-013 must not fire for legacy / no-semantic-plan state"
+        );
+
+        let outcome = agent.run_verifier_diagnostic_pass();
+        assert!(
+            matches!(outcome, super::VerifierDiagnosticPassOutcome::Skipped),
+            "CB-013 regression: legacy `assessment.is_some()` Skipped \
+             short-circuit must remain intact; got {outcome:?}"
+        );
+
+        // assessment_attempts must NOT have been incremented (diagnostic
+        // body never ran).
+        assert_eq!(
+            agent
+                .repair_job
+                .as_ref()
+                .map(|job| job.assessment_attempts)
+                .unwrap_or(0),
+            0,
+            "CB-013 regression: Skipped must not increment assessment_attempts"
         );
     }
 
@@ -19613,8 +21569,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19677,8 +21636,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19772,8 +21734,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19816,8 +21781,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19829,6 +21797,855 @@ E   assert [{'id': 1}] == []\n";
         assert_eq!(
             assessment.repair_target_hint.as_ref().map(|hint| hint.role),
             Some(super::super::task_contract::ArtifactRole::Setup)
+        );
+    }
+
+    // ---- Issue #647 (Phase D): diagnostic 経路統合 ---- //
+
+    /// Phase D / D.1 (S1-009): a diagnostic reply that **does** carry a
+    /// well-formed semantic-failure payload parses into
+    /// `Some(SemanticFailureReport)` via the shared extraction boundary.
+    /// This is the positive path that gates D.2 plan construction.
+    #[test]
+    fn phase_d_parse_semantic_failure_report_from_diagnostic_reply_succeeds() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.84,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"todos list initialized incorrectly",
+            "failure_clusters":[
+                {
+                    "observed":"got 200 want 201",
+                    "expected":"201 Created",
+                    "input_shape":"POST /todos",
+                    "assertion_shape":"AssertEq",
+                    "involved_artifacts":["implementation","test"],
+                    "affected_cases":["test_create_todo"]
+                }
+            ],
+            "contract_conflict":{
+                "implementation":"returns 200",
+                "test":"expects 201",
+                "usage_docs":"unspecified"
+            },
+            "probable_cause_role":"implementation",
+            "summary":"http status mismatch"
+        }"#;
+
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("semantic parse ok");
+
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert_eq!(
+            report.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+        assert!(report.repair_hypothesis.starts_with("todos list"));
+    }
+
+    /// Phase D / D.1 (S1-009 / DR3-005): a legacy diagnostic reply that
+    /// lacks the semantic-failure schema (no `confidence` /
+    /// `preferred_repair_role`) collapses to `None` at the semantic parse
+    /// boundary. The caller will leave `RepairJob.semantic_plan = None`
+    /// without disturbing the legacy `ParsedVerifierRepairAssessment`
+    /// parse — verified by the parallel `parse_verifier_repair_assessment_reply`
+    /// call.
+    #[test]
+    fn phase_d_legacy_reply_yields_none_semantic_report_but_legacy_parse_holds() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"fix","confidence":0.9}]
+        }"#;
+
+        // Semantic parse returns None — no confidence / preferred_repair_role.
+        assert!(super::parse_semantic_failure_report_from_reply(reply).is_none());
+        // Legacy parse still succeeds — DR3-005: independent paths.
+        let legacy = super::parse_verifier_repair_assessment_reply(reply)
+            .expect("legacy parse must still succeed");
+        assert_eq!(
+            legacy.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+    }
+
+    /// Phase D / D.1 (DR3-005): the diagnostic reply guard at
+    /// `run_verifier_diagnostic_pass` short-circuits on `tool_calls`
+    /// before the parsers run, so neither semantic nor legacy parse ever
+    /// sees the payload. We mirror that behavior at the parser level by
+    /// confirming that a non-JSON / unparseable reply yields `None` from
+    /// the semantic parse boundary without panicking.
+    #[test]
+    fn phase_d_semantic_parse_returns_none_for_unparseable_reply() {
+        // Empty / non-JSON / no braces.
+        assert!(super::parse_semantic_failure_report_from_reply("").is_none());
+        assert!(super::parse_semantic_failure_report_from_reply("not json at all").is_none());
+        // Malformed JSON.
+        assert!(super::parse_semantic_failure_report_from_reply(r#"{"failure_kind":"#).is_none());
+    }
+
+    /// Phase D / D.2: a positive-path semantic report produces a
+    /// `SemanticRepairPlan` whose fields are wired from the report
+    /// (cluster id from `failure_clusters[0]`, `semantic_cause = failure_kind`,
+    /// `repair_hypothesis` from the report, `expected_improvement = None`).
+    /// `spec_authority` falls back to `ImplementationContract` per the
+    /// Phase-D candidate set (D.2 design).
+    #[test]
+    fn phase_d_build_semantic_repair_plan_wires_report_into_plan_slot() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.91,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"impl returns 200, test expects 201",
+            "failure_clusters":[
+                {
+                    "observed":"200 OK",
+                    "expected":"201 Created",
+                    "input_shape":"POST /todos",
+                    "assertion_shape":"AssertEq",
+                    "involved_artifacts":["implementation","test"],
+                    "affected_cases":["test_create_todo"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = super::build_semantic_repair_plan_from_report(report)
+            .expect("plan should be built for AssertionMismatch with clusters");
+
+        assert_eq!(
+            plan.semantic_cause,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        assert_eq!(plan.failure_cluster_id, cluster_id);
+        assert_eq!(
+            plan.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+        assert!(plan.repair_hypothesis.contains("returns 200"));
+        assert!(plan.expected_improvement.is_none());
+    }
+
+    /// SF1-production-uses-resolve (Issue #647): the production builder
+    /// flows through `spec_authority::resolve` — verified end-to-end by
+    /// (a) the default-input wrapper electing `LlmGeneratedTest` on a
+    /// newly-generated task with no consensus, and (b) an explicit
+    /// `has_behavior_contract = true` input electing `BehaviorContract`.
+    /// Pre-SF1 the builder was hard-coded to `ImplementationContract`
+    /// regardless of input, so this asserts the new wiring.
+    #[test]
+    fn sf1_production_build_semantic_repair_plan_uses_resolve() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.91,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"impl returns 200, test expects 201",
+            "failure_clusters":[
+                {
+                    "observed":"200 OK",
+                    "expected":"201 Created",
+                    "input_shape":"POST /todos",
+                    "assertion_shape":"AssertEq",
+                    "involved_artifacts":["implementation","test"],
+                    "affected_cases":["test_create_todo"]
+                }
+            ]
+        }"#;
+        // Default-input path (newly-generated task, no consensus,
+        // no behavior contract) → resolve elects LlmGeneratedTest.
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        let plan = super::build_semantic_repair_plan_from_report(report)
+            .expect("plan should be built for AssertionMismatch with clusters");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::LlmGeneratedTest,
+            "newly-generated task with no consensus must elect LlmGeneratedTest (SF1)"
+        );
+
+        // Explicit-input path with has_behavior_contract=true → resolve
+        // elects BehaviorContract, proving the production builder honors
+        // the resolver's decision rules end-to-end.
+        let report2 = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan2 =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report2, input, 0)
+                .expect("plan should be built");
+        assert_eq!(
+            plan2.spec_authority,
+            super::super::spec_authority::SpecAuthority::BehaviorContract,
+            "has_behavior_contract=true must elect BehaviorContract via resolve()"
+        );
+    }
+
+    /// SF1: the production callsite helper
+    /// `build_spec_authority_input_for_active_request` flips
+    /// `has_behavior_contract` when the active request yields a
+    /// `RequiredBehaviorContract` with actionable signal.
+    #[test]
+    fn sf1_build_spec_authority_input_detects_behavior_contract_in_request() {
+        // A request that names an operation keyword ("create") + a domain
+        // term should yield `has_behavior_contract: true`. The exact
+        // detection is owned by `task_contract::TaskContract::from_request`
+        // — we only assert the routing here. (V3) We also pass
+        // `semantic_report = None` and a default history hint so the new
+        // V3 detectors stay neutral and we exercise the same routing as
+        // pre-V3 production.
+        let request = "Create a TODO API: implement POST /todos to create a new todo item, then add a pytest that POSTs and asserts 201.";
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        assert!(
+            input.has_behavior_contract,
+            "actionable request must set has_behavior_contract=true"
+        );
+        assert!(!input.has_user_request_match);
+        assert!(!input.has_verified_public_interface);
+        assert!(input.is_newly_generated_task);
+        assert!(input.consensus.is_none());
+
+        // Empty / missing request → behavior contract flag stays false.
+        let empty_input = super::build_spec_authority_input_for_active_request(
+            None,
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        assert!(!empty_input.has_behavior_contract);
+        assert!(empty_input.is_newly_generated_task);
+    }
+
+    // -- SF1 V3 production integration tests (Issue #647 / SF1 V3.5) -- //
+    //
+    // These tests close the Codex SF1 V3 finding: prior to V3 the
+    // production builder hard-coded `has_user_request_match`, `consensus`,
+    // and `has_verified_public_interface` to neutral values regardless of
+    // input. V3 wires three real detectors plus the
+    // `SemanticFailureReport` + `AgentHistoryHint` parameters; the tests
+    // below exercise each detector through the production helper.
+
+    /// SF1 V3.1: an active request that carries two or more distinct
+    /// explicit-spec keywords (e.g. "must return 404", "must accept")
+    /// must flip `has_user_request_match = true` via the production
+    /// builder.
+    #[test]
+    fn sf1_v3_user_request_match_detected_from_explicit_spec_keywords() {
+        let request = "The endpoint must return 404 when the item is missing. \
+                       The handler must accept a JSON body with an `id` field.";
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        assert!(
+            input.has_user_request_match,
+            "explicit-spec keywords (>=2 distinct hits) must flip has_user_request_match"
+        );
+
+        // Conversational guidance (one "should") must NOT trip the detector.
+        let conversational = "You should maybe add a test here.";
+        let input2 = super::build_spec_authority_input_for_active_request(
+            Some(conversational),
+            None,
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        assert!(
+            !input2.has_user_request_match,
+            "single-keyword conversational request must NOT flip the flag"
+        );
+    }
+
+    /// SF1 V3.3: when the `SemanticFailureReport.contract_conflict` shows
+    /// two roles agreeing and one dissenting, the production builder must
+    /// surface a non-`None` `consensus` value (with the right agreeing /
+    /// dissenting role layout).
+    #[test]
+    fn sf1_v3_consensus_detected_when_two_artifacts_agree() {
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["read missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 404 when missing",
+                "test": "expects 200",
+                "usage_docs": "Returns 404 when missing"
+            },
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "test expects the pre-spec 200 response",
+            "confidence": 0.8
+        }"#;
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("sample report parses");
+        let input = super::build_spec_authority_input_for_active_request(
+            None,
+            Some(&report),
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        let consensus = input
+            .consensus
+            .as_ref()
+            .expect("two-vs-one agreement in contract_conflict must surface a consensus");
+        assert!(
+            consensus
+                .agreeing
+                .contains(&super::super::task_contract::ArtifactRole::Implementation),
+            "impl/docs agreed in the fixture"
+        );
+        assert!(
+            consensus
+                .agreeing
+                .contains(&super::super::task_contract::ArtifactRole::UsageDocs),
+            "impl/docs agreed in the fixture"
+        );
+        assert_eq!(
+            consensus.dissenting,
+            vec![super::super::task_contract::ArtifactRole::Test],
+            "test was the dissenting role"
+        );
+    }
+
+    /// SF1 V3 acceptance: when the production builder is called with
+    /// rich inputs (explicit-spec request, a real
+    /// `SemanticFailureReport` with two-vs-one consensus, and a verifier
+    /// history hint), the resulting `SpecAuthorityInput` is **not**
+    /// all-neutral. At least one of the V3 detectors must light up.
+    ///
+    /// CB-011 (Issue #647 iteration-4): the verifier-history detector is
+    /// pinned to `false` until artifact identity is bound to the failing
+    /// `SemanticFailureReport`. The two remaining V3 detectors
+    /// (`has_user_request_match` + `consensus`) must still light up on
+    /// this fixture so the production builder stays non-trivial; the
+    /// verifier flag is now asserted to stay `false` even when
+    /// `verifier_passed_in_loop = true` (CB-011).
+    #[test]
+    fn sf1_v3_production_input_is_not_all_false() {
+        let request = "The API must return 404 when missing. The body must accept JSON.";
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 404 when missing",
+                "test": "expects 200",
+                "usage_docs": "returns 404 when missing"
+            },
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "stale test assertion",
+            "confidence": 0.9
+        }"#;
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("sample report parses");
+        let hint = super::super::spec_authority::AgentHistoryHint {
+            verifier_passed_in_loop: true,
+        };
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            Some(&report),
+            hint,
+        );
+        // V3 must light at least one detector when real inputs exist.
+        // Post-CB-011: the user-request and consensus detectors light up,
+        // while the verifier-history detector stays a dead placeholder.
+        assert!(
+            input.has_user_request_match,
+            "explicit-spec request must light has_user_request_match"
+        );
+        assert!(
+            !input.has_verified_public_interface,
+            "CB-011: verifier_passed_in_loop alone must NOT light has_verified_public_interface (dead variant placeholder)"
+        );
+        assert!(
+            input.consensus.is_some(),
+            "two-vs-one contract_conflict must surface a consensus"
+        );
+    }
+
+    /// SF1 V3 acceptance end-to-end: an explicit-spec user request flows
+    /// all the way through the production builder + `resolve()` and
+    /// elects `SpecAuthority::UserRequest` on the resulting plan.
+    #[test]
+    fn sf1_v3_resolver_elects_user_request_when_match_detected() {
+        let request = "The API must return 404 when missing. The body must accept JSON.";
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 200",
+                "test": "expects 404",
+                "usage_docs": "returns 404"
+            },
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "impl returns the wrong status",
+            "confidence": 0.85
+        }"#;
+        let report =
+            super::parse_semantic_failure_report_from_reply(reply).expect("sample report parses");
+        let input = super::build_spec_authority_input_for_active_request(
+            Some(request),
+            Some(&report),
+            super::super::spec_authority::AgentHistoryHint::default(),
+        );
+        let plan = super::build_semantic_repair_plan_from_report_with_authority_input(
+            report.clone(),
+            input,
+            0,
+        )
+        .expect("plan must build for assertion_mismatch");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            "an explicit-spec user request must dominate downstream authority resolution"
+        );
+    }
+
+    /// Phase D / D.3 (S1-010): `DependencyMissing` dispatches to the
+    /// setup-repair / `MissingVerifierJob` path; no `SemanticRepairPlan`
+    /// is constructed (slot stays `None`).
+    #[test]
+    fn phase_d_dependency_missing_routes_to_setup_with_no_semantic_plan() {
+        let reply = r#"{
+            "failure_kind":"dependency_missing",
+            "confidence":0.97,
+            "preferred_repair_role":"setup",
+            "repair_hypothesis":"pytest cannot import requests",
+            "failure_clusters":[
+                {
+                    "observed":"ModuleNotFoundError: requests",
+                    "expected":"requests importable",
+                    "input_shape":"pytest collection",
+                    "assertion_shape":"ImportError",
+                    "involved_artifacts":["setup"],
+                    "affected_cases":["test_health"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// Phase D / D.3: `ConfigOrVerifierError` likewise routes to setup
+    /// repair — no `SemanticRepairPlan` is constructed.
+    #[test]
+    fn phase_d_config_or_verifier_error_routes_to_setup_with_no_semantic_plan() {
+        let reply = r#"{
+            "failure_kind":"config_or_verifier_error",
+            "confidence":0.80,
+            "preferred_repair_role":"setup",
+            "repair_hypothesis":"pytest config malformed",
+            "failure_clusters":[
+                {
+                    "observed":"ERROR: pytest.ini malformed",
+                    "expected":"pytest.ini parseable",
+                    "input_shape":"pytest startup",
+                    "assertion_shape":"ConfigError",
+                    "involved_artifacts":["setup"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// Phase D / D.2: an `AssertionMismatch` report with **no** clusters
+    /// cannot identify a cluster to attack — the plan slot stays `None`
+    /// (1 RepairJob = 1 cluster, slot reuse is a Phase E concern).
+    #[test]
+    fn phase_d_assertion_mismatch_with_no_clusters_yields_no_plan() {
+        let reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "confidence":0.75,
+            "preferred_repair_role":"implementation",
+            "repair_hypothesis":"hypothesis without clusters",
+            "failure_clusters":[]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// Phase D / D.4 (DR4-002): the repair editor prompt carries the
+    /// `SemanticRepairPlan` as a structured JSON data field. The plan is
+    /// **never** concatenated into the system / developer instruction
+    /// text — the system message still declares verifier output as
+    /// untrusted data, and the plan fields appear only inside the JSON
+    /// payload.
+    #[test]
+    fn phase_d_repair_editor_prompt_carries_semantic_plan_as_json_data() {
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use super::super::semantic_failure::{
+            ContractConflict, FailureCluster, SemanticFailureReport,
+            build_failure_cluster_from_observation,
+        };
+        use super::super::spec_authority::SpecAuthority;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def todos():\n    return []\n").unwrap();
+
+        let cluster: FailureCluster = build_failure_cluster_from_observation(
+            "200 OK",
+            "201 Created",
+            "POST /todos",
+            "AssertEq",
+            &[
+                super::super::task_contract::ArtifactRole::Implementation,
+                super::super::task_contract::ArtifactRole::Test,
+            ],
+            Vec::new(),
+        );
+        let cluster_id = cluster.cluster_key.clone();
+        let report = SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster],
+            contract_conflict: ContractConflict {
+                implementation: "returns 200".to_string(),
+                test: "expects 201".to_string(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl returns 200; test expects 201".to_string(),
+            confidence: 0.91,
+        };
+        let plan = SemanticRepairPlan {
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl returns 200; test expects 201".to_string(),
+            failure_cluster_id: cluster_id.clone(),
+            expected_improvement: None,
+            semantic_report: report,
+            assessment_generation_at_creation: 0,
+        };
+
+        let target_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "fix impl".to_string(),
+        };
+
+        let job = RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "FAILED".to_string(),
+            failure_type: super::super::VerifierFailureType::AssertionFailure,
+            target_hint: Some(target_hint.clone()),
+            repair_target_hint: Some(target_hint.clone()),
+            failure_signature: "sig".to_string(),
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+        let messages = super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task")
+            .expect("messages built");
+        assert_eq!(messages.len(), 2);
+
+        // The system message must NOT contain semantic-plan fields — those
+        // are untrusted data, not instructions.
+        let system_text = format!("{:?}", messages[0]);
+        assert!(
+            !system_text.contains("impl returns 200"),
+            "semantic_plan must not leak into system instruction: {system_text}",
+        );
+        assert!(
+            !system_text.contains(cluster_id.as_str()),
+            "cluster_id must not leak into system instruction: {system_text}",
+        );
+
+        // The user message JSON payload must carry the plan under
+        // `semantic_plan` as structured data, not as free-form prose.
+        let user_text = format!("{:?}", messages[1]);
+        assert!(
+            user_text.contains("\\\"semantic_plan\\\""),
+            "user payload must include semantic_plan key: {user_text}",
+        );
+        assert!(
+            user_text.contains(cluster_id.as_str()),
+            "user payload must include the cluster id: {user_text}",
+        );
+        assert!(
+            user_text.contains("failure_cluster_id"),
+            "user payload must include failure_cluster_id field",
+        );
+    }
+
+    /// Phase D / D.4 (DR4-002): when `semantic_plan = None` (legacy
+    /// fallback / SetupRepair dispatch), the prompt still builds and
+    /// carries `semantic_plan: null` — the field is present but empty so
+    /// the JSON shape is stable across legacy / semantic runs.
+    #[test]
+    fn phase_d_repair_editor_prompt_carries_null_semantic_plan_for_legacy_path() {
+        use super::super::repair_job::RepairJob;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def f():\n    return 1\n").unwrap();
+        let target_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "fix impl".to_string(),
+        };
+        let job = RepairJob {
+            failure_signature: "sig".to_string(),
+            target_hint: Some(target_hint.clone()),
+            semantic_plan: None,
+            ..RepairJob::new_for_test()
+        };
+        let messages = super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task")
+            .expect("messages built");
+        let user_text = format!("{:?}", messages[1]);
+        assert!(
+            user_text.contains("\\\"semantic_plan\\\":null"),
+            "legacy path must emit semantic_plan: null in payload: {user_text}",
+        );
+    }
+
+    // ---- Issue #647 (MF1): diagnostic prompt embeds semantic schema + ---- //
+    // ---- legacy → semantic fallback so production emits SemanticRepairPlan ---- //
+
+    /// MF1-a: the diagnostic prompt MUST advertise the `SemanticFailureReport`
+    /// schema so LLMs return the new fields (`failure_clusters`,
+    /// `contract_conflict`, `preferred_repair_role`, `repair_hypothesis`,
+    /// `confidence`) alongside the legacy fields. Without these field names
+    /// in the prompt, `parse_semantic_failure_report` never gets a payload to
+    /// parse and `semantic_plan` stays `None` in production.
+    #[test]
+    fn mf1_a_diagnostic_prompt_includes_semantic_schema() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "def f():\n    return 1\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build api");
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for needle in [
+            "SemanticFailureReport",
+            "failure_clusters",
+            "contract_conflict",
+            "preferred_repair_role",
+            "repair_hypothesis",
+            "confidence",
+        ] {
+            assert!(
+                prompt.contains(needle),
+                "diagnostic prompt must mention semantic field {needle:?}: {prompt}",
+            );
+        }
+    }
+
+    /// MF1-b: the deterministic legacy-fallback helper MUST produce a
+    /// `SemanticFailureReport` from a `ParsedVerifierRepairAssessment` even
+    /// when the LLM returned only legacy fields (so
+    /// `parse_semantic_failure_report` returned `None`).
+    #[test]
+    fn mf1_b_legacy_fallback_builds_semantic_report() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"return 201 not 200","confidence":0.9}],
+            "summary":"impl returns 200 but test expects 201"
+        }"#;
+        // Confirm pre-condition: the semantic parse fails on this legacy reply.
+        assert!(super::parse_semantic_failure_report_from_reply(legacy_reply).is_none());
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "tests/test_health.py::test_create_validation AssertionError"
+                .to_string(),
+            output_excerpt:
+                "FAILED tests/test_health.py::test_create_validation - assert 200 == 201"
+                    .to_string(),
+            ..RepairJob::new_for_test()
+        };
+
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        // Deterministic legacy default — never LLM-supplied.
+        assert!((report.confidence - 0.5).abs() < f32::EPSILON);
+        // The fallback re-uses the legacy `repair_plan` first item as the
+        // repair_hypothesis, truncated by the SSOT sanitize entry.
+        assert!(
+            !report.repair_hypothesis.is_empty(),
+            "repair_hypothesis must be populated from legacy result",
+        );
+        // preferred_repair_role is mapped from probable_cause_role.
+        assert_eq!(
+            report.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+    }
+
+    /// MF1-b: the legacy fallback constructs exactly one failure cluster
+    /// derived from `RepairJob.failure_signature` / `output_excerpt`, and the
+    /// cluster's `involved_artifacts` reflects the legacy `probable_cause_role`.
+    #[test]
+    fn mf1_b_legacy_fallback_constructs_one_failure_cluster() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"runtime_error",
+            "probable_cause_role":"test",
+            "repair_plan":[{"target":"tests/test_health.py","intent":"fix fixture","confidence":0.8}]
+        }"#;
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "tests/test_health.py KeyError".to_string(),
+            output_excerpt: "KeyError: 'missing_fixture'".to_string(),
+            ..RepairJob::new_for_test()
+        };
+
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::RuntimeError
+        );
+        assert_eq!(
+            report.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Test
+        );
+        let cluster = &report.failure_clusters[0];
+        assert!(
+            cluster
+                .involved_artifacts
+                .contains(&super::super::task_contract::ArtifactRole::Test),
+            "cluster must record the probable_cause_role as an involved artifact",
+        );
+    }
+
+    /// MF1-b: the legacy fallback is deterministic — the same
+    /// `(ParsedVerifierRepairAssessment, RepairJob)` input MUST yield the same
+    /// `SemanticFailureReport` (cluster keys identical, confidence fixed).
+    #[test]
+    fn mf1_b_legacy_fallback_is_deterministic() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"return 201","confidence":0.9}]
+        }"#;
+        let parsed_a = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let parsed_b = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "sig".to_string(),
+            output_excerpt: "FAILED assert 200 == 201".to_string(),
+            ..RepairJob::new_for_test()
+        };
+
+        let report_a = super::build_semantic_failure_report_from_legacy(&parsed_a, &job)
+            .expect("fallback report a");
+        let report_b = super::build_semantic_failure_report_from_legacy(&parsed_b, &job)
+            .expect("fallback report b");
+        assert_eq!(
+            report_a.failure_clusters[0].cluster_key,
+            report_b.failure_clusters[0].cluster_key,
+        );
+        assert_eq!(report_a.confidence, report_b.confidence);
+        assert_eq!(report_a.repair_hypothesis, report_b.repair_hypothesis);
+    }
+
+    /// MF1-b: `DependencyMissing` / `ConfigOrVerifierError` legacy replies
+    /// still route to setup repair after the fallback — the helper produces a
+    /// report, but `build_semantic_repair_plan_from_report` returns `None`,
+    /// so the existing setup-repair pipeline keeps owning those failure kinds.
+    #[test]
+    fn mf1_b_legacy_fallback_routes_dependency_missing_to_setup() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"dependency_missing",
+            "probable_cause_role":"setup",
+            "repair_plan":[{"target":"requirements.txt","intent":"add requests","confidence":0.95}]
+        }"#;
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "ModuleNotFoundError requests".to_string(),
+            output_excerpt: "ModuleNotFoundError: No module named 'requests'".to_string(),
+            ..RepairJob::new_for_test()
+        };
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        // Even though we build a report for the dependency_missing kind, the
+        // dispatch_target → setup-repair contract keeps `semantic_plan = None`.
+        assert!(super::build_semantic_repair_plan_from_report(report).is_none());
+    }
+
+    /// MF1 production flow integration: when the LLM reply returns only
+    /// legacy fields, the semantic parse returns `None`, but the fallback
+    /// kicks in and a `SemanticRepairPlan` is built end-to-end via
+    /// `build_semantic_failure_report_from_legacy` →
+    /// `build_semantic_repair_plan_from_report`.
+    #[test]
+    fn mf1_legacy_reply_yields_semantic_plan_via_fallback() {
+        use super::super::repair_job::RepairJob;
+
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_plan":[{"target":"app/main.py","intent":"return 201","confidence":0.9}]
+        }"#;
+        // pre-condition: pure semantic parse returns None.
+        assert!(super::parse_semantic_failure_report_from_reply(legacy_reply).is_none());
+
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse should succeed");
+        let job = RepairJob {
+            failure_signature: "app/main.py AssertionError".to_string(),
+            output_excerpt: "assert 200 == 201".to_string(),
+            ..RepairJob::new_for_test()
+        };
+        let report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield report");
+        let plan = super::build_semantic_repair_plan_from_report(report)
+            .expect("semantic plan must be built from legacy fallback report");
+        assert_eq!(
+            plan.semantic_cause,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch
+        );
+        assert_eq!(
+            plan.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation
         );
     }
 
@@ -19856,8 +22673,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19901,8 +22721,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert_eq!(
             assessment
@@ -19985,8 +22808,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert!(assessment.repair_target_hint.is_none());
         assert!(assessment.needed_reads.is_empty());
@@ -20014,8 +22840,11 @@ E   assert [{'id': 1}] == []\n";
         )
         .expect("diagnostic json should parse");
 
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(&work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
 
         assert!(assessment.repair_target_hint.is_none());
     }
@@ -20260,6 +23089,247 @@ E   assert [{'id': 1}] == []\n";
             verifier_repair_decision(true, Some(&context), &[], &work_root, Some(2), 3),
             VerifierRepairDecision::ReadyToVerify
         );
+    }
+
+    // ---- Issue #647 (CB-007): selected_target must follow semantic_plan ---- //
+    //
+    // Background: `verifier_repair_effective_target_hint` historically read
+    // `assessment.repair_plan` / `assessment.repair_target_hint` only, and
+    // ignored the active `semantic_plan`. After Phase E slot reuse pushes a
+    // cluster into `exhausted_attempts` and advances the plan to a new
+    // cluster, a re-diagnostic LLM call can re-propose the exhausted cluster
+    // (it sees the same failure text). `assign_semantic_plan_preserving_exhausted`
+    // walks the new plan past the exhausted entry, but the freshly built
+    // `assessment.repair_target_hint` still points at the old cluster's path.
+    // Without CB-007's guard, the repair editor keeps attacking the exhausted
+    // cluster (CB-007).
+    //
+    // CB-007 fix: when `semantic_plan` is `Some` and the job has already
+    // exhausted at least one prior cluster, the legacy assessment hint is
+    // potentially stale (the diagnostic that produced it cannot be linked
+    // back to a specific cluster id). The conservative behaviour is to
+    // return `None` so the controller forces a re-diagnostic pass instead
+    // of reusing the stale hint. Tests below pin both branches.
+
+    /// CB-007.2 — selected_target follows semantic_plan advancement.
+    ///
+    /// Scenario: cluster A repair attempt failed, was pushed onto
+    /// `exhausted_attempts`, and `semantic_plan` was advanced to cluster B.
+    /// The freshly re-built `assessment.repair_target_hint` still references
+    /// cluster A's path. `verifier_repair_effective_target_hint` MUST NOT
+    /// return that stale hint — it MUST return `None` so the controller
+    /// re-runs diagnostic against the new cluster instead of attacking the
+    /// exhausted one again.
+    #[test]
+    fn cb007_selected_target_follows_semantic_plan_advancement() {
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use super::super::semantic_failure::{
+            ContractConflict, SemanticFailureReport, build_failure_cluster_from_observation,
+        };
+        use super::super::spec_authority::SpecAuthority;
+
+        // Build a 2-cluster report (A then B) with the same preferred role.
+        let cluster_a = build_failure_cluster_from_observation(
+            "200 OK",
+            "201 Created",
+            "POST /todos",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let cluster_b = build_failure_cluster_from_observation(
+            "missing field",
+            "field present",
+            "GET /todos",
+            "AssertContains",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let cluster_a_id = cluster_a.cluster_key.clone();
+        let cluster_b_id = cluster_b.cluster_key.clone();
+        assert_ne!(
+            cluster_a_id, cluster_b_id,
+            "fixture sanity: distinct cluster ids"
+        );
+
+        let report = SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_a, cluster_b],
+            contract_conflict: ContractConflict {
+                implementation: "returns 200".to_string(),
+                test: "expects 201".to_string(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            confidence: 0.9,
+        };
+
+        // semantic_plan now targets cluster B (after advance_to_next_cluster).
+        let plan_b = SemanticRepairPlan {
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            failure_cluster_id: cluster_b_id.clone(),
+            expected_improvement: None,
+            semantic_report: report,
+            assessment_generation_at_creation: 0,
+        };
+
+        // Stale assessment from the re-diagnostic re-points at cluster A's path.
+        let stale_hint_a = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/todos.py".to_string(),
+            reason: "re-diagnostic re-proposed cluster A".to_string(),
+        };
+        let job = RepairJob {
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: super::super::VerifierFailureType::AssertionFailure,
+                probable_cause_role: Some(
+                    super::super::task_contract::ArtifactRole::Implementation,
+                ),
+                needed_reads: vec![stale_hint_a.clone()],
+                repair_target_hint: Some(stale_hint_a.clone()),
+                repair_plan: vec![stale_hint_a.clone()],
+                summary: Some("re-diagnostic".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            semantic_plan: Some(plan_b),
+            // ledger holds the previously attacked (cluster_a, Implementation):
+            exhausted_attempts: vec![(
+                cluster_a_id.clone(),
+                super::super::spec_authority::RepairRole::Implementation,
+            )],
+            ..RepairJob::new_for_test()
+        };
+
+        // CB-007: the stale assessment hint must NOT be surfaced when the
+        // semantic_plan has advanced past an exhausted cluster — the
+        // function must return None so the controller forces re-diagnostic.
+        assert!(
+            verifier_repair_effective_target_hint(&job).is_none(),
+            "CB-007: stale assessment.repair_target_hint (cluster A path) must \
+             not be returned after semantic_plan advanced to cluster B; \
+             expected None (force re-diagnostic), got Some",
+        );
+    }
+
+    /// CB-007.2 — regression guard: when `semantic_plan` is `Some` and no
+    /// cluster has been exhausted yet (the plan is freshly built and matches
+    /// the assessment), the function MUST keep returning the assessment hint
+    /// unchanged. This pins the "matching cluster" branch so the CB-007 guard
+    /// does not over-fire.
+    #[test]
+    fn cb007_selected_target_uses_assessment_when_cluster_matches() {
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use super::super::semantic_failure::{
+            ContractConflict, SemanticFailureReport, build_failure_cluster_from_observation,
+        };
+        use super::super::spec_authority::SpecAuthority;
+
+        let cluster_a = build_failure_cluster_from_observation(
+            "200 OK",
+            "201 Created",
+            "POST /todos",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let cluster_a_id = cluster_a.cluster_key.clone();
+        let report = SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_a],
+            contract_conflict: ContractConflict {
+                implementation: "returns 200".to_string(),
+                test: "expects 201".to_string(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            confidence: 0.9,
+        };
+        let plan_a = SemanticRepairPlan {
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            failure_cluster_id: cluster_a_id,
+            expected_improvement: None,
+            semantic_report: report,
+            assessment_generation_at_creation: 0,
+        };
+
+        let hint_a = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/todos.py".to_string(),
+            reason: "first diagnostic".to_string(),
+        };
+        let job = RepairJob {
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: super::super::VerifierFailureType::AssertionFailure,
+                probable_cause_role: Some(
+                    super::super::task_contract::ArtifactRole::Implementation,
+                ),
+                needed_reads: vec![hint_a.clone()],
+                repair_target_hint: Some(hint_a.clone()),
+                repair_plan: vec![hint_a.clone()],
+                summary: Some("first diagnostic".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            semantic_plan: Some(plan_a),
+            // exhausted_attempts is empty: plan is fresh, no advancement yet.
+            exhausted_attempts: Vec::new(),
+            ..RepairJob::new_for_test()
+        };
+
+        // semantic_plan matches the assessment (no cluster has been exhausted
+        // yet) → assessment hint is returned unchanged.
+        let returned = verifier_repair_effective_target_hint(&job)
+            .expect("matching-cluster branch must return the assessment hint");
+        assert_eq!(returned.path, "app/todos.py");
+        assert_eq!(
+            returned.role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+    }
+
+    /// CB-007.3 — legacy regression guard: `semantic_plan = None` callers
+    /// must keep the pre-CB-007 behaviour (return assessment.repair_target_hint
+    /// regardless of `exhausted_attempts`). This guards against the new branch
+    /// accidentally firing on the legacy / SetupRepair code paths.
+    #[test]
+    fn cb007_selected_target_legacy_path_unchanged_when_semantic_plan_none() {
+        use super::super::repair_job::RepairJob;
+
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "legacy".to_string(),
+        };
+        let job = RepairJob {
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::RuntimeError,
+                failure_type: super::super::VerifierFailureType::RuntimeError,
+                probable_cause_role: Some(
+                    super::super::task_contract::ArtifactRole::Implementation,
+                ),
+                needed_reads: vec![hint.clone()],
+                repair_target_hint: Some(hint.clone()),
+                repair_plan: vec![hint.clone()],
+                summary: Some("legacy assessment".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            semantic_plan: None,
+            exhausted_attempts: Vec::new(),
+            ..RepairJob::new_for_test()
+        };
+
+        let returned = verifier_repair_effective_target_hint(&job)
+            .expect("legacy path must still return assessment hint when semantic_plan is None");
+        assert_eq!(returned.path, "app/main.py");
     }
 
     #[test]
@@ -21607,8 +24677,11 @@ export default function App() {
             }"#,
         )
         .expect("diagnostic json should parse");
-        let assessment =
-            super::model_assessment_to_verifier_repair_assessment(work_root, &context, parsed);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            work_root, &context, parsed, &admission,
+        );
 
         // Issue #638 (設計判断 #3): LocalImportContractMismatch → ImportOrDependency,
         // so verifier_repair_preferred_local_import_source fires and promotes
@@ -21754,6 +24827,223 @@ export default function App() {
 
         assert!(
             verifier_repair_target_candidate_from_output(work_root, output, &changed).is_none()
+        );
+    }
+
+    /// Issue #647 (MF2.1): `verifier_repair_context_from_failure` must carry
+    /// over `semantic_plan` and `exhausted_attempts` from the previous turn's
+    /// `RepairJob`. Without this, every new verifier failure would drop the
+    /// Phase-D semantic plan and force a fresh diagnostic round-trip, which
+    /// in turn defeats sequential cluster repair (the slot reuse design).
+    #[test]
+    fn verifier_repair_context_carries_over_semantic_plan_and_exhausted_attempts() {
+        use super::super::repair_job::SemanticRepairPlan;
+        use super::super::semantic_failure::parse_semantic_failure_report;
+        use super::super::spec_authority::SpecAuthority;
+        use super::super::task_contract::ArtifactRole;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def create_todo(): pass\n").unwrap();
+        let changed = vec!["app/main.py".to_string()];
+        let output = "FAILED tests/test_api.py::test_create - AssertionError\n1 failed";
+
+        // Build a multi-cluster SemanticFailureReport via the SSOT parser.
+        let report_json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "carryover hypothesis",
+            "failure_clusters": [
+                {
+                    "observed": "alpha",
+                    "expected": "ALPHA",
+                    "input_shape": "alphashape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation", "test"],
+                    "affected_cases": ["alphacase"],
+                },
+                {
+                    "observed": "beta",
+                    "expected": "BETA",
+                    "input_shape": "betashape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation", "test"],
+                    "affected_cases": ["betacase"],
+                },
+            ],
+        });
+        let report = parse_semantic_failure_report(&report_json).expect("report parses");
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+        let cluster_b = report.failure_clusters[1].cluster_key.clone();
+
+        // Build a previous-turn RepairJob with a semantic plan + a non-empty
+        // ledger (simulating "we already burned cluster A").
+        let prev_plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_b.clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: report.preferred_repair_role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let mut previous = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        previous.semantic_plan = Some(prev_plan);
+        previous.exhausted_attempts = vec![(cluster_a.clone(), ArtifactRole::Implementation)];
+
+        // Run a second cycle. The new context must carry both fields over.
+        let next = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&previous),
+        );
+
+        // semantic_plan was carried over.
+        let next_plan = next.semantic_plan.expect("plan carried over");
+        assert_eq!(next_plan.failure_cluster_id, cluster_b);
+        // exhausted_attempts ledger was carried over.
+        assert_eq!(
+            next.exhausted_attempts,
+            vec![(cluster_a.clone(), ArtifactRole::Implementation)]
+        );
+    }
+
+    /// Issue #647 (CB-015): `verifier_repair_context_from_failure` must
+    /// also carry `assessment_generation` over the turn boundary so the
+    /// stale↔fresh distinction survives slot reuse. A new failure with no
+    /// `previous_context` resets the generation to 0; a follow-up failure
+    /// inherits whatever the previous turn's generation was.
+    #[test]
+    fn cb015_verifier_repair_context_carries_over_assessment_generation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def main(): pass\n").unwrap();
+        let changed = vec!["app/main.py".to_string()];
+        let output = "FAILED tests/test_api.py::test_x - AssertionError\n1 failed";
+
+        // First cycle: no previous context → generation defaults to 0.
+        let mut previous = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        assert_eq!(
+            previous.assessment_generation, 0,
+            "CB-015: fresh RepairJob without previous_context starts at generation 0",
+        );
+
+        // Simulate `run_verifier_diagnostic_pass` bumping the generation
+        // after writing a fresh assessment.
+        previous.assessment_generation = 5;
+
+        // Second cycle: previous_context carries the generation forward.
+        let next = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&previous),
+        );
+        assert_eq!(
+            next.assessment_generation, 5,
+            "CB-015: assessment_generation must survive turn boundary via previous_context",
+        );
+    }
+
+    /// Issue #647 / CB-017 A''' (CR-4 V2): `verifier_repair_context_from_failure`
+    /// must carry the `assessment_bound_cluster_id` over the turn boundary so
+    /// `rebind_legacy_assessment_to_current_cluster` can detect cluster-key
+    /// transitions across slot reuse. A fresh failure with no previous
+    /// context starts at `None`; subsequent failures inherit the prior bind.
+    #[test]
+    fn cb017_verifier_repair_context_carries_over_assessment_bound_cluster_id() {
+        use super::repair_job::SemanticRepairPlan;
+        use super::spec_authority::SpecAuthority;
+        use super::task_contract::ArtifactRole;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def main(): pass\n").unwrap();
+        let changed = vec!["app/main.py".to_string()];
+        let output = "FAILED tests/test_api.py::test_x - AssertionError\n1 failed";
+
+        // First cycle: no previous context → bound id starts at None.
+        let mut previous = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        assert!(
+            previous.assessment_bound_cluster_id.is_none(),
+            "CB-017: fresh RepairJob without previous_context starts with bound id None",
+        );
+
+        // Simulate a successful diagnostic + rebind landing on cluster A.
+        let report = super::semantic_failure::parse_semantic_failure_report(&serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "alpha",
+                    "expected": "ALPHA",
+                    "input_shape": "alpha-shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": ["case_alpha"],
+                }
+            ],
+        }))
+        .expect("report parses");
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+        let prev_plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_a.clone(),
+            semantic_cause: super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        previous.semantic_plan = Some(prev_plan);
+        previous.assessment_bound_cluster_id = Some(cluster_a.clone());
+
+        // Second cycle: previous_context carries the bind forward.
+        let next = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&previous),
+        );
+        assert_eq!(
+            next.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_a),
+            "CB-017: assessment_bound_cluster_id must survive turn boundary via previous_context",
         );
     }
 
@@ -23547,32 +26837,21 @@ export default function App() {
         let mut context = super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "ImportError: cannot import name 'store' from 'app.main'".to_string(),
-            failure_type: super::super::VerifierFailureType::Unknown,
             target_hint: Some(hint.clone()),
-            repair_target_hint: None,
-            changed_file_hints: vec![],
-            assessment: None,
-            assessment_attempts: 0,
-            diagnostic_attempted: false,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: vec![],
-            target_line: None,
-            error_kind: None,
             failure_signature: "app/main.py import_error".to_string(),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         };
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
 
         // With Unknown (parser-only), the helper must NOT fire.
         assert!(
             verifier_repair_preferred_local_import_source(
                 &context,
-                super::super::VerifierFailureType::Unknown
+                super::super::VerifierFailureType::Unknown,
+                &admission,
             )
             .is_none(),
             "helper must early-return for Unknown derived_failure_type"
@@ -23583,6 +26862,7 @@ export default function App() {
         let preferred = verifier_repair_preferred_local_import_source(
             &context,
             super::super::VerifierFailureType::ImportOrDependency,
+            &admission,
         );
         assert!(
             preferred.is_some(),
@@ -23597,6 +26877,7 @@ export default function App() {
         let preferred2 = verifier_repair_preferred_local_import_source(
             &context,
             super::super::VerifierFailureType::ImportOrDependency,
+            &admission,
         );
         assert!(preferred2.is_some());
     }
@@ -23614,31 +26895,22 @@ export default function App() {
         let context = super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "ImportError: cannot import name 'store' from 'app.main'".to_string(),
-            failure_type: super::super::VerifierFailureType::Unknown,
             target_hint: Some(hint.clone()),
-            repair_target_hint: None,
-            changed_file_hints: vec![],
-            assessment: None,
-            assessment_attempts: 0,
-            diagnostic_attempted: false,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: vec![],
-            target_line: None,
-            error_kind: None,
             failure_signature: "app/main.py import_error".to_string(),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
         // parser-origin Unknown → both helpers must early-return
         assert!(
             verifier_repair_preferred_local_import_source(
                 &context,
-                super::super::VerifierFailureType::Unknown
+                super::super::VerifierFailureType::Unknown,
+                &admission,
             )
             .is_none()
         );
@@ -23646,7 +26918,8 @@ export default function App() {
             verifier_repair_stale_assertion_test_target(
                 &context,
                 None,
-                super::super::VerifierFailureType::Unknown
+                super::super::VerifierFailureType::Unknown,
+                &admission,
             )
             .is_none()
         );
@@ -23969,25 +27242,12 @@ export default function App() {
         let context = super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "error".to_string(),
-            failure_type: super::super::VerifierFailureType::Unknown,
             target_hint: Some(hint),
-            repair_target_hint: None,
-            changed_file_hints: vec![],
-            assessment: None,
-            assessment_attempts: 0,
-            diagnostic_attempted: false,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: vec![],
             target_line: Some(1),
-            error_kind: None,
             failure_signature: "app/main.py error".to_string(),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         };
         let messages = verifier_diagnostic_messages(&work_root, &context, "fix bug");
         let payload = messages
@@ -24195,6 +27455,1320 @@ export default function App() {
             agent.bounded_post_edit_excerpt("link.txt").is_none(),
             "symlink pointing outside the workspace must be rejected"
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Issue #647 (Phase C, §4.4 / §5.1): `admit_repair_target_hint`
+    // SSOT unit & integration tests. Every hint promotion path must
+    // pass through the SSOT gate; only `Owned` hints are admitted.
+    // ───────────────────────────────────────────────────────────────
+
+    /// SSOT: an `Owned` hint passes through `admit_repair_target_hint`.
+    #[test]
+    fn admit_repair_target_hint_returns_owned_hint() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "test".to_string(),
+        };
+        let admitted = super::admit_repair_target_hint(hint.clone(), &admission);
+        assert_eq!(admitted, Some(hint));
+    }
+
+    /// SSOT: a `CandidateOnly` hint (in-scope, no edit/scaffold/explicit
+    /// signal) is rejected (S1-002 / S7-002).
+    #[test]
+    fn admit_repair_target_hint_rejects_candidate_only() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::write(work_root.join("README.md"), "# pre-existing\n").unwrap();
+        // SingleProjectRoot scope without explicit subtree → CandidateOnly
+        // when no edit signal is set on the predicate.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::UsageDocs,
+            path: "README.md".to_string(),
+            reason: "test".to_string(),
+        };
+        let admitted = super::admit_repair_target_hint(hint, &admission);
+        assert_eq!(admitted, None);
+    }
+
+    /// SSOT: an `OutOfScope` hint (path traversal) is rejected (S7-002).
+    #[test]
+    fn admit_repair_target_hint_rejects_out_of_scope_traversal() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "../sibling/escape.py".to_string(),
+            reason: "test".to_string(),
+        };
+        assert_eq!(super::admit_repair_target_hint(hint, &admission), None);
+    }
+
+    /// DR3-001: edited_this_session is evaluated **per-path**, so an edit
+    /// signal on path A must not promote a separate path B to Owned.
+    #[test]
+    fn admit_repair_target_hint_path_local_edited_signal() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/edited.py"), "x = 1\n").unwrap();
+        std::fs::write(work_root.join("app/untouched.py"), "y = 2\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let edited_for = |p: &str| p == "app/edited.py";
+        let scaffold_for = |_: &str| false;
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &edited_for,
+            scaffold_changed_for: &scaffold_for,
+        };
+
+        let edited_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/edited.py".to_string(),
+            reason: "edited".to_string(),
+        };
+        let untouched_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/untouched.py".to_string(),
+            reason: "not edited".to_string(),
+        };
+
+        assert!(super::admit_repair_target_hint(edited_hint.clone(), &admission).is_some());
+        assert!(
+            super::admit_repair_target_hint(untouched_hint, &admission).is_none(),
+            "path-local edited signal must not promote a sibling path"
+        );
+    }
+
+    /// Integration: path 1 — diagnostic LLM-derived hints route through
+    /// `recovery_target_hint_for_diagnostic_path` → admission gate. A
+    /// CandidateOnly hint must drop out of the resulting assessment.
+    #[test]
+    fn model_assessment_paths_rejects_candidate_only_diagnostic_hint() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        // SingleProjectRoot + no edit/scaffold signal → CandidateOnly.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        let context = verifier_context_for("app/main.py");
+        let parsed = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"assertion_mismatch",
+                "probable_cause_role":"implementation",
+                "repair_targets":[
+                    {"path":"app/main.py","confidence":0.95,"reason":"diagnostic LLM picked this"}
+                ],
+                "summary":"diagnostic"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+
+        assert!(
+            assessment.repair_target_hint.is_none(),
+            "CandidateOnly diagnostic hint must not become a repair target"
+        );
+        assert!(
+            assessment.repair_plan.is_empty(),
+            "CandidateOnly diagnostic hint must not appear in repair_plan"
+        );
+    }
+
+    /// Integration: paths 2-3 — `context.target_hint` / `changed_file_hints`
+    /// surface into the fallback `repair_target_hint`. When admission is
+    /// CandidateOnly, the fallback must drop them too.
+    #[test]
+    fn model_assessment_paths_rejects_candidate_only_changed_file_fallback() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        // context.changed_file_hints carries app/main.py (path 3).
+        let context = verifier_context_for("app/main.py");
+        // Parsed JSON has *no* repair_targets / repair_plan, so the
+        // fallback at the end of model_assessment must fire.
+        let parsed = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"unknown",
+                "probable_cause_role":"implementation",
+                "summary":"no diagnostic targets"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+
+        assert!(
+            assessment.repair_target_hint.is_none(),
+            "fallback must not promote a CandidateOnly changed_file_hint"
+        );
+    }
+
+    /// Integration: path 4 — `verifier_repair_preferred_local_import_source`
+    /// must apply admission gate at its exit. A CandidateOnly target hint
+    /// must not be promoted even when the local-import-mismatch pattern
+    /// fires.
+    #[test]
+    fn model_assessment_paths_path_4_admits_only_owned_local_import_source() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        // Build a context whose target_hint resolves to app/main.py and
+        // whose output looks like a local import mismatch.
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "provider".to_string(),
+        };
+        let context = super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "ImportError: cannot import name 'store' from 'app.main'".to_string(),
+            target_hint: Some(hint),
+            failure_signature: "app/main.py import_error".to_string(),
+            failure_count: Some(1),
+            repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        // CandidateOnly: no edit / scaffold signal.
+        let candidate_only = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        assert!(
+            verifier_repair_preferred_local_import_source(
+                &context,
+                super::super::VerifierFailureType::ImportOrDependency,
+                &candidate_only,
+            )
+            .is_none(),
+            "CandidateOnly local-import target must be rejected by SSOT gate"
+        );
+
+        // Owned: helper fires.
+        let owned = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        assert!(
+            verifier_repair_preferred_local_import_source(
+                &context,
+                super::super::VerifierFailureType::ImportOrDependency,
+                &owned,
+            )
+            .is_some(),
+            "Owned local-import target must pass the SSOT gate"
+        );
+    }
+
+    /// Integration: path 5 — `verifier_repair_stale_assertion_test_target`
+    /// must apply admission gate at its exit.
+    #[test]
+    fn model_assessment_paths_path_5_admits_only_owned_stale_assertion_target() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        std::fs::write(
+            work_root.join("tests/test_health.py"),
+            "def test_x(): assert False\n",
+        )
+        .unwrap();
+
+        let app_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "impl".to_string(),
+        };
+        let test_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_health.py".to_string(),
+            reason: "test".to_string(),
+        };
+        let context = super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "AssertionError".to_string(),
+            target_hint: Some(test_hint),
+            repair_target_hint: Some(app_hint),
+            failure_signature: "stale-assertion".to_string(),
+            failure_count: Some(1),
+            repair_attempt: 2,
+            rerun_outcome: Some(super::super::VerifierRepairRerunOutcome::SameFailureRemaining),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let candidate_only = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        assert!(
+            verifier_repair_stale_assertion_test_target(
+                &context,
+                None,
+                super::super::VerifierFailureType::AssertionFailure,
+                &candidate_only,
+            )
+            .is_none(),
+            "CandidateOnly stale-assertion test target must be rejected by SSOT gate"
+        );
+        let owned = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        assert!(
+            verifier_repair_stale_assertion_test_target(
+                &context,
+                None,
+                super::super::VerifierFailureType::AssertionFailure,
+                &owned,
+            )
+            .is_some(),
+            "Owned stale-assertion test target must pass the SSOT gate"
+        );
+    }
+
+    /// Integration: path 6 — `repair_target_hint` fallback from
+    /// `probable_cause_role`. When the only candidate is CandidateOnly
+    /// (changed_file_hint surfaced by `verifier_repair_context_from_failure`
+    /// but never edited / scaffolded this session), the fallback must not
+    /// promote it.
+    #[test]
+    fn model_assessment_paths_path_6_fallback_admits_only_owned() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let admission = super::RepairTargetAdmissionContext {
+            work_root: &work_root,
+            scope: &scope,
+            edited_this_session_for: &super::admission_always_false,
+            scaffold_changed_for: &super::admission_always_false,
+        };
+        // verifier_context_for() seeds context.changed_file_hints with
+        // app/main.py and provides a probable_cause_role-style match below.
+        let context = verifier_context_for("app/main.py");
+        // No repair_targets/plan → forces fallback. probable_cause_role
+        // is set so the role-filter branch runs.
+        let parsed = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"unknown",
+                "probable_cause_role":"implementation",
+                "summary":"force path 6 fallback"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+        assert!(
+            assessment.repair_target_hint.is_none(),
+            "path 6 fallback must drop CandidateOnly probable_cause_role hint"
+        );
+
+        // Same context with Owned admission → fallback promotes the hint.
+        let owned_admission =
+            super::RepairTargetAdmissionContext::owned_for_test(&work_root, &scope);
+        let parsed_owned = parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"unknown",
+                "probable_cause_role":"implementation",
+                "summary":"force path 6 fallback owned"
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+        let assessment_owned = super::model_assessment_to_verifier_repair_assessment(
+            &work_root,
+            &context,
+            parsed_owned,
+            &owned_admission,
+        );
+        assert_eq!(
+            assessment_owned
+                .repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("app/main.py"),
+            "Owned admission must allow path 6 fallback to promote the hint"
+        );
+    }
+
+    // ─── Issue #647 (SF3 / S3-005): semantic-boundary invariant ────────
+    //
+    // Pin the two responsibility halves so future edits cannot silently
+    // erase the boundary markers we just installed.
+
+    #[test]
+    fn sf3_model_assessment_doc_comment_pins_legacy_boundary() {
+        let src = include_str!("turn.rs");
+        // Doc comment on the legacy boundary helper must label its role
+        // and explicitly state the unchanged-callsites invariant. We do
+        // NOT pin specific line numbers (those drift with surrounding
+        // edits); we pin the *contract* instead.
+        let fn_pos = src
+            .find("\nfn model_assessment_to_verifier_repair_assessment(")
+            .expect("function must exist");
+        let doc_start = fn_pos.saturating_sub(3000);
+        let doc = &src[doc_start..fn_pos];
+        assert!(
+            doc.contains("Legacy boundary") || doc.contains("legacy-side"),
+            "SF3: doc must label this helper as the legacy boundary"
+        );
+        assert!(
+            doc.contains("Semantic boundary") || doc.contains("semantic-repair planning"),
+            "SF3: doc must contrast with the semantic boundary"
+        );
+        assert!(
+            doc.contains("unchanged by Issue #647")
+                || doc.contains("are unchanged")
+                || doc.contains("unchanged-callsites"),
+            "SF3: doc must declare the unchanged-callsites invariant"
+        );
+        // Sanity: the 7 legacy callsites must still exist as struct
+        // literals in the file (literal count, not line-number pinning).
+        let struct_literal_count = src.matches("super::VerifierRepairAssessment {").count()
+            + src.matches("VerifierRepairAssessment {").count()
+            - src.matches("super::VerifierRepairAssessment {").count();
+        // We expect at least 7 occurrences of `VerifierRepairAssessment {`
+        // (the exact number can be 7+ because tests may add new ones,
+        // but never less than 7 — the boundary contract).
+        let total_literals = src.matches("VerifierRepairAssessment {").count();
+        assert!(
+            total_literals >= 7,
+            "SF3: at least 7 VerifierRepairAssessment struct literals must \
+             exist (legacy callsite invariant), found {total_literals}"
+        );
+        let _ = struct_literal_count; // keep variable for future tightening
+    }
+
+    #[test]
+    fn sf3_run_verifier_diagnostic_pass_uses_explicit_semantic_boundary_markers() {
+        let src = include_str!("turn.rs");
+        // Both BEGIN and END markers must exist *inside*
+        // `run_verifier_diagnostic_pass` so a reader can scan the function
+        // body and immediately see which lines are legacy vs. semantic.
+        assert!(
+            src.contains("BEGIN semantic-boundary (Issue #647 / S3-005 / SF3)"),
+            "SF3: BEGIN semantic-boundary marker must be present"
+        );
+        assert!(
+            src.contains("END semantic-boundary (Issue #647 / S3-005 / SF3)"),
+            "SF3: END semantic-boundary marker must be present"
+        );
+        // The BEGIN marker must appear *before* the semantic helpers
+        // are called, and the END marker must appear *after* the last
+        // semantic helper and *before* `model_assessment_to_verifier_repair_assessment`
+        // is invoked.
+        let begin = src
+            .find("BEGIN semantic-boundary (Issue #647 / S3-005 / SF3)")
+            .expect("BEGIN marker missing");
+        let end = src
+            .find("END semantic-boundary (Issue #647 / S3-005 / SF3)")
+            .expect("END marker missing");
+        let semantic_call = src
+            .find("build_semantic_repair_plan_from_report_with_authority_input(")
+            .expect("semantic helper call missing");
+        let legacy_call = src
+            .find("let assessment = model_assessment_to_verifier_repair_assessment(")
+            .expect("legacy helper call missing");
+        assert!(
+            begin < semantic_call,
+            "SF3: BEGIN marker must precede semantic helper call"
+        );
+        assert!(
+            semantic_call < end,
+            "SF3: semantic helper call must be inside the boundary"
+        );
+        assert!(
+            end < legacy_call,
+            "SF3: END marker must precede the legacy helper call"
+        );
+    }
+
+    // ─── Issue #647 joint-integration: BehaviorContract / UserRequest /
+    //     UsageDocs consensus × SemanticRepairPlan / SpecAuthority. ────────
+    //
+    // The user-orchestrator asked for joint tests covering the resolver's
+    // three production-relevant inputs (BehaviorContract, UserRequest,
+    // UsageDocs consensus tie-break) flowing end-to-end into a built
+    // SemanticRepairPlan.
+
+    fn joint_sample_report() -> super::super::semantic_failure::SemanticFailureReport {
+        // A minimal valid report that exercises the assertion-mismatch
+        // path with one cluster involving Implementation + Test.
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["read missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 200 instead of 404",
+                "test": "expects 404",
+                "usage_docs": "not specified"
+            },
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "make the not-found branch return 404",
+            "confidence": 0.7
+        }"#;
+        super::parse_semantic_failure_report_from_reply(reply).expect("sample report must parse")
+    }
+
+    #[test]
+    fn joint_user_request_authority_flows_into_plan() {
+        // UserRequest is the top-priority authority; resolve() must
+        // elect it regardless of other flags, and the resulting plan
+        // must carry it verbatim.
+        let report = joint_sample_report();
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: true,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
+                .expect("plan must build");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            "UserRequest must dominate even when BehaviorContract is also present"
+        );
+        assert_eq!(
+            plan.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "preferred_repair_role carries through from the semantic report"
+        );
+        assert!(
+            !plan.repair_hypothesis.is_empty(),
+            "MF3 guard requires non-empty repair_hypothesis on the plan"
+        );
+    }
+
+    #[test]
+    fn joint_behavior_contract_authority_flows_into_plan() {
+        let report = joint_sample_report();
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
+                .expect("plan must build");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::BehaviorContract,
+            "BehaviorContract is the chosen authority when UserRequest is absent"
+        );
+    }
+
+    #[test]
+    fn joint_usage_docs_consensus_tiebreaks_into_plan() {
+        // Newly generated task + impl/usage_docs agreement against test
+        // → consensus tie-break must elect ImplementationContract
+        // (or BehaviorContract, depending on the resolver wiring), and
+        // crucially must NOT elect LlmGeneratedTest (which would suppress
+        // test edits). The acceptance criterion here is that consensus
+        // tie-break engages instead of the bare "newly generated → test"
+        // fallback.
+        let report = joint_sample_report();
+        let consensus = super::super::spec_authority::ArtifactConsensus {
+            agreeing: vec![
+                super::super::task_contract::ArtifactRole::Implementation,
+                super::super::task_contract::ArtifactRole::UsageDocs,
+            ],
+            dissenting: vec![super::super::task_contract::ArtifactRole::Test],
+            reason: "impl and docs both say 404; only test says 200".to_string(),
+        };
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: false,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: Some(consensus),
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
+                .expect("plan must build");
+        assert_ne!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::LlmGeneratedTest,
+            "Consensus tie-break must override the newly-generated→LlmGeneratedTest fallback"
+        );
+    }
+
+    #[test]
+    fn joint_test_edit_admission_requires_semantic_plan_built_from_authority() {
+        // MF3 + SF1 combined: an admission attempt against a test file
+        // succeeds only when a SemanticRepairPlan with a resolved
+        // SpecAuthority and a non-empty repair_hypothesis is present.
+        // Build the plan via the authority-aware production helper.
+        let report = joint_sample_report();
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
+                .expect("plan must build");
+        // Authority is resolved (any of the 5 enum variants is acceptable
+        // — it is never None because the type itself has no None state).
+        let _: super::super::spec_authority::SpecAuthority = plan.spec_authority;
+        // The plan must carry a non-empty hypothesis (MF3 admission guard
+        // for test edits requires this).
+        assert!(!plan.repair_hypothesis.trim().is_empty());
+    }
+
+    // ─── CB-017 A''' (Commit 3): merge + enrich + sort production helpers ───
+
+    /// Build a single-cluster `SemanticFailureReport` whose
+    /// `proposed_target_candidates` list is supplied by the caller. Bypasses
+    /// JSON parsing so we can inject candidates with arbitrary role hints
+    /// (including ones that disagree with the path classification).
+    fn cb017_single_cluster_report_with_candidates(
+        failure_kind: super::super::VerifierDiagnosticFailureKind,
+        candidates: Vec<super::super::semantic_failure::RawClusterTargetCandidate>,
+    ) -> super::super::semantic_failure::SemanticFailureReport {
+        let cluster = super::super::semantic_failure::build_failure_cluster_from_observation(
+            "observed",
+            "expected",
+            "shape",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            candidates,
+        );
+        super::super::semantic_failure::SemanticFailureReport {
+            failure_kind,
+            failure_clusters: vec![cluster],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "hypothesis".to_string(),
+            confidence: 0.7,
+        }
+    }
+
+    fn cb017_admission_for_test<'a>(
+        work_root: &'a std::path::Path,
+        scope: &'a super::super::task_workspace_scope::TaskWorkspaceScope,
+    ) -> super::RepairTargetAdmissionContext<'a> {
+        super::RepairTargetAdmissionContext::owned_for_test(work_root, scope)
+    }
+
+    /// CR-2 V2: partial output (some clusters have target_paths, some not)
+    /// must NOT be merged with legacy targets. Targetless clusters are left
+    /// untouched and the downstream walker skips them.
+    #[test]
+    fn cb017_mixed_reply_partial_semantic_does_not_merge_legacy() {
+        let cluster_with_targets =
+            super::super::semantic_failure::build_failure_cluster_from_observation(
+                "obs_a",
+                "exp_a",
+                "shape_a",
+                "AssertEq",
+                &[super::super::task_contract::ArtifactRole::Implementation],
+                vec![super::super::semantic_failure::RawClusterTargetCandidate {
+                    raw_path: "src/a.rs".to_string(),
+                    role_hint: None,
+                    reason: "from llm".to_string(),
+                }],
+            );
+        let cluster_without_targets =
+            super::super::semantic_failure::build_failure_cluster_from_observation(
+                "obs_b",
+                "exp_b",
+                "shape_b",
+                "AssertEq",
+                &[super::super::task_contract::ArtifactRole::Implementation],
+                Vec::new(),
+            );
+        let mut report = super::super::semantic_failure::SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_with_targets, cluster_without_targets],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            confidence: 0.7,
+        };
+        let parsed = super::ParsedVerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            probable_cause_role: None,
+            repair_targets: vec![super::ParsedVerifierRepairTarget {
+                path: "legacy/path.rs".to_string(),
+                confidence: 0.5,
+                reason: "legacy".to_string(),
+            }],
+            repair_plan: Vec::new(),
+            secondary_targets: Vec::new(),
+            do_not_edit_tests_without_evidence: false,
+            summary: None,
+        };
+        super::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        // Partial output policy: nothing merged.
+        assert_eq!(
+            report.failure_clusters[0].proposed_target_candidates.len(),
+            1
+        );
+        assert_eq!(
+            report.failure_clusters[0].proposed_target_candidates[0].raw_path,
+            "src/a.rs"
+        );
+        assert!(
+            report.failure_clusters[1]
+                .proposed_target_candidates
+                .is_empty(),
+            "CR-2 V2: targetless cluster must NOT be filled by legacy merge under partial output"
+        );
+    }
+
+    /// CR-2 V2 fallback: every cluster targetless → first cluster gets the
+    /// legacy targets appended (role_hint=None — ParsedVerifierRepairTarget
+    /// has no role).
+    #[test]
+    fn cb017_all_clusters_targetless_merges_legacy_into_first() {
+        let cluster_a = super::super::semantic_failure::build_failure_cluster_from_observation(
+            "obs_a",
+            "exp_a",
+            "shape_a",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let cluster_b = super::super::semantic_failure::build_failure_cluster_from_observation(
+            "obs_b",
+            "exp_b",
+            "shape_b",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let mut report = super::super::semantic_failure::SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_a, cluster_b],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            confidence: 0.7,
+        };
+        let parsed = super::ParsedVerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            probable_cause_role: None,
+            repair_targets: vec![super::ParsedVerifierRepairTarget {
+                path: "legacy/from_targets.rs".to_string(),
+                confidence: 0.5,
+                reason: "from targets list".to_string(),
+            }],
+            repair_plan: vec![
+                super::ParsedVerifierRepairTarget {
+                    path: "legacy/from_plan.rs".to_string(),
+                    confidence: 0.4,
+                    reason: "from plan".to_string(),
+                },
+                // duplicate path must be deduped by merge.
+                super::ParsedVerifierRepairTarget {
+                    path: "legacy/from_targets.rs".to_string(),
+                    confidence: 0.4,
+                    reason: "duplicate".to_string(),
+                },
+            ],
+            secondary_targets: Vec::new(),
+            do_not_edit_tests_without_evidence: false,
+            summary: None,
+        };
+        super::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        let first = &report.failure_clusters[0].proposed_target_candidates;
+        assert_eq!(first.len(), 2, "duplicate path must be deduped");
+        assert_eq!(first[0].raw_path, "legacy/from_targets.rs");
+        assert_eq!(
+            first[0].role_hint, None,
+            "ParsedVerifierRepairTarget has no role"
+        );
+        assert_eq!(first[1].raw_path, "legacy/from_plan.rs");
+        assert!(
+            report.failure_clusters[1]
+                .proposed_target_candidates
+                .is_empty(),
+            "merge only touches the first cluster (slot reuse handles the rest)"
+        );
+    }
+
+    /// CR-1 V2 grep test: `enrich_failure_clusters_with_admitted_targets`
+    /// must invoke `recovery_target_hint_for_diagnostic_path` (SSOT) and
+    /// must NOT directly invoke `admit_repair_target_hint` (which would
+    /// double-gate Owned).
+    #[test]
+    fn cb017_enrich_calls_admission_ssot_exactly_once_per_candidate() {
+        let src = include_str!("turn.rs");
+        let fn_pos = src
+            .find("pub(super) fn enrich_failure_clusters_with_admitted_targets(")
+            .expect("enrich function must exist");
+        // Take a generous slice of the function body (up to the next top-level
+        // `pub(super) fn` / `fn ` declaration).
+        let after = &src[fn_pos..];
+        let next_fn = after[1..]
+            .find("\npub(super) fn ")
+            .or_else(|| after[1..].find("\nfn "))
+            .map(|n| n + 1)
+            .unwrap_or(after.len());
+        let body = &after[..next_fn];
+        assert!(
+            body.contains("recovery_target_hint_for_diagnostic_path"),
+            "enrich must route every candidate through recovery_target_hint_for_diagnostic_path (CR-1 V2 SSOT)"
+        );
+        assert!(
+            !body.contains("admit_repair_target_hint("),
+            "enrich must NOT call admit_repair_target_hint directly — recovery_target_hint_for_diagnostic_path already composes it (CR-1 V2)"
+        );
+    }
+
+    /// CR-3 V2: even when the LLM-supplied `role_hint` disagrees with the
+    /// path classification (here: role_hint=Test but raw_path resolves to an
+    /// implementation file), the admitted hint's role MUST come from the
+    /// path classification.
+    #[test]
+    fn cb017_admitted_role_comes_from_path_classification_not_role_hint() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Create an implementation file at app/main.py (classified as
+        // Implementation by `classify_repo_edit_path`).
+        let impl_file = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(impl_file.parent().unwrap()).unwrap();
+        std::fs::write(&impl_file, "def f(): pass\n").unwrap();
+
+        let mut report = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            vec![super::super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: "app/main.py".to_string(),
+                // Deliberately misleading hint:
+                role_hint: Some(super::super::task_contract::ArtifactRole::Test),
+                reason: "fix it".to_string(),
+            }],
+        );
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+        );
+        let admitted = &report.failure_clusters[0].admitted_cluster_targets;
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "CR-3 V2: admitted role must come from path classification, NOT from role_hint"
+        );
+        assert_eq!(admitted[0].path, "app/main.py");
+    }
+
+    /// CR-5: under UserRequest authority + AssertionMismatch failure, the
+    /// default decision-table ordering places Implementation before Test.
+    #[test]
+    fn cb017_sort_impl_first_under_user_request_authority() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/test_a.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/main.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "default table: impl-first"
+        );
+        assert_eq!(
+            admitted[1].role,
+            super::super::task_contract::ArtifactRole::Test
+        );
+    }
+
+    /// CR-5: TestBug override flips the order — Test must come first.
+    #[test]
+    fn cb017_sort_test_first_when_failure_kind_is_test_bug() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/main.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/test_a.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            super::super::VerifierDiagnosticFailureKind::TestBug,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Test,
+            "TestBug override: test-first"
+        );
+    }
+
+    /// CR-5 defensive: under DependencyMissing, Setup comes first (even
+    /// though SetupRepair dispatch normally short-circuits before sort is
+    /// reached, the branch must exist).
+    #[test]
+    fn cb017_sort_setup_first_for_dependency_missing_defensive() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/main.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Setup,
+                path: "requirements.txt".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::ImplementationContract,
+            super::super::VerifierDiagnosticFailureKind::DependencyMissing,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Setup,
+            "DependencyMissing defensive: setup-first"
+        );
+    }
+
+    /// CR-5 V2: ties are broken by path order so the sort is deterministic
+    /// across runs.
+    #[test]
+    fn cb017_sort_is_stable_with_path_tiebreaker() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/z.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/a.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+        );
+        assert_eq!(
+            admitted[0].path, "app/a.py",
+            "tie-break must be path-sorted"
+        );
+        assert_eq!(admitted[1].path, "app/z.py");
+    }
+
+    /// Security: `../`, absolute path, embedded NUL all rejected by
+    /// `verifier_diagnostic_path_input_is_safe` (which the SSOT
+    /// `recovery_target_hint_for_diagnostic_path` calls). After enrich, no
+    /// admitted target should land in the cluster.
+    #[test]
+    fn cb017_security_unsafe_paths_rejected_by_enrich() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Create a real file so the path-validation step has an existing
+        // file at every "safe" baseline — we want to be sure rejection
+        // happens for the unsafe shapes, not for "file does not exist".
+        let safe = work_root.join("app").join("safe.py");
+        std::fs::create_dir_all(safe.parent().unwrap()).unwrap();
+        std::fs::write(&safe, "x = 1\n").unwrap();
+
+        let cand = |raw_path: &str| super::super::semantic_failure::RawClusterTargetCandidate {
+            raw_path: raw_path.to_string(),
+            role_hint: None,
+            reason: "test".to_string(),
+        };
+        let candidates = vec![
+            cand("../etc/passwd"),
+            cand("/etc/passwd"),
+            cand("app/with\0nul.py"),
+        ];
+        let mut report = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            candidates,
+        );
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+        );
+        assert!(
+            report.failure_clusters[0]
+                .admitted_cluster_targets
+                .is_empty(),
+            "unsafe paths (../, absolute, control chars) must NOT survive enrich admission"
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, §12 #21 — legacy fallback closure):
+    /// when the diagnostic LLM returns ONLY legacy fields (no semantic
+    /// `failure_clusters` schema), the SF1 → CB-017 pipeline must still
+    /// yield an admitted semantic plan:
+    ///
+    /// 1. `parse_semantic_failure_report_from_reply` returns `None` — the
+    ///    reply does not satisfy the semantic schema.
+    /// 2. `build_semantic_failure_report_from_legacy` synthesizes a
+    ///    single-cluster report with **no** proposed target candidates.
+    /// 3. `merge_legacy_targets_into_clusters` populates the first
+    ///    cluster's `proposed_target_candidates` from
+    ///    `parsed.repair_targets` (the "all clusters targetless" branch
+    ///    fires because the synthesized report has exactly one targetless
+    ///    cluster).
+    /// 4. `enrich_failure_clusters_with_admitted_targets` admits each
+    ///    candidate via the SSOT `recovery_target_hint_for_diagnostic_path`
+    ///    — at least one survives because the legacy target points at a
+    ///    real implementation file in the workspace.
+    /// 5. The cluster now carries a non-empty
+    ///    `admitted_cluster_targets` slice → the production callsite
+    ///    keeps the semantic report (non-None) and downstream code can
+    ///    build a `SemanticRepairPlan`.
+    ///
+    /// This is the production-level closure for the legacy-only reply
+    /// case Codex review 4 flagged as the last A''' §12 item.
+    #[test]
+    fn cb017_legacy_only_reply_yields_semantic_plan_via_merge_then_enrich() {
+        use super::super::repair_job::RepairJob;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let impl_file = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(impl_file.parent().unwrap()).unwrap();
+        std::fs::write(&impl_file, "def f():\n    return 200\n").unwrap();
+
+        // Legacy schema: no `failure_clusters` array — only
+        // `probable_cause_role` / `repair_targets` / `summary`.
+        let legacy_reply = r#"{
+            "failure_kind":"assertion_mismatch",
+            "probable_cause_role":"implementation",
+            "repair_targets":[
+                {"target":"app/main.py","reason":"return 201 not 200","confidence":0.9}
+            ],
+            "summary":"impl returns 200 but test expects 201"
+        }"#;
+
+        // Step 1: semantic parse fails on the legacy reply.
+        assert!(
+            super::parse_semantic_failure_report_from_reply(legacy_reply).is_none(),
+            "pre-condition: semantic parse must fail on legacy-only reply",
+        );
+
+        // Step 2: legacy fallback synthesizes a SemanticFailureReport with
+        // a single cluster that has NO proposed target candidates.
+        let parsed = super::parse_verifier_repair_assessment_reply(legacy_reply)
+            .expect("legacy parse must succeed");
+        let job = RepairJob {
+            failure_signature: "tests/test_health.py::test_create AssertionError".to_string(),
+            output_excerpt: "FAILED tests/test_health.py::test_create - assert 200 == 201"
+                .to_string(),
+            ..RepairJob::new_for_test()
+        };
+        let mut report = super::build_semantic_failure_report_from_legacy(&parsed, &job)
+            .expect("legacy fallback must yield a semantic report");
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert!(
+            report.failure_clusters[0]
+                .proposed_target_candidates
+                .is_empty(),
+            "legacy fallback must yield a cluster with NO proposed_target_candidates",
+        );
+        assert!(
+            report.failure_clusters[0]
+                .admitted_cluster_targets
+                .is_empty(),
+            "legacy fallback must yield a cluster with NO admitted_cluster_targets pre-merge",
+        );
+
+        // Step 3: merge — "all clusters targetless" branch fires, the
+        // first cluster gets the legacy `repair_targets` appended.
+        super::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        let candidates = &report.failure_clusters[0].proposed_target_candidates;
+        assert_eq!(
+            candidates.len(),
+            1,
+            "merge must populate proposed_target_candidates from legacy repair_targets",
+        );
+        assert_eq!(candidates[0].raw_path, "app/main.py");
+        assert!(
+            candidates[0].role_hint.is_none(),
+            "merge from legacy: role_hint is always None (ParsedVerifierRepairTarget has no role)",
+        );
+
+        // Step 4: enrich — the SSOT admission gate produces at least one
+        // admitted target because `app/main.py` exists in the workspace.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::ImplementationContract,
+        );
+
+        // Step 5: cluster now carries an admitted target — the
+        // production "all admitted_cluster_targets empty → drop semantic
+        // report" predicate would now be **false**, so the caller keeps
+        // the report and the downstream pipeline can build a
+        // SemanticRepairPlan.
+        let admitted = &report.failure_clusters[0].admitted_cluster_targets;
+        assert!(
+            !admitted.is_empty(),
+            "enrich must admit at least one target from the legacy reply (production-level closure)",
+        );
+        assert_eq!(
+            admitted[0].path, "app/main.py",
+            "admitted path must round-trip the legacy target",
+        );
+        assert!(
+            !report
+                .failure_clusters
+                .iter()
+                .all(|c| c.admitted_cluster_targets.is_empty()),
+            "production gate: report is kept (NOT dropped) because at least one cluster has admitted targets",
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, Codex required change #2 closure): the
+    /// `enrich_failure_clusters_with_admitted_targets` callsite MUST pass
+    /// `SpecAuthority` as an **explicit argument** — not consult some
+    /// implicit helper inside the function body. This is enforced
+    /// structurally at the production callsite in `run_verifier_diagnostic_pass`.
+    ///
+    /// The grep half asserts that the enrich helper's signature names
+    /// `spec_authority` (no implicit helper like `current_spec_authority_for`
+    /// inside the body), and the call-site half observes that two
+    /// different `SpecAuthority` values can be passed and threaded
+    /// through to `sort_admitted_by_authority_role_priority` (the
+    /// authority parameter is currently advisory per the CR-5 V2 decision
+    /// table, but the parameter is structurally wired so future
+    /// authority-conditional branches can be introduced without touching
+    /// the call-sites).
+    #[test]
+    fn cb017_enrich_uses_explicit_spec_authority_argument() {
+        // Grep half: confirm the enrich signature names spec_authority and
+        // the body has no `current_spec_authority_for(` helper invocation.
+        let src = include_str!("turn.rs");
+        let fn_pos = src
+            .find("pub(super) fn enrich_failure_clusters_with_admitted_targets(")
+            .expect("enrich function must exist");
+        let signature_window = &src[fn_pos..fn_pos + 400];
+        assert!(
+            signature_window.contains("spec_authority: super::spec_authority::SpecAuthority"),
+            "enrich must declare SpecAuthority as an explicit named argument (Codex CR #2)",
+        );
+        // Take a generous body slice (up to the next top-level fn).
+        let after = &src[fn_pos..];
+        let next_fn = after[1..]
+            .find("\npub(super) fn ")
+            .or_else(|| after[1..].find("\nfn "))
+            .map(|n| n + 1)
+            .unwrap_or(after.len());
+        let body = &after[..next_fn];
+        assert!(
+            !body.contains("current_spec_authority_for("),
+            "enrich body must NOT consult an implicit `current_spec_authority_for` helper — \
+             SpecAuthority is threaded as an explicit argument (Codex CR #2)",
+        );
+
+        // Behaviour half: confirm the explicit argument is actually
+        // observable by the sort routine — two enrich runs with different
+        // SpecAuthority values successfully complete with the explicit
+        // argument visible to the sort.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let impl_file = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(impl_file.parent().unwrap()).unwrap();
+        std::fs::write(&impl_file, "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+
+        let candidate = |path: &str| super::super::semantic_failure::RawClusterTargetCandidate {
+            raw_path: path.to_string(),
+            role_hint: None,
+            reason: "r".to_string(),
+        };
+        let mut report_user = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            vec![candidate("app/main.py")],
+        );
+        let mut report_contract = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            vec![candidate("app/main.py")],
+        );
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report_user,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+        );
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report_contract,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::ImplementationContract,
+        );
+        // Both runs admit the same single target — different SpecAuthority
+        // values do not crash and produce a determinstic admitted list (the
+        // decision table is advisory under CR-5 V2 but the argument is
+        // structurally wired all the way to the sort routine).
+        assert_eq!(
+            report_user.failure_clusters[0]
+                .admitted_cluster_targets
+                .len(),
+            1
+        );
+        assert_eq!(
+            report_contract.failure_clusters[0]
+                .admitted_cluster_targets
+                .len(),
+            1
+        );
+    }
+
+    /// CB-017 A''' (Commit 5, Codex required change #3 closure):
+    /// `RawClusterTargetCandidate.role_hint` is untrusted advisory data
+    /// (LLM-supplied). Production code must NOT log it as raw metadata —
+    /// the value is consumed only inside the structured sort routines and
+    /// is never threaded into `log_llm_event` / `tracing::info!` /
+    /// `tracing::debug!` / `tracing::warn!` payloads.
+    ///
+    /// This is a structural grep test: production-grade source files in
+    /// `src/agent/loop_run/` must contain no occurrence of
+    /// `role_hint` inside a log payload context. Test fixtures (in
+    /// `#[cfg(test)] mod ...`) are permitted to mention `role_hint` for
+    /// assertions.
+    #[test]
+    fn cb017_role_hint_not_logged_as_raw_metadata() {
+        // We grep each file's production region (everything before the
+        // first `#[cfg(test)]` marker) for prohibited combinations of
+        // `role_hint` with logging macros / helpers.
+        const FILES: &[(&str, &str)] = &[
+            ("turn.rs", include_str!("turn.rs")),
+            ("repair_job.rs", include_str!("repair_job.rs")),
+            ("semantic_failure.rs", include_str!("semantic_failure.rs")),
+        ];
+        for (name, src) in FILES {
+            // Take everything before the first `#[cfg(test)]` block — this
+            // is the production region. Files without a cfg(test) marker
+            // are scanned in full.
+            let prod_region: &str = match src.find("#[cfg(test)]") {
+                Some(idx) => &src[..idx],
+                None => src,
+            };
+            // Forbidden patterns: role_hint appearing on the same line as
+            // a logging entry-point. We use a coarse line scan.
+            for (lineno, line) in prod_region.lines().enumerate() {
+                if !line.contains("role_hint") {
+                    continue;
+                }
+                let in_log_payload = line.contains("log_llm_event")
+                    || line.contains("tracing::info!")
+                    || line.contains("tracing::debug!")
+                    || line.contains("tracing::warn!")
+                    || line.contains("tracing::error!")
+                    || line.contains("tracing::trace!");
+                assert!(
+                    !in_log_payload,
+                    "{name}:{}: role_hint must NOT appear inside a log payload line (Codex CR #3 / DR4-001 advisory boundary)",
+                    lineno + 1
+                );
+            }
+        }
     }
 }
 
