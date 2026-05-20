@@ -383,8 +383,13 @@ pub(super) struct SpecAuthorityInput {
 ///    Returning the lowest authority instead is the safe default — the
 ///    weakening detectors get a chance to block test edits before we
 ///    decide impl is the source of truth.
-/// 5. `consensus.is_some()` → delegate to [`select_authority`] with the
-///    full candidate set so 2-vs-1 tie-break logic applies.
+/// 5. `consensus.is_some()` → apply [`consensus_to_authority_for_resolve`]
+///    directly so the agreeing roles drive authority selection (CB-008).
+///    The previous implementation delegated to [`select_authority`] with a
+///    fixed candidate base `[ImplementationContract, LlmGeneratedTest]`,
+///    which always returned `ImplementationContract` by ordered-enum top
+///    even when test + usage_docs agreed against impl — the consensus
+///    signal became a dead path.
 /// 6. Default fallback → [`SpecAuthority::ImplementationContract`].
 pub(super) fn resolve(input: &SpecAuthorityInput) -> SpecAuthority {
     if input.has_user_request_match {
@@ -400,16 +405,12 @@ pub(super) fn resolve(input: &SpecAuthorityInput) -> SpecAuthority {
         return SpecAuthority::LlmGeneratedTest;
     }
     if let Some(consensus) = input.consensus.as_ref() {
-        // Pass the full candidate set so `select_authority` can apply its
-        // tie-break logic. We include `ImplementationContract` and
-        // `LlmGeneratedTest` as the default candidate base.
-        let candidates = [
-            SpecAuthority::ImplementationContract,
-            SpecAuthority::LlmGeneratedTest,
-        ];
-        if let Some(picked) = select_authority(&candidates, Some(consensus)) {
-            return picked;
-        }
+        // CB-008: apply the agreeing-role mapping directly. We deliberately
+        // do NOT route through `select_authority` here — its `[Impl,
+        // LlmGenTest]` candidate base always returns `Impl` by ordered-enum
+        // top, which silently bypassed the consensus signal for the
+        // test + usage_docs case.
+        return consensus_to_authority_for_resolve(consensus);
     }
     SpecAuthority::ImplementationContract
 }
@@ -432,6 +433,42 @@ fn consensus_to_authority(consensus: Option<&ArtifactConsensus>) -> Option<SpecA
         // available.
         Some(SpecAuthority::LlmGeneratedTest)
     }
+}
+
+/// CB-008: map an `ArtifactConsensus` to a `SpecAuthority` from `resolve`'s
+/// point of view. Unlike [`consensus_to_authority`] (used by
+/// [`select_authority`] as a fallback that must not demote an existing
+/// candidate top), this mapping is the **primary** decision when no
+/// higher-authority signal is available: the agreeing roles drive the
+/// outcome, not the ordered-enum top of a fixed candidate base.
+///
+/// Mapping (closed, deterministic):
+/// - agreeing contains `Implementation` → `ImplementationContract`
+///   (canonical "stale test" case).
+/// - agreeing is `Test` + `UsageDocs` (no `Implementation`) →
+///   `BehaviorContract` — the spec-side (test assertions + user-facing
+///   docs) agrees against the impl, so we elect the spec-side authority
+///   rather than letting the repair editor weaken the test toward buggy
+///   impl. This is the CB-008 bug fix's central case.
+/// - any other agreeing layout (incl. empty / `Test`-only / `UsageDocs`-only)
+///   → `ImplementationContract` as the safe default. A lone Test or lone
+///   docs is too thin to elect `BehaviorContract`; the empty case is
+///   already filtered out at the caller, but we guard it defensively.
+fn consensus_to_authority_for_resolve(consensus: &ArtifactConsensus) -> SpecAuthority {
+    let has_impl = consensus.agreeing.contains(&ArtifactRole::Implementation);
+    let has_test = consensus.agreeing.contains(&ArtifactRole::Test);
+    let has_docs = consensus.agreeing.contains(&ArtifactRole::UsageDocs);
+
+    if has_impl {
+        return SpecAuthority::ImplementationContract;
+    }
+    if has_test && has_docs {
+        // Spec-side 2-vs-1: test assertions and user-facing docs agree
+        // against the implementation. Elect BehaviorContract so the repair
+        // editor cannot weaken the test toward buggy impl.
+        return SpecAuthority::BehaviorContract;
+    }
+    SpecAuthority::ImplementationContract
 }
 
 /// Closed list of test/impl weakening patterns detected at the repair
@@ -1075,6 +1112,53 @@ mod tests {
         };
         // Consensus is present → resolve() takes the tie-break path and
         // elects ImplementationContract, *not* LlmGeneratedTest.
+        assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
+    }
+
+    // -- CB-008: consensus must not be bypassed by select_authority ordering -- //
+
+    #[test]
+    fn cb008_resolve_honors_consensus_when_test_and_usage_docs_agree_against_impl() {
+        // CB-008 regression: test+usage_docs agreeing, impl dissenting.
+        // Pre-fix: resolve() called select_authority(&[Impl, LlmGenTest], …)
+        // which always returns Impl by ordered-enum top, silently bypassing
+        // the consensus signal. Post-fix: the spec-side agreement (test +
+        // docs) elects BehaviorContract so the repair editor cannot rewrite
+        // the test to match buggy impl.
+        let consensus = ArtifactConsensus::new(
+            vec![ArtifactRole::Test, ArtifactRole::UsageDocs],
+            vec![ArtifactRole::Implementation],
+            "test and docs agree on spec",
+        );
+        let input = SpecAuthorityInput {
+            consensus: Some(consensus),
+            ..empty_input()
+        };
+        assert_eq!(resolve(&input), SpecAuthority::BehaviorContract);
+    }
+
+    #[test]
+    fn cb008_resolve_honors_consensus_when_impl_and_usage_docs_agree_against_test() {
+        // CB-008 regression: impl+usage_docs agreeing → ImplementationContract.
+        // This is the most common 2-vs-1 case (stale test); the agreeing side
+        // contains Implementation so the canonical mapping wins.
+        let consensus = ArtifactConsensus::new(
+            vec![ArtifactRole::Implementation, ArtifactRole::UsageDocs],
+            vec![ArtifactRole::Test],
+            "impl and docs agree",
+        );
+        let input = SpecAuthorityInput {
+            consensus: Some(consensus),
+            ..empty_input()
+        };
+        assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
+    }
+
+    #[test]
+    fn cb008_resolve_falls_through_to_implementation_default_when_consensus_is_none() {
+        // CB-008 regression: existing fallback behavior must be preserved
+        // when consensus is None (and no higher-authority flag is set).
+        let input = empty_input();
         assert_eq!(resolve(&input), SpecAuthority::ImplementationContract);
     }
 
