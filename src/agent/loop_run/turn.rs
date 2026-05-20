@@ -9532,6 +9532,22 @@ impl Agent {
                 semantic_plan,
                 new_report.as_ref(),
             );
+            // CB-017 A''': immediately rebind the freshly-landed legacy
+            // assessment to the current semantic-plan cluster so the
+            // controller routes to the new cluster's admitted targets —
+            // not the previous cluster's stale paths surfaced by
+            // `needed_reads` / `repair_plan`. The rebind helper is a no-op
+            // when `semantic_plan = None` (legacy fallback) or when the
+            // current cluster is targetless (caller already skipped it via
+            // `first_repairable_cluster` / `next_repairable_cluster`).
+            //
+            // Path-coverage: this is the `DiagnosticSkip` callsite when
+            // `assign_semantic_plan_preserving_exhausted` walked past an
+            // already-exhausted cluster; for the "new bind" path it
+            // realigns the assessment to the freshly-elected first
+            // cluster. Either way `applied_repair_intents` only clears
+            // on actual cluster-id transition.
+            super::repair_job::rebind_legacy_assessment_to_current_cluster(current);
         }
         log_llm_event(
             "agent.verifier_diagnostic.completed",
@@ -14414,6 +14430,14 @@ fn verifier_repair_context_from_failure(
         assessment_generation: previous_context
             .map(|context| context.assessment_generation)
             .unwrap_or(0),
+        // Issue #647 / CB-017 A''' (CR-4 V2): carry over the cluster-key bind
+        // so `rebind_legacy_assessment_to_current_cluster` can detect cluster
+        // transitions across turn boundaries. A new failure that builds a
+        // fresh `RepairJob` (no previous_context) starts with `None` —
+        // matching the "no semantic plan yet" defaults applied above so the
+        // first rebind after a fresh diagnostic is treated as a new bind.
+        assessment_bound_cluster_id: previous_context
+            .and_then(|context| context.assessment_bound_cluster_id.clone()),
     }
 }
 
@@ -24941,6 +24965,85 @@ export default function App() {
         assert_eq!(
             next.assessment_generation, 5,
             "CB-015: assessment_generation must survive turn boundary via previous_context",
+        );
+    }
+
+    /// Issue #647 / CB-017 A''' (CR-4 V2): `verifier_repair_context_from_failure`
+    /// must carry the `assessment_bound_cluster_id` over the turn boundary so
+    /// `rebind_legacy_assessment_to_current_cluster` can detect cluster-key
+    /// transitions across slot reuse. A fresh failure with no previous
+    /// context starts at `None`; subsequent failures inherit the prior bind.
+    #[test]
+    fn cb017_verifier_repair_context_carries_over_assessment_bound_cluster_id() {
+        use super::repair_job::SemanticRepairPlan;
+        use super::spec_authority::SpecAuthority;
+        use super::task_contract::ArtifactRole;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def main(): pass\n").unwrap();
+        let changed = vec!["app/main.py".to_string()];
+        let output = "FAILED tests/test_api.py::test_x - AssertionError\n1 failed";
+
+        // First cycle: no previous context → bound id starts at None.
+        let mut previous = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        assert!(
+            previous.assessment_bound_cluster_id.is_none(),
+            "CB-017: fresh RepairJob without previous_context starts with bound id None",
+        );
+
+        // Simulate a successful diagnostic + rebind landing on cluster A.
+        let report = super::semantic_failure::parse_semantic_failure_report(&serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "alpha",
+                    "expected": "ALPHA",
+                    "input_shape": "alpha-shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["implementation"],
+                    "affected_cases": ["case_alpha"],
+                }
+            ],
+        }))
+        .expect("report parses");
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+        let prev_plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_a.clone(),
+            semantic_cause: super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        previous.semantic_plan = Some(prev_plan);
+        previous.assessment_bound_cluster_id = Some(cluster_a.clone());
+
+        // Second cycle: previous_context carries the bind forward.
+        let next = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&previous),
+        );
+        assert_eq!(
+            next.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_a),
+            "CB-017: assessment_bound_cluster_id must survive turn boundary via previous_context",
         );
     }
 

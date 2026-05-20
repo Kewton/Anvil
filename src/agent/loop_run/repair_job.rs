@@ -69,6 +69,33 @@ pub(super) struct SemanticRepairPlan {
     pub(super) assessment_generation_at_creation: u32,
 }
 
+impl SemanticRepairPlan {
+    /// CB-017 A''': locate the `FailureCluster` matching this plan's
+    /// `failure_cluster_id` inside the embedded `semantic_report`.
+    ///
+    /// Returns `None` when no cluster with that id is present (defensive —
+    /// production code always seeds the plan from a cluster that already
+    /// lives in the report). This SSOT lookup keeps the cluster-key match
+    /// in one place so `rebind_legacy_assessment_to_current_cluster` and
+    /// any future consumer agree on the predicate.
+    pub(super) fn current_cluster(&self) -> Option<&super::semantic_failure::FailureCluster> {
+        self.semantic_report
+            .failure_clusters
+            .iter()
+            .find(|c| c.cluster_key == self.failure_cluster_id)
+    }
+
+    /// CB-017 A''' (CR-7 V2): the admitted, Owned-validated targets for the
+    /// plan's current cluster. Returns an empty slice when the cluster is
+    /// not found or when the cluster has no admitted targets (targetless
+    /// cluster — caller MUST skip rebinding).
+    pub(super) fn current_cluster_targets(&self) -> &[RecoveryTargetHint] {
+        self.current_cluster()
+            .map(|c| c.admitted_cluster_targets.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
 /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
 /// task-contract verifier. Rename of the previous `VerifierRepairContext`
 /// type. Fields are 1:1 with the legacy definition (see design policy §4-1).
@@ -117,6 +144,21 @@ pub(super) struct RepairJob {
     /// より古い (stale)」か「plan は新 assessment と同じ世代 (まだ re-diagnostic
     /// が走っていない / advance 直後の stale state)」かを区別する。
     pub(super) assessment_generation: u32,
+    /// CB-017 A''': cluster_key-based transition detection.
+    /// `rebind_legacy_assessment_to_current_cluster` でのみ書き換えられ、
+    /// `cluster_key` の差分で `applied_repair_intents.clear()` を判定する。
+    ///
+    /// lifecycle:
+    /// - 初期値 `None` (新規 assessment / legacy fallback)
+    /// - `rebind_legacy_assessment_to_current_cluster` で
+    ///   `Some(plan.failure_cluster_id.clone())` に更新
+    /// - `verifier_repair_context_from_failure` で previous_context から
+    ///   carry over
+    /// - assessment が `None` に落ちる経路 (re-diagnostic 切替) で `None`
+    ///   に reset
+    ///
+    /// turn-local field (session.messages には persist しない)。
+    pub(super) assessment_bound_cluster_id: Option<FailureClusterKey>,
 }
 
 /// Controller-internal decision used by `run_turn` to pick the next action
@@ -321,6 +363,7 @@ impl RepairJob {
             semantic_plan: None,
             exhausted_attempts: Vec::new(),
             assessment_generation: 0,
+            assessment_bound_cluster_id: None,
         }
     }
 }
@@ -873,6 +916,11 @@ pub(super) fn apply_semantic_repair_dispatch_after_rerun(
     if should_re_diagnostic(repair_job) {
         repair_job.assessment = None;
         repair_job.assessment_attempts = repair_job.assessment_attempts.saturating_add(1);
+        // CB-017 A''' (CR-4 V2): assessment が None に落ちる経路では
+        // `assessment_bound_cluster_id` も None に reset しておく — 次の
+        // diagnostic が新 assessment を書き込む直後の rebind 呼び出しで
+        // "新 bind" として扱われ、`applied_repair_intents` が clear される。
+        repair_job.assessment_bound_cluster_id = None;
         return;
     }
 
@@ -918,10 +966,20 @@ pub(super) fn apply_semantic_repair_dispatch_after_rerun(
             new_cluster_id,
             base_outcome,
         ));
+        // CB-017 A''': after `RerunNoProgress` advance, rebind the legacy
+        // assessment slice to the new cluster's admitted targets so the
+        // controller does not keep routing to cluster A's path via
+        // `needed_reads` / `repair_plan`. The plan stamp is "stale" under
+        // this trigger (CB-016), so CB-007/CB-012 will still force a fresh
+        // diagnostic before edits land — but if the diagnostic budget is
+        // exhausted, the rebind already realigned the assessment.
+        rebind_legacy_assessment_to_current_cluster(repair_job);
     } else {
         // No remaining clusters in the report → fall back to re-diagnostic.
         repair_job.assessment = None;
         repair_job.assessment_attempts = repair_job.assessment_attempts.saturating_add(1);
+        // CB-017 A''' (CR-4 V2): re-diagnostic 経路では bound も None に reset。
+        repair_job.assessment_bound_cluster_id = None;
     }
 }
 
@@ -1008,6 +1066,67 @@ pub(super) fn assign_semantic_plan_preserving_exhausted(
     // `advance_to_next_cluster` already mutates `semantic_plan`
     // (either to the next unexhausted cluster or to `None`) and updates the
     // ledger — no further bookkeeping required here.
+}
+
+/// Issue #647 / CB-017 A''' (CR-4 V2 / CR-7 V2): rebind the legacy
+/// `VerifierRepairAssessment.repair_target_hint` / `repair_plan` /
+/// `needed_reads` triple to the current semantic-plan cluster's admitted
+/// targets — SSOT for the §0.1 invariant ("active cluster id ↔ legacy
+/// target set rebound together").
+///
+/// Behaviour:
+/// 1. `semantic_plan == None` → no-op (legacy path is respected as-is).
+/// 2. `current_cluster_targets()` is empty → no-op (caller MUST skip
+///    targetless clusters via `first_repairable_cluster` /
+///    `next_repairable_cluster`).
+/// 3. Otherwise: overwrite `assessment.repair_target_hint` with
+///    `targets[0].clone()` and `assessment.repair_plan` /
+///    `assessment.needed_reads` with `targets.clone()` — the previous
+///    cluster's stale paths are dropped so the verifier-decision routes
+///    only to the current cluster (CR-7 V2 prevents stale cluster A
+///    paths from being re-promoted by the `needed_reads` fallback).
+/// 4. Cluster transition detection uses `assessment_bound_cluster_id`
+///    (CR-4 V2 cluster-key SSOT, not path/role comparison): when the
+///    bound id is `None` OR differs from `plan.failure_cluster_id`,
+///    `applied_repair_intents.clear()` so a previous cluster's repair
+///    history does not gate the new cluster's edit pass.
+/// 5. After the rebind, `assessment_bound_cluster_id` is set to
+///    `Some(plan.failure_cluster_id.clone())` so future calls within the
+///    same cluster do not clear the ledger.
+///
+/// Note: this helper does NOT mutate `applied_repair_intents` beyond the
+/// transition-`clear()` above, and does NOT touch
+/// `assessment_generation` / `assessment_attempts` / `semantic_plan` —
+/// those remain owned by the diagnostic / dispatch machinery (S7-005
+/// boundary).
+pub(super) fn rebind_legacy_assessment_to_current_cluster(repair_job: &mut RepairJob) {
+    let Some(plan) = repair_job.semantic_plan.as_ref() else {
+        return; // semantic_plan = None → legacy 経路尊重
+    };
+    let plan_cluster_id = plan.failure_cluster_id.clone();
+    let targets = plan.current_cluster_targets().to_vec();
+    if targets.is_empty() {
+        return; // targetless cluster は rebind しない (caller が skip 済み想定)
+    }
+    // CR-4 V2: cluster_key ベースで transition 判定。
+    // 未 bind (None) は "new bind" 扱い = transition と見なし
+    // applied_repair_intents を clear する。
+    let is_cluster_transition = repair_job
+        .assessment_bound_cluster_id
+        .as_ref()
+        .map(|bound| bound != &plan_cluster_id)
+        .unwrap_or(true);
+    if let Some(assessment) = repair_job.assessment.as_mut() {
+        // CR-7 V2: Vec<RecoveryTargetHint> を clone で代入。
+        assessment.repair_target_hint = Some(targets[0].clone());
+        assessment.repair_plan = targets.clone();
+        assessment.needed_reads = targets.clone();
+    }
+    if is_cluster_transition {
+        repair_job.applied_repair_intents.clear();
+    }
+    // CR-4 V2: rebind 後は新しい cluster_id に bind。
+    repair_job.assessment_bound_cluster_id = Some(plan_cluster_id);
 }
 
 /// Issue #647 (Phase E.3 / S3-014): wrap the existing
@@ -3313,6 +3432,667 @@ mod tests {
             )
             .is_none(),
             "next_repairable_cluster must skip targetless clusters",
+        );
+    }
+
+    // ─── CB-017 A''' (Commit 4): rebind + assessment_bound_cluster_id ─────
+
+    /// Helper: build a `VerifierRepairAssessment` with caller-supplied
+    /// target slices so transition tests can compare pre/post rebind state
+    /// without re-typing the struct literal at every call site.
+    fn assessment_with_targets(
+        repair_target_hint: Option<RecoveryTargetHint>,
+        repair_plan: Vec<RecoveryTargetHint>,
+        needed_reads: Vec<RecoveryTargetHint>,
+    ) -> super::super::VerifierRepairAssessment {
+        super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Implementation),
+            needed_reads,
+            repair_target_hint,
+            repair_plan,
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        }
+    }
+
+    fn impl_hint(path: &str) -> RecoveryTargetHint {
+        RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: path.to_string(),
+            reason: "rebind fixture".to_string(),
+        }
+    }
+
+    /// CR-4 V2: cluster_key 変化時のみ `applied_repair_intents.clear()`。
+    /// bound = cluster A、plan = cluster B → transition と判定 → clear。
+    #[test]
+    fn cb017_rebind_clears_applied_intents_on_cluster_id_transition() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // semantic_plan は cluster B を指している (admitted targets が seed されている)
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let stale_hint = impl_hint("app/cluster_a.py");
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            assessment: Some(assessment_with_targets(
+                Some(stale_hint.clone()),
+                vec![stale_hint.clone()],
+                vec![stale_hint],
+            )),
+            applied_repair_intents: vec!["intent-from-cluster-a".to_string()],
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        assert!(
+            job.applied_repair_intents.is_empty(),
+            "cluster_key transition (A → B) must clear applied_repair_intents",
+        );
+        assert_eq!(
+            job.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_ids[1]),
+            "bound id must be re-bound to the new cluster",
+        );
+    }
+
+    /// CR-4 V2: bound と plan の cluster_id が一致するときは
+    /// `applied_repair_intents` を維持。
+    #[test]
+    fn cb017_rebind_does_not_clear_applied_intents_within_same_cluster() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        // bound = B (same cluster) → no transition.
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            assessment: Some(assessment_with_targets(
+                Some(impl_hint("app/cluster_b.py")),
+                vec![impl_hint("app/cluster_b.py")],
+                vec![impl_hint("app/cluster_b.py")],
+            )),
+            applied_repair_intents: vec!["intent-for-cluster-b".to_string()],
+            assessment_bound_cluster_id: Some(cluster_ids[1].clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        assert_eq!(
+            job.applied_repair_intents,
+            vec!["intent-for-cluster-b".to_string()],
+            "no cluster_key transition → applied_repair_intents must be preserved",
+        );
+        assert_eq!(
+            job.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_ids[1]),
+            "bound id stays on cluster B",
+        );
+    }
+
+    /// CR-4 V2: path/role が同じでも `cluster_key` が違えば transition。
+    /// path/role 比較ではなく cluster_key の差分で判定することを固定する。
+    #[test]
+    fn cb017_rebind_handles_same_file_role_in_different_clusters() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        // 両 cluster の admitted_cluster_targets を同じ path/role にする
+        // (multi_cluster_report_fixture は idx で path を差別化するので
+        // 手動で揃える)。
+        let shared_hint = impl_hint("app/shared.py");
+        for cluster in report.failure_clusters.iter_mut() {
+            cluster.admitted_cluster_targets = vec![shared_hint.clone()];
+        }
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        assert_ne!(
+            cluster_ids[0], cluster_ids[1],
+            "cluster_keys must differ even when paths are identical",
+        );
+        let role = report.preferred_repair_role;
+
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        // bound = cluster A (same path/role as cluster B).
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            assessment: Some(assessment_with_targets(
+                Some(shared_hint.clone()),
+                vec![shared_hint.clone()],
+                vec![shared_hint],
+            )),
+            applied_repair_intents: vec!["intent-from-cluster-a".to_string()],
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        assert!(
+            job.applied_repair_intents.is_empty(),
+            "CR-4 V2: same path/role but different cluster_key must still be detected as transition",
+        );
+        assert_eq!(
+            job.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_ids[1])
+        );
+    }
+
+    /// CR-7 V2: `needed_reads` is overwritten with the current cluster's
+    /// admitted targets (Vec<RecoveryTargetHint> clone), not the previous
+    /// cluster's stale paths. Closes the `needed_reads` fallback that
+    /// re-promoted cluster A paths after advance.
+    #[test]
+    fn cb017_rebind_writes_needed_reads_to_current_cluster_paths_only() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        // cluster B の admitted targets を確定値に差し替え (multi_cluster fixture は
+        // idx ベースなので、明示する)。
+        let cluster_b_target = impl_hint("app/cluster_b.py");
+        report.failure_clusters[1].admitted_cluster_targets = vec![cluster_b_target.clone()];
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let stale_a = impl_hint("app/cluster_a.py");
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            assessment: Some(assessment_with_targets(
+                Some(stale_a.clone()),
+                vec![stale_a.clone()],
+                vec![stale_a.clone()],
+            )),
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        let updated = job.assessment.as_ref().expect("assessment preserved");
+        assert_eq!(
+            updated.needed_reads,
+            vec![cluster_b_target.clone()],
+            "needed_reads must be overwritten with current cluster targets (no stale cluster A path)",
+        );
+        // Stale A path must not survive anywhere.
+        assert!(
+            !updated.needed_reads.iter().any(|h| h.path == stale_a.path),
+            "stale cluster A path must not appear in needed_reads after rebind",
+        );
+    }
+
+    /// CR-7 V2: `repair_plan` is written as a verbatim clone of the current
+    /// cluster's admitted targets — preserving order and role exactly so the
+    /// controller can iterate the slice without re-classifying.
+    #[test]
+    fn cb017_rebind_writes_repair_plan_as_targets_clone() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        // Multiple targets on cluster B so we can assert order preservation.
+        let t1 = impl_hint("app/b1.py");
+        let t2 = impl_hint("app/b2.py");
+        let t3 = impl_hint("app/b3.py");
+        report.failure_clusters[1].admitted_cluster_targets =
+            vec![t1.clone(), t2.clone(), t3.clone()];
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            assessment: Some(assessment_with_targets(None, Vec::new(), Vec::new())),
+            assessment_bound_cluster_id: None,
+            ..RepairJob::new_for_test()
+        };
+
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        let updated = job.assessment.as_ref().expect("assessment preserved");
+        assert_eq!(
+            updated.repair_plan,
+            vec![t1.clone(), t2.clone(), t3.clone()],
+            "repair_plan must be a verbatim clone of current cluster targets",
+        );
+        assert_eq!(
+            updated.repair_target_hint.as_ref(),
+            Some(&t1),
+            "repair_target_hint must be the first target (clone)",
+        );
+    }
+
+    /// Legacy path preservation: `semantic_plan = None` → rebind is a no-op.
+    #[test]
+    fn cb017_rebind_no_op_when_semantic_plan_none() {
+        let stale_hint = impl_hint("app/legacy.py");
+        let mut job = RepairJob {
+            semantic_plan: None,
+            assessment: Some(assessment_with_targets(
+                Some(stale_hint.clone()),
+                vec![stale_hint.clone()],
+                vec![stale_hint.clone()],
+            )),
+            applied_repair_intents: vec!["legacy-intent".to_string()],
+            assessment_bound_cluster_id: None,
+            ..RepairJob::new_for_test()
+        };
+
+        let before = job.clone();
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        assert_eq!(
+            job, before,
+            "rebind must be a complete no-op when semantic_plan is None",
+        );
+    }
+
+    /// Caller-skipped invariant: targetless cluster (admitted_cluster_targets
+    /// empty) → rebind is a no-op. `first_repairable_cluster` /
+    /// `next_repairable_cluster` already skip these, so reaching the rebind
+    /// helper with an empty target list is defensive.
+    #[test]
+    fn cb017_rebind_no_op_when_cluster_targetless() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        // Clear the second cluster's admitted targets to make it targetless.
+        report.failure_clusters[1].admitted_cluster_targets.clear();
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let stale_a = impl_hint("app/cluster_a.py");
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b),
+            assessment: Some(assessment_with_targets(
+                Some(stale_a.clone()),
+                vec![stale_a.clone()],
+                vec![stale_a.clone()],
+            )),
+            applied_repair_intents: vec!["intent".to_string()],
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        let before = job.clone();
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        assert_eq!(
+            job, before,
+            "rebind must be a complete no-op when the current cluster has no admitted targets",
+        );
+    }
+
+    /// CR-4 V2 carry-over invariant: a fresh-built RepairJob preserves the
+    /// `assessment_bound_cluster_id` field shape across `Clone` so
+    /// `verifier_repair_context_from_failure` can carry it over previous
+    /// turn contexts.
+    #[test]
+    fn cb017_assessment_bound_cluster_id_carry_over_from_previous_context() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+
+        // Mutating the new field breaks PartialEq, confirming the field
+        // participates in equality and `Clone` preserves it.
+        let mut job = RepairJob::new_for_test();
+        assert!(job.assessment_bound_cluster_id.is_none());
+        job.assessment_bound_cluster_id = Some(cluster_a.clone());
+        let cloned = job.clone();
+        assert_eq!(
+            cloned.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_a)
+        );
+        assert_eq!(job, cloned);
+
+        let mut diverged = job.clone();
+        diverged.assessment_bound_cluster_id = None;
+        assert_ne!(job, diverged);
+    }
+
+    /// CR-4 V2: `apply_semantic_repair_dispatch_after_rerun` must reset
+    /// `assessment_bound_cluster_id` to `None` whenever it clears the
+    /// assessment for a re-diagnostic round (both `should_re_diagnostic`
+    /// path and "no more clusters" path).
+    #[test]
+    fn cb017_assessment_bound_cluster_id_reset_on_dispatch_re_diagnostic() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // 1. should_re_diagnostic = true path (plan targets exhausted cluster).
+        let plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_a),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(assessment_with_targets(None, Vec::new(), Vec::new())),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+        assert!(
+            job.assessment.is_none(),
+            "re-diagnostic path clears assessment"
+        );
+        assert!(
+            job.assessment_bound_cluster_id.is_none(),
+            "re-diagnostic (already-exhausted plan) must reset bound id to None",
+        );
+
+        // 2. "no more clusters" path: plan present, rerun bad, no remaining clusters.
+        let report_one =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 1);
+        let only_cluster = report_one.failure_clusters[0].cluster_key.clone();
+        let mut job2 = job_with_first_cluster_plan(&report_one);
+        job2.assessment = Some(assessment_with_targets(None, Vec::new(), Vec::new()));
+        job2.rerun_outcome = Some(VerifierRepairRerunOutcome::Worsened);
+        job2.assessment_bound_cluster_id = Some(only_cluster.clone());
+
+        apply_semantic_repair_dispatch_after_rerun(&mut job2, Some(&only_cluster));
+        assert!(
+            job2.semantic_plan.is_none(),
+            "no more clusters → slot cleared"
+        );
+        assert!(
+            job2.assessment.is_none(),
+            "no more clusters → assessment cleared"
+        );
+        assert!(
+            job2.assessment_bound_cluster_id.is_none(),
+            "no-more-clusters fallback must reset bound id to None",
+        );
+    }
+
+    /// Production-level (CB-017 core fix): `DiagnosticSkip` path rebinds
+    /// the legacy assessment slice to cluster B's admitted targets. This is
+    /// the scenario fired by `assign_semantic_plan_preserving_exhausted`
+    /// inside `run_verifier_diagnostic_pass` when a fresh diagnostic
+    /// re-proposes an already-exhausted cluster A.
+    #[test]
+    fn cb017_diagnostic_skip_rebinds_legacy_assessment_to_cluster_b() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_b_target = impl_hint("app/cluster_b.py");
+        report.failure_clusters[1].admitted_cluster_targets = vec![cluster_b_target.clone()];
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Posture: cluster A exhausted, fresh diagnostic re-proposed A,
+        // dispatch will walk to B via DiagnosticSkip. Legacy assessment
+        // currently still has cluster A paths.
+        let stale_a = impl_hint("app/cluster_a.py");
+        let mut job = RepairJob {
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(assessment_with_targets(
+                Some(stale_a.clone()),
+                vec![stale_a.clone()],
+                vec![stale_a.clone()],
+            )),
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+        let doomed_plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+
+        // Mirror the production sequence:
+        //   1. assign_semantic_plan_preserving_exhausted walks past A to B.
+        //   2. rebind_legacy_assessment_to_current_cluster realigns assessment.
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(doomed_plan_a), Some(&report));
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        let assessment = job.assessment.as_ref().expect("assessment preserved");
+        assert_eq!(
+            assessment.repair_target_hint.as_ref(),
+            Some(&cluster_b_target),
+            "DiagnosticSkip rebind must promote cluster B target as repair_target_hint",
+        );
+        assert_eq!(
+            assessment.repair_plan,
+            vec![cluster_b_target.clone()],
+            "DiagnosticSkip rebind must overwrite repair_plan with cluster B targets",
+        );
+        assert_eq!(
+            assessment.needed_reads,
+            vec![cluster_b_target],
+            "DiagnosticSkip rebind must overwrite needed_reads with cluster B targets",
+        );
+        assert_eq!(
+            job.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_ids[1]),
+            "bound id must now point at cluster B",
+        );
+    }
+
+    /// Production-level: `RerunNoProgress` path (dispatch helper) also
+    /// rebinds the legacy assessment slice — without this, after a rerun
+    /// no-progress advance to cluster B the controller would still route to
+    /// cluster A paths via the legacy needed_reads fallback (the bug CB-017
+    /// closes for the rerun path too).
+    #[test]
+    fn cb017_rerun_no_progress_also_rebinds_legacy_assessment() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_b_target = impl_hint("app/cluster_b.py");
+        report.failure_clusters[1].admitted_cluster_targets = vec![cluster_b_target.clone()];
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let stale_a = impl_hint("app/cluster_a.py");
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_a),
+            assessment: Some(assessment_with_targets(
+                Some(stale_a.clone()),
+                vec![stale_a.clone()],
+                vec![stale_a.clone()],
+            )),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+
+        // Slot walked to cluster B AND assessment slice was rebound.
+        assert_eq!(
+            job.semantic_plan.as_ref().unwrap().failure_cluster_id,
+            cluster_ids[1],
+        );
+        let assessment = job.assessment.as_ref().expect("assessment preserved");
+        assert_eq!(
+            assessment.repair_target_hint.as_ref(),
+            Some(&cluster_b_target),
+            "RerunNoProgress advance must rebind repair_target_hint to cluster B",
+        );
+        assert_eq!(assessment.needed_reads, vec![cluster_b_target]);
+        assert_eq!(
+            job.assessment_bound_cluster_id.as_ref(),
+            Some(&cluster_ids[1]),
+        );
+    }
+
+    /// Production-level (CR-7 V2): after a `DiagnosticSkip` rebind, the
+    /// stale cluster A target must no longer appear anywhere in the
+    /// assessment slice — preventing the `verifier_repair_effective_target_hint`
+    /// fallback from re-promoting it via `needed_reads`.
+    #[test]
+    fn cb017_stale_a_target_not_re_promoted_from_needed_reads() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_b_target = impl_hint("app/cluster_b.py");
+        report.failure_clusters[1].admitted_cluster_targets = vec![cluster_b_target.clone()];
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let stale_a = impl_hint("app/cluster_a.py");
+        let mut job = RepairJob {
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(assessment_with_targets(
+                Some(stale_a.clone()),
+                // Multiple stale entries to make sure none survive.
+                vec![stale_a.clone(), stale_a.clone()],
+                vec![stale_a.clone(), stale_a.clone(), stale_a.clone()],
+            )),
+            assessment_bound_cluster_id: Some(cluster_ids[0].clone()),
+            ..RepairJob::new_for_test()
+        };
+        let doomed_plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(doomed_plan_a), Some(&report));
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+
+        let assessment = job.assessment.as_ref().expect("assessment preserved");
+        let stale_path = stale_a.path.as_str();
+        assert!(
+            !assessment.needed_reads.iter().any(|h| h.path == stale_path),
+            "stale cluster A path must not survive in needed_reads",
+        );
+        assert!(
+            !assessment.repair_plan.iter().any(|h| h.path == stale_path),
+            "stale cluster A path must not survive in repair_plan",
+        );
+        assert!(
+            assessment
+                .repair_target_hint
+                .as_ref()
+                .is_none_or(|h| h.path != stale_path),
+            "stale cluster A path must not remain as repair_target_hint",
         );
     }
 }
