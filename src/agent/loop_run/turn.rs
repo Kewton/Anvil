@@ -16349,6 +16349,31 @@ pub(super) fn verifier_repair_context_target_path(
 pub(super) fn verifier_repair_effective_target_hint(
     context: &super::repair_job::RepairJob,
 ) -> Option<&super::task_contract::RecoveryTargetHint> {
+    // Issue #647 (CB-007): when a `SemanticRepairPlan` is active and the
+    // job has already exhausted at least one prior cluster, the freshly
+    // re-built `assessment.repair_target_hint` can be stale — the
+    // re-diagnostic LLM commonly re-proposes the just-exhausted cluster
+    // because the same failure text is still visible. `assign_semantic_plan_preserving_exhausted`
+    // walks the new plan past the exhausted entry, but nothing rebuilds
+    // the assessment hint to follow that walk. Returning the stale hint
+    // would make the repair editor keep attacking the exhausted cluster.
+    //
+    // We deliberately do NOT try to map `assessment.repair_target_hint.path`
+    // to a `FailureClusterKey` (no such mapping is recorded by the parser),
+    // and we keep the legacy `semantic_plan = None` path bit-for-bit
+    // identical so SetupRepair / pre-semantic flows are unaffected
+    // (DR3-001 / "semantic_plan = None 経路は既存挙動" constraint).
+    //
+    // The conservative rule:
+    //   semantic_plan = Some AND exhausted_attempts non-empty
+    //     → return None (force re-diagnostic against the current cluster).
+    //   semantic_plan = Some AND exhausted_attempts empty
+    //     → plan is fresh, legacy behaviour stands.
+    //   semantic_plan = None
+    //     → legacy behaviour (unchanged).
+    if context.semantic_plan.is_some() && !context.exhausted_attempts.is_empty() {
+        return None;
+    }
     if let Some(assessment) = context.assessment.as_ref() {
         if let Some(next) = assessment
             .repair_plan
@@ -22424,6 +22449,242 @@ E   assert [{'id': 1}] == []\n";
             verifier_repair_decision(true, Some(&context), &[], &work_root, Some(2), 3),
             VerifierRepairDecision::ReadyToVerify
         );
+    }
+
+    // ---- Issue #647 (CB-007): selected_target must follow semantic_plan ---- //
+    //
+    // Background: `verifier_repair_effective_target_hint` historically read
+    // `assessment.repair_plan` / `assessment.repair_target_hint` only, and
+    // ignored the active `semantic_plan`. After Phase E slot reuse pushes a
+    // cluster into `exhausted_attempts` and advances the plan to a new
+    // cluster, a re-diagnostic LLM call can re-propose the exhausted cluster
+    // (it sees the same failure text). `assign_semantic_plan_preserving_exhausted`
+    // walks the new plan past the exhausted entry, but the freshly built
+    // `assessment.repair_target_hint` still points at the old cluster's path.
+    // Without CB-007's guard, the repair editor keeps attacking the exhausted
+    // cluster (CB-007).
+    //
+    // CB-007 fix: when `semantic_plan` is `Some` and the job has already
+    // exhausted at least one prior cluster, the legacy assessment hint is
+    // potentially stale (the diagnostic that produced it cannot be linked
+    // back to a specific cluster id). The conservative behaviour is to
+    // return `None` so the controller forces a re-diagnostic pass instead
+    // of reusing the stale hint. Tests below pin both branches.
+
+    /// CB-007.2 — selected_target follows semantic_plan advancement.
+    ///
+    /// Scenario: cluster A repair attempt failed, was pushed onto
+    /// `exhausted_attempts`, and `semantic_plan` was advanced to cluster B.
+    /// The freshly re-built `assessment.repair_target_hint` still references
+    /// cluster A's path. `verifier_repair_effective_target_hint` MUST NOT
+    /// return that stale hint — it MUST return `None` so the controller
+    /// re-runs diagnostic against the new cluster instead of attacking the
+    /// exhausted one again.
+    #[test]
+    fn cb007_selected_target_follows_semantic_plan_advancement() {
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use super::super::semantic_failure::{
+            ContractConflict, SemanticFailureReport, build_failure_cluster_from_observation,
+        };
+        use super::super::spec_authority::SpecAuthority;
+
+        // Build a 2-cluster report (A then B) with the same preferred role.
+        let cluster_a = build_failure_cluster_from_observation(
+            "200 OK",
+            "201 Created",
+            "POST /todos",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+        );
+        let cluster_b = build_failure_cluster_from_observation(
+            "missing field",
+            "field present",
+            "GET /todos",
+            "AssertContains",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+        );
+        let cluster_a_id = cluster_a.cluster_key.clone();
+        let cluster_b_id = cluster_b.cluster_key.clone();
+        assert_ne!(
+            cluster_a_id, cluster_b_id,
+            "fixture sanity: distinct cluster ids"
+        );
+
+        let report = SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_a, cluster_b],
+            contract_conflict: ContractConflict {
+                implementation: "returns 200".to_string(),
+                test: "expects 201".to_string(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            confidence: 0.9,
+        };
+
+        // semantic_plan now targets cluster B (after advance_to_next_cluster).
+        let plan_b = SemanticRepairPlan {
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            failure_cluster_id: cluster_b_id.clone(),
+            expected_improvement: None,
+            semantic_report: report,
+        };
+
+        // Stale assessment from the re-diagnostic re-points at cluster A's path.
+        let stale_hint_a = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/todos.py".to_string(),
+            reason: "re-diagnostic re-proposed cluster A".to_string(),
+        };
+        let job = RepairJob {
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: super::super::VerifierFailureType::AssertionFailure,
+                probable_cause_role: Some(
+                    super::super::task_contract::ArtifactRole::Implementation,
+                ),
+                needed_reads: vec![stale_hint_a.clone()],
+                repair_target_hint: Some(stale_hint_a.clone()),
+                repair_plan: vec![stale_hint_a.clone()],
+                summary: Some("re-diagnostic".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            semantic_plan: Some(plan_b),
+            // ledger holds the previously attacked (cluster_a, Implementation):
+            exhausted_attempts: vec![(
+                cluster_a_id.clone(),
+                super::super::spec_authority::RepairRole::Implementation,
+            )],
+            ..RepairJob::new_for_test()
+        };
+
+        // CB-007: the stale assessment hint must NOT be surfaced when the
+        // semantic_plan has advanced past an exhausted cluster — the
+        // function must return None so the controller forces re-diagnostic.
+        assert!(
+            verifier_repair_effective_target_hint(&job).is_none(),
+            "CB-007: stale assessment.repair_target_hint (cluster A path) must \
+             not be returned after semantic_plan advanced to cluster B; \
+             expected None (force re-diagnostic), got Some",
+        );
+    }
+
+    /// CB-007.2 — regression guard: when `semantic_plan` is `Some` and no
+    /// cluster has been exhausted yet (the plan is freshly built and matches
+    /// the assessment), the function MUST keep returning the assessment hint
+    /// unchanged. This pins the "matching cluster" branch so the CB-007 guard
+    /// does not over-fire.
+    #[test]
+    fn cb007_selected_target_uses_assessment_when_cluster_matches() {
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use super::super::semantic_failure::{
+            ContractConflict, SemanticFailureReport, build_failure_cluster_from_observation,
+        };
+        use super::super::spec_authority::SpecAuthority;
+
+        let cluster_a = build_failure_cluster_from_observation(
+            "200 OK",
+            "201 Created",
+            "POST /todos",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+        );
+        let cluster_a_id = cluster_a.cluster_key.clone();
+        let report = SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_a],
+            contract_conflict: ContractConflict {
+                implementation: "returns 200".to_string(),
+                test: "expects 201".to_string(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            confidence: 0.9,
+        };
+        let plan_a = SemanticRepairPlan {
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "impl mismatch".to_string(),
+            failure_cluster_id: cluster_a_id,
+            expected_improvement: None,
+            semantic_report: report,
+        };
+
+        let hint_a = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/todos.py".to_string(),
+            reason: "first diagnostic".to_string(),
+        };
+        let job = RepairJob {
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: super::super::VerifierFailureType::AssertionFailure,
+                probable_cause_role: Some(
+                    super::super::task_contract::ArtifactRole::Implementation,
+                ),
+                needed_reads: vec![hint_a.clone()],
+                repair_target_hint: Some(hint_a.clone()),
+                repair_plan: vec![hint_a.clone()],
+                summary: Some("first diagnostic".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            semantic_plan: Some(plan_a),
+            // exhausted_attempts is empty: plan is fresh, no advancement yet.
+            exhausted_attempts: Vec::new(),
+            ..RepairJob::new_for_test()
+        };
+
+        // semantic_plan matches the assessment (no cluster has been exhausted
+        // yet) → assessment hint is returned unchanged.
+        let returned = verifier_repair_effective_target_hint(&job)
+            .expect("matching-cluster branch must return the assessment hint");
+        assert_eq!(returned.path, "app/todos.py");
+        assert_eq!(
+            returned.role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+    }
+
+    /// CB-007.3 — legacy regression guard: `semantic_plan = None` callers
+    /// must keep the pre-CB-007 behaviour (return assessment.repair_target_hint
+    /// regardless of `exhausted_attempts`). This guards against the new branch
+    /// accidentally firing on the legacy / SetupRepair code paths.
+    #[test]
+    fn cb007_selected_target_legacy_path_unchanged_when_semantic_plan_none() {
+        use super::super::repair_job::RepairJob;
+
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "legacy".to_string(),
+        };
+        let job = RepairJob {
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::RuntimeError,
+                failure_type: super::super::VerifierFailureType::RuntimeError,
+                probable_cause_role: Some(
+                    super::super::task_contract::ArtifactRole::Implementation,
+                ),
+                needed_reads: vec![hint.clone()],
+                repair_target_hint: Some(hint.clone()),
+                repair_plan: vec![hint.clone()],
+                summary: Some("legacy assessment".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            semantic_plan: None,
+            exhausted_attempts: Vec::new(),
+            ..RepairJob::new_for_test()
+        };
+
+        let returned = verifier_repair_effective_target_hint(&job)
+            .expect("legacy path must still return assessment hint when semantic_plan is None");
+        assert_eq!(returned.path, "app/main.py");
     }
 
     #[test]
