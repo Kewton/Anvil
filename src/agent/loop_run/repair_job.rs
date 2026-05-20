@@ -56,6 +56,17 @@ pub(super) struct SemanticRepairPlan {
     pub(super) repair_hypothesis: String,
     /// rerun 後に書き込まれる予測対比の結果。未 rerun 時は `None`。
     pub(super) expected_improvement: Option<VerifierRepairRerunOutcome>,
+    /// Issue #647 (CB-015): `RepairJob.assessment_generation` の値を、
+    /// この `SemanticRepairPlan` が構築された **時点** で coil した snapshot。
+    ///
+    /// re-diagnostic が完了して新しい assessment が書き込まれると
+    /// `RepairJob.assessment_generation` は `+1` される — それより前に
+    /// 作られた plan は `plan.assessment_generation_at_creation <
+    /// repair_job.assessment_generation` となり、stale ではなく
+    /// **fresh** assessment と組み合わさった "post re-diagnostic" 状態
+    /// として区別される (CB-007 / CB-012 / CB-013 / CB-014 ガードは
+    /// この比較で stale を判定する)。
+    pub(super) assessment_generation_at_creation: u32,
 }
 
 /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
@@ -96,6 +107,16 @@ pub(super) struct RepairJob {
     /// `slot reuse` でも保持される (per-cluster ではない) — 同じ
     /// `(FailureClusterKey, RepairRole)` 組み合わせを 2 度 attack しないため。
     pub(super) exhausted_attempts: Vec<(FailureClusterKey, RepairRole)>,
+    /// Issue #647 (CB-015): "assessment は何代目か" を first-class state に
+    /// した generation counter。`run_verifier_diagnostic_pass` が新 assessment
+    /// を書き込むたびに `+= 1`、`verifier_repair_context_from_failure` は
+    /// previous_context から carry over する。
+    ///
+    /// `SemanticRepairPlan.assessment_generation_at_creation` と比較する
+    /// ことで CB-007/CB-012/CB-013/CB-014 のガードは「plan は新 assessment
+    /// より古い (stale)」か「plan は新 assessment と同じ世代 (まだ re-diagnostic
+    /// が走っていない / advance 直後の stale state)」かを区別する。
+    pub(super) assessment_generation: u32,
 }
 
 /// Controller-internal decision used by `run_turn` to pick the next action
@@ -299,6 +320,7 @@ impl RepairJob {
             repair_attempt: 0,
             semantic_plan: None,
             exhausted_attempts: Vec::new(),
+            assessment_generation: 0,
         }
     }
 }
@@ -374,6 +396,47 @@ fn truncate_chars_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Issue #647 (CB-015): SSOT predicate for "the active `semantic_plan` is
+/// stale" — i.e. the plan was constructed under the *same* assessment that
+/// is currently sitting in `RepairJob.assessment`, and at least one cluster
+/// has already been pushed onto `exhausted_attempts`.
+///
+/// "Stale" means: the cluster pointer has advanced (e.g. cluster B is now in
+/// the slot after A was exhausted), but the assessment / repair-target hint
+/// was generated for the **previous** cluster and no re-diagnostic has run
+/// yet to refresh it. Returning `true` here is the precondition for CB-007
+/// (hint guard returns `None`), CB-012/CB-014 (decision routes to
+/// `NeedDiagnostic` / `DiagnosticUnavailable`), and CB-013 (diagnostic
+/// runner clears the stale assessment before its `Skipped` short-circuit
+/// fires).
+///
+/// "Fresh" means: after a re-diagnostic has bumped
+/// `RepairJob.assessment_generation`, the plan's
+/// `assessment_generation_at_creation` is strictly less than the job's
+/// generation — the assessment in the slot was rebuilt *after* the plan
+/// was last advanced, so the hint is no longer stale and CB-007 should
+/// step out of the way so the controller can route to `NeedFreshRead` /
+/// `NeedEdit` on cluster B.
+///
+/// Returns `false` when:
+/// - `semantic_plan` is `None` (legacy / SetupRepair path),
+/// - `exhausted_attempts` is empty (fresh first-cluster state, never advanced),
+/// - the plan's `assessment_generation_at_creation` is strictly less than
+///   `RepairJob.assessment_generation` (re-diagnostic produced a fresh
+///   assessment after the last advance).
+pub(super) fn semantic_plan_is_stale(job: &RepairJob) -> bool {
+    let Some(plan) = job.semantic_plan.as_ref() else {
+        return false;
+    };
+    if job.exhausted_attempts.is_empty() {
+        return false;
+    }
+    // Plan was created at or after the current assessment generation →
+    // no re-diagnostic has refreshed the assessment since the plan was
+    // advanced. The plan is stale relative to its own assessment.
+    plan.assessment_generation_at_creation >= job.assessment_generation
+}
+
 /// Pure function moved from `turn.rs`. Drives the verifier-repair state
 /// machine using `messages` (for fresh-read detection) and `work_root`
 /// (for target-path resolution). Behaviour and ordering are identical to
@@ -411,11 +474,11 @@ pub(super) fn verifier_repair_decision(
     if job.is_some_and(|job| job.assessment.is_none()) {
         return VerifierRepairDecision::DiagnosticUnavailable;
     }
-    // Issue #647 (CB-012 / CB-014): When semantic_plan is active but
-    // the assessment was constructed before exhausted_attempts grew
-    // (= the hint guard in `verifier_repair_context_target_path`
-    // returns `None` because exhausted_attempts is non-empty), the
-    // assessment is **stale**. Two branches:
+    // Issue #647 (CB-012 / CB-014 / CB-015): When semantic_plan is active
+    // but the assessment was constructed before the plan advanced to its
+    // current cluster (= `semantic_plan_is_stale` returns `true`), the
+    // assessment is stale and the repair-target hint guard in
+    // `verifier_repair_context_target_path` returns `None`. Two branches:
     //
     //   * **CB-012** (attempts remain): force a fresh diagnostic so
     //     the next assessment reflects the advanced cluster. Without
@@ -428,11 +491,17 @@ pub(super) fn verifier_repair_decision(
     //     boundary because `assessment.is_some()` keeps the earlier
     //     `assessment.is_none() -> DiagnosticUnavailable` arm from
     //     firing.
-    if job.is_some_and(|job| {
-        job.semantic_plan.is_some()
-            && !job.exhausted_attempts.is_empty()
-            && super::turn::verifier_repair_context_target_path(work_root, job).is_none()
-    }) {
+    //
+    // **CB-015** (architectural refactor): the stale-state predicate now
+    // uses `semantic_plan_is_stale` which compares
+    // `plan.assessment_generation_at_creation` against
+    // `RepairJob.assessment_generation`. After a re-diagnostic bumps the
+    // job's generation, the predicate flips to `false` (fresh state) and
+    // the controller can advance to `NeedFreshRead` / `NeedEdit` on the
+    // current cluster — closing the liveness gap where cluster B repair
+    // could never start because the same exhausted_attempts-based predicate
+    // kept routing back to `NeedDiagnostic`.
+    if job.is_some_and(semantic_plan_is_stale) {
         if job.is_some_and(|job| {
             job.assessment_attempts
                 < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
@@ -463,8 +532,8 @@ pub(super) fn verifier_repair_decision(
     }
 }
 
-/// Issue #647 (CB-013): detect the "advanced semantic_plan + stale
-/// assessment" state that CB-012 catches in the decision layer.
+/// Issue #647 (CB-013 / CB-015): detect the "advanced semantic_plan +
+/// stale assessment" state that CB-012 catches in the decision layer.
 ///
 /// The diagnostic runner (`run_verifier_diagnostic_pass` in `turn.rs`)
 /// consults this helper to know whether to clear the stale assessment
@@ -475,22 +544,22 @@ pub(super) fn verifier_repair_decision(
 /// to actually run because the stale assessment from the previous
 /// cluster is still in the slot.
 ///
-/// The predicate mirrors the CB-007 / CB-012 invariant:
-/// * `assessment.is_some()` — a stale assessment exists
-/// * `semantic_plan.is_some()` — we are inside a semantic plan
-/// * `!exhausted_attempts.is_empty()` — at least one cluster has been
-///   exhausted, i.e. the plan has advanced
-/// * `verifier_repair_context_target_path(...) == None` — the CB-007 hint
-///   guard is already returning None for this state, confirming the
-///   assessment is stale
+/// The predicate composes:
+/// * `assessment.is_some()` — a stale assessment exists to clear
+/// * `semantic_plan_is_stale(job)` — CB-015 generation-aware staleness
+///   (subsumes the legacy `semantic_plan.is_some() &&
+///   !exhausted_attempts.is_empty()` shape, and additionally flips to
+///   `false` once a re-diagnostic has refreshed the assessment).
+///
+/// `work_root` is no longer consulted: stale detection lives entirely
+/// on the `RepairJob` generation fields, so the predicate is now
+/// O(1) and independent of filesystem state. The argument is retained
+/// for the existing call-site signature; future cleanup may remove it.
 pub(super) fn has_stale_assessment_after_cluster_advance(
     job: &RepairJob,
-    work_root: &Path,
+    _work_root: &Path,
 ) -> bool {
-    job.assessment.is_some()
-        && job.semantic_plan.is_some()
-        && !job.exhausted_attempts.is_empty()
-        && super::turn::verifier_repair_context_target_path(work_root, job).is_none()
+    job.assessment.is_some() && semantic_plan_is_stale(job)
 }
 
 /// Adapter moved from `turn.rs::Agent::task_contract_repair_state()`. Pure
@@ -621,6 +690,16 @@ pub(super) fn advance_to_next_cluster(
     //    uses when no higher-authority signal fires.
     let spec_authority = carried_authority.unwrap_or(SpecAuthority::ImplementationContract);
 
+    // Issue #647 (CB-015): the new plan's generation snapshot is set to
+    // the **current** `RepairJob.assessment_generation`. This intentionally
+    // creates a "stale" state immediately after a cluster advance:
+    // `plan.assessment_generation_at_creation == job.assessment_generation`
+    // → `semantic_plan_is_stale` returns `true` → CB-007/CB-012 force a
+    // re-diagnostic against the new cluster. Once that re-diagnostic
+    // increments `RepairJob.assessment_generation`, the comparison
+    // flips and the controller proceeds to repair the freshly-diagnosed
+    // cluster (the liveness gap CB-015 closes).
+    let assessment_generation_at_creation = repair_job.assessment_generation;
     repair_job.semantic_plan = Some(SemanticRepairPlan {
         semantic_cause: report.failure_kind,
         spec_authority,
@@ -629,6 +708,7 @@ pub(super) fn advance_to_next_cluster(
         failure_cluster_id: next_cluster.cluster_key.clone(),
         expected_improvement: None,
         semantic_report: report.clone(),
+        assessment_generation_at_creation,
     });
     true
 }
@@ -959,6 +1039,7 @@ mod tests {
             preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
             repair_hypothesis: "h".to_string(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let plan_b = SemanticRepairPlan {
             semantic_report: report,
@@ -968,6 +1049,7 @@ mod tests {
             preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
             repair_hypothesis: "h".to_string(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         assert_eq!(plan_a, plan_b);
     }
@@ -984,6 +1066,7 @@ mod tests {
             preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
             repair_hypothesis: "h".to_string(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut different_authority = base.clone();
         different_authority.spec_authority = SpecAuthority::LlmGeneratedTest;
@@ -1060,6 +1143,7 @@ mod tests {
             preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
             repair_hypothesis: "h".to_string(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let a = RepairJob {
             semantic_plan: Some(plan.clone()),
@@ -1149,6 +1233,7 @@ mod tests {
             preferred_repair_role: report.preferred_repair_role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         RepairJob {
             semantic_plan: Some(plan),
@@ -1294,6 +1379,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let job = RepairJob {
             semantic_plan: Some(plan),
@@ -1311,6 +1397,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let job2 = RepairJob {
             semantic_plan: Some(plan2),
@@ -1517,6 +1604,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut job = RepairJob {
             semantic_plan: Some(plan),
@@ -1718,6 +1806,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
 
         assign_semantic_plan_preserving_exhausted(&mut job, Some(new_plan), Some(&report));
@@ -1761,6 +1850,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
 
         assign_semantic_plan_preserving_exhausted(&mut job, Some(doomed_plan), Some(&report));
@@ -1803,6 +1893,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
 
         assign_semantic_plan_preserving_exhausted(&mut job, Some(any_plan), Some(&report));
@@ -1841,6 +1932,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
 
         assign_semantic_plan_preserving_exhausted(&mut job, Some(doomed), Some(&report));
@@ -1913,6 +2005,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
 
         // (5) MF2 V3.1 router → must skip A and land on B.
@@ -1961,6 +2054,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut job = RepairJob {
             semantic_plan: Some(plan_b),
@@ -1978,6 +2072,7 @@ mod tests {
                 preferred_repair_role: role,
                 repair_hypothesis: report.repair_hypothesis.clone(),
                 expected_improvement: None,
+                assessment_generation_at_creation: 0,
             };
             assign_semantic_plan_preserving_exhausted(&mut job, Some(re_diag_plan), Some(&report));
             // After every router call, A remains exhausted; B is the slot.
@@ -2024,6 +2119,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut job = RepairJob {
             semantic_plan: Some(plan),
@@ -2067,6 +2163,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut job = RepairJob {
             semantic_plan: Some(plan),
@@ -2112,6 +2209,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut job = RepairJob {
             semantic_plan: Some(plan),
@@ -2185,6 +2283,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let stale_hint = RecoveryTargetHint {
             role: super::super::task_contract::ArtifactRole::Implementation,
@@ -2238,6 +2337,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let job = RepairJob {
             semantic_plan: Some(plan),
@@ -2285,6 +2385,7 @@ mod tests {
             preferred_repair_role: role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let job = RepairJob {
             semantic_plan: Some(plan),
@@ -2327,6 +2428,250 @@ mod tests {
             !has_stale_assessment_after_cluster_advance(&job, &work_root),
             "CB-013: semantic_plan None → helper must not fire",
         );
+    }
+
+    // ---- Issue #647 (CB-015): stale↔fresh distinction via assessment_generation ---- //
+
+    /// CB-015.1: a freshly-built RepairJob has `assessment_generation == 0`
+    /// and `semantic_plan_is_stale` is `false` (no plan, no exhausted
+    /// attempts). The legacy zero-init posture is preserved.
+    #[test]
+    fn cb015_new_job_starts_with_generation_zero_and_is_not_stale() {
+        let job = RepairJob::new_for_test();
+        assert_eq!(job.assessment_generation, 0);
+        assert!(!semantic_plan_is_stale(&job));
+    }
+
+    /// CB-015.2 (core stale state): after a cluster advance, the new plan is
+    /// `assessment_generation_at_creation == job.assessment_generation`
+    /// AND `!exhausted_attempts.is_empty()` → `semantic_plan_is_stale`
+    /// fires. This is the precondition where CB-007 / CB-012 must force
+    /// re-diagnostic.
+    #[test]
+    fn cb015_stale_state_after_cluster_advance_returns_true() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let mut job = job_with_first_cluster_plan(&report);
+        // The fixture sets job.assessment_generation = 0 (default). The
+        // initial plan is also at generation 0 — but `exhausted_attempts`
+        // is empty, so the plan is not yet stale.
+        assert!(!semantic_plan_is_stale(&job));
+
+        // Simulate a "diagnostic landed at generation 1" baseline (so the
+        // initial plan from `job_with_first_cluster_plan` looks fresh
+        // post-bump). This mirrors the production sequencing in
+        // `run_verifier_diagnostic_pass`.
+        job.assessment_generation = 1;
+        assert!(!semantic_plan_is_stale(&job)); // empty exhausted_attempts
+
+        // Now advance to cluster B → the new plan is created with
+        // `assessment_generation_at_creation = job.assessment_generation = 1`
+        // AND cluster A is pushed onto `exhausted_attempts`. The stale
+        // predicate must fire.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(
+            semantic_plan_is_stale(&job),
+            "CB-015: post-advance, plan.gen == job.gen and exhausted non-empty → stale must be true",
+        );
+        assert_eq!(
+            job.semantic_plan
+                .as_ref()
+                .unwrap()
+                .assessment_generation_at_creation,
+            1,
+            "advance must coil the current job.gen into the new plan",
+        );
+    }
+
+    /// CB-015.3 (fresh state): once a re-diagnostic bumps
+    /// `RepairJob.assessment_generation`, the plan's
+    /// `assessment_generation_at_creation` becomes strictly less than the
+    /// job's generation → `semantic_plan_is_stale` flips back to `false`.
+    /// This is the architectural change that lets CB-007 / CB-012 step
+    /// out of the way after a re-diagnostic has refreshed the assessment.
+    #[test]
+    fn cb015_post_re_diagnostic_fresh_state_is_not_stale() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let mut job = job_with_first_cluster_plan(&report);
+        job.assessment_generation = 1;
+        // Advance to cluster B → stale precondition.
+        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(semantic_plan_is_stale(&job));
+
+        // Simulate `run_verifier_diagnostic_pass` writing a new assessment:
+        // bump `assessment_generation` by 1. The slot still holds the
+        // cluster-B plan with `assessment_generation_at_creation == 1`.
+        job.assessment_generation = 2;
+        assert!(
+            !semantic_plan_is_stale(&job),
+            "CB-015: after re-diagnostic bump, plan.gen < job.gen → stale must be false",
+        );
+    }
+
+    /// CB-015.4 (decision integration): the `verifier_repair_decision`
+    /// state machine routes a stale state through `NeedDiagnostic`, and a
+    /// fresh state (post-re-diagnostic) through the normal target
+    /// resolution path (`NeedTargetDiscovery` here because the test
+    /// fixture's `repair_target_hint` path does not exist on disk; the
+    /// essential invariant is "no longer `NeedDiagnostic`").
+    #[test]
+    fn cb015_decision_routes_fresh_state_past_need_diagnostic() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let stale_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/stale.py".to_string(),
+            reason: "stale".to_string(),
+        };
+
+        // Stale state: plan.gen == job.gen, exhausted non-empty.
+        let mut job = RepairJob {
+            semantic_plan: Some(SemanticRepairPlan {
+                semantic_report: report.clone(),
+                failure_cluster_id: cluster_ids[1].clone(),
+                semantic_cause: report.failure_kind,
+                spec_authority: SpecAuthority::ImplementationContract,
+                preferred_repair_role: role,
+                repair_hypothesis: report.repair_hypothesis.clone(),
+                expected_improvement: None,
+                assessment_generation_at_creation: 1,
+            }),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: Some(stale_hint.clone()),
+                repair_plan: vec![stale_hint],
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            assessment_attempts: 0,
+            assessment_generation: 1,
+            ..RepairJob::new_for_test()
+        };
+
+        // Stale → NeedDiagnostic (CB-012 path via CB-015 predicate).
+        let dec = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-015 stale state must route to NeedDiagnostic",
+        );
+
+        // Now simulate re-diagnostic bumping `assessment_generation` →
+        // plan becomes fresh.
+        job.assessment_generation = 2;
+        assert!(!semantic_plan_is_stale(&job));
+
+        // Fresh → no longer NeedDiagnostic. The decision falls through to
+        // the normal target-resolution branches.
+        let dec_fresh = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(1), 1);
+        assert_ne!(
+            dec_fresh,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-015 fresh state must NOT route to NeedDiagnostic — \
+             the controller can now proceed to NeedFreshRead/NeedEdit/etc.",
+        );
+        assert_ne!(
+            dec_fresh,
+            VerifierRepairDecision::DiagnosticUnavailable,
+            "CB-015 fresh state must NOT fail closed as DiagnosticUnavailable",
+        );
+    }
+
+    /// CB-015.5 (CB-013 helper integration): once the assessment is fresh
+    /// (post-re-diagnostic generation bump), `has_stale_assessment_after_cluster_advance`
+    /// no longer fires — the diagnostic runner's `Skipped` short-circuit
+    /// returns to its normal posture instead of being pre-empted.
+    #[test]
+    fn cb015_has_stale_assessment_fires_only_for_stale_generation() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        let mut job = RepairJob {
+            semantic_plan: Some(SemanticRepairPlan {
+                semantic_report: report.clone(),
+                failure_cluster_id: cluster_ids[1].clone(),
+                semantic_cause: report.failure_kind,
+                spec_authority: SpecAuthority::ImplementationContract,
+                preferred_repair_role: role,
+                repair_hypothesis: report.repair_hypothesis.clone(),
+                expected_improvement: None,
+                assessment_generation_at_creation: 1,
+            }),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: None,
+                repair_plan: Vec::new(),
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            assessment_generation: 1,
+            ..RepairJob::new_for_test()
+        };
+
+        // Stale: helper fires.
+        assert!(has_stale_assessment_after_cluster_advance(&job, &work_root));
+
+        // Fresh (re-diagnostic bumped gen): helper must NOT fire — the
+        // assessment now belongs to the current cluster, no need to
+        // clear it before the next diagnostic call.
+        job.assessment_generation = 2;
+        assert!(
+            !has_stale_assessment_after_cluster_advance(&job, &work_root),
+            "CB-015: post-re-diagnostic fresh assessment must NOT trigger the stale-clear helper",
+        );
+    }
+
+    /// CB-015.6 (carryover invariant): `verifier_repair_context_from_failure`
+    /// carries `assessment_generation` over the turn boundary. This pin
+    /// guards the SSOT carryover so a future refactor cannot silently
+    /// drop the generation field across slot reuse.
+    ///
+    /// The actual production carryover lives in `turn.rs`; we verify the
+    /// field shape here by constructing a job with a non-zero generation,
+    /// cloning the field through the public API, and asserting it survives.
+    #[test]
+    fn cb015_assessment_generation_field_is_copyable_and_survives_clone() {
+        let mut job = RepairJob::new_for_test();
+        job.assessment_generation = 7;
+        let cloned = job.clone();
+        assert_eq!(cloned.assessment_generation, 7);
+        // PartialEq still holds across the new field.
+        assert_eq!(job, cloned);
+        // Mutating the new field breaks equality, confirming the field
+        // participates in `PartialEq`.
+        let mut bumped = job.clone();
+        bumped.assessment_generation = 8;
+        assert_ne!(job, bumped);
     }
 
     // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //

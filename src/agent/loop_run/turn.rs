@@ -9411,10 +9411,23 @@ impl Agent {
             semantic_report.as_ref(),
             agent_history_hint,
         );
+        // Issue #647 (CB-015): the new plan's generation snapshot uses the
+        // **pre-bump** `assessment_generation`. The live `RepairJob.assessment_generation`
+        // is incremented below in lock-step with the new assessment landing
+        // in the slot, so after the bump:
+        //   plan.assessment_generation_at_creation == pre_bump_gen
+        //   job.assessment_generation              == pre_bump_gen + 1
+        // → `plan.gen < job.gen` → `semantic_plan_is_stale` returns `false`
+        // (fresh). This is the SSOT signal that the assessment in the slot
+        // is the one this plan was built against — the controller can route
+        // to NeedFreshRead/NeedEdit instead of looping back to
+        // NeedDiagnostic on the same cluster.
+        let pre_bump_assessment_generation = context.assessment_generation;
         let semantic_plan = semantic_report.and_then(|report| {
             build_semantic_repair_plan_from_report_with_authority_input(
                 report,
                 authority_input.clone(),
+                pre_bump_assessment_generation,
             )
         });
         // Issue #647 (§5.1 SSOT plumbing): build the path-local admission
@@ -9455,6 +9468,22 @@ impl Agent {
             current.diagnostic_error = None;
             current.diagnostic_unavailable = false;
             current.assessment = Some(assessment);
+            // Issue #647 (CB-015): bump `assessment_generation` in lock-step
+            // with the new assessment landing in the slot. Combined with the
+            // pre-bump generation threaded into the semantic plan above:
+            //   * stale (post-advance, pre-re-diagnostic):
+            //     `plan.assessment_generation_at_creation ==
+            //     job.assessment_generation` AND `exhausted_attempts`
+            //     non-empty → `semantic_plan_is_stale` = true →
+            //     CB-007/CB-012/CB-014 force re-diagnostic.
+            //   * fresh (post-re-diagnostic, ready to repair the new cluster):
+            //     `plan.assessment_generation_at_creation <
+            //     job.assessment_generation` →
+            //     `semantic_plan_is_stale` = false → controller routes to
+            //     NeedFreshRead/NeedEdit on the current cluster (closing the
+            //     liveness gap where the stale predicate kept looping back
+            //     to NeedDiagnostic after a cluster advance).
+            current.assessment_generation = pre_bump_assessment_generation.saturating_add(1);
             // Issue #647 (Phase D / D.2 / DR3-005): write the
             // SemanticRepairPlan slot. `None` is the legacy-compatible
             // value when semantic parse failed or dispatch routed to
@@ -14351,6 +14380,16 @@ fn verifier_repair_context_from_failure(
         exhausted_attempts: previous_context
             .map(|context| context.exhausted_attempts.clone())
             .unwrap_or_default(),
+        // Issue #647 (CB-015): carry `assessment_generation` over so the
+        // stale↔fresh distinction survives turn boundaries. The generation
+        // is monotonic across the job lifetime — every successful
+        // diagnostic write bumps it; cluster advances do not touch it.
+        // A new failure that builds a fresh `RepairJob` (no previous_context)
+        // resets the generation to 0, mirroring the `semantic_plan = None /
+        // exhausted_attempts = empty` defaults applied above.
+        assessment_generation: previous_context
+            .map(|context| context.assessment_generation)
+            .unwrap_or(0),
     }
 }
 
@@ -15841,9 +15880,14 @@ fn build_spec_authority_input_for_active_request(
 fn build_semantic_repair_plan_from_report(
     report: super::semantic_failure::SemanticFailureReport,
 ) -> Option<super::repair_job::SemanticRepairPlan> {
+    // Issue #647 (CB-015): test-only wrapper threads `0` as the
+    // generation snapshot — tests that pre-date CB-015 model a
+    // first-build "no prior re-diagnostic" state where the plan was
+    // created against generation 0.
     build_semantic_repair_plan_from_report_with_authority_input(
         report,
         default_spec_authority_input(),
+        0,
     )
 }
 
@@ -15876,6 +15920,7 @@ fn default_spec_authority_input() -> super::spec_authority::SpecAuthorityInput {
 fn build_semantic_repair_plan_from_report_with_authority_input(
     report: super::semantic_failure::SemanticFailureReport,
     authority_input: super::spec_authority::SpecAuthorityInput,
+    assessment_generation: u32,
 ) -> Option<super::repair_job::SemanticRepairPlan> {
     // D.3: DependencyMissing / ConfigOrVerifierError → setup repair path,
     // no semantic plan.
@@ -15903,6 +15948,11 @@ fn build_semantic_repair_plan_from_report_with_authority_input(
         failure_cluster_id,
         expected_improvement: None,
         semantic_report: report,
+        // Issue #647 (CB-015): coil the caller-provided generation. The
+        // production callsite in `run_verifier_diagnostic_pass` passes the
+        // RepairJob's pre-bump generation so this plan is fresh relative
+        // to the assessment we are about to write into the slot.
+        assessment_generation_at_creation: assessment_generation,
     })
 }
 
@@ -16373,9 +16423,9 @@ pub(super) fn verifier_repair_context_target_path(
 pub(super) fn verifier_repair_effective_target_hint(
     context: &super::repair_job::RepairJob,
 ) -> Option<&super::task_contract::RecoveryTargetHint> {
-    // Issue #647 (CB-007): when a `SemanticRepairPlan` is active and the
-    // job has already exhausted at least one prior cluster, the freshly
-    // re-built `assessment.repair_target_hint` can be stale — the
+    // Issue #647 (CB-007 / CB-015): when a `SemanticRepairPlan` is active
+    // and the job is in the stale state (per `semantic_plan_is_stale`), the
+    // freshly re-built `assessment.repair_target_hint` can be stale — the
     // re-diagnostic LLM commonly re-proposes the just-exhausted cluster
     // because the same failure text is still visible. `assign_semantic_plan_preserving_exhausted`
     // walks the new plan past the exhausted entry, but nothing rebuilds
@@ -16388,14 +16438,17 @@ pub(super) fn verifier_repair_effective_target_hint(
     // identical so SetupRepair / pre-semantic flows are unaffected
     // (DR3-001 / "semantic_plan = None 経路は既存挙動" constraint).
     //
-    // The conservative rule:
-    //   semantic_plan = Some AND exhausted_attempts non-empty
+    // The CB-015 generation-aware rule (subsumes the legacy
+    // `semantic_plan.is_some() && !exhausted_attempts.is_empty()`):
+    //   stale (plan.gen >= job.gen, exhausted non-empty)
     //     → return None (force re-diagnostic against the current cluster).
-    //   semantic_plan = Some AND exhausted_attempts empty
-    //     → plan is fresh, legacy behaviour stands.
+    //   fresh (plan.gen < job.gen, post-re-diagnostic)
+    //     → assessment has been refreshed for the current cluster; legacy
+    //       behaviour stands and the controller can route to NeedFreshRead /
+    //       NeedEdit.
     //   semantic_plan = None
     //     → legacy behaviour (unchanged).
-    if context.semantic_plan.is_some() && !context.exhausted_attempts.is_empty() {
+    if super::repair_job::semantic_plan_is_stale(context) {
         return None;
     }
     if let Some(assessment) = context.assessment.as_ref() {
@@ -20029,6 +20082,7 @@ mod progress_tests {
             preferred_repair_role: super::super::task_contract::ArtifactRole::Test,
             repair_hypothesis: "test fixture hypothesis".to_string(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         }
     }
 
@@ -21670,7 +21724,7 @@ E   assert [{'id': 1}] == []\n";
             consensus: None,
         };
         let plan2 =
-            super::build_semantic_repair_plan_from_report_with_authority_input(report2, input)
+            super::build_semantic_repair_plan_from_report_with_authority_input(report2, input, 0)
                 .expect("plan should be built");
         assert_eq!(
             plan2.spec_authority,
@@ -21903,6 +21957,7 @@ E   assert [{'id': 1}] == []\n";
         let plan = super::build_semantic_repair_plan_from_report_with_authority_input(
             report.clone(),
             input,
+            0,
         )
         .expect("plan must build for assertion_mismatch");
         assert_eq!(
@@ -22028,6 +22083,7 @@ E   assert [{'id': 1}] == []\n";
             failure_cluster_id: cluster_id.clone(),
             expected_improvement: None,
             semantic_report: report,
+            assessment_generation_at_creation: 0,
         };
 
         let target_hint = super::super::task_contract::RecoveryTargetHint {
@@ -22861,6 +22917,7 @@ E   assert [{'id': 1}] == []\n";
             failure_cluster_id: cluster_b_id.clone(),
             expected_improvement: None,
             semantic_report: report,
+            assessment_generation_at_creation: 0,
         };
 
         // Stale assessment from the re-diagnostic re-points at cluster A's path.
@@ -22943,6 +23000,7 @@ E   assert [{'id': 1}] == []\n";
             failure_cluster_id: cluster_a_id,
             expected_improvement: None,
             semantic_report: report,
+            assessment_generation_at_creation: 0,
         };
 
         let hint_a = super::super::task_contract::RecoveryTargetHint {
@@ -24572,6 +24630,7 @@ export default function App() {
             preferred_repair_role: report.preferred_repair_role,
             repair_hypothesis: report.repair_hypothesis.clone(),
             expected_improvement: None,
+            assessment_generation_at_creation: 0,
         };
         let mut previous = verifier_repair_context_from_failure(
             work_root,
@@ -24601,6 +24660,53 @@ export default function App() {
         assert_eq!(
             next.exhausted_attempts,
             vec![(cluster_a.clone(), ArtifactRole::Implementation)]
+        );
+    }
+
+    /// Issue #647 (CB-015): `verifier_repair_context_from_failure` must
+    /// also carry `assessment_generation` over the turn boundary so the
+    /// stale↔fresh distinction survives slot reuse. A new failure with no
+    /// `previous_context` resets the generation to 0; a follow-up failure
+    /// inherits whatever the previous turn's generation was.
+    #[test]
+    fn cb015_verifier_repair_context_carries_over_assessment_generation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def main(): pass\n").unwrap();
+        let changed = vec!["app/main.py".to_string()];
+        let output = "FAILED tests/test_api.py::test_x - AssertionError\n1 failed";
+
+        // First cycle: no previous context → generation defaults to 0.
+        let mut previous = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        assert_eq!(
+            previous.assessment_generation, 0,
+            "CB-015: fresh RepairJob without previous_context starts at generation 0",
+        );
+
+        // Simulate `run_verifier_diagnostic_pass` bumping the generation
+        // after writing a fresh assessment.
+        previous.assessment_generation = 5;
+
+        // Second cycle: previous_context carries the generation forward.
+        let next = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&previous),
+        );
+        assert_eq!(
+            next.assessment_generation, 5,
+            "CB-015: assessment_generation must survive turn boundary via previous_context",
         );
     }
 
@@ -27540,7 +27646,7 @@ export default function App() {
             consensus: None,
         };
         let plan =
-            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
                 .expect("plan must build");
         assert_eq!(
             plan.spec_authority,
@@ -27569,7 +27675,7 @@ export default function App() {
             consensus: None,
         };
         let plan =
-            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
                 .expect("plan must build");
         assert_eq!(
             plan.spec_authority,
@@ -27604,7 +27710,7 @@ export default function App() {
             consensus: Some(consensus),
         };
         let plan =
-            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
                 .expect("plan must build");
         assert_ne!(
             plan.spec_authority,
@@ -27628,7 +27734,7 @@ export default function App() {
             consensus: None,
         };
         let plan =
-            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input, 0)
                 .expect("plan must build");
         // Authority is resolved (any of the 5 enum variants is acceptable
         // — it is never None because the type itself has no None state).
