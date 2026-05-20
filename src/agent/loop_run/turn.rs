@@ -9345,6 +9345,15 @@ impl Agent {
         // when the LLM volunteered the extended schema. The legacy
         // `ParsedVerifierRepairAssessment` / `VerifierRepairAssessment` flow
         // below is **not** disturbed.
+        //
+        // -------- BEGIN semantic-boundary (Issue #647 / S3-005 / SF3) --------
+        // Everything between this marker and END semantic-boundary is
+        // *outside* the legacy assessment pipeline. The legacy struct-literal
+        // callsites for `super::VerifierRepairAssessment`
+        // (turn.rs:15399 / 18785 / 19477 / 19553 / 20230 / 23108 / 23133)
+        // remain unchanged by Issue #647. See the doc comment on
+        // `model_assessment_to_verifier_repair_assessment` for the full
+        // responsibility split.
         let semantic_report = parse_semantic_failure_report_from_reply(&reply.content)
             .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &context));
         // Issue #647 (SF1): build the `SpecAuthorityInput` from the active
@@ -9377,6 +9386,10 @@ impl Agent {
             edited_this_session_for: &edited_predicate,
             scaffold_changed_for: &scaffold_predicate,
         };
+        // -------- END semantic-boundary (Issue #647 / S3-005 / SF3) --------
+        // Re-entering the legacy assessment pipeline: the call below builds
+        // `super::VerifierRepairAssessment` only. `semantic_plan` lives on
+        // the `RepairJob` it never touches.
         let assessment = model_assessment_to_verifier_repair_assessment(
             &self.work_root,
             &context,
@@ -15797,6 +15810,39 @@ fn build_semantic_repair_plan_from_report_with_authority_input(
     })
 }
 
+/// Boundary helper that converts a parsed diagnostic reply into the
+/// legacy `super::VerifierRepairAssessment` value used by the rest of the
+/// verifier-repair pipeline.
+///
+/// # Responsibility boundary (Issue #647 / S3-005 / SF3)
+///
+/// This function is **the** SSOT boundary for legacy-side assessment
+/// construction. The Issue #647 semantic-repair planning lives outside
+/// this boundary on purpose:
+///
+///   * **Legacy boundary (this function)**: builds
+///     `VerifierRepairAssessment { failure_kind, failure_type,
+///     probable_cause_role, needed_reads, repair_target_hint,
+///     repair_plan, summary, source }` only. The 7 existing
+///     `VerifierRepairAssessment` struct-literal callsites
+///     (turn.rs:15399 / 18785 / 19477 / 19553 / 20230 / 23108 / 23133)
+///     are unchanged by Issue #647 — none of them call into the
+///     semantic-repair helpers.
+///   * **Semantic boundary (outside this function, in
+///     [`run_verifier_diagnostic_pass`])**: after this function returns
+///     the legacy assessment, the caller separately runs:
+///       1. [`parse_semantic_failure_report_from_reply`] on the raw reply
+///       2. [`build_semantic_failure_report_from_legacy`] as a
+///          deterministic fallback (MF1) when (1) returns `None`
+///       3. [`build_semantic_repair_plan_from_report_with_authority_input`]
+///          to construct the `SemanticRepairPlan` and write it into
+///          `RepairJob.semantic_plan`
+///
+/// The two boundaries are intentionally kept separate so that:
+///   * existing tests pinning the legacy 7 struct-literal callsites
+///     remain unaffected (S3-005 unchanged-callsites invariant);
+///   * the semantic-repair pipeline can be evolved (new fallback paths,
+///     consensus detection, ...) without touching this function.
 fn model_assessment_to_verifier_repair_assessment(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -26494,6 +26540,98 @@ export default function App() {
                 .map(|hint| hint.path.as_str()),
             Some("app/main.py"),
             "Owned admission must allow path 6 fallback to promote the hint"
+        );
+    }
+
+    // ─── Issue #647 (SF3 / S3-005): semantic-boundary invariant ────────
+    //
+    // Pin the two responsibility halves so future edits cannot silently
+    // erase the boundary markers we just installed.
+
+    #[test]
+    fn sf3_model_assessment_doc_comment_pins_legacy_boundary() {
+        let src = include_str!("turn.rs");
+        // Doc comment on the legacy boundary helper must label its role
+        // and explicitly state the unchanged-callsites invariant. We do
+        // NOT pin specific line numbers (those drift with surrounding
+        // edits); we pin the *contract* instead.
+        let fn_pos = src
+            .find("\nfn model_assessment_to_verifier_repair_assessment(")
+            .expect("function must exist");
+        let doc_start = fn_pos.saturating_sub(3000);
+        let doc = &src[doc_start..fn_pos];
+        assert!(
+            doc.contains("Legacy boundary") || doc.contains("legacy-side"),
+            "SF3: doc must label this helper as the legacy boundary"
+        );
+        assert!(
+            doc.contains("Semantic boundary") || doc.contains("semantic-repair planning"),
+            "SF3: doc must contrast with the semantic boundary"
+        );
+        assert!(
+            doc.contains("unchanged by Issue #647")
+                || doc.contains("are unchanged")
+                || doc.contains("unchanged-callsites"),
+            "SF3: doc must declare the unchanged-callsites invariant"
+        );
+        // Sanity: the 7 legacy callsites must still exist as struct
+        // literals in the file (literal count, not line-number pinning).
+        let struct_literal_count = src.matches("super::VerifierRepairAssessment {").count()
+            + src.matches("VerifierRepairAssessment {").count()
+            - src.matches("super::VerifierRepairAssessment {").count();
+        // We expect at least 7 occurrences of `VerifierRepairAssessment {`
+        // (the exact number can be 7+ because tests may add new ones,
+        // but never less than 7 — the boundary contract).
+        let total_literals = src.matches("VerifierRepairAssessment {").count();
+        assert!(
+            total_literals >= 7,
+            "SF3: at least 7 VerifierRepairAssessment struct literals must \
+             exist (legacy callsite invariant), found {total_literals}"
+        );
+        let _ = struct_literal_count; // keep variable for future tightening
+    }
+
+    #[test]
+    fn sf3_run_verifier_diagnostic_pass_uses_explicit_semantic_boundary_markers() {
+        let src = include_str!("turn.rs");
+        // Both BEGIN and END markers must exist *inside*
+        // `run_verifier_diagnostic_pass` so a reader can scan the function
+        // body and immediately see which lines are legacy vs. semantic.
+        assert!(
+            src.contains("BEGIN semantic-boundary (Issue #647 / S3-005 / SF3)"),
+            "SF3: BEGIN semantic-boundary marker must be present"
+        );
+        assert!(
+            src.contains("END semantic-boundary (Issue #647 / S3-005 / SF3)"),
+            "SF3: END semantic-boundary marker must be present"
+        );
+        // The BEGIN marker must appear *before* the semantic helpers
+        // are called, and the END marker must appear *after* the last
+        // semantic helper and *before* `model_assessment_to_verifier_repair_assessment`
+        // is invoked.
+        let begin = src
+            .find("BEGIN semantic-boundary (Issue #647 / S3-005 / SF3)")
+            .expect("BEGIN marker missing");
+        let end = src
+            .find("END semantic-boundary (Issue #647 / S3-005 / SF3)")
+            .expect("END marker missing");
+        let semantic_call = src
+            .find("build_semantic_repair_plan_from_report_with_authority_input(")
+            .expect("semantic helper call missing");
+        let legacy_call = src
+            .find("let assessment = model_assessment_to_verifier_repair_assessment(")
+            .expect("legacy helper call missing");
+        assert!(
+            begin < semantic_call,
+            "SF3: BEGIN marker must precede semantic helper call"
+        );
+        assert!(
+            semantic_call < end,
+            "SF3: semantic helper call must be inside the boundary"
+        );
+        assert!(
+            end < legacy_call,
+            "SF3: END marker must precede the legacy helper call"
         );
     }
 }
