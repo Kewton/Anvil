@@ -20657,6 +20657,93 @@ mod progress_tests {
         );
     }
 
+    /// Issue #647 (CB-012): when `semantic_plan` is active and
+    /// `exhausted_attempts` is non-empty, the `verifier_repair_effective_target_hint`
+    /// guard returns `None` for stale assessments. The repair-decision
+    /// state machine must then return `NeedDiagnostic` instead of
+    /// falling through to `latest_successful_read_existing_path` / a
+    /// `NeedTargetDiscovery` fallback that would route the repair pass
+    /// to an unrelated turn-local read target.
+    #[test]
+    fn cb012_advanced_semantic_plan_with_stale_assessment_forces_need_diagnostic() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Create an unrelated file so `latest_successful_read_existing_path`
+        // *could* return a fallback target. Without CB-012 the decision
+        // would route to that fallback; with CB-012 it must force a
+        // fresh diagnostic instead.
+        let unrelated = work_root.join("unrelated.txt");
+        std::fs::write(&unrelated, "irrelevant\n").unwrap();
+
+        // Build a RepairJob in the "advanced semantic_plan + stale
+        // assessment" state: semantic_plan is Some (= we have an
+        // active cluster B), exhausted_attempts is non-empty (= cluster
+        // A is already exhausted), and `assessment` still points at the
+        // stale cluster-A hint via `repair_target_hint`. The CB-007
+        // guard makes `verifier_repair_context_target_path` return None
+        // for this state; CB-012 must then return `NeedDiagnostic`.
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        // The stale assessment must exist (assessment.is_some()) — that
+        // is the precondition where CB-012 fires.
+        assert!(context.assessment.is_some(), "fixture invariant");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        // One exhausted (cluster_id, role) tuple is enough to trigger
+        // the guard.
+        let any_cluster_id = context
+            .semantic_plan
+            .as_ref()
+            .unwrap()
+            .failure_cluster_id
+            .clone();
+        context.exhausted_attempts.push((
+            any_cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        context.assessment_attempts = 0;
+        context.diagnostic_attempted = true;
+        // No pending read target message — `latest_successful_read_existing_path`
+        // would still walk message history; with CB-012 we bypass it.
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-012: advanced semantic_plan with stale assessment must force NeedDiagnostic"
+        );
+    }
+
+    /// Issue #647 (CB-012): the new guard must NOT fire when
+    /// `exhausted_attempts` is empty — i.e., legacy / fresh diagnostic
+    /// flow is unaffected.
+    #[test]
+    fn cb012_advanced_semantic_plan_without_exhausted_attempts_is_unaffected() {
+        use super::super::repair_job::{
+            RepairJob, VerifierRepairDecision, verifier_repair_decision as decision_fn,
+        };
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app_dir = work_root.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("main.py"), "def main():\n    return 1\n").unwrap();
+
+        let mut context: RepairJob = verifier_context_for("app/main.py");
+        context.semantic_plan = Some(semantic_plan_for_test_fixture());
+        // No exhausted attempts → CB-012 must NOT engage.
+        assert!(context.exhausted_attempts.is_empty(), "fixture invariant");
+
+        let dec = decision_fn(true, Some(&context), &[], &work_root, Some(1), 1);
+        // Fresh state should route to NeedFreshRead/NeedEdit (target
+        // resolves), not the new NeedDiagnostic shortcut.
+        assert_ne!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-012: guard must NOT fire when exhausted_attempts is empty"
+        );
+    }
+
     #[test]
     fn verifier_diagnostic_attempt_spec_uses_sidecar_then_main_fallback() {
         let first = verifier_diagnostic_attempt_spec("main-model", Some("sidecar-model"), 0)
