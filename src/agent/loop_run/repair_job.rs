@@ -614,6 +614,48 @@ pub(super) fn task_contract_repair_state(
 // entry) so linear `contains` is fine — total entries are bounded by
 // `failure_clusters.len() * artifact roles in scope`.
 
+/// Issue #647 (CB-016): semantic distinction between "advance because the
+/// rerun showed no progress and we should walk to the next cluster with
+/// the same (now stale) assessment" vs "advance because a fresh
+/// diagnostic re-proposed an already-exhausted cluster and we skip to
+/// the next one with the fresh assessment in hand".
+///
+/// The two triggers differ in how the new plan's
+/// `assessment_generation_at_creation` is stamped:
+///   - `RerunNoProgress`: stamp with `job.assessment_generation` (same gen,
+///     stale plan; the controller will route through CB-012/CB-014 for a
+///     fresh diagnostic).
+///   - `DiagnosticSkip`: stamp with
+///     `job.assessment_generation.saturating_sub(1)` (one generation older
+///     than current → fresh plan; the controller proceeds to the
+///     cluster-B repair pass).
+///
+/// Without this distinction (V8 posture), both call sites stamped the
+/// post-bump `job.assessment_generation`, which made the
+/// `DiagnosticSkip` path look stale even though the caller had just
+/// landed a fresh diagnostic and the assessment in `job.assessment` was
+/// already current. The result was a livelock between
+/// `assign_semantic_plan_preserving_exhausted` advancing to cluster B
+/// and `verifier_repair_decision` immediately routing back to
+/// `NeedDiagnostic` (because `plan.gen == job.gen` looked stale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdvanceTrigger {
+    /// Verifier rerun produced no progress; advance with the still-stale
+    /// assessment. The new plan's
+    /// `assessment_generation_at_creation` equals the current
+    /// `job.assessment_generation`, so the plan looks stale to
+    /// CB-007/CB-012/CB-014 and the controller will run a fresh
+    /// diagnostic before proceeding.
+    RerunNoProgress,
+    /// A fresh diagnostic re-proposed an exhausted cluster; skip to the
+    /// next cluster with the fresh assessment. The new plan's
+    /// `assessment_generation_at_creation` is one generation older than
+    /// the current `job.assessment_generation`, so the plan is fresh
+    /// and the controller proceeds directly to the cluster-B repair
+    /// pass without re-running the diagnostic.
+    DiagnosticSkip,
+}
+
 /// Issue #647 (Phase E.1): advance the `repair_job.semantic_plan` slot to
 /// the next unattempted cluster from `report.failure_clusters`.
 ///
@@ -646,6 +688,9 @@ pub(super) fn task_contract_repair_state(
 /// (initial fixture / defensive path), we still fall back to the
 /// `ImplementationContract` default so the helper remains total.
 ///
+/// `trigger` (Issue #647 CB-016) controls how the new plan's
+/// `assessment_generation_at_creation` is stamped — see `AdvanceTrigger`.
+///
 /// Returns `false` (and clears `semantic_plan`) when the report has no
 /// remaining clusters; callers MUST treat that as "no more clusters to
 /// attack in this report" and switch back to `re_diagnostic`.
@@ -653,6 +698,7 @@ pub(super) fn task_contract_repair_state(
 pub(super) fn advance_to_next_cluster(
     repair_job: &mut RepairJob,
     report: &SemanticFailureReport,
+    trigger: AdvanceTrigger,
 ) -> bool {
     // 1. Record the current plan in the exhausted_attempts ledger before
     //    we drop it, so slot reuse preserves history (S3-010). At the same
@@ -690,16 +736,33 @@ pub(super) fn advance_to_next_cluster(
     //    uses when no higher-authority signal fires.
     let spec_authority = carried_authority.unwrap_or(SpecAuthority::ImplementationContract);
 
-    // Issue #647 (CB-015): the new plan's generation snapshot is set to
-    // the **current** `RepairJob.assessment_generation`. This intentionally
-    // creates a "stale" state immediately after a cluster advance:
-    // `plan.assessment_generation_at_creation == job.assessment_generation`
-    // → `semantic_plan_is_stale` returns `true` → CB-007/CB-012 force a
-    // re-diagnostic against the new cluster. Once that re-diagnostic
-    // increments `RepairJob.assessment_generation`, the comparison
-    // flips and the controller proceeds to repair the freshly-diagnosed
-    // cluster (the liveness gap CB-015 closes).
-    let assessment_generation_at_creation = repair_job.assessment_generation;
+    // Issue #647 (CB-015 / CB-016): the new plan's generation snapshot is
+    // chosen by `trigger`:
+    //
+    //   * `AdvanceTrigger::RerunNoProgress` — stamp with the **current**
+    //     `RepairJob.assessment_generation` (CB-015 default). This
+    //     intentionally creates a "stale" state immediately after a
+    //     cluster advance:
+    //     `plan.assessment_generation_at_creation == job.assessment_generation`
+    //     → `semantic_plan_is_stale` returns `true` → CB-007/CB-012 force
+    //     a re-diagnostic against the new cluster. Once that re-diagnostic
+    //     increments `RepairJob.assessment_generation`, the comparison
+    //     flips and the controller proceeds to repair the freshly-diagnosed
+    //     cluster (the liveness gap CB-015 closes).
+    //   * `AdvanceTrigger::DiagnosticSkip` — stamp with
+    //     `repair_job.assessment_generation.saturating_sub(1)`. The caller
+    //     has just landed a fresh diagnostic (post-bump
+    //     `job.assessment_generation`) and is only walking past an
+    //     already-exhausted cluster proposed by the LLM. The fresh
+    //     assessment in `job.assessment` already corresponds to the
+    //     new cluster, so the new plan must look **fresh**
+    //     (`plan.gen < job.gen`) — that lets CB-012 step out of the way
+    //     and the controller routes directly to `NeedFreshRead` /
+    //     `NeedEdit`.
+    let assessment_generation_at_creation = match trigger {
+        AdvanceTrigger::RerunNoProgress => repair_job.assessment_generation,
+        AdvanceTrigger::DiagnosticSkip => repair_job.assessment_generation.saturating_sub(1),
+    };
     repair_job.semantic_plan = Some(SemanticRepairPlan {
         semantic_cause: report.failure_kind,
         spec_authority,
@@ -797,7 +860,12 @@ pub(super) fn apply_semantic_repair_dispatch_after_rerun(
         return;
     };
 
-    let advanced = advance_to_next_cluster(repair_job, &report);
+    // CB-016: dispatch-after-rerun is the `RerunNoProgress` semantic — the
+    // verifier rerun returned no progress and we are walking to the next
+    // cluster with the still-stale assessment. The new plan must look stale
+    // so the controller routes through CB-012/CB-014 for a fresh
+    // diagnostic before attempting the next repair pass.
+    let advanced = advance_to_next_cluster(repair_job, &report, AdvanceTrigger::RerunNoProgress);
 
     if advanced {
         // Cluster transition → upgrade the outcome via the SSOT wrapper.
@@ -890,7 +958,13 @@ pub(super) fn assign_semantic_plan_preserving_exhausted(
     // report (it travels with the plan); fall back to the caller-supplied
     // `new_report` only if the caller explicitly passes a different one.
     let report = new_report.cloned().unwrap_or(embedded_report);
-    advance_to_next_cluster(repair_job, &report);
+    // CB-016: this path is the `DiagnosticSkip` semantic — a freshly-built
+    // plan from the diagnostic LLM targets an already-exhausted cluster,
+    // so we skip ahead with the **fresh** assessment in hand. The new
+    // plan must look fresh (plan.gen < job.gen) so the controller does
+    // NOT route back to `NeedDiagnostic` (which would be a livelock —
+    // we have already produced a fresh diagnostic this turn).
+    advance_to_next_cluster(repair_job, &report, AdvanceTrigger::DiagnosticSkip);
     // `advance_to_next_cluster` already mutates `semantic_plan`
     // (either to the next unexhausted cluster or to `None`) and updates the
     // ledger — no further bookkeeping required here.
@@ -1269,21 +1343,33 @@ mod tests {
         );
 
         // First advance: cluster 1 → cluster 2.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(
             job.semantic_plan.as_ref().unwrap().failure_cluster_id,
             cluster_ids[1]
         );
 
         // Second advance: cluster 2 → cluster 3.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(
             job.semantic_plan.as_ref().unwrap().failure_cluster_id,
             cluster_ids[2]
         );
 
         // Third advance: no more clusters — slot cleared, return false.
-        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(!advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert!(job.semantic_plan.is_none());
     }
 
@@ -1305,7 +1391,11 @@ mod tests {
         assert!(job.exhausted_attempts.is_empty());
 
         // Advance 1: cluster 1 → cluster 2; ledger now holds cluster 1.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(job.exhausted_attempts.len(), 1);
         assert_eq!(job.exhausted_attempts[0], (cluster_ids[0].clone(), role));
         // Slot now targets cluster 2.
@@ -1315,7 +1405,11 @@ mod tests {
         );
 
         // Advance 2: cluster 2 → cluster 3; ledger preserves cluster 1.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(job.exhausted_attempts.len(), 2);
         assert_eq!(job.exhausted_attempts[0], (cluster_ids[0].clone(), role));
         assert_eq!(job.exhausted_attempts[1], (cluster_ids[1].clone(), role));
@@ -1328,7 +1422,11 @@ mod tests {
         // Advance 3: no more clusters; slot cleared, ledger still holds
         // both 1 and 2 (the cluster 3 attempt is recorded too because we
         // pushed it before searching).
-        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(!advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert!(job.semantic_plan.is_none());
         assert_eq!(job.exhausted_attempts.len(), 3);
         assert_eq!(job.exhausted_attempts[2], (cluster_ids[2].clone(), role));
@@ -1344,12 +1442,20 @@ mod tests {
         let mut job = job_with_first_cluster_plan(&report);
 
         // First call: no other clusters → slot cleared, false returned.
-        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(!advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         let after_first_len = job.exhausted_attempts.len();
         assert_eq!(after_first_len, 1);
 
         // Second call: semantic_plan is None, so no new ledger entry.
-        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(!advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(job.exhausted_attempts.len(), after_first_len);
     }
 
@@ -1507,10 +1613,22 @@ mod tests {
         let mut job = job_with_first_cluster_plan(&report);
 
         // Walk all three clusters via the Phase-E helper.
-        assert!(advance_to_next_cluster(&mut job, &report)); // 1 → 2
-        assert!(advance_to_next_cluster(&mut job, &report)); // 2 → 3
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        )); // 1 → 2
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        )); // 2 → 3
         // Third advance: no more clusters.
-        assert!(!advance_to_next_cluster(&mut job, &report));
+        assert!(!advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
 
         // The Phase-E slot reuse path must not touch the legacy retry
         // counters — they remain at their fresh-job defaults so the
@@ -2126,7 +2244,11 @@ mod tests {
             ..RepairJob::new_for_test()
         };
 
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
 
         let advanced = job.semantic_plan.as_ref().expect("slot now holds plan B");
         assert_eq!(
@@ -2170,7 +2292,11 @@ mod tests {
             ..RepairJob::new_for_test()
         };
 
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
 
         let advanced = job.semantic_plan.as_ref().expect("slot now holds plan B");
         assert_eq!(advanced.failure_cluster_id, cluster_ids[1]);
@@ -2217,7 +2343,11 @@ mod tests {
         };
 
         // First advance: A → B. Authority must remain BehaviorContract.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(
             job.semantic_plan.as_ref().unwrap().failure_cluster_id,
             cluster_ids[1],
@@ -2230,7 +2360,11 @@ mod tests {
 
         // Second advance: B → C. Authority must STILL remain BehaviorContract
         // (carry-forward survives chained slot reuse).
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert_eq!(
             job.semantic_plan.as_ref().unwrap().failure_cluster_id,
             cluster_ids[2],
@@ -2468,7 +2602,11 @@ mod tests {
         // `assessment_generation_at_creation = job.assessment_generation = 1`
         // AND cluster A is pushed onto `exhausted_attempts`. The stale
         // predicate must fire.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert!(
             semantic_plan_is_stale(&job),
             "CB-015: post-advance, plan.gen == job.gen and exhausted non-empty → stale must be true",
@@ -2496,7 +2634,11 @@ mod tests {
         let mut job = job_with_first_cluster_plan(&report);
         job.assessment_generation = 1;
         // Advance to cluster B → stale precondition.
-        assert!(advance_to_next_cluster(&mut job, &report));
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::RerunNoProgress
+        ));
         assert!(semantic_plan_is_stale(&job));
 
         // Simulate `run_verifier_diagnostic_pass` writing a new assessment:
@@ -2672,6 +2814,300 @@ mod tests {
         let mut bumped = job.clone();
         bumped.assessment_generation = 8;
         assert_ne!(job, bumped);
+    }
+
+    // ---- Issue #647 (CB-016): AdvanceTrigger semantic distinction ---- //
+
+    /// CB-016 (helper unit): from the same initial job, `DiagnosticSkip`
+    /// stamps the new plan one generation behind the current job, while
+    /// `RerunNoProgress` stamps it equal to the current job — yielding a
+    /// stale plan for the latter and a fresh plan for the former.
+    #[test]
+    fn cb016_advance_trigger_stamps_correct_generation() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+
+        // Use job.assessment_generation = 2 so we can distinguish the two
+        // stamps unambiguously (saturating_sub(1) yields 1, not the same
+        // value as the RerunNoProgress branch).
+        let mut job_rerun = job_with_first_cluster_plan(&report);
+        job_rerun.assessment_generation = 2;
+        assert!(advance_to_next_cluster(
+            &mut job_rerun,
+            &report,
+            AdvanceTrigger::RerunNoProgress,
+        ));
+        let rerun_plan = job_rerun.semantic_plan.as_ref().expect("rerun advanced");
+        assert_eq!(
+            rerun_plan.assessment_generation_at_creation, 2,
+            "RerunNoProgress must stamp plan.gen = job.gen (stale post-advance)",
+        );
+        assert!(
+            semantic_plan_is_stale(&job_rerun),
+            "RerunNoProgress post-advance must produce a stale plan",
+        );
+
+        let mut job_skip = job_with_first_cluster_plan(&report);
+        job_skip.assessment_generation = 2;
+        assert!(advance_to_next_cluster(
+            &mut job_skip,
+            &report,
+            AdvanceTrigger::DiagnosticSkip,
+        ));
+        let skip_plan = job_skip.semantic_plan.as_ref().expect("skip advanced");
+        assert_eq!(
+            skip_plan.assessment_generation_at_creation, 1,
+            "DiagnosticSkip must stamp plan.gen = job.gen - 1 (fresh post-advance)",
+        );
+        assert!(
+            !semantic_plan_is_stale(&job_skip),
+            "DiagnosticSkip post-advance must produce a fresh plan",
+        );
+    }
+
+    /// CB-016 (boundary): when `job.assessment_generation == 0`,
+    /// `DiagnosticSkip` saturates at 0 instead of underflowing. The plan
+    /// is then equal to the job (not less than), so the stale predicate
+    /// fires the same way as `RerunNoProgress` — defensive posture for a
+    /// caller that wires the new trigger in before the first
+    /// re-diagnostic bump has happened.
+    #[test]
+    fn cb016_diagnostic_skip_saturates_at_zero_generation() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let mut job = job_with_first_cluster_plan(&report);
+        // job.assessment_generation defaults to 0 (RepairJob::new_for_test).
+        assert_eq!(job.assessment_generation, 0);
+
+        assert!(advance_to_next_cluster(
+            &mut job,
+            &report,
+            AdvanceTrigger::DiagnosticSkip,
+        ));
+        let plan = job.semantic_plan.as_ref().expect("advanced");
+        assert_eq!(
+            plan.assessment_generation_at_creation, 0,
+            "DiagnosticSkip with job.gen=0 must saturate at 0 (no underflow)",
+        );
+    }
+
+    /// CB-016.1 (production integration scenario): `assign_semantic_plan_preserving_exhausted`
+    /// is the `DiagnosticSkip` callsite. When a fresh diagnostic
+    /// re-proposes an already-exhausted cluster, the helper walks to the
+    /// next unexhausted cluster — and the new plan must look **fresh**
+    /// (plan.gen < job.gen) so the controller does NOT route back to
+    /// `NeedDiagnostic`. That would be a livelock: we just finished a
+    /// fresh diagnostic, and routing back would consume the diagnostic
+    /// budget for nothing.
+    #[test]
+    fn cb016_diagnostic_skip_advance_produces_fresh_plan() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // The work_root needs a file for `verifier_repair_context_target_path`
+        // / `latest_successful_read_existing_path` to resolve to it; we
+        // construct one matching the fresh repair_target_hint we will set
+        // on the assessment below. The essential CB-016.1 invariant is
+        // that the decision is NOT `NeedDiagnostic` / `DiagnosticUnavailable`
+        // post-advance.
+        let fresh_target = "app/cluster_b.py";
+        let fresh_target_path = work_root.join(fresh_target);
+        if let Some(parent) = fresh_target_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&fresh_target_path, "# fresh cluster B target\n").unwrap();
+
+        // Job posture: cluster A exhausted (verifier rerun no-progress
+        // pushed it onto the ledger and walked to cluster B on a prior
+        // turn). The fresh diagnostic just ran and bumped the assessment
+        // generation to 2. The assessment now corresponds to the freshly
+        // diagnosed (still) cluster A — the LLM re-proposed it.
+        let fresh_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: fresh_target.to_string(),
+            reason: "fresh diagnostic re-proposed cluster A".to_string(),
+        };
+        let plan_b_before = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            // Plan was created at the previous gen (CB-015 RerunNoProgress
+            // path); pre-diagnostic generation = 1.
+            assessment_generation_at_creation: 1,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_b_before),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: Some(fresh_hint.clone()),
+                repair_plan: vec![fresh_hint],
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            // Fresh diagnostic just landed → assessment_generation bumped to 2.
+            assessment_generation: 2,
+            ..RepairJob::new_for_test()
+        };
+
+        // Fresh diagnostic produced a plan that re-proposes cluster A
+        // (LLM has no memory of the previous turn's exhaustion). The
+        // plan's stamp matches the current generation (= 2) because
+        // `run_verifier_diagnostic_pass` threads the pre-bump value
+        // (which was 1) into the candidate plan after the assessment
+        // landed; but the precise stamp is what
+        // `build_semantic_repair_plan_from_report_with_authority_input`
+        // produces — we only need the (cluster_id, role) to be exhausted
+        // to drive the skip path.
+        let proposed_plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 1,
+        };
+
+        // DiagnosticSkip path: the helper recognises cluster A is exhausted
+        // and walks to cluster B with the fresh assessment in hand.
+        assign_semantic_plan_preserving_exhausted(&mut job, Some(proposed_plan_a), Some(&report));
+
+        let advanced = job
+            .semantic_plan
+            .as_ref()
+            .expect("DiagnosticSkip must land on cluster B");
+        assert_eq!(
+            advanced.failure_cluster_id, cluster_ids[1],
+            "DiagnosticSkip must walk past exhausted cluster A to cluster B",
+        );
+        // CB-016 core invariant: the new plan looks fresh
+        // (plan.gen < job.gen) so the stale predicate does NOT fire.
+        assert!(
+            !semantic_plan_is_stale(&job),
+            "CB-016: DiagnosticSkip post-advance plan must be fresh (plan.gen < job.gen)",
+        );
+
+        // The decision must NOT route back to NeedDiagnostic /
+        // DiagnosticUnavailable — that would be the V8 livelock CB-016
+        // closes.
+        let dec = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(0), 0);
+        assert_ne!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-016: post DiagnosticSkip, the controller must NOT re-route through NeedDiagnostic",
+        );
+        assert_ne!(
+            dec,
+            VerifierRepairDecision::DiagnosticUnavailable,
+            "CB-016: post DiagnosticSkip, the controller must NOT fail closed as DiagnosticUnavailable",
+        );
+    }
+
+    /// CB-016.2 (production integration scenario): the legacy `RerunNoProgress`
+    /// path through `apply_semantic_repair_dispatch_after_rerun` must keep
+    /// its stale-stamp behaviour intact — that is the precondition for
+    /// CB-012/CB-014 to force a fresh diagnostic between cluster A and
+    /// cluster B repair attempts.
+    #[test]
+    fn cb016_rerun_no_progress_advance_produces_stale_plan() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Job posture: a successful diagnostic produced a plan targeting
+        // cluster A at generation 1; the assessment is in the slot too.
+        let stale_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/cluster_a.py".to_string(),
+            reason: "cluster A repair".to_string(),
+        };
+        let plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 1,
+        };
+        let mut job = RepairJob {
+            semantic_plan: Some(plan_a),
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: Some(stale_hint.clone()),
+                repair_plan: vec![stale_hint],
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            assessment_generation: 1,
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            ..RepairJob::new_for_test()
+        };
+
+        // RerunNoProgress path: dispatch advances the slot to cluster B
+        // with the stale assessment carried over.
+        apply_semantic_repair_dispatch_after_rerun(&mut job, Some(&cluster_ids[0]));
+
+        let advanced = job
+            .semantic_plan
+            .as_ref()
+            .expect("RerunNoProgress must land on cluster B");
+        assert_eq!(
+            advanced.failure_cluster_id, cluster_ids[1],
+            "RerunNoProgress must advance past cluster A to cluster B",
+        );
+        // CB-016 core invariant for the legacy path: the new plan is
+        // stale (plan.gen == job.gen) so CB-012 forces a fresh diagnostic.
+        assert_eq!(
+            advanced.assessment_generation_at_creation, job.assessment_generation,
+            "CB-016: RerunNoProgress post-advance must stamp plan.gen = job.gen",
+        );
+        assert!(
+            semantic_plan_is_stale(&job),
+            "CB-016: RerunNoProgress post-advance plan must be stale (CB-015 invariant)",
+        );
+
+        // The decision must route through NeedDiagnostic (CB-012 path) —
+        // that is the existing behaviour the legacy `RerunNoProgress`
+        // semantic preserves.
+        let dec = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(0), 0);
+        assert_eq!(
+            dec,
+            VerifierRepairDecision::NeedDiagnostic,
+            "CB-016: post RerunNoProgress, controller must route to NeedDiagnostic (CB-012)",
+        );
     }
 
     // -- Phase G grep / structure tests (Issue #647 acceptance closure) -- //
