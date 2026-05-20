@@ -14166,6 +14166,14 @@ fn verifier_repair_context_from_failure(
         previous_failure_count,
         rerun_outcome,
         repair_attempt,
+        // Issue #647 (Phase B): semantic-repair planning fields are populated
+        // by Phase D (`model_assessment_to_verifier_repair_assessment` end).
+        // At this construction point we have not yet parsed the diagnostic
+        // LLM payload into a `SemanticFailureReport`, so both slots start
+        // empty. `exhausted_attempts` is the per-job ledger that survives
+        // slot reuse — it has no prior entries when the job is first built.
+        semantic_plan: None,
+        exhausted_attempts: Vec::new(),
     }
 }
 
@@ -18794,20 +18802,12 @@ mod progress_tests {
                 summary: Some("test helper assessment".to_string()),
                 source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
             }),
-            assessment_attempts: 0,
             diagnostic_attempted: true,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: Vec::new(),
-            target_line: None,
             error_kind: Some("TypeError".to_string()),
             failure_signature: format!("{path} TypeError"),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         }
     }
 
@@ -23547,25 +23547,11 @@ export default function App() {
         let mut context = super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "ImportError: cannot import name 'store' from 'app.main'".to_string(),
-            failure_type: super::super::VerifierFailureType::Unknown,
             target_hint: Some(hint.clone()),
-            repair_target_hint: None,
-            changed_file_hints: vec![],
-            assessment: None,
-            assessment_attempts: 0,
-            diagnostic_attempted: false,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: vec![],
-            target_line: None,
-            error_kind: None,
             failure_signature: "app/main.py import_error".to_string(),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         };
 
         // With Unknown (parser-only), the helper must NOT fire.
@@ -23614,25 +23600,11 @@ export default function App() {
         let context = super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "ImportError: cannot import name 'store' from 'app.main'".to_string(),
-            failure_type: super::super::VerifierFailureType::Unknown,
             target_hint: Some(hint.clone()),
-            repair_target_hint: None,
-            changed_file_hints: vec![],
-            assessment: None,
-            assessment_attempts: 0,
-            diagnostic_attempted: false,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: vec![],
-            target_line: None,
-            error_kind: None,
             failure_signature: "app/main.py import_error".to_string(),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         };
         // parser-origin Unknown → both helpers must early-return
         assert!(
@@ -23969,25 +23941,12 @@ export default function App() {
         let context = super::super::repair_job::RepairJob {
             command: "python3 -m pytest".to_string(),
             output_excerpt: "error".to_string(),
-            failure_type: super::super::VerifierFailureType::Unknown,
             target_hint: Some(hint),
-            repair_target_hint: None,
-            changed_file_hints: vec![],
-            assessment: None,
-            assessment_attempts: 0,
-            diagnostic_attempted: false,
-            diagnostic_unavailable: false,
-            diagnostic_error: None,
-            repair_error: None,
-            applied_repair_intents: vec![],
             target_line: Some(1),
-            error_kind: None,
             failure_signature: "app/main.py error".to_string(),
             failure_count: Some(1),
-            previous_failure_signature: None,
-            previous_failure_count: None,
-            rerun_outcome: None,
             repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
         };
         let messages = verifier_diagnostic_messages(&work_root, &context, "fix bug");
         let payload = messages

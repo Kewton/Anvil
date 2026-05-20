@@ -16,18 +16,56 @@
 
 use std::path::{Path, PathBuf};
 
+use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
+use super::spec_authority::{RepairRole, SpecAuthority};
 use super::task_contract::RecoveryTargetHint;
-use super::{VerifierFailureType, VerifierRepairAssessment, VerifierRepairRerunOutcome};
+use super::{
+    VerifierDiagnosticFailureKind, VerifierFailureType, VerifierRepairAssessment,
+    VerifierRepairRerunOutcome,
+};
 use crate::session::store::ConversationMessage;
 
 /// Maximum byte length retained for sanitized snapshot text fields. Consumed
 /// by `truncate_for_snapshot` and the `failure_snapshot` production path (Issue #638).
 pub(super) const SNAPSHOT_FIELD_BYTE_CAP: usize = 4096;
 
+/// Issue #647 (Phase B / DR1-003): 1 cluster 攻略 plan を束ねる sub-struct。
+/// `slot reuse` (設計判断 #5) 時はこの struct 単位で `RepairJob.semantic_plan`
+/// に書き戻される — 失敗 cluster は `RepairJob.exhausted_attempts` ledger に
+/// 記録され、新しい `SemanticRepairPlan` が semantic_plan slot に書き込まれる。
+///
+/// `Eq` derive は drop している (S7-001): `SemanticFailureReport` が `f32`
+/// confidence を保持するため、`TaskContract` と同方針で `PartialEq` のみ。
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SemanticRepairPlan {
+    /// 観測 — diagnostic LLM が出力した sanitized + bounded report
+    /// (`parse_semantic_failure_report` を通過済)。
+    pub(super) semantic_report: SemanticFailureReport,
+    /// 1 plan = 1 cluster。`semantic_report.failure_clusters` のうち
+    /// 今 attack 中の cluster の `cluster_key` を保持する。
+    pub(super) failure_cluster_id: FailureClusterKey,
+    /// `semantic_report.failure_kind` のコピー (cheap-access)。
+    pub(super) semantic_cause: VerifierDiagnosticFailureKind,
+    /// この cluster に対して採用された spec authority (Phase D で
+    /// `select_authority` の結果がここに書かれる)。
+    pub(super) spec_authority: SpecAuthority,
+    /// この cluster の修復で attack するアーティファクト役割。
+    pub(super) preferred_repair_role: RepairRole,
+    /// 修復仮説。`MAX_REPAIR_HYPOTHESIS_CHARS` (240 chars) に
+    /// sanitized + truncated 済 (`semantic_report.repair_hypothesis` 由来)。
+    pub(super) repair_hypothesis: String,
+    /// rerun 後に書き込まれる予測対比の結果。未 rerun 時は `None`。
+    pub(super) expected_improvement: Option<VerifierRepairRerunOutcome>,
+}
+
 /// Issue #625 / #627 / #637: turn-local diagnostic context for a failed
 /// task-contract verifier. Rename of the previous `VerifierRepairContext`
 /// type. Fields are 1:1 with the legacy definition (see design policy §4-1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Issue #647 (Phase B): `semantic_plan` / `exhausted_attempts` の 2 field を
+/// 追加し、`Eq` derive を drop (S7-001) — `SemanticRepairPlan` 経由で
+/// `f32` confidence を含むため `PartialEq` のみ。
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct RepairJob {
     pub(super) command: String,
     pub(super) output_excerpt: String,
@@ -50,6 +88,14 @@ pub(super) struct RepairJob {
     pub(super) previous_failure_count: Option<usize>,
     pub(super) rerun_outcome: Option<VerifierRepairRerunOutcome>,
     pub(super) repair_attempt: usize,
+    /// Issue #647 (Phase B / DR1-003): 現在 attack 中の cluster と plan。
+    /// `slot reuse` 時はこの Option を書き換える (前 cluster の attempt は
+    /// `exhausted_attempts` に push されてから replace される)。
+    pub(super) semantic_plan: Option<SemanticRepairPlan>,
+    /// Issue #647 (Phase B / DR2-007): per-job 累積の重複検出 ledger。
+    /// `slot reuse` でも保持される (per-cluster ではない) — 同じ
+    /// `(FailureClusterKey, RepairRole)` 組み合わせを 2 度 attack しないため。
+    pub(super) exhausted_attempts: Vec<(FailureClusterKey, RepairRole)>,
 }
 
 /// Controller-internal decision used by `run_turn` to pick the next action
@@ -207,6 +253,52 @@ impl RepairJob {
             repair_error: self.repair_error.as_deref().map(sanitize_repair_job_text),
             rerun_outcome: self.rerun_outcome,
             applied_repair_intent_count: self.applied_repair_intents.len() as u32,
+        }
+    }
+
+    /// Issue #647 (Phase B / S3-001): test fixture helper.
+    ///
+    /// Build a `RepairJob` with all fields at sensible defaults so test sites
+    /// only need to override the fields that matter to their scenario. Combine
+    /// with struct update syntax for partial overrides:
+    ///
+    /// ```ignore
+    /// let job = RepairJob {
+    ///     target_hint: Some(my_hint),
+    ///     ..RepairJob::new_for_test()
+    /// };
+    /// ```
+    ///
+    /// All Issue #647 semantic-repair fields (`semantic_plan` /
+    /// `exhausted_attempts`) are initialized to their empty defaults (`None` /
+    /// empty `Vec`), so existing fixtures that pre-date Phase B continue to
+    /// describe a pre-semantic-planning state.
+    #[cfg(test)]
+    pub(super) fn new_for_test() -> Self {
+        Self {
+            command: String::new(),
+            output_excerpt: String::new(),
+            failure_type: VerifierFailureType::Unknown,
+            target_hint: None,
+            repair_target_hint: None,
+            changed_file_hints: Vec::new(),
+            assessment: None,
+            assessment_attempts: 0,
+            diagnostic_attempted: false,
+            diagnostic_unavailable: false,
+            diagnostic_error: None,
+            repair_error: None,
+            applied_repair_intents: Vec::new(),
+            target_line: None,
+            error_kind: None,
+            failure_signature: String::new(),
+            failure_count: None,
+            previous_failure_signature: None,
+            previous_failure_count: None,
+            rerun_outcome: None,
+            repair_attempt: 0,
+            semantic_plan: None,
+            exhausted_attempts: Vec::new(),
         }
     }
 }
@@ -418,5 +510,185 @@ mod tests {
         let truncated = truncate_for_snapshot(&multi);
         assert!(truncated.len() <= SNAPSHOT_FIELD_BYTE_CAP);
         assert!(truncated.chars().all(|c| c == 'あ'));
+    }
+
+    // ---- Issue #647 (Phase B): SemanticRepairPlan + RepairJob::new_for_test ---- //
+
+    /// Build a minimal `SemanticFailureReport` for SemanticRepairPlan tests.
+    /// Uses Phase A.1 entry points so the fixture stays SSOT-aligned.
+    #[cfg(test)]
+    fn semantic_report_fixture(
+        kind: VerifierDiagnosticFailureKind,
+        confidence: f32,
+    ) -> super::super::semantic_failure::SemanticFailureReport {
+        let json = serde_json::json!({
+            "failure_kind": kind_label(kind),
+            "confidence": confidence,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "hypothesis text",
+            "failure_clusters": [
+                {
+                    "observed": "obs",
+                    "expected": "exp",
+                    "input_shape": "shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["test"],
+                    "affected_cases": ["case1"],
+                }
+            ],
+        });
+        super::super::semantic_failure::parse_semantic_failure_report(&json)
+            .expect("fixture parses")
+    }
+
+    #[cfg(test)]
+    fn kind_label(kind: VerifierDiagnosticFailureKind) -> &'static str {
+        match kind {
+            VerifierDiagnosticFailureKind::DependencyMissing => "dependency_missing",
+            VerifierDiagnosticFailureKind::LocalImportContractMismatch => {
+                "local_import_contract_mismatch"
+            }
+            VerifierDiagnosticFailureKind::CompileOrSyntaxError => "compile_or_syntax_error",
+            VerifierDiagnosticFailureKind::AssertionMismatch => "assertion_mismatch",
+            VerifierDiagnosticFailureKind::RuntimeError => "runtime_error",
+            VerifierDiagnosticFailureKind::TestBug => "test_bug",
+            VerifierDiagnosticFailureKind::ConfigOrVerifierError => "config_or_verifier_error",
+            VerifierDiagnosticFailureKind::Unknown => "unknown",
+        }
+    }
+
+    #[test]
+    fn semantic_repair_plan_constructs_and_compares_equal_for_same_inputs() {
+        let report = semantic_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 0.7);
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan_a = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_id.clone(),
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+        };
+        let plan_b = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+        };
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn semantic_repair_plan_partial_eq_distinguishes_authority_and_role() {
+        let report = semantic_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 0.7);
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let base = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_id.clone(),
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+        };
+        let mut different_authority = base.clone();
+        different_authority.spec_authority = SpecAuthority::LlmGeneratedTest;
+        assert_ne!(base, different_authority);
+
+        let mut different_role = base.clone();
+        different_role.preferred_repair_role = super::super::task_contract::ArtifactRole::Test;
+        assert_ne!(base, different_role);
+    }
+
+    #[test]
+    fn repair_job_new_for_test_initializes_semantic_fields_empty() {
+        let job = RepairJob::new_for_test();
+        // Issue #647 (Phase B): semantic planning slots start empty so that
+        // pre-Phase-D code paths see a "no semantic plan yet" state.
+        assert!(job.semantic_plan.is_none());
+        assert!(job.exhausted_attempts.is_empty());
+    }
+
+    #[test]
+    fn repair_job_new_for_test_initializes_legacy_fields_to_neutral_defaults() {
+        let job = RepairJob::new_for_test();
+        assert_eq!(job.failure_type, VerifierFailureType::Unknown);
+        assert!(job.target_hint.is_none());
+        assert!(job.repair_target_hint.is_none());
+        assert!(job.changed_file_hints.is_empty());
+        assert!(job.assessment.is_none());
+        assert_eq!(job.assessment_attempts, 0);
+        assert!(!job.diagnostic_attempted);
+        assert!(!job.diagnostic_unavailable);
+        assert!(job.diagnostic_error.is_none());
+        assert!(job.repair_error.is_none());
+        assert!(job.applied_repair_intents.is_empty());
+        assert!(job.target_line.is_none());
+        assert!(job.error_kind.is_none());
+        assert_eq!(job.failure_signature, "");
+        assert!(job.failure_count.is_none());
+        assert!(job.previous_failure_signature.is_none());
+        assert!(job.previous_failure_count.is_none());
+        assert!(job.rerun_outcome.is_none());
+        assert_eq!(job.repair_attempt, 0);
+    }
+
+    #[test]
+    fn repair_job_supports_struct_update_syntax_for_partial_override() {
+        // S3-001: existing test fixtures override only the fields they care
+        // about and let `new_for_test()` fill the rest. Mirror that pattern
+        // here to lock the API shape (no `..Default::default()` indirection).
+        let job = RepairJob {
+            command: "pytest".to_string(),
+            failure_signature: "sig".to_string(),
+            ..RepairJob::new_for_test()
+        };
+        assert_eq!(job.command, "pytest");
+        assert_eq!(job.failure_signature, "sig");
+        // Untouched fields still take new_for_test defaults.
+        assert_eq!(job.failure_type, VerifierFailureType::Unknown);
+        assert!(job.semantic_plan.is_none());
+        assert!(job.exhausted_attempts.is_empty());
+    }
+
+    #[test]
+    fn repair_job_partial_eq_holds_with_semantic_plan_some() {
+        // S7-001: `Eq` is dropped because `SemanticFailureReport.confidence`
+        // is `f32`, but `PartialEq` must still work for assertion / diff
+        // workflows in tests.
+        let report = semantic_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 0.5);
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+        };
+        let a = RepairJob {
+            semantic_plan: Some(plan.clone()),
+            ..RepairJob::new_for_test()
+        };
+        let b = RepairJob {
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+        assert_eq!(a, b);
+
+        // Mutating exhausted_attempts breaks equality.
+        let c = RepairJob {
+            exhausted_attempts: vec![(
+                a.semantic_plan.as_ref().unwrap().failure_cluster_id.clone(),
+                super::super::task_contract::ArtifactRole::Test,
+            )],
+            ..a.clone()
+        };
+        assert_ne!(a, c);
     }
 }
