@@ -78,6 +78,75 @@ pub(super) enum VerifierRepairState {
     },
 }
 
+/// Issue #646 (A1): first-class state for "verifier is missing from the
+/// repository". Distinct from the failure-driven `RepairJob` so the planner
+/// can:
+///   1. Suppress verifier retry until an in-scope edit lands.
+///   2. Hold the active scope's allowed-tool whitelist (Write / Edit / Bash)
+///      independently of the failure-diagnostic state machine.
+///   3. Enforce its own retry budget separate from
+///      `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`.
+///
+/// Lives on `Agent` next to `repair_job` and is cleared at the
+/// `handle_user_message` head (per-turn cap pattern).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MissingVerifierJob {
+    /// Inclusive ceiling on how many times we'll re-emit the "create a
+    /// verifier" recovery loop in a single task.
+    pub(super) retry_budget: u8,
+    /// How many retries have already been consumed.
+    pub(super) retries_used: u8,
+    /// Becomes `true` once a successful in-scope Write/Edit lands after
+    /// the job entered the `pending` state. Until then, the planner
+    /// MUST suppress `RunVerifier` to avoid an infinite retry loop.
+    pub(super) in_scope_edit_observed: bool,
+    /// Snapshot of `repo_edit_calls_made_this_turn` when the job entered
+    /// `pending`. Retained for diagnostics / future log-event emission.
+    pub(super) repo_edit_count_at_pending: usize,
+}
+
+impl MissingVerifierJob {
+    pub(super) fn new(retry_budget: u8, repo_edit_count_at_pending: usize) -> Self {
+        Self {
+            retry_budget,
+            retries_used: 0,
+            in_scope_edit_observed: false,
+            repo_edit_count_at_pending,
+        }
+    }
+
+    /// Whether the planner should suppress `RunVerifier` for this turn.
+    /// True when the model has not yet produced an in-scope edit since the
+    /// `MissingVerifierJob` was raised.
+    pub(super) fn should_suppress_verifier_retry(&self) -> bool {
+        !self.in_scope_edit_observed
+    }
+
+    /// Mark that an in-scope edit has been observed. After this fires,
+    /// verifier retries become allowed again.
+    pub(super) fn record_in_scope_edit(&mut self) {
+        self.in_scope_edit_observed = true;
+    }
+
+    /// Consume one retry slot. Returns `true` when the call falls inside
+    /// the configured budget.
+    pub(super) fn record_retry(&mut self) -> bool {
+        if self.retries_used >= self.retry_budget {
+            return false;
+        }
+        self.retries_used = self.retries_used.saturating_add(1);
+        true
+    }
+
+    /// Allowed-tool whitelist surfaced to the effective tool policy when
+    /// this state is active. Intentionally narrow: the model is expected
+    /// to either create a verifier file or run one (Bash) — Read alone
+    /// cannot make progress out of this state.
+    pub(super) fn allowed_tool_names(&self) -> &'static [&'static str] {
+        &["Write", "Edit", "Bash"]
+    }
+}
+
 /// Read-only snapshot consumed by #638 and by event-log persistence. Each
 /// text field is re-sanitized at snapshot time so the SSOT for redaction is
 /// preserved at every transfer boundary.
@@ -313,6 +382,32 @@ mod tests {
         assert!(!out.contains("SECRETVALUE"));
         assert!(!out.contains('\n'));
         assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn missing_verifier_job_suppresses_verifier_retry_until_in_scope_edit() {
+        // Issue #646 (A1/B2): a fresh job suppresses verifier retry;
+        // recording an in-scope edit flips the gate.
+        let mut job = MissingVerifierJob::new(3, 0);
+        assert!(job.should_suppress_verifier_retry());
+        job.record_in_scope_edit();
+        assert!(!job.should_suppress_verifier_retry());
+    }
+
+    #[test]
+    fn missing_verifier_job_retry_budget_is_bounded() {
+        let mut job = MissingVerifierJob::new(2, 0);
+        assert!(job.record_retry());
+        assert!(job.record_retry());
+        // Third call should report budget exhausted.
+        assert!(!job.record_retry());
+        assert_eq!(job.retries_used, 2);
+    }
+
+    #[test]
+    fn missing_verifier_job_allowed_tool_names_match_first_class_state() {
+        let job = MissingVerifierJob::new(3, 0);
+        assert_eq!(job.allowed_tool_names(), &["Write", "Edit", "Bash"]);
     }
 
     #[test]

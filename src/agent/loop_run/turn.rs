@@ -3483,6 +3483,15 @@ impl Agent {
         // user message — reset here so a fresh handle_user_message can fire
         // the Reminder once even if the previous turn already did.
         self.reminder_called_this_turn = false;
+        // Issue #646 (C1): per-turn ownership reset. Each user turn starts a
+        // fresh task — prior-turn edits do NOT auto-confer ownership on the
+        // new task. Clearing here also wipes the MissingVerifierJob so
+        // verifier retry budgets restart per task, and the
+        // `turn_pre_tool_file_hashes` capture cache so stale baselines from
+        // a prior turn cannot mask the next turn's first write.
+        self.turn_edited_relative_paths.clear();
+        self.turn_pre_tool_file_hashes.clear();
+        self.missing_verifier_job = None;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -5322,10 +5331,16 @@ impl Agent {
                 .allowed_tool_names_for_prompt()
                 .is_some()
             {
-                match effective_tool_batch_action(
+                let batch_scope = if self.missing_verifier_job.is_some() {
+                    Some(self.current_workspace_scope())
+                } else {
+                    None
+                };
+                match effective_tool_batch_action_with_scope(
                     &prepared_tool_calls,
                     &effective_tool_policy,
                     &self.work_root,
+                    batch_scope.as_ref(),
                 ) {
                     FocusedEditBatchAction::Accept => {}
                     FocusedEditBatchAction::TruncateToFirst => {
@@ -7503,6 +7518,9 @@ impl Agent {
                     args.task_contract_verify_commands_collected.push(sanitized);
                 }
                 self.repair_job = None;
+                // Issue #646 (A1): verifier success retires any in-flight
+                // MissingVerifierJob — no further suppression is needed.
+                self.missing_verifier_job = None;
                 *args.verifier_repair_retries = 0;
                 // Issue #637 (CB-001): mirror the local counter reset on the
                 // Agent-field counter so the next verifier failure / repair
@@ -7580,12 +7598,30 @@ impl Agent {
                 TaskContractVerifierFlowOutcome::Continue
             }
             TaskContractVerifierOutcome::NoVerifier => {
-                *args.contract_verification_retries += 1;
-                if *args.contract_verification_retries >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
+                // Issue #646 (A1): the MissingVerifierJob is the first-class
+                // owner of the NoVerifier retry budget. Create the job on
+                // the first transition and advance it on every subsequent
+                // one. The legacy `contract_verification_retries` counter
+                // is intentionally NOT incremented for NoVerifier
+                // transitions any more — it tracks verifier *failures*, a
+                // distinct lifecycle (NoVerifier ≠ Failed). Exiting on
+                // exhausted budget happens here, before any of the
+                // pending-flag bookkeeping below.
+                if self.missing_verifier_job.is_none() {
+                    self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
+                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
+                        args.repo_edit_calls_made_this_turn,
+                    ));
+                }
+                let budget_exhausted = self
+                    .missing_verifier_job
+                    .as_mut()
+                    .is_some_and(|job| !job.record_retry());
+                if budget_exhausted {
                     return TaskContractVerifierFlowOutcome::Exit {
                         reason: ExitReason::MissingVerification,
                         error_text:
-                            "task contract requires verification, but no verifier was detected"
+                            "task contract requires verification, but the MissingVerifierJob retry budget is exhausted"
                                 .to_string(),
                     };
                 }
@@ -7609,8 +7645,17 @@ impl Agent {
                     ),
                     true,
                 );
+                // Issue #646 (A1): prompt uses the MissingVerifierJob's
+                // own counter so the displayed attempt N/M reflects the
+                // first-class retry budget, not the legacy verifier-failure
+                // counter.
+                let job_attempt = self
+                    .missing_verifier_job
+                    .as_ref()
+                    .map(|job| job.retries_used as usize)
+                    .unwrap_or(0);
                 self.push_system_note(task_contract_no_verifier_note(
-                    *args.contract_verification_retries,
+                    job_attempt,
                     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
                 ));
                 TaskContractVerifierFlowOutcome::Continue
@@ -8774,7 +8819,21 @@ impl Agent {
             }
         }
         if self.task_contract_verifier_repair_pending {
-            return verifier_repair_policy_for_decision(self.verifier_repair_decision_for_policy());
+            // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
+            // active and the safeguarded decision returns `NoRepair` (i.e.
+            // the scope check rejected the legacy out-of-scope target),
+            // expose the MissingVerifierJob's narrow tool whitelist so the
+            // model can still produce an in-scope verifier file.
+            let decision = self.verifier_repair_decision_for_policy();
+            if matches!(decision, VerifierRepairDecision::NoRepair)
+                && let Some(job) = self.missing_verifier_job.as_ref()
+            {
+                return EffectiveToolPolicy::restricted(
+                    EffectiveToolPolicyReason::VerifierRepair,
+                    job.allowed_tool_names().to_vec(),
+                );
+            }
+            return verifier_repair_policy_for_decision(decision);
         }
         if let Some(target) = self.forced_small_edit_recovery_target() {
             return self.focused_edit_policy_for_target(
@@ -8803,14 +8862,47 @@ impl Agent {
     }
 
     fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
-        verifier_repair_decision(
+        // Issue #646 (A3/B1): the legacy `verifier_repair_decision` falls
+        // back to `latest_successful_read_existing_path` when no real
+        // `RepairJob` is attached. That fallback can return an out-of-scope
+        // path which then directs the tool policy / recovery note into a
+        // prior-session subtree. Route through the shared scope safeguard
+        // so all three consumers (`task_contract_repair_state`,
+        // `effective_tool_policy`, `push_verifier_repair_recovery_note`)
+        // see an identically gated decision.
+        self.scope_safeguarded_verifier_repair_decision(None, 0)
+    }
+
+    /// Issue #646 (A3/B1): single SSOT for the verifier-repair decision
+    /// after applying the active-scope safeguard. When `repair_job` is
+    /// `None` and the raw decision targets an out-of-scope path, returns
+    /// `NoRepair` instead, so downstream consumers cannot drag the model
+    /// into a prior subtree.
+    fn scope_safeguarded_verifier_repair_decision(
+        &self,
+        repair_edit_count: Option<usize>,
+        repo_edit_calls_made_this_turn: usize,
+    ) -> VerifierRepairDecision {
+        let decision = verifier_repair_decision(
             self.task_contract_verifier_repair_pending,
             self.repair_job.as_ref(),
             &self.session.messages,
             &self.work_root,
-            None,
-            0,
-        )
+            repair_edit_count,
+            repo_edit_calls_made_this_turn,
+        );
+        if self.repair_job.is_some() {
+            return decision;
+        }
+        let Some(target) = decision_target_path(&decision) else {
+            return decision;
+        };
+        let scope = self.current_workspace_scope();
+        if target_path_in_scope(target, &self.work_root, &scope) {
+            decision
+        } else {
+            VerifierRepairDecision::NoRepair
+        }
     }
 
     fn focused_edit_policy_for_target(
@@ -9730,8 +9822,23 @@ impl Agent {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
         }
+        // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
+        // active, hand the active workspace scope to the policy gate so
+        // out-of-scope `Write`/`Edit` paths are rejected even when the
+        // restricted whitelist would otherwise admit them.
+        let scope_for_policy = if self.missing_verifier_job.is_some() {
+            Some(self.current_workspace_scope())
+        } else {
+            None
+        };
         let effective_policy_error = if let Some(policy) = effective_tool_policy {
-            effective_tool_policy_error_for_call(policy, name, arguments, &self.work_root)
+            effective_tool_policy_error_for_call_with_scope(
+                policy,
+                name,
+                arguments,
+                &self.work_root,
+                scope_for_policy.as_ref(),
+            )
         } else {
             self.effective_tool_policy_error(name, arguments)
         };
@@ -9829,6 +9936,16 @@ impl Agent {
             };
         }
 
+        // Issue #646 (C2 / A4): capture pre-tool hash so
+        // `observe_evidence_from_repo_edit` can detect no-op Write/Edit
+        // calls (content unchanged → no `Owned` promotion).
+        if matches!(name, "Write" | "Edit")
+            && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
+            && let Some(rel) = workspace_relative_path_for_tool_arg(&self.work_root, raw_path)
+        {
+            let pre_hash = current_file_hash_for_relative_path(&self.work_root, &rel);
+            self.turn_pre_tool_file_hashes.insert(rel, pre_hash);
+        }
         match self.tool_registry.execute(name, arguments, &context) {
             Ok(result) => {
                 if matches!(name, "Write" | "Edit")
@@ -9979,6 +10096,46 @@ impl Agent {
             );
             return;
         }
+        // Issue #646 (C2 / A4): even after the scaffold-delta gate, a
+        // Write/Edit can be a content no-op for a NON-scaffold file (e.g.
+        // model writes the same body back, or `Edit` whose `old_string`
+        // equals `new_string`). Compare the pre-tool hash captured in
+        // `execute_tool_call` against the current on-disk hash. Identical
+        // hashes mean the file did not actually change — bail out so the
+        // path does NOT enter `turn_edited_relative_paths` and does NOT
+        // contribute completion evidence. The pre-tool entry is removed in
+        // either branch to keep the cache turn-local and bounded.
+        let pre_tool_hash = self.turn_pre_tool_file_hashes.remove(&relative_path);
+        let current_hash = current_file_hash_for_relative_path(&self.work_root, &relative_path);
+        if is_repo_edit_no_op(
+            pre_tool_hash.as_ref().and_then(Option::as_deref),
+            current_hash.as_deref(),
+        ) {
+            crate::logging::log_completion_evidence_observed(
+                self.current_turn_index,
+                0,
+                "repo_edit_no_op",
+                serde_json::json!({
+                    "category": format!("{:?}", category),
+                    "path": relative_path,
+                }),
+            );
+            return;
+        }
+        // Issue #646 (C2): record the edited path AFTER both the scaffold-
+        // delta gate AND the no-op hash check so a content-unchanged
+        // Write/Edit (scaffold body re-written, or `Edit` with
+        // `old_string == new_string`) never promotes the file to `Owned`.
+        self.turn_edited_relative_paths
+            .insert(relative_path.clone());
+        // Issue #646 (A1/B2): once an in-scope edit has landed, the
+        // MissingVerifierJob can begin retrying verifier creation.
+        if self.missing_verifier_job.is_some() {
+            let in_scope = self.current_workspace_scope().contains(&relative_path);
+            if in_scope && let Some(job) = self.missing_verifier_job.as_mut() {
+                job.record_in_scope_edit();
+            }
+        }
         self.evidence_set_this_turn
             .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
         if self.repo_edit_satisfies_current_artifact_target(category, &relative_path) {
@@ -10087,15 +10244,38 @@ impl Agent {
         &self,
         contract: &super::task_contract::TaskContract,
     ) -> Vec<super::task_contract::ArtifactState> {
+        let scope = self.current_workspace_scope();
         let mut states = Vec::new();
         for role in &contract.required_artifacts {
             if let Some(path) = self.scaffold_candidate_for_missing_role(*role) {
                 states.push(super::task_contract::ArtifactState::scaffold(*role, path));
             }
-            if let Some(path) = existing_workspace_candidate_for_role(&self.work_root, *role)
-                && self.repo_edit_has_post_scaffold_delta(&path)
+            // Issue #646: an existing workspace artifact only enters as
+            // `ExistsButUnverified` when ownership classification returns
+            // `Owned`. Pre-existing nested-subtree artifacts the active
+            // task did not produce stay out of the artifact-state vector
+            // and therefore cannot satisfy `artifact_ready_for_verification`.
+            if let Some(path) =
+                existing_workspace_candidate_for_role_in_scope(&self.work_root, *role, &scope)
             {
-                states.push(super::task_contract::ArtifactState::exists(*role, path));
+                let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
+                let edited_this_session = self.turn_edited_relative_paths.contains(&path);
+                let ownership = super::artifact_ownership::classify_ownership(
+                    super::artifact_ownership::OwnershipInputs {
+                        work_root: &self.work_root,
+                        relative_path: &path,
+                        scope: &scope,
+                        edited_this_session,
+                        scaffold_changed,
+                        verifier_passed_in_scope: false,
+                    },
+                );
+                if matches!(
+                    ownership,
+                    super::artifact_ownership::ArtifactOwnership::Owned
+                ) {
+                    states.push(super::task_contract::ArtifactState::exists(*role, path));
+                }
             }
         }
         for evidence in self.task_contract_evidence_set_this_turn.iter() {
@@ -10109,19 +10289,27 @@ impl Agent {
         states
     }
 
+    /// Issue #646: build the active `TaskWorkspaceScope` for the current
+    /// task. Pure projection of `work_root` + the active user request; no
+    /// filesystem mutation. Called from `task_contract_artifact_states` and
+    /// `task_contract_recovery_target`; not cached because the bounded
+    /// shallow read of `work_root` is cheap and the scope is recomputed
+    /// only a handful of times per turn.
+    fn current_workspace_scope(&self) -> super::task_workspace_scope::TaskWorkspaceScope {
+        let request = self.active_request_text().unwrap_or_default();
+        super::task_workspace_scope::TaskWorkspaceScope::detect(&self.work_root, &request)
+    }
+
     fn task_contract_repair_state(
         &self,
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::VerifierRepairState {
-        match verifier_repair_decision(
-            self.task_contract_verifier_repair_pending,
-            self.repair_job.as_ref(),
-            &self.session.messages,
-            &self.work_root,
+        let decision = self.scope_safeguarded_verifier_repair_decision(
             repair_edit_count,
             repo_edit_calls_made_this_turn,
-        ) {
+        );
+        match decision {
             VerifierRepairDecision::NeedDiagnostic
             | VerifierRepairDecision::NeedTargetDiscovery
             | VerifierRepairDecision::NeedFreshRead(_)
@@ -10152,12 +10340,17 @@ impl Agent {
         let artifacts = self.task_contract_artifact_states(contract);
         let repair_state =
             self.task_contract_repair_state(repair_edit_count, repo_edit_calls_made_this_turn);
+        let missing_verifier_suppress_retry = self
+            .missing_verifier_job
+            .as_ref()
+            .is_some_and(|job| job.should_suppress_verifier_retry());
         super::task_contract::plan_artifact_recovery(super::task_contract::ArtifactRecoveryInputs {
             contract,
             evidence: &self.task_contract_evidence_set_this_turn,
             artifacts: &artifacts,
             repair_state: &repair_state,
             artifact_excerpts: &self.task_contract_excerpts,
+            missing_verifier_suppress_retry,
         })
     }
 
@@ -10177,14 +10370,37 @@ impl Agent {
                     .to_string(),
             });
         }
-        if let Some(path) = existing_workspace_candidate_for_role(&self.work_root, role) {
-            return Some(super::task_contract::RecoveryTargetHint {
-                role,
-                path,
-                reason: "existing workspace artifact matches the missing role".to_string(),
-            });
+        // Issue #646 (D1): two-step gate — first scope, then full ownership
+        // classifier. A scope-internal but non-`Owned` artifact (e.g. an
+        // unchanged scaffold body, a CandidateOnly README the user never
+        // mentioned) MUST NOT be surfaced as a recovery target either. The
+        // ownership signal — edit / scaffold delta / explicit scope mention
+        // — is the same one the planner uses upstream.
+        let scope = self.current_workspace_scope();
+        let path = existing_workspace_candidate_for_role_in_scope(&self.work_root, role, &scope)?;
+        let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
+        let edited_this_session = self.turn_edited_relative_paths.contains(&path);
+        let ownership = super::artifact_ownership::classify_ownership(
+            super::artifact_ownership::OwnershipInputs {
+                work_root: &self.work_root,
+                relative_path: &path,
+                scope: &scope,
+                edited_this_session,
+                scaffold_changed,
+                verifier_passed_in_scope: false,
+            },
+        );
+        if !matches!(
+            ownership,
+            super::artifact_ownership::ArtifactOwnership::Owned
+        ) {
+            return None;
         }
-        None
+        Some(super::task_contract::RecoveryTargetHint {
+            role,
+            path,
+            reason: "existing workspace artifact matches the missing role".to_string(),
+        })
     }
 
     fn set_artifact_recovery_target_for_decision(
@@ -10312,11 +10528,17 @@ impl Agent {
         arguments: &serde_json::Value,
     ) -> Option<String> {
         let effective_tool_policy = self.effective_tool_policy();
-        effective_tool_policy_error_for_call(
+        let scope = if self.missing_verifier_job.is_some() {
+            Some(self.current_workspace_scope())
+        } else {
+            None
+        };
+        effective_tool_policy_error_for_call_with_scope(
             &effective_tool_policy,
             name,
             arguments,
             &self.work_root,
+            scope.as_ref(),
         )
     }
 
@@ -13724,6 +13946,12 @@ fn workspace_relative_path_for_tool_arg(work_root: &Path, raw_path: &str) -> Opt
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
+/// Legacy un-scoped lookup kept for unit-test fixtures that exercise the
+/// `scaffold_candidate_priority` ordering independently of scope detection.
+/// Production code MUST use [`existing_workspace_candidate_for_role_in_scope`]
+/// so out-of-scope nested-subtree files cannot leak into completion evidence
+/// (Issue #646).
+#[cfg(test)]
 fn existing_workspace_candidate_for_role(
     work_root: &Path,
     role: super::task_contract::ArtifactRole,
@@ -13736,6 +13964,73 @@ fn existing_workspace_candidate_for_role(
             )
             .is_some_and(|candidate| candidate == role)
         })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
+    });
+    candidates
+        .first()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Issue #646: project the workspace-target half of a [`VerifierRepairDecision`]
+/// so the MissingVerifierJob safeguard can re-validate the scope when no real
+/// [`RepairJob`] is attached. Returns `None` for decisions that do not carry
+/// a path (NoRepair / NeedDiagnostic / NeedTargetDiscovery / ReadyToVerify /
+/// DiagnosticUnavailable).
+fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
+    match decision {
+        VerifierRepairDecision::NeedFreshRead(path)
+        | VerifierRepairDecision::NeedWrite(path)
+        | VerifierRepairDecision::NeedEdit(path) => Some(path.as_path()),
+        VerifierRepairDecision::NoRepair
+        | VerifierRepairDecision::NeedDiagnostic
+        | VerifierRepairDecision::NeedTargetDiscovery
+        | VerifierRepairDecision::DiagnosticUnavailable
+        | VerifierRepairDecision::ReadyToVerify => None,
+    }
+}
+
+/// Issue #646: confirm that an absolute repair target lies inside the active
+/// workspace scope. The path is normalized against `work_root` and the
+/// resulting relative form is handed to [`TaskWorkspaceScope::contains`].
+/// Targets that fail to strip the prefix (escape via canonical/symlink) are
+/// treated as out-of-scope.
+fn target_path_in_scope(
+    target: &Path,
+    work_root: &Path,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+) -> bool {
+    let root_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let Ok(relative) = target_canon.strip_prefix(&root_canon) else {
+        return false;
+    };
+    scope.contains(&relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Issue #646: scope-aware variant of [`existing_workspace_candidate_for_role`].
+///
+/// Filters workspace files through `scope.contains(...)` before priority
+/// sorting so candidates inside out-of-scope nested subtrees (the
+/// fresh-session-parent-directory bug case) are never surfaced. Used by
+/// `task_contract_artifact_states` and `task_contract_recovery_target`;
+/// the legacy un-scoped function is preserved for unit-test fixtures that
+/// exercise the priority logic independently.
+pub(super) fn existing_workspace_candidate_for_role_in_scope(
+    work_root: &Path,
+    role: super::task_contract::ArtifactRole,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+) -> Option<String> {
+    let mut candidates = meaningful_workspace_files(work_root, 64)?
+        .into_iter()
+        .filter(|path| {
+            artifact_role_from_repo_edit_category(
+                super::completion_evidence::classify_repo_edit_path(path),
+            )
+            .is_some_and(|candidate| candidate == role)
+        })
+        .filter(|path| scope.contains(&path.to_string_lossy().replace('\\', "/")))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|path| {
         scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
@@ -15556,10 +15851,8 @@ fn collect_meaningful_workspace_files(
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            ".git" | ".anvil" | ".anvil-state" | "node_modules" | "target"
-        ) {
+        // Issue #646 (E1): single SSOT for ignored workspace directories.
+        if super::task_workspace_scope::is_workspace_ignored_dir(&name) {
             continue;
         }
         let path = entry.path();
@@ -16164,11 +16457,32 @@ fn focused_edit_tool_policy_error(
     }
 }
 
+/// Legacy non-scope wrapper kept for unit tests and tests-only re-exports.
+/// Production code MUST use [`effective_tool_policy_error_for_call_with_scope`]
+/// so the MissingVerifierJob scope gate fires (Issue #646 A1/A3).
+#[cfg(test)]
 fn effective_tool_policy_error_for_call(
     policy: &EffectiveToolPolicy,
     name: &str,
     arguments: &serde_json::Value,
     work_root: &Path,
+) -> Option<String> {
+    effective_tool_policy_error_for_call_with_scope(policy, name, arguments, work_root, None)
+}
+
+/// Issue #646 (A1/A3): scope-aware variant. When `scope` is provided and the
+/// policy is a `VerifierRepair`-reasoned restricted policy WITHOUT a
+/// focused-edit or artifact-directed target (i.e. the MissingVerifierJob
+/// fallback whitelist), the file-targeting tool calls must additionally pass
+/// `scope.contains(...)` on the resolved path argument. Out-of-scope writes
+/// are rejected even though `Write`/`Edit`/`Bash` would otherwise satisfy
+/// the tool-name whitelist.
+fn effective_tool_policy_error_for_call_with_scope(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    scope: Option<&super::task_workspace_scope::TaskWorkspaceScope>,
 ) -> Option<String> {
     if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt()
         && !allowed_tools.contains(&name)
@@ -16195,7 +16509,51 @@ fn effective_tool_policy_error_for_call(
         return artifact_directed_tool_policy_error(name, arguments, &artifact.target, work_root);
     }
 
+    // Issue #646 (A1/A3): MissingVerifierJob fallback scope enforcement.
+    if policy.reason() == EffectiveToolPolicyReason::VerifierRepair
+        && let Some(scope) = scope
+        && let Some(err) = missing_verifier_scope_policy_error(name, arguments, work_root, scope)
+    {
+        return Some(err);
+    }
+
     None
+}
+
+/// Issue #646 (C2 / A4): no-op repo-edit detector. Compares the pre-tool
+/// content hash captured in `execute_tool_call` against the post-tool
+/// content hash. When both are `Some(x)` with equal values the Write/Edit
+/// did not modify the file and MUST NOT promote the path to `Owned`.
+///
+/// Returns `false` whenever the pre-tool hash is missing (first observation
+/// in the turn) or `None` (file didn't exist before the tool call), since
+/// those are real edits.
+fn is_repo_edit_no_op(pre_tool_hash: Option<&str>, current_hash: Option<&str>) -> bool {
+    matches!((pre_tool_hash, current_hash), (Some(p), Some(c)) if p == c)
+}
+
+/// Issue #646 (A1/A3): rejects file-targeting tool calls whose resolved path
+/// argument falls outside the active `TaskWorkspaceScope`. Applies only when
+/// the policy reason is `VerifierRepair` and the policy carries no specific
+/// target (i.e. the MissingVerifierJob whitelist case).
+fn missing_verifier_scope_policy_error(
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+) -> Option<String> {
+    if !matches!(name, "Write" | "Edit") {
+        return None;
+    }
+    let raw_path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+    let relative = workspace_relative_path_for_tool_arg(work_root, raw_path)?;
+    if scope.contains(&relative) {
+        return None;
+    }
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    Some(format!(
+        "MissingVerifierJob policy rejected {rejected_tool}; path {relative} is outside the active workspace scope"
+    ))
 }
 
 fn artifact_directed_tool_policy_error(
@@ -16333,20 +16691,36 @@ fn focused_edit_tool_batch_action(
     }
 }
 
+/// Legacy non-scope wrapper kept for unit tests and tests-only re-exports.
+/// Production code MUST use [`effective_tool_batch_action_with_scope`].
+#[cfg(test)]
 fn effective_tool_batch_action(
     tool_calls: &[ToolCall],
     policy: &EffectiveToolPolicy,
     work_root: &Path,
 ) -> FocusedEditBatchAction {
+    effective_tool_batch_action_with_scope(tool_calls, policy, work_root, None)
+}
+
+/// Issue #646 (A1/A3): scope-aware variant of [`effective_tool_batch_action`].
+/// Forwarded scope is consulted only by the MissingVerifierJob fallback
+/// branch inside `effective_tool_policy_error_for_call_with_scope`.
+fn effective_tool_batch_action_with_scope(
+    tool_calls: &[ToolCall],
+    policy: &EffectiveToolPolicy,
+    work_root: &Path,
+    scope: Option<&super::task_workspace_scope::TaskWorkspaceScope>,
+) -> FocusedEditBatchAction {
     let Some(first_tool_call) = tool_calls.first() else {
         return FocusedEditBatchAction::Accept;
     };
 
-    if let Some(err) = effective_tool_policy_error_for_call(
+    if let Some(err) = effective_tool_policy_error_for_call_with_scope(
         policy,
         &first_tool_call.name,
         &first_tool_call.arguments,
         work_root,
+        scope,
     ) {
         return FocusedEditBatchAction::Reject(err);
     }
@@ -17498,7 +17872,8 @@ mod progress_tests {
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         effective_tool_batch_action, effective_tool_policy_error_for_call,
-        existing_workspace_candidate_for_role, extract_page_copy_block_from_numbered_read,
+        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
+        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
         first_existing_impl_target, focused_edit_compact_anchor_note,
         focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
         focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
@@ -17511,8 +17886,8 @@ mod progress_tests {
         focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
-        has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
-        last_read_tool_path, latest_page_copy_block_from_read,
+        has_successful_repo_edit, implementation_quality_issue_for_request, is_repo_edit_no_op,
+        is_utf8_locale, last_read_tool_path, latest_page_copy_block_from_read,
         latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
         parse_verifier_repair_assessment_reply, parse_verifier_repair_intent_reply,
         parse_verifier_repair_intents_reply, post_scaffold_continuation_active,
@@ -20870,6 +21245,231 @@ export default function App() {
         .unwrap();
 
         assert_eq!(target, "app/main.py");
+    }
+
+    #[test]
+    fn scope_aware_lookup_filters_out_of_scope_nested_subtree_candidates() {
+        // Issue #646 regression: fresh-session parent-directory layout with
+        // a prior project at `0517_003/*`. The scope-aware lookup must
+        // refuse those out-of-scope candidates even though the legacy
+        // `existing_workspace_candidate_for_role` happily returns them.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        std::fs::write(
+            work_root.join("0517_003/app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("0517_003/tests/test_main.py"),
+            "def test_health(): pass\n",
+        )
+        .unwrap();
+        std::fs::write(work_root.join("0517_003/README.md"), "# Old\n").unwrap();
+
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。",
+        );
+        // Pre-existing subtree is detected, no explicit mention → ambiguous parent.
+        let target = existing_workspace_candidate_for_role_in_scope(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+            &scope,
+        );
+        assert!(
+            target.is_none(),
+            "expected no in-scope implementation candidate, got {target:?}"
+        );
+
+        // Legacy lookup still returns the old subtree candidate — the safety
+        // belongs to the scope filter, not the meaningful-files walk.
+        let legacy_target = existing_workspace_candidate_for_role(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+        );
+        assert_eq!(legacy_target.as_deref(), Some("0517_003/app/main.py"));
+    }
+
+    #[test]
+    fn missing_verifier_safeguard_rejects_out_of_scope_repair_target() {
+        // Issue #646: when verifier_repair_decision falls back to the latest
+        // successful `Read`, an OOS path must NOT be accepted as the
+        // MissingVerifierJob repair target. `target_path_in_scope` is the
+        // gate consulted by `task_contract_repair_state` for this case.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        // `tests/` marker dir is what makes the prior subtree project-like.
+        std::fs::write(work_root.join("0517_003/tests/test_main.py"), "").unwrap();
+        std::fs::write(
+            work_root.join("0517_003/app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでcrudのAPIを開発してください",
+        );
+        // Sanity: scope must classify the prior subtree as out-of-scope
+        // before any safeguard check is meaningful.
+        assert!(!scope.contains("0517_003/app/main.py"));
+
+        let oos_target = work_root.join("0517_003/app/main.py");
+        assert!(!super::target_path_in_scope(&oos_target, work_root, &scope));
+
+        // A new, in-scope target at the parent root is allowed.
+        let in_scope_target = work_root.join("app/main.py");
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(&in_scope_target, "").unwrap();
+        assert!(super::target_path_in_scope(
+            &in_scope_target,
+            work_root,
+            &scope
+        ));
+    }
+
+    #[test]
+    fn no_op_repo_edit_detector_returns_true_only_for_matching_hashes() {
+        // Issue #646 (A4 / C2): the pure helper guarding
+        // `observe_evidence_from_repo_edit` against no-op Write/Edit calls.
+        // Identical pre/post hashes → no-op; any difference, or a None on
+        // either side, → real edit (insertion + evidence flow proceeds).
+        assert!(is_repo_edit_no_op(Some("abc"), Some("abc")));
+        assert!(!is_repo_edit_no_op(Some("abc"), Some("def")));
+        assert!(!is_repo_edit_no_op(None, Some("abc"))); // file didn't exist before
+        assert!(!is_repo_edit_no_op(Some("abc"), None)); // file deleted (treat as edit)
+        assert!(!is_repo_edit_no_op(None, None));
+    }
+
+    #[test]
+    fn missing_verifier_policy_rejects_out_of_scope_write() {
+        // Issue #646 (A1/A3): the MissingVerifierJob fallback policy is a
+        // `restricted(VerifierRepair, ["Write","Edit","Bash"])`. Without
+        // the scope gate, `Write` on `0517_003/app/main.py` would silently
+        // pass — exactly the codex finding. The scope-aware policy gate
+        // must reject the call with a MissingVerifierJob-flavoured error.
+        let dir = tempdir().unwrap();
+        let work_root = dir.path();
+        // Make `0517_003/` project-like so it sits in AmbiguousParent scope.
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        std::fs::write(work_root.join("0517_003/tests/test_main.py"), "").unwrap();
+        std::fs::write(work_root.join("0517_003/app/main.py"), "").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでCRUDのAPIを開発してください",
+        );
+        assert!(!scope.contains("0517_003/app/main.py"));
+
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write", "Edit", "Bash"],
+        );
+        let arguments = serde_json::json!({
+            "path": "0517_003/app/main.py",
+            "content": "from fastapi import FastAPI\napp = FastAPI()\n",
+        });
+        let err = effective_tool_policy_error_for_call_with_scope(
+            &policy,
+            "Write",
+            &arguments,
+            work_root,
+            Some(&scope),
+        )
+        .expect("OOS write must be rejected by MissingVerifierJob scope gate");
+        assert!(
+            err.contains("MissingVerifierJob policy rejected"),
+            "got: {err}"
+        );
+        assert!(err.contains("0517_003/app/main.py"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_verifier_policy_admits_in_scope_write() {
+        // Issue #646: the same scope gate must NOT reject an in-scope path.
+        let dir = tempdir().unwrap();
+        let work_root = dir.path();
+        std::fs::create_dir_all(work_root.join("0517_003/tests")).unwrap();
+        std::fs::write(work_root.join("0517_003/tests/test_main.py"), "").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでCRUDのAPIを開発してください",
+        );
+        // Sanity: a fresh root-level path is in scope under AmbiguousParent.
+        assert!(scope.contains("app/main.py"));
+
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write", "Edit", "Bash"],
+        );
+        let arguments = serde_json::json!({
+            "path": "app/main.py",
+            "content": "from fastapi import FastAPI\napp = FastAPI()\n",
+        });
+        assert!(
+            effective_tool_policy_error_for_call_with_scope(
+                &policy,
+                "Write",
+                &arguments,
+                work_root,
+                Some(&scope),
+            )
+            .is_none(),
+            "in-scope write must pass under MissingVerifierJob scope gate"
+        );
+    }
+
+    #[test]
+    fn missing_verifier_policy_lets_bash_through_irrespective_of_path_arg() {
+        // Bash has no `path` argument; the scope gate intentionally only
+        // restricts file-targeting tools (Write/Edit). Bash is the
+        // verifier-run / dependency-install lifeline and must not be
+        // blocked by this gate.
+        let dir = tempdir().unwrap();
+        let work_root = dir.path();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "FastAPIでCRUDのAPIを開発してください",
+        );
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write", "Edit", "Bash"],
+        );
+        let arguments = serde_json::json!({"command": "pytest -q"});
+        assert!(
+            effective_tool_policy_error_for_call_with_scope(
+                &policy,
+                "Bash",
+                &arguments,
+                work_root,
+                Some(&scope),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn scope_aware_lookup_admits_explicit_subtree_candidates() {
+        // Issue #646: user explicitly named the existing subtree, so its
+        // artifacts ARE in scope and ARE Owned.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("0517_003/app")).unwrap();
+        std::fs::write(work_root.join("0517_003/app/main.py"), "").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work_root,
+            "0517_003 配下を修正してください",
+        );
+        let target = existing_workspace_candidate_for_role_in_scope(
+            work_root,
+            super::super::task_contract::ArtifactRole::Implementation,
+            &scope,
+        );
+        assert_eq!(target.as_deref(), Some("0517_003/app/main.py"));
     }
 
     #[test]

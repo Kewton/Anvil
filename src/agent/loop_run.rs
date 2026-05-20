@@ -25,6 +25,10 @@ use crate::stdin_prompt;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
+// Issue #646: artifact ownership classification. Module is intentionally
+// *not* re-exported (DR3-001) — `turn.rs` and `task_contract.rs` are the
+// only in-crate consumers via `super::artifact_ownership::*`.
+mod artifact_ownership;
 pub(crate) mod auto_promote;
 mod auto_test;
 pub mod commands;
@@ -60,6 +64,10 @@ mod spinner;
 mod success;
 mod summary;
 mod task_contract;
+// Issue #646: task workspace scope detection. Module is intentionally
+// *not* re-exported (DR3-001) — `turn.rs` is the only in-crate consumer
+// via `super::task_workspace_scope::*`.
+mod task_workspace_scope;
 mod tester;
 mod turn;
 pub(crate) mod verifier_skill;
@@ -527,6 +535,31 @@ pub struct Agent {
     /// the behavior-coverage decision is evaluated within the same turn
     /// the excerpts were observed.
     task_contract_excerpts: task_contract::ArtifactExcerpts,
+    /// Issue #646 (C2 / A4): turn-scoped map of pre-tool file hashes captured
+    /// immediately before each Write/Edit execution. Consumed by
+    /// `observe_evidence_from_repo_edit` to detect no-op writes (content
+    /// unchanged → no `Owned` promotion). `None` means the file did not exist
+    /// prior to the tool call. Reset at the `handle_user_message` head.
+    turn_pre_tool_file_hashes: std::collections::HashMap<String, Option<String>>,
+    /// Issue #646 (A1): turn-scoped first-class state for "verifier is
+    /// missing". Set by `drive_task_contract_verifier::NoVerifier`, cleared
+    /// at `handle_user_message` head and on verifier success. While
+    /// populated, the planner suppresses `RunVerifier` until an in-scope
+    /// edit is observed (`record_in_scope_edit`).
+    missing_verifier_job: Option<repair_job::MissingVerifierJob>,
+    /// Issue #646: per-turn set of workspace-relative paths that were
+    /// successfully written or edited during the current user turn. Consumed
+    /// by `artifact_ownership::classify_ownership` to gate which existing
+    /// files the active task is allowed to claim as completion evidence.
+    ///
+    /// **Per-turn cap pattern (CLAUDE.md "per-turn cap" §)** — reset at the
+    /// head of every `handle_user_message`. The previous turn's edits do
+    /// not auto-confer ownership on the new task: a new task must
+    /// re-establish ownership through fresh edits or an explicit user-named
+    /// scope. Fresh sessions also begin empty, so pre-existing filesystem
+    /// artifacts cannot auto-promote themselves (Issue #646 §修正方針 2
+    /// `Owned` rules).
+    turn_edited_relative_paths: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,6 +777,9 @@ impl Agent {
             repair_job_artifact_attempts: 0,
             repair_failure_snapshot: None,
             task_contract_excerpts: task_contract::ArtifactExcerpts::new(),
+            missing_verifier_job: None,
+            turn_pre_tool_file_hashes: std::collections::HashMap::new(),
+            turn_edited_relative_paths: std::collections::HashSet::new(),
         }
     }
 
