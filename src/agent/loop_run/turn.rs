@@ -3483,6 +3483,12 @@ impl Agent {
         // user message — reset here so a fresh handle_user_message can fire
         // the Reminder once even if the previous turn already did.
         self.reminder_called_this_turn = false;
+        // Issue #646 (C1): per-turn ownership reset. Each user turn starts a
+        // fresh task — prior-turn edits do NOT auto-confer ownership on the
+        // new task. Clearing here also wipes the MissingVerifierJob so
+        // verifier retry budgets restart per task.
+        self.turn_edited_relative_paths.clear();
+        self.missing_verifier_job = None;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -7503,6 +7509,9 @@ impl Agent {
                     args.task_contract_verify_commands_collected.push(sanitized);
                 }
                 self.repair_job = None;
+                // Issue #646 (A1): verifier success retires any in-flight
+                // MissingVerifierJob — no further suppression is needed.
+                self.missing_verifier_job = None;
                 *args.verifier_repair_retries = 0;
                 // Issue #637 (CB-001): mirror the local counter reset on the
                 // Agent-field counter so the next verifier failure / repair
@@ -7593,6 +7602,15 @@ impl Agent {
                     Some(args.repo_edit_calls_made_this_turn);
                 self.task_contract_verifier_repair_pending = true;
                 self.repair_job = None;
+                // Issue #646 (A1): raise a first-class MissingVerifierJob so
+                // the planner suppresses `RunVerifier` until an in-scope edit
+                // lands (B2). The retry budget mirrors the legacy
+                // `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (3) but is owned by
+                // the job itself, decoupled from the failure-driven counter.
+                self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
+                    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
+                    args.repo_edit_calls_made_this_turn,
+                ));
                 *args.repo_change_retries = 0;
                 *args.verifier_repair_retries = 0;
                 // Issue #637 (CB-001): transitioning to NoVerifier resets the
@@ -8774,7 +8792,21 @@ impl Agent {
             }
         }
         if self.task_contract_verifier_repair_pending {
-            return verifier_repair_policy_for_decision(self.verifier_repair_decision_for_policy());
+            // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
+            // active and the safeguarded decision returns `NoRepair` (i.e.
+            // the scope check rejected the legacy out-of-scope target),
+            // expose the MissingVerifierJob's narrow tool whitelist so the
+            // model can still produce an in-scope verifier file.
+            let decision = self.verifier_repair_decision_for_policy();
+            if matches!(decision, VerifierRepairDecision::NoRepair)
+                && let Some(job) = self.missing_verifier_job.as_ref()
+            {
+                return EffectiveToolPolicy::restricted(
+                    EffectiveToolPolicyReason::VerifierRepair,
+                    job.allowed_tool_names().to_vec(),
+                );
+            }
+            return verifier_repair_policy_for_decision(decision);
         }
         if let Some(target) = self.forced_small_edit_recovery_target() {
             return self.focused_edit_policy_for_target(
@@ -8803,14 +8835,47 @@ impl Agent {
     }
 
     fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
-        verifier_repair_decision(
+        // Issue #646 (A3/B1): the legacy `verifier_repair_decision` falls
+        // back to `latest_successful_read_existing_path` when no real
+        // `RepairJob` is attached. That fallback can return an out-of-scope
+        // path which then directs the tool policy / recovery note into a
+        // prior-session subtree. Route through the shared scope safeguard
+        // so all three consumers (`task_contract_repair_state`,
+        // `effective_tool_policy`, `push_verifier_repair_recovery_note`)
+        // see an identically gated decision.
+        self.scope_safeguarded_verifier_repair_decision(None, 0)
+    }
+
+    /// Issue #646 (A3/B1): single SSOT for the verifier-repair decision
+    /// after applying the active-scope safeguard. When `repair_job` is
+    /// `None` and the raw decision targets an out-of-scope path, returns
+    /// `NoRepair` instead, so downstream consumers cannot drag the model
+    /// into a prior subtree.
+    fn scope_safeguarded_verifier_repair_decision(
+        &self,
+        repair_edit_count: Option<usize>,
+        repo_edit_calls_made_this_turn: usize,
+    ) -> VerifierRepairDecision {
+        let decision = verifier_repair_decision(
             self.task_contract_verifier_repair_pending,
             self.repair_job.as_ref(),
             &self.session.messages,
             &self.work_root,
-            None,
-            0,
-        )
+            repair_edit_count,
+            repo_edit_calls_made_this_turn,
+        );
+        if self.repair_job.is_some() {
+            return decision;
+        }
+        let Some(target) = decision_target_path(&decision) else {
+            return decision;
+        };
+        let scope = self.current_workspace_scope();
+        if target_path_in_scope(target, &self.work_root, &scope) {
+            decision
+        } else {
+            VerifierRepairDecision::NoRepair
+        }
     }
 
     fn focused_edit_policy_for_target(
@@ -9964,14 +10029,6 @@ impl Agent {
         else {
             return;
         };
-        // Issue #646: record every successful Write/Edit observation so the
-        // ownership classifier can promote in-scope existing artifacts to
-        // `Owned`. Recording here (before the scaffold-delta gate) is
-        // deliberate — the tool call already succeeded, and the scaffold-
-        // delta gate is about completion-evidence semantics, not about
-        // whether the path was touched.
-        self.session_edited_relative_paths
-            .insert(relative_path.clone());
         let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(
             &relative_path,
         ));
@@ -9986,6 +10043,20 @@ impl Agent {
                 }),
             );
             return;
+        }
+        // Issue #646 (C2): record the edited path AFTER the scaffold-delta
+        // gate so a no-op Write/Edit (writing the same scaffold body back)
+        // never promotes the file to `Owned`. Only substantive changes
+        // contribute to ownership.
+        self.turn_edited_relative_paths
+            .insert(relative_path.clone());
+        // Issue #646 (A1/B2): once an in-scope edit has landed, the
+        // MissingVerifierJob can begin retrying verifier creation.
+        if self.missing_verifier_job.is_some() {
+            let in_scope = self.current_workspace_scope().contains(&relative_path);
+            if in_scope && let Some(job) = self.missing_verifier_job.as_mut() {
+                job.record_in_scope_edit();
+            }
         }
         self.evidence_set_this_turn
             .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
@@ -10110,7 +10181,7 @@ impl Agent {
                 existing_workspace_candidate_for_role_in_scope(&self.work_root, *role, &scope)
             {
                 let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
-                let edited_this_session = self.session_edited_relative_paths.contains(&path);
+                let edited_this_session = self.turn_edited_relative_paths.contains(&path);
                 let ownership = super::artifact_ownership::classify_ownership(
                     super::artifact_ownership::OwnershipInputs {
                         work_root: &self.work_root,
@@ -10156,30 +10227,10 @@ impl Agent {
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::VerifierRepairState {
-        let decision = verifier_repair_decision(
-            self.task_contract_verifier_repair_pending,
-            self.repair_job.as_ref(),
-            &self.session.messages,
-            &self.work_root,
+        let decision = self.scope_safeguarded_verifier_repair_decision(
             repair_edit_count,
             repo_edit_calls_made_this_turn,
         );
-        // Issue #646 (MissingVerifierJob safeguard): when there is no real
-        // `RepairJob` (i.e. NoVerifier branch produced `pending=true` without
-        // a failure), `verifier_repair_decision` falls back to the latest
-        // successful `Read` path. A pre-session exploration `Read` of an
-        // out-of-scope subtree would otherwise drive the repair loop into
-        // that subtree. Downgrading to `None` lets `plan_artifact_recovery`
-        // fall through to the artifact-missing branch, which forces an
-        // in-scope edit before any verifier retry.
-        if self.repair_job.is_none()
-            && let Some(target) = decision_target_path(&decision)
-        {
-            let scope = self.current_workspace_scope();
-            if !target_path_in_scope(target, &self.work_root, &scope) {
-                return super::task_contract::VerifierRepairState::None;
-            }
-        }
         match decision {
             VerifierRepairDecision::NeedDiagnostic
             | VerifierRepairDecision::NeedTargetDiscovery
@@ -10211,12 +10262,17 @@ impl Agent {
         let artifacts = self.task_contract_artifact_states(contract);
         let repair_state =
             self.task_contract_repair_state(repair_edit_count, repo_edit_calls_made_this_turn);
+        let missing_verifier_suppress_retry = self
+            .missing_verifier_job
+            .as_ref()
+            .is_some_and(|job| job.should_suppress_verifier_retry());
         super::task_contract::plan_artifact_recovery(super::task_contract::ArtifactRecoveryInputs {
             contract,
             evidence: &self.task_contract_evidence_set_this_turn,
             artifacts: &artifacts,
             repair_state: &repair_state,
             artifact_excerpts: &self.task_contract_excerpts,
+            missing_verifier_suppress_retry,
         })
     }
 
@@ -10236,20 +10292,37 @@ impl Agent {
                     .to_string(),
             });
         }
-        // Issue #646: only suggest an existing workspace artifact when it
-        // is inside the active scope. Out-of-scope nested-subtree files are
-        // never a legitimate recovery target.
+        // Issue #646 (D1): two-step gate — first scope, then full ownership
+        // classifier. A scope-internal but non-`Owned` artifact (e.g. an
+        // unchanged scaffold body, a CandidateOnly README the user never
+        // mentioned) MUST NOT be surfaced as a recovery target either. The
+        // ownership signal — edit / scaffold delta / explicit scope mention
+        // — is the same one the planner uses upstream.
         let scope = self.current_workspace_scope();
-        if let Some(path) =
-            existing_workspace_candidate_for_role_in_scope(&self.work_root, role, &scope)
-        {
-            return Some(super::task_contract::RecoveryTargetHint {
-                role,
-                path,
-                reason: "existing workspace artifact matches the missing role".to_string(),
-            });
+        let path = existing_workspace_candidate_for_role_in_scope(&self.work_root, role, &scope)?;
+        let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
+        let edited_this_session = self.turn_edited_relative_paths.contains(&path);
+        let ownership = super::artifact_ownership::classify_ownership(
+            super::artifact_ownership::OwnershipInputs {
+                work_root: &self.work_root,
+                relative_path: &path,
+                scope: &scope,
+                edited_this_session,
+                scaffold_changed,
+                verifier_passed_in_scope: false,
+            },
+        );
+        if !matches!(
+            ownership,
+            super::artifact_ownership::ArtifactOwnership::Owned
+        ) {
+            return None;
         }
-        None
+        Some(super::task_contract::RecoveryTargetHint {
+            role,
+            path,
+            reason: "existing workspace artifact matches the missing role".to_string(),
+        })
     }
 
     fn set_artifact_recovery_target_for_decision(
@@ -15694,10 +15767,8 @@ fn collect_meaningful_workspace_files(
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            ".git" | ".anvil" | ".anvil-state" | "node_modules" | "target"
-        ) {
+        // Issue #646 (E1): single SSOT for ignored workspace directories.
+        if super::task_workspace_scope::is_workspace_ignored_dir(&name) {
             continue;
         }
         let path = entry.path();

@@ -109,14 +109,12 @@ fn path_is_syntactically_safe(relative_path: &str) -> bool {
 }
 
 fn path_in_ignored_top_dir(relative_path: &str) -> bool {
-    let first = Path::new(relative_path).components().find_map(|c| match c {
-        std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
-        _ => None,
-    });
-    let Some(top) = first else { return true };
-    super::task_workspace_scope::IGNORED_TOP_DIRS
-        .iter()
-        .any(|ignored| *ignored == top)
+    Path::new(relative_path).components().any(|c| match c {
+        std::path::Component::Normal(s) => {
+            super::task_workspace_scope::is_workspace_ignored_dir(&s.to_string_lossy())
+        }
+        _ => false,
+    })
 }
 
 /// Returns `true` when canonicalizing `work_root.join(relative_path)`
@@ -306,6 +304,79 @@ mod tests {
             relative_path: "0517_003/app/main.py",
             scope: &scope,
             edited_this_session: false,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+        });
+        assert_eq!(out, ArtifactOwnership::Owned);
+    }
+
+    #[test]
+    fn turn_boundary_clear_demotes_owned_back_to_candidate_only() {
+        // Issue #646 (A4): the `turn_edited_relative_paths` set is reset at
+        // each `handle_user_message` head (CLAUDE.md per-turn cap pattern).
+        // Once that set is cleared, the same file the previous turn promoted
+        // to Owned must classify as CandidateOnly again — preventing the
+        // new task from auto-inheriting prior-turn ownership.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
+        let scope = single_root_scope();
+
+        // Inside the original turn — the set contained the path → Owned.
+        let during_turn = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "app.py",
+            scope: &scope,
+            edited_this_session: true,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+        });
+        assert_eq!(during_turn, ArtifactOwnership::Owned);
+
+        // After `handle_user_message` cleared the set — same file, no
+        // signals → CandidateOnly.
+        let after_turn_boundary = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "app.py",
+            scope: &scope,
+            edited_this_session: false,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+        });
+        assert_eq!(after_turn_boundary, ArtifactOwnership::CandidateOnly);
+    }
+
+    #[test]
+    fn no_op_write_does_not_promote_to_owned() {
+        // Issue #646 (A4 / C2): an in-scope file exists but the model
+        // wrote the exact same body back (no scaffold delta, no recorded
+        // edit). Ownership must stay CandidateOnly even though the path
+        // matches an artifact role.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Scaffold body\n").unwrap();
+        let scope = single_root_scope();
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "README.md",
+            scope: &scope,
+            edited_this_session: false,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+        });
+        assert_eq!(out, ArtifactOwnership::CandidateOnly);
+    }
+
+    #[test]
+    fn ambiguous_parent_root_root_file_is_owned_when_edited_this_turn() {
+        // Issue #646 (A4): a fresh in-scope artifact created at the parent
+        // root (not inside any nested project subtree) promotes to Owned
+        // as soon as it is recorded in `turn_edited_relative_paths`.
+        let dir = tempdir().unwrap();
+        let scope = ambiguous_scope(vec![PathBuf::from("0517_003")]);
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "app/main.py",
+            scope: &scope,
+            edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
         });

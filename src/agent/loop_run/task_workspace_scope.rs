@@ -32,8 +32,23 @@ const PROJECT_MARKER_FILES: &[&str] = &[
 
 const PROJECT_MARKER_DIRS: &[&str] = &[".git", "src", "tests"];
 
+/// Conventional monorepo parent directories. When one of these is the only
+/// non-marker child of `work_root` (or sits alongside other monorepo
+/// parents), each child of the monorepo parent is treated as its own
+/// nested subtree. Avoids "single project root" misclassification of
+/// `packages/foo/`, `apps/bar/`, `crates/baz/` (Issue #646 A2).
+const MONOREPO_PARENT_DIRS: &[&str] =
+    &["packages", "apps", "crates", "services", "modules", "pkgs"];
+
 /// Directories that never contribute project-like signal even if they look
 /// like one (dependency / build caches). Skipped by every detection helper.
+///
+/// SSOT consumed by:
+/// - `nested_project_subtrees` (scope detection)
+/// - `artifact_ownership::path_in_ignored_top_dir`
+/// - `turn::collect_meaningful_workspace_files` (workspace walker)
+///
+/// Always extend by editing this list; do NOT duplicate the names elsewhere.
 pub(super) const IGNORED_TOP_DIRS: &[&str] = &[
     ".git",
     ".anvil",
@@ -46,6 +61,13 @@ pub(super) const IGNORED_TOP_DIRS: &[&str] = &[
     "build",
     "__pycache__",
 ];
+
+/// SSOT predicate: returns `true` when `name` is the file-name component of
+/// a directory that is never part of the active workspace (dependency
+/// cache, VCS metadata, build output).
+pub(super) fn is_workspace_ignored_dir(name: &str) -> bool {
+    IGNORED_TOP_DIRS.contains(&name)
+}
 
 /// Mode of the active scope. Three deterministic states; the planner reads
 /// this through [`TaskWorkspaceScope::contains`].
@@ -154,8 +176,13 @@ fn path_is_inside(candidate: &Path, scope: &Path) -> bool {
 
 /// Returns workspace-relative paths of subdirectories of `work_root` that
 /// look like a project root by structure (manifest file or marker dir).
-/// Sorted lexicographically and de-duplicated. Bounded read of the root
-/// directory only — does not recurse.
+/// Sorted lexicographically and de-duplicated.
+///
+/// Monorepo aware (Issue #646 A2): when a child directory is one of
+/// `MONOREPO_PARENT_DIRS` (`packages/`, `apps/`, `crates/`, …) and is
+/// itself NOT project-like, its children are scanned and any that are
+/// project-like are returned as `packages/<name>` etc. This stops one
+/// `crates/<inner>` from being treated as "work_root is a single project".
 pub(super) fn nested_project_subtrees(work_root: &Path) -> Vec<PathBuf> {
     let Ok(read_dir) = std::fs::read_dir(work_root) else {
         return Vec::new();
@@ -171,16 +198,51 @@ pub(super) fn nested_project_subtrees(work_root: &Path) -> Vec<PathBuf> {
         }
         let name = entry.file_name();
         let name_str = name.to_string_lossy().to_string();
-        if IGNORED_TOP_DIRS.iter().any(|ignored| *ignored == name_str) {
+        if is_workspace_ignored_dir(&name_str) {
             continue;
         }
         let abs = entry.path();
         if directory_is_project_like(&abs) {
             out.push(PathBuf::from(name_str));
+            continue;
+        }
+        if MONOREPO_PARENT_DIRS
+            .iter()
+            .any(|parent| *parent == name_str)
+        {
+            // Recurse exactly one level into the monorepo parent so its
+            // sibling packages stay distinct subtrees.
+            for nested in monorepo_child_subtrees(&abs, &name_str) {
+                out.push(nested);
+            }
         }
     }
     out.sort();
     out.dedup();
+    out
+}
+
+fn monorepo_child_subtrees(parent_abs: &Path, parent_rel: &str) -> Vec<PathBuf> {
+    let Ok(read_dir) = std::fs::read_dir(parent_abs) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let child_name = entry.file_name();
+        let child_name_str = child_name.to_string_lossy().to_string();
+        if is_workspace_ignored_dir(&child_name_str) {
+            continue;
+        }
+        if directory_is_project_like(&entry.path()) {
+            out.push(PathBuf::from(format!("{parent_rel}/{child_name_str}")));
+        }
+    }
     out
 }
 
@@ -354,6 +416,40 @@ mod tests {
         let nested = nested_project_subtrees(dir.path());
         assert!(!nested.contains(&PathBuf::from("node_modules")));
         assert!(!nested.contains(&PathBuf::from(".venv")));
+    }
+
+    #[test]
+    fn monorepo_packages_layout_yields_nested_subtrees_per_package() {
+        let dir = tempdir().unwrap();
+        // `packages/<name>` layout — neither `packages/` itself nor
+        // `work_root` is project-like, but each package has its own
+        // marker file.
+        touch(&dir.path().join("packages/api/package.json"));
+        touch(&dir.path().join("packages/web/package.json"));
+        let nested = nested_project_subtrees(dir.path());
+        assert!(nested.contains(&PathBuf::from("packages/api")));
+        assert!(nested.contains(&PathBuf::from("packages/web")));
+        let scope = TaskWorkspaceScope::detect(dir.path(), "update the API service");
+        match &scope.mode {
+            ScopeMode::AmbiguousParent { nested_subtrees } => {
+                assert!(nested_subtrees.contains(&PathBuf::from("packages/api")));
+                assert!(nested_subtrees.contains(&PathBuf::from("packages/web")));
+            }
+            other => panic!("expected AmbiguousParent for monorepo layout, got {other:?}"),
+        }
+        // A sibling package's artifact stays out of scope.
+        assert!(!scope.contains("packages/web/src/index.ts"));
+        assert!(!scope.contains("packages/api/src/index.ts"));
+    }
+
+    #[test]
+    fn monorepo_crates_layout_yields_nested_subtrees() {
+        let dir = tempdir().unwrap();
+        touch(&dir.path().join("crates/core/Cargo.toml"));
+        touch(&dir.path().join("crates/cli/Cargo.toml"));
+        let nested = nested_project_subtrees(dir.path());
+        assert!(nested.contains(&PathBuf::from("crates/core")));
+        assert!(nested.contains(&PathBuf::from("crates/cli")));
     }
 
     #[test]

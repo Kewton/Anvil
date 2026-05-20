@@ -170,6 +170,13 @@ pub(super) struct ArtifactRecoveryInputs<'a> {
     /// `&ArtifactExcerpts::new()` (empty) is the back-compat sentinel that
     /// disables behavior-coverage gating.
     pub(super) artifact_excerpts: &'a ArtifactExcerpts,
+    /// Issue #646 (A1/B2): when `true`, the planner MUST suppress
+    /// `RunVerifier` so the model does not enter an infinite NoVerifier
+    /// retry loop before an in-scope edit lands. Driven by the
+    /// `MissingVerifierJob` first-class state on `Agent`. `false` is the
+    /// back-compat default for tests / call sites that have no awareness
+    /// of the missing-verifier track.
+    pub(super) missing_verifier_suppress_retry: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +316,14 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
         && (inputs.contract.verification_required
             || (existing_unverified_used && code_or_test_required))
     {
+        // Issue #646 (A1/B2): once a MissingVerifierJob is in flight and no
+        // in-scope edit has landed, refuse to re-trigger RunVerifier. The
+        // model needs to first produce an in-scope verifier or implementation
+        // edit; without this gate the NoVerifier → RunVerifier → NoVerifier
+        // loop runs until `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`.
+        if inputs.missing_verifier_suppress_retry {
+            return ArtifactRecoveryAction::RepairArtifact { target_hint: None };
+        }
         return ArtifactRecoveryAction::RunVerifier;
     }
 
@@ -962,9 +977,64 @@ mod tests {
                 artifacts: &artifacts,
                 repair_state: &repair_state,
                 artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
             }),
             ArtifactRecoveryAction::RunVerifier
         );
+    }
+
+    #[test]
+    fn planner_suppresses_run_verifier_when_missing_verifier_pending() {
+        // Issue #646 (B2): when MissingVerifierJob has no in-scope edit yet,
+        // the planner must NOT return RunVerifier even if all required
+        // artifacts are observed. Instead it returns RepairArtifact so the
+        // model creates a verifier file.
+        let contract = TaskContract::from_request(
+            "FastAPIでCRUD APIを作成してREADMEとテストも追加してください",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        let artifacts: Vec<ArtifactState> = Vec::new();
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: true,
+        });
+        assert!(
+            matches!(action, ArtifactRecoveryAction::RepairArtifact { .. }),
+            "expected RepairArtifact under MissingVerifierJob suppression, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn planner_runs_verifier_again_after_in_scope_edit_lifted_suppression() {
+        // Issue #646: once an in-scope edit lands (the agent flips
+        // `missing_verifier_suppress_retry` back to false), the planner
+        // resumes its normal RunVerifier behaviour.
+        let contract = TaskContract::from_request(
+            "FastAPIでCRUD APIを作成してREADMEとテストも追加してください",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        let artifacts: Vec<ArtifactState> = Vec::new();
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+        });
+        assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
 
     #[test]
@@ -986,6 +1056,7 @@ mod tests {
             artifacts: &artifacts,
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
         });
         match action {
             ArtifactRecoveryAction::Continue { missing, .. } => {
@@ -1016,6 +1087,7 @@ mod tests {
             artifacts: &artifacts,
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
         });
 
         assert_eq!(
@@ -1064,6 +1136,7 @@ mod tests {
                 artifacts: &artifacts,
                 repair_state: &repair_state,
                 artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
             }),
             ArtifactRecoveryAction::RepairArtifact {
                 target_hint: Some(target_hint),
@@ -1126,6 +1199,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         match action {
             ArtifactRecoveryAction::Continue { missing, .. } => {
@@ -1159,6 +1233,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         assert!(
             matches!(action, ArtifactRecoveryAction::Continue { .. }),
@@ -1196,6 +1271,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         // With coverage satisfied + tests required, the planner falls
         // through to verifier execution.
@@ -1226,6 +1302,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
@@ -1257,6 +1334,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         match action {
             ArtifactRecoveryAction::Continue { missing, .. } => {
@@ -1290,6 +1368,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         assert_eq!(action, ArtifactRecoveryAction::Done);
     }
@@ -1336,6 +1415,7 @@ mod tests {
             artifacts: &[],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
         });
         assert!(
             matches!(action, ArtifactRecoveryAction::Continue { .. }),

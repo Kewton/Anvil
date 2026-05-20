@@ -535,18 +535,25 @@ pub struct Agent {
     /// the behavior-coverage decision is evaluated within the same turn
     /// the excerpts were observed.
     task_contract_excerpts: task_contract::ArtifactExcerpts,
-    /// Issue #646: session-scoped set of workspace-relative paths that were
-    /// successfully written or edited during the current `Agent` lifetime
-    /// (not just the current turn). Consumed by
-    /// `artifact_ownership::classify_ownership` to gate which existing files
-    /// the active task is allowed to claim as completion evidence.
+    /// Issue #646 (A1): turn-scoped first-class state for "verifier is
+    /// missing". Set by `drive_task_contract_verifier::NoVerifier`, cleared
+    /// at `handle_user_message` head and on verifier success. While
+    /// populated, the planner suppresses `RunVerifier` until an in-scope
+    /// edit is observed (`record_in_scope_edit`).
+    missing_verifier_job: Option<repair_job::MissingVerifierJob>,
+    /// Issue #646: per-turn set of workspace-relative paths that were
+    /// successfully written or edited during the current user turn. Consumed
+    /// by `artifact_ownership::classify_ownership` to gate which existing
+    /// files the active task is allowed to claim as completion evidence.
     ///
-    /// **Lives on `Agent`, not `SessionSnapshot`** — fresh sessions deliberately
-    /// start empty so existing filesystem artifacts cannot auto-promote
-    /// themselves (Issue #646 §修正方針 2 `Owned` rules + §追加で考慮するケース
-    /// "resumed session"). A resumed session also begins with an empty set
-    /// and must re-establish ownership through fresh edits / scope mention.
-    session_edited_relative_paths: std::collections::HashSet<String>,
+    /// **Per-turn cap pattern (CLAUDE.md "per-turn cap" §)** — reset at the
+    /// head of every `handle_user_message`. The previous turn's edits do
+    /// not auto-confer ownership on the new task: a new task must
+    /// re-establish ownership through fresh edits or an explicit user-named
+    /// scope. Fresh sessions also begin empty, so pre-existing filesystem
+    /// artifacts cannot auto-promote themselves (Issue #646 §修正方針 2
+    /// `Owned` rules).
+    turn_edited_relative_paths: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -764,7 +771,8 @@ impl Agent {
             repair_job_artifact_attempts: 0,
             repair_failure_snapshot: None,
             task_contract_excerpts: task_contract::ArtifactExcerpts::new(),
-            session_edited_relative_paths: std::collections::HashSet::new(),
+            missing_verifier_job: None,
+            turn_edited_relative_paths: std::collections::HashSet::new(),
         }
     }
 
