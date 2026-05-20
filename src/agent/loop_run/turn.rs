@@ -14700,6 +14700,33 @@ fn validate_verifier_repair_intents(
             result.updated_contents
         };
     }
+    // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): apply the deterministic
+    // test/impl weakening detectors at the repair editor's admission
+    // boundary. `original_contents` is the pre-edit `before` snapshot and
+    // `contents` is the post-edit `after`. Both are simultaneously available
+    // here (DR3-002), unlike inside `apply_validated_verifier_repair_edit`
+    // which only sees pre/post hashes. Test-side and impl-side detectors are
+    // dispatched by `file_classify` so each path is judged by the relevant
+    // closed pattern list (5 test patterns / 4 impl patterns). A non-empty
+    // pattern vec rejects the intent — this implements the AND coupling with
+    // the legacy `do_not_edit_tests_without_evidence` reject (which lives
+    // separately at hint admission via `diagnostic_target_allowed_by_confidence`):
+    // any weakening detected here is rejected unconditionally, while the
+    // evidence-required gate remains the independent first line of defence.
+    let weakening_path = Path::new(&relative_path);
+    let weakening = if is_test_file(weakening_path) {
+        super::spec_authority::detect_test_weakening(&relative_path, &original_contents, &contents)
+    } else if is_implementation_file(weakening_path) {
+        super::spec_authority::detect_impl_weakening(&relative_path, &original_contents, &contents)
+    } else {
+        Vec::new()
+    };
+    if !weakening.is_empty() {
+        return Err(CheapCheckOutcome::Failed(format!(
+            "repair intent rejected: test/impl weakening detected ({:?})",
+            weakening
+        )));
+    }
     validate_verifier_repair_candidate_contents(
         &relative_path,
         &contents,
@@ -18117,14 +18144,14 @@ mod progress_tests {
         classify_verifier_failure_type, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
-        effective_tool_batch_action, effective_tool_policy_error_for_call,
-        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
-        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_guidance_note_for_policy, focused_edit_history,
+        diagnostic_target_allowed_by_confidence, effective_tool_batch_action,
+        effective_tool_policy_error_for_call, effective_tool_policy_error_for_call_with_scope,
+        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
@@ -19542,6 +19569,452 @@ mod progress_tests {
         let err =
             validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
         assert!(err.contains("duplicate"));
+    }
+
+    // ---- Issue #647 (Phase F): weakening detector at validate_verifier_repair_intents ---- //
+
+    /// Helper: build a test-targeting `RepairJob` whose `target_hint` /
+    /// `assessment.repair_target_hint` point at a test-file path (so
+    /// `verifier_repair_path_input_is_safe` accepts it and the hint role is
+    /// coherent with the test path that `is_test_file` will classify).
+    fn verifier_test_context_for(path: &str) -> super::super::repair_job::RepairJob {
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: path.to_string(),
+            reason: "test".to_string(),
+        };
+        super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "failure".to_string(),
+            failure_type: super::super::VerifierFailureType::AssertionFailure,
+            target_hint: Some(hint.clone()),
+            repair_target_hint: Some(hint.clone()),
+            changed_file_hints: vec![hint.clone()],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: super::super::VerifierFailureType::AssertionFailure,
+                probable_cause_role: Some(super::super::task_contract::ArtifactRole::Test),
+                needed_reads: vec![hint.clone()],
+                repair_target_hint: Some(hint.clone()),
+                repair_plan: vec![hint.clone()],
+                summary: Some("test helper assessment".to_string()),
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            diagnostic_attempted: true,
+            error_kind: Some("AssertionError".to_string()),
+            failure_signature: format!("{path} AssertionError"),
+            failure_count: Some(1),
+            repair_attempt: 1,
+            ..super::super::repair_job::RepairJob::new_for_test()
+        }
+    }
+
+    /// S1-004: any of the 5 closed test-side weakening patterns detected on a
+    /// path classified as a test file by `is_test_file` must reject the
+    /// intent at `validate_verifier_repair_intents`.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_assertion_deletion_in_test() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n    do_setup()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Deleting the `assert foo() == 1` line is AssertionDeleted.
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert foo() == 1\n    do_setup()\n".to_string(),
+            new_string: "    do_setup()\n".to_string(),
+            reason: "remove failing assert".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(
+            err.contains("weakening detected"),
+            "expected weakening rejection, got: {err}"
+        );
+        assert!(err.contains("AssertionDeleted"), "got: {err}");
+        // File on disk must remain untouched.
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("tests/test_main.py")).unwrap(),
+            original
+        );
+    }
+
+    /// S1-004 / SkipMarkerAdded.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_skip_marker_added_in_test() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "def test_x():\n    assert foo()\n".to_string(),
+            new_string: "@pytest.mark.skip\ndef test_x():\n    assert foo()\n".to_string(),
+            reason: "skip failing test".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("SkipMarkerAdded"), "got: {err}");
+    }
+
+    /// S1-004 / AssertTrueWeakening.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_assert_true_weakening_in_test() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert foo() == 1\n".to_string(),
+            new_string: "    assert True\n".to_string(),
+            reason: "bypass assert".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("AssertTrueWeakening"), "got: {err}");
+    }
+
+    /// S1-004 / TestFunctionDeleted.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_test_function_deleted() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo()\n\ndef test_y():\n    assert bar()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "\ndef test_y():\n    assert bar()\n".to_string(),
+            new_string: "".to_string(),
+            reason: "drop failing test".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("TestFunctionDeleted"), "got: {err}");
+    }
+
+    /// S1-004 / LiteralOnlyExpectedChange.
+    #[test]
+    fn validate_verifier_repair_intents_rejects_literal_only_expected_change() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    x = compute()\n    assert x == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert x == 1\n".to_string(),
+            new_string: "    assert x == 99\n".to_string(),
+            reason: "move goalposts".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("LiteralOnlyExpectedChange"), "got: {err}");
+    }
+
+    /// S1-007 / ValidatorDeleted (impl-side, `assert!` deletion in Rust).
+    #[test]
+    fn validate_verifier_repair_intents_rejects_validator_deleted_in_impl() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "fn run(x: i32) -> i32 {\n    assert!(x > 0);\n    x * 2\n}\n";
+        std::fs::write(work_root.join("app/lib.rs"), original).unwrap();
+        let context = verifier_context_for("app/lib.rs");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/lib.rs".to_string(),
+            old_string: "    assert!(x > 0);\n    x * 2\n".to_string(),
+            new_string: "    x * 2\n".to_string(),
+            reason: "remove guard".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("ValidatorDeleted"), "got: {err}");
+    }
+
+    /// S1-007 / ErrorSwallowed (impl-side).
+    #[test]
+    fn validate_verifier_repair_intents_rejects_error_swallowed_in_impl() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    do_thing()\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "def run():\n    do_thing()\n".to_string(),
+            new_string: "def run():\n    try:\n        do_thing()\n    except: pass\n".to_string(),
+            reason: "swallow errors".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("ErrorSwallowed"), "got: {err}");
+    }
+
+    /// S1-007 / EarlyReturnBypass (impl-side).
+    #[test]
+    fn validate_verifier_repair_intents_rejects_early_return_bypass_in_impl() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "fn run(flag: bool) -> i32 {\n    let x = compute();\n    x\n}\n";
+        std::fs::write(work_root.join("app/lib.rs"), original).unwrap();
+        let context = verifier_context_for("app/lib.rs");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/lib.rs".to_string(),
+            old_string: "fn run(flag: bool) -> i32 {\n    let x = compute();\n    x\n}\n"
+                .to_string(),
+            new_string: "fn run(flag: bool) -> i32 {\n    return Ok(());\n    let x = compute();\n    x\n}\n"
+                .to_string(),
+            reason: "early return".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("EarlyReturnBypass"), "got: {err}");
+    }
+
+    /// DR3-002 + false-positive guard: a benign refactor on an impl file
+    /// (renaming a local) must NOT be classified as weakening.
+    #[test]
+    fn validate_verifier_repair_intents_accepts_benign_impl_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    value = 1\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n    return value\n".to_string(),
+            new_string: "    value = 2\n    return value\n".to_string(),
+            reason: "fix constant".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
+        assert!(edit.updated_contents.contains("value = 2"));
+    }
+
+    /// DR3-002: non-test / non-impl file paths (e.g. JSON) must not invoke
+    /// either detector and must pass cleanly.
+    #[test]
+    fn validate_verifier_repair_intents_skips_detector_for_non_code_paths() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "{\n  \"a\": 1\n}\n";
+        std::fs::write(work_root.join("app/data.json"), original).unwrap();
+        let context = verifier_context_for("app/data.json");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Mimic a literal-value change that *would* fire `LiteralOnlyExpectedChange`
+        // on a `.py` file because of the leading `assert`-like prefix — but on a
+        // JSON path neither detector runs.
+        let intent = VerifierRepairIntent {
+            path: "app/data.json".to_string(),
+            old_string: "  \"a\": 1\n".to_string(),
+            new_string: "  \"a\": 2\n".to_string(),
+            reason: "tweak data".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
+        assert!(edit.updated_contents.contains("\"a\": 2"));
+    }
+
+    /// S3-011: AND coupling — when `do_not_edit_tests_without_evidence` is
+    /// asserted, weakening detection at `validate_verifier_repair_intents`
+    /// still rejects unconditionally. The evidence-required gate lives at
+    /// hint admission (`diagnostic_target_allowed_by_confidence`) and stays
+    /// independent. This test pins both halves: the weakening reject fires
+    /// here, while `diagnostic_target_allowed_by_confidence` continues to
+    /// gate hint admission via confidence.
+    #[test]
+    fn validate_verifier_repair_intents_weakening_reject_compounds_evidence_gate() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Weakening edit (assert True replacement) must reject regardless of
+        // how the evidence flag would have ruled at hint admission.
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert foo() == 1\n".to_string(),
+            new_string: "    assert True\n".to_string(),
+            reason: "bypass".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(err.contains("weakening detected"), "got: {err}");
+
+        // Independent half: with evidence required + Test hint, low-confidence
+        // hint admission is rejected by the legacy gate.
+        let evidence_required = true;
+        let test_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_main.py".to_string(),
+            reason: "low-conf test edit".to_string(),
+        };
+        assert!(!diagnostic_target_allowed_by_confidence(
+            &test_hint,
+            0.10,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            Some(super::super::task_contract::ArtifactRole::Test),
+            evidence_required,
+        ));
+    }
+
+    /// DR3-002: detector input is `(original_contents, post-edit contents)`.
+    /// A weakening pattern that only emerges when **two** edits are applied
+    /// in sequence (each individually benign) must still fire because the
+    /// detector runs after the full intent list is applied to `contents`.
+    #[test]
+    fn validate_verifier_repair_intents_detects_weakening_across_multi_edit() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        // Two asserts. Edit 1 deletes assert #1, edit 2 deletes assert #2.
+        // Neither in isolation is the only edit visible to the detector —
+        // it sees `before` vs `after-everything-applied`.
+        let original = "def test_x():\n    assert a == 1\n    assert b == 2\n    do_more()\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let err = validate_verifier_repair_intents(
+            work_root,
+            &context,
+            &target,
+            vec![
+                VerifierRepairIntent {
+                    path: "tests/test_main.py".to_string(),
+                    old_string: "    assert a == 1\n".to_string(),
+                    new_string: "".to_string(),
+                    reason: "drop assert a".to_string(),
+                    replace_all: false,
+                },
+                VerifierRepairIntent {
+                    path: "tests/test_main.py".to_string(),
+                    old_string: "    assert b == 2\n".to_string(),
+                    new_string: "".to_string(),
+                    reason: "drop assert b".to_string(),
+                    replace_all: false,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("AssertionDeleted"), "got: {err}");
     }
 
     #[test]
