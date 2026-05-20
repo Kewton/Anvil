@@ -7598,25 +7598,15 @@ impl Agent {
                 TaskContractVerifierFlowOutcome::Continue
             }
             TaskContractVerifierOutcome::NoVerifier => {
-                *args.contract_verification_retries += 1;
-                if *args.contract_verification_retries >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
-                    return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::MissingVerification,
-                        error_text:
-                            "task contract requires verification, but no verifier was detected"
-                                .to_string(),
-                    };
-                }
-                *args.contract_verifier_repair_edit_count =
-                    Some(args.repo_edit_calls_made_this_turn);
-                self.task_contract_verifier_repair_pending = true;
-                self.repair_job = None;
-                // Issue #646 (A1): raise / advance the first-class
-                // MissingVerifierJob. The job persists across NoVerifier
-                // transitions within the same user turn so its retry budget
-                // (`record_retry`) is the authoritative ceiling; the legacy
-                // `contract_verification_retries` counter remains as a
-                // belt-and-braces guard.
+                // Issue #646 (A1): the MissingVerifierJob is the first-class
+                // owner of the NoVerifier retry budget. Create the job on
+                // the first transition and advance it on every subsequent
+                // one. The legacy `contract_verification_retries` counter
+                // is intentionally NOT incremented for NoVerifier
+                // transitions any more — it tracks verifier *failures*, a
+                // distinct lifecycle (NoVerifier ≠ Failed). Exiting on
+                // exhausted budget happens here, before any of the
+                // pending-flag bookkeeping below.
                 if self.missing_verifier_job.is_none() {
                     self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
                         TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
@@ -7635,6 +7625,10 @@ impl Agent {
                                 .to_string(),
                     };
                 }
+                *args.contract_verifier_repair_edit_count =
+                    Some(args.repo_edit_calls_made_this_turn);
+                self.task_contract_verifier_repair_pending = true;
+                self.repair_job = None;
                 *args.repo_change_retries = 0;
                 *args.verifier_repair_retries = 0;
                 // Issue #637 (CB-001): transitioning to NoVerifier resets the
@@ -7651,8 +7645,17 @@ impl Agent {
                     ),
                     true,
                 );
+                // Issue #646 (A1): prompt uses the MissingVerifierJob's
+                // own counter so the displayed attempt N/M reflects the
+                // first-class retry budget, not the legacy verifier-failure
+                // counter.
+                let job_attempt = self
+                    .missing_verifier_job
+                    .as_ref()
+                    .map(|job| job.retries_used as usize)
+                    .unwrap_or(0);
                 self.push_system_note(task_contract_no_verifier_note(
-                    *args.contract_verification_retries,
+                    job_attempt,
                     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
                 ));
                 TaskContractVerifierFlowOutcome::Continue

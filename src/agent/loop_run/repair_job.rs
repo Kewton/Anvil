@@ -130,7 +130,6 @@ impl MissingVerifierJob {
 
     /// Consume one retry slot. Returns `true` when the call falls inside
     /// the configured budget.
-    #[allow(dead_code)] // wired in once the verifier loop migrates off the legacy contract_verification_retries counter.
     pub(super) fn record_retry(&mut self) -> bool {
         if self.retries_used >= self.retry_budget {
             return false;
