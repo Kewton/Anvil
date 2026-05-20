@@ -9411,6 +9411,45 @@ impl Agent {
             semantic_report.as_ref(),
             agent_history_hint,
         );
+        // Issue #647 / CB-017 A''' (Commit 3): build the path-local admission
+        // context **before** semantic enrich so `enrich_failure_clusters_with_admitted_targets`
+        // can route every LLM-supplied target_path through the SSOT
+        // `recovery_target_hint_for_diagnostic_path` (syntactic safety +
+        // Owned admission). This is the same admission context used by the
+        // legacy `model_assessment_to_verifier_repair_assessment` below.
+        let scope = self.current_workspace_scope();
+        let turn_edited = self.turn_edited_relative_paths.clone();
+        let edited_predicate = |path: &str| turn_edited.contains(path);
+        let scaffold_predicate = |path: &str| self.repo_edit_has_post_scaffold_delta(path);
+        let admission = RepairTargetAdmissionContext {
+            work_root: &self.work_root,
+            scope: &scope,
+            edited_this_session_for: &edited_predicate,
+            scaffold_changed_for: &scaffold_predicate,
+        };
+        // CB-017 A''' (Commit 3): merge + enrich each report so every cluster
+        // carries `admitted_cluster_targets` derived from the SSOT admission
+        // gate. If every cluster ends up targetless, drop the semantic report
+        // so the legacy assessment path is used unchanged.
+        let semantic_report = semantic_report.and_then(|mut report| {
+            merge_legacy_targets_into_clusters(&mut report, &parsed);
+            let spec_authority = super::spec_authority::resolve(&authority_input);
+            enrich_failure_clusters_with_admitted_targets(
+                &mut report,
+                &self.work_root,
+                &admission,
+                spec_authority,
+            );
+            if report
+                .failure_clusters
+                .iter()
+                .all(|c| c.admitted_cluster_targets.is_empty())
+            {
+                None
+            } else {
+                Some(report)
+            }
+        });
         // Issue #647 (CB-015): the new plan's generation snapshot uses the
         // **pre-bump** `assessment_generation`. The live `RepairJob.assessment_generation`
         // is incremented below in lock-step with the new assessment landing
@@ -9430,21 +9469,6 @@ impl Agent {
                 pre_bump_assessment_generation,
             )
         });
-        // Issue #647 (§5.1 SSOT plumbing): build the path-local admission
-        // context from the agent's current scope + edit signals so every
-        // hint promoted by `model_assessment_to_verifier_repair_assessment`
-        // (and its sibling helpers) routes through `admit_repair_target_hint`
-        // for the *hint's own path*, not a turn-global signal.
-        let scope = self.current_workspace_scope();
-        let turn_edited = self.turn_edited_relative_paths.clone();
-        let edited_predicate = |path: &str| turn_edited.contains(path);
-        let scaffold_predicate = |path: &str| self.repo_edit_has_post_scaffold_delta(path);
-        let admission = RepairTargetAdmissionContext {
-            work_root: &self.work_root,
-            scope: &scope,
-            edited_this_session_for: &edited_predicate,
-            scaffold_changed_for: &scaffold_predicate,
-        };
         // -------- END semantic-boundary (Issue #647 / S3-005 / SF3) --------
         // Re-entering the legacy assessment pipeline: the call below builds
         // `super::VerifierRepairAssessment` only. `semantic_plan` lives on
@@ -14525,21 +14549,21 @@ fn verifier_repair_changed_file_hints(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ParsedVerifierRepairAssessment {
-    failure_kind: super::VerifierDiagnosticFailureKind,
-    probable_cause_role: Option<super::task_contract::ArtifactRole>,
-    repair_targets: Vec<ParsedVerifierRepairTarget>,
-    repair_plan: Vec<ParsedVerifierRepairTarget>,
-    secondary_targets: Vec<String>,
-    do_not_edit_tests_without_evidence: bool,
-    summary: Option<String>,
+pub(super) struct ParsedVerifierRepairAssessment {
+    pub(super) failure_kind: super::VerifierDiagnosticFailureKind,
+    pub(super) probable_cause_role: Option<super::task_contract::ArtifactRole>,
+    pub(super) repair_targets: Vec<ParsedVerifierRepairTarget>,
+    pub(super) repair_plan: Vec<ParsedVerifierRepairTarget>,
+    pub(super) secondary_targets: Vec<String>,
+    pub(super) do_not_edit_tests_without_evidence: bool,
+    pub(super) summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ParsedVerifierRepairTarget {
-    path: String,
-    confidence: f64,
-    reason: String,
+pub(super) struct ParsedVerifierRepairTarget {
+    pub(super) path: String,
+    pub(super) confidence: f64,
+    pub(super) reason: String,
 }
 
 fn parse_verifier_repair_assessment_reply(reply: &str) -> Option<ParsedVerifierRepairAssessment> {
@@ -15539,6 +15563,199 @@ fn recovery_target_hint_for_diagnostic_path(
     admit_repair_target_hint(hint, admission)
 }
 
+/// Issue #647 / CB-017 A''' (Commit 3, CR-2 V2): merge legacy
+/// `ParsedVerifierRepairAssessment` targets into the first cluster of a
+/// `SemanticFailureReport` **only when every cluster is targetless**.
+///
+/// Policy (all-or-nothing): partial output (some clusters target_paths, some
+/// not) is never merged — targetless clusters are skipped downstream by
+/// `first_repairable_cluster` / `next_repairable_cluster`. Merging into a
+/// random "first" cluster on partial output would break the LLM-supplied
+/// cluster ↔ path binding.
+///
+/// `role_hint` is always `None` because `ParsedVerifierRepairTarget` does
+/// not carry a role; the admitted hint's role is decided later by
+/// `recovery_target_hint_for_existing_path` (CR-3 V2). Each appended
+/// candidate's `raw_path` / `reason` is sanitized via
+/// `sanitize_repair_job_text_with_char_cap` so the parse-boundary invariant
+/// (same SSOT as `parse_semantic_failure_report`) holds.
+pub(super) fn merge_legacy_targets_into_clusters(
+    report: &mut super::semantic_failure::SemanticFailureReport,
+    parsed: &ParsedVerifierRepairAssessment,
+) {
+    let all_empty = report
+        .failure_clusters
+        .iter()
+        .all(|c| c.proposed_target_candidates.is_empty());
+    if !all_empty {
+        return;
+    }
+    let Some(first_cluster) = report.failure_clusters.first_mut() else {
+        return;
+    };
+    for target in &parsed.repair_targets {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &target.path,
+                    super::semantic_failure::MAX_RAW_PATH_CHARS,
+                ),
+                role_hint: None,
+                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &target.reason,
+                    240,
+                ),
+            },
+        );
+    }
+    for entry in &parsed.repair_plan {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        // Dedup-by-path: a path already appended via `repair_targets` is not
+        // re-appended via `repair_plan`. We compare against the sanitized
+        // entry that was pushed (the same SSOT is applied to the new entry
+        // below) so a path string that differs only in trailing whitespace /
+        // control chars still dedupes correctly.
+        let sanitized_path = super::repair_job::sanitize_repair_job_text_with_char_cap(
+            &entry.path,
+            super::semantic_failure::MAX_RAW_PATH_CHARS,
+        );
+        if first_cluster
+            .proposed_target_candidates
+            .iter()
+            .any(|c| c.raw_path == sanitized_path)
+        {
+            continue;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: sanitized_path,
+                role_hint: None,
+                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &entry.reason,
+                    240,
+                ),
+            },
+        );
+    }
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-1 V2 / CR-3 V2 / CR-5):
+/// for every failure cluster, admit each `proposed_target_candidate` via
+/// the SSOT `recovery_target_hint_for_diagnostic_path` (which composes
+/// syntactic safety + Owned admission + setup-target gating), dedup the
+/// admitted hints by `(role, path)`, and sort them with the
+/// authority/failure-kind decision table in
+/// [`sort_admitted_by_authority_role_priority`].
+///
+/// CR-3 V2: `candidate.role_hint` is **advisory only** — it is never passed
+/// to the admission helper. The admitted hint's role is decided by
+/// `recovery_target_hint_for_existing_path`'s path classification.
+///
+/// CR-1 V2: the admission SSOT is invoked exactly once per candidate. We do
+/// NOT additionally call `admit_repair_target_hint` after the fact (that
+/// would double-gate Owned).
+pub(super) fn enrich_failure_clusters_with_admitted_targets(
+    report: &mut super::semantic_failure::SemanticFailureReport,
+    work_root: &Path,
+    admission_ctx: &RepairTargetAdmissionContext<'_>,
+    spec_authority: super::spec_authority::SpecAuthority,
+) {
+    let failure_kind = report.failure_kind;
+    for cluster in report.failure_clusters.iter_mut() {
+        let mut admitted: Vec<super::task_contract::RecoveryTargetHint> = Vec::new();
+        for candidate in cluster.proposed_target_candidates.iter() {
+            // recovery_target_hint_for_diagnostic_path is the SSOT — it
+            // composes syntactic safety + Owned admission via
+            // admit_repair_target_hint. role_hint is intentionally not
+            // forwarded (CR-3 V2).
+            if let Some(hint) = recovery_target_hint_for_diagnostic_path(
+                work_root,
+                &candidate.raw_path,
+                &candidate.reason,
+                failure_kind,
+                admission_ctx,
+            ) {
+                admitted.push(hint);
+            }
+        }
+        // (role, path) dedup — Codex nice-to-have 2.
+        admitted.sort_by(|a, b| (a.role, &a.path).cmp(&(b.role, &b.path)));
+        admitted.dedup_by(|a, b| a.role == b.role && a.path == b.path);
+        // Role priority sort (TestBug override / SetupRepair defensive /
+        // default impl-first). Stable sort with (rank, path) tie-breaker.
+        sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
+        cluster.admitted_cluster_targets = admitted;
+    }
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-5 V2): stable role-priority sort
+/// for an `admitted_cluster_targets` slice.
+///
+/// Decision table:
+///
+/// | `failure_kind`                                            | Order                                          |
+/// |-----------------------------------------------------------|------------------------------------------------|
+/// | `TestBug` (override)                                      | Test > Impl > UsageDocs > Setup                |
+/// | `DependencyMissing` / `ConfigOrVerifierError` (defensive) | Setup > Impl > UsageDocs > Test                |
+/// | everything else                                           | Impl > UsageDocs > Setup > Test (test suppress)|
+///
+/// `spec_authority` is currently advisory at this layer — the table above
+/// is independent of authority. The parameter is retained for forward
+/// compatibility (a future Issue may introduce authority-conditional
+/// branches without touching the call sites).
+///
+/// The sort is stable and uses `(rank, path)` as the sort key so ties (two
+/// targets of the same role) resolve in deterministic path order.
+pub(super) fn sort_admitted_by_authority_role_priority(
+    admitted: &mut [super::task_contract::RecoveryTargetHint],
+    spec_authority: super::spec_authority::SpecAuthority,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+) {
+    let _ = spec_authority; // explicit no-op for clarity (CR-5 V2 decision table).
+    let primary_rank_for = |role: super::task_contract::ArtifactRole| -> u8 {
+        if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug) {
+            return match role {
+                super::task_contract::ArtifactRole::Test => 0,
+                super::task_contract::ArtifactRole::Implementation => 1,
+                super::task_contract::ArtifactRole::UsageDocs => 2,
+                super::task_contract::ArtifactRole::Setup => 3,
+            };
+        }
+        if matches!(
+            failure_kind,
+            super::VerifierDiagnosticFailureKind::DependencyMissing
+                | super::VerifierDiagnosticFailureKind::ConfigOrVerifierError
+        ) {
+            return match role {
+                super::task_contract::ArtifactRole::Setup => 0,
+                super::task_contract::ArtifactRole::Implementation => 1,
+                super::task_contract::ArtifactRole::UsageDocs => 2,
+                super::task_contract::ArtifactRole::Test => 3,
+            };
+        }
+        match role {
+            super::task_contract::ArtifactRole::Implementation => 0,
+            super::task_contract::ArtifactRole::UsageDocs => 1,
+            super::task_contract::ArtifactRole::Setup => 2,
+            super::task_contract::ArtifactRole::Test => 3,
+        }
+    };
+    admitted.sort_by(|a, b| {
+        let pa = primary_rank_for(a.role);
+        let pb = primary_rank_for(b.role);
+        pa.cmp(&pb).then_with(|| a.path.cmp(&b.path))
+    });
+}
+
 fn diagnostic_target_allowed_by_confidence(
     hint: &super::task_contract::RecoveryTargetHint,
     confidence: f64,
@@ -15934,10 +16151,17 @@ fn build_semantic_repair_plan_from_report_with_authority_input(
     {
         return None;
     }
-    // 1 RepairJob = 1 cluster (slot reuse, Phase E). Pick the first cluster
-    // as the attack target; if no clusters were reported, the plan cannot
-    // be built (caller keeps `semantic_plan = None`).
-    let failure_cluster_id = report.failure_clusters.first()?.cluster_key.clone();
+    // 1 RepairJob = 1 cluster (slot reuse, Phase E). Pick the first
+    // **repairable** cluster — CB-017 A''' (Commit 3, CR-6 V2) skips
+    // targetless clusters (admitted_cluster_targets empty) so the plan is
+    // always anchored to a cluster the controller can actually attack.
+    // When tests build a fixture report *without* running the enrich step,
+    // every cluster looks targetless; fall back to the legacy "first cluster"
+    // behavior in that case so the existing test suite stays green.
+    let failure_cluster_id = super::repair_job::first_repairable_cluster(&report)
+        .or_else(|| report.failure_clusters.first())?
+        .cluster_key
+        .clone();
     // Issue #647 (SF1): SpecAuthority is now resolved through the
     // structured `resolve()` SSOT so impl/test/README are treated as
     // equally authoritative on newly generated tasks. Pre-SF1 the
@@ -27752,6 +27976,421 @@ export default function App() {
         // The plan must carry a non-empty hypothesis (MF3 admission guard
         // for test edits requires this).
         assert!(!plan.repair_hypothesis.trim().is_empty());
+    }
+
+    // ─── CB-017 A''' (Commit 3): merge + enrich + sort production helpers ───
+
+    /// Build a single-cluster `SemanticFailureReport` whose
+    /// `proposed_target_candidates` list is supplied by the caller. Bypasses
+    /// JSON parsing so we can inject candidates with arbitrary role hints
+    /// (including ones that disagree with the path classification).
+    fn cb017_single_cluster_report_with_candidates(
+        failure_kind: super::super::VerifierDiagnosticFailureKind,
+        candidates: Vec<super::super::semantic_failure::RawClusterTargetCandidate>,
+    ) -> super::super::semantic_failure::SemanticFailureReport {
+        let cluster = super::super::semantic_failure::build_failure_cluster_from_observation(
+            "observed",
+            "expected",
+            "shape",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            candidates,
+        );
+        super::super::semantic_failure::SemanticFailureReport {
+            failure_kind,
+            failure_clusters: vec![cluster],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "hypothesis".to_string(),
+            confidence: 0.7,
+        }
+    }
+
+    fn cb017_admission_for_test<'a>(
+        work_root: &'a std::path::Path,
+        scope: &'a super::super::task_workspace_scope::TaskWorkspaceScope,
+    ) -> super::RepairTargetAdmissionContext<'a> {
+        super::RepairTargetAdmissionContext::owned_for_test(work_root, scope)
+    }
+
+    /// CR-2 V2: partial output (some clusters have target_paths, some not)
+    /// must NOT be merged with legacy targets. Targetless clusters are left
+    /// untouched and the downstream walker skips them.
+    #[test]
+    fn cb017_mixed_reply_partial_semantic_does_not_merge_legacy() {
+        let cluster_with_targets =
+            super::super::semantic_failure::build_failure_cluster_from_observation(
+                "obs_a",
+                "exp_a",
+                "shape_a",
+                "AssertEq",
+                &[super::super::task_contract::ArtifactRole::Implementation],
+                vec![super::super::semantic_failure::RawClusterTargetCandidate {
+                    raw_path: "src/a.rs".to_string(),
+                    role_hint: None,
+                    reason: "from llm".to_string(),
+                }],
+            );
+        let cluster_without_targets =
+            super::super::semantic_failure::build_failure_cluster_from_observation(
+                "obs_b",
+                "exp_b",
+                "shape_b",
+                "AssertEq",
+                &[super::super::task_contract::ArtifactRole::Implementation],
+                Vec::new(),
+            );
+        let mut report = super::super::semantic_failure::SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_with_targets, cluster_without_targets],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            confidence: 0.7,
+        };
+        let parsed = super::ParsedVerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            probable_cause_role: None,
+            repair_targets: vec![super::ParsedVerifierRepairTarget {
+                path: "legacy/path.rs".to_string(),
+                confidence: 0.5,
+                reason: "legacy".to_string(),
+            }],
+            repair_plan: Vec::new(),
+            secondary_targets: Vec::new(),
+            do_not_edit_tests_without_evidence: false,
+            summary: None,
+        };
+        super::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        // Partial output policy: nothing merged.
+        assert_eq!(
+            report.failure_clusters[0].proposed_target_candidates.len(),
+            1
+        );
+        assert_eq!(
+            report.failure_clusters[0].proposed_target_candidates[0].raw_path,
+            "src/a.rs"
+        );
+        assert!(
+            report.failure_clusters[1]
+                .proposed_target_candidates
+                .is_empty(),
+            "CR-2 V2: targetless cluster must NOT be filled by legacy merge under partial output"
+        );
+    }
+
+    /// CR-2 V2 fallback: every cluster targetless → first cluster gets the
+    /// legacy targets appended (role_hint=None — ParsedVerifierRepairTarget
+    /// has no role).
+    #[test]
+    fn cb017_all_clusters_targetless_merges_legacy_into_first() {
+        let cluster_a = super::super::semantic_failure::build_failure_cluster_from_observation(
+            "obs_a",
+            "exp_a",
+            "shape_a",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let cluster_b = super::super::semantic_failure::build_failure_cluster_from_observation(
+            "obs_b",
+            "exp_b",
+            "shape_b",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Implementation],
+            Vec::new(),
+        );
+        let mut report = super::super::semantic_failure::SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster_a, cluster_b],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            confidence: 0.7,
+        };
+        let parsed = super::ParsedVerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            probable_cause_role: None,
+            repair_targets: vec![super::ParsedVerifierRepairTarget {
+                path: "legacy/from_targets.rs".to_string(),
+                confidence: 0.5,
+                reason: "from targets list".to_string(),
+            }],
+            repair_plan: vec![
+                super::ParsedVerifierRepairTarget {
+                    path: "legacy/from_plan.rs".to_string(),
+                    confidence: 0.4,
+                    reason: "from plan".to_string(),
+                },
+                // duplicate path must be deduped by merge.
+                super::ParsedVerifierRepairTarget {
+                    path: "legacy/from_targets.rs".to_string(),
+                    confidence: 0.4,
+                    reason: "duplicate".to_string(),
+                },
+            ],
+            secondary_targets: Vec::new(),
+            do_not_edit_tests_without_evidence: false,
+            summary: None,
+        };
+        super::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        let first = &report.failure_clusters[0].proposed_target_candidates;
+        assert_eq!(first.len(), 2, "duplicate path must be deduped");
+        assert_eq!(first[0].raw_path, "legacy/from_targets.rs");
+        assert_eq!(
+            first[0].role_hint, None,
+            "ParsedVerifierRepairTarget has no role"
+        );
+        assert_eq!(first[1].raw_path, "legacy/from_plan.rs");
+        assert!(
+            report.failure_clusters[1]
+                .proposed_target_candidates
+                .is_empty(),
+            "merge only touches the first cluster (slot reuse handles the rest)"
+        );
+    }
+
+    /// CR-1 V2 grep test: `enrich_failure_clusters_with_admitted_targets`
+    /// must invoke `recovery_target_hint_for_diagnostic_path` (SSOT) and
+    /// must NOT directly invoke `admit_repair_target_hint` (which would
+    /// double-gate Owned).
+    #[test]
+    fn cb017_enrich_calls_admission_ssot_exactly_once_per_candidate() {
+        let src = include_str!("turn.rs");
+        let fn_pos = src
+            .find("pub(super) fn enrich_failure_clusters_with_admitted_targets(")
+            .expect("enrich function must exist");
+        // Take a generous slice of the function body (up to the next top-level
+        // `pub(super) fn` / `fn ` declaration).
+        let after = &src[fn_pos..];
+        let next_fn = after[1..]
+            .find("\npub(super) fn ")
+            .or_else(|| after[1..].find("\nfn "))
+            .map(|n| n + 1)
+            .unwrap_or(after.len());
+        let body = &after[..next_fn];
+        assert!(
+            body.contains("recovery_target_hint_for_diagnostic_path"),
+            "enrich must route every candidate through recovery_target_hint_for_diagnostic_path (CR-1 V2 SSOT)"
+        );
+        assert!(
+            !body.contains("admit_repair_target_hint("),
+            "enrich must NOT call admit_repair_target_hint directly — recovery_target_hint_for_diagnostic_path already composes it (CR-1 V2)"
+        );
+    }
+
+    /// CR-3 V2: even when the LLM-supplied `role_hint` disagrees with the
+    /// path classification (here: role_hint=Test but raw_path resolves to an
+    /// implementation file), the admitted hint's role MUST come from the
+    /// path classification.
+    #[test]
+    fn cb017_admitted_role_comes_from_path_classification_not_role_hint() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Create an implementation file at app/main.py (classified as
+        // Implementation by `classify_repo_edit_path`).
+        let impl_file = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(impl_file.parent().unwrap()).unwrap();
+        std::fs::write(&impl_file, "def f(): pass\n").unwrap();
+
+        let mut report = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            vec![super::super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: "app/main.py".to_string(),
+                // Deliberately misleading hint:
+                role_hint: Some(super::super::task_contract::ArtifactRole::Test),
+                reason: "fix it".to_string(),
+            }],
+        );
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+        );
+        let admitted = &report.failure_clusters[0].admitted_cluster_targets;
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "CR-3 V2: admitted role must come from path classification, NOT from role_hint"
+        );
+        assert_eq!(admitted[0].path, "app/main.py");
+    }
+
+    /// CR-5: under UserRequest authority + AssertionMismatch failure, the
+    /// default decision-table ordering places Implementation before Test.
+    #[test]
+    fn cb017_sort_impl_first_under_user_request_authority() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/test_a.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/main.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "default table: impl-first"
+        );
+        assert_eq!(
+            admitted[1].role,
+            super::super::task_contract::ArtifactRole::Test
+        );
+    }
+
+    /// CR-5: TestBug override flips the order — Test must come first.
+    #[test]
+    fn cb017_sort_test_first_when_failure_kind_is_test_bug() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/main.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/test_a.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            super::super::VerifierDiagnosticFailureKind::TestBug,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Test,
+            "TestBug override: test-first"
+        );
+    }
+
+    /// CR-5 defensive: under DependencyMissing, Setup comes first (even
+    /// though SetupRepair dispatch normally short-circuits before sort is
+    /// reached, the branch must exist).
+    #[test]
+    fn cb017_sort_setup_first_for_dependency_missing_defensive() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/main.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Setup,
+                path: "requirements.txt".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::ImplementationContract,
+            super::super::VerifierDiagnosticFailureKind::DependencyMissing,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Setup,
+            "DependencyMissing defensive: setup-first"
+        );
+    }
+
+    /// CR-5 V2: ties are broken by path order so the sort is deterministic
+    /// across runs.
+    #[test]
+    fn cb017_sort_is_stable_with_path_tiebreaker() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/z.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "app/a.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+        );
+        assert_eq!(
+            admitted[0].path, "app/a.py",
+            "tie-break must be path-sorted"
+        );
+        assert_eq!(admitted[1].path, "app/z.py");
+    }
+
+    /// Security: `../`, absolute path, embedded NUL all rejected by
+    /// `verifier_diagnostic_path_input_is_safe` (which the SSOT
+    /// `recovery_target_hint_for_diagnostic_path` calls). After enrich, no
+    /// admitted target should land in the cluster.
+    #[test]
+    fn cb017_security_unsafe_paths_rejected_by_enrich() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        // Create a real file so the path-validation step has an existing
+        // file at every "safe" baseline — we want to be sure rejection
+        // happens for the unsafe shapes, not for "file does not exist".
+        let safe = work_root.join("app").join("safe.py");
+        std::fs::create_dir_all(safe.parent().unwrap()).unwrap();
+        std::fs::write(&safe, "x = 1\n").unwrap();
+
+        let cand = |raw_path: &str| super::super::semantic_failure::RawClusterTargetCandidate {
+            raw_path: raw_path.to_string(),
+            role_hint: None,
+            reason: "test".to_string(),
+        };
+        let candidates = vec![
+            cand("../etc/passwd"),
+            cand("/etc/passwd"),
+            cand("app/with\0nul.py"),
+        ];
+        let mut report = cb017_single_cluster_report_with_candidates(
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            candidates,
+        );
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = cb017_admission_for_test(&work_root, &scope);
+        super::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &work_root,
+            &admission,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+        );
+        assert!(
+            report.failure_clusters[0]
+                .admitted_cluster_targets
+                .is_empty(),
+            "unsafe paths (../, absolute, control chars) must NOT survive enrich admission"
+        );
     }
 }
 

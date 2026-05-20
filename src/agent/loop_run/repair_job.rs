@@ -713,13 +713,13 @@ pub(super) fn advance_to_next_cluster(
     });
 
     // 2. Find the next cluster in document order that is NOT exhausted
-    //    under the report's preferred_repair_role.
+    //    under the report's preferred_repair_role. CB-017 A''' (Commit 3,
+    //    CR-6 V2): route through `next_repairable_cluster` so targetless
+    //    clusters (admitted_cluster_targets empty after enrich) are skipped
+    //    and the ledger comparison uses `(cluster_key, RepairRole)` exact
+    //    pairs.
     let role = report.preferred_repair_role;
-    let next_cluster = report.failure_clusters.iter().find(|cluster| {
-        !repair_job
-            .exhausted_attempts
-            .contains(&(cluster.cluster_key.clone(), role))
-    });
+    let next_cluster = next_repairable_cluster(report, role, &repair_job.exhausted_attempts);
 
     let Some(next_cluster) = next_cluster else {
         // 3. No more clusters — clear the slot and signal no progress.
@@ -794,6 +794,46 @@ pub(super) fn should_re_diagnostic(repair_job: &RepairJob) -> bool {
     repair_job
         .exhausted_attempts
         .contains(&(plan.failure_cluster_id.clone(), plan.preferred_repair_role))
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-6 V2): return the first cluster
+/// of `report` that is *repairable* — i.e. has a non-empty
+/// `admitted_cluster_targets` list. Targetless clusters (no LLM-supplied
+/// target_paths AND no merged legacy targets, or all candidates rejected by
+/// the admission gate) are skipped.
+///
+/// Used by `turn.rs::build_semantic_repair_plan_from_report_with_authority_input`
+/// to pick the initial cluster for the new plan.
+pub(super) fn first_repairable_cluster(
+    report: &SemanticFailureReport,
+) -> Option<&super::semantic_failure::FailureCluster> {
+    report
+        .failure_clusters
+        .iter()
+        .find(|c| !c.admitted_cluster_targets.is_empty())
+}
+
+/// Issue #647 / CB-017 A''' (Commit 3, CR-6 V2): return the next cluster
+/// that:
+///
+/// 1. Has a non-empty `admitted_cluster_targets` list (repairable), AND
+/// 2. Is not already in `exhausted` under the **exact** `(cluster_key,
+///    preferred_role)` pair.
+///
+/// CR-6 V2 distinguishes attacks on the same cluster under different
+/// roles: an entry `(cluster_A, Implementation)` in `exhausted` does NOT
+/// block a later attempt on `(cluster_A, Test)`.
+pub(super) fn next_repairable_cluster<'a>(
+    report: &'a SemanticFailureReport,
+    preferred_role: RepairRole,
+    exhausted: &[(FailureClusterKey, RepairRole)],
+) -> Option<&'a super::semantic_failure::FailureCluster> {
+    report.failure_clusters.iter().find(|c| {
+        !c.admitted_cluster_targets.is_empty()
+            && !exhausted
+                .iter()
+                .any(|(id, role)| id == &c.cluster_key && *role == preferred_role)
+    })
 }
 
 /// Issue #647 (MF2.3): production dispatch helper that wires the Phase-E
@@ -1287,8 +1327,23 @@ mod tests {
             "repair_hypothesis": "multi-cluster hypothesis",
             "failure_clusters": clusters,
         });
-        super::super::semantic_failure::parse_semantic_failure_report(&json)
-            .expect("multi-cluster fixture parses")
+        let mut report = super::super::semantic_failure::parse_semantic_failure_report(&json)
+            .expect("multi-cluster fixture parses");
+        // CB-017 A''' (Commit 3): seed every cluster with a synthetic admitted
+        // target so the new `next_repairable_cluster` skip rule does not
+        // accidentally drop clusters in pre-CB-017 fixtures. Production code
+        // fills this slot via `enrich_failure_clusters_with_admitted_targets`
+        // in `turn.rs`; tests that exercise the cluster-walker rely on the
+        // pre-Commit-3 "every cluster is repairable" expectation.
+        for (idx, cluster) in report.failure_clusters.iter_mut().enumerate() {
+            cluster.admitted_cluster_targets =
+                vec![super::super::task_contract::RecoveryTargetHint {
+                    role: super::super::task_contract::ArtifactRole::Implementation,
+                    path: format!("app/main_{idx}.py"),
+                    reason: "fixture-admitted target".to_string(),
+                }];
+        }
+        report
     }
 
     /// Build a fresh `RepairJob` whose `semantic_plan` slot targets the
@@ -3181,5 +3236,83 @@ mod tests {
                  (S1-011 / S3-006: SemanticFailureReport is turn-local)",
             );
         }
+    }
+
+    // ─── CB-017 A''' (Commit 3): first/next_repairable_cluster ─────────────
+
+    /// CR-6 V2: `first_repairable_cluster` skips clusters whose
+    /// `admitted_cluster_targets` is empty, returning the first cluster with
+    /// at least one admitted target.
+    #[test]
+    fn cb017_first_repairable_cluster_skips_targetless() {
+        // Build a 3-cluster fixture (every cluster pre-seeded with admitted
+        // targets), then clear the first cluster's admitted list. The helper
+        // must walk past the empty first cluster and return the second.
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        report.failure_clusters[0].admitted_cluster_targets.clear();
+        let chosen = super::first_repairable_cluster(&report).expect("second cluster repairable");
+        assert_eq!(chosen.cluster_key, report.failure_clusters[1].cluster_key);
+
+        // If we clear every cluster, the helper returns None.
+        for cluster in report.failure_clusters.iter_mut() {
+            cluster.admitted_cluster_targets.clear();
+        }
+        assert!(super::first_repairable_cluster(&report).is_none());
+    }
+
+    /// CR-6 V2: `next_repairable_cluster` distinguishes the same cluster
+    /// under different `RepairRole`s — an entry `(cluster_A, Implementation)`
+    /// does NOT block a later attempt on `(cluster_A, Test)`.
+    #[test]
+    fn cb017_next_repairable_distinguishes_same_cluster_different_role() {
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_a = report.failure_clusters[0].cluster_key.clone();
+        // Cluster A exhausted under Implementation; query under Test should
+        // still admit Cluster A.
+        let exhausted = vec![(
+            cluster_a.clone(),
+            super::super::task_contract::ArtifactRole::Implementation,
+        )];
+        let chosen = super::next_repairable_cluster(
+            &report,
+            super::super::task_contract::ArtifactRole::Test,
+            &exhausted,
+        )
+        .expect("cluster A still repairable under Test role");
+        assert_eq!(chosen.cluster_key, cluster_a);
+        // Same query under Implementation must skip A and pick B.
+        let chosen = super::next_repairable_cluster(
+            &report,
+            super::super::task_contract::ArtifactRole::Implementation,
+            &exhausted,
+        )
+        .expect("cluster B repairable under Implementation");
+        assert_eq!(chosen.cluster_key, report.failure_clusters[1].cluster_key);
+    }
+
+    /// CR-6 V2 (fallback test): when every cluster of the report is targetless
+    /// (no LLM-supplied target_paths, no merged legacy targets, or all
+    /// candidates rejected by admission), the controller falls back to the
+    /// legacy assessment — represented here by `first_repairable_cluster`
+    /// returning `None`.
+    #[test]
+    fn cb017_all_clusters_targetless_falls_back_to_legacy_assessment() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 3);
+        for cluster in report.failure_clusters.iter_mut() {
+            cluster.admitted_cluster_targets.clear();
+        }
+        assert!(super::first_repairable_cluster(&report).is_none());
+        assert!(
+            super::next_repairable_cluster(
+                &report,
+                super::super::task_contract::ArtifactRole::Implementation,
+                &[]
+            )
+            .is_none(),
+            "next_repairable_cluster must skip targetless clusters",
+        );
     }
 }
