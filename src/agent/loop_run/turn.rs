@@ -9294,6 +9294,30 @@ impl Agent {
     }
 
     fn run_verifier_diagnostic_pass(&mut self) -> VerifierDiagnosticPassOutcome {
+        // Issue #647 (CB-013): before the Skipped short-circuit consults
+        // `context.assessment.is_some()`, detect the "advanced semantic_plan
+        // + stale assessment" state that CB-012 catches at the decision
+        // layer. If we are in that state, clear the stale assessment so the
+        // diagnostic actually runs — otherwise the Skipped short-circuit
+        // below would fire and neutralize the CB-012 fix at the production
+        // layer (the decision layer returns NeedDiagnostic, but this runner
+        // refuses to actually run because the stale assessment is still
+        // present).
+        //
+        // We deliberately do NOT touch `assessment_attempts` here — the
+        // existing diagnostic runner logic below increments it via the
+        // `current.assessment_attempts = current.assessment_attempts.saturating_add(1)`
+        // line after `verifier_diagnostic_attempt_spec` resolves. We only
+        // clear the stale assessment + flip `diagnostic_attempted` back to
+        // `false` so a fresh diagnostic pass is permitted under the same
+        // attempt budget.
+        let stale_advance = self.repair_job.as_ref().is_some_and(|job| {
+            super::repair_job::has_stale_assessment_after_cluster_advance(job, &self.work_root)
+        });
+        if stale_advance && let Some(current) = self.repair_job.as_mut() {
+            current.assessment = None;
+            current.diagnostic_attempted = false;
+        }
         let Some(context) = self.repair_job.clone() else {
             return VerifierDiagnosticPassOutcome::Skipped;
         };
@@ -20741,6 +20765,134 @@ mod progress_tests {
             dec,
             VerifierRepairDecision::NeedDiagnostic,
             "CB-012: guard must NOT fire when exhausted_attempts is empty"
+        );
+    }
+
+    /// Issue #647 (CB-013): production-level integration test.
+    ///
+    /// When `run_verifier_diagnostic_pass` is invoked with the same
+    /// "advanced semantic_plan + stale assessment" state that the CB-012
+    /// decision layer routes through `NeedDiagnostic`, the runner MUST
+    /// clear the stale assessment before its own `assessment.is_some()`
+    /// Skipped short-circuit fires — otherwise the CB-012 fix is
+    /// neutralized at the production layer.
+    ///
+    /// We assert two production invariants:
+    ///   1. The outcome is NOT `Skipped` — diagnostic actually ran.
+    ///   2. `repair_job.assessment_attempts` was incremented (>= 1),
+    ///      proving the diagnostic runner's body executed past the
+    ///      Skipped short-circuit.
+    ///
+    /// The ollama call inside the runner will fail (the test agent's
+    /// host points at a fake endpoint), but that is intentional —
+    /// `Failed`/`Unavailable`/`RetryPending` are all acceptable; the
+    /// essential signal is that we left `Skipped` behind.
+    #[test]
+    fn cb013_stale_advanced_semantic_plan_actually_runs_diagnostic() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+
+        // Build the stale-state RepairJob: semantic_plan = Some,
+        // exhausted_attempts non-empty, assessment = Some (stale cluster A).
+        let mut job: RepairJob = verifier_context_for("app/main.py");
+        assert!(
+            job.assessment.is_some(),
+            "fixture invariant: assessment must be Some so CB-013 has something to clear"
+        );
+        let plan: SemanticRepairPlan = semantic_plan_for_test_fixture();
+        let cluster_id = plan.failure_cluster_id.clone();
+        job.semantic_plan = Some(plan);
+        job.exhausted_attempts.push((
+            cluster_id,
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        job.assessment_attempts = 0;
+        job.diagnostic_attempted = true;
+        agent.repair_job = Some(job);
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Sanity check: the decision layer (CB-012) would route this state
+        // through NeedDiagnostic. CB-013's job is to make sure the
+        // diagnostic runner honors that intent in production.
+        assert!(
+            super::super::repair_job::has_stale_assessment_after_cluster_advance(
+                agent.repair_job.as_ref().unwrap(),
+                &agent.work_root,
+            ),
+            "CB-013 fixture must satisfy the stale-state predicate"
+        );
+
+        let outcome = agent.run_verifier_diagnostic_pass();
+        assert!(
+            !matches!(outcome, super::VerifierDiagnosticPassOutcome::Skipped),
+            "CB-013: diagnostic must NOT short-circuit to Skipped when the \
+             stale-advance state holds; got {outcome:?}"
+        );
+
+        let attempts = agent
+            .repair_job
+            .as_ref()
+            .map(|job| job.assessment_attempts)
+            .unwrap_or(0);
+        assert!(
+            attempts >= 1,
+            "CB-013: assessment_attempts must be incremented after the \
+             diagnostic runner clears the stale assessment and proceeds \
+             past Skipped (got {attempts})"
+        );
+    }
+
+    /// Issue #647 (CB-013) regression: when `semantic_plan` is `None` (=
+    /// legacy / SetupRepair path), the existing Skipped short-circuit on
+    /// `assessment.is_some()` must remain intact. CB-013 only bypasses
+    /// Skipped for the narrow stale-advance state.
+    #[test]
+    fn cb013_fresh_state_with_assessment_still_skips() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::repair_job::RepairJob;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+
+        // Legacy state: no semantic_plan, no exhausted_attempts, but
+        // assessment is Some. CB-013 must NOT fire — Skipped wins.
+        let mut job: RepairJob = verifier_context_for("app/main.py");
+        assert!(job.assessment.is_some(), "fixture invariant");
+        assert!(job.semantic_plan.is_none(), "fixture invariant");
+        assert!(job.exhausted_attempts.is_empty(), "fixture invariant");
+        job.assessment_attempts = 0;
+        agent.repair_job = Some(job);
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Confirm CB-013 predicate does not fire for legacy state.
+        assert!(
+            !super::super::repair_job::has_stale_assessment_after_cluster_advance(
+                agent.repair_job.as_ref().unwrap(),
+                &agent.work_root,
+            ),
+            "CB-013 must not fire for legacy / no-semantic-plan state"
+        );
+
+        let outcome = agent.run_verifier_diagnostic_pass();
+        assert!(
+            matches!(outcome, super::VerifierDiagnosticPassOutcome::Skipped),
+            "CB-013 regression: legacy `assessment.is_some()` Skipped \
+             short-circuit must remain intact; got {outcome:?}"
+        );
+
+        // assessment_attempts must NOT have been incremented (diagnostic
+        // body never ran).
+        assert_eq!(
+            agent
+                .repair_job
+                .as_ref()
+                .map(|job| job.assessment_attempts)
+                .unwrap_or(0),
+            0,
+            "CB-013 regression: Skipped must not increment assessment_attempts"
         );
     }
 

@@ -450,6 +450,36 @@ pub(super) fn verifier_repair_decision(
     }
 }
 
+/// Issue #647 (CB-013): detect the "advanced semantic_plan + stale
+/// assessment" state that CB-012 catches in the decision layer.
+///
+/// The diagnostic runner (`run_verifier_diagnostic_pass` in `turn.rs`)
+/// consults this helper to know whether to clear the stale assessment
+/// before running a fresh diagnostic. Without this clear, the runner's
+/// own `assessment.is_some()` Skipped short-circuit would fire and
+/// neutralize the CB-012 fix at the production layer — the decision
+/// layer returns `NeedDiagnostic`, but the diagnostic runner refuses
+/// to actually run because the stale assessment from the previous
+/// cluster is still in the slot.
+///
+/// The predicate mirrors the CB-007 / CB-012 invariant:
+/// * `assessment.is_some()` — a stale assessment exists
+/// * `semantic_plan.is_some()` — we are inside a semantic plan
+/// * `!exhausted_attempts.is_empty()` — at least one cluster has been
+///   exhausted, i.e. the plan has advanced
+/// * `verifier_repair_context_target_path(...) == None` — the CB-007 hint
+///   guard is already returning None for this state, confirming the
+///   assessment is stale
+pub(super) fn has_stale_assessment_after_cluster_advance(
+    job: &RepairJob,
+    work_root: &Path,
+) -> bool {
+    job.assessment.is_some()
+        && job.semantic_plan.is_some()
+        && !job.exhausted_attempts.is_empty()
+        && super::turn::verifier_repair_context_target_path(work_root, job).is_none()
+}
+
 /// Adapter moved from `turn.rs::Agent::task_contract_repair_state()`. Pure
 /// projection from `(Option<&RepairJob>, &VerifierRepairDecision)` to the
 /// two-variant projection consumed by `task_contract::plan_artifact_recovery`.
@@ -2098,6 +2128,191 @@ mod tests {
             job.semantic_plan.as_ref().unwrap().spec_authority,
             SpecAuthority::BehaviorContract,
             "CB-009: consensus-decided BehaviorContract must persist across chained advances",
+        );
+    }
+
+    /// Issue #647 (CB-013): `has_stale_assessment_after_cluster_advance`
+    /// must return `true` exactly when:
+    ///   1. `assessment.is_some()`
+    ///   2. `semantic_plan.is_some()`
+    ///   3. `!exhausted_attempts.is_empty()`
+    ///   4. `verifier_repair_context_target_path` returns `None` (the
+    ///      CB-007 guard fires)
+    ///
+    /// This is the same predicate the CB-012 decision-layer guard uses.
+    /// `run_verifier_diagnostic_pass` consults this helper to clear the
+    /// stale assessment before its own `assessment.is_some()` Skipped
+    /// short-circuit fires (without the clear, CB-012's NeedDiagnostic
+    /// would be neutralized at the production layer).
+    #[test]
+    fn cb013_has_stale_assessment_after_cluster_advance_fires_for_stale_state() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let role = report.preferred_repair_role;
+
+        // Job state: active semantic_plan + non-empty exhausted_attempts +
+        // assessment Some. No work_root file exists, and the CB-007 guard
+        // in `verifier_repair_effective_target_hint` returns None whenever
+        // `semantic_plan.is_some() && !exhausted_attempts.is_empty()` —
+        // so `verifier_repair_context_target_path` returns None too.
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let stale_hint = RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/stale.py".to_string(),
+            reason: "stale cluster A".to_string(),
+        };
+        let job = RepairJob {
+            semantic_plan: Some(plan),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: Some(stale_hint.clone()),
+                repair_plan: vec![stale_hint],
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            ..RepairJob::new_for_test()
+        };
+
+        assert!(
+            has_stale_assessment_after_cluster_advance(&job, &work_root),
+            "CB-013: stale state (advanced plan + non-empty exhausted_attempts + Some assessment) must be detected",
+        );
+    }
+
+    /// Issue #647 (CB-013): the helper must NOT fire when
+    /// `exhausted_attempts` is empty — fresh semantic_plan flow is
+    /// unaffected so the Skipped short-circuit keeps its normal behavior.
+    #[test]
+    fn cb013_has_stale_assessment_does_not_fire_when_no_exhausted_attempts() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let role = report.preferred_repair_role;
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[0].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let job = RepairJob {
+            semantic_plan: Some(plan),
+            // exhausted_attempts empty — CB-013 must NOT engage.
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: Some(role),
+                needed_reads: Vec::new(),
+                repair_target_hint: None,
+                repair_plan: Vec::new(),
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            ..RepairJob::new_for_test()
+        };
+        assert!(
+            !has_stale_assessment_after_cluster_advance(&job, &work_root),
+            "CB-013: fresh state (empty exhausted_attempts) must NOT engage the stale-clear helper",
+        );
+    }
+
+    /// Issue #647 (CB-013): the helper must NOT fire when `assessment` is
+    /// already None — there is nothing to clear, and the diagnostic
+    /// runner's normal path already handles this case.
+    #[test]
+    fn cb013_has_stale_assessment_does_not_fire_when_assessment_already_none() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 2);
+        let role = report.preferred_repair_role;
+        let cluster_ids: Vec<_> = report
+            .failure_clusters
+            .iter()
+            .map(|c| c.cluster_key.clone())
+            .collect();
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_ids[1].clone(),
+            semantic_cause: report.failure_kind,
+            spec_authority: SpecAuthority::ImplementationContract,
+            preferred_repair_role: role,
+            repair_hypothesis: report.repair_hypothesis.clone(),
+            expected_improvement: None,
+        };
+        let job = RepairJob {
+            semantic_plan: Some(plan),
+            exhausted_attempts: vec![(cluster_ids[0].clone(), role)],
+            assessment: None,
+            ..RepairJob::new_for_test()
+        };
+        assert!(
+            !has_stale_assessment_after_cluster_advance(&job, &work_root),
+            "CB-013: assessment already None → helper must not fire",
+        );
+    }
+
+    /// Issue #647 (CB-013): the helper must NOT fire when no
+    /// `semantic_plan` is active — the legacy / SetupRepair path keeps its
+    /// existing Skipped short-circuit behavior.
+    #[test]
+    fn cb013_has_stale_assessment_does_not_fire_when_no_semantic_plan() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+
+        let job = RepairJob {
+            semantic_plan: None,
+            // Even with an assessment present, the legacy / SetupRepair
+            // path must keep its existing Skipped short-circuit behavior.
+            assessment: Some(super::super::VerifierRepairAssessment {
+                failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+                failure_type: VerifierFailureType::Unknown,
+                probable_cause_role: None,
+                needed_reads: Vec::new(),
+                repair_target_hint: None,
+                repair_plan: Vec::new(),
+                summary: None,
+                source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+            }),
+            ..RepairJob::new_for_test()
+        };
+        assert!(
+            !has_stale_assessment_after_cluster_advance(&job, &work_root),
+            "CB-013: semantic_plan None → helper must not fire",
         );
     }
 
