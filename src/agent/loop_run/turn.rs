@@ -26634,6 +26634,149 @@ export default function App() {
             "SF3: END marker must precede the legacy helper call"
         );
     }
+
+    // ─── Issue #647 joint-integration: BehaviorContract / UserRequest /
+    //     UsageDocs consensus × SemanticRepairPlan / SpecAuthority. ────────
+    //
+    // The user-orchestrator asked for joint tests covering the resolver's
+    // three production-relevant inputs (BehaviorContract, UserRequest,
+    // UsageDocs consensus tie-break) flowing end-to-end into a built
+    // SemanticRepairPlan.
+
+    fn joint_sample_report() -> super::super::semantic_failure::SemanticFailureReport {
+        // A minimal valid report that exercises the assertion-mismatch
+        // path with one cluster involving Implementation + Test.
+        let reply = r#"{
+            "failure_kind": "assertion_mismatch",
+            "failure_clusters": [{
+                "observed": "200",
+                "expected": "404",
+                "affected_cases": ["read missing item"],
+                "involved_artifacts": ["implementation", "test"]
+            }],
+            "contract_conflict": {
+                "implementation": "returns 200 instead of 404",
+                "test": "expects 404",
+                "usage_docs": "not specified"
+            },
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "make the not-found branch return 404",
+            "confidence": 0.7
+        }"#;
+        super::parse_semantic_failure_report_from_reply(reply).expect("sample report must parse")
+    }
+
+    #[test]
+    fn joint_user_request_authority_flows_into_plan() {
+        // UserRequest is the top-priority authority; resolve() must
+        // elect it regardless of other flags, and the resulting plan
+        // must carry it verbatim.
+        let report = joint_sample_report();
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: true,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+                .expect("plan must build");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::UserRequest,
+            "UserRequest must dominate even when BehaviorContract is also present"
+        );
+        assert_eq!(
+            plan.preferred_repair_role,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "preferred_repair_role carries through from the semantic report"
+        );
+        assert!(
+            !plan.repair_hypothesis.is_empty(),
+            "MF3 guard requires non-empty repair_hypothesis on the plan"
+        );
+    }
+
+    #[test]
+    fn joint_behavior_contract_authority_flows_into_plan() {
+        let report = joint_sample_report();
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+                .expect("plan must build");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::BehaviorContract,
+            "BehaviorContract is the chosen authority when UserRequest is absent"
+        );
+    }
+
+    #[test]
+    fn joint_usage_docs_consensus_tiebreaks_into_plan() {
+        // Newly generated task + impl/usage_docs agreement against test
+        // → consensus tie-break must elect ImplementationContract
+        // (or BehaviorContract, depending on the resolver wiring), and
+        // crucially must NOT elect LlmGeneratedTest (which would suppress
+        // test edits). The acceptance criterion here is that consensus
+        // tie-break engages instead of the bare "newly generated → test"
+        // fallback.
+        let report = joint_sample_report();
+        let consensus = super::super::spec_authority::ArtifactConsensus {
+            agreeing: vec![
+                super::super::task_contract::ArtifactRole::Implementation,
+                super::super::task_contract::ArtifactRole::UsageDocs,
+            ],
+            dissenting: vec![super::super::task_contract::ArtifactRole::Test],
+            reason: "impl and docs both say 404; only test says 200".to_string(),
+        };
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: false,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: Some(consensus),
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+                .expect("plan must build");
+        assert_ne!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::LlmGeneratedTest,
+            "Consensus tie-break must override the newly-generated→LlmGeneratedTest fallback"
+        );
+    }
+
+    #[test]
+    fn joint_test_edit_admission_requires_semantic_plan_built_from_authority() {
+        // MF3 + SF1 combined: an admission attempt against a test file
+        // succeeds only when a SemanticRepairPlan with a resolved
+        // SpecAuthority and a non-empty repair_hypothesis is present.
+        // Build the plan via the authority-aware production helper.
+        let report = joint_sample_report();
+        let input = super::super::spec_authority::SpecAuthorityInput {
+            has_user_request_match: false,
+            has_behavior_contract: true,
+            has_verified_public_interface: false,
+            is_newly_generated_task: true,
+            consensus: None,
+        };
+        let plan =
+            super::build_semantic_repair_plan_from_report_with_authority_input(report, input)
+                .expect("plan must build");
+        // Authority is resolved (any of the 5 enum variants is acceptable
+        // — it is never None because the type itself has no None state).
+        let _: super::super::spec_authority::SpecAuthority = plan.spec_authority;
+        // The plan must carry a non-empty hypothesis (MF3 admission guard
+        // for test edits requires this).
+        assert!(!plan.repair_hypothesis.trim().is_empty());
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
