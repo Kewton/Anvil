@@ -14732,6 +14732,34 @@ fn validate_verifier_repair_intents(
             result.updated_contents
         };
     }
+    // Issue #647 (MF3 / codex final review): SemanticRepairPlan gate for test
+    // edits. Test files (`is_test_file`) may only be edited when the
+    // RepairJob carries a `SemanticRepairPlan` with both a determined
+    // `spec_authority` (enum closed set, never None) and a non-empty
+    // `repair_hypothesis`. Issue 受入条件: "test edit is allowed only when
+    // SpecAuthority and RepairHypothesis exist" / "test edit must preserve
+    // verification intent". This pre-gate runs before the weakening detector
+    // so that semantic_plan = None always rejects regardless of whether the
+    // edit text itself appears benign. Impl edits remain unaffected (impl
+    // repair has wider latitude — only test edits are gated here).
+    let relative_path_classified = Path::new(&relative_path);
+    if is_test_file(relative_path_classified) {
+        let plan = context.semantic_plan.as_ref().ok_or_else(|| {
+            CheapCheckOutcome::Failed(
+                "repair intent rejected: test edit requires SemanticRepairPlan \
+                 (spec_authority + repair_hypothesis); none was constructed"
+                    .to_string(),
+            )
+        })?;
+        if plan.repair_hypothesis.trim().is_empty() {
+            return Err(CheapCheckOutcome::Failed(
+                "repair intent rejected: test edit requires a non-empty \
+                 repair_hypothesis in the SemanticRepairPlan"
+                    .to_string(),
+            ));
+        }
+    }
+
     // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): apply the deterministic
     // test/impl weakening detectors at the repair editor's admission
     // boundary. `original_contents` is the pre-edit `before` snapshot and
@@ -19712,10 +19740,54 @@ mod progress_tests {
 
     // ---- Issue #647 (Phase F): weakening detector at validate_verifier_repair_intents ---- //
 
+    /// Issue #647 (MF3): build a valid `SemanticRepairPlan` for test-path
+    /// fixtures. Existing weakening tests target test files, which now go
+    /// through the MF3 admission gate before the weakening detector — so the
+    /// fixture must carry a non-empty `repair_hypothesis` and a determined
+    /// `SpecAuthority` for those tests to keep exercising the weakening
+    /// detector path.
+    fn semantic_plan_for_test_fixture() -> super::super::repair_job::SemanticRepairPlan {
+        use super::super::semantic_failure::build_failure_cluster_from_observation;
+        let cluster = build_failure_cluster_from_observation(
+            "obs",
+            "exp",
+            "shape",
+            "AssertEq",
+            &[super::super::task_contract::ArtifactRole::Test],
+        );
+        let cluster_id = cluster.cluster_key.clone();
+        let report = super::super::semantic_failure::SemanticFailureReport {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_clusters: vec![cluster],
+            contract_conflict: super::super::semantic_failure::ContractConflict {
+                implementation: String::new(),
+                test: String::new(),
+                usage_docs: String::new(),
+            },
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Test,
+            repair_hypothesis: "test fixture hypothesis".to_string(),
+            confidence: 0.8,
+        };
+        super::super::repair_job::SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: super::super::spec_authority::SpecAuthority::UserRequest,
+            preferred_repair_role: super::super::task_contract::ArtifactRole::Test,
+            repair_hypothesis: "test fixture hypothesis".to_string(),
+            expected_improvement: None,
+        }
+    }
+
     /// Helper: build a test-targeting `RepairJob` whose `target_hint` /
     /// `assessment.repair_target_hint` point at a test-file path (so
     /// `verifier_repair_path_input_is_safe` accepts it and the hint role is
     /// coherent with the test path that `is_test_file` will classify).
+    ///
+    /// Issue #647 (MF3): the fixture attaches a valid `SemanticRepairPlan`
+    /// by default so weakening tests continue to reach the weakening
+    /// detector (the MF3 admission gate rejects test edits whose RepairJob
+    /// has no semantic plan, before the weakening detector ever runs).
     fn verifier_test_context_for(path: &str) -> super::super::repair_job::RepairJob {
         let hint = super::super::task_contract::RecoveryTargetHint {
             role: super::super::task_contract::ArtifactRole::Test,
@@ -19744,6 +19816,7 @@ mod progress_tests {
             failure_signature: format!("{path} AssertionError"),
             failure_count: Some(1),
             repair_attempt: 1,
+            semantic_plan: Some(semantic_plan_for_test_fixture()),
             ..super::super::repair_job::RepairJob::new_for_test()
         }
     }
@@ -20154,6 +20227,181 @@ mod progress_tests {
         )
         .unwrap_err();
         assert!(err.contains("AssertionDeleted"), "got: {err}");
+    }
+
+    // ---- Issue #647 (MF3): SemanticRepairPlan gate for test edits ---- //
+
+    /// MF3-test-edit-without-plan: a benign (non-weakening) edit on a test
+    /// file must be rejected by `validate_verifier_repair_intents` when the
+    /// RepairJob carries `semantic_plan = None`. Without a SemanticRepairPlan
+    /// the agent cannot identify SpecAuthority / RepairHypothesis, so test
+    /// edits are categorically refused (Issue 受入条件: "test edit は
+    /// SpecAuthority と RepairHypothesis がある場合のみ許可").
+    #[test]
+    fn mf3_test_edit_without_semantic_plan_is_rejected() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n    assert bar() == 2\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        // Start from the (now plan-bearing) test fixture and clear the
+        // semantic_plan slot — this mirrors the pre-MF1 legacy null case.
+        let mut context = verifier_test_context_for("tests/test_main.py");
+        context.semantic_plan = None;
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Benign edit: append a new assertion (NOT a weakening). With no
+        // semantic plan, the MF3 admission gate must still reject.
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert bar() == 2\n".to_string(),
+            new_string: "    assert bar() == 2\n    assert baz() == 3\n".to_string(),
+            reason: "add coverage".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(
+            err.contains("SemanticRepairPlan"),
+            "expected MF3 rejection for missing semantic plan, got: {err}"
+        );
+        // The on-disk file must remain untouched.
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("tests/test_main.py")).unwrap(),
+            original
+        );
+    }
+
+    /// MF3-test-edit-without-hypothesis: a SemanticRepairPlan is present but
+    /// its `repair_hypothesis` is empty (whitespace only). The MF3 gate must
+    /// reject because "test edit must preserve verification intent", which
+    /// requires an articulated hypothesis.
+    #[test]
+    fn mf3_test_edit_with_empty_hypothesis_is_rejected() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let original = "def test_x():\n    assert foo() == 1\n    assert bar() == 2\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let mut context = verifier_test_context_for("tests/test_main.py");
+        // Replace the fixture plan with one whose repair_hypothesis is empty.
+        let mut empty_hyp_plan = semantic_plan_for_test_fixture();
+        empty_hyp_plan.repair_hypothesis = "   ".to_string();
+        context.semantic_plan = Some(empty_hyp_plan);
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "    assert bar() == 2\n".to_string(),
+            new_string: "    assert bar() == 2\n    assert baz() == 3\n".to_string(),
+            reason: "add coverage".to_string(),
+            replace_all: false,
+        };
+        let err =
+            validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap_err();
+        assert!(
+            err.contains("repair_hypothesis"),
+            "expected MF3 rejection for empty hypothesis, got: {err}"
+        );
+    }
+
+    /// MF3-impl-edit-allowed-without-plan: the MF3 admission gate must NOT
+    /// fire on implementation paths. Impl repair has wider latitude (it can
+    /// reason from compile errors, runtime traces, etc.) and is gated only
+    /// by the weakening detector. A benign impl edit with `semantic_plan
+    /// = None` must therefore still pass admission.
+    #[test]
+    fn mf3_impl_edit_without_semantic_plan_is_accepted() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    value = 1\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let mut context = verifier_context_for("app/main.py");
+        // Explicitly assert the pre-condition: impl fixture has no plan.
+        assert!(context.semantic_plan.is_none());
+        // Belt-and-suspenders: drop any incidental plan a future refactor
+        // might attach to the impl fixture.
+        context.semantic_plan = None;
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n    return value\n".to_string(),
+            new_string: "    value = 2\n    return value\n".to_string(),
+            reason: "fix constant".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent)
+            .expect("impl edit must pass without a semantic plan");
+        assert!(edit.updated_contents.contains("value = 2"));
+    }
+
+    /// MF3-test-edit-with-full-plan: a test edit must pass admission when
+    /// the RepairJob carries a SemanticRepairPlan with a determined
+    /// `SpecAuthority::UserRequest` and a non-empty `repair_hypothesis`, and
+    /// the edit itself does not trigger the weakening detector. This is the
+    /// positive path the MF3 gate guards — it must not over-reject benign
+    /// test additions that strengthen verification intent.
+    #[test]
+    fn mf3_test_edit_with_full_semantic_plan_is_accepted() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        // The repair adds a brand-new test function — strictly strengthens,
+        // and weakening detectors stay silent because pre-existing asserts /
+        // non-asserts are untouched.
+        let original = "def test_x():\n    assert foo() == 1\n";
+        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
+        let context = verifier_test_context_for("tests/test_main.py");
+        // Pre-condition: the fixture attaches a full plan (MF3 admission
+        // input). Spot-check the SpecAuthority / repair_hypothesis fields
+        // since they are the gate's explicit inputs.
+        let plan = context.semantic_plan.as_ref().expect("fixture has plan");
+        assert_eq!(
+            plan.spec_authority,
+            super::super::spec_authority::SpecAuthority::UserRequest
+        );
+        assert!(!plan.repair_hypothesis.trim().is_empty());
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "tests/test_main.py".to_string(),
+            old_string: "def test_x():\n    assert foo() == 1\n".to_string(),
+            new_string:
+                "def test_x():\n    assert foo() == 1\n\ndef test_y():\n    assert bar() == 2\n"
+                    .to_string(),
+            reason: "add new test case".to_string(),
+            replace_all: false,
+        };
+        let edit = validate_verifier_repair_intent(work_root, &context, &target, intent)
+            .expect("test edit with full plan and no weakening must pass");
+        assert!(edit.updated_contents.contains("def test_y()"));
+        assert!(edit.updated_contents.contains("assert bar() == 2"));
     }
 
     #[test]
