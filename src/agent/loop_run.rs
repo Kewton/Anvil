@@ -158,7 +158,7 @@ pub fn build_verifier_exit_zero_evidence_for_test(
 ) -> Option<(String, &'static str)> {
     let evidence = turn::build_verifier_exit_zero_evidence(outcome)?;
     match evidence {
-        completion_evidence::CompletionEvidence::VerifierExitZero { class, command } => {
+        completion_evidence::CompletionEvidence::VerifierExitZero { class, command, .. } => {
             Some((command, class.as_str()))
         }
         _ => None,

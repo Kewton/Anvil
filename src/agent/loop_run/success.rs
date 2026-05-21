@@ -7,6 +7,8 @@ use super::protocol::{
     requested_paths_from_text,
 };
 use super::summary::{ExitReason, LoopStats};
+use super::task_contract::TaskContract;
+use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tester;
 use super::verifier_skill::VerifierInputs;
 use crate::agent::loop_run::Agent;
@@ -168,6 +170,27 @@ impl Agent {
         self.should_run_auto_test_for_success()
     }
 
+    /// Issue #651 Phase 5.1: derive `(owned_test_artifacts, test_execution_required)`
+    /// from the active request text for the success-path verifier
+    /// dispatch. Builds a one-shot `TaskContract` from
+    /// `active_request_text` (the same SSOT producer that drives the
+    /// post-loop verifier flow) and asks the contract for both the
+    /// `RequiredBehaviorContract.test_execution_required` flag and the
+    /// classified `owned_test_artifacts` slice.
+    ///
+    /// Returns `(vec![], false)` when there is no active request — the
+    /// structured Weak/Missing branch is then skipped and the legacy
+    /// `detect_with_recent_successes -> run` path runs verbatim.
+    fn success_verifier_test_binding(&self) -> (Vec<String>, bool) {
+        let Some(request) = self.active_request_text() else {
+            return (Vec::new(), false);
+        };
+        let contract = TaskContract::from_request(&request);
+        let test_execution_required = contract.required_behavior.test_execution_required;
+        let owned_test_artifacts = self.owned_test_artifacts_for_verifier(&contract);
+        (owned_test_artifacts, test_execution_required)
+    }
+
     pub(super) fn run_post_loop_success_verifier(
         &mut self,
         final_verif: &RepoVerification,
@@ -269,6 +292,9 @@ impl Agent {
         let model = self.models.main.clone();
         let recent_successful_bash_commands =
             recent_successful_bash_commands_since_last_user(&self.session.messages);
+        // Issue #651 Phase 5.1: structured verifier binding inputs.
+        let (owned_test_artifacts, test_execution_required) = self.success_verifier_test_binding();
+        let workspace_scope: TaskWorkspaceScope = self.current_workspace_scope();
         let v_inputs = VerifierInputs {
             score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
@@ -283,6 +309,9 @@ impl Agent {
             recent_successful_bash_commands: &recent_successful_bash_commands,
             tester_candidate_some,
             workspace_root: &self.work_root,
+            owned_test_artifacts: &owned_test_artifacts,
+            test_execution_required,
+            workspace_scope: &workspace_scope,
         };
 
         let started = std::time::Instant::now();
@@ -335,6 +364,11 @@ impl Agent {
                     | VerifierOutcome::NoVerifier { score, .. }
                     | VerifierOutcome::Skipped { score }
                     | VerifierOutcome::EnvDisabled { score } => score.clone(),
+                    // Issue #651: Weak / Missing carry an AnvilScore so the
+                    // post-loop dashboard reads survive the safe stop; the
+                    // exit_reason / error_text translation lives below.
+                    VerifierOutcome::Weak { score, .. }
+                    | VerifierOutcome::Missing { score, .. } => score.clone(),
                 };
 
                 if let VerifierOutcome::AutoTestRan {
@@ -346,11 +380,22 @@ impl Agent {
                     ..
                 } = &outcome
                 {
+                    // Issue #651 Phase 5.1 / DR4-004: the structured runner
+                    // already redacted `auto_test_command` via
+                    // `redact_verifier_command_for_storage` inside
+                    // `AutoTestRunner::run_structured`. Re-applying the SSOT
+                    // here keeps the legacy `AutoTestRunner::run` path
+                    // (shell-based, command field not pre-redacted) safe by
+                    // construction.
+                    let safe_command =
+                        crate::session::feedback::redact_verifier_command_for_storage(
+                            auto_test_command,
+                        );
                     log_llm_event(
                         "agent.autotest.completed",
                         serde_json::json!({
                             "session_id": &session_id,
-                            "command": auto_test_command,
+                            "command": safe_command,
                             "passed": auto_test_passed,
                             "reason": auto_test_reason,
                         }),
@@ -415,6 +460,64 @@ impl Agent {
                             "reason": "ANVIL_NO_AUTO_TEST",
                         }),
                     );
+                }
+                // Issue #651 Phase 5.1 / 6.1: SafeStop telemetry. Emit the
+                // dedicated `agent.verifier.{weak,missing}` log keys under
+                // the per-turn cap (`verifier_safe_stop_emitted_this_turn`)
+                // so a multi-iteration turn can re-evaluate without
+                // duplicating the alert; the surrounding flow already
+                // promoted the post-loop exit_reason to MissingVerification
+                // via the Verifier failure path, but this site is the SSOT
+                // for the structured stop telemetry.
+                if let VerifierOutcome::Weak {
+                    owned_test_artifacts_count,
+                    command_runner,
+                    ..
+                } = &outcome
+                {
+                    if !self.session.verifier_safe_stop_emitted_this_turn {
+                        self.session.verifier_safe_stop_emitted_this_turn = true;
+                        log_llm_event(
+                            "agent.verifier.weak",
+                            serde_json::json!({
+                                "session_id": &session_id,
+                                "turn_index": self.current_turn_index,
+                                "iter_index": self.session.iter_count_this_turn,
+                                "owned_test_artifacts_count": owned_test_artifacts_count,
+                                "command_runner": command_runner,
+                                "auto_test_detected": true,
+                                "test_execution_required": true,
+                            }),
+                        );
+                    }
+                    *exit_reason = ExitReason::SafeStopVerifierWeak;
+                    *error_text = ExitReason::SafeStopVerifierWeak
+                        .default_error_text()
+                        .to_string();
+                }
+                if let VerifierOutcome::Missing {
+                    owned_test_artifacts_count,
+                    ..
+                } = &outcome
+                {
+                    if !self.session.verifier_safe_stop_emitted_this_turn {
+                        self.session.verifier_safe_stop_emitted_this_turn = true;
+                        log_llm_event(
+                            "agent.verifier.missing",
+                            serde_json::json!({
+                                "session_id": &session_id,
+                                "turn_index": self.current_turn_index,
+                                "iter_index": self.session.iter_count_this_turn,
+                                "owned_test_artifacts_count": owned_test_artifacts_count,
+                                "auto_test_detected": false,
+                                "test_execution_required": true,
+                            }),
+                        );
+                    }
+                    *exit_reason = ExitReason::SafeStopVerifierMissing;
+                    *error_text = ExitReason::SafeStopVerifierMissing
+                        .default_error_text()
+                        .to_string();
                 }
                 Some(score)
             }
@@ -641,6 +744,7 @@ mod tests {
         CE::VerifierExitZero {
             class: BashCommandClass::EnvSetup,
             command: "npm install".to_string(),
+            bound_test_artifacts_count: None,
         }
     }
 
@@ -648,6 +752,7 @@ mod tests {
         CE::VerifierExitZero {
             class: BashCommandClass::BuildTest,
             command: "cargo test".to_string(),
+            bound_test_artifacts_count: None,
         }
     }
 

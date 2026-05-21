@@ -77,6 +77,19 @@ pub(super) struct RequiredBehaviorContract {
     pub(super) required_artifacts: Option<Vec<ArtifactKind>>,
     pub(super) verification: Option<Vec<VerificationKind>>,
     pub(super) confidence: f32,
+    /// Issue #651: hard gate that says "the user request literally asked for
+    /// test execution evidence". SSOT predicate is
+    /// `super::task_contract::request_asks_for_test_artifact`, computed once
+    /// per `extract` / `filter_against_request` call against the bounded
+    /// masked scan. Distinct from `verification.contains(VerificationKind::Test)`
+    /// — that one only fires on the English `test` keyword, missing
+    /// `spec` / `テストも実装` (design judgement #1).
+    ///
+    /// `Default` is intentionally NOT implemented for this struct;
+    /// every literal construction site (7 in this module + 0 elsewhere)
+    /// is updated explicitly so adding a new boolean field stays
+    /// compile-time visible (design policy DR2-006 / DR2-008).
+    pub(super) test_execution_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +302,13 @@ pub(super) fn extract(request: &str) -> RequiredBehaviorContract {
     let scan_text = bounded_masked_request(request);
     let scan = scan_text.as_str();
     let lower = scan.to_ascii_lowercase();
+    // Issue #651: SSOT predicate is computed once and reused by both
+    // `extract_required_artifacts` (via `asks_for_tests` inside that
+    // helper) and the `test_execution_required` field below.
+    // `request_asks_for_test_artifact` is invoked here exactly once; the
+    // call inside `extract_required_artifacts` reads the same masked
+    // scan so the two stay in lock-step.
+    let asks_for_tests = super::task_contract::request_asks_for_test_artifact(scan, &lower);
     let operations = extract_operations(scan, &lower);
     let domain_terms = extract_domain_terms(scan);
     let interface_hints = extract_interface_hints(&lower);
@@ -308,6 +328,7 @@ pub(super) fn extract(request: &str) -> RequiredBehaviorContract {
         required_artifacts,
         verification,
         confidence,
+        test_execution_required: asks_for_tests,
     };
     debug_assert!(
         candidate.validate().is_ok(),
@@ -816,6 +837,14 @@ pub(super) fn filter_against_request(
         verification.as_ref(),
     );
 
+    // Issue #651: `verification` may have lost the Test variant during
+    // narrowing above; the test_execution_required gate is still derived
+    // from the bounded masked request directly so a `spec` / `テストも実装`
+    // request keeps `test_execution_required = true` even when the
+    // `Test` verification kind drops out (design judgement #1).
+    let test_execution_required =
+        super::task_contract::request_asks_for_test_artifact(scan, &lower);
+
     let filtered = RequiredBehaviorContract {
         operations,
         domain_terms,
@@ -823,6 +852,7 @@ pub(super) fn filter_against_request(
         required_artifacts,
         verification,
         confidence,
+        test_execution_required,
     };
     debug_assert!(
         filtered.validate().is_ok(),
@@ -900,6 +930,9 @@ mod tests {
             required_artifacts: None,
             verification: None,
             confidence: 0.0,
+            // Issue #651: explicit default at every literal site so
+            // adding a new boolean stays compile-time visible.
+            test_execution_required: false,
         }
     }
 
@@ -1027,6 +1060,7 @@ mod tests {
             required_artifacts: None,
             verification: None,
             confidence: 1.0,
+            test_execution_required: false,
         };
         // Request mentions create + Foo only; Delete / Bar are unbacked.
         let filtered = filter_against_request(&candidate, "create a Foo");
@@ -1044,6 +1078,7 @@ mod tests {
             required_artifacts: None,
             verification: None,
             confidence: 1.0,
+            test_execution_required: false,
         };
         let request = format!("use {oversized}");
         let filtered = filter_against_request(&candidate, &request);
@@ -1064,6 +1099,7 @@ mod tests {
             required_artifacts: None,
             verification: None,
             confidence: 1.0,
+            test_execution_required: false,
         };
         let filtered = filter_against_request(&candidate, &format!("use token {token}"));
         assert!(
@@ -1317,6 +1353,7 @@ mod tests {
             required_artifacts: Some(vec![ArtifactKind::Test, ArtifactKind::Implementation]),
             verification: None,
             confidence: 1.0,
+            test_execution_required: false,
         };
         // The request is an explain-only / read-only ask. It backs
         // neither Test nor Implementation, so both must be filtered out.
@@ -1408,5 +1445,55 @@ mod tests {
         let mut c2 = empty_contract();
         c2.domain_terms = Some(Vec::new());
         assert!(!c2.excerpt_hits_any_domain_term("Task api"));
+    }
+
+    // -----------------------------------------------------------------
+    // Group F (Issue #651): test_execution_required is SSOT-aligned
+    // with `super::task_contract::request_asks_for_test_artifact`.
+    // -----------------------------------------------------------------
+
+    /// Helper: assert that `extract(request).test_execution_required`
+    /// matches the SSOT predicate `request_asks_for_test_artifact`
+    /// applied to the same bounded masked scan.
+    fn assert_test_execution_required_matches_ssot(request: &str) {
+        let c = extract(request);
+        let scan = bounded_masked_request(request);
+        let lower = scan.to_ascii_lowercase();
+        let expected = super::super::task_contract::request_asks_for_test_artifact(&scan, &lower);
+        assert_eq!(
+            c.test_execution_required, expected,
+            "request={request:?} test_execution_required diverged from SSOT predicate"
+        );
+        assert!(
+            expected,
+            "request={request:?} should request test execution (SSOT must be true)"
+        );
+    }
+
+    #[test]
+    fn extract_marks_test_execution_required_for_english_test_keyword() {
+        assert_test_execution_required_matches_ssot("Please add a unit test for the API handler");
+    }
+
+    #[test]
+    fn extract_marks_test_execution_required_for_pytest_keyword() {
+        assert_test_execution_required_matches_ssot("write pytest cases for the new module");
+    }
+
+    #[test]
+    fn extract_marks_test_execution_required_for_unittest_keyword() {
+        assert_test_execution_required_matches_ssot("add unittest coverage for the parser");
+    }
+
+    #[test]
+    fn extract_marks_test_execution_required_for_spec_keyword() {
+        assert_test_execution_required_matches_ssot("write a spec describing the CRUD flow");
+    }
+
+    #[test]
+    fn extract_marks_test_execution_required_for_japanese_test_keyword() {
+        assert_test_execution_required_matches_ssot(
+            "FastAPIでCRUDのAPIを開発してください。テストも実装してください。",
+        );
     }
 }

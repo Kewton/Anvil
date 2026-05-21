@@ -51,9 +51,70 @@ pub(super) struct TaskContract {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CompletionDecision {
-    Continue { missing: Vec<ArtifactRole> },
+    Continue {
+        missing: Vec<ArtifactRole>,
+    },
     Verify,
     Done,
+    /// Issue #651: verifier was attempted but the required-test invariant
+    /// (`test_execution_required && owned_test_artifacts bound to runner`)
+    /// could not be satisfied. The agent must stop without claiming `Done`
+    /// to prevent false-positive completion. The reason is preserved at
+    /// type level so caller match sites stay exhaustive (no `_ =>`).
+    ///
+    /// Phase 4.1 is the first producer of this variant. The arm also
+    /// keeps `_ =>` fallback out of `turn.rs` match sites (design
+    /// judgement #2).
+    SafeStop {
+        reason: SafeStopReason,
+    },
+}
+
+/// Issue #651: dispatch tag for [`TaskContract::evaluate_inner`]. The
+/// legacy `evaluate(...)` entry passes `Legacy` so existing unit tests
+/// (e.g. `test_only_contract_does_not_require_implementation`) and
+/// `task_contract_needs_verification` keep their pre-#651 semantics.
+/// New code paths that DO know the owned test artifact slice pass
+/// `OwnedTestArtifacts(...)`, which activates the SafeStop gate.
+#[derive(Clone, Copy)]
+enum EvaluateMode<'a> {
+    /// Back-compat entry — SafeStop gate is skipped.
+    Legacy,
+    /// New entry — `evaluate_with_owned_test_artifacts` callers pass
+    /// the SSOT bound slice and accept the SafeStop gate.
+    OwnedTestArtifacts(&'a [String]),
+}
+
+/// Issue #651: deterministic reason for `CompletionDecision::SafeStop`.
+///
+/// `Weak`: a structurally runnable verifier was found, but the owned test
+/// artifacts could not be bound to its arguments (e.g. ProjectInstruction
+/// / RecentSuccessfulBash / shell-only compound command).
+///
+/// `Missing`: no allowlisted test runner could be detected at all.
+///
+/// The variants are kept narrow on purpose. Adding a new reason (e.g.
+/// `VerifierTimedOut`) must be a type-level extension so `_ =>` fallback
+/// stays out of the codebase (CLAUDE.md unwritten rule for new enums).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SafeStopReason {
+    /// A structurally runnable verifier was found, but owned test
+    /// artifacts could not be bound to its arguments.
+    ///
+    /// `#[allow(dead_code)]` is intentional today: `VerifierOutcome::Weak`
+    /// in `verifier_skill.rs` is observed by `success.rs` /
+    /// `turn.rs::run_task_contract_verifier_once`, which translate it
+    /// directly to `ExitReason::SafeStopVerifierWeak` without going
+    /// through the planner-side `CompletionDecision::SafeStop`. The
+    /// variant is retained so the `_ =>` ban (design judgement #2)
+    /// holds at every match site and so a future planner-driven
+    /// "Weak-from-evaluate" path lights up here at compile time.
+    #[allow(dead_code)]
+    VerifierWeak,
+    /// No allowlisted test runner could be detected at all (or
+    /// `evaluate_with_owned_test_artifacts` saw an empty owned slice
+    /// while `test_execution_required` was true).
+    VerifierMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +203,13 @@ pub(super) enum ArtifactRecoveryAction {
         target_hint: Option<RecoveryTargetHint>,
     },
     Done,
+    /// Issue #651: mirror of `CompletionDecision::SafeStop` for the
+    /// recovery planner side. Carries the same `SafeStopReason` so the
+    /// caller can emit reason-specific log keys without re-deriving the
+    /// classification.
+    SafeStop {
+        reason: SafeStopReason,
+    },
 }
 
 /// Issue #636: bounded `ArtifactRole -> excerpt` sidecar carried alongside
@@ -177,6 +245,13 @@ pub(super) struct ArtifactRecoveryInputs<'a> {
     /// back-compat default for tests / call sites that have no awareness
     /// of the missing-verifier track.
     pub(super) missing_verifier_suppress_retry: bool,
+    /// Issue #651 Phase 5: SSOT slice of "test artifact paths the
+    /// current task owns and that the structured verifier can bind to".
+    /// Threaded through to `TaskContract::evaluate_with_owned_test_artifacts`
+    /// so the SafeStop gate fires on `test_execution_required &&
+    /// owned_test_artifacts.is_empty()`. `&[]` is the back-compat default
+    /// (existing tests / planner sites that have no ownership view).
+    pub(super) owned_test_artifacts: &'a [String],
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +402,16 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
         return ArtifactRecoveryAction::RunVerifier;
     }
 
-    inputs.contract.evaluate(inputs.evidence).into()
+    // Issue #651 Phase 5: when the caller has populated the SSOT
+    // `owned_test_artifacts` slice, evaluate through the gated entry so
+    // a SafeStop can propagate. Empty slice + a non-test request
+    // collapses back to the legacy completion branches (test_execution_required
+    // is false, gate never fires) — same semantics as the bare
+    // `evaluate(...)` path used by existing planner regression tests.
+    inputs
+        .contract
+        .evaluate_with_owned_test_artifacts(inputs.evidence, inputs.owned_test_artifacts)
+        .into()
 }
 
 fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRole) -> bool {
@@ -371,6 +455,10 @@ impl From<CompletionDecision> for ArtifactRecoveryAction {
             },
             CompletionDecision::Verify => ArtifactRecoveryAction::RunVerifier,
             CompletionDecision::Done => ArtifactRecoveryAction::Done,
+            // Issue #651: `_ =>` fallback is intentionally forbidden so that
+            // a future `SafeStopReason` variant lights up compile errors at
+            // every match site.
+            CompletionDecision::SafeStop { reason } => ArtifactRecoveryAction::SafeStop { reason },
         }
     }
 }
@@ -427,7 +515,48 @@ impl TaskContract {
         }
     }
 
+    /// Back-compat entrypoint that bypasses the Issue #651 test-execution
+    /// gate. Tests / callers that have no `owned_test_artifacts` view
+    /// (e.g. `plan_artifact_recovery` regression tests) keep their
+    /// pre-#651 completion semantics. New code paths that DO know the
+    /// owned slice MUST call [`Self::evaluate_with_owned_test_artifacts`]
+    /// directly so the SafeStop gate can fire.
     pub(super) fn evaluate(&self, evidence: &EvidenceSet) -> CompletionDecision {
+        self.evaluate_inner(evidence, EvaluateMode::Legacy)
+    }
+
+    /// Issue #651 Task 4.1 / PR-001: evaluate completion with awareness
+    /// of the current task's owned test artifacts AND the structural
+    /// binding of the verifier evidence.
+    ///
+    /// Rule (only fires when `required_behavior.test_execution_required`):
+    /// - If `owned_test_artifacts.is_empty()`, the verifier could not
+    ///   have bound to any owned path; return
+    ///   `SafeStop { reason: VerifierMissing }`.
+    /// - Else if no `VerifierExitZero { class: BuildTest, bound_test_artifacts_count: Some(_), .. }`
+    ///   evidence was observed this turn, the only verifier success we
+    ///   saw is the **unbound** kind (legacy manual `cargo test`,
+    ///   shell-based `AutoTestRunner::run` path). The verifier input is
+    ///   not structurally tied to the owned test artifact list, so the
+    ///   gate returns `SafeStop { reason: VerifierMissing }` rather than
+    ///   `Done`. This is PR-001: a manual `cargo test` that happens to
+    ///   coexist with a `tests/test_x.py` write must not satisfy Done.
+    ///
+    /// `test_execution_required == false` keeps the previous Done /
+    /// Verify / Continue branches verbatim — this is the regression
+    /// guard for every request that did not literally ask for tests.
+    pub(super) fn evaluate_with_owned_test_artifacts(
+        &self,
+        evidence: &EvidenceSet,
+        owned_test_artifacts: &[String],
+    ) -> CompletionDecision {
+        self.evaluate_inner(
+            evidence,
+            EvaluateMode::OwnedTestArtifacts(owned_test_artifacts),
+        )
+    }
+
+    fn evaluate_inner(&self, evidence: &EvidenceSet, mode: EvaluateMode<'_>) -> CompletionDecision {
         if matches!(self.intent, TaskIntent::Explain) {
             return CompletionDecision::Done;
         }
@@ -443,6 +572,38 @@ impl TaskContract {
         }
         if self.verification_required && !has_build_test_verifier(evidence) {
             return CompletionDecision::Verify;
+        }
+        // Issue #651 Task 4.1: test-execution gate. Only fires under the
+        // `OwnedTestArtifacts` mode — `evaluate(...)` legacy entrypoint
+        // is the back-compat path and intentionally skips the gate so
+        // existing unit / integration tests (and any caller that has
+        // no ownership view yet) keep pre-#651 completion semantics.
+        if let EvaluateMode::OwnedTestArtifacts(owned_test_artifacts) = mode
+            && self.required_behavior.test_execution_required
+        {
+            // Sub-gate 1: empty owned slice → nothing for the verifier to
+            // have bound to. SafeStop unconditionally.
+            if owned_test_artifacts.is_empty() {
+                return CompletionDecision::SafeStop {
+                    reason: SafeStopReason::VerifierMissing,
+                };
+            }
+            // Sub-gate 2 (PR-001): even when the owned slice is non-empty,
+            // the only verifier success we accept as "Done" is one that
+            // came through the structured `AutoTestRunner::run_structured`
+            // path, which records
+            // `VerifierExitZero { class: BuildTest, bound_test_artifacts_count: Some(_), .. }`.
+            // A manual / legacy unbound `VerifierExitZero` (e.g. a Bash
+            // `cargo test` outcome with `bound_test_artifacts_count: None`)
+            // is NOT proof that the runner argv contained the owned test
+            // paths — it could be a stale workspace test suite that
+            // happens to pass while the new tests/test_x.py is ignored.
+            // Refuse to mark Done in that case.
+            if !has_bound_build_test_verifier(evidence) {
+                return CompletionDecision::SafeStop {
+                    reason: SafeStopReason::VerifierMissing,
+                };
+            }
         }
         CompletionDecision::Done
     }
@@ -497,6 +658,13 @@ fn missing_labels(decision: &CompletionDecision) -> Vec<&'static str> {
         }
         CompletionDecision::Verify => vec!["verifier_exit_zero"],
         CompletionDecision::Done => Vec::new(),
+        // Issue #651: SafeStop labels mirror the log-payload `dispatched`
+        // tags so unit tests can assert the reason without reaching into
+        // log_llm_event output.
+        CompletionDecision::SafeStop { reason } => match reason {
+            SafeStopReason::VerifierWeak => vec!["verifier_weak"],
+            SafeStopReason::VerifierMissing => vec!["verifier_missing"],
+        },
     }
 }
 
@@ -722,6 +890,29 @@ fn has_build_test_verifier(evidence: &EvidenceSet) -> bool {
     })
 }
 
+/// Issue #651 PR-001: stricter sibling of `has_build_test_verifier`. True
+/// only when at least one BuildTest verifier evidence carries a
+/// `bound_test_artifacts_count: Some(_)`, i.e. came through the
+/// `AutoTestRunner::run_structured` path that re-validates owned test
+/// artifacts before spawning `Command::new(runner).args(args)`.
+///
+/// Manual `cargo test` / shell `AutoTestRunner::run` legacy paths record
+/// `bound_test_artifacts_count: None` and are not accepted as proof that
+/// the verifier input was structurally tied to the current task's owned
+/// test artifacts.
+fn has_bound_build_test_verifier(evidence: &EvidenceSet) -> bool {
+    evidence.iter().any(|item| {
+        matches!(
+            item,
+            CompletionEvidence::VerifierExitZero {
+                class: BashCommandClass::BuildTest,
+                bound_test_artifacts_count: Some(_),
+                ..
+            }
+        )
+    })
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -809,9 +1000,24 @@ mod tests {
     }
 
     fn build_test() -> CompletionEvidence {
+        // Default helper: legacy / unbound verifier evidence (no
+        // `bound_test_artifacts_count`). Tests that need to assert the
+        // PR-001 binding gate use `build_test_bound(n)` instead.
         CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::BuildTest,
             command: "pytest".to_string(),
+            bound_test_artifacts_count: None,
+        }
+    }
+
+    /// Issue #651 PR-001: structured / bound verifier evidence factory.
+    /// Mirrors what `AutoTestRunner::run_structured` produces via
+    /// `build_task_contract_verifier_exit_zero_evidence_bound`.
+    fn build_test_bound(bound_count: usize) -> CompletionEvidence {
+        CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "pytest tests/test_x.py".to_string(),
+            bound_test_artifacts_count: Some(bound_count),
         }
     }
 
@@ -978,6 +1184,7 @@ mod tests {
                 repair_state: &repair_state,
                 artifact_excerpts: &ArtifactExcerpts::new(),
                 missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::RunVerifier
         );
@@ -1005,6 +1212,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
             missing_verifier_suppress_retry: true,
+            owned_test_artifacts: &[],
         });
         assert!(
             matches!(action, ArtifactRecoveryAction::RepairArtifact { .. }),
@@ -1033,6 +1241,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
@@ -1057,6 +1266,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         match action {
             ArtifactRecoveryAction::Continue { missing, .. } => {
@@ -1088,6 +1298,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
 
         assert_eq!(
@@ -1137,6 +1348,7 @@ mod tests {
                 repair_state: &repair_state,
                 artifact_excerpts: &ArtifactExcerpts::new(),
                 missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::RepairArtifact {
                 target_hint: Some(target_hint),
@@ -1200,6 +1412,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         match action {
             ArtifactRecoveryAction::Continue { missing, .. } => {
@@ -1234,6 +1447,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         assert!(
             matches!(action, ArtifactRecoveryAction::Continue { .. }),
@@ -1272,6 +1486,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         // With coverage satisfied + tests required, the planner falls
         // through to verifier execution.
@@ -1303,6 +1518,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
@@ -1335,6 +1551,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         match action {
             ArtifactRecoveryAction::Continue { missing, .. } => {
@@ -1369,6 +1586,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         assert_eq!(action, ArtifactRecoveryAction::Done);
     }
@@ -1416,10 +1634,190 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
         });
         assert!(
             matches!(action, ArtifactRecoveryAction::Continue { .. }),
             "expected Continue (token boundary), got {action:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651: SafeStop / SafeStopReason variant smoke tests.
+    // The variants are not yet produced by `evaluate()` (Phase 4.1).
+    // These tests pin the label / conversion contract so the variants
+    // cannot be silently dropped before then.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn missing_labels_for_safe_stop_weak_returns_verifier_weak() {
+        let decision = CompletionDecision::SafeStop {
+            reason: SafeStopReason::VerifierWeak,
+        };
+        assert_eq!(missing_labels(&decision), vec!["verifier_weak"]);
+    }
+
+    #[test]
+    fn missing_labels_for_safe_stop_missing_returns_verifier_missing() {
+        let decision = CompletionDecision::SafeStop {
+            reason: SafeStopReason::VerifierMissing,
+        };
+        assert_eq!(missing_labels(&decision), vec!["verifier_missing"]);
+    }
+
+    #[test]
+    fn safe_stop_decision_converts_to_safe_stop_recovery_action() {
+        let action = ArtifactRecoveryAction::from(CompletionDecision::SafeStop {
+            reason: SafeStopReason::VerifierWeak,
+        });
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::SafeStop {
+                reason: SafeStopReason::VerifierWeak,
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 Phase 4.1: evaluate_with_owned_test_artifacts gate.
+    //
+    // These tests pin the SafeStop transition condition:
+    //
+    //   test_execution_required && owned_test_artifacts.is_empty()
+    //
+    // The bare `evaluate(...)` entry must stay legacy-equivalent so the
+    // existing regression tests above keep their pre-#651 semantics
+    // (back-compat guard — see `EvaluateMode::Legacy`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn evaluate_with_owned_artifacts_emits_safe_stop_when_required_and_empty() {
+        // Request literally asks for tests → test_execution_required=true.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test());
+        // Empty owned_test_artifacts slice → SafeStop(VerifierMissing).
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierMissing,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_returns_done_when_required_and_bound() {
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        // PR-001: structured / bound verifier evidence — this is what
+        // `AutoTestRunner::run_structured` produces.
+        evidence.push(build_test_bound(1));
+        // Owned test artifact present + bound evidence → Done.
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 PR-001 (High): unbound `VerifierExitZero` evidence must
+    // not satisfy `Done` for a `test_execution_required` request — even
+    // when the owned test artifact slice is non-empty. This is the
+    // exact attack the Codex PR review identified: model writes
+    // `tests/test_x.py`, runs a manual `cargo test` whose exit-zero
+    // outcome was promoted to `VerifierExitZero { command: "cargo test",
+    // bound_test_artifacts_count: None, .. }`, and the legacy gate
+    // returned `Done` because the owned list was non-empty.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn evaluate_required_test_with_unbound_verifier_exit_zero_does_not_done() {
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        // Unbound verifier evidence (legacy manual Bash `cargo test`).
+        // `bound_test_artifacts_count: None` is the regression marker.
+        evidence.push(build_test());
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierMissing,
+            },
+            "unbound verifier evidence must not satisfy Done"
+        );
+    }
+
+    #[test]
+    fn evaluate_required_test_with_structured_verifier_exit_zero_done() {
+        // Regression complement of the PR-001 test above: with bound
+        // (structured) evidence, the same inputs MUST return Done.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test_bound(1));
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    #[test]
+    fn evaluate_required_test_with_mixed_evidence_accepts_bound() {
+        // PR-001: when BOTH an unbound (manual cargo test) and a bound
+        // (run_structured) verifier evidence are observed in the same
+        // turn, the bound one is enough to satisfy Done. The gate is
+        // "at least one bound BuildTest", not "all BuildTest evidence
+        // must be bound".
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test()); // unbound
+        evidence.push(build_test_bound(2)); // bound
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_keeps_done_when_not_required() {
+        // Setup-only request → test_execution_required=false. The
+        // SafeStop gate must NOT fire even with an empty owned slice.
+        let contract = TaskContract::from_request("依存をインストールしてください");
+        assert!(!contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Setup));
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    #[test]
+    fn evaluate_back_compat_entry_bypasses_safe_stop_gate() {
+        // Regression guard: the bare `evaluate(...)` entry MUST NOT
+        // produce SafeStop even when test_execution_required is true
+        // and there is no ownership view. Existing planner tests rely
+        // on this — they hand `plan_artifact_recovery` an empty
+        // `owned_test_artifacts` slice via `ArtifactRecoveryInputs`,
+        // and the underlying call resolves to Done / Verify / Continue
+        // (NOT SafeStop) so the regression-guard suite stays green.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test());
+        assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
     }
 }

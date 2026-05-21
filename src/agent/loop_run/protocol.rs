@@ -994,6 +994,7 @@ mod tests {
         CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::BuildTest,
             command: "cargo test".to_string(),
+            bound_test_artifacts_count: None,
         }
     }
 
@@ -1179,6 +1180,7 @@ mod tests {
         CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::EnvSetup,
             command: "npm install".to_string(),
+            bound_test_artifacts_count: None,
         }
     }
 
