@@ -29,6 +29,39 @@ use crate::tools::registry::{ToolContext, ToolRegistry};
 // *not* re-exported (DR3-001) — `turn.rs` and `task_contract.rs` are the
 // only in-crate consumers via `super::artifact_ownership::*`.
 mod artifact_ownership;
+// Issue #659: `ArtifactLedger` SSOT for current-turn artifact observations.
+// Module is intentionally *not* re-exported (DR3-001) — `turn.rs` is the
+// only in-crate consumer (Phase 2) via `super::artifact_ledger::*`.
+mod artifact_ledger;
+// Issue #659 Phase 2: in-crate `#[cfg(test)]` E2E tests for the Agent-level
+// ArtifactLedger wiring (per-turn reset, seed call sites, dual-source
+// divergence emit). Production binary does not include this module
+// (DR3-001 / CB-001 fix pattern shared with `safe_stop_e2e_tests`).
+#[cfg(test)]
+mod artifact_ledger_phase2_tests;
+// Issue #659 Phase 3: in-crate `#[cfg(test)]` tests for the
+// legacy-helper internal-implementation switch
+// (`task_contract_artifact_states` / `owned_test_artifacts_for_verifier`
+// / `turn_edited_relative_paths` view). Production binary does not include
+// this module (DR3-001 / CB-001 fix pattern shared with `safe_stop_e2e_tests`).
+#[cfg(test)]
+mod artifact_ledger_phase3_tests;
+// Issue #659 Phase 4: in-crate `#[cfg(test)]` tests for the production-
+// aligned test seam `seed_artifact_ledger_repo_edit_for_test` that
+// replaces the legacy `seed_turn_edited_relative_path_for_test` (Issue
+// #654 / CB-005). Production binary does not include this module
+// (DR3-001 / CB-001 fix pattern shared with `safe_stop_e2e_tests`).
+#[cfg(test)]
+mod artifact_ledger_phase4_tests;
+// Issue #659 Phase 5: in-crate `#[cfg(test)]` tests pinning the design-
+// policy Section 9 acceptance checklist items not already covered by
+// Phase 1-4 (nested test path Owned classification, ArtifactState
+// signature, pub(super) public-API surface, mask_payload_inplace
+// final-defence, event_recorded each-time emit, projection signature
+// anchor). Production binary does not include this module (DR3-001 /
+// CB-001 fix pattern shared with `safe_stop_e2e_tests`).
+#[cfg(test)]
+mod artifact_ledger_phase5_tests;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -352,16 +385,49 @@ pub(crate) fn clear_safe_stop_report_dedup_for_test(agent: &mut Agent) {
     agent.safe_stop_report_emitted.clear();
 }
 
-/// Issue #654 (CB-005) test seam: seed `turn_edited_relative_paths` with a
-/// caller-supplied workspace-relative path so the in-crate safe-stop e2e
-/// suite can simulate "agent edited this test file during the turn" without
-/// driving the entire actor loop. Used by `safe_stop_e2e_tests` to confirm
-/// that the `verifier_missing` / `verifier_weak` paths populate
-/// `owned_test_artifacts` from real Owned-validated edits, and that
-/// CandidateOnly / OutOfScope inputs are excluded.
+/// Issue #659 (Phase 4 / Task 4.1) test seam: simulate "agent successfully
+/// edited this workspace-relative path during the current turn" by routing
+/// through the **production** RepoEdit write-through adapter
+/// (`Agent::seed_artifact_ledger_repo_edit`). Replaces the legacy Issue
+/// #654 / CB-005 `seed_turn_edited_relative_paths_for_test` seam.
+///
+/// The seam:
+/// 1. Infers the artifact role from the path via the production
+///    `classify_repo_edit_path` → `role_from_repo_edit` chain. Paths that
+///    classify into `RepoEditCategory::Other` (no role) only update the
+///    legacy `turn_edited_relative_paths` HashSet — they do **not**
+///    produce a ledger event, matching the production gate in
+///    `observe_evidence_from_repo_edit`.
+/// 2. Records the event into both the legacy set and the ArtifactLedger
+///    SSOT in the same instruction (write-through divergence anchor).
+/// 3. Goes through the `ArtifactLedger::record_repo_edit_event` admission
+///    pipeline (`classify_ownership` workspace-relative / `..` / control-
+///    char / symlink-escape / ignored-top-dir guards + role re-confirmation).
+///
+/// **Signature contract (DR3-001 / private_interfaces)**: only `&mut Agent`
+/// and `String` cross the `pub(crate)` boundary. `ArtifactRole` /
+/// `ArtifactOrigin` / `LedgerAdmissionContext` etc. remain `pub(super)` to
+/// the `loop_run` module and are NOT exposed by this signature.
 #[cfg(test)]
-pub(crate) fn seed_turn_edited_relative_path_for_test(agent: &mut Agent, path: String) {
-    agent.turn_edited_relative_paths.insert(path);
+pub(crate) fn seed_artifact_ledger_repo_edit_for_test(agent: &mut Agent, path: String) {
+    // Legacy set update — kept in lockstep with the ledger seed for the
+    // Phase 4 adapter contract. Performed unconditionally so callers that
+    // want to assert "non-test paths still pass through the legacy filter"
+    // (safe_stop_e2e_tests::from_missing_verifier_excludes_*) see the
+    // same set membership the old seam produced.
+    agent.turn_edited_relative_paths.insert(path.clone());
+
+    // Role inference via the production classifier chain. Paths that map
+    // to `RepoEditCategory::Other` (no artifact role) do not get a ledger
+    // event — same gate as `observe_evidence_from_repo_edit` (turn.rs).
+    let category =
+        crate::agent::loop_run::completion_evidence::classify_repo_edit_path(Path::new(&path));
+    let Some(role) = crate::agent::loop_run::task_contract::role_from_repo_edit(category) else {
+        return;
+    };
+
+    let scope = agent.current_workspace_scope();
+    agent.seed_artifact_ledger_repo_edit(&path, role, &scope);
 }
 
 // Issue #576: expose WorkMode second-pass confirmation adapter surface so
@@ -748,6 +814,19 @@ pub struct Agent {
     /// persistence schemas are unchanged by Issue #654.
     pub(in crate::agent::loop_run) safe_stop_report_emitted:
         std::collections::HashSet<repair_job::StopReason>,
+    /// Issue #659 (Phase 2): per-turn SSOT for artifact observations
+    /// (Existing / Scaffold / RepoEdit) + verifier observations bound by
+    /// path. Adapter-period contract: `turn_edited_relative_paths` remains
+    /// the legacy authority for caller-facing decisions (Phase 6.1); the
+    /// ledger is seeded via write-through (Task 2.5) so dual-source
+    /// divergence can be asserted at turn end (Task 2.7).
+    ///
+    /// **Per-turn cap (CLAUDE.md per-turn rule)** — reset at the head of
+    /// every `handle_user_message` alongside `turn_edited_relative_paths` /
+    /// `turn_pre_tool_file_hashes`. NOT serialized — Phase 1 invariant: the
+    /// ledger lives only on `Agent`, never on `SessionSnapshot`.
+    pub(in crate::agent::loop_run) artifact_ledger:
+        crate::agent::loop_run::artifact_ledger::ArtifactLedger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,6 +1058,7 @@ impl Agent {
             turn_pre_tool_file_hashes: std::collections::HashMap::new(),
             turn_edited_relative_paths: std::collections::HashSet::new(),
             safe_stop_report_emitted: std::collections::HashSet::new(),
+            artifact_ledger: artifact_ledger::ArtifactLedger::new(),
         }
     }
 

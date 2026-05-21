@@ -829,6 +829,31 @@ fn rfc3339_now_utc() -> String {
     crate::session::case_photon_bridge::format_rfc3339_utc(secs)
 }
 
+/// CB-004: bounded, masked-hash projection of an iterator of paths for use
+/// in panic / log messages. Each path is masked via
+/// `session::feedback::mask_secrets` and then hashed with the same stable
+/// `DefaultHasher` shape `artifact_ledger::stable_path_hash` uses, so the
+/// hash space is identical between debug-build panics and release-build
+/// observability events. Output is hard-capped at 16 entries so a flood of
+/// divergent paths cannot blow up the panic message size.
+#[cfg(debug_assertions)]
+fn masked_path_hash_bounded_list<'a, I>(paths: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    const MAX_PANIC_HASH_ENTRIES: usize = 16;
+    let mut out: Vec<String> = Vec::new();
+    for p in paths.into_iter().take(MAX_PANIC_HASH_ENTRIES) {
+        let masked = crate::session::feedback::mask_secrets(p);
+        let mut hasher = DefaultHasher::new();
+        masked.hash(&mut hasher);
+        out.push(format!("{:016x}", hasher.finish()));
+    }
+    out
+}
+
 /// AP-09 word-boundary check for the `rerun` keyword. Returns true iff
 /// `s.contains("rerun")` AND the surrounding char on each side (if any) is
 /// NOT ASCII alphanumeric. Pure / no allocation.
@@ -3760,6 +3785,11 @@ impl Agent {
         // a prior turn cannot mask the next turn's first write.
         self.turn_edited_relative_paths.clear();
         self.turn_pre_tool_file_hashes.clear();
+        // Issue #659 (Task 2.2): per-turn ArtifactLedger reset. Lives at
+        // the same per-turn boundary as `turn_edited_relative_paths` /
+        // `turn_pre_tool_file_hashes` so all artifact-observation state
+        // restarts together on a fresh user turn (CLAUDE.md per-turn rule).
+        self.clear_per_turn_ledger_state();
         self.missing_verifier_job = None;
         // Issue #654: per-turn dedup marker reset (DR1-006 / DR2-005). The
         // `agent.safe_stop.report` event is emitted at most once per
@@ -7894,6 +7924,15 @@ impl Agent {
             write_eval_record(&record);
         }
 
+        // Issue #659 (Task 2.2 / Task 2.7): end-of-turn ArtifactLedger
+        // observability. The turn_summary event fires once per termination
+        // path (both SafeStop and Done); the dual-source divergence
+        // assertion runs adjacent so the adapter-period contract
+        // (`turn_edited_relative_paths` == ledger RepoEdit projection) is
+        // pinned at the same boundary that the summary publishes.
+        self.assert_dual_source_alignment_at_turn_end();
+        self.record_turn_end_artifact_ledger_summary();
+
         log_llm_event(
             "agent.milestone.turn_completed",
             serde_json::json!({
@@ -7964,6 +8003,14 @@ impl Agent {
                     // TaskWorkspaceScope before spawning, so the count
                     // here is what actually appeared in argv.
                     let bound_test_artifacts_count = command.bound_test_artifacts().len();
+                    // Issue #659 (Task 2.6): capture the bound paths
+                    // BEFORE `command` is borrowed by `run_structured` so
+                    // the verifier_observation seed can record each
+                    // structurally-bound path with the resulting outcome
+                    // (Pass/Fail). Legacy / unbound paths skip this seed
+                    // entirely so the absence-as-NotRun rule stays intact.
+                    let bound_test_artifacts_paths: Vec<String> =
+                        command.bound_test_artifacts().to_vec();
                     let result = {
                         let _sp = Spinner::start("running verifier...".to_string());
                         AutoTestRunner::run_structured(
@@ -7994,6 +8041,20 @@ impl Agent {
                             self.record_task_contract_verifier_invocation(
                                 &result.command,
                                 result.exit_code,
+                            );
+                            // Issue #659 (Task 2.6): seed the bound test
+                            // path verifier_observations once the result
+                            // is known.
+                            let last_outcome = if result.passed {
+                                super::artifact_ledger::VerifierOutcome::Pass
+                            } else {
+                                super::artifact_ledger::VerifierOutcome::Fail
+                            };
+                            let scope_for_seed = workspace_scope.clone();
+                            self.seed_artifact_ledger_verifier_observation(
+                                &bound_test_artifacts_paths,
+                                last_outcome,
+                                &scope_for_seed,
                             );
                             if result.passed {
                                 // PR-001: structured (bound) evidence —
@@ -8154,7 +8215,7 @@ impl Agent {
     /// aligned with `success.rs::success_verifier_test_binding`.
     /// Returns `(vec![], false, None)` when there is no active request.
     fn task_contract_verifier_test_binding(
-        &self,
+        &mut self,
     ) -> (
         Vec<String>,
         bool,
@@ -11641,6 +11702,238 @@ impl Agent {
                 "path": relative_path,
             }),
         );
+        // Issue #659 Task 2.5: write-through seed into the ArtifactLedger
+        // SSOT. `relative_path` has already passed the workspace-relative /
+        // scaffold-delta / no-op guards; the legacy
+        // `turn_edited_relative_paths` insert above stays as the adapter-
+        // period authority. The seed is gated by category-to-role mapping
+        // so the `Other` category (which legacy callers do not classify
+        // into a role) does not inject an ambiguous event.
+        if let Some(role) = super::task_contract::role_from_repo_edit(category) {
+            let scope = self.current_workspace_scope();
+            self.seed_artifact_ledger_repo_edit(&relative_path, role, &scope);
+        }
+    }
+
+    /// Issue #659 (Task 2.2) — per-turn reset of `artifact_ledger`. Caller
+    /// (`handle_user_message` head) invokes this alongside the existing
+    /// `turn_edited_relative_paths.clear()` / `turn_pre_tool_file_hashes.clear()`
+    /// resets. Kept as its own helper so the test seam in
+    /// `artifact_ledger_phase2_tests` can drive the reset without spinning
+    /// up the full `handle_user_message` pipeline.
+    pub(super) fn clear_per_turn_ledger_state(&mut self) {
+        self.artifact_ledger.clear();
+    }
+
+    /// Issue #659 (Task 2.2) — emit the end-of-turn
+    /// `agent.artifact_ledger.turn_summary` event exactly once. Caller
+    /// (`run_actor_loop` tail, next to `agent.milestone.turn_completed`)
+    /// invokes this on every termination path so SafeStop / Done turns
+    /// share a single observability surface. The event itself is masked by
+    /// `log_llm_event` (final-defence `mask_payload_inplace`).
+    pub(super) fn record_turn_end_artifact_ledger_summary(&self) {
+        self.artifact_ledger.emit_turn_summary();
+    }
+
+    /// Issue #659 (Task 2.3) — admit an Existing-origin event into the
+    /// ledger for a workspace-relative path that came from the
+    /// task-contract candidate iteration / workspace scan SSOT
+    /// (`existing_workspace_candidate_for_role_in_scope`). Baseline seeds
+    /// are idempotent on `(origin, role, path)` so repeated contract
+    /// evaluations during the same turn do NOT inflate the event count.
+    pub(super) fn seed_artifact_ledger_existing(
+        &mut self,
+        relative_path: &str,
+        role: super::task_contract::ArtifactRole,
+        scope: &super::task_workspace_scope::TaskWorkspaceScope,
+    ) {
+        let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
+        let _ = self
+            .artifact_ledger
+            .record_existing_event(&ctx, relative_path.to_string(), role);
+    }
+
+    /// Issue #659 (Task 2.4) — admit a Scaffold-origin event into the
+    /// ledger for a workspace-relative path that came from the
+    /// `scaffold_candidate_for_missing_role` / `scaffold_artifact_snapshots`
+    /// SSOT. `post_scaffold_delta` should be the **caller-computed**
+    /// signal (`repo_edit_has_post_scaffold_delta(...)`) so the seed is
+    /// always consistent with the production no-op gate. Baseline seeds
+    /// are idempotent on `(origin, role, path)`.
+    pub(super) fn seed_artifact_ledger_scaffold(
+        &mut self,
+        relative_path: &str,
+        role: super::task_contract::ArtifactRole,
+        post_scaffold_delta: bool,
+        scope: &super::task_workspace_scope::TaskWorkspaceScope,
+    ) {
+        let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
+        let _ = self.artifact_ledger.record_scaffold_event(
+            &ctx,
+            relative_path.to_string(),
+            role,
+            post_scaffold_delta,
+        );
+    }
+
+    /// Issue #659 (Task 2.5) — write-through adapter for a successful,
+    /// non-no-op Write/Edit observation. The legacy
+    /// `turn_edited_relative_paths` set is updated in the **same**
+    /// instruction so adapter-period divergence (Task 2.7) is detectable
+    /// at turn end. Callers MUST have already passed the no-op /
+    /// scaffold-delta guards in `observe_evidence_from_repo_edit` so the
+    /// seed never promotes a content-unchanged write to Owned.
+    pub(super) fn seed_artifact_ledger_repo_edit(
+        &mut self,
+        relative_path: &str,
+        role: super::task_contract::ArtifactRole,
+        scope: &super::task_workspace_scope::TaskWorkspaceScope,
+    ) {
+        // Write-through adapter (divergence anchor): keep the legacy set
+        // in lockstep with the ledger seed. Caller-facing decisions stay
+        // on the legacy authority during the adapter period (Phase 6.1).
+        self.turn_edited_relative_paths
+            .insert(relative_path.to_string());
+        let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
+        let _ = self.artifact_ledger.record_repo_edit_event(
+            &ctx,
+            relative_path.to_string(),
+            role,
+            true,
+        );
+    }
+
+    /// Issue #659 (Task 2.6) — record a verifier observation for each
+    /// bound test path produced by a structured `VerifierCommand`. Legacy
+    /// / unbound verifier paths (empty `bound_paths`) intentionally
+    /// produce no observation so the projection-side absence-as-`NotRun`
+    /// rule stays consistent.
+    pub(super) fn seed_artifact_ledger_verifier_observation(
+        &mut self,
+        bound_paths: &[String],
+        last_outcome: super::artifact_ledger::VerifierOutcome,
+        scope: &super::task_workspace_scope::TaskWorkspaceScope,
+    ) {
+        if bound_paths.is_empty() {
+            return;
+        }
+        let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
+        for path in bound_paths {
+            let _ = self.artifact_ledger.record_verifier_observation(
+                &ctx,
+                path,
+                super::artifact_ledger::VerifierObservation {
+                    argv_path_matched: true,
+                    last_outcome,
+                },
+            );
+        }
+    }
+
+    /// Issue #659 (Task 2.7) — dual-source divergence assertion. Adapter-
+    /// period contract (Section 6.1 of design policy): the legacy
+    /// `turn_edited_relative_paths` set remains the caller-facing
+    /// authority while the ledger applies a **stricter** admission gate
+    /// (`classify_ownership` re-validates workspace-relative / scope /
+    /// control-char / role-mismatch). Legitimate divergence is therefore
+    /// "ledger is a SUBSET of legacy": the ledger may reject a path the
+    /// legacy set kept (e.g. an LLM-supplied path with embedded control
+    /// chars that passed the legacy `workspace_relative_path_for_tool_arg`
+    /// guard but failed `classify_ownership`).
+    ///
+    /// Hard fail (panic in debug builds) is reserved for the **inverse**
+    /// case — the ledger admits a path the legacy set does NOT carry,
+    /// which would be a write-through adapter bug since the seed helper
+    /// inserts into both sources in the same instruction. In release
+    /// builds the same condition emits a masked
+    /// `agent.artifact_ledger.divergence_detected` event WITHOUT
+    /// panicking, preserving the agent loop.
+    pub(super) fn assert_dual_source_alignment_at_turn_end(&self) {
+        let (legacy, ledger) = self.collect_dual_source_repo_edit_sets();
+        let ledger_only: std::collections::BTreeSet<&String> = ledger.difference(&legacy).collect();
+        #[cfg(debug_assertions)]
+        {
+            // CB-004: the panic message must not leak raw workspace-relative
+            // paths (they may contain LLM-injected secrets). Mirror the
+            // release-shape observability schema: counts + masked path
+            // hashes only.
+            assert!(
+                ledger_only.is_empty(),
+                "DR3 dual-source divergence: ledger admitted paths absent from legacy set \
+                 (write-through adapter bug). legacy_count={legacy_count}, \
+                 ledger_count={ledger_count}, ledger_only_count={only_count}, \
+                 ledger_only_hashes={hashes:?}",
+                legacy_count = legacy.len(),
+                ledger_count = ledger.len(),
+                only_count = ledger_only.len(),
+                hashes = masked_path_hash_bounded_list(ledger_only.iter().map(|s| s.as_str())),
+            );
+            if legacy != ledger {
+                // Stricter-ledger case: legitimate gating difference. Still
+                // emit the observability event so dataset consumers can
+                // count how often the ledger rejects what legacy accepts.
+                self.emit_artifact_ledger_divergence_event(&legacy, &ledger);
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = ledger_only;
+            if legacy != ledger {
+                self.emit_artifact_ledger_divergence_event(&legacy, &ledger);
+            }
+        }
+    }
+
+    /// Issue #659 (Task 2.7) — release-shape divergence helper. Always
+    /// emits the event (no panic) when sources disagree. Exposed so the
+    /// in-crate test suite can drive the release shape regardless of the
+    /// `debug_assertions` cfg under which `cargo test` actually runs. The
+    /// production code path goes through `assert_dual_source_alignment_at_turn_end`
+    /// which compiles to a `debug_assert_eq!`-style panic in debug builds
+    /// and dispatches to this emitter in release builds.
+    #[allow(dead_code)]
+    pub(super) fn emit_artifact_ledger_divergence_if_any(&self) {
+        let (legacy, ledger) = self.collect_dual_source_repo_edit_sets();
+        if legacy != ledger {
+            self.emit_artifact_ledger_divergence_event(&legacy, &ledger);
+        }
+    }
+
+    fn collect_dual_source_repo_edit_sets(
+        &self,
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let legacy: std::collections::BTreeSet<String> =
+            self.turn_edited_relative_paths.iter().cloned().collect();
+        // Issue #659 Task 3.1: route through the ledger's SSOT projection
+        // method so the divergence helper and the Phase 3 internal-switch
+        // helpers share a single source of truth (`repo_edit_projection_set`).
+        let ledger = self.artifact_ledger.repo_edit_projection_set();
+        (legacy, ledger)
+    }
+
+    #[allow(dead_code)] // invoked from release-build `assert_dual_source_alignment_at_turn_end` and the in-crate test seam.
+    fn emit_artifact_ledger_divergence_event(
+        &self,
+        legacy: &std::collections::BTreeSet<String>,
+        ledger: &std::collections::BTreeSet<String>,
+    ) {
+        let only_legacy: Vec<String> = legacy.difference(ledger).cloned().collect();
+        let only_ledger: Vec<String> = ledger.difference(legacy).cloned().collect();
+        log_llm_event(
+            "agent.artifact_ledger.divergence_detected",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "authority": "legacy",
+                "legacy_count": legacy.len() as u32,
+                "ledger_count": ledger.len() as u32,
+                "only_legacy_count": only_legacy.len() as u32,
+                "only_ledger_count": only_ledger.len() as u32,
+            }),
+        );
     }
 
     fn repo_edit_satisfies_current_artifact_target(
@@ -11719,14 +12012,85 @@ impl Agent {
         Some(truncate_on_char_boundary(masked, cap))
     }
 
-    fn task_contract_artifact_states(
+    /// Issue #659 (Task 3.2) test seam — re-exports
+    /// `task_contract_artifact_states` to the sibling
+    /// `artifact_ledger_phase3_tests` module **without** changing the
+    /// caller-facing signature of the production helper (which stays
+    /// private `fn`). The seam is `#[cfg(test)]` only and not compiled into
+    /// the production binary.
+    #[cfg(test)]
+    pub(super) fn task_contract_artifact_states_for_test(
+        &mut self,
+        contract: &super::task_contract::TaskContract,
+    ) -> Vec<super::task_contract::ArtifactState> {
+        self.task_contract_artifact_states(contract)
+    }
+
+    /// Issue #659 (Task 3.2) test seam — re-exports the legacy
+    /// derivation so the equivalence test can read both projections
+    /// without going through the public helper (which would emit a
+    /// divergence event if the two derivations disagreed).
+    #[cfg(test)]
+    pub(super) fn task_contract_artifact_states_legacy_for_test(
+        &mut self,
+        contract: &super::task_contract::TaskContract,
+    ) -> Vec<super::task_contract::ArtifactState> {
+        self.task_contract_artifact_states_legacy(contract)
+    }
+
+    /// Issue #659 (Task 3.2) test seam — re-exports the ledger
+    /// projection helper. Mirrors `task_contract_artifact_states_legacy_for_test`.
+    #[cfg(test)]
+    pub(super) fn task_contract_artifact_states_from_ledger_for_test(
         &self,
+        contract: &super::task_contract::TaskContract,
+    ) -> Vec<super::task_contract::ArtifactState> {
+        self.task_contract_artifact_states_from_ledger(contract)
+    }
+
+    fn task_contract_artifact_states(
+        &mut self,
+        contract: &super::task_contract::TaskContract,
+    ) -> Vec<super::task_contract::ArtifactState> {
+        // Issue #659 (Task 3.2): the internal implementation is now driven by
+        // the ledger projection (`task_contract_artifact_states_from_ledger`).
+        // The legacy shape is computed in parallel so the adapter-period
+        // contract — legacy authority on divergence (Phase 6.1 of the design
+        // policy) — is preserved: when the two derivations disagree we emit
+        // `agent.artifact_ledger.divergence_detected` and return the legacy
+        // result. `ArtifactState` signature / constructor remain unchanged so
+        // every existing planner unit test (e.g.
+        // `controller_does_not_count_unchanged_scaffold_as_verifier_ready`)
+        // passes without modification.
+        let legacy_states = self.task_contract_artifact_states_legacy(contract);
+        let ledger_states = self.task_contract_artifact_states_from_ledger(contract);
+        if legacy_states != ledger_states {
+            self.emit_artifact_state_projection_divergence(&legacy_states, &ledger_states);
+        }
+        legacy_states
+    }
+
+    /// Issue #659 (Task 3.2): the pre-Phase-3 implementation of
+    /// `task_contract_artifact_states`. Kept intact (other than being renamed)
+    /// so the caller-facing decision uses the legacy authority during the
+    /// adapter period. Seed side-effects into the ledger remain here — the
+    /// ledger reads the seeded events back in
+    /// `task_contract_artifact_states_from_ledger`.
+    fn task_contract_artifact_states_legacy(
+        &mut self,
         contract: &super::task_contract::TaskContract,
     ) -> Vec<super::task_contract::ArtifactState> {
         let scope = self.current_workspace_scope();
         let mut states = Vec::new();
         for role in &contract.required_artifacts {
             if let Some(path) = self.scaffold_candidate_for_missing_role(*role) {
+                // Issue #659 (Task 2.4): seed the Scaffold-origin event
+                // alongside the existing `ArtifactState::scaffold` push so
+                // the ledger sees the same scaffold baseline. `post_scaffold_delta`
+                // is the production no-op gate, kept consistent with
+                // `observe_evidence_from_repo_edit`.
+                let post_scaffold_delta = self.repo_edit_has_post_scaffold_delta(&path);
+                self.seed_artifact_ledger_scaffold(&path, *role, post_scaffold_delta, &scope);
                 states.push(super::task_contract::ArtifactState::scaffold(*role, path));
             }
             // Issue #646: an existing workspace artifact only enters as
@@ -11749,6 +12113,12 @@ impl Agent {
                         verifier_passed_in_scope: false,
                     },
                 );
+                // Issue #659 (Task 2.3): seed the Existing-origin event
+                // regardless of the `Owned` gate above. The ledger's own
+                // admission re-runs `classify_ownership`, so role-mismatch
+                // / OutOfScope downgrades happen at admission time;
+                // baseline seed is idempotent across repeated evaluations.
+                self.seed_artifact_ledger_existing(&path, *role, &scope);
                 if matches!(
                     ownership,
                     super::artifact_ownership::ArtifactOwnership::Owned
@@ -11766,6 +12136,98 @@ impl Agent {
             }
         }
         states
+    }
+
+    /// Issue #659 (Task 3.2): build `Vec<ArtifactState>` from the
+    /// `ArtifactLedger` projection. The legacy helper above seeds Scaffold /
+    /// Existing events as a side-effect of its own iteration; this helper
+    /// reads those seeded events back, projecting:
+    /// - `Scaffold`-origin events → `ArtifactState::scaffold(role, path)`
+    /// - `Existing` or `RepoEdit` events with `Owned` ownership
+    ///   → `ArtifactState::exists(role, path)`
+    /// - `task_contract_evidence_set_this_turn` rows (RepoEdit category)
+    ///   → `ArtifactState::changed(role)` (path-less, ledger does NOT carry
+    ///   these rows because their `path: None` shape is rejected at
+    ///   admission per DR2-002 of the design policy)
+    ///
+    /// Order follows `contract.required_artifacts` iteration so the legacy
+    /// shape is matched byte-for-byte; `(role, path)` dedupe is applied to
+    /// guard against the `Existing + RepoEdit` overlap that
+    /// `seed_artifact_ledger_repo_edit` produces when an existing file is
+    /// edited this turn.
+    fn task_contract_artifact_states_from_ledger(
+        &self,
+        contract: &super::task_contract::TaskContract,
+    ) -> Vec<super::task_contract::ArtifactState> {
+        use super::artifact_ledger::ArtifactOrigin;
+        use super::artifact_ownership::ArtifactOwnership;
+        use std::collections::BTreeSet;
+
+        let mut states = Vec::new();
+        for role in &contract.required_artifacts {
+            // Scaffold rows for this role.
+            let mut scaffold_seen: BTreeSet<&str> = BTreeSet::new();
+            for ev in self.artifact_ledger.events_for_role(*role) {
+                if matches!(ev.origin, ArtifactOrigin::Scaffold)
+                    && scaffold_seen.insert(ev.path.as_str())
+                {
+                    states.push(super::task_contract::ArtifactState::scaffold(
+                        *role,
+                        ev.path.clone(),
+                    ));
+                }
+            }
+            // Exists rows for this role (Existing or RepoEdit with Owned
+            // ownership). Dedupe by path so the same workspace-relative
+            // entry doesn't appear twice when an Existing baseline + a
+            // RepoEdit observation collide.
+            let mut exists_seen: BTreeSet<&str> = BTreeSet::new();
+            for ev in self.artifact_ledger.events_for_role(*role) {
+                if matches!(ev.origin, ArtifactOrigin::Scaffold) {
+                    continue;
+                }
+                if !matches!(ev.ownership, ArtifactOwnership::Owned) {
+                    continue;
+                }
+                if exists_seen.insert(ev.path.as_str()) {
+                    states.push(super::task_contract::ArtifactState::exists(
+                        *role,
+                        ev.path.clone(),
+                    ));
+                }
+            }
+        }
+        for evidence in self.task_contract_evidence_set_this_turn.iter() {
+            if let super::completion_evidence::CompletionEvidence::RepoEdit { category, .. } =
+                evidence
+                && let Some(role) = artifact_role_from_repo_edit_category(*category)
+            {
+                states.push(super::task_contract::ArtifactState::changed(role));
+            }
+        }
+        states
+    }
+
+    /// Issue #659 (Task 3.2): masked observability emit when the legacy and
+    /// ledger-projection derivations of `task_contract_artifact_states`
+    /// disagree. `authority="legacy"` is preserved per Phase 6.1 of the
+    /// design policy. No raw paths are emitted; only role / kind counts.
+    fn emit_artifact_state_projection_divergence(
+        &self,
+        legacy: &[super::task_contract::ArtifactState],
+        ledger: &[super::task_contract::ArtifactState],
+    ) {
+        log_llm_event(
+            "agent.artifact_ledger.divergence_detected",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "authority": "legacy",
+                "projection": "task_contract_artifact_states",
+                "legacy_count": legacy.len() as u32,
+                "ledger_count": ledger.len() as u32,
+            }),
+        );
     }
 
     /// Issue #646: build the active `TaskWorkspaceScope` for the current
@@ -11787,19 +12249,66 @@ impl Agent {
     /// predicates pointing back at `turn_edited_relative_paths` /
     /// `repo_edit_has_post_scaffold_delta` so the planner-side ownership
     /// signals stay consistent across all call sites (DR1-008).
+    ///
+    /// Issue #659 (Task 3.3): internal implementation now reads the
+    /// `ArtifactLedger` projection
+    /// (`artifact_ledger::owned_test_artifacts(ArtifactRole::Test)`) in
+    /// parallel with the legacy `artifact_ownership::owned_test_artifacts`
+    /// derivation. The two should agree by construction (write-through
+    /// adapter from Task 2.5 keeps both sources in lockstep); when they
+    /// diverge the adapter-period contract (Phase 6.1) preserves legacy
+    /// authority — we emit a masked
+    /// `agent.artifact_ledger.divergence_detected` event and return the
+    /// legacy slice. The caller signature (`&mut self`,
+    /// `&TaskContract`, `Vec<String>`) is unchanged so every existing
+    /// consumer (`success.rs`, `turn.rs::run_task_contract_verifier_once`,
+    /// `task_contract_recovery_action`) remains source-compatible.
     pub(super) fn owned_test_artifacts_for_verifier(
-        &self,
+        &mut self,
         contract: &super::task_contract::TaskContract,
     ) -> Vec<String> {
         let scope = self.current_workspace_scope();
+        // task_contract_artifact_states has the side effect of seeding the
+        // ledger with Existing / Scaffold baseline events. We MUST call it
+        // before reading the ledger projection so the Phase 3 path sees the
+        // same baseline the legacy derivation sees.
         let states = self.task_contract_artifact_states(contract);
-        super::artifact_ownership::owned_test_artifacts(
+        let legacy = super::artifact_ownership::owned_test_artifacts(
             &states,
             &self.work_root,
             &scope,
             &|path| self.turn_edited_relative_paths.contains(path),
             &|path| self.repo_edit_has_post_scaffold_delta(path),
-        )
+        );
+        let ledger = self
+            .artifact_ledger
+            .owned_test_artifacts(super::task_contract::ArtifactRole::Test);
+        if legacy != ledger {
+            self.emit_owned_test_artifacts_projection_divergence(&legacy, &ledger);
+        }
+        legacy
+    }
+
+    /// Issue #659 (Task 3.3): masked observability emit when the legacy and
+    /// ledger-projection derivations of `owned_test_artifacts_for_verifier`
+    /// disagree. `authority="legacy"` is preserved per Phase 6.1 of the
+    /// design policy. No raw paths are emitted; only role / count metadata.
+    fn emit_owned_test_artifacts_projection_divergence(
+        &self,
+        legacy: &[String],
+        ledger: &[String],
+    ) {
+        log_llm_event(
+            "agent.artifact_ledger.divergence_detected",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "authority": "legacy",
+                "projection": "owned_test_artifacts_for_verifier",
+                "legacy_count": legacy.len() as u32,
+                "ledger_count": ledger.len() as u32,
+            }),
+        );
     }
 
     fn task_contract_repair_state(
@@ -11834,7 +12343,7 @@ impl Agent {
     }
 
     fn task_contract_recovery_action(
-        &self,
+        &mut self,
         contract: &super::task_contract::TaskContract,
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
