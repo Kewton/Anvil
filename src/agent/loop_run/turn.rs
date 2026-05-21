@@ -260,6 +260,37 @@ impl ValidationFailure {
     }
 }
 
+/// Issue #653 (CB-001): pure helper that derives the per-attempt ledger
+/// outcome for a single iteration of `run_verifier_repair_pass_and_apply`'s
+/// retry loop.
+///
+/// Contract:
+/// - Returns `Some(RejectedUnsafe { .. })` **only** when the current attempt
+///   detected a weakening pattern AND the repair job has an active semantic
+///   plan (legacy path with `semantic_plan = None` stays ledger-non-target,
+///   S5-004).
+/// - Returns `None` for every other attempt result (parse error / duplicate
+///   / exact match failure / apply failure / LLM request failure / unexpected
+///   tool calls / `Unavailable`), so the caller can rely on
+///   `last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(...)`
+///   as an unconditional assignment per attempt, without stale outcomes from
+///   prior attempts leaking into `VerifierRepairPassOutcome::Invalid`.
+fn build_verifier_repair_pass_ledger_outcome(
+    weakening: Option<ValidationWeakening>,
+    semantic_plan: Option<&super::repair_job::SemanticRepairPlan>,
+) -> Option<super::repair_attempt_outcome::RepairAttemptOutcome> {
+    let weakening = weakening?;
+    let plan = semantic_plan?;
+    Some(super::repair_attempt_outcome::RepairAttemptOutcome {
+        cluster: plan.failure_cluster_id.clone(),
+        role: plan.preferred_repair_role,
+        kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
+            rejection: weakening.rejection,
+            pattern: weakening.pattern,
+        },
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VerifierRepairIntent {
     path: String,
@@ -10141,9 +10172,18 @@ impl Agent {
         let mut last_error = "repair pass did not run".to_string();
         // Issue #653 (DR2-005): 1 pass = 最大 1 outcome push。retry loop 内では
         // 最新の invalid outcome を上書きし、loop 終了時に Invalid に載せる。
+        // Issue #653 CB-001: 各 attempt 冒頭で `None` にリセットし、過去 attempt の
+        // ledger 対象 outcome (典型的には `RejectedUnsafe`) が ledger-non-target な
+        // 後続失敗 (parse error / duplicate / exact match 失敗 / apply 失敗 /
+        // LLM request 失敗 / 予期せぬ tool call) に紛れて伝播しないようにする。
+        // `VerifierRepairPassOutcome::Invalid` は **最後の attempt が ledger 対象
+        // だった場合のみ** `Some(...)` を載せる契約 (DR2-005)。
         let mut last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome> =
             None;
         for attempt in 1..=VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
+            // Issue #653 CB-001: 各 attempt 開始時にリセット。これ以降の branch で
+            // 明示的に `Some(...)` を入れた場合のみ最終 `Invalid` outcome に伝播する。
+            last_invalid_outcome = None;
             let reply = match repair_client.chat_text_control(&model, &messages) {
                 Ok(reply) => reply,
                 Err(err) => {
@@ -10205,19 +10245,13 @@ impl Agent {
                         // Issue #653 (DR1-001 / S5-003): weakening = Some(...) の
                         // 時のみ ledger 対象。active plan が無い (semantic_plan
                         // = None) legacy path は ledger 非対象 (S5-004)。
-                        if let Some(w) = weakening
-                            && let Some(plan) = context.semantic_plan.as_ref()
-                        {
-                            last_invalid_outcome =
-                                Some(super::repair_attempt_outcome::RepairAttemptOutcome {
-                                    cluster: plan.failure_cluster_id.clone(),
-                                    role: plan.preferred_repair_role,
-                                    kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
-                                        rejection: w.rejection,
-                                        pattern: w.pattern,
-                                    },
-                                });
-                        }
+                        // CB-001: `last_invalid_outcome` は loop top で `None`
+                        // にリセット済 — ここで `Some(...)` を入れた場合のみ
+                        // 最終 `Invalid` outcome に伝播する。
+                        last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(
+                            weakening,
+                            context.semantic_plan.as_ref(),
+                        );
                         last_error = message;
                     }
                     Err(ValidationFailure {
@@ -25527,6 +25561,110 @@ export default function App() {
             None,
         );
         assert!(context.repair_attempt_outcomes.is_empty());
+    }
+
+    #[test]
+    fn phase3_repair_pass_clears_stale_unsafe_outcome_between_attempts() {
+        // Issue #653 CB-001 regression: the `run_verifier_repair_pass_and_apply`
+        // retry loop must NOT propagate an earlier attempt's `RejectedUnsafe`
+        // ledger entry into `VerifierRepairPassOutcome::Invalid` when a later
+        // attempt fails for a ledger-non-target reason (parse error / duplicate
+        // / exact match failure / apply failure / LLM request failure / unexpected
+        // tool calls / `Unavailable`).
+        //
+        // The bug: `last_invalid_outcome` was only set to `Some(...)` inside
+        // the weakening branch and never reset, so attempt 1 = unsafe-weakening,
+        // attempt 2 = parse-error left attempt 1's stale `RejectedUnsafe` on
+        // the final `Invalid` outcome and falsely exhausted (cluster, role).
+        //
+        // Fix (CB-001): `last_invalid_outcome` is unconditionally derived from
+        // each attempt's `(weakening, semantic_plan)` pair via the pure helper
+        // `build_verifier_repair_pass_ledger_outcome`, AND the retry loop
+        // resets `last_invalid_outcome = None` at the top of every iteration.
+        // This test exercises the pure helper to lock the contract: only
+        // `(Some(weakening), Some(plan))` returns `Some(RejectedUnsafe)`; any
+        // other combination returns `None`.
+        use super::super::repair_attempt_outcome::{RepairAttemptOutcomeKind, RepairRejectionKind};
+        use super::super::repair_job::SemanticRepairPlan;
+        use super::super::semantic_failure::parse_semantic_failure_report;
+        use super::super::spec_authority::{SpecAuthority, WeakeningPattern};
+        use super::super::task_contract::ArtifactRole;
+        use super::{ValidationWeakening, build_verifier_repair_pass_ledger_outcome};
+
+        // Build a minimal SemanticRepairPlan (active plan, ledger eligible).
+        let json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "hypothesis text",
+            "failure_clusters": [{
+                "observed": "obs",
+                "expected": "exp",
+                "input_shape": "shape",
+                "assertion_shape": "AssertEq",
+                "involved_artifacts": ["test"],
+                "affected_cases": ["case1"],
+            }],
+        });
+        let report = parse_semantic_failure_report(&json).expect("fixture parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_id.clone(),
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+
+        // Attempt 1: weakening detected, active plan present → ledger-target.
+        let weakening_attempt_1 = Some(ValidationWeakening {
+            rejection: RepairRejectionKind::TestWeakening,
+            pattern: WeakeningPattern::AssertionDeleted,
+        });
+        let attempt_1 = build_verifier_repair_pass_ledger_outcome(weakening_attempt_1, Some(&plan));
+        let attempt_1_outcome = attempt_1.expect("attempt 1 must produce RejectedUnsafe outcome");
+        assert_eq!(attempt_1_outcome.cluster, cluster_id);
+        assert_eq!(attempt_1_outcome.role, ArtifactRole::Implementation);
+        match attempt_1_outcome.kind {
+            RepairAttemptOutcomeKind::RejectedUnsafe { rejection, pattern } => {
+                assert_eq!(rejection, RepairRejectionKind::TestWeakening);
+                assert_eq!(pattern, WeakeningPattern::AssertionDeleted);
+            }
+            other => panic!("expected RejectedUnsafe, got {other:?}"),
+        }
+
+        // Attempt 2 — every ledger-non-target failure modeled by the helper
+        // (weakening = None) MUST return None regardless of whether a plan is
+        // active. This is the property that prevents the cross-attempt leak.
+        let attempt_2_parse_error = build_verifier_repair_pass_ledger_outcome(None, Some(&plan));
+        assert!(
+            attempt_2_parse_error.is_none(),
+            "ledger-non-target attempt (e.g. parse error / duplicate / exact match \
+             failure / apply failure / LLM request failure) must NOT inherit a \
+             stale ledger outcome from a prior attempt, even when an active \
+             SemanticRepairPlan exists",
+        );
+
+        // Legacy path (no active plan): even a real weakening detection stays
+        // ledger-non-target (S5-004), so the helper returns None.
+        let legacy_weakening = build_verifier_repair_pass_ledger_outcome(
+            Some(ValidationWeakening {
+                rejection: RepairRejectionKind::ImplWeakening,
+                pattern: WeakeningPattern::EarlyReturnBypass,
+            }),
+            None,
+        );
+        assert!(
+            legacy_weakening.is_none(),
+            "legacy path (semantic_plan = None) must stay ledger-non-target even when \
+             a weakening pattern is detected",
+        );
+
+        // No weakening AND no plan: trivially None.
+        assert!(build_verifier_repair_pass_ledger_outcome(None, None).is_none());
     }
 
     #[test]
