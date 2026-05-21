@@ -5349,7 +5349,12 @@ impl Agent {
             // `safe_stop_report_emitted`. The helper itself is the only emit
             // site; raw verifier commands / raw paths are redacted by the
             // pure `build_active_job_selected_payload` builder (DR4-001/002).
-            self.emit_active_job_selected_if_changed();
+            //
+            // Codex CB-002: pass the actor-loop `iter_count` as the
+            // payload's `iteration_seq` so the field name and the value
+            // semantics agree (previously the per-turn index was passed,
+            // which collapsed all same-turn re-emits to a single value).
+            self.emit_active_job_selected_if_changed(iter_count as u32);
 
             // Boundary 1: before requesting the next assistant reply. Lets us
             // bail out between iterations without starting a fresh LLM call.
@@ -9722,6 +9727,19 @@ impl Agent {
             }
         }
 
+        // Issue #660 (Codex CB-001 / §4 design table): `PlanModeGate` is also
+        // a pre-arbitration gate, not a selectable arbitration kind. The
+        // Plan-file Write/Edit exception is the authority of
+        // `src/tools/registry.rs::resolve_plan_mode_write_target` /
+        // `enforce_plan_stage_scope`; the arbiter must not pre-empt that
+        // decision with stale `task_contract_verifier_repair_pending` or
+        // other selectable state. Returning `unrestricted()` keeps the
+        // tool-spec surface and recovery-target gating out of the arbiter
+        // while the registry-layer PAM gate enforces actual write target.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return EffectiveToolPolicy::unrestricted();
+        }
+
         // Issue #660 (Phase E): arbiter is the **sole authority** for write
         // owner selection. The legacy if-elif chain, the
         // `#[cfg(debug_assertions)]` dual-source assertion, and the
@@ -9901,14 +9919,21 @@ impl Agent {
     /// Raw verifier commands / raw paths / raw recovery reasons are NEVER
     /// included; emit goes through `log_llm_event` so
     /// `mask_payload_inplace` is the final defense line.
-    pub(super) fn emit_active_job_selected_if_changed(&mut self) -> bool {
+    ///
+    /// **`iteration_seq` semantics** (Codex CB-002): the caller passes the
+    /// actor-loop iteration counter (`run_actor_loop`'s `iter_count`) so
+    /// that the payload `iteration_seq` field name and value semantics
+    /// agree. Two re-emits within the same turn carry distinct
+    /// `iteration_seq` values, which lets #666 consumers identify the
+    /// iteration at which a selection change occurred.
+    pub(super) fn emit_active_job_selected_if_changed(&mut self, iteration_seq: u32) -> bool {
         let selection = self.current_active_job_selection();
         if self.last_active_job_selection.as_ref() == Some(&selection) {
             return false;
         }
         let payload = build_active_job_selected_payload(
             &selection,
-            self.current_turn_index as u32,
+            iteration_seq,
             self.repair_job_artifact_attempts as u32,
             self.artifact_completion_job
                 .as_ref()
@@ -9926,7 +9951,22 @@ impl Agent {
     /// emit, no state mutation. Recomputed on demand so callers
     /// (`emit_active_job_selected_if_changed`) can observe the selection
     /// independently of `effective_tool_policy()`.
+    ///
+    /// Issue #660 (Codex CB-001 / §4): mirrors the `effective_tool_policy`
+    /// pre-arbitration gate for `ExecutionMode::Plan`. The PAM gate at
+    /// `src/tools/registry.rs::resolve_plan_mode_write_target` /
+    /// `enforce_plan_stage_scope` is the authority for plan-file Write/Edit
+    /// arbitration; the arbiter does not see any candidate while Plan mode
+    /// is active, so observers (e.g. `emit_active_job_selected_if_changed`,
+    /// the `selected_skips_*` generic-retry guards in Phase D) see a
+    /// `None` selection that accurately reflects the design.
     fn current_active_job_selection(&self) -> super::active_job_arbiter::ActiveJobSelection {
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return super::active_job_arbiter::ActiveJobSelection {
+                selected: None,
+                rejected: Vec::new(),
+            };
+        }
         let candidates = self.build_arbiter_candidates();
         super::active_job_arbiter::select_active_job(&candidates)
     }
@@ -16227,7 +16267,7 @@ mod tests {
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         assert!(agent.last_active_job_selection.is_none());
-        let emitted = agent.emit_active_job_selected_if_changed();
+        let emitted = agent.emit_active_job_selected_if_changed(0);
         assert!(
             emitted,
             "first call after turn reset must emit (None -> Some transition)"
@@ -16248,8 +16288,8 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        let first = agent.emit_active_job_selected_if_changed();
-        let second = agent.emit_active_job_selected_if_changed();
+        let first = agent.emit_active_job_selected_if_changed(0);
+        let second = agent.emit_active_job_selected_if_changed(1);
         assert!(first, "first emit must succeed");
         assert!(
             !second,
@@ -16268,13 +16308,13 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        let first = agent.emit_active_job_selected_if_changed();
+        let first = agent.emit_active_job_selected_if_changed(0);
         assert!(first);
 
         // Install verifier-repair pending so the next selection differs
         // from the previous None-winner selection.
         agent.task_contract_verifier_repair_pending = true;
-        let second = agent.emit_active_job_selected_if_changed();
+        let second = agent.emit_active_job_selected_if_changed(1);
         assert!(
             second,
             "selection change (None -> VerifierRepair) MUST re-emit"
@@ -16291,13 +16331,13 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        agent.emit_active_job_selected_if_changed();
+        agent.emit_active_job_selected_if_changed(0);
         assert!(agent.last_active_job_selection.is_some());
 
         // Simulate per-turn reset (same lines as handle_user_message head).
         agent.last_active_job_selection = None;
 
-        let after_reset = agent.emit_active_job_selected_if_changed();
+        let after_reset = agent.emit_active_job_selected_if_changed(0);
         assert!(
             after_reset,
             "post-turn-reset call must emit again (None -> Some transition)"
@@ -17217,13 +17257,15 @@ mod tests {
 
     #[test]
     fn issue660_phase_d_plan_mode_pre_arbitration_gate_skips_arbiter() {
-        // Stage 3 DR3-005 / §9-4: when `mode == Plan`, `effective_tool_policy`
-        // never enters the arbiter (the AnswerOnlyMode early-return at the
-        // head of the function only fires in answer-only work modes, but
-        // Plan mode is also a pre-arbitration gate via `should_materialize_
-        // plan_after_*` and the PAM `enforce_mode` / `resolve_plan_mode_
-        // write_target` registry path). Confirm the arbiter does NOT
-        // surface a selected active job while Plan mode is active.
+        // §4 / Codex CB-001: `PlanModeGate` is a pre-arbitration gate
+        // (priority n/a in the §4 design table), not a selectable
+        // arbitration kind. `effective_tool_policy()` and
+        // `current_active_job_selection()` short-circuit at the Plan-mode
+        // check before constructing any `JobCandidate`. The plan-file
+        // Write/Edit exception is the authority of
+        // `src/tools/registry.rs::resolve_plan_mode_write_target` /
+        // `enforce_plan_stage_scope`; the arbiter must NOT pre-empt that
+        // decision with stale `task_contract_verifier_repair_pending`.
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
         use crate::modes::plan_act::ExecutionMode;
@@ -17231,30 +17273,108 @@ mod tests {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         agent.session.mode_state.mode = ExecutionMode::Plan;
 
-        // Even if `task_contract_verifier_repair_pending` is set (a
-        // hypothetical regression where Plan mode leaks verifier-repair
-        // state from a previous Act turn), the registry-side PAM gate is
-        // responsible for write-target arbitration, not the arbiter.
+        // Even with `task_contract_verifier_repair_pending` set (the worst-
+        // case Plan-mode leak from a previous Act turn), the arbiter MUST
+        // return an empty selection — the registry-layer PAM gate is the
+        // sole authority for write-target arbitration in Plan mode.
         agent.task_contract_verifier_repair_pending = true;
         let selection = agent.current_active_job_selection();
-        // The arbiter still sees the candidate (we did not gate the
-        // selectable candidate construction itself on Plan mode — that is
-        // the PAM gate's job at the registry layer), but the candidate
-        // arrives with its own derived policy. The Plan-mode pre-
-        // arbitration gate at the registry (`enforce_mode` /
-        // `resolve_plan_mode_write_target`) is the authority that
-        // ultimately denies Write/Edit outside the plan file. So the test
-        // here is: the arbiter does NOT short-circuit on `mode == Plan`,
-        // which means the PAM gate is the SSOT for Plan-mode write owner
-        // arbitration — exactly what DR3-005 requires.
-        //
-        // We assert by selecting a candidate (VerifierRepair) and noting
-        // that the *Plan mode registry tests* (in `src/tools/registry.rs`)
-        // remain the regression guard for write-target enforcement.
         assert!(
-            selection.selected.is_some(),
-            "the arbiter does not short-circuit on Plan mode; PAM gate is \
-             the registry-layer authority (DR3-005)"
+            selection.selected.is_none(),
+            "Plan mode pre-arbitration gate MUST short-circuit \
+             current_active_job_selection() to None (Codex CB-001 / §4)"
+        );
+        assert!(
+            selection.rejected.is_empty(),
+            "Plan mode pre-arbitration gate MUST yield an empty rejected[] \
+             list (no candidates ever constructed)"
+        );
+
+        // And `effective_tool_policy()` returns unrestricted policy so the
+        // tool-spec surface and recovery-target gating stay out of the
+        // arbiter while the registry-layer PAM gate enforces the actual
+        // write target.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "Plan mode pre-arbitration gate MUST yield Unrestricted policy \
+             (Codex CB-001 / §4)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_4_plan_mode_with_verifier_repair_pending_yields_unrestricted_policy() {
+        // Codex CB-001: `ExecutionMode::Plan` is a pre-arbitration gate
+        // (§4 design table). Even if `task_contract_verifier_repair_pending`
+        // is set, `effective_tool_policy()` MUST early-return
+        // `unrestricted()` before consulting the arbiter, so the registry-
+        // layer PAM gate (`resolve_plan_mode_write_target` /
+        // `enforce_plan_stage_scope`) remains the single authority for
+        // plan-file Write/Edit arbitration. Previously the arbiter
+        // pre-empted that decision and could surface `VerifierRepair` /
+        // `ArtifactRecovery` / etc. policies while Plan mode was active.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        use crate::modes::plan_act::ExecutionMode;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.session.mode_state.mode = ExecutionMode::Plan;
+        agent.task_contract_verifier_repair_pending = true;
+
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "Plan mode + verifier_repair_pending MUST yield Unrestricted \
+             policy (registry PAM gate is the authority — Codex CB-001)"
+        );
+        // Cross-check: `current_active_job_selection()` mirrors the same
+        // gate so consumers (`emit_active_job_selected_if_changed`, generic-
+        // retry guards) observe `None`.
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_none(),
+            "Plan mode pre-arbitration gate MUST also short-circuit \
+             current_active_job_selection() (cross-check)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_4_iteration_seq_is_propagated_from_caller() {
+        // Codex CB-002: `iteration_seq` is no longer derived from
+        // `current_turn_index`; the caller passes the actor-loop
+        // `iter_count` so two same-turn re-emits carry distinct
+        // `iteration_seq` values. The pure builder is exercised directly
+        // to assert that whatever the caller supplies is reflected
+        // verbatim in the payload.
+        use super::super::active_job_arbiter::ActiveJobSelection;
+
+        let selection = ActiveJobSelection {
+            selected: None,
+            rejected: vec![],
+        };
+        let payload_at_2 = super::build_active_job_selected_payload(&selection, 2, 0, 0);
+        let payload_at_3 = super::build_active_job_selected_payload(&selection, 3, 0, 0);
+
+        assert_eq!(
+            payload_at_2.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(2),
+            "iteration_seq=2 MUST appear verbatim in the payload (CB-002)"
+        );
+        assert_eq!(
+            payload_at_3.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(3),
+            "iteration_seq=3 MUST appear verbatim in the payload (CB-002)"
+        );
+        // The rest of the payload (selected, rejected, policy_projected,
+        // budget_state) is identical for the same `selection`, isolating
+        // the iteration_seq propagation.
+        assert_eq!(payload_at_2.get("selected"), payload_at_3.get("selected"));
+        assert_eq!(payload_at_2.get("rejected"), payload_at_3.get("rejected"));
+        assert_eq!(
+            payload_at_2.get("policy_projected"),
+            payload_at_3.get("policy_projected")
         );
     }
 
