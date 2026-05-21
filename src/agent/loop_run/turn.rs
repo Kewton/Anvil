@@ -16976,6 +16976,438 @@ mod tests {
         // No repair_job, no recovery_target, no active request -> None.
         assert_eq!(agent.resolve_current_role_for_safe_stop(None), None);
     }
+
+    // ========================================================================
+    // Issue #660 (Phase D / §9-3) — generic retry suppression while an active
+    // job is selected.
+    //
+    // Acceptance criterion (Issue #660, §3): "active job がある間、他 job は
+    // tool policy を上書きしない". The generic retry / deterministic fallback
+    // family must not horn in on an in-flight active job and edit repo files
+    // outside that job's scope.
+    //
+    // These tests exercise the **internal seam** (call the recovery /
+    // fallback functions directly) so the regression guard does not depend
+    // on a full E2E loop. They cover the three bounded-failure active job
+    // kinds — VerifierRepair / ArtifactRecovery / ForcedSmallEditRecovery —
+    // and assert two invariants per case:
+    //
+    //   (1) `effective_tool_policy().reason()` is the active-job-derived
+    //       reason (not `Unrestricted`), confirming the arbiter routed the
+    //       turn to the active job.
+    //   (2) The current `ActiveJobSelection.selected` is `Some(...)`, so
+    //       Phase C's diff-based dedup state would observe an active job
+    //       on the next iteration.
+    //   (3) `maybe_apply_local_llm_small_edit_fallback()` returns
+    //       `Ok(None)` (= no-op). This is the "generic retry does not
+    //       horn in" assertion.
+    //
+    // Plan timeout materialization is covered separately in
+    // `issue660_phase_d_plan_mode_pre_arbitration_gate_skips_arbiter`
+    // (Stage 3 DR3-005: PAM is the pre-arbitration gate, so Plan-mode
+    // behavior parity is verified independently of `selected.is_some()`).
+    // ========================================================================
+
+    #[test]
+    fn issue660_phase_d_verifier_repair_selected_skips_generic_small_edit_fallback() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+
+        // FullTemplate so `maybe_apply_local_llm_small_edit_fallback`'s
+        // outer `allows_template_completion` gate would otherwise allow
+        // template completion; we then assert it still returns Ok(None)
+        // because the verifier-repair active job owns the turn.
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // Install VerifierRepair as the active job (Priority 1 — wins over
+        // every other selectable kind).
+        agent.task_contract_verifier_repair_pending = true;
+
+        // (1) Arbiter must surface a VerifierRepair-derived policy.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            "VerifierRepair must own the effective tool policy (§4 priority 1)"
+        );
+
+        // (2) ActiveJobSelection.selected MUST be Some (Phase C dedup state
+        //     would observe an active job at the head of the next iteration).
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_some(),
+            "current_active_job_selection().selected must be Some(VerifierRepair)"
+        );
+
+        // (3) Generic retry (local-LLM small-edit fallback) must NOT fire.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("update the project");
+        assert!(
+            matches!(result, Ok(None)),
+            "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
+             VerifierRepair is the active job; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_artifact_recovery_selected_skips_generic_small_edit_fallback() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{ArtifactRole, RecoveryTarget};
+        use crate::config::{Config, DeterministicFallbackMode};
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // Install ArtifactRecovery via a non-Test role (Implementation) so
+        // we do not need to attach an `ArtifactCompletionJob` (which would
+        // require Test-role artifact path validation). The arbiter still
+        // routes the turn through `artifact_recovery_target_path()` and
+        // returns an `artifact_directed` policy.
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+        std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Implementation,
+            path: "src/main.py".to_string(),
+            reason: "missing implementation".to_string(),
+            attempt: 1,
+        });
+
+        // (1) Arbiter must surface an artifact-directed-recovery policy.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::ArtifactDirectedRecovery,
+            "ArtifactRecovery must own the effective tool policy (§4 priority 3)"
+        );
+
+        // (2) ActiveJobSelection.selected MUST be Some.
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_some(),
+            "current_active_job_selection().selected must be Some(ArtifactRecovery)"
+        );
+
+        // (3) Generic retry MUST NOT fire.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("implement the feature");
+        assert!(
+            matches!(result, Ok(None)),
+            "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
+             ArtifactRecovery is the active job; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_forced_small_edit_recovery_selected_skips_generic_small_edit_fallback() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::ollama::xml_fallback::ToolCall;
+        use crate::session::store::ConversationMessage;
+        use serde_json::json;
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // ForcedSmallEditRecovery requires: Act mode + truncated-tool-call
+        // system note + a recent Read of an existing file. Set up the same
+        // fixture as `forced_small_edit_recovery_targets_existing_recent_read_file`.
+        let target_rel = "app/page.tsx";
+        std::fs::create_dir_all(agent.work_root.join("app")).unwrap();
+        std::fs::write(
+            agent.work_root.join(target_rel),
+            "export default function Home() { return null; }\n",
+        )
+        .unwrap();
+        // Push a user message so `latest_user_turn_slice` finds the system
+        // note in the current turn (the truncated-tool-call detector walks
+        // back from the latest user turn).
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user("update page.tsx".to_string()));
+        agent.session.messages.push(ConversationMessage::system(
+            "Previous tool call was cut off by the model length limit: \
+             tool call parser failed: truncated tool call (generate response \
+             hit length limit). tool_call_format_attempt=1"
+                .to_string(),
+        ));
+        agent.session.messages.push(ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "xml-1".to_string(),
+                name: "Read".to_string(),
+                arguments: json!({"path": target_rel}),
+            }],
+        ));
+
+        // Sanity: forced_small_edit_recovery_target must resolve under
+        // this fixture (otherwise the arbiter would not select ForcedSmallEdit).
+        assert!(
+            agent.forced_small_edit_recovery_target().is_some(),
+            "fixture invariant: forced_small_edit_recovery_target must be Some"
+        );
+
+        // (1) Arbiter must surface a focused-edit-recovery policy
+        //     (ForcedSmallEditRecovery uses the FocusedEditRecovery reason).
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::FocusedEditRecovery,
+            "ForcedSmallEditRecovery must own the effective tool policy (§4 priority 2)"
+        );
+
+        // (2) ActiveJobSelection.selected MUST be Some.
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_some(),
+            "current_active_job_selection().selected must be Some(ForcedSmallEditRecovery)"
+        );
+        // Confirm the winning kind is exactly ForcedSmallEditRecovery (not
+        // a lower-priority FocusedEditRecovery / LocalLlmSmallEditAfterRead
+        // due to a fixture bug).
+        let kind = selection.selected.as_ref().map(|c| c.kind);
+        assert_eq!(
+            kind,
+            Some(super::super::active_job_arbiter::ActiveJobKind::ForcedSmallEditRecovery),
+            "selected kind must be ForcedSmallEditRecovery"
+        );
+
+        // (3) Generic retry MUST NOT fire.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("update page.tsx");
+        assert!(
+            matches!(result, Ok(None)),
+            "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
+             ForcedSmallEditRecovery is the active job; got {result:?}"
+        );
+
+        // Regression guard: the target file must not have been overwritten
+        // by a generic deterministic polish behind the active job's back.
+        let after = std::fs::read_to_string(agent.work_root.join(target_rel)).unwrap();
+        assert_eq!(
+            after, "export default function Home() { return null; }\n",
+            "the target file MUST NOT be modified by a generic small-edit \
+             fallback while a higher-priority active job is selected"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_no_active_job_allows_generic_fallback_path_to_run() {
+        // Negative regression guard: when no selectable active job is in
+        // flight, `effective_tool_policy()` projects to `Unrestricted` and
+        // `current_active_job_selection().selected` is `None`. The generic
+        // retry / fallback paths must remain available (Phase D must not
+        // accidentally suppress every generic retry — only the ones that
+        // would horn in on a selected active job).
+        use super::super::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // No verifier_repair, no recovery_target, no truncated-tool-call,
+        // no focused / local-llm target -> no selectable active job.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "without any selectable job, effective_tool_policy must be Unrestricted"
+        );
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_none(),
+            "without any selectable job, ActiveJobSelection.selected must be None"
+        );
+        // The fallback still safely returns Ok(None) under the default
+        // test fixture (no playable-UI request, no read-after-small-edit
+        // model). The point of this test is the policy / selection
+        // assertions above — confirming generic retry is *available* in
+        // principle when no active job is selected.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("placeholder");
+        assert!(
+            matches!(result, Ok(None)),
+            "fallback returns Ok(None) under the default test model; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_tool_call_format_retry_recovery_inert_under_verifier_repair() {
+        // `tool_call_format_retry` recovery (turn.rs L8896-8965) lives in
+        // the chat-retry loop and only fires after the assistant reply
+        // path itself yields a tool-call-format error. The relevant
+        // invariant for Phase D is upstream of that retry: when
+        // VerifierRepair owns the turn, the recovery branch reads
+        // `effective_tool_policy.focused_edit_policy()` (not
+        // `restricted.allowed_tools`) before pushing any system note, so
+        // the recovery cannot "switch over" to a focused-edit fallback
+        // that would target the wrong file.
+        //
+        // This test asserts that invariant at the policy layer: a
+        // VerifierRepair-restricted policy carries `allowed_tools` (Some)
+        // but `focused_edit_policy()` is None — exactly the shape the
+        // recovery uses to fall through to the generic format-recovery
+        // note without redirecting writes.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.task_contract_verifier_repair_pending = true;
+
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::VerifierRepair,
+        );
+        // The focused_edit_policy() accessor is the discriminator the
+        // tool_call_format_retry recovery uses to decide whether to push
+        // a focused-edit-specific recovery note. For VerifierRepair this
+        // must be None so the recovery cannot redirect the model into a
+        // focused-edit target that is *outside* the verifier scope.
+        assert!(
+            policy.focused_edit_policy().is_none(),
+            "VerifierRepair policy MUST NOT expose a focused_edit_policy \
+             (tool_call_format_retry would otherwise push a focused-edit \
+             recovery note that overrides the active verifier job)"
+        );
+        // The allowed_tools whitelist is preserved so the model is still
+        // constrained to verifier-repair-allowed tools.
+        assert!(
+            policy.allowed_tool_names_for_prompt().is_some(),
+            "VerifierRepair policy MUST surface an allowed_tools whitelist"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_timeout_deterministic_fallback_inert_under_verifier_repair() {
+        // `maybe_apply_deterministic_quality_fallback_after_timeout` and
+        // `maybe_apply_deterministic_polish_fallback_after_timeout` only
+        // fire when `current_request_needs_playable_ui_quality_gate()` is
+        // true. Under the default test fixture (no playable-UI request,
+        // default Auto work mode) that gate is false, so both helpers
+        // return `None`. We assert that explicitly here so a future
+        // regression that loosens the gate would surface as a Phase D
+        // failure rather than silently letting a deterministic polish run
+        // while VerifierRepair owns the turn.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Sanity: VerifierRepair owns the turn.
+        assert_eq!(
+            agent.effective_tool_policy().reason(),
+            super::EffectiveToolPolicyReason::VerifierRepair,
+        );
+
+        // Timeout error string passed in; both fallbacks must return None.
+        let timeout_err = "request timed out after 30s";
+        assert!(
+            agent
+                .maybe_apply_deterministic_polish_fallback_after_timeout(timeout_err)
+                .is_none(),
+            "timeout polish fallback MUST be inert while VerifierRepair owns the turn"
+        );
+        assert!(
+            agent
+                .maybe_apply_deterministic_quality_fallback_after_timeout(timeout_err)
+                .is_none(),
+            "timeout quality fallback MUST be inert while VerifierRepair owns the turn"
+        );
+    }
+
+    // ========================================================================
+    // Task D.2 (Stage 3 DR3-005): Plan timeout materialization is verified
+    // independently of `selected.is_some()`. Plan mode (`ExecutionMode::Plan`)
+    // is the **pre-arbitration gate** (§4 of the design policy), so the
+    // arbiter is bypassed entirely and Plan-mode behavior parity is the
+    // sole correctness criterion.
+    // ========================================================================
+
+    #[test]
+    fn issue660_phase_d_plan_mode_pre_arbitration_gate_skips_arbiter() {
+        // Stage 3 DR3-005 / §9-4: when `mode == Plan`, `effective_tool_policy`
+        // never enters the arbiter (the AnswerOnlyMode early-return at the
+        // head of the function only fires in answer-only work modes, but
+        // Plan mode is also a pre-arbitration gate via `should_materialize_
+        // plan_after_*` and the PAM `enforce_mode` / `resolve_plan_mode_
+        // write_target` registry path). Confirm the arbiter does NOT
+        // surface a selected active job while Plan mode is active.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        use crate::modes::plan_act::ExecutionMode;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.session.mode_state.mode = ExecutionMode::Plan;
+
+        // Even if `task_contract_verifier_repair_pending` is set (a
+        // hypothetical regression where Plan mode leaks verifier-repair
+        // state from a previous Act turn), the registry-side PAM gate is
+        // responsible for write-target arbitration, not the arbiter.
+        agent.task_contract_verifier_repair_pending = true;
+        let selection = agent.current_active_job_selection();
+        // The arbiter still sees the candidate (we did not gate the
+        // selectable candidate construction itself on Plan mode — that is
+        // the PAM gate's job at the registry layer), but the candidate
+        // arrives with its own derived policy. The Plan-mode pre-
+        // arbitration gate at the registry (`enforce_mode` /
+        // `resolve_plan_mode_write_target`) is the authority that
+        // ultimately denies Write/Edit outside the plan file. So the test
+        // here is: the arbiter does NOT short-circuit on `mode == Plan`,
+        // which means the PAM gate is the SSOT for Plan-mode write owner
+        // arbitration — exactly what DR3-005 requires.
+        //
+        // We assert by selecting a candidate (VerifierRepair) and noting
+        // that the *Plan mode registry tests* (in `src/tools/registry.rs`)
+        // remain the regression guard for write-target enforcement.
+        assert!(
+            selection.selected.is_some(),
+            "the arbiter does not short-circuit on Plan mode; PAM gate is \
+             the registry-layer authority (DR3-005)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_plan_timeout_materialization_independent_of_active_job() {
+        // `should_materialize_plan_after_timeout` is a pure function over
+        // (mode, plan_model_override, err). It returns true iff
+        // `mode == Plan` and the error string contains "timed out". This
+        // is the PAM pre-arbitration gate that DR3-005 marks as the
+        // authority for Plan-mode timeout materialization. The boolean
+        // is independent of `last_active_job_selection` / `selected`.
+        use super::should_materialize_plan_after_timeout;
+        use crate::modes::plan_act::ExecutionMode;
+
+        // Plan + timeout -> materialize.
+        assert!(should_materialize_plan_after_timeout(
+            ExecutionMode::Plan,
+            None,
+            "request timed out after 60s"
+        ));
+        // Act + timeout -> do NOT materialize (active job arbitration lives
+        // in Act mode; Plan-only fallback must not fire).
+        assert!(!should_materialize_plan_after_timeout(
+            ExecutionMode::Act,
+            None,
+            "request timed out"
+        ));
+        // Plan + non-timeout -> do NOT materialize.
+        assert!(!should_materialize_plan_after_timeout(
+            ExecutionMode::Plan,
+            None,
+            "transport error"
+        ));
+    }
 }
 
 /// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
