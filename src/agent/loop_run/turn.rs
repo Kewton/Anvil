@@ -9722,109 +9722,22 @@ impl Agent {
             }
         }
 
-        // Legacy if-elif chain (Phase A+B dual-source authority). Phase E
-        // will delete this block; until then the legacy result is the
-        // single authority and the arbiter result is checked against it.
-        let legacy_policy = self.effective_tool_policy_legacy();
-
-        // New arbiter path (Phase A+B). Construct the candidate list from
-        // the same source signals the legacy chain reads. The arbiter is a
-        // pure function over the candidates.
+        // Issue #660 (Phase E): arbiter is the **sole authority** for write
+        // owner selection. The legacy if-elif chain, the
+        // `#[cfg(debug_assertions)]` dual-source assertion, and the
+        // `agent.active_job.divergence_detected` event emit that lived here
+        // during Phase A+B-D have all been removed. `effective_tool_policy`
+        // is now a thin shell over `build_arbiter_candidates` +
+        // `select_active_job` + `project_policy`.
+        //
+        // The `agent.active_job.selected` event is emitted by
+        // `emit_active_job_selected_if_changed` from the agent loop driver
+        // (see L5352 `run_actor_loop` site) — `effective_tool_policy` stays
+        // a pure read so it can be called freely without log-emit side
+        // effects.
         let candidates = self.build_arbiter_candidates();
         let selection = super::active_job_arbiter::select_active_job(&candidates);
-        let arbiter_policy = super::active_job_arbiter::project_policy(&selection);
-
-        // Dual-source guard (#659 `assert_dual_source_alignment_at_turn_end`
-        // pattern):
-        // - `assert!` is gated by `#[cfg(debug_assertions)]` so the agent
-        //   loop never panics in release.
-        // - The divergence event is emitted in **both** debug and release
-        //   so production deployments can observe regressions.
-        // - Legacy chain compute and arbiter compute both run in release
-        //   (no `#[cfg]` gate) so dead_code warnings stay at 0.
-        // Phase E deletes the legacy chain, the assertion, and the
-        // divergence emit together.
-        #[cfg(debug_assertions)]
-        {
-            assert!(
-                legacy_policy == arbiter_policy,
-                "issue#660 dual-source divergence: legacy reason={} arbiter reason={}",
-                legacy_policy.reason().as_str(),
-                arbiter_policy.reason().as_str(),
-            );
-        }
-        if legacy_policy != arbiter_policy {
-            self.emit_active_job_divergence_event(&legacy_policy, &arbiter_policy);
-        }
-
-        // Authority during Phase A+B-D: legacy result. Phase E flips to
-        // `arbiter_policy` as the single source of truth and removes the
-        // legacy compute + divergence emit.
-        legacy_policy
-    }
-
-    /// Issue #660 (Phase A+B / Phase E will delete): the legacy if-elif
-    /// chain extracted verbatim from `effective_tool_policy()` so the new
-    /// arbiter can be cross-checked without breaking behaviour parity.
-    fn effective_tool_policy_legacy(&self) -> EffectiveToolPolicy {
-        if self.task_contract_verifier_repair_pending {
-            // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
-            // active and the safeguarded decision returns `NoRepair` (i.e.
-            // the scope check rejected the legacy out-of-scope target),
-            // expose the MissingVerifierJob's narrow tool whitelist so the
-            // model can still produce an in-scope verifier file.
-            let decision = self.verifier_repair_decision_for_policy();
-            if matches!(decision, VerifierRepairDecision::NoRepair)
-                && let Some(job) = self.missing_verifier_job.as_ref()
-            {
-                return EffectiveToolPolicy::restricted(
-                    EffectiveToolPolicyReason::VerifierRepair,
-                    job.allowed_tool_names().to_vec(),
-                );
-            }
-            return verifier_repair_policy_for_decision(decision);
-        }
-        if let Some(target) = self.forced_small_edit_recovery_target() {
-            return self.focused_edit_policy_for_target(
-                target,
-                EffectiveToolPolicyReason::FocusedEditRecovery,
-            );
-        }
-        if let Some(target) = self.artifact_recovery_target_path() {
-            let target_already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            // PRR-003 (re-review v2): when a Test-role `ArtifactCompletionJob`
-            // is active, project its `AllowedWriteActions` /
-            // `AllowedReadScope` into the policy so the job is the explicit
-            // source of truth for the allowed-tools set (least privilege).
-            // Non-Test roles (Implementation / UsageDocs / Setup) do not
-            // attach a job today and continue to use the legacy
-            // `target.is_file()`-derived constructor.
-            if let Some(job) = self.artifact_completion_job.as_ref()
-                && matches!(job.role(), super::task_contract::ArtifactRole::Test)
-            {
-                return EffectiveToolPolicy::artifact_directed_from_job(
-                    target,
-                    target_already_read,
-                    job.allowed_write_actions(),
-                    job.allowed_read_scope(),
-                );
-            }
-            return EffectiveToolPolicy::artifact_directed(target, target_already_read);
-        }
-        if let Some(target) = self.focused_edit_recovery_target() {
-            return self.focused_edit_policy_for_target(
-                target,
-                EffectiveToolPolicyReason::FocusedEditRecovery,
-            );
-        }
-        if let Some(target) = self.local_llm_small_edit_target() {
-            return self.focused_edit_policy_for_target(
-                target,
-                EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
-            );
-        }
-        EffectiveToolPolicy::unrestricted()
+        super::active_job_arbiter::project_policy(&selection)
     }
 
     /// Issue #660: build the arbiter candidate list from the same source
@@ -9968,38 +9881,6 @@ impl Agent {
         }
 
         candidates
-    }
-
-    /// Issue #660 (Phase A+B / Phase E will delete): emit
-    /// `agent.active_job.divergence_detected` when the legacy chain and
-    /// the new arbiter project to different `EffectiveToolPolicy` values.
-    /// Mirrors the #659 `emit_artifact_ledger_divergence_event` shape:
-    /// sanitized projection only (DR4-001), no raw path / raw verifier
-    /// command in the payload. Routes through `log_llm_event` so
-    /// `mask_payload_inplace` is the final defence.
-    fn emit_active_job_divergence_event(
-        &self,
-        legacy: &EffectiveToolPolicy,
-        arbiter: &EffectiveToolPolicy,
-    ) {
-        log_llm_event(
-            "agent.active_job.divergence_detected",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "authority": "legacy",
-                "legacy_reason_label": legacy.reason().as_str(),
-                "arbiter_reason_label": arbiter.reason().as_str(),
-                "legacy_allowed_tools_count": legacy
-                    .allowed_tool_names_for_prompt()
-                    .map(|t| t.len() as u32)
-                    .unwrap_or(0),
-                "arbiter_allowed_tools_count": arbiter
-                    .allowed_tool_names_for_prompt()
-                    .map(|t| t.len() as u32)
-                    .unwrap_or(0),
-            }),
-        );
     }
 
     /// Issue #660 (Phase C / DD-4): per-turn diff-based emit of

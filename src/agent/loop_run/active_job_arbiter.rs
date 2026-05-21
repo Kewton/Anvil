@@ -17,10 +17,10 @@
 //!
 //! ### Security invariants (CLAUDE.md)
 //! - **no log emit**: `select_active_job` and `project_policy` are pure
-//!   functions; structured log emission (`agent.active_job.selected` /
-//!   `agent.active_job.divergence_detected`) lives in `turn.rs` event payload
-//!   builders that route through `logging::mask_payload_inplace` and
-//!   `session::feedback::mask_secrets` / `redact_verifier_command_for_storage`.
+//!   functions; structured log emission (`agent.active_job.selected`) lives
+//!   in `turn.rs` event payload builders that route through
+//!   `logging::mask_payload_inplace` and `session::feedback::mask_secrets` /
+//!   `redact_verifier_command_for_storage`.
 //! - **no raw path / command**: arbiter does not format / `Debug` payload
 //!   strings. `DesiredAction::VerifierRepair.command` is held only for the
 //!   internal contract; the payload builder must redact via
