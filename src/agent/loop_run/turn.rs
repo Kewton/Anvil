@@ -3799,6 +3799,14 @@ impl Agent {
         // StopReason per turn; clearing here lets a new user turn re-emit
         // the same StopReason if the stop condition recurs.
         self.safe_stop_report_emitted.clear();
+        // Issue #660 (Phase C / DD-4 / DR1-007): per-turn diff-based dedup
+        // state for the `agent.active_job.selected` event. Reset adjacent to
+        // `safe_stop_report_emitted.clear()` so all per-turn dedup state
+        // restarts together at turn boundary (locality eases review when
+        // adding new per-turn caps). Forces the first selection of the new
+        // turn to emit (None → Some triggers emit), so each turn starts the
+        // observation series fresh.
+        self.last_active_job_selection = None;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -5332,6 +5340,16 @@ impl Agent {
             // Reuses the value we just computed — O(1), no second walk over
             // `messages`. No-op when the footer handle is disabled.
             self.footer.publish_tokens(approx_tokens);
+
+            // Issue #660 (Phase C / DD-4): emit `agent.active_job.selected`
+            // at the head of every iteration when the selection differs from
+            // the previous emission. Per-turn diff-based dedup state lives
+            // on `self.last_active_job_selection`, reset at
+            // `handle_user_message` entry adjacent to
+            // `safe_stop_report_emitted`. The helper itself is the only emit
+            // site; raw verifier commands / raw paths are redacted by the
+            // pure `build_active_job_selected_payload` builder (DR4-001/002).
+            self.emit_active_job_selected_if_changed();
 
             // Boundary 1: before requesting the next assistant reply. Lets us
             // bail out between iterations without starting a fresh LLM call.
@@ -9982,6 +10000,54 @@ impl Agent {
                     .unwrap_or(0),
             }),
         );
+    }
+
+    /// Issue #660 (Phase C / DD-4): per-turn diff-based emit of
+    /// `agent.active_job.selected`. Computes the current
+    /// `ActiveJobSelection`, compares it with the previous emission stored
+    /// in `self.last_active_job_selection`, and emits a single structured
+    /// log event when the selection differs. Returns `true` when the event
+    /// was emitted, `false` when dedup skipped it.
+    ///
+    /// **Per-turn rule** (DR1-007): `self.last_active_job_selection` is
+    /// reset to `None` at the head of every `handle_user_message`, so the
+    /// first call of a new turn always emits.
+    ///
+    /// **Security** (Stage 4 DR4-001/002 / §7 of the design policy): the
+    /// payload contains only short type labels, sanitized
+    /// `EffectiveToolPolicyReason::as_str()` strings, counts, and
+    /// non-cryptographic `stable_path_hash(mask_secrets(...))` correlators.
+    /// Raw verifier commands / raw paths / raw recovery reasons are NEVER
+    /// included; emit goes through `log_llm_event` so
+    /// `mask_payload_inplace` is the final defense line.
+    pub(super) fn emit_active_job_selected_if_changed(&mut self) -> bool {
+        let selection = self.current_active_job_selection();
+        if self.last_active_job_selection.as_ref() == Some(&selection) {
+            return false;
+        }
+        let payload = build_active_job_selected_payload(
+            &selection,
+            self.current_turn_index as u32,
+            self.repair_job_artifact_attempts as u32,
+            self.artifact_completion_job
+                .as_ref()
+                .map(|job| job.attempts().len() as u32)
+                .unwrap_or(0),
+        );
+        log_llm_event("agent.active_job.selected", payload);
+        self.last_active_job_selection = Some(selection);
+        true
+    }
+
+    /// Issue #660 (Phase C): compute the current `ActiveJobSelection`
+    /// using the same `build_arbiter_candidates` + `select_active_job`
+    /// pipeline as `effective_tool_policy()`. Pure on `self` — no log
+    /// emit, no state mutation. Recomputed on demand so callers
+    /// (`emit_active_job_selected_if_changed`) can observe the selection
+    /// independently of `effective_tool_policy()`.
+    fn current_active_job_selection(&self) -> super::active_job_arbiter::ActiveJobSelection {
+        let candidates = self.build_arbiter_candidates();
+        super::active_job_arbiter::select_active_job(&candidates)
     }
 
     fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
@@ -16265,6 +16331,291 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // Issue #660 (Phase C / DD-4 / DD-5) — agent.active_job.selected emit +
+    // per-turn diff-based dedup tests
+    // ========================================================================
+
+    #[test]
+    fn issue660_phase_c_first_emit_after_turn_reset_returns_true() {
+        // Per-turn rule (DR1-007): `last_active_job_selection` is `None` on
+        // turn entry, so the first call of a new turn must always emit
+        // (None → Some triggers the change-detection branch).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert!(agent.last_active_job_selection.is_none());
+        let emitted = agent.emit_active_job_selected_if_changed();
+        assert!(
+            emitted,
+            "first call after turn reset must emit (None -> Some transition)"
+        );
+        assert!(
+            agent.last_active_job_selection.is_some(),
+            "emit must update the dedup state to Some(...) so the next \
+             identical call is deduped"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_identical_selection_twice_is_deduped() {
+        // DD-4 contract: diff-based dedup. Calling
+        // `emit_active_job_selected_if_changed` twice in a row with no
+        // state change between calls must emit exactly ONCE.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let first = agent.emit_active_job_selected_if_changed();
+        let second = agent.emit_active_job_selected_if_changed();
+        assert!(first, "first emit must succeed");
+        assert!(
+            !second,
+            "second emit with identical selection MUST be deduped (DD-4)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_selection_change_triggers_re_emit() {
+        // DD-4 contract: when the selection differs from
+        // `last_active_job_selection`, emit again. We mutate Agent state
+        // between the two calls (install a verifier-repair pending flag)
+        // so the candidate list changes and the projected selection is no
+        // longer the empty/None selection.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let first = agent.emit_active_job_selected_if_changed();
+        assert!(first);
+
+        // Install verifier-repair pending so the next selection differs
+        // from the previous None-winner selection.
+        agent.task_contract_verifier_repair_pending = true;
+        let second = agent.emit_active_job_selected_if_changed();
+        assert!(
+            second,
+            "selection change (None -> VerifierRepair) MUST re-emit"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_turn_reset_re_emits_same_selection() {
+        // DR1-007: per-turn reset (`handle_user_message` head) clears
+        // `last_active_job_selection` to `None`, which means the same
+        // selection in the next turn emits again (turn boundary is the
+        // diff baseline).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.emit_active_job_selected_if_changed();
+        assert!(agent.last_active_job_selection.is_some());
+
+        // Simulate per-turn reset (same lines as handle_user_message head).
+        agent.last_active_job_selection = None;
+
+        let after_reset = agent.emit_active_job_selected_if_changed();
+        assert!(
+            after_reset,
+            "post-turn-reset call must emit again (None -> Some transition)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_payload_contains_required_top_level_keys() {
+        // DD-5 schema contract: every emission carries
+        // iteration_seq / selected / rejected / policy_projected /
+        // budget_state at the top level. The pure builder is exercised
+        // directly so the assertion does not need a log-capture seam.
+        use super::super::active_job_arbiter::{ActiveJobSelection, project_policy};
+
+        let selection = ActiveJobSelection {
+            selected: None,
+            rejected: vec![],
+        };
+        let payload = super::build_active_job_selected_payload(&selection, /*seq=*/ 7, 0, 0);
+        for key in [
+            "iteration_seq",
+            "selected",
+            "rejected",
+            "policy_projected",
+            "budget_state",
+        ] {
+            assert!(
+                payload.get(key).is_some(),
+                "payload MUST contain top-level key {key}"
+            );
+        }
+        assert_eq!(
+            payload.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(7),
+            "iteration_seq must be propagated verbatim"
+        );
+        // `selected.job_kind` is "None" when there is no winner; the
+        // projected policy reason is "unrestricted".
+        let selected = payload.get("selected").unwrap();
+        assert_eq!(
+            selected.get("job_kind").and_then(|v| v.as_str()),
+            Some("None")
+        );
+        let projected = payload.get("policy_projected").unwrap();
+        assert_eq!(
+            projected.get("reason_label").and_then(|v| v.as_str()),
+            Some(project_policy(&selection).reason().as_str())
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_payload_redacts_raw_path_and_command() {
+        // §7 of the design policy (DR4-001/002): raw verifier command MUST
+        // NOT appear in the payload — `desired_action` collapses to the
+        // static label "verifier_repair". Raw `PathBuf` targets MUST NOT
+        // appear either — `target_path_hash` is 16-hex (or null) only.
+        use super::super::active_job_arbiter::{
+            ActiveJobKind, ActiveJobSelection, Budget, DesiredAction, JobCandidate,
+        };
+        use std::path::PathBuf;
+
+        // Candidate carrying a sensitive raw command + a "secret-ish" path
+        // (so that mask_secrets would have something to mask if a
+        // regression let it through).
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read", "Edit"],
+        );
+        let candidate = JobCandidate {
+            kind: ActiveJobKind::VerifierRepair,
+            desired_action: DesiredAction::VerifierRepair {
+                command: "cargo test -- --token=AKIAIOSFODNN7EXAMPLE".to_string(),
+                target_hint: None,
+            },
+            policy,
+            budget: Budget::Unbounded,
+        };
+        let selection = ActiveJobSelection {
+            selected: Some(candidate),
+            rejected: vec![],
+        };
+        let payload = super::build_active_job_selected_payload(&selection, 0, 0, 0);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains("AKIAIOSFODNN7EXAMPLE"),
+            "raw command MUST NEVER appear in payload — found in {serialized}"
+        );
+        assert!(
+            !serialized.contains("cargo test"),
+            "raw command MUST NEVER appear in payload — found 'cargo test' in {serialized}"
+        );
+        // desired_action is the static label only.
+        assert_eq!(
+            payload
+                .get("selected")
+                .and_then(|s| s.get("desired_action"))
+                .and_then(|v| v.as_str()),
+            Some("verifier_repair")
+        );
+
+        // Now an artifact-directed candidate with a path; verify that the
+        // payload carries a `target_path_hash` (16 hex chars) and never
+        // the raw path.
+        let path = PathBuf::from("tests/leak_check_test.py");
+        let policy2 = super::EffectiveToolPolicy::artifact_directed(path.clone(), false);
+        let candidate2 = JobCandidate {
+            kind: ActiveJobKind::ArtifactRecovery,
+            desired_action: DesiredAction::ArtifactDirected {
+                target: path.clone(),
+                already_read: false,
+                write_actions:
+                    super::super::artifact_completion_job::AllowedWriteActions::target_create_only(),
+                read_scope: super::super::artifact_completion_job::AllowedReadScope::TargetOnly,
+            },
+            policy: policy2,
+            budget: Budget::Unbounded,
+        };
+        let selection2 = ActiveJobSelection {
+            selected: Some(candidate2),
+            rejected: vec![],
+        };
+        let payload2 = super::build_active_job_selected_payload(&selection2, 1, 0, 0);
+        let serialized2 = serde_json::to_string(&payload2).unwrap();
+        assert!(
+            !serialized2.contains("tests/leak_check_test.py"),
+            "raw path MUST NEVER appear in payload — found in {serialized2}"
+        );
+        let hash = payload2
+            .get("selected")
+            .and_then(|s| s.get("target_path_hash"))
+            .and_then(|v| v.as_str())
+            .expect("ArtifactDirected MUST carry target_path_hash");
+        assert_eq!(hash.len(), 16, "target_path_hash must be 16 hex chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "target_path_hash must be hex-only, got {hash}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_rejected_reasons_collapse_to_static_labels() {
+        // DR1-004: rejection_reason payload field is one of the two
+        // closed static labels — "LowerPriority" or "BudgetExhausted".
+        // No external strings (winner_kind / stop_reason) leak as raw
+        // fields because the schema reduces them to a single label.
+        use super::super::active_job_arbiter::{
+            ActiveJobKind, ActiveJobSelection, JobCandidate, RejectedJob, RejectionReason,
+        };
+        use super::super::repair_job::StopReason;
+        use std::num::NonZeroU32;
+
+        // We need at least one selected candidate so the payload's
+        // "selected" block is non-trivial; the assertion below targets
+        // the `rejected` array specifically.
+        let _ = NonZeroU32::new(3).unwrap();
+        let selection = ActiveJobSelection {
+            selected: Some(JobCandidate {
+                kind: ActiveJobKind::FocusedEditRecovery,
+                desired_action: super::super::active_job_arbiter::DesiredAction::FocusedEdit {
+                    target: std::path::PathBuf::from("src/lib.rs"),
+                    already_read: true,
+                },
+                policy: super::EffectiveToolPolicy::focused_edit(
+                    super::EffectiveToolPolicyReason::FocusedEditRecovery,
+                    vec!["Read", "Edit"],
+                    std::path::PathBuf::from("src/lib.rs"),
+                    true,
+                ),
+                budget: super::super::active_job_arbiter::Budget::Unbounded,
+            }),
+            rejected: vec![
+                RejectedJob {
+                    kind: ActiveJobKind::VerifierRepair,
+                    reason: RejectionReason::BudgetExhausted {
+                        stop_reason: StopReason::VerifierFailedSafeStop,
+                    },
+                },
+                RejectedJob {
+                    kind: ActiveJobKind::ArtifactRecovery,
+                    reason: RejectionReason::LowerPriority {
+                        winner_kind: ActiveJobKind::FocusedEditRecovery,
+                    },
+                },
+            ],
+        };
+        let payload = super::build_active_job_selected_payload(&selection, 0, 0, 0);
+        let rejected = payload
+            .get("rejected")
+            .and_then(|v| v.as_array())
+            .expect("rejected MUST be an array");
+        assert_eq!(rejected.len(), 2);
+        let labels: Vec<&str> = rejected
+            .iter()
+            .filter_map(|r| r.get("rejection_reason").and_then(|v| v.as_str()))
+            .collect();
+        assert!(labels.contains(&"BudgetExhausted"));
+        assert!(labels.contains(&"LowerPriority"));
+    }
+
     #[test]
     fn pr001_test_role_valid_hint_installs_job_and_syncs_projection() {
         use crate::agent::loop_run::commands::test_agent_with_config;
@@ -20779,6 +21130,142 @@ fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String>
         }
     }
     out
+}
+
+/// Issue #660 (Phase C / DD-5 / Stage 4 DR4-001/002) — pure builder that
+/// renders an `ActiveJobSelection` to the `agent.active_job.selected`
+/// payload. The payload schema (proposed to #666) is:
+///
+/// ```json
+/// {
+///   "iteration_seq": <u32>,
+///   "selected": {
+///     "job_kind": "<kind>|None",
+///     "desired_action": "<short type label>",
+///     "policy_reason": "<EffectiveToolPolicyReason::as_str()>",
+///     "allowed_tools_count": <u32>,
+///     "target_path_hash": "<hex16>|null"
+///   },
+///   "rejected": [{"job_kind": "<kind>", "rejection_reason": "LowerPriority|BudgetExhausted"}],
+///   "policy_projected": {"reason_label": "<...>", "allowed_tool_kinds": <u32>},
+///   "budget_state": {"repair_attempts": <u32>, "artifact_attempts": <u32>}
+/// }
+/// ```
+///
+/// **Security invariants** (§7 of design policy):
+/// - Raw verifier commands NEVER appear; `DesiredAction::VerifierRepair`
+///   collapses to the static label `"verifier_repair"` only.
+/// - Raw `PathBuf` targets NEVER appear; `target_path_hash` is the
+///   non-cryptographic correlator `stable_path_hash_for_active_job(
+///   mask_secrets(...))`.
+/// - `log_llm_event` re-applies `mask_payload_inplace` as the final
+///   defense line.
+pub(super) fn build_active_job_selected_payload(
+    selection: &super::active_job_arbiter::ActiveJobSelection,
+    iteration_seq: u32,
+    repair_attempts: u32,
+    artifact_attempts: u32,
+) -> serde_json::Value {
+    let projected_policy = super::active_job_arbiter::project_policy(selection);
+    let policy_reason_label = projected_policy.reason().as_str();
+    let allowed_tool_kinds = projected_policy
+        .allowed_tool_names_for_prompt()
+        .map(|t| t.len() as u32)
+        .unwrap_or(0);
+
+    let selected_block = match selection.selected.as_ref() {
+        Some(candidate) => {
+            let target_path_hash = candidate
+                .desired_action
+                .target_path()
+                .map(|path| {
+                    // Stage 4 DR4-001: never emit the raw path. The mask
+                    // pass catches inline credentials; the hash gives
+                    // dataset consumers a stable correlator without
+                    // leaking the literal path.
+                    let masked =
+                        crate::session::feedback::mask_secrets(&path.display().to_string());
+                    serde_json::Value::String(stable_path_hash_for_active_job(&masked))
+                })
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "job_kind": candidate.kind.as_str(),
+                "desired_action": candidate.desired_action.label(),
+                "policy_reason": candidate.policy.reason().as_str(),
+                "allowed_tools_count": candidate
+                    .policy
+                    .allowed_tool_names_for_prompt()
+                    .map(|t| t.len() as u32)
+                    .unwrap_or(0),
+                "target_path_hash": target_path_hash,
+            })
+        }
+        None => serde_json::json!({
+            "job_kind": "None",
+            "desired_action": serde_json::Value::Null,
+            "policy_reason": projected_policy.reason().as_str(),
+            "allowed_tools_count": allowed_tool_kinds,
+            "target_path_hash": serde_json::Value::Null,
+        }),
+    };
+
+    let rejected_block: Vec<serde_json::Value> = selection
+        .rejected
+        .iter()
+        .map(|rj| {
+            // DR1-004: `RejectionReason` only has `LowerPriority` and
+            // `BudgetExhausted` — both reduce to a single static label
+            // without leaking external strings.
+            let reason_label = match rj.reason {
+                super::active_job_arbiter::RejectionReason::LowerPriority { .. } => "LowerPriority",
+                super::active_job_arbiter::RejectionReason::BudgetExhausted { .. } => {
+                    "BudgetExhausted"
+                }
+            };
+            serde_json::json!({
+                "job_kind": rj.kind.as_str(),
+                "rejection_reason": reason_label,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "iteration_seq": iteration_seq,
+        "selected": selected_block,
+        "rejected": rejected_block,
+        "policy_projected": {
+            "reason_label": policy_reason_label,
+            "allowed_tool_kinds": allowed_tool_kinds,
+        },
+        "budget_state": {
+            "repair_attempts": repair_attempts,
+            "artifact_attempts": artifact_attempts,
+        },
+    })
+}
+
+/// Issue #660 (Phase C / §7 / DR2-003 / DR4-004): stable, non-cryptographic
+/// correlator for masked workspace-relative paths used by
+/// `build_active_job_selected_payload`. Algorithm matches
+/// `artifact_ledger.rs::stable_path_hash` (`DefaultHasher` → `{:016x}`).
+///
+/// **Not a secret-hiding hash.** Path secrecy is enforced upstream by
+/// `mask_secrets` (caller passes the masked form here) and by
+/// `mask_payload_inplace` at `log_llm_event` time. This helper merely
+/// gives dataset consumers a stable correlator for the same masked path
+/// across `agent.active_job.*` events without leaking the literal path.
+///
+/// The duplication with `artifact_ledger.rs::stable_path_hash` is
+/// intentional (DR2-003): widening the ledger's visibility surface just
+/// to share this helper would break the "ledger has no consumers outside
+/// turn.rs" rule. The two SSOTs MUST be kept aligned by doc-comment
+/// contract; algorithm changes must update both sites.
+fn stable_path_hash_for_active_job(masked_path: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    masked_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Issue #654 (D.1 / DR1-007 / DR4-001) — pure builder that renders a

@@ -72,7 +72,6 @@ impl ActiveJobKind {
     /// enum into a log — use this method so the wire vocabulary stays
     /// pinned and a future variant rename does not silently change
     /// downstream dataset columns.
-    #[allow(dead_code)] // consumed by Phase C event payload builder.
     pub(super) fn as_str(self) -> &'static str {
         match self {
             ActiveJobKind::VerifierRepair => "VerifierRepair",
@@ -134,13 +133,26 @@ impl DesiredAction {
     /// Short static label for structured log payloads. Never include the
     /// raw verifier command / raw path in the label — those go through the
     /// `turn.rs` payload builder's redaction pipeline.
-    #[allow(dead_code)] // consumed by Phase C event payload builder.
     pub(super) fn label(&self) -> &'static str {
         match self {
             DesiredAction::VerifierRepair { .. } => "verifier_repair",
             DesiredAction::MissingVerifierCreate => "missing_verifier_create",
             DesiredAction::FocusedEdit { .. } => "focused_edit",
             DesiredAction::ArtifactDirected { .. } => "artifact_directed",
+        }
+    }
+
+    /// Optional workspace-relative target path. `None` for action variants
+    /// with no path semantic (`VerifierRepair` / `MissingVerifierCreate`).
+    /// Consumed by the Phase C `agent.active_job.selected` payload builder
+    /// to derive `target_path_hash` via
+    /// `stable_path_hash(mask_secrets(...))`. The raw path MUST NOT be
+    /// logged — callers route through the redaction pipeline.
+    pub(super) fn target_path(&self) -> Option<&PathBuf> {
+        match self {
+            DesiredAction::VerifierRepair { .. } | DesiredAction::MissingVerifierCreate => None,
+            DesiredAction::FocusedEdit { target, .. } => Some(target),
+            DesiredAction::ArtifactDirected { target, .. } => Some(target),
         }
     }
 }
