@@ -55,6 +55,10 @@ mod quality;
 pub(crate) mod quality_confirm;
 pub(crate) mod reminder;
 mod repair_job;
+// Issue #653: `RepairAttemptOutcome` lifecycle ledger. Module is intentionally
+// *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
+// in-crate consumers via `super::repair_attempt_outcome::*`.
+mod repair_attempt_outcome;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.

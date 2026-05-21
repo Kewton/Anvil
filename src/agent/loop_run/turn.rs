@@ -138,6 +138,11 @@ enum VerifierRepairPassOutcome {
     },
     Invalid {
         error: String,
+        /// Issue #653 (S5-001 / S7-001): ledger 対象だけ `Some(...)` を載せる。
+        /// `RejectedUnsafe` (weakening) と `RejectedNoCandidate` (no safe target)
+        /// のみ `Some(...)`。parse error / exact match 失敗 / duplicate /
+        /// cheap syntax check 失敗は `None` (S7-002 / S5-003)。
+        repair_attempt_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome>,
     },
     /// Issue #639: no safe project verifier exists for the candidate path.
     /// The caller should defer to a full verifier rerun rather than treating
@@ -153,7 +158,11 @@ enum VerifierRepairPassOutcome {
 /// pipeline) from "no safe verifier exists" (which short-circuits to a full
 /// verifier rerun). `impl From<String>` lets `?` automatically convert
 /// existing `Err(String)` paths into `CheapCheckOutcome::Failed`.
-#[derive(Debug)]
+///
+/// Issue #653 (DR3-001): `Clone, PartialEq, Eq` 拡張 — `ValidationFailure` の
+/// derive 連鎖を成立させるための変更。`Hash` は付与しない (HashMap key と
+/// しては未使用)。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CheapCheckOutcome {
     Failed(String),
     Unavailable,
@@ -186,6 +195,100 @@ impl CheapCheckOutcome {
             CheapCheckOutcome::Unavailable => false,
         }
     }
+}
+
+/// Issue #653 (DR1-001 / DR3-002): weakening 検出時の構造化 metadata。
+/// `detect_test_weakening` branch は `TestWeakening`、`detect_impl_weakening`
+/// branch は `ImplWeakening` を入れる。message からの再 parse、および
+/// `preferred_repair_role` からの `RepairRejectionKind` 再導出は行わない
+/// (DR3-002 — `RepairRole = ArtifactRole` には `UsageDocs` / `Setup` も含む
+/// ため、coarse category は detector branch 側で確定する)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidationWeakening {
+    rejection: super::repair_attempt_outcome::RepairRejectionKind,
+    pattern: super::spec_authority::WeakeningPattern,
+}
+
+/// Issue #653 (DR1-001 / DR3-001): `validate_verifier_repair_intents` の
+/// 構造化 Err 型。`outcome` は既存 `CheapCheckOutcome` の文字列互換性を維持し、
+/// `weakening` は `Some(...)` の場合のみ ledger 対象 (`RejectedUnsafe`)。
+/// parse error / exact match 失敗 / duplicate / cheap syntax check 失敗は
+/// `weakening = None` (S5-003 — ledger 非対象)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidationFailure {
+    outcome: CheapCheckOutcome,
+    weakening: Option<ValidationWeakening>,
+}
+
+impl ValidationFailure {
+    fn failed(message: String) -> Self {
+        Self {
+            outcome: CheapCheckOutcome::Failed(message),
+            weakening: None,
+        }
+    }
+}
+
+impl From<String> for ValidationFailure {
+    fn from(message: String) -> Self {
+        Self::failed(message)
+    }
+}
+
+impl From<CheapCheckOutcome> for ValidationFailure {
+    fn from(outcome: CheapCheckOutcome) -> Self {
+        Self {
+            outcome,
+            weakening: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.outcome.fmt(f)
+    }
+}
+
+#[cfg(test)]
+impl ValidationFailure {
+    /// Test-only convenience to preserve the previous `err.contains("...")`
+    /// assertion style used throughout `turn.rs::tests` after the signature
+    /// of `validate_verifier_repair_intents` changed (DR3-001).
+    fn contains(&self, needle: &str) -> bool {
+        self.outcome.contains(needle)
+    }
+}
+
+/// Issue #653 (CB-001): pure helper that derives the per-attempt ledger
+/// outcome for a single iteration of `run_verifier_repair_pass_and_apply`'s
+/// retry loop.
+///
+/// Contract:
+/// - Returns `Some(RejectedUnsafe { .. })` **only** when the current attempt
+///   detected a weakening pattern AND the repair job has an active semantic
+///   plan (legacy path with `semantic_plan = None` stays ledger-non-target,
+///   S5-004).
+/// - Returns `None` for every other attempt result (parse error / duplicate
+///   / exact match failure / apply failure / LLM request failure / unexpected
+///   tool calls / `Unavailable`), so the caller can rely on
+///   `last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(...)`
+///   as an unconditional assignment per attempt, without stale outcomes from
+///   prior attempts leaking into `VerifierRepairPassOutcome::Invalid`.
+fn build_verifier_repair_pass_ledger_outcome(
+    weakening: Option<ValidationWeakening>,
+    semantic_plan: Option<&super::repair_job::SemanticRepairPlan>,
+) -> Option<super::repair_attempt_outcome::RepairAttemptOutcome> {
+    let weakening = weakening?;
+    let plan = semantic_plan?;
+    Some(super::repair_attempt_outcome::RepairAttemptOutcome {
+        cluster: plan.failure_cluster_id.clone(),
+        role: plan.preferred_repair_role,
+        kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
+            rejection: weakening.rejection,
+            pattern: weakening.pattern,
+        },
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5247,9 +5350,15 @@ impl Agent {
                             true,
                         );
                     }
-                    VerifierRepairPassOutcome::Invalid { error } => {
+                    VerifierRepairPassOutcome::Invalid {
+                        error,
+                        repair_attempt_outcome,
+                    } => {
                         verifier_repair_retries = verifier_repair_retries.saturating_add(1);
-                        self.record_controller_verifier_repair_invalid(&error);
+                        self.record_controller_verifier_repair_invalid(
+                            &error,
+                            repair_attempt_outcome,
+                        );
                         if verifier_repair_retries >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
                             exit_reason = ExitReason::VerifierFailed;
                             error_text = error;
@@ -5272,9 +5381,13 @@ impl Agent {
                         // attempt — defer to the next verifier rerun for a full
                         // re-check. We keep `verifier_repair_retries` unchanged
                         // so the natural attempt budget is preserved.
-                        self.record_controller_verifier_repair_invalid(&format!(
-                            "deferred to full verifier rerun (no safe cheap check available for {relative_path})"
-                        ));
+                        // Issue #653 (S7-002): Unavailable は ledger 対象外 — None を渡す。
+                        self.record_controller_verifier_repair_invalid(
+                            &format!(
+                                "deferred to full verifier rerun (no safe cheap check available for {relative_path})"
+                            ),
+                            None,
+                        );
                         write_stdout_rendered(
                             &format_iteration_status(
                                 last_iter,
@@ -7884,6 +7997,41 @@ impl Agent {
                     .as_ref()
                     .and_then(|context| context.semantic_plan.as_ref())
                     .map(|plan| plan.failure_cluster_id.clone());
+                // Issue #653 (S5-002 / S5-004 / DR3-004): Applied 系 lifecycle
+                // emission. `rerun_outcome` → `RepairAttemptOutcomeKind` 翻訳
+                // (`NewFailure` は `AppliedNoProgress` に畳む)。push は
+                // `apply_semantic_repair_dispatch_after_rerun` の **前** に
+                // 行う — dispatch 後では `semantic_plan` が次 cluster に
+                // 差し替わる可能性があり、旧 `(cluster, role)` を保持できなく
+                // なるため。`semantic_plan = None` の legacy path は ledger
+                // 非対象 (S5-004)。
+                {
+                    // S5-002: `SameFailureRemaining` と `NewFailure` は
+                    // どちらも progress なしとして同一 variant に畳む。
+                    let kind_opt = match repair_context.rerun_outcome {
+                        Some(super::VerifierRepairRerunOutcome::Improved) => Some(
+                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedImproved,
+                        ),
+                        Some(super::VerifierRepairRerunOutcome::SameFailureRemaining)
+                        | Some(super::VerifierRepairRerunOutcome::NewFailure) => Some(
+                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress,
+                        ),
+                        Some(super::VerifierRepairRerunOutcome::Worsened) => Some(
+                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedWorsened,
+                        ),
+                        None => None,
+                    };
+                    if let (Some(kind), Some(plan)) =
+                        (kind_opt, repair_context.semantic_plan.as_ref())
+                    {
+                        let outcome = super::repair_attempt_outcome::RepairAttemptOutcome {
+                            cluster: plan.failure_cluster_id.clone(),
+                            role: plan.preferred_repair_role,
+                            kind,
+                        };
+                        repair_context.record_repair_attempt_outcome(outcome);
+                    }
+                }
                 super::repair_job::apply_semantic_repair_dispatch_after_rerun(
                     &mut repair_context,
                     previous_cluster_id.as_ref(),
@@ -9976,8 +10124,20 @@ impl Agent {
             return VerifierRepairPassOutcome::Skipped;
         };
         let Some(target_hint) = verifier_repair_effective_target_hint(&context).cloned() else {
+            // Issue #653 (S7-002): `RejectedNoCandidate` は active
+            // `SemanticRepairPlan = Some` の場合だけ ledger に積む。
+            // semantic_plan = None の legacy path では fake cluster を作らず
+            // repair_error のみに留める (S5-004 / Phase 0 invariant cluster)。
+            let outcome = context.semantic_plan.as_ref().map(|plan| {
+                super::repair_attempt_outcome::RepairAttemptOutcome {
+                    cluster: plan.failure_cluster_id.clone(),
+                    role: plan.preferred_repair_role,
+                    kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoCandidate,
+                }
+            });
             return VerifierRepairPassOutcome::Invalid {
                 error: "verifier_repair_pass_invalid: no safe repair target".to_string(),
+                repair_attempt_outcome: outcome,
             };
         };
         let active_request = self.active_request_text().unwrap_or_default();
@@ -9991,6 +10151,7 @@ impl Agent {
             Err(err) => {
                 return VerifierRepairPassOutcome::Invalid {
                     error: format!("verifier_repair_pass_invalid: {err}"),
+                    repair_attempt_outcome: None,
                 };
             }
         };
@@ -10003,12 +10164,26 @@ impl Agent {
             Err(err) => {
                 return VerifierRepairPassOutcome::Invalid {
                     error: format!("verifier_repair_pass_invalid: client clone failed: {err}"),
+                    repair_attempt_outcome: None,
                 };
             }
         };
 
         let mut last_error = "repair pass did not run".to_string();
+        // Issue #653 (DR2-005): 1 pass = 最大 1 outcome push。retry loop 内では
+        // 最新の invalid outcome を上書きし、loop 終了時に Invalid に載せる。
+        // Issue #653 CB-001: 各 attempt 冒頭で `None` にリセットし、過去 attempt の
+        // ledger 対象 outcome (典型的には `RejectedUnsafe`) が ledger-non-target な
+        // 後続失敗 (parse error / duplicate / exact match 失敗 / apply 失敗 /
+        // LLM request 失敗 / 予期せぬ tool call) に紛れて伝播しないようにする。
+        // `VerifierRepairPassOutcome::Invalid` は **最後の attempt が ledger 対象
+        // だった場合のみ** `Some(...)` を載せる契約 (DR2-005)。
+        let mut last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome> =
+            None;
         for attempt in 1..=VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
+            // Issue #653 CB-001: 各 attempt 開始時にリセット。これ以降の branch で
+            // 明示的に `Some(...)` を入れた場合のみ最終 `Invalid` outcome に伝播する。
+            last_invalid_outcome = None;
             let reply = match repair_client.chat_text_control(&model, &messages) {
                 Ok(reply) => reply,
                 Err(err) => {
@@ -10019,12 +10194,12 @@ impl Agent {
             if !reply.tool_calls.is_empty() {
                 last_error = "repair reply contained unexpected tool calls".to_string();
             } else {
-                // Issue #639: split parse / validate so the latter can signal
-                // `CheapCheckOutcome::Unavailable` separately from a Failed
-                // string. Unavailable short-circuits the whole repair pass
-                // and defers to a full verifier rerun.
+                // Issue #639 / #653: parse + validate. Parse errors and
+                // non-weakening validation failures stay ledger-non-target
+                // (`weakening: None`), only weakening detections carry
+                // `ValidationWeakening` metadata for ledger push (S5-003).
                 let validation = parse_verifier_repair_intents_reply(&reply.content)
-                    .map_err(CheapCheckOutcome::Failed)
+                    .map_err(ValidationFailure::from)
                     .and_then(|intents| {
                         validate_verifier_repair_intents(
                             &self.work_root,
@@ -10063,10 +10238,26 @@ impl Agent {
                             };
                         }
                     }
-                    Err(CheapCheckOutcome::Failed(message)) => {
+                    Err(ValidationFailure {
+                        outcome: CheapCheckOutcome::Failed(message),
+                        weakening,
+                    }) => {
+                        // Issue #653 (DR1-001 / S5-003): weakening = Some(...) の
+                        // 時のみ ledger 対象。active plan が無い (semantic_plan
+                        // = None) legacy path は ledger 非対象 (S5-004)。
+                        // CB-001: `last_invalid_outcome` は loop top で `None`
+                        // にリセット済 — ここで `Some(...)` を入れた場合のみ
+                        // 最終 `Invalid` outcome に伝播する。
+                        last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(
+                            weakening,
+                            context.semantic_plan.as_ref(),
+                        );
                         last_error = message;
                     }
-                    Err(CheapCheckOutcome::Unavailable) => {
+                    Err(ValidationFailure {
+                        outcome: CheapCheckOutcome::Unavailable,
+                        ..
+                    }) => {
                         log_llm_event(
                             "agent.verifier_repair_pass.unavailable",
                             serde_json::json!({
@@ -10100,7 +10291,10 @@ impl Agent {
                 "error": compact_verifier_failure_text(&error, 240),
             }),
         );
-        VerifierRepairPassOutcome::Invalid { error }
+        VerifierRepairPassOutcome::Invalid {
+            error,
+            repair_attempt_outcome: last_invalid_outcome,
+        }
     }
 
     fn record_controller_verifier_repair_edit(
@@ -10133,13 +10327,22 @@ impl Agent {
         );
     }
 
-    fn record_controller_verifier_repair_invalid(&mut self, error: &str) {
+    fn record_controller_verifier_repair_invalid(
+        &mut self,
+        error: &str,
+        outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome>,
+    ) {
         // Issue #637 (CB-002): sanitize `repair_error` at the store boundary
         // so the verifier_repair_pass payload's `previous_repair_error` field
         // never carries raw secrets / Authorization headers / control chars.
         let compact = super::repair_job::sanitize_repair_job_text_with_char_cap(error, 360);
         if let Some(context) = self.repair_job.as_mut() {
             context.repair_error = Some(compact.clone());
+            // Issue #653 (S7-003): ledger mutation は helper 集約。
+            // `outcome = Some(...)` の場合のみ ledger に push される。
+            if let Some(o) = outcome {
+                context.record_repair_attempt_outcome(o);
+            }
         }
         self.session.working_memory.note_error(compact.clone());
         log_llm_event(
@@ -10147,6 +10350,8 @@ impl Agent {
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "error": compact,
+                // Phase 0 invariant (b): `repair_attempt_outcomes` は payload に
+                // 出さない (variant 名のみで mask 不要だが、出力経路を増やさない)。
             }),
         );
     }
@@ -14957,6 +15162,12 @@ fn verifier_repair_context_from_failure(
         // first rebind after a fresh diagnostic is treated as a new bind.
         assessment_bound_cluster_id: previous_context
             .and_then(|context| context.assessment_bound_cluster_id.clone()),
+        // Issue #653 (S3-001): turn 境界 carryover。`exhausted_attempts` と
+        // 同一規約 — previous_context = Some なら clone、None なら空 Vec
+        // (新規 verifier failure はクリーンスタート)。session 永続化対象外。
+        repair_attempt_outcomes: previous_context
+            .map(|context| context.repair_attempt_outcomes.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -15291,7 +15502,7 @@ fn validate_verifier_repair_intent(
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     intent: VerifierRepairIntent,
-) -> Result<ValidatedVerifierRepairEdit, CheapCheckOutcome> {
+) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
     validate_verifier_repair_intents(work_root, context, target_hint, vec![intent])
 }
 
@@ -15300,24 +15511,24 @@ fn validate_verifier_repair_intents(
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     intents: Vec<VerifierRepairIntent>,
-) -> Result<ValidatedVerifierRepairEdit, CheapCheckOutcome> {
+) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
     // Issue #639: every early-return path here represents a *Failed* cheap
     // check (validation rejection). Only `validate_verifier_repair_candidate_contents`
     // can produce `CheapCheckOutcome::Unavailable`, which propagates verbatim
     // via the trailing `?` below. The `impl From<String> for CheapCheckOutcome`
     // makes `.into()` on a `String` produce a `Failed` variant.
     if intents.is_empty() {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "repair intent list must not be empty".to_string(),
         ));
     }
     if intents.len() > VERIFIER_REPAIR_PASS_MAX_EDITS {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "repair intent list contained too many edits".to_string(),
         ));
     }
     if !verifier_repair_path_input_is_safe(&target_hint.path) {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "selected repair target path is not safe".to_string(),
         ));
     }
@@ -15325,23 +15536,23 @@ fn validate_verifier_repair_intents(
     let root = std::fs::canonicalize(work_root)
         .map_err(|err| format!("failed to canonicalize workspace: {err}"))?;
     let selected =
-        resolve_user_path(work_root, &target_hint.path).map_err(CheapCheckOutcome::Failed)?;
+        resolve_user_path(work_root, &target_hint.path).map_err(ValidationFailure::failed)?;
     let canonical = std::fs::canonicalize(&selected)
         .map_err(|err| format!("selected repair target cannot be resolved: {err}"))?;
     if canonical.strip_prefix(&root).is_err() {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "repair intent target escapes workspace".to_string(),
         ));
     }
     if !canonical.is_file() {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "repair intent target is not an existing file".to_string(),
         ));
     }
     let metadata = std::fs::metadata(&canonical)
         .map_err(|err| format!("failed to read repair target metadata: {err}"))?;
     if metadata.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "repair target file is too large".to_string(),
         ));
     }
@@ -15360,26 +15571,26 @@ fn validate_verifier_repair_intents(
     let mut used_whitespace_fallback = false;
     for intent in &intents {
         if !verifier_repair_path_input_is_safe(&intent.path) {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent path is not a safe workspace-relative path".to_string(),
             ));
         }
         let candidate =
-            resolve_user_path(work_root, &intent.path).map_err(CheapCheckOutcome::Failed)?;
+            resolve_user_path(work_root, &intent.path).map_err(ValidationFailure::failed)?;
         let candidate = std::fs::canonicalize(&candidate)
             .map_err(|err| format!("repair intent target cannot be resolved: {err}"))?;
         if candidate != canonical {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent path does not match selected repair target".to_string(),
             ));
         }
         if intent.old_string.is_empty() {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent old_string must not be empty".to_string(),
             ));
         }
         if intent.old_string == intent.new_string {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent old_string and new_string are identical".to_string(),
             ));
         }
@@ -15387,7 +15598,7 @@ fn validate_verifier_repair_intents(
             .saturating_add(intent.old_string.len())
             .saturating_add(intent.new_string.len());
         if total_edit_bytes > VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent edit is too large".to_string(),
             ));
         }
@@ -15395,19 +15606,19 @@ fn validate_verifier_repair_intents(
             || verifier_repair_contains_tool_or_markdown(&intent.new_string)
             || verifier_repair_contains_tool_or_markdown(&intent.reason)
         {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent string contained markdown or tool-call markup".to_string(),
             ));
         }
         if introduces_obvious_secret(&intent.old_string, &intent.new_string) {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent appears to introduce a secret".to_string(),
             ));
         }
         if !verifier_repair_path_allows_shell_controls(&relative_path)
             && verifier_repair_contains_suspicious_shell_payload(&intent.new_string)
         {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent contains suspicious shell-control payload".to_string(),
             ));
         }
@@ -15443,14 +15654,14 @@ fn validate_verifier_repair_intents(
     let relative_path_classified = Path::new(&relative_path);
     if is_test_file(relative_path_classified) {
         let plan = context.semantic_plan.as_ref().ok_or_else(|| {
-            CheapCheckOutcome::Failed(
+            ValidationFailure::failed(
                 "repair intent rejected: test edit requires SemanticRepairPlan \
                  (spec_authority + repair_hypothesis); none was constructed"
                     .to_string(),
             )
         })?;
         if plan.repair_hypothesis.trim().is_empty() {
-            return Err(CheapCheckOutcome::Failed(
+            return Err(ValidationFailure::failed(
                 "repair intent rejected: test edit requires a non-empty \
                  repair_hypothesis in the SemanticRepairPlan"
                     .to_string(),
@@ -15472,18 +15683,48 @@ fn validate_verifier_repair_intents(
     // any weakening detected here is rejected unconditionally, while the
     // evidence-required gate remains the independent first line of defence.
     let weakening_path = Path::new(&relative_path);
-    let weakening = if is_test_file(weakening_path) {
-        super::spec_authority::detect_test_weakening(&relative_path, &original_contents, &contents)
+    // Issue #653 (DR1-001 / DR3-002): record which detector branch produced the
+    // weakening so the call site can build a `RepairAttemptOutcome::RejectedUnsafe`
+    // with the right `RepairRejectionKind` without re-parsing message text.
+    let (weakening, rejection_kind) = if is_test_file(weakening_path) {
+        (
+            super::spec_authority::detect_test_weakening(
+                &relative_path,
+                &original_contents,
+                &contents,
+            ),
+            Some(super::repair_attempt_outcome::RepairRejectionKind::TestWeakening),
+        )
     } else if is_implementation_file(weakening_path) {
-        super::spec_authority::detect_impl_weakening(&relative_path, &original_contents, &contents)
+        (
+            super::spec_authority::detect_impl_weakening(
+                &relative_path,
+                &original_contents,
+                &contents,
+            ),
+            Some(super::repair_attempt_outcome::RepairRejectionKind::ImplWeakening),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     if !weakening.is_empty() {
-        return Err(CheapCheckOutcome::Failed(format!(
+        // Issue #653 (DR1-001): emission **文字列** は維持 (controller / log /
+        // test 既存挙動非破壊)。構造化 metadata は `ValidationFailure.weakening`
+        // から call site で取り回す。
+        let message = format!(
             "repair intent rejected: test/impl weakening detected ({:?})",
             weakening
-        )));
+        );
+        let weakening_meta = match (rejection_kind, weakening.first().copied()) {
+            (Some(rejection), Some(pattern)) => Some(ValidationWeakening { rejection, pattern }),
+            // Defensive: should never happen because weakening is non-empty and
+            // rejection_kind is Some when we entered this branch.
+            _ => None,
+        };
+        return Err(ValidationFailure {
+            outcome: CheapCheckOutcome::Failed(message),
+            weakening: weakening_meta,
+        });
     }
     validate_verifier_repair_candidate_contents(
         &relative_path,
@@ -15493,7 +15734,7 @@ fn validate_verifier_repair_intents(
 
     let fingerprint = verifier_repair_intents_fingerprint(context, &relative_path, &intents);
     if context.applied_repair_intents.contains(&fingerprint) {
-        return Err(CheapCheckOutcome::Failed(
+        return Err(ValidationFailure::failed(
             "duplicate repair edit intent for the same failure".to_string(),
         ));
     }
@@ -25242,6 +25483,201 @@ export default function App() {
 
         assert_eq!(first.failure_signature, second.failure_signature);
         assert_eq!(second.repair_attempt, 2);
+    }
+
+    #[test]
+    fn phase3_carryover_preserves_repair_attempt_outcomes_across_turn() {
+        // Issue #653 (S3-001): `verifier_repair_context_from_failure` carries
+        // `repair_attempt_outcomes` over from `previous_context` (clone), or
+        // starts with empty Vec when `previous_context = None`.
+        use crate::agent::loop_run::repair_attempt_outcome::{
+            RepairAttemptOutcome, RepairAttemptOutcomeKind, RepairRejectionKind,
+        };
+        use crate::agent::loop_run::semantic_failure::cluster_key_for_test;
+        use crate::agent::loop_run::spec_authority::WeakeningPattern;
+        use crate::agent::loop_run::task_contract::ArtifactRole;
+
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let app_path = work_root.join("app/main.py");
+        std::fs::write(&app_path, "def f(): pass\n").unwrap();
+        let output = "app/main.py:1: AssertionError";
+        let changed = vec!["app/main.py".to_string()];
+
+        // Fresh failure → empty ledger.
+        let mut first = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            1,
+            None,
+        );
+        assert!(
+            first.repair_attempt_outcomes.is_empty(),
+            "fresh RepairJob must start with empty ledger"
+        );
+
+        // Push an outcome into `first` so we can verify carryover to `second`.
+        first.record_repair_attempt_outcome(RepairAttemptOutcome::for_test(
+            cluster_key_for_test("A"),
+            ArtifactRole::Test,
+            RepairAttemptOutcomeKind::RejectedUnsafe {
+                rejection: RepairRejectionKind::TestWeakening,
+                pattern: WeakeningPattern::AssertionDeleted,
+            },
+        ));
+        assert_eq!(first.repair_attempt_outcomes.len(), 1);
+
+        // Carryover.
+        let second = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            output,
+            &changed,
+            2,
+            Some(&first),
+        );
+        assert_eq!(
+            second.repair_attempt_outcomes, first.repair_attempt_outcomes,
+            "carryover must clone the ledger"
+        );
+    }
+
+    #[test]
+    fn phase3_carryover_starts_empty_for_unrelated_failure() {
+        // Issue #653 (S3-001): `previous_context = None` → empty ledger.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "def f(): pass\n").unwrap();
+        let context = verifier_repair_context_from_failure(
+            work_root,
+            "python3 -B -m pytest",
+            "app/main.py:1: AssertionError",
+            &["app/main.py".to_string()],
+            1,
+            None,
+        );
+        assert!(context.repair_attempt_outcomes.is_empty());
+    }
+
+    #[test]
+    fn phase3_repair_pass_clears_stale_unsafe_outcome_between_attempts() {
+        // Issue #653 CB-001 regression: the `run_verifier_repair_pass_and_apply`
+        // retry loop must NOT propagate an earlier attempt's `RejectedUnsafe`
+        // ledger entry into `VerifierRepairPassOutcome::Invalid` when a later
+        // attempt fails for a ledger-non-target reason (parse error / duplicate
+        // / exact match failure / apply failure / LLM request failure / unexpected
+        // tool calls / `Unavailable`).
+        //
+        // The bug: `last_invalid_outcome` was only set to `Some(...)` inside
+        // the weakening branch and never reset, so attempt 1 = unsafe-weakening,
+        // attempt 2 = parse-error left attempt 1's stale `RejectedUnsafe` on
+        // the final `Invalid` outcome and falsely exhausted (cluster, role).
+        //
+        // Fix (CB-001): `last_invalid_outcome` is unconditionally derived from
+        // each attempt's `(weakening, semantic_plan)` pair via the pure helper
+        // `build_verifier_repair_pass_ledger_outcome`, AND the retry loop
+        // resets `last_invalid_outcome = None` at the top of every iteration.
+        // This test exercises the pure helper to lock the contract: only
+        // `(Some(weakening), Some(plan))` returns `Some(RejectedUnsafe)`; any
+        // other combination returns `None`.
+        use super::super::repair_attempt_outcome::{RepairAttemptOutcomeKind, RepairRejectionKind};
+        use super::super::repair_job::SemanticRepairPlan;
+        use super::super::semantic_failure::parse_semantic_failure_report;
+        use super::super::spec_authority::{SpecAuthority, WeakeningPattern};
+        use super::super::task_contract::ArtifactRole;
+        use super::{ValidationWeakening, build_verifier_repair_pass_ledger_outcome};
+
+        // Build a minimal SemanticRepairPlan (active plan, ledger eligible).
+        let json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "hypothesis text",
+            "failure_clusters": [{
+                "observed": "obs",
+                "expected": "exp",
+                "input_shape": "shape",
+                "assertion_shape": "AssertEq",
+                "involved_artifacts": ["test"],
+                "affected_cases": ["case1"],
+            }],
+        });
+        let report = parse_semantic_failure_report(&json).expect("fixture parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report.clone(),
+            failure_cluster_id: cluster_id.clone(),
+            semantic_cause: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: ArtifactRole::Implementation,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+
+        // Attempt 1: weakening detected, active plan present → ledger-target.
+        let weakening_attempt_1 = Some(ValidationWeakening {
+            rejection: RepairRejectionKind::TestWeakening,
+            pattern: WeakeningPattern::AssertionDeleted,
+        });
+        let attempt_1 = build_verifier_repair_pass_ledger_outcome(weakening_attempt_1, Some(&plan));
+        let attempt_1_outcome = attempt_1.expect("attempt 1 must produce RejectedUnsafe outcome");
+        assert_eq!(attempt_1_outcome.cluster, cluster_id);
+        assert_eq!(attempt_1_outcome.role, ArtifactRole::Implementation);
+        match attempt_1_outcome.kind {
+            RepairAttemptOutcomeKind::RejectedUnsafe { rejection, pattern } => {
+                assert_eq!(rejection, RepairRejectionKind::TestWeakening);
+                assert_eq!(pattern, WeakeningPattern::AssertionDeleted);
+            }
+            other => panic!("expected RejectedUnsafe, got {other:?}"),
+        }
+
+        // Attempt 2 — every ledger-non-target failure modeled by the helper
+        // (weakening = None) MUST return None regardless of whether a plan is
+        // active. This is the property that prevents the cross-attempt leak.
+        let attempt_2_parse_error = build_verifier_repair_pass_ledger_outcome(None, Some(&plan));
+        assert!(
+            attempt_2_parse_error.is_none(),
+            "ledger-non-target attempt (e.g. parse error / duplicate / exact match \
+             failure / apply failure / LLM request failure) must NOT inherit a \
+             stale ledger outcome from a prior attempt, even when an active \
+             SemanticRepairPlan exists",
+        );
+
+        // Legacy path (no active plan): even a real weakening detection stays
+        // ledger-non-target (S5-004), so the helper returns None.
+        let legacy_weakening = build_verifier_repair_pass_ledger_outcome(
+            Some(ValidationWeakening {
+                rejection: RepairRejectionKind::ImplWeakening,
+                pattern: WeakeningPattern::EarlyReturnBypass,
+            }),
+            None,
+        );
+        assert!(
+            legacy_weakening.is_none(),
+            "legacy path (semantic_plan = None) must stay ledger-non-target even when \
+             a weakening pattern is detected",
+        );
+
+        // No weakening AND no plan: trivially None.
+        assert!(build_verifier_repair_pass_ledger_outcome(None, None).is_none());
+    }
+
+    #[test]
+    fn phase3_ledger_text_does_not_contain_framework_specific_words() {
+        // Issue #653 AC (7) / S1-009: variant names + module text must not carry
+        // framework-specific vocabulary.
+        let source = include_str!("repair_attempt_outcome.rs");
+        for forbidden in &["FastAPI", "pytest", "422", "404", "pytest_collect"] {
+            assert!(
+                !source.contains(forbidden),
+                "repair_attempt_outcome.rs must not contain framework-specific token: {forbidden}",
+            );
+        }
     }
 
     #[test]

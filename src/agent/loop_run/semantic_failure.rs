@@ -162,6 +162,26 @@ impl FailureClusterKey {
     }
 }
 
+/// Issue #653 test-only helper: build a deterministic `FailureClusterKey`
+/// from an arbitrary label. Production code MUST go through
+/// `build_failure_cluster_from_observation` (which enforces the sanitize
+/// precondition). This seam exists so sibling private-mod tests can synthesize
+/// stable cluster keys without re-staging the full diagnostic pipeline.
+#[cfg(test)]
+pub(super) fn cluster_key_for_test(label: &str) -> FailureClusterKey {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        write!(&mut hex, "{byte:02x}").unwrap();
+    }
+    FailureClusterKey(hex)
+}
+
 /// Three-way contract conflict view: implementation vs. test vs. usage docs.
 /// Each field is sanitized to `MAX_CLUSTER_TEXT_CHARS` at the parse boundary.
 #[derive(Debug, Clone, PartialEq)]
