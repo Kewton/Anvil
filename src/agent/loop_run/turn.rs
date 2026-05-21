@@ -102,6 +102,12 @@ const VERIFIER_REPAIR_PASS_MAX_EDITS: usize = 16;
 const VERIFIER_REPAIR_PASS_MAX_REPLACE_ALL_MATCHES: usize = 32;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
+/// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
+/// exhaustion break-points (NoTool / ProseOnly / cross-iteration flag) in
+/// `run_actor_loop`. Defined as a single constant so the three sites
+/// stay aligned and any future copy survives review.
+const ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT: &str =
+    "artifact completion role-specific retry budget exhausted";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectiveToolPolicy {
@@ -3679,6 +3685,21 @@ impl Agent {
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
         self.tester_called_this_turn = false;
+        // Issue #652 CB-002: per-turn `ArtifactCompletionJob` exhaustion flag.
+        // Reset here so a fresh turn can re-arm the budget once the previous
+        // turn's job was either completed or exhausted.
+        self.artifact_completion_exhausted_this_turn = false;
+        // Issue #652 CB2-003: turn-local dedup flag for
+        // `maybe_emit_artifact_completion_failed_diagnostic`. The previous
+        // dedup looked at `working_memory.unresolved_errors`, which is
+        // *session* state that handle_user_message does NOT clear — so a
+        // residual `artifact_completion_failed role=<role>` from the prior
+        // turn suppressed the very first emission of the current turn.
+        // Resetting a turn-local bool here is the CLAUDE.md per-turn cap
+        // pattern; combined with `artifact_completion_exhausted_this_turn`
+        // it gives a within-turn single-emit guarantee that does NOT bleed
+        // across turn boundaries.
+        self.artifact_completion_failed_diagnostic_emitted_this_turn = false;
         // Issue #456: AnvilScore compute happens once per turn, post-loop.
         // The flag flips after the compute so the post-loop Reminder hook
         // sees `CurrentTurn` while the iteration-internal hook sees
@@ -5119,6 +5140,11 @@ impl Agent {
         // current turn never observes a previous turn's edits.
         self.task_contract_excerpts.clear();
         self.current_artifact_recovery_target = None;
+        // Issue #652: per-turn reset of the artifact completion job state
+        // (DR3-003 / per-turn cap pattern). A job is only reconstructed
+        // through `set_artifact_recovery_target_from_hint`, so dropping it
+        // here cannot leak prior-turn budget into the new turn.
+        self.artifact_completion_job = None;
         self.task_contract_verifier_repair_pending = false;
         // Issue #647 (SF1 V3.2): mirror reset for the verifier-passed
         // hint that backs `SpecAuthorityInput.has_verified_public_interface`.
@@ -5603,6 +5629,24 @@ impl Agent {
                                     role.label()
                                 ));
                             }
+                            // Issue #652: classify the reject as a
+                            // `RolePolicyViolation` against the active job
+                            // (multi-tool batch / disallowed-tool / repeat
+                            // read all funnel through `FocusedEditBatchAction
+                            // ::Reject`). If the job exhausts as a result,
+                            // the diagnostic emission decides whether to
+                            // continue or break out via `MissingRepoEdits`.
+                            if self.record_artifact_completion_attempt(
+                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::RolePolicyViolation,
+                                vec!["focused_edit_batch_reject".to_string()],
+                            ) {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = format!(
+                                    "artifact completion role-policy violation budget exhausted for role {}",
+                                    role.label()
+                                );
+                                break 'outer;
+                            }
                             continue;
                         }
                         focused_policy_retries += 1;
@@ -6076,6 +6120,20 @@ impl Agent {
                     self.session
                         .messages
                         .push(ConversationMessage::tool(tool_name.clone(), compact_result));
+
+                    // CB-002: if an artifact-directed WrongTarget rejection
+                    // just exhausted the role-specific retry budget inside
+                    // `execute_tool_call`, the actor loop must terminate
+                    // with `MissingRepoEdits` mirror to the NoTool /
+                    // ProseOnly exhaustion exits above (lines 6566 /
+                    // 6741). The flag was flipped in
+                    // `record_artifact_completion_attempt` and is reset
+                    // at `handle_user_message` head.
+                    if self.artifact_completion_exhausted_this_turn {
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
+                        break 'outer;
+                    }
 
                     if self.session.mode_state.mode == ExecutionMode::Plan
                         && is_plan_file_tool_call(
@@ -6753,6 +6811,23 @@ impl Agent {
                             repo_change_retries,
                         ));
                     }
+                    // Issue #652: record the empty-reply path as a
+                    // `NoTool` attempt against the active
+                    // `ArtifactCompletionJob`. (Prose-only is classified
+                    // separately at the executable-prose path below — when
+                    // `final_reply` is non-empty AND no tool calls were
+                    // produced.) Recording exhausts the role-specific
+                    // budget independently of the generic
+                    // `repo_change_retries` counter; on exhaustion we exit
+                    // with `MissingRepoEdits` so the actor loop terminates.
+                    if self.record_artifact_completion_attempt(
+                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
+                        Vec::new(),
+                    ) {
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
+                        break 'outer;
+                    }
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
                     let plan_contents = self
                         .current_plan_contents()
@@ -6914,6 +6989,18 @@ impl Agent {
                         self.push_system_note(recovery::repo_change_no_tool_recovery_note(
                             repo_change_retries,
                         ));
+                    }
+                    // Issue #652: prose-only branch — the assistant produced
+                    // text but no tool call. Record against the active job
+                    // (no-op when no job exists). On exhaustion exit with
+                    // `MissingRepoEdits` to terminate the loop.
+                    if self.record_artifact_completion_attempt(
+                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
+                        Vec::new(),
+                    ) {
+                        exit_reason = ExitReason::MissingRepoEdits;
+                        error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
+                        break 'outer;
                     }
                 } else if action_expectation == recovery::ActionExpectation::PlanProgress {
                     let plan_contents = self
@@ -10371,6 +10458,49 @@ impl Agent {
         true
     }
 
+    /// Issue #652: record an attempt against the active
+    /// `ArtifactCompletionJob` (no-op when no job exists). Triggers the
+    /// turn-local `artifact_completion_failed` diagnostic when the
+    /// recording causes the job to transition to `Exhausted`.
+    fn record_artifact_completion_attempt(
+        &mut self,
+        kind: super::artifact_completion_job::ArtifactAttemptOutcomeKind,
+        actual_actions: Vec<String>,
+    ) -> bool {
+        let expected_target = match self.artifact_completion_job.as_ref() {
+            Some(job) => job.target_path().to_string(),
+            None => return false,
+        };
+        let outcome = super::artifact_completion_job::ArtifactAttemptOutcome::new(
+            kind,
+            actual_actions,
+            expected_target,
+        );
+        let status_after = match self.artifact_completion_job.as_mut() {
+            Some(job) => job.record_attempt(outcome),
+            None => return false,
+        };
+        if matches!(
+            status_after,
+            super::artifact_completion_job::ArtifactCompletionStatus::Exhausted { .. }
+        ) {
+            // CB-002: tag the turn so the actor loop terminates with
+            // `MissingRepoEdits` even on call paths that previously
+            // dropped the return value (artifact-directed policy
+            // WrongTarget). Emit the diagnostic only once per
+            // exhaustion (`maybe_emit_..._diagnostic` is gated by the
+            // same flag).
+            let first_exhaustion = !self.artifact_completion_exhausted_this_turn;
+            self.artifact_completion_exhausted_this_turn = true;
+            if first_exhaustion {
+                self.maybe_emit_artifact_completion_failed_diagnostic();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn focused_edit_no_tool_note_for_target(
         &self,
         target: &Path,
@@ -10620,6 +10750,33 @@ impl Agent {
         };
         if let Some(err) = effective_policy_error {
             self.session.working_memory.note_error(err.clone());
+            // Issue #652: classify "artifact-directed recovery rejected …"
+            // policy errors as `WrongTarget` attempts against the active
+            // `ArtifactCompletionJob`. Path-string matching is intentional
+            // — the policy gate's error format is the SSOT for this class
+            // of rejection (see `artifact_directed_tool_policy_error`).
+            // No-op when the err is from a different policy gate or when
+            // no job is installed.
+            if err.contains("artifact-directed recovery rejected") {
+                let actual_path = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                // CB-002: capture the exhaustion signal so the actor
+                // loop can break with `MissingRepoEdits` instead of
+                // continuing past a budget-exhausted WrongTarget. The
+                // `artifact_completion_exhausted_this_turn` flag is the
+                // SSOT and is also flipped by NoTool / ProseOnly /
+                // RolePolicyViolation paths (those break the loop via
+                // the returned bool directly; this WrongTarget path is
+                // inside `execute_tool_call` and propagates via the
+                // flag instead).
+                let _ = self.record_artifact_completion_attempt(
+                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                    vec![format!("{name} on {actual_path}")],
+                );
+            }
             return lifecycle::format_tool_error(&err);
         }
         if cancel_flag
@@ -11252,6 +11409,12 @@ impl Agent {
             );
         }
         self.current_artifact_recovery_target = Some(target);
+        // Issue #652: when the recovery target is a Test artifact, build /
+        // refresh the SSOT `ArtifactCompletionJob` so wrong-target / no-tool
+        // / prose-only / role-policy-violation attempts can be tracked and
+        // role-specific retry budget can be enforced independently of the
+        // generic `repo_change_retries`.
+        self.maybe_install_artifact_completion_job_for_hint(&hint);
         Some(hint)
     }
 
@@ -11268,6 +11431,148 @@ impl Agent {
                 }),
             );
         }
+        // Issue #652: drop the SSOT artifact-completion job along with the
+        // projection so a subsequent role change cannot reuse stale budget.
+        self.artifact_completion_job = None;
+    }
+
+    /// Issue #652: install (or refresh) the `ArtifactCompletionJob` for a
+    /// fresh `RecoveryTargetHint` when the target role is `Test` (the only
+    /// role for which `RequiredBehaviorContract::requires_test_execution()`
+    /// currently fires). Refresh is identity-based on `(role, target_path)`
+    /// — re-pointing at the same path leaves the existing job (and its
+    /// retry budget) intact so wrong-target attempts already recorded keep
+    /// counting.
+    fn maybe_install_artifact_completion_job_for_hint(
+        &mut self,
+        hint: &super::task_contract::RecoveryTargetHint,
+    ) {
+        if hint.role != super::task_contract::ArtifactRole::Test {
+            // CB2-001: non-test roles fall back to the existing generic
+            // recovery path (design judgement #11 —
+            // `role_from_repo_edit(Other)` semantics), BUT a prior Test
+            // job's expected target is now stale relative to the new
+            // (Implementation / UsageDocs / Setup) `current_artifact_
+            // recovery_target`. Leaving the Test job in place would let
+            // subsequent NoTool / ProseOnly / RolePolicyViolation events
+            // consume the old Test budget and fire
+            // `artifact_completion_failed role=test` for a target that no
+            // longer represents the agent's recovery focus. Drop the
+            // stale job here so role-changes always start with an empty
+            // job slot for non-Test roles.
+            self.artifact_completion_job = None;
+            return;
+        }
+        let trimmed = hint.path.trim();
+        // Identity refresh: same role + same target → keep the existing
+        // job (and its retry budget) intact. Same-target hints must NOT
+        // reset the budget so accumulated wrong-target attempts keep
+        // counting toward exhaustion.
+        if let Some(job) = self.artifact_completion_job.as_ref()
+            && job.role() == hint.role
+            && job.target_path() == trimmed
+        {
+            return;
+        }
+        // CB-005: when the new hint points at a *different* target than
+        // the current job, the prior job's expected target is now
+        // stale. Drop it BEFORE attempting to validate the new hint so
+        // a validation failure cannot leave the agent with a stale job
+        // whose budget belongs to an old `current_artifact_recovery_target`.
+        // The atomic ordering is: clear → validate-and-install. If the
+        // new hint validates, we install it (atomic SWAP). If it does
+        // NOT validate, we leave the agent without an active job — the
+        // new `current_artifact_recovery_target` is still recorded by
+        // the caller, but with NO job attached, so no stale-target
+        // budget can be consumed.
+        self.artifact_completion_job = None;
+        let scope = self.current_workspace_scope();
+        match super::artifact_completion_job::ArtifactCompletionJob::new(
+            &self.work_root,
+            &scope,
+            hint.clone(),
+            self.turn_edited_relative_paths.contains(trimmed),
+            false,
+        ) {
+            Ok(job) => {
+                self.artifact_completion_job = Some(job);
+            }
+            Err(_) => {
+                // Invalid hint after clearing the prior job: leave the
+                // job slot empty so no stale budget is consumed by the
+                // new (now-disjoint) `current_artifact_recovery_target`.
+            }
+        }
+    }
+
+    /// Issue #652: emit a turn-local `artifact_completion_failed` diagnostic
+    /// when the active job has exhausted its budget. Sinks are limited to:
+    /// system note, working-memory error, and an agent-controlled failure
+    /// JSON event (design judgement #7). The payload is rendered from the
+    /// sanitized `failure_snapshot()` (mask + cap + control-char neutralize
+    /// already applied) and passed through `mask_payload_inplace` as the
+    /// defensive final-defence line.
+    fn maybe_emit_artifact_completion_failed_diagnostic(&mut self) -> bool {
+        let snapshot = match self.artifact_completion_job.as_ref() {
+            Some(job) => match job.failure_snapshot() {
+                Some(s) => s,
+                None => return false,
+            },
+            None => return false,
+        };
+        // CB-002 / CB2-003: once the current turn has already emitted the
+        // exhaustion diagnostic, subsequent identical-kind attempts (which
+        // are no-ops on `record_attempt`) must NOT re-fire the system note
+        // / log / working-memory tuple. The dedup is gated on a
+        // **turn-local** flag (`artifact_completion_failed_diagnostic_emitted_this_turn`),
+        // reset at every `handle_user_message` head.
+        //
+        // The previous implementation matched against
+        // `working_memory.unresolved_errors` for the
+        // `artifact_completion_failed role=<role>` prefix, but
+        // `working_memory` is session state — `handle_user_message` does
+        // NOT clear it. So a residual error from the prior turn would
+        // suppress the very first emission of the current turn. CB2-003
+        // moves the dedup to a per-turn boolean instead.
+        if self.artifact_completion_failed_diagnostic_emitted_this_turn {
+            return false;
+        }
+        let role_label = snapshot.current_role.label();
+        let expected_target = snapshot.expected_target.clone();
+        let actions_preview = snapshot
+            .actual_actions
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Sink 1: system note — sanitized snapshot fields only.
+        self.push_system_note(format!(
+            "[Artifact Completion Failed] Missing role: {role_label}. Expected target: {expected_target}. Recent actions: {actions_preview}. Retry budget exhausted."
+        ));
+        // Sink 2: working-memory error.
+        self.session.working_memory.note_error(format!(
+            "artifact_completion_failed role={role_label} target={expected_target}"
+        ));
+        // Sink 3: agent-controlled failure result emitted as a JSON event
+        // run through `mask_payload_inplace` as a defensive final pass.
+        let mut payload = serde_json::json!({
+            "session_id": self.session_store.session_id(),
+            "turn_index": self.current_turn_index,
+            "role": role_label,
+            "expected_target": expected_target,
+            "actual_actions": snapshot.actual_actions,
+            "attempts": snapshot.attempts.len(),
+        });
+        crate::logging::mask_payload_inplace(&mut payload);
+        log_llm_event("agent.artifact_completion_failed", payload);
+        // CB2-003: flip the turn-local dedup flag AFTER the three sinks
+        // have actually run, so a within-turn second call short-circuits
+        // at the top guard above. Cross-turn dedup is handled by the
+        // per-turn reset in `handle_user_message`, which restores this
+        // flag to `false` at every fresh user turn.
+        self.artifact_completion_failed_diagnostic_emitted_this_turn = true;
+        true
     }
 
     fn artifact_recovery_target_path(&self) -> Option<PathBuf> {
@@ -14063,6 +14368,365 @@ mod tests {
                 ExitReason::SafeStopVerifierMissing,
                 "safe_stop_verifier_missing",
             ),
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // CB-002 regression — WrongTarget exhaustion must set the per-turn
+    // `artifact_completion_exhausted_this_turn` flag and the diagnostic
+    // must not re-fire on subsequent same-kind no-op attempts.
+    // ----------------------------------------------------------------
+
+    fn install_artifact_completion_job_for_test(agent: &mut super::super::Agent, target: &str) {
+        use crate::agent::loop_run::task_contract::RecoveryTargetHint;
+        let hint = RecoveryTargetHint {
+            role: crate::agent::loop_run::task_contract::ArtifactRole::Test,
+            path: target.to_string(),
+            reason: "fixture".to_string(),
+        };
+        agent.maybe_install_artifact_completion_job_for_hint(&hint);
+    }
+
+    #[test]
+    fn wrong_target_exhaustion_sets_per_turn_flag_and_terminates_loop_signal() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        // Build a real Test target so the job validates (missing leaf
+        // under existing work_root is accepted by CB-001 logic).
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        install_artifact_completion_job_for_test(&mut agent, "tests/test_foo.py");
+        assert!(
+            agent.artifact_completion_job.is_some(),
+            "job must install for valid hint"
+        );
+
+        // Two WrongTarget attempts → still InFlight, flag not set.
+        for i in 0..2 {
+            let exhausted = agent.record_artifact_completion_attempt(
+                super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                vec![format!("Write on src/x_{i}.py")],
+            );
+            assert!(!exhausted, "iteration {i} must not exhaust yet");
+            assert!(
+                !agent.artifact_completion_exhausted_this_turn,
+                "flag must remain false before exhaustion (iter {i})"
+            );
+        }
+        // Third WrongTarget attempt → transition to Exhausted; flag flips.
+        let exhausted = agent.record_artifact_completion_attempt(
+            super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["Write on src/x_3.py".to_string()],
+        );
+        assert!(exhausted, "third attempt must exhaust the budget");
+        assert!(
+            agent.artifact_completion_exhausted_this_turn,
+            "CB-002: per-turn flag MUST be set so the actor loop terminates"
+        );
+    }
+
+    #[test]
+    fn exhaustion_diagnostic_emits_when_prior_turn_unresolved_errors_residual() {
+        // CB2-003: simulate the cross-turn case — a prior turn left a
+        // `artifact_completion_failed role=test` error in
+        // `working_memory.unresolved_errors`. `WorkingMemory` is session
+        // state and `handle_user_message` does NOT clear it, so the
+        // previous dedup (which scanned unresolved_errors) suppressed
+        // the very first emission of the current turn. With CB2-003 the
+        // dedup is turn-local: a residual error from the prior turn
+        // does NOT short-circuit the current turn's emission.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        // Plant the residual error from a "prior turn".
+        agent
+            .session
+            .working_memory
+            .note_error("artifact_completion_failed role=test target=tests/old.py".to_string());
+        // CB2-003 turn-local flag must be reset at the start of a fresh
+        // turn (the production code does this in
+        // `handle_user_message`). We mimic that here so the test
+        // exercises the dedup logic, not the reset itself.
+        agent.artifact_completion_failed_diagnostic_emitted_this_turn = false;
+
+        // Now install a fresh Test job for THIS turn and drive it to
+        // exhaustion. The diagnostic MUST fire once, even though the
+        // residual error is still present in unresolved_errors.
+        install_artifact_completion_job_for_test(&mut agent, "tests/test_foo.py");
+        for _ in 0..3 {
+            agent.record_artifact_completion_attempt(
+                super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                vec!["Write on src/x.py".to_string()],
+            );
+        }
+        let current_turn_emits: Vec<String> = agent
+            .session
+            .working_memory
+            .unresolved_errors
+            .iter()
+            .filter(|err| err.starts_with("artifact_completion_failed role=test"))
+            .cloned()
+            .collect();
+        // Expect TWO entries: the residual from the "prior turn", PLUS
+        // the current turn's fresh emission. Pre-CB2-003 we would have
+        // seen only ONE (the residual), with the current turn's
+        // emission incorrectly suppressed by the cross-turn dedup.
+        assert!(
+            current_turn_emits.len() >= 2,
+            "CB2-003: residual prior-turn unresolved_errors MUST NOT suppress the current turn's emission; got {current_turn_emits:?}"
+        );
+        assert!(
+            agent.artifact_completion_failed_diagnostic_emitted_this_turn,
+            "CB2-003: emission must flip the turn-local flag"
+        );
+    }
+
+    #[test]
+    fn exhaustion_diagnostic_does_not_double_emit_on_repeat_attempts() {
+        // CB-002: subsequent WrongTarget attempts after exhaustion
+        // hit the `record_attempt`-is-noop-on-Exhausted guard in
+        // `ArtifactCompletionJob`, but they must NOT re-emit the
+        // failure diagnostic (working_memory note_error). The dedup
+        // gate checks `unresolved_errors` for the
+        // `artifact_completion_failed role=…` prefix written by the
+        // first emission.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        install_artifact_completion_job_for_test(&mut agent, "tests/test_foo.py");
+
+        // Drive to exhaustion.
+        for _ in 0..3 {
+            agent.record_artifact_completion_attempt(
+                super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                vec!["Write on src/x.py".to_string()],
+            );
+        }
+        let first_emit_errors: Vec<String> = agent
+            .session
+            .working_memory
+            .unresolved_errors
+            .iter()
+            .filter(|err| err.starts_with("artifact_completion_failed role="))
+            .cloned()
+            .collect();
+        assert_eq!(
+            first_emit_errors.len(),
+            1,
+            "exactly one exhaustion diagnostic must be emitted after the 3rd attempt"
+        );
+
+        // A 4th attempt (after exhaustion) must NOT re-emit. The
+        // record_attempt is a no-op on Exhausted, returns true again,
+        // but the dedup gate suppresses the diagnostic.
+        let exhausted_again = agent.record_artifact_completion_attempt(
+            super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["Write on src/y.py".to_string()],
+        );
+        // The function still returns true (exhausted), but the
+        // working memory must not gain a 2nd identical error.
+        assert!(exhausted_again);
+        let second_emit_errors: Vec<String> = agent
+            .session
+            .working_memory
+            .unresolved_errors
+            .iter()
+            .filter(|err| err.starts_with("artifact_completion_failed role="))
+            .cloned()
+            .collect();
+        assert_eq!(
+            second_emit_errors.len(),
+            1,
+            "CB-002: repeated post-exhaustion attempts must NOT spam the diagnostic"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // CB-005 regression — invalid hint for a NEW target must not
+    // leave a stale job pointing at the OLD target. The job is
+    // cleared atomically before the new hint validates.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn invalid_new_hint_clears_stale_artifact_completion_job() {
+        // CB-005: a Test hint that fails validation (e.g. ignored top
+        // dir) for a NEW target must drop the prior job so subsequent
+        // NoTool / ProseOnly / RolePolicyViolation events cannot
+        // consume the old job's budget (which belongs to a different
+        // `current_artifact_recovery_target`).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        // Install a valid initial Test target.
+        install_artifact_completion_job_for_test(&mut agent, "tests/initial.py");
+        let initial_target = agent
+            .artifact_completion_job
+            .as_ref()
+            .map(|j| j.target_path().to_string());
+        assert_eq!(
+            initial_target.as_deref(),
+            Some("tests/initial.py"),
+            "initial valid job must install"
+        );
+
+        // Now an invalid hint for a different Test target (ignored top
+        // dir → `ArtifactCompletionJobError::InvalidTarget`).
+        let bad_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "node_modules/evil/test.js".to_string(),
+            reason: "attacker-supplied".to_string(),
+        };
+        agent.maybe_install_artifact_completion_job_for_hint(&bad_hint);
+
+        assert!(
+            agent.artifact_completion_job.is_none(),
+            "CB-005: invalid new hint MUST clear the stale job so no budget belongs to the old target"
+        );
+    }
+
+    #[test]
+    fn same_target_hint_refresh_does_not_reset_budget() {
+        // CB-005 positive regression: the existing identity-refresh
+        // semantic (same role + same target → keep job & budget) must
+        // be preserved by the atomic-clear ordering change.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        install_artifact_completion_job_for_test(&mut agent, "tests/keep.py");
+        // Consume one attempt.
+        agent.record_artifact_completion_attempt(
+            super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["Write on src/x.py".to_string()],
+        );
+        // Same target hint should not reset the budget.
+        install_artifact_completion_job_for_test(&mut agent, "tests/keep.py");
+        let attempts = agent
+            .artifact_completion_job
+            .as_ref()
+            .map(|j| j.attempts().len());
+        assert_eq!(
+            attempts,
+            Some(1),
+            "same-target refresh must keep prior attempts intact (no budget reset)"
+        );
+    }
+
+    #[test]
+    fn non_test_hint_clears_stale_test_artifact_completion_job() {
+        // CB2-001 / CB-005 (was partial): a Test job is installed,
+        // then the recovery target switches to a non-Test role
+        // (Implementation / UsageDocs / Setup). The function must
+        // drop the prior Test job before returning so subsequent
+        // NoTool / ProseOnly / RolePolicyViolation events cannot
+        // consume the stale Test budget and fire a misleading
+        // `artifact_completion_failed role=test` for a target that
+        // no longer represents the agent's recovery focus.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        for new_role in [
+            ArtifactRole::Implementation,
+            ArtifactRole::UsageDocs,
+            ArtifactRole::Setup,
+        ] {
+            let (mut agent, _temp) = test_agent_with_config(Config::default());
+            std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+            install_artifact_completion_job_for_test(&mut agent, "tests/test_foo.py");
+            assert!(
+                agent.artifact_completion_job.is_some(),
+                "fixture invariant: initial Test job installs ({new_role:?})"
+            );
+            // Now point the recovery target at a non-Test role. The
+            // path itself is irrelevant — the function early-returns
+            // on non-Test BEFORE consulting the path validator.
+            let non_test_hint = RecoveryTargetHint {
+                role: new_role,
+                path: "src/main.py".to_string(),
+                reason: "role change".to_string(),
+            };
+            agent.maybe_install_artifact_completion_job_for_hint(&non_test_hint);
+            assert!(
+                agent.artifact_completion_job.is_none(),
+                "CB2-001: non-Test hint ({new_role:?}) MUST clear the prior Test job"
+            );
+        }
+    }
+
+    #[test]
+    fn non_test_role_change_via_set_artifact_recovery_target_clears_stale_job() {
+        // CB2-001 follow-up: confirm the clearing also flows through
+        // `set_artifact_recovery_target_from_hint`, since that is the
+        // production entry point used by both
+        // `set_artifact_recovery_target_for_decision` and
+        // `set_artifact_recovery_target_for_action`. A Test job is
+        // installed via the public entry, then the same entry is
+        // called with a non-Test hint. The Test job must be gone.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        let test_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/test_foo.py".to_string(),
+            reason: "missing test".to_string(),
+        };
+        agent.set_artifact_recovery_target_from_hint(test_hint, 0);
+        assert!(
+            agent.artifact_completion_job.is_some(),
+            "fixture invariant: Test recovery target installs the job"
+        );
+        let impl_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "src/main.py".to_string(),
+            reason: "missing implementation".to_string(),
+        };
+        agent.set_artifact_recovery_target_from_hint(impl_hint, 0);
+        assert!(
+            agent.artifact_completion_job.is_none(),
+            "CB2-001: switching the recovery target from Test to Implementation MUST clear the Test job"
+        );
+    }
+
+    #[test]
+    fn new_valid_hint_replaces_stale_job_atomically() {
+        // CB-005 positive regression: a valid hint for a NEW target
+        // installs the new job atomically (no transient `None`
+        // observable from outside, the new job replaces the old).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        install_artifact_completion_job_for_test(&mut agent, "tests/first.py");
+        // Consume an attempt against the first target.
+        agent.record_artifact_completion_attempt(
+            super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["Write on src/x.py".to_string()],
+        );
+        // Switch to a valid different target → new job, fresh budget.
+        install_artifact_completion_job_for_test(&mut agent, "tests/second.py");
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("new valid hint must install a fresh job");
+        assert_eq!(job.target_path(), "tests/second.py");
+        assert_eq!(
+            job.attempts().len(),
+            0,
+            "new target must start with a fresh budget"
         );
     }
 }
@@ -18321,10 +18985,21 @@ fn artifact_directed_tool_policy_error(
     target: &Path,
     work_root: &Path,
 ) -> Option<String> {
+    // CB-003: SSOT target match — compare on the workspace-relative
+    // canonical form derived from `resolve_user_path` (used by both
+    // `task_workspace_scope` and `ArtifactCompletionJob.target_path`).
+    // The legacy `tool_path_matches_target` fell back to `target` and
+    // `resolved` directly when `std::fs::canonicalize` failed, which
+    // diverged from the missing-leaf handling in `ArtifactCompletionJob`
+    // (CB-001 / CB-003). Using the workspace-relative SSOT keeps the
+    // policy gate and the job constructor in lock-step on symlink and
+    // missing-file edge cases.
     let path_matches = arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|raw_path| tool_path_matches_target(raw_path, target, work_root));
+        .is_some_and(|raw_path| {
+            tool_path_matches_target_via_workspace_ssot(raw_path, target, work_root)
+        });
     if path_matches {
         return None;
     }
@@ -18338,6 +19013,117 @@ fn artifact_directed_tool_policy_error(
     Some(format!(
         "artifact-directed recovery rejected {rejected_tool}; only allows Read, Write, or Edit on {path_display}"
     ))
+}
+
+/// CB-003 / CB2-002: SSOT target match for the artifact-directed policy
+/// gate.
+///
+/// Routes both the tool argument and the policy target through the
+/// same `workspace_relative_path_for_tool_arg` helper used by the
+/// rest of the workspace-scope SSOT. The strings are then compared
+/// for byte equality. When either side fails to resolve (absolute
+/// path, parent traversal, symlink escape, missing canonical
+/// resolution, or **dangling-symlink ancestor**), the call returns
+/// `false` — defensive default that matches `ArtifactCompletionJob::new`.
+///
+/// CB2-002: the workspace-relative helper relies on
+/// `safety::path_guard::canonicalize_with_missing_tail`, which walks
+/// ancestors with `Path::exists()`. A dangling symlink ancestor has
+/// `exists()=false` (the link target is absent), so the walker would
+/// silently skip past it. We add an explicit `symlink_metadata` /
+/// `canonicalize` re-check on the input path's ancestor chain so the
+/// policy gate refuses to confer write permission through any path
+/// whose ancestor is a dangling symlink, matching the job
+/// constructor's behavior at construction time.
+fn tool_path_matches_target_via_workspace_ssot(
+    raw_path: &str,
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    let Some(input_rel) = workspace_relative_path_for_tool_arg(work_root, raw_path) else {
+        return false;
+    };
+    // Derive the target's workspace-relative form via the same SSOT.
+    // The target was originally produced by
+    // `Agent::artifact_recovery_target_path` (= `resolve_user_path` on
+    // a workspace-relative `current_artifact_recovery_target.path`),
+    // so going back through `workspace_relative_path_for_tool_arg`
+    // gives a stable, canonical-prefix-stripped string we can byte-
+    // compare against the tool argument's relative form.
+    let target_str = target.to_string_lossy();
+    let Some(target_rel) = workspace_relative_path_for_tool_arg(work_root, &target_str) else {
+        return false;
+    };
+    if input_rel != target_rel {
+        return false;
+    }
+    // CB2-002: defensive ancestor-chain re-check for both sides. A
+    // dangling-symlink ancestor would otherwise be skipped by the
+    // `Path::exists()`-based walk inside `resolve_user_path`, and
+    // both sides would byte-compare equal even though the parent
+    // could be flipped between validation and execution. By
+    // rejecting any side whose nearest existing ancestor is a
+    // dangling symlink, the gate stays consistent with
+    // `ArtifactCompletionJob::new`.
+    if !ancestor_chain_has_no_dangling_symlinks(work_root, raw_path) {
+        return false;
+    }
+    if !ancestor_chain_has_no_dangling_symlinks(work_root, &target_str) {
+        return false;
+    }
+    true
+}
+
+/// CB2-002: helper consulted by `tool_path_matches_target_via_workspace_ssot`
+/// to enforce that no ancestor of `raw_path` (resolved against `work_root`)
+/// is a **dangling symlink**. Returns `true` when every ancestor either
+/// (a) does not exist per `symlink_metadata`, or (b) canonicalizes
+/// successfully inside `canonicalize(work_root)`. Returns `false` when
+/// any ancestor is present per `symlink_metadata` but fails to
+/// canonicalize (the dangling-symlink class).
+///
+/// Mirrors the structure of
+/// `artifact_completion_job::nearest_existing_parent_within_work_root`
+/// but operates on the *tool argument* path (raw, possibly absolute)
+/// after stripping it through the path-guard.
+fn ancestor_chain_has_no_dangling_symlinks(work_root: &Path, raw_path: &str) -> bool {
+    let Ok(root_canon) = std::fs::canonicalize(work_root) else {
+        return false;
+    };
+    // We rebuild the would-be candidate path the same way
+    // `resolve_user_path` does: relative segments append to
+    // `work_root`. For absolute paths we use them verbatim.
+    let input = Path::new(raw_path);
+    let candidate: PathBuf = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        work_root.join(input)
+    };
+    let mut cursor: &Path = candidate.as_path();
+    loop {
+        match cursor.parent() {
+            Some(p) => cursor = p,
+            None => return false,
+        }
+        match cursor.symlink_metadata() {
+            Ok(_) => {
+                // Ancestor exists per the link itself. Now confirm
+                // `canonicalize` (which resolves links AND requires
+                // the target to exist) succeeds and stays inside
+                // `work_root`. A dangling symlink ancestor fails
+                // here.
+                let Ok(canon) = std::fs::canonicalize(cursor) else {
+                    return false;
+                };
+                return canon.starts_with(&root_canon);
+            }
+            Err(_) => {
+                // Ancestor is genuinely missing (not a dangling
+                // symlink) — keep walking up.
+                continue;
+            }
+        }
+    }
 }
 
 fn restricted_tool_policy_error(
@@ -26292,6 +27078,116 @@ export default function App() {
             "got: {err}"
         );
         assert!(!err.contains("secret-token"), "got: {err}");
+    }
+
+    // -------------------------------------------------------------
+    // CB-003 regression — artifact-directed policy gate target match
+    // routes through the workspace-scope SSOT helper. Symlink-escape
+    // and missing-leaf cases must produce the SAME accept/reject
+    // verdict as `ArtifactCompletionJob::new` (which uses the SSOT).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn artifact_directed_policy_target_match_uses_workspace_relative_ssot() {
+        // CB-003: target match must be byte-equal on the workspace-
+        // relative form. A tool argument that resolves to the same
+        // workspace-relative path as the target is accepted; any other
+        // path is rejected.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "x = 1\n").unwrap();
+
+        // Identical workspace-relative form → accepted.
+        assert!(super::tool_path_matches_target_via_workspace_ssot(
+            "app/main.py",
+            &target,
+            work_root,
+        ));
+        // Different leaf → rejected.
+        assert!(!super::tool_path_matches_target_via_workspace_ssot(
+            "app/other.py",
+            &target,
+            work_root,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directed_policy_rejects_dangling_symlink_parent_via_ssot() {
+        // CB2-002: when the would-be target's ancestor is a dangling
+        // symlink, the gate must NOT confer write permission. With
+        // the original `Path::exists()`-based ancestor walk inside
+        // `resolve_user_path`, the dangling link would be silently
+        // skipped (both sides resolved to the same relative form),
+        // and the policy would accept the call. The CB2-002 helper
+        // `ancestor_chain_has_no_dangling_symlinks` re-checks the
+        // ancestor chain with `symlink_metadata` + `canonicalize`
+        // so the gate stays consistent with
+        // `ArtifactCompletionJob::new`.
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        let outside = tempdir().unwrap();
+        symlink(outside.path().join("nonexistent"), work_root.join("tests")).unwrap();
+        // The target (and the tool arg) point at a missing leaf
+        // whose parent is the dangling symlink `tests/`.
+        let target = work_root.join("tests").join("test_new.py");
+        assert!(
+            !super::tool_path_matches_target_via_workspace_ssot(
+                "tests/test_new.py",
+                &target,
+                work_root,
+            ),
+            "CB2-002: dangling-symlink ancestor MUST NOT confer artifact-directed write permission"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directed_policy_rejects_symlink_aliased_path_via_ssot() {
+        // CB-003: a path that escapes the work_root via a symlink must
+        // not silently match the target — the workspace-scope SSOT
+        // either strips the canonical prefix or refuses to resolve,
+        // both of which produce a clean reject.
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let target = work_root.join("app/main.py");
+        std::fs::write(&target, "x = 1\n").unwrap();
+        // outside/ has a `main.py` that an attacker might try to alias.
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("main.py"), "evil()\n").unwrap();
+        symlink(outside.path().join("main.py"), work_root.join("alias.py")).unwrap();
+        assert!(!super::tool_path_matches_target_via_workspace_ssot(
+            "alias.py", &target, work_root,
+        ));
+    }
+
+    #[test]
+    fn artifact_directed_policy_rejects_missing_leaf_path_through_ssot() {
+        // CB-003: when the target is a missing leaf, the SSOT must
+        // still reject mismatched tool arguments rather than fall
+        // back to a permissive identity comparison.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        // Note: the leaf does NOT exist.
+        let target = work_root.join("tests/test_new.py");
+        assert!(!super::tool_path_matches_target_via_workspace_ssot(
+            "tests/wrong_file.py",
+            &target,
+            work_root,
+        ));
+        // Same-leaf workspace-relative form → matches even for missing
+        // target.
+        assert!(super::tool_path_matches_target_via_workspace_ssot(
+            "tests/test_new.py",
+            &target,
+            work_root,
+        ));
     }
 
     #[test]
