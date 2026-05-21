@@ -133,23 +133,23 @@ enum JobInstallOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EffectiveToolPolicy {
-    allowed_tools: Option<Vec<&'static str>>,
-    focused_edit: Option<FocusedEditPolicy>,
-    artifact_directed: Option<ArtifactDirectedPolicy>,
-    reason: EffectiveToolPolicyReason,
+pub(super) struct EffectiveToolPolicy {
+    pub(super) allowed_tools: Option<Vec<&'static str>>,
+    pub(super) focused_edit: Option<FocusedEditPolicy>,
+    pub(super) artifact_directed: Option<ArtifactDirectedPolicy>,
+    pub(super) reason: EffectiveToolPolicyReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FocusedEditPolicy {
-    target: PathBuf,
-    target_already_read: bool,
+pub(super) struct FocusedEditPolicy {
+    pub(super) target: PathBuf,
+    pub(super) target_already_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtifactDirectedPolicy {
-    target: PathBuf,
-    target_already_read: bool,
+pub(super) struct ArtifactDirectedPolicy {
+    pub(super) target: PathBuf,
+    pub(super) target_already_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,7 +346,7 @@ struct VerifierRepairIntentApplyResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffectiveToolPolicyReason {
+pub(super) enum EffectiveToolPolicyReason {
     Unrestricted,
     AnswerOnly,
     VerifierRepair,
@@ -356,7 +356,7 @@ enum EffectiveToolPolicyReason {
 }
 
 impl EffectiveToolPolicyReason {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Unrestricted => "unrestricted",
             Self::AnswerOnly => "answer_only",
@@ -369,7 +369,7 @@ impl EffectiveToolPolicyReason {
 }
 
 impl EffectiveToolPolicy {
-    fn unrestricted() -> Self {
+    pub(super) fn unrestricted() -> Self {
         Self {
             allowed_tools: None,
             focused_edit: None,
@@ -378,7 +378,10 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn restricted(reason: EffectiveToolPolicyReason, allowed_tools: Vec<&'static str>) -> Self {
+    pub(super) fn restricted(
+        reason: EffectiveToolPolicyReason,
+        allowed_tools: Vec<&'static str>,
+    ) -> Self {
         Self {
             allowed_tools: Some(allowed_tools),
             focused_edit: None,
@@ -387,7 +390,7 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn artifact_directed(target: PathBuf, target_already_read: bool) -> Self {
+    pub(super) fn artifact_directed(target: PathBuf, target_already_read: bool) -> Self {
         let allowed_tools = if !target.is_file() {
             vec!["Write"]
         } else if target_already_read {
@@ -427,7 +430,7 @@ impl EffectiveToolPolicy {
     /// difference is that the SOURCE of truth is now the job's least-
     /// privilege projection, so future writes/reads granularity changes
     /// (Issue #653+) ripple through here automatically.
-    fn artifact_directed_from_job(
+    pub(super) fn artifact_directed_from_job(
         target: PathBuf,
         target_already_read: bool,
         allowed_write_actions: &super::artifact_completion_job::AllowedWriteActions,
@@ -463,7 +466,7 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn focused_edit(
+    pub(super) fn focused_edit(
         reason: EffectiveToolPolicyReason,
         allowed_tools: Vec<&'static str>,
         target: PathBuf,
@@ -480,19 +483,19 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn allowed_tool_names_for_prompt(&self) -> Option<&[&str]> {
+    pub(super) fn allowed_tool_names_for_prompt(&self) -> Option<&[&str]> {
         self.allowed_tools.as_deref()
     }
 
-    fn focused_edit_policy(&self) -> Option<&FocusedEditPolicy> {
+    pub(super) fn focused_edit_policy(&self) -> Option<&FocusedEditPolicy> {
         self.focused_edit.as_ref()
     }
 
-    fn artifact_directed_policy(&self) -> Option<&ArtifactDirectedPolicy> {
+    pub(super) fn artifact_directed_policy(&self) -> Option<&ArtifactDirectedPolicy> {
         self.artifact_directed.as_ref()
     }
 
-    fn reason(&self) -> EffectiveToolPolicyReason {
+    pub(super) fn reason(&self) -> EffectiveToolPolicyReason {
         self.reason
     }
 }
@@ -9678,6 +9681,9 @@ impl Agent {
     }
 
     fn effective_tool_policy(&self) -> EffectiveToolPolicy {
+        // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
+        // in §4 of the design policy). The arbiter never sees it; we early-
+        // return before constructing any selectable `JobCandidate`.
         if self.answer_only_mode_active() {
             if self.workspace_appears_empty() {
                 return EffectiveToolPolicy::restricted(
@@ -9697,6 +9703,52 @@ impl Agent {
                 );
             }
         }
+
+        // Legacy if-elif chain (Phase A+B dual-source authority). Phase E
+        // will delete this block; until then the legacy result is the
+        // single authority and the arbiter result is checked against it.
+        let legacy_policy = self.effective_tool_policy_legacy();
+
+        // New arbiter path (Phase A+B). Construct the candidate list from
+        // the same source signals the legacy chain reads. The arbiter is a
+        // pure function over the candidates.
+        let candidates = self.build_arbiter_candidates();
+        let selection = super::active_job_arbiter::select_active_job(&candidates);
+        let arbiter_policy = super::active_job_arbiter::project_policy(&selection);
+
+        // Dual-source guard (#659 `assert_dual_source_alignment_at_turn_end`
+        // pattern):
+        // - `assert!` is gated by `#[cfg(debug_assertions)]` so the agent
+        //   loop never panics in release.
+        // - The divergence event is emitted in **both** debug and release
+        //   so production deployments can observe regressions.
+        // - Legacy chain compute and arbiter compute both run in release
+        //   (no `#[cfg]` gate) so dead_code warnings stay at 0.
+        // Phase E deletes the legacy chain, the assertion, and the
+        // divergence emit together.
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                legacy_policy == arbiter_policy,
+                "issue#660 dual-source divergence: legacy reason={} arbiter reason={}",
+                legacy_policy.reason().as_str(),
+                arbiter_policy.reason().as_str(),
+            );
+        }
+        if legacy_policy != arbiter_policy {
+            self.emit_active_job_divergence_event(&legacy_policy, &arbiter_policy);
+        }
+
+        // Authority during Phase A+B-D: legacy result. Phase E flips to
+        // `arbiter_policy` as the single source of truth and removes the
+        // legacy compute + divergence emit.
+        legacy_policy
+    }
+
+    /// Issue #660 (Phase A+B / Phase E will delete): the legacy if-elif
+    /// chain extracted verbatim from `effective_tool_policy()` so the new
+    /// arbiter can be cross-checked without breaking behaviour parity.
+    fn effective_tool_policy_legacy(&self) -> EffectiveToolPolicy {
         if self.task_contract_verifier_repair_pending {
             // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
             // active and the safeguarded decision returns `NoRepair` (i.e.
@@ -9755,6 +9807,181 @@ impl Agent {
             );
         }
         EffectiveToolPolicy::unrestricted()
+    }
+
+    /// Issue #660: build the arbiter candidate list from the same source
+    /// signals the legacy chain reads. Per DR1-004 only candidates with a
+    /// determined `desired_action` are pushed — there is no
+    /// `RejectionReason::NoDesiredAction`.
+    ///
+    /// Each branch mirrors a single legacy `if let Some(target) = ...`
+    /// arm. The policy attached to the candidate is the exact value the
+    /// legacy chain would have returned, so `project_policy(selection)`
+    /// is value-equal to the legacy result.
+    fn build_arbiter_candidates(&self) -> Vec<super::active_job_arbiter::JobCandidate> {
+        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
+
+        let mut candidates: Vec<JobCandidate> = Vec::new();
+
+        // Priority 1: VerifierRepair (task_contract_verifier_repair_pending).
+        if self.task_contract_verifier_repair_pending {
+            let decision = self.verifier_repair_decision_for_policy();
+            let (policy, desired_action) = if matches!(decision, VerifierRepairDecision::NoRepair)
+                && let Some(job) = self.missing_verifier_job.as_ref()
+            {
+                (
+                    EffectiveToolPolicy::restricted(
+                        EffectiveToolPolicyReason::VerifierRepair,
+                        job.allowed_tool_names().to_vec(),
+                    ),
+                    DesiredAction::MissingVerifierCreate,
+                )
+            } else {
+                (
+                    verifier_repair_policy_for_decision(decision),
+                    DesiredAction::VerifierRepair {
+                        command: String::new(),
+                        target_hint: None,
+                    },
+                )
+            };
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::VerifierRepair,
+                desired_action,
+                policy,
+                budget: Budget::Unbounded,
+            });
+        }
+
+        // Priority 2: ForcedSmallEditRecovery.
+        if let Some(target) = self.forced_small_edit_recovery_target() {
+            let policy = self.focused_edit_policy_for_target(
+                target.clone(),
+                EffectiveToolPolicyReason::FocusedEditRecovery,
+            );
+            let already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::ForcedSmallEditRecovery,
+                desired_action: DesiredAction::FocusedEdit {
+                    target,
+                    already_read,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
+        }
+
+        // Priority 3: ArtifactRecovery.
+        if let Some(target) = self.artifact_recovery_target_path() {
+            let target_already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            let policy = if let Some(job) = self.artifact_completion_job.as_ref()
+                && matches!(job.role(), super::task_contract::ArtifactRole::Test)
+            {
+                EffectiveToolPolicy::artifact_directed_from_job(
+                    target.clone(),
+                    target_already_read,
+                    job.allowed_write_actions(),
+                    job.allowed_read_scope(),
+                )
+            } else {
+                EffectiveToolPolicy::artifact_directed(target.clone(), target_already_read)
+            };
+            let (write_actions, read_scope) = match self.artifact_completion_job.as_ref() {
+                Some(job) if matches!(job.role(), super::task_contract::ArtifactRole::Test) => (
+                    job.allowed_write_actions().clone(),
+                    job.allowed_read_scope().clone(),
+                ),
+                _ => (
+                    super::artifact_completion_job::AllowedWriteActions::target_create_only(),
+                    super::artifact_completion_job::AllowedReadScope::TargetOnly,
+                ),
+            };
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::ArtifactRecovery,
+                desired_action: DesiredAction::ArtifactDirected {
+                    target,
+                    already_read: target_already_read,
+                    write_actions,
+                    read_scope,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
+        }
+
+        // Priority 4: FocusedEditRecovery.
+        if let Some(target) = self.focused_edit_recovery_target() {
+            let policy = self.focused_edit_policy_for_target(
+                target.clone(),
+                EffectiveToolPolicyReason::FocusedEditRecovery,
+            );
+            let already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::FocusedEditRecovery,
+                desired_action: DesiredAction::FocusedEdit {
+                    target,
+                    already_read,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
+        }
+
+        // Priority 5: LocalLlmSmallEditAfterRead.
+        if let Some(target) = self.local_llm_small_edit_target() {
+            let policy = self.focused_edit_policy_for_target(
+                target.clone(),
+                EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
+            );
+            let already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::LocalLlmSmallEditAfterRead,
+                desired_action: DesiredAction::FocusedEdit {
+                    target,
+                    already_read,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
+        }
+
+        candidates
+    }
+
+    /// Issue #660 (Phase A+B / Phase E will delete): emit
+    /// `agent.active_job.divergence_detected` when the legacy chain and
+    /// the new arbiter project to different `EffectiveToolPolicy` values.
+    /// Mirrors the #659 `emit_artifact_ledger_divergence_event` shape:
+    /// sanitized projection only (DR4-001), no raw path / raw verifier
+    /// command in the payload. Routes through `log_llm_event` so
+    /// `mask_payload_inplace` is the final defence.
+    fn emit_active_job_divergence_event(
+        &self,
+        legacy: &EffectiveToolPolicy,
+        arbiter: &EffectiveToolPolicy,
+    ) {
+        log_llm_event(
+            "agent.active_job.divergence_detected",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "authority": "legacy",
+                "legacy_reason_label": legacy.reason().as_str(),
+                "arbiter_reason_label": arbiter.reason().as_str(),
+                "legacy_allowed_tools_count": legacy
+                    .allowed_tool_names_for_prompt()
+                    .map(|t| t.len() as u32)
+                    .unwrap_or(0),
+                "arbiter_allowed_tools_count": arbiter
+                    .allowed_tool_names_for_prompt()
+                    .map(|t| t.len() as u32)
+                    .unwrap_or(0),
+            }),
+        );
     }
 
     fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
