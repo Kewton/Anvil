@@ -390,7 +390,6 @@ impl RepairJob {
     ///
     /// 昇格判定本体は pure-fn 側 (`repair_attempt_outcome::should_promote_to_exhausted_after_push`)
     /// にあるため、ここではフロー制御のみ。
-    #[allow(dead_code)] // wired into turn.rs by Phase 3 lifecycle hooks.
     pub(super) fn record_repair_attempt_outcome(&mut self, outcome: RepairAttemptOutcome) {
         // 1. FIFO cap → oldest drop + tracing::warn! (closed metadata, DR4-002)
         if self.repair_attempt_outcomes.len() >= MAX_REPAIR_ATTEMPT_OUTCOMES {

@@ -8006,14 +8006,14 @@ impl Agent {
                 // なるため。`semantic_plan = None` の legacy path は ledger
                 // 非対象 (S5-004)。
                 {
+                    // S5-002: `SameFailureRemaining` と `NewFailure` は
+                    // どちらも progress なしとして同一 variant に畳む。
                     let kind_opt = match repair_context.rerun_outcome {
                         Some(super::VerifierRepairRerunOutcome::Improved) => Some(
                             super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedImproved,
                         ),
-                        Some(super::VerifierRepairRerunOutcome::SameFailureRemaining) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress,
-                        ),
-                        Some(super::VerifierRepairRerunOutcome::NewFailure) => Some(
+                        Some(super::VerifierRepairRerunOutcome::SameFailureRemaining)
+                        | Some(super::VerifierRepairRerunOutcome::NewFailure) => Some(
                             super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress,
                         ),
                         Some(super::VerifierRepairRerunOutcome::Worsened) => Some(

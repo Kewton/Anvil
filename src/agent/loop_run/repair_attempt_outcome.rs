@@ -18,7 +18,6 @@ use super::spec_authority::{RepairRole, WeakeningPattern};
 /// 1 RepairJob あたりに保持する outcome 上限 (S1-003)。
 /// 超過時は **oldest を drop** (FIFO) し、`tracing::warn!` で
 /// drop metadata (件数のみ、内容は出さない) を emit する。
-#[allow(dead_code)] // wired into repair_job.rs in Phase 2.
 pub(super) const MAX_REPAIR_ATTEMPT_OUTCOMES: usize = 16;
 
 /// repair attempt の結末を表す coarse 5 variant (payload 付き enum)。
@@ -31,7 +30,6 @@ pub(super) const MAX_REPAIR_ATTEMPT_OUTCOMES: usize = 16;
 /// **DR1-004 反映**: `rejection_kind` / `detail` を並列 `Option<...>` field
 /// として持たず、payload 付き variant で illegal states unrepresentable
 /// (Applied 系で `Some(...)` が混入する余地を型で排除)。
-#[allow(dead_code)] // wired into turn.rs in Phase 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RepairAttemptOutcomeKind {
     /// `VerifierRepairRerunOutcome::Improved` 1:1 (no payload)。
@@ -61,7 +59,6 @@ pub(super) enum RepairAttemptOutcomeKind {
 /// 系の 2 variant のみ。`RejectedNoCandidate` は `RepairAttemptOutcomeKind`
 /// 側の独立 variant、`OtherUnsafe` は production emission site が無いため
 /// premature variant として導入しない (将来必要になれば別 Issue で追加)。
-#[allow(dead_code)] // wired into turn.rs in Phase 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RepairRejectionKind {
     /// `detect_test_weakening` 由来 (5 pattern)。
@@ -84,7 +81,6 @@ pub(super) enum RepairRejectionKind {
 /// 条件で消費されないため premature field として削除。#654 が per-generation
 /// grouping を必要とした時点で additive に再導入する (`RepairAttemptOutcome`
 /// への field 追加は破壊的でない)。
-#[allow(dead_code)] // wired into repair_job.rs (Phase 2) and turn.rs (Phase 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairAttemptOutcome {
     /// active `SemanticRepairPlan.failure_cluster_id` からのみ取得 (S5-004 / Phase 0)。
@@ -121,7 +117,6 @@ impl RepairAttemptOutcome {
 ///
 /// **副作用なし**。`outcomes` / `pushed` を mutate しない。これにより helper を
 /// 経由せず slice + outcome literal で unit test 可能 (受入条件 S1-006(a))。
-#[allow(dead_code)] // wired into repair_job.rs in Phase 2.
 pub(super) fn should_promote_to_exhausted_after_push(
     outcomes: &[RepairAttemptOutcome],
     pushed: &RepairAttemptOutcome,
