@@ -18,9 +18,10 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use super::auto_test::{
-    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
-    combined_output_for_classify,
+    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, OwnedTestVerifierPlan,
+    auto_test_disabled, combined_output_for_classify,
 };
+use super::task_workspace_scope::TaskWorkspaceScope;
 use crate::agent::orchestration::RepoVerification;
 use crate::session::anvil_score::{
     AnvilScore, AnvilScoreInputs, AnvilTestSummary, compute_anvil_score,
@@ -64,6 +65,44 @@ pub struct VerifierInputs<'a> {
     pub recent_successful_bash_commands: &'a [String],
     pub tester_candidate_some: bool,
     pub workspace_root: &'a Path,
+    /// Issue #651 Task 3.1: owned test artifact paths the current task is
+    /// allowed to bind to a structured verifier command. SSOT producer is
+    /// `super::artifact_ownership::owned_test_artifacts(...)`.
+    ///
+    /// Contract (DR1-007):
+    /// - The skills framework crate (`src/agent/skills/mod.rs`) MUST NOT
+    ///   read this field; it is exposed across the `SkillInput::Verifier`
+    ///   public boundary only because `VerifierInputs` itself is `pub`.
+    ///   The field is consumed exclusively by `VerifierSkill::execute` in
+    ///   this module.
+    /// - An empty slice (`&[]`) is the back-compat sentinel — the
+    ///   structured verifier path treats it as `Missing` when
+    ///   `test_execution_required` is true, and as "no-op" otherwise.
+    /// - The slice is **never persisted**: it is a per-turn borrow into
+    ///   the planner-side artifact view.
+    pub owned_test_artifacts: &'a [String],
+    /// Issue #651 Task 3.1 / 3.3: gate that flips the structured Weak /
+    /// Missing branch on. SSOT: `RequiredBehaviorContract.test_execution_required`,
+    /// itself backed by `task_contract::request_asks_for_test_artifact`.
+    ///
+    /// `false` preserves the legacy `detect_with_recent_successes -> run`
+    /// path verbatim (regression guard for every non-test-bearing
+    /// request). `true` routes through
+    /// `AutoTestRunner::detect_with_owned_test_artifacts` →
+    /// `OwnedTestVerifierPlan::{Runnable, Weak, Missing}`.
+    pub test_execution_required: bool,
+    /// Issue #651 Task 3.3: workspace scope the planner is currently
+    /// operating in. Required so `run_structured` can re-validate every
+    /// `command.bound_test_artifacts` path at execution time
+    /// (canonicalize + scope re-check, defends against TOCTOU symlink
+    /// swap between planning and execution).
+    ///
+    /// Visibility is intentionally `pub(crate)`, narrower than the
+    /// surrounding `pub struct VerifierInputs`, because
+    /// `TaskWorkspaceScope` is itself `pub(crate)` (DR3-001 boundary).
+    /// The skills framework crate does not need to read this field —
+    /// `VerifierSkill::execute` is the sole in-crate consumer.
+    pub(crate) workspace_scope: &'a TaskWorkspaceScope,
 }
 
 /// VerifierSkill::execute の出力. turn.rs facade が解釈して side-effect を適用する.
@@ -107,6 +146,28 @@ pub enum VerifierOutcome {
     Skipped { score: AnvilScore },
     /// ANVIL_NO_AUTO_TEST が設定されている場合. AnvilScore は計算済み.
     EnvDisabled { score: AnvilScore },
+    /// Issue #651: a structured verifier candidate was detected but the
+    /// owned test artifacts could not be bound to it (free-form shell
+    /// from ProjectInstruction / RecentSuccessfulBash, unsupported
+    /// toolchain, etc.). Caller (success.rs / turn.rs) maps this to
+    /// `CompletionDecision::SafeStop { reason: VerifierWeak }`.
+    ///
+    /// Payload is intentionally narrow (no `display_command` / path
+    /// list / output) so the per-turn log emit stays well under the
+    /// 1 KiB payload budget (design 8-A) and never leaks raw command
+    /// text past the `redact_verifier_command_for_storage` SSOT.
+    Weak {
+        score: AnvilScore,
+        owned_test_artifacts_count: usize,
+        command_runner: &'static str,
+    },
+    /// Issue #651: no runnable verifier could be detected at all (and
+    /// `test_execution_required == true`). Caller maps this to
+    /// `CompletionDecision::SafeStop { reason: VerifierMissing }`.
+    Missing {
+        score: AnvilScore,
+        owned_test_artifacts_count: usize,
+    },
 }
 
 /// VerifierSkill アダプタ. unit struct (状態を持たない).
@@ -167,7 +228,95 @@ impl AgentSkill for VerifierSkill {
             }));
         }
 
-        // [2] gate true → SuccessVerifier 三値で分岐 (DR2-001/007: AutoTestRunner は
+        // [2] Issue #651: structured verifier gate. Activates only when the
+        // request literally asks for test execution evidence
+        // (`RequiredBehaviorContract.test_execution_required`) AND the
+        // protocol demands a verifier this turn. In that mode the legacy
+        // `detect_with_recent_successes -> run` path is bypassed because
+        // a free-form shell command could otherwise execute without the
+        // current task's owned test artifact appearing in argv (Issue #651
+        // root cause).
+        //
+        // When `test_execution_required == false` we deliberately keep the
+        // legacy path untouched so every non-test-bearing request preserves
+        // its existing behaviour (Phase 4.1 regression guard).
+        if inputs.test_execution_required && inputs.protocol_demands_verifier {
+            let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
+                inputs.workspace_root,
+                inputs.changed_files,
+                inputs.recent_successful_bash_commands,
+                inputs.owned_test_artifacts,
+            );
+            match owned_plan {
+                OwnedTestVerifierPlan::Runnable { plan, command } => {
+                    let display_command = command.to_display_string();
+                    match AutoTestRunner::run_structured(
+                        inputs.workspace_root,
+                        inputs.workspace_scope,
+                        &command,
+                        &display_command,
+                    ) {
+                        Ok(result) => {
+                            let summary = build_anvil_test_summary_for_skill(&plan, &result);
+                            let score = compute_anvil_score(
+                                &inputs.score_inputs,
+                                inputs.repo_verification,
+                                Some(&summary),
+                            );
+                            let combined_output = combined_output_for_classify(&result);
+                            let feedback = Some(super::turn::build_feedback_for_auto_test(
+                                &plan,
+                                &result,
+                                inputs.workspace_root,
+                                inputs.changed_files,
+                            ));
+                            return Ok(wrap_skill_output(VerifierOutcome::AutoTestRan {
+                                score,
+                                auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),
+                                auto_test_passed: result.passed,
+                                auto_test_command: result.command.clone(),
+                                auto_test_output: result.output.clone(),
+                                auto_test_reason: plan.reason.clone(),
+                                anvil_test_summary: summary,
+                                feedback,
+                                auto_test_combined_output: combined_output,
+                            }));
+                        }
+                        Err(error) => {
+                            let score = compute_anvil_score(
+                                &inputs.score_inputs,
+                                inputs.repo_verification,
+                                None,
+                            );
+                            return Ok(wrap_skill_output(
+                                VerifierOutcome::AutoTestTransportError { score, error },
+                            ));
+                        }
+                    }
+                }
+                OwnedTestVerifierPlan::Weak {
+                    detected_source, ..
+                } => {
+                    let score =
+                        compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+                    return Ok(wrap_skill_output(VerifierOutcome::Weak {
+                        score,
+                        owned_test_artifacts_count: inputs.owned_test_artifacts.len(),
+                        command_runner: detected_source,
+                    }));
+                }
+                OwnedTestVerifierPlan::Missing => {
+                    let score =
+                        compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+                    return Ok(wrap_skill_output(VerifierOutcome::Missing {
+                        score,
+                        owned_test_artifacts_count: inputs.owned_test_artifacts.len(),
+                    }));
+                }
+            }
+        }
+
+        // [3] gate true → SuccessVerifier 三値で分岐 (DR2-001/007: AutoTestRunner は
         // unit struct + associated fn で changed_files が必須引数)
         let detected_plan = AutoTestRunner::detect_with_recent_successes(
             inputs.workspace_root,
@@ -269,6 +418,10 @@ impl AgentSkill for VerifierSkill {
                 VerifierOutcome::NoVerifier { .. } => "no_verifier",
                 VerifierOutcome::Skipped { .. } => "skip",
                 VerifierOutcome::EnvDisabled { .. } => "env_disabled",
+                // Issue #651: `_ =>` is forbidden so future
+                // VerifierOutcome variants light up compile errors.
+                VerifierOutcome::Weak { .. } => "weak",
+                VerifierOutcome::Missing { .. } => "missing",
             },
             // DR1-007: 将来 variant 追加で更新漏れがあると debug build で panic、release では
             // 安全 fallback。

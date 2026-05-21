@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use super::task_contract::{ArtifactRole, ArtifactState, ArtifactStateKind};
 use super::task_workspace_scope::{ScopeMode, TaskWorkspaceScope};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +131,75 @@ fn canonical_escape(work_root: &Path, relative_path: &str) -> bool {
     };
     let root_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
     target_canon.strip_prefix(&root_canon).is_err()
+}
+
+/// Issue #651: SSOT extraction of "test artifact paths the current task is
+/// allowed to bind to the structured verifier command".
+///
+/// Filters `artifacts` to entries that are
+/// - `role == Test`
+/// - `kind ∈ {ChangedThisTurn, ExistsButUnverified}` (i.e. the planner is
+///   actively interested in this turn's edit)
+/// - have a known `path` (entries with `path: None` are skipped — the
+///   verifier cannot bind a path it does not know)
+/// - classify as [`ArtifactOwnership::Owned`] under
+///   [`classify_ownership`] (so scope / symlink / `..` / absolute checks
+///   all run inside the SSOT, never duplicated by callers).
+///
+/// The two predicate closures (`edited_this_session_for`,
+/// `scaffold_changed_for`) keep the helper decoupled from `turn.rs`
+/// internals (`turn_edited_relative_paths`, scaffold delta logic) per
+/// design judgement #4 / DR3-005.
+///
+/// Returned paths preserve their input order (artifact-list order) and
+/// are deduplicated.
+///
+/// `#[allow(dead_code)]` is intentional in Phase 1.3 — Phase 3/5 (caller
+/// migration) will wire `verifier_skill.rs` / `success.rs` /
+/// `turn.rs::run_task_contract_verifier_once` to this helper.
+#[allow(dead_code)]
+pub(super) fn owned_test_artifacts(
+    artifacts: &[ArtifactState],
+    work_root: &Path,
+    scope: &TaskWorkspaceScope,
+    edited_this_session_for: &dyn Fn(&str) -> bool,
+    scaffold_changed_for: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for state in artifacts {
+        if state.role != ArtifactRole::Test {
+            continue;
+        }
+        if !matches!(
+            state.kind,
+            ArtifactStateKind::ChangedThisTurn | ArtifactStateKind::ExistsButUnverified
+        ) {
+            continue;
+        }
+        let Some(path) = state.path.as_deref() else {
+            // `path: None` means the turn observed a Test edit but did
+            // not retain the path (e.g. an aggregate evidence row).
+            // Such entries cannot be bound to a structured verifier;
+            // verifier_missing semantics are the caller's responsibility.
+            continue;
+        };
+        let ownership = classify_ownership(OwnershipInputs {
+            work_root,
+            relative_path: path,
+            scope,
+            edited_this_session: edited_this_session_for(path),
+            scaffold_changed: scaffold_changed_for(path),
+            verifier_passed_in_scope: false,
+        });
+        if !matches!(ownership, ArtifactOwnership::Owned) {
+            continue;
+        }
+        let path_owned = path.to_string();
+        if !out.contains(&path_owned) {
+            out.push(path_owned);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -399,5 +469,188 @@ mod tests {
             verifier_passed_in_scope: false,
         });
         assert_eq!(out, ArtifactOwnership::Owned);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651: owned_test_artifacts helper (SSOT for verifier binding).
+    // -----------------------------------------------------------------
+
+    fn test_state_exists(path: &str) -> ArtifactState {
+        ArtifactState {
+            role: ArtifactRole::Test,
+            path: Some(path.to_string()),
+            kind: ArtifactStateKind::ExistsButUnverified,
+        }
+    }
+
+    fn test_state_changed_with_path(path: &str) -> ArtifactState {
+        ArtifactState {
+            role: ArtifactRole::Test,
+            path: Some(path.to_string()),
+            kind: ArtifactStateKind::ChangedThisTurn,
+        }
+    }
+
+    fn test_state_changed_no_path() -> ArtifactState {
+        ArtifactState {
+            role: ArtifactRole::Test,
+            path: None,
+            kind: ArtifactStateKind::ChangedThisTurn,
+        }
+    }
+
+    fn impl_state_changed(path: &str) -> ArtifactState {
+        ArtifactState {
+            role: ArtifactRole::Implementation,
+            path: Some(path.to_string()),
+            kind: ArtifactStateKind::ChangedThisTurn,
+        }
+    }
+
+    #[test]
+    fn owned_test_artifacts_collects_changed_and_exists_test_paths() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/tests")).unwrap();
+        std::fs::write(dir.path().join("app/tests/test_a.py"), "").unwrap();
+        std::fs::write(dir.path().join("app/tests/test_b.py"), "").unwrap();
+        let scope = single_root_scope();
+        let artifacts = vec![
+            test_state_changed_with_path("app/tests/test_a.py"),
+            test_state_exists("app/tests/test_b.py"),
+            // ChangedThisTurn for Implementation must be ignored.
+            impl_state_changed("app/main.py"),
+        ];
+        let edited_for: Box<dyn Fn(&str) -> bool> = Box::new(|p| {
+            p == "app/tests/test_a.py" || p == "app/tests/test_b.py" || p == "app/main.py"
+        });
+        let scaffold_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let owned = owned_test_artifacts(
+            &artifacts,
+            dir.path(),
+            &scope,
+            edited_for.as_ref(),
+            scaffold_for.as_ref(),
+        );
+        assert_eq!(
+            owned,
+            vec![
+                "app/tests/test_a.py".to_string(),
+                "app/tests/test_b.py".to_string(),
+            ],
+            "expected both Test artifact rows in input order"
+        );
+    }
+
+    #[test]
+    fn owned_test_artifacts_skips_entries_with_no_path() {
+        let dir = tempdir().unwrap();
+        let scope = single_root_scope();
+        let artifacts = vec![
+            test_state_changed_no_path(),
+            test_state_changed_with_path("tests/test_real.py"),
+        ];
+        let edited_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| true);
+        let scaffold_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let owned = owned_test_artifacts(
+            &artifacts,
+            dir.path(),
+            &scope,
+            edited_for.as_ref(),
+            scaffold_for.as_ref(),
+        );
+        assert_eq!(owned, vec!["tests/test_real.py".to_string()]);
+    }
+
+    #[test]
+    fn owned_test_artifacts_rejects_absolute_path() {
+        let dir = tempdir().unwrap();
+        let scope = single_root_scope();
+        let artifacts = vec![test_state_changed_with_path("/etc/passwd")];
+        let edited_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| true);
+        let scaffold_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let owned = owned_test_artifacts(
+            &artifacts,
+            dir.path(),
+            &scope,
+            edited_for.as_ref(),
+            scaffold_for.as_ref(),
+        );
+        assert!(
+            owned.is_empty(),
+            "absolute path must be filtered by classify_ownership, got {owned:?}"
+        );
+    }
+
+    #[test]
+    fn owned_test_artifacts_rejects_parent_dir_traversal() {
+        let dir = tempdir().unwrap();
+        let scope = single_root_scope();
+        let artifacts = vec![test_state_changed_with_path("../sibling/test_x.py")];
+        let edited_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| true);
+        let scaffold_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let owned = owned_test_artifacts(
+            &artifacts,
+            dir.path(),
+            &scope,
+            edited_for.as_ref(),
+            scaffold_for.as_ref(),
+        );
+        assert!(
+            owned.is_empty(),
+            "parent-dir traversal must be filtered, got {owned:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_test_artifacts_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret_test.py"), "").unwrap();
+        let work = tempdir().unwrap();
+        symlink(
+            outside.path().join("secret_test.py"),
+            work.path().join("alias_test.py"),
+        )
+        .unwrap();
+        let scope = single_root_scope();
+        let artifacts = vec![test_state_changed_with_path("alias_test.py")];
+        let edited_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| true);
+        let scaffold_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let owned = owned_test_artifacts(
+            &artifacts,
+            work.path(),
+            &scope,
+            edited_for.as_ref(),
+            scaffold_for.as_ref(),
+        );
+        assert!(
+            owned.is_empty(),
+            "symlink escape must be filtered, got {owned:?}"
+        );
+    }
+
+    #[test]
+    fn owned_test_artifacts_keeps_only_owned_classifications() {
+        // No `edited_this_session`, no `scaffold_changed`, scope is the
+        // generic single-project root → classify_ownership returns
+        // CandidateOnly, so the helper must drop the entry.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("test_pre_existing.py"), "").unwrap();
+        let scope = single_root_scope();
+        let artifacts = vec![test_state_exists("test_pre_existing.py")];
+        let edited_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let scaffold_for: Box<dyn Fn(&str) -> bool> = Box::new(|_| false);
+        let owned = owned_test_artifacts(
+            &artifacts,
+            dir.path(),
+            &scope,
+            edited_for.as_ref(),
+            scaffold_for.as_ref(),
+        );
+        assert!(
+            owned.is_empty(),
+            "CandidateOnly classification must be dropped, got {owned:?}"
+        );
     }
 }

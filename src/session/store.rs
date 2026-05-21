@@ -874,6 +874,17 @@ pub struct SessionSnapshot {
     /// `handle_user_message` (wired in Task 5.2).
     #[serde(skip, default)]
     pub auto_promote_called_this_turn: bool,
+    /// Issue #651 Phase 6.1: turn-local per-turn cap for the structured
+    /// SafeStop telemetry (`agent.verifier.weak` / `agent.verifier.missing`).
+    /// Set to `true` the first time `VerifierSkill::execute` returns
+    /// `Weak` / `Missing` and the success-path orchestrator emits the
+    /// log key; subsequent re-evaluations in the same turn observe the
+    /// flag and skip the log emit. Reset at the head of
+    /// `handle_user_message` so the next user turn can re-emit. Not
+    /// persisted (`#[serde(skip, default)]`) — the flag is per-turn
+    /// runtime state only.
+    #[serde(skip, default)]
+    pub verifier_safe_stop_emitted_this_turn: bool,
     /// Issue #464: turn-local per-turn cap for anti-pattern retrieval.
     /// Set to `true` once `try_inject_anti_pattern_message` consumes the cap.
     /// Plan-mode early return does NOT set this. Reset at `run_turn` head.
@@ -1796,5 +1807,80 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         let back: VerifierInvocationRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rec);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 Phase 6.1: verifier_safe_stop_emitted_this_turn cap.
+    //
+    // Three invariants:
+    //   (a) `#[serde(skip, default)]` — the flag is never persisted and
+    //       always defaults to `false` after a resume.
+    //   (b) per-turn emission cap — setting the flag once causes
+    //       follow-up calls in the same turn to skip the log emit.
+    //       (Behavioural check via the flag value because the actual
+    //       log_llm_event sink is async / external.)
+    //   (c) turn boundary reset — after a manual reset to `false`
+    //       (modelled on `handle_user_message` head), the next emit
+    //       is allowed again.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verifier_safe_stop_emitted_flag_is_not_persisted() {
+        let snap = SessionSnapshot {
+            verifier_safe_stop_emitted_this_turn: true,
+            ..SessionSnapshot::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("verifier_safe_stop_emitted_this_turn"),
+            "flag must be skipped during serialization: {json}"
+        );
+        let decoded: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(
+            !decoded.verifier_safe_stop_emitted_this_turn,
+            "flag must default to false on deserialize"
+        );
+    }
+
+    #[test]
+    fn verifier_safe_stop_emitted_flag_caps_second_emit_in_same_turn() {
+        // Model the producer site: read-modify-write on the flag mirrors
+        // the per-turn cap pattern used at every emit site
+        // (`!flag` ↦ emit + flag := true ↦ skip on subsequent calls).
+        let mut snap = SessionSnapshot::default();
+        let mut emits = 0usize;
+        for _ in 0..2 {
+            if !snap.verifier_safe_stop_emitted_this_turn {
+                snap.verifier_safe_stop_emitted_this_turn = true;
+                emits += 1;
+            }
+        }
+        assert_eq!(
+            emits, 1,
+            "per-turn cap must emit exactly once per turn, got {emits}"
+        );
+    }
+
+    #[test]
+    fn verifier_safe_stop_emitted_flag_resets_at_turn_boundary() {
+        // Model the reset performed at the head of `handle_user_message`.
+        let mut snap = SessionSnapshot::default();
+        // Turn N: emit fires.
+        if !snap.verifier_safe_stop_emitted_this_turn {
+            snap.verifier_safe_stop_emitted_this_turn = true;
+        }
+        // Turn boundary: emulate the reset SSOT in
+        // `Agent::handle_user_message`.
+        snap.verifier_safe_stop_emitted_this_turn = false;
+        // Turn N+1: emit fires again.
+        let mut emits = 0usize;
+        if !snap.verifier_safe_stop_emitted_this_turn {
+            snap.verifier_safe_stop_emitted_this_turn = true;
+            emits += 1;
+        }
+        assert_eq!(
+            emits, 1,
+            "next turn must be able to re-emit after reset, got {emits}"
+        );
     }
 }

@@ -1,10 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::agent::prompting::load_project_instructions;
 use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
+
+use super::task_workspace_scope::TaskWorkspaceScope;
 
 /// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
 /// `AutoTestResult.output`. Issue #459 / DR2-009 keeps this private to the
@@ -105,6 +108,260 @@ impl VerifierCandidate {
     }
 }
 
+/// Issue #651: structured verifier command. Fields are intentionally
+/// private — sibling modules MUST construct values through the allowlisted
+/// `from_*` constructors below so an LLM-proposed `&&` / pipe / shell
+/// substitution can never reach `Command::new(...).args(...)`.
+///
+/// `to_display_string` is for **display / log** only and uses std-only
+/// whitespace joining (no `shlex` dependency, design 5-2). It must still
+/// pass through `crate::session::feedback::redact_verifier_command_for_storage`
+/// before landing in any persisted payload (DR4-004).
+///
+/// `bound_test_artifacts` stores the (already scope-validated) test
+/// artifact paths that were appended to `args`. Phase 2.3
+/// (`validate_bound_test_artifacts_for_execution`) re-checks them at
+/// execution time to defend against symlink-swap / TOCTOU.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifierCommand {
+    runner: String,
+    args: Vec<String>,
+    bound_test_artifacts: Vec<String>,
+}
+
+/// Runners allowlisted as structured verifier programs. The list is
+/// intentionally narrow and matches the structured `detect_*` entries
+/// in this module. Any new entry must come with a `from_*` constructor
+/// below and (where required) a Phase 2.3 execution-time path validator.
+const VERIFIER_RUNNER_ALLOWLIST: &[&str] = &[
+    "cargo", "python3", "python", "pytest", "uv", "poetry", "hatch", "npm", "pnpm", "yarn",
+];
+
+impl VerifierCommand {
+    /// Internal allowlist-checked constructor. Returns `None` when the
+    /// runner is not on `VERIFIER_RUNNER_ALLOWLIST`, when any arg
+    /// contains a shell control character (per
+    /// `completion_evidence::contains_evidence_poisoning_shell_control`,
+    /// DR4-002), or when `runner` itself contains such a character.
+    ///
+    /// Callers must dedupe `bound_test_artifacts` if they care about
+    /// ordering — the constructor preserves whatever ordering they pass.
+    fn new_allowlisted(
+        runner: &str,
+        args: Vec<String>,
+        bound_test_artifacts: Vec<String>,
+    ) -> Option<Self> {
+        if !VERIFIER_RUNNER_ALLOWLIST.contains(&runner) {
+            return None;
+        }
+        if super::completion_evidence::contains_evidence_poisoning_shell_control(runner) {
+            return None;
+        }
+        for arg in &args {
+            if super::completion_evidence::contains_evidence_poisoning_shell_control(arg) {
+                return None;
+            }
+        }
+        Some(Self {
+            runner: runner.to_string(),
+            args,
+            bound_test_artifacts,
+        })
+    }
+
+    /// `cargo test --test <name> ...` structured constructor.
+    ///
+    /// Issue #651 (CB-001 / CB-002): cargo positional args are
+    /// test-name filters, **not** file paths. Passing `tests/test_a.rs`
+    /// directly produces 0 tests matched and a misleading exit 0. We
+    /// therefore convert each owned test artifact to a
+    /// `--test <name>` flag for top-level `tests/<name>.rs` integration
+    /// tests. Any path we cannot safely convert (`src/...` unit tests,
+    /// nested integration paths, paths without a `.rs` stem) makes the
+    /// constructor return `None` so the caller falls back to `Weak`.
+    ///
+    /// CB-001 defense in depth: empty `owned_test_artifacts` is also a
+    /// hard reject. An unbound cargo verifier could otherwise execute
+    /// the entire test suite without satisfying the design contract
+    /// that the *current task's* test artifact actually ran.
+    ///
+    /// `args_prefix` lets the detector inject flags like `--no-fail-fast`
+    /// when needed; today the cargo path passes an empty prefix.
+    #[allow(dead_code)]
+    pub(super) fn from_cargo_test(
+        args_prefix: Vec<String>,
+        owned_test_artifacts: &[String],
+    ) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        let mut test_flags: Vec<String> = Vec::with_capacity(owned_test_artifacts.len() * 2);
+        for path in owned_test_artifacts {
+            let name = cargo_integration_test_name(path)?;
+            test_flags.push("--test".to_string());
+            test_flags.push(name);
+        }
+        let mut args = Vec::with_capacity(args_prefix.len() + 1 + test_flags.len());
+        args.push("test".to_string());
+        args.extend(args_prefix);
+        args.extend(test_flags);
+        Self::new_allowlisted("cargo", args, owned_test_artifacts.to_vec())
+    }
+
+    /// `pytest [<owned_test_artifacts>]` structured constructor. Used by
+    /// the bare-pytest / generic-Python detector path. Toolchain-specific
+    /// runners (`uv run pytest` etc.) get their own constructors.
+    ///
+    /// Issue #651 CB-001 defense in depth: empty `owned_test_artifacts`
+    /// is rejected so an unbound pytest verifier can never reach
+    /// `Command::new`. pytest does accept file paths as positional
+    /// args, so we forward them as-is; execution-time validation in
+    /// `validate_bound_test_artifacts_for_execution` re-checks the
+    /// canonical path then.
+    #[allow(dead_code)]
+    pub(super) fn from_pytest(
+        args_prefix: Vec<String>,
+        owned_test_artifacts: &[String],
+    ) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        let mut args = args_prefix;
+        args.extend(owned_test_artifacts.iter().cloned());
+        Self::new_allowlisted("pytest", args, owned_test_artifacts.to_vec())
+    }
+
+    /// `python3 -B -m pytest -p no:cacheprovider [<owned_test_artifacts>]`
+    /// structured constructor for the stdlib-Python toolchain detected by
+    /// `python_pytest_command`. Toolchain-specific runners (`uv run` etc.)
+    /// still go through Weak in Phase 2.2 because parsing their shell
+    /// shape is out of scope.
+    ///
+    /// Issue #651 CB-001 defense in depth: empty `owned_test_artifacts`
+    /// is rejected — pytest with no positional path scans the entire
+    /// rootdir, which means the verifier may pass even when zero tests
+    /// from the current task ran.
+    #[allow(dead_code)]
+    pub(super) fn from_python3_pytest_stdlib(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        let mut args = vec![
+            "-B".to_string(),
+            "-m".to_string(),
+            "pytest".to_string(),
+            "-p".to_string(),
+            "no:cacheprovider".to_string(),
+        ];
+        args.extend(owned_test_artifacts.iter().cloned());
+        Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
+    }
+
+    /// Returns the runner program name (allowlist member).
+    #[allow(dead_code)]
+    pub(super) fn runner(&self) -> &str {
+        &self.runner
+    }
+
+    /// Returns the structured args slice (no shell metacharacters).
+    #[allow(dead_code)]
+    pub(super) fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Returns the bound test artifact paths (scope-validated at planning
+    /// time; Phase 2.3 re-validates at execution time).
+    #[allow(dead_code)]
+    pub(super) fn bound_test_artifacts(&self) -> &[String] {
+        &self.bound_test_artifacts
+    }
+
+    /// Display-only join. Uses std whitespace join (no `shlex` crate).
+    /// Output must be passed through
+    /// `crate::session::feedback::redact_verifier_command_for_storage`
+    /// before landing in any persisted / logged payload (DR4-004).
+    #[allow(dead_code)]
+    pub(super) fn to_display_string(&self) -> String {
+        std::iter::once(self.runner.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Issue #651 CB-002: convert an owned test artifact path to the
+/// integration-test name `cargo test --test <name>` expects.
+///
+/// Cargo positional args after `cargo test` are test-name **filters**,
+/// not file paths. The only structurally safe binding we can produce
+/// from a path is the integration-test stem under top-level `tests/`:
+/// `tests/<name>.rs` → `--test <name>`.
+///
+/// Any path that is not exactly `tests/<stem>.rs` (e.g. `src/...`
+/// internal unit tests, `tests/sub/dir.rs` nested integration files,
+/// non-`.rs` extensions) returns `None`. The caller — currently
+/// [`VerifierCommand::from_cargo_test`] — must then drop to the `Weak`
+/// branch rather than fabricating a filter the LLM did not request.
+fn cargo_integration_test_name(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let mut components = p.components();
+    let first = components.next()?;
+    let std::path::Component::Normal(first_name) = first else {
+        return None;
+    };
+    if first_name.to_string_lossy() != "tests" {
+        return None;
+    }
+    let second = components.next()?;
+    if components.next().is_some() {
+        // Nested under `tests/<subdir>/...` — not a top-level
+        // integration test we can convert to `--test <name>`.
+        return None;
+    }
+    let std::path::Component::Normal(file_name) = second else {
+        return None;
+    };
+    let file_path = Path::new(file_name);
+    if file_path.extension()?.to_string_lossy() != "rs" {
+        return None;
+    }
+    let stem = file_path.file_stem()?.to_string_lossy().into_owned();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem)
+}
+
+/// Issue #651 Task 2.2: structured outcome of "given owned test
+/// artifacts, what verifier can we actually run?". Distinct from
+/// `Option<AutoTestPlan>` because Phase 4.1 needs to distinguish "found
+/// a runner but it cannot bind to a structured args list"
+/// (`Weak` → `SafeStopReason::VerifierWeak`) from "no runner detected
+/// at all" (`Missing` → `SafeStopReason::VerifierMissing`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum OwnedTestVerifierPlan {
+    /// A structured `VerifierCommand` was bound to `owned_test_artifacts`
+    /// and is safe to feed to `Command::new(runner).args(args)`. `plan`
+    /// is the display-side metadata (reason / shell-string preview).
+    Runnable {
+        plan: AutoTestPlan,
+        command: VerifierCommand,
+    },
+    /// A runner was detected, but it cannot be expressed as a structured
+    /// allowlisted `VerifierCommand` (e.g. `ProjectInstruction`,
+    /// `RecentSuccessfulBash`, `uv run pytest`, shell-only compound).
+    /// `display_command` carries the original shell preview for log
+    /// payload context (already constrained to the
+    /// `redact_verifier_command_for_storage` SSOT by callers).
+    Weak {
+        reason: &'static str,
+        detected_source: &'static str,
+        display_command: Option<String>,
+    },
+    /// No verifier candidate detected at all.
+    Missing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AutoTestResult {
     pub command: String,
@@ -172,6 +429,101 @@ impl AutoTestRunner {
         detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands)
     }
 
+    /// Issue #651 Task 2.2: `OwnedTestVerifierPlan` entrypoint.
+    ///
+    /// Selects the highest-priority `VerifierCandidate` (same SSOT as
+    /// `detect_candidate_with_recent_successes`) and then maps it to:
+    ///
+    /// - `Runnable` when the source has an allowlisted structured
+    ///   constructor (currently `CargoManifest` → cargo test and
+    ///   `PythonTests` stdlib → `python3 -B -m pytest`).
+    /// - `Weak` when a candidate exists but cannot be expressed as a
+    ///   structured `VerifierCommand` (free-form shell strings from
+    ///   ProjectInstruction / RecentSuccessfulBash, npm/pnpm/yarn or
+    ///   uv/poetry/hatch toolchains, pip-install compound, native node
+    ///   framework builds, python_compile fallback).
+    /// - `Missing` when no candidate was detected at all.
+    ///
+    /// The function never parses `plan.command` to construct a
+    /// `VerifierCommand` — only the per-source allowlisted builder may
+    /// call `VerifierCommand::new_allowlisted` (design 5-2 invariant).
+    #[allow(dead_code)]
+    pub(super) fn detect_with_owned_test_artifacts(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        owned_test_artifacts: &[String],
+    ) -> OwnedTestVerifierPlan {
+        // CB-001 (high): Without any owned test artifact, there is
+        // nothing for the verifier to bind to. Issue #651 design treats
+        // this as `Missing` rather than `Weak` — the semantic problem is
+        // "no test artifact for the current task", not "we lack a
+        // structured runner". This matches the SafeStopReason mapping
+        // (`Missing` → `VerifierMissing`).
+        if owned_test_artifacts.is_empty() {
+            return OwnedTestVerifierPlan::Missing;
+        }
+        let Some(candidate) = Self::detect_candidate_with_recent_successes(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+        ) else {
+            return OwnedTestVerifierPlan::Missing;
+        };
+        let display_command = candidate.plan.command.clone();
+        let source = candidate.source;
+        let evidence = candidate.evidence.clone();
+        let plan = candidate.into_plan();
+        match source {
+            VerifierCandidateSource::CargoManifest => {
+                if let Some(command) =
+                    VerifierCommand::from_cargo_test(Vec::new(), owned_test_artifacts)
+                {
+                    return OwnedTestVerifierPlan::Runnable { plan, command };
+                }
+                // CB-002: `from_cargo_test` returns `None` when an owned
+                // test artifact cannot be safely mapped to
+                // `cargo test --test <name>` (src/... internal paths,
+                // nested integration paths, non-`tests/<stem>.rs`
+                // shapes). The allowlist may also have rejected an arg.
+                // Either way we fall back to `Weak` rather than fabricate
+                // a positional filter that would match 0 tests.
+                OwnedTestVerifierPlan::Weak {
+                    reason: "cargo runner cannot bind owned test artifacts as --test flag",
+                    detected_source: source.as_str(),
+                    display_command: Some(display_command),
+                }
+            }
+            VerifierCandidateSource::PythonTests => {
+                // Only the stdlib toolchain has a structured constructor
+                // today. uv/poetry/hatch/pip-install paths fall through
+                // to Weak so an LLM-edited shell string can never become
+                // a structured execution path.
+                let is_stdlib = evidence.iter().any(|e| e == "python-toolchain:stdlib");
+                if is_stdlib
+                    && let Some(command) =
+                        VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
+                {
+                    return OwnedTestVerifierPlan::Runnable { plan, command };
+                }
+                OwnedTestVerifierPlan::Weak {
+                    reason: "python toolchain not structurally bindable",
+                    detected_source: source.as_str(),
+                    display_command: Some(display_command),
+                }
+            }
+            VerifierCandidateSource::ProjectInstruction
+            | VerifierCandidateSource::RecentSuccessfulBash
+            | VerifierCandidateSource::PackageJsonScripts
+            | VerifierCandidateSource::NativeNodeFramework
+            | VerifierCandidateSource::PythonCompileFallback => OwnedTestVerifierPlan::Weak {
+                reason: "verifier source has no allowlisted structured constructor",
+                detected_source: source.as_str(),
+                display_command: Some(display_command),
+            },
+        }
+    }
+
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
         let output = Command::new("sh")
             .arg("-lc")
@@ -208,6 +560,272 @@ impl AutoTestRunner {
             stderr,
         })
     }
+
+    /// Issue #651 Task 2.3: structured verifier execution.
+    ///
+    /// Re-validates `command.bound_test_artifacts` at execution time
+    /// (canonicalize + scope re-check, see
+    /// `validate_bound_test_artifacts_for_execution`) before spawning
+    /// `Command::new(runner).args(args)`. There is no shell — invalid
+    /// LLM-proposed shell text cannot reach the child process here
+    /// (DR4-002).
+    ///
+    /// A polling timeout (`AUTO_TEST_RUN_STRUCTURED_TIMEOUT`) kills the
+    /// child if it hangs (mirrors `project_verifier.rs::run_with_timeout`).
+    /// `display_command` is passed through
+    /// `crate::session::feedback::redact_verifier_command_for_storage`
+    /// so the persisted `AutoTestResult.command` field never contains
+    /// a raw LLM-supplied secret-shaped substring (DR4-004).
+    #[allow(dead_code)]
+    pub(super) fn run_structured(
+        work_root: &Path,
+        scope: &TaskWorkspaceScope,
+        command: &VerifierCommand,
+        display_command: &str,
+    ) -> Result<AutoTestResult, String> {
+        validate_bound_test_artifacts_for_execution(work_root, scope, command)?;
+
+        let mut child_cmd = Command::new(command.runner());
+        child_cmd
+            .args(command.args())
+            .current_dir(work_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = wait_with_auto_test_timeout(
+            &mut child_cmd,
+            Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let mut combined = String::new();
+        combined.push_str(&stdout);
+        if !stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr);
+        }
+        let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+        let redacted =
+            crate::session::feedback::redact_verifier_command_for_storage(display_command);
+        Ok(AutoTestResult {
+            command: redacted,
+            passed: output.status.success(),
+            output: truncate(&formatted, MAX_OUTPUT_BYTES),
+            exit_code: output.status.code(),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+/// Issue #651 Task 2.3: upper bound on a structured verifier process.
+/// 300s mirrors the value used by the legacy `auto_test::run` path's
+/// implicit wait (kept conservative to avoid breaking long test suites).
+const AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS: u64 = 300;
+
+/// Issue #651 Task 2.3: execution-time validator for
+/// `VerifierCommand.bound_test_artifacts`.
+///
+/// Stricter than planning-time `classify_ownership` because the child
+/// process is about to read the file. Rejects:
+/// - empty `bound_test_artifacts` (CB-001 defense in depth)
+/// - empty / absolute / `..` / control-character paths
+/// - paths containing an ignored top-level directory component
+///   (`node_modules`, `.git`, `target`, ...) — CB-004 re-applies the
+///   `task_workspace_scope::is_workspace_ignored_dir` SSOT that
+///   `classify_ownership` already runs at planning time
+/// - paths whose `std::fs::canonicalize` fails (missing file) — at
+///   execution time a missing test artifact is a hard reject
+/// - canonical targets that escape canonical `work_root` (symlink swap)
+/// - paths the `TaskWorkspaceScope::contains` SSOT does not admit
+#[allow(dead_code)]
+pub(super) fn validate_bound_test_artifacts_for_execution(
+    work_root: &Path,
+    scope: &TaskWorkspaceScope,
+    command: &VerifierCommand,
+) -> Result<(), String> {
+    // CB-001 defense in depth: an empty bound list means the verifier
+    // command was not bound to *any* owned test artifact. The
+    // constructors already reject this, but re-check here so an
+    // execution-time `VerifierCommand` mutated by a future caller can
+    // never run zero-bound and pass.
+    if command.bound_test_artifacts().is_empty() {
+        return Err("bound test artifact list is empty at execution time".to_string());
+    }
+    let work_root_canon = std::fs::canonicalize(work_root)
+        .map_err(|err| format!("failed to canonicalize work_root: {err}"))?;
+    for path in command.bound_test_artifacts() {
+        if path.is_empty() {
+            return Err("bound test artifact path is empty".to_string());
+        }
+        if path.chars().any(|c| c.is_control()) {
+            return Err(format!(
+                "bound test artifact path contains control character: {path:?}"
+            ));
+        }
+        let p = Path::new(path);
+        if p.is_absolute() {
+            return Err(format!(
+                "bound test artifact path must be relative, got absolute: {path:?}"
+            ));
+        }
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "bound test artifact path contains parent traversal: {path:?}"
+            ));
+        }
+        // CB-004: re-apply the planning-time ignored-top-dir filter at
+        // execution time. `classify_ownership` already rejects these
+        // paths at planning, but `VerifierCommand` constructors are
+        // `pub(super)` and a future sibling caller may stage a path
+        // that bypassed `owned_test_artifacts` (e.g. legacy callers,
+        // tests). Defense in depth keeps `node_modules/...`,
+        // `.git/...`, `target/...` etc. out of the verifier child
+        // process regardless of how the command was assembled.
+        if let Some(ignored) = p.components().find_map(|c| match c {
+            std::path::Component::Normal(name) => {
+                let name_str = name.to_string_lossy().into_owned();
+                if super::task_workspace_scope::is_workspace_ignored_dir(&name_str) {
+                    Some(name_str)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }) {
+            return Err(format!(
+                "bound test artifact path traverses an ignored workspace directory \
+                 ({ignored}): {path:?}"
+            ));
+        }
+        if !scope.contains(path) {
+            return Err(format!(
+                "bound test artifact path is not in TaskWorkspaceScope: {path:?}"
+            ));
+        }
+        let target = work_root.join(path);
+        let target_canon = std::fs::canonicalize(&target).map_err(|err| {
+            format!("bound test artifact missing at execution time: {path:?} ({err})")
+        })?;
+        if target_canon.strip_prefix(&work_root_canon).is_err() {
+            return Err(format!(
+                "bound test artifact canonicalization escapes work_root: {path:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Issue #651 Task 2.3 + CB-003: std-only polling wait with
+/// kill-on-timeout that **drains stdout/stderr concurrently** so a
+/// chatty test process never blocks on a full pipe buffer.
+///
+/// CB-003 fix: the previous implementation kept `stdout`/`stderr` as
+/// `Stdio::piped()` and waited via `try_wait` without reading the
+/// pipes. On macOS / Linux pipe buffers are ~64 KiB, so a chatty
+/// pytest / cargo test could block on `write(stdout)` while the parent
+/// loop spins in `try_wait` forever — eventually surfacing as a
+/// spurious timeout error instead of the real test exit code.
+///
+/// We now spawn one `std::thread` per output stream that drains the
+/// pipe into a `Vec<u8>` and reports the result over `mpsc::channel`.
+/// The main thread keeps the existing polling structure (so the
+/// kill-on-timeout contract is unchanged) and joins both drain threads
+/// after `wait()` returns — whether due to natural exit, timeout, or
+/// poll error.
+#[allow(dead_code)]
+fn wait_with_auto_test_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to run auto test command: {err}"))?;
+
+    // Move the piped handles out of `child` before any wait — once
+    // wait returns, the handles are no longer reachable for read.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let stdout_join = stdout_handle.map(|mut handle| {
+        let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+        let join = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let result = handle.read_to_end(&mut buf).map(|_| buf);
+            let _ = tx.send(result);
+        });
+        (join, rx)
+    });
+    let stderr_join = stderr_handle.map(|mut handle| {
+        let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+        let join = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let result = handle.read_to_end(&mut buf).map(|_| buf);
+            let _ = tx.send(result);
+        });
+        (join, rx)
+    });
+
+    let start = Instant::now();
+    let wait_outcome: Result<std::process::ExitStatus, String> = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!(
+                    "auto test command timed out after {}s",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("failed while waiting for auto test command: {err}"));
+            }
+        }
+    };
+
+    // Always join the drain threads. Both the success and timeout
+    // paths need to consume the channel result so the OS pipe can
+    // close cleanly and the thread handle is not detached.
+    let stdout_bytes = drain_collect(stdout_join);
+    let stderr_bytes = drain_collect(stderr_join);
+
+    let status = wait_outcome?;
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
+/// CB-003 helper type alias: per-stream drain handle = (join, rx).
+#[allow(dead_code)]
+type DrainHandle = (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+);
+
+/// CB-003 helper: join a drain thread's channel and unwrap to bytes.
+/// Any IO / panic failure degrades to an empty buffer — we never let a
+/// drain glitch mask the child exit status that the caller cares about.
+#[allow(dead_code)]
+fn drain_collect(handle: Option<DrainHandle>) -> Vec<u8> {
+    let Some((join, rx)) = handle else {
+        return Vec::new();
+    };
+    let bytes = rx.recv().ok().and_then(Result::ok).unwrap_or_default();
+    let _ = join.join();
+    bytes
 }
 
 fn detect_verifier_candidates(
@@ -2025,5 +2643,696 @@ dev = [
     #[test]
     fn auto_test_disabled_returns_false_when_env_absent() {
         assert!(!auto_test_disabled(|_| Err(std::env::VarError::NotPresent)));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 Task 2.1: VerifierCommand allowlist + display safety.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verifier_command_from_cargo_test_binds_artifact_paths() {
+        // CB-002: `tests/<name>.rs` paths convert to `--test <name>`
+        // flags rather than passing the file path verbatim (which cargo
+        // would interpret as a test-name filter, not a file path).
+        let owned = vec!["tests/test_a.rs".to_string()];
+        let command =
+            VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo is allowlisted");
+        assert_eq!(command.runner(), "cargo");
+        assert_eq!(
+            command.args(),
+            vec![
+                "test".to_string(),
+                "--test".to_string(),
+                "test_a".to_string()
+            ]
+            .as_slice()
+        );
+        assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+        // Display string joins with single spaces — no `shlex`.
+        assert_eq!(command.to_display_string(), "cargo test --test test_a");
+    }
+
+    #[test]
+    fn verifier_command_from_pytest_binds_artifact_paths() {
+        let owned = vec!["app/tests/test_foo.py".to_string()];
+        let command = VerifierCommand::from_pytest(vec!["-q".to_string()], &owned)
+            .expect("pytest allowlisted");
+        assert_eq!(command.runner(), "pytest");
+        assert_eq!(
+            command.args(),
+            vec!["-q".to_string(), "app/tests/test_foo.py".to_string()].as_slice()
+        );
+        assert_eq!(
+            command.to_display_string(),
+            "pytest -q app/tests/test_foo.py"
+        );
+    }
+
+    #[test]
+    fn verifier_command_rejects_shell_compound_in_runner_or_args() {
+        // Runner outside the allowlist (e.g. `sh`, or pre-joined shell
+        // string) must fail to construct via the internal allowlist gate.
+        assert!(
+            VerifierCommand::new_allowlisted("sh", vec!["-c".into(), "cargo test".into()], vec![])
+                .is_none(),
+            "sh must not be allowlisted as a verifier runner"
+        );
+        // Shell-compound `&&` injected in an arg must trip the DR4-002
+        // detector and reject the construction.
+        let bad_args = vec!["test".to_string(), "&&".to_string(), "rm".to_string()];
+        assert!(
+            VerifierCommand::new_allowlisted("cargo", bad_args, vec![]).is_none(),
+            "arg containing `&&` must trip contains_evidence_poisoning_shell_control"
+        );
+    }
+
+    #[test]
+    fn verifier_command_display_string_for_shell_safe_path_does_not_trip_detector() {
+        // Shell-safe (no `;`, `&`, `|`, `<`, `>`, backtick, `$(`, etc.)
+        // owned test artifacts produce a display string that itself
+        // passes the DR4-002 detector. This pins the invariant that
+        // VerifierCommand never round-trips into the
+        // `contains_evidence_poisoning_shell_control` reject path.
+        let owned = vec!["tests/test_a.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        let display = command.to_display_string();
+        assert!(
+            !super::super::completion_evidence::contains_evidence_poisoning_shell_control(&display),
+            "shell-safe owned test artifact path should produce a shell-safe display string, got {display:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 Task 2.2: detect_with_owned_test_artifacts dispatch.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_owned_for_cargo_project_returns_runnable_with_bound_paths() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write");
+        let owned = vec!["tests/test_a.rs".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "cargo");
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+                // CB-002: positional `tests/test_a.rs` becomes
+                // `--test test_a` so cargo runs the integration test.
+                assert_eq!(
+                    command.args(),
+                    vec![
+                        "test".to_string(),
+                        "--test".to_string(),
+                        "test_a".to_string()
+                    ]
+                    .as_slice()
+                );
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_owned_for_stdlib_python_project_returns_runnable_python3() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+        let owned = vec!["tests/test_x.py".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["app.py".to_string()],
+            &[],
+            &owned,
+        );
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert!(command.args().contains(&"pytest".to_string()));
+                assert!(
+                    command.args().contains(&"tests/test_x.py".to_string()),
+                    "owned test artifact must be appended to args, got {:?}",
+                    command.args()
+                );
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_owned_for_project_instruction_returns_weak() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ANVIL.md"),
+            "Preferred verify: `python3 project_csv_tool.py example.csv`\n",
+        )
+        .expect("anvil");
+        std::fs::write(dir.path().join("project_csv_tool.py"), "print('ok')\n").expect("py");
+        std::fs::write(dir.path().join("example.csv"), "Category,Amount\nA,1\n").expect("csv");
+        // CB-001 entry-point check requires a non-empty bound list.
+        // The owned test artifact (a Python test file) keeps us out of
+        // the Missing branch; the candidate detector still selects
+        // `project_instruction` and the dispatch maps it to Weak.
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["project_csv_tool.py".to_string()],
+            &[],
+            &["tests/test_x.py".to_string()],
+        );
+        match plan {
+            OwnedTestVerifierPlan::Weak {
+                detected_source, ..
+            } => {
+                assert_eq!(detected_source, "project_instruction");
+            }
+            other => panic!("expected Weak, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_owned_for_recent_successful_bash_only_returns_weak() {
+        // No detectable structured project; only a recent successful
+        // bash command. The detector must return Weak so the caller
+        // does not feed the free-form shell text to `Command::new`.
+        // CB-001 requires a non-empty owned list to even reach the
+        // candidate-source dispatch.
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.py"), "print('ok')\n").expect("py");
+        let recent = vec!["cargo test".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["app.py".to_string()],
+            &recent,
+            &["tests/test_x.py".to_string()],
+        );
+        match plan {
+            OwnedTestVerifierPlan::Weak {
+                detected_source, ..
+            } => {
+                assert_eq!(detected_source, "recent_successful_bash");
+            }
+            other => panic!("expected Weak, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_owned_with_nothing_detected_returns_missing() {
+        let dir = tempdir().expect("tempdir");
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &[]);
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 Task 2.3: validate_bound_test_artifacts_for_execution
+    // + run_structured (spawn + polling timeout).
+    // -----------------------------------------------------------------
+
+    fn single_root_scope_for_validation() -> super::super::task_workspace_scope::TaskWorkspaceScope
+    {
+        super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        }
+    }
+
+    #[test]
+    fn validate_bound_artifacts_accepts_existing_in_scope_paths() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/test_x.rs"), "").unwrap();
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["tests/test_x.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn validate_bound_artifacts_rejects_missing_file_at_execution_time() {
+        let dir = tempdir().expect("tempdir");
+        let scope = single_root_scope_for_validation();
+        // Use `from_pytest` here: it preserves the path verbatim in
+        // `bound_test_artifacts`, while `from_cargo_test` rejects any
+        // path that does not match the `tests/<stem>.rs` shape
+        // (CB-002).
+        let owned = vec!["tests/does_not_exist.rs".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err("missing file must reject");
+        assert!(
+            err.contains("missing at execution time"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_bound_artifacts_rejects_absolute_path() {
+        // The pytest constructor stores `bound_test_artifacts` verbatim,
+        // so we can stage a bad path that bypasses planning-time checks.
+        // (CB-002 prevents `from_cargo_test` from being used for this.)
+        let dir = tempdir().expect("tempdir");
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["/etc/passwd".to_string()];
+        // /etc/passwd contains shell-safe characters only — the
+        // allowlist constructor accepts it; the execution-time
+        // validator must still reject.
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err("absolute path must reject");
+        assert!(err.contains("must be relative"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_bound_artifacts_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret.rs"), "").unwrap();
+        let work = tempdir().expect("work");
+        symlink(
+            outside.path().join("secret.rs"),
+            work.path().join("alias.rs"),
+        )
+        .expect("symlink");
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["alias.rs".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(work.path(), &scope, &command);
+        let err = result.expect_err("symlink escape must reject");
+        assert!(
+            err.contains("canonicalization escapes work_root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_structured_kills_child_on_timeout() {
+        // Spawn /bin/sleep 60 and force a 50ms timeout to exercise the
+        // kill path. We cannot easily build a VerifierCommand for sleep
+        // (not on the allowlist), so we go through the lower-level
+        // helper directly. This pins the polling-timeout contract.
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = wait_with_auto_test_timeout(&mut command, Duration::from_millis(50));
+        let err = result.expect_err("timed-out sleep must Err");
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 CB-001: empty owned_test_artifacts must produce
+    // OwnedTestVerifierPlan::Missing (not Runnable, not Weak).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_owned_with_cargo_project_and_empty_artifacts_returns_missing() {
+        // Cargo.toml is present, so the candidate detector finds
+        // `CargoManifest`. Without any bound test artifact path,
+        // however, `detect_with_owned_test_artifacts` must drop to
+        // `Missing` per CB-001 — running `cargo test` unbound would
+        // produce a false-positive completion when the suite happens
+        // to be empty / pre-existing.
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write");
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &[]);
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    #[test]
+    fn detect_owned_with_python_project_and_empty_artifacts_returns_missing() {
+        // Python stdlib pytest project (tests/ dir present) with no
+        // owned test artifact must also Missing rather than running
+        // `python3 -m pytest` with zero positional paths (which would
+        // scan the rootdir indiscriminately).
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["app.py".to_string()],
+            &[],
+            &[],
+        );
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    #[test]
+    fn validate_bound_artifacts_rejects_empty_bound_paths() {
+        // `bound_test_artifacts` is normally guaranteed non-empty by
+        // the constructors, but the execution-time validator must
+        // independently reject an empty list (CB-001 defense in depth).
+        // We build the command via the from_pytest path with a single
+        // path, then exercise the empty-list branch through a hand-
+        // assembled `VerifierCommand` via `new_allowlisted` with no
+        // bound artifacts.
+        let dir = tempdir().expect("tempdir");
+        let scope = single_root_scope_for_validation();
+        let command =
+            VerifierCommand::new_allowlisted("pytest", vec!["-q".to_string()], vec![]).expect("ok");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err("empty bound list must reject");
+        assert!(err.contains("empty"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 CB-002: cargo positional arg is a name filter, not
+    // a path. `from_cargo_test` must convert `tests/<stem>.rs` →
+    // `--test <stem>` and reject paths it cannot safely convert.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn verifier_command_from_cargo_test_converts_tests_dir_to_test_flag() {
+        let owned = vec!["tests/integration_one.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(
+            command.args(),
+            vec![
+                "test".to_string(),
+                "--test".to_string(),
+                "integration_one".to_string()
+            ]
+            .as_slice(),
+            "tests/<stem>.rs must map to `--test <stem>` (CB-002)"
+        );
+    }
+
+    #[test]
+    fn verifier_command_from_cargo_test_rejects_src_internal_path_returns_none() {
+        // src/... is a unit-test module path; cargo cannot run an
+        // arbitrary file under `src/` as an integration test, so the
+        // constructor must return None (and the caller falls back to
+        // Weak).
+        let owned = vec!["src/lib/foo.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
+        assert!(command.is_none(), "src/... path must not be convertible");
+    }
+
+    #[test]
+    fn verifier_command_from_cargo_test_rejects_non_rs_extension_returns_none() {
+        // `.py`, `.toml`, etc. cannot be an integration test file —
+        // the helper must refuse to fabricate a `--test <stem>` flag.
+        let owned = vec!["tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
+        assert!(command.is_none(), "non-.rs path must not be convertible");
+    }
+
+    #[test]
+    fn verifier_command_from_cargo_test_rejects_nested_tests_path_returns_none() {
+        // tests/sub/dir.rs is a sub-directory integration file. cargo's
+        // `--test <name>` flag does not address those; reject so the
+        // caller drops to Weak rather than fabricate a misleading flag.
+        let owned = vec!["tests/sub/dir.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
+        assert!(
+            command.is_none(),
+            "nested tests/<sub>/<file>.rs must not be convertible"
+        );
+    }
+
+    #[test]
+    fn detect_owned_for_cargo_project_with_unconvertible_path_returns_weak() {
+        // A Cargo project with an owned test artifact under src/...
+        // means `from_cargo_test` returns None. The detector must
+        // surface this as `Weak` so the caller never executes an
+        // unbound `cargo test` (CB-002).
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write");
+        let owned = vec!["src/lib/foo.rs".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
+        match plan {
+            OwnedTestVerifierPlan::Weak {
+                detected_source, ..
+            } => {
+                assert_eq!(detected_source, "cargo_manifest");
+            }
+            other => panic!("expected Weak, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 CB-003: timeout polling must concurrently drain
+    // stdout/stderr so a chatty child cannot block on pipe buffer.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn run_structured_drains_large_output_without_pipe_block() {
+        // The previous implementation kept stdout piped without
+        // reading it, so a child that writes more than the OS pipe
+        // buffer (~64 KiB on Linux/macOS) blocks on `write()` and
+        // never exits, eventually surfacing as a spurious timeout.
+        //
+        // We emit ~512 KiB to stdout from a tiny shell command, then
+        // exit 0. With concurrent drain in place the helper must
+        // collect the full output and return Ok within the timeout.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            // 1024 lines of ~512 bytes each → ~512 KiB on stdout.
+            .arg("i=0; while [ $i -lt 1024 ]; do printf '%s\\n' \"$(printf '%.0sa' $(seq 1 500))\"; i=$((i+1)); done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let result = wait_with_auto_test_timeout(&mut command, Duration::from_secs(10))
+            .expect("large stdout must not deadlock with concurrent drain (CB-003)");
+        assert!(result.status.success(), "shell must exit 0");
+        assert!(
+            result.stdout.len() >= 500 * 1024,
+            "expected ~512 KiB of stdout, got {} bytes",
+            result.stdout.len()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 CB-004: execution-time validator must re-apply the
+    // ignored-top-dir rule (node_modules / .git / target / ...).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_bound_artifacts_rejects_node_modules_path() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/test.js"), "").unwrap();
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["node_modules/pkg/test.js".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err("node_modules path must reject");
+        assert!(
+            err.contains("ignored workspace directory") && err.contains("node_modules"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_bound_artifacts_rejects_dot_git_path() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+        std::fs::write(dir.path().join(".git/hooks/test.py"), "").unwrap();
+        let scope = single_root_scope_for_validation();
+        let owned = vec![".git/hooks/test.py".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err(".git path must reject");
+        assert!(
+            err.contains("ignored workspace directory") && err.contains(".git"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_bound_artifacts_rejects_target_dir_path() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/test_x.rs"), "").unwrap();
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["target/debug/test_x.rs".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err("target/ path must reject");
+        assert!(
+            err.contains("ignored workspace directory") && err.contains("target"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 Phase 7: E2E observation tests (5 acceptance criteria).
+    //
+    // These pin the end-to-end Issue #651 receipt conditions at the
+    // structured-verifier seam. Ollama is not required; every scenario
+    // exercises pure dispatch / construction logic of the
+    // `OwnedTestVerifierPlan` family.
+    // -----------------------------------------------------------------
+
+    use super::super::task_contract::{CompletionDecision, SafeStopReason, TaskContract};
+
+    /// 受入条件 1: a request that literally asks for tests AND only has
+    /// a `py_compile`-style fallback (no allowlisted runner) MUST NOT
+    /// reach `CompletionDecision::Done` — `evaluate_with_owned_test_artifacts`
+    /// returns `SafeStop { reason: VerifierMissing }` when no owned
+    /// test artifact bound to a structured runner.
+    #[test]
+    fn e2e_651_001_py_compile_only_with_required_tests_does_not_reach_done() {
+        let contract = TaskContract::from_request(
+            "Implement a small feature and add a test for it (tests required).",
+        );
+        assert!(
+            contract.required_behavior.test_execution_required,
+            "request must mark test_execution_required"
+        );
+        // Simulate "all required artifacts observed + verifier passed"
+        // — the only failure mode left is "no owned test artifact bound".
+        use super::super::completion_evidence::{
+            CompletionEvidence, EvidenceSet, RepoEditCategory,
+        };
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Impl,
+            count: 1,
+        });
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Test,
+            count: 1,
+        });
+        evidence.push(CompletionEvidence::VerifierExitZero {
+            class: crate::tools::bash::BashCommandClass::BuildTest,
+            command: "python3 -m py_compile app.py".to_string(),
+        });
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierMissing,
+            },
+            "py_compile + required-tests + empty owned must SafeStop, got {decision:?}"
+        );
+    }
+
+    /// 受入条件 2: when an owned Python test artifact is staged,
+    /// `OwnedTestVerifierPlan::Runnable.command.bound_test_artifacts`
+    /// MUST contain that path verbatim.
+    #[test]
+    fn e2e_651_002_owned_test_artifact_appears_in_bound_test_artifacts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+        let owned = vec!["tests/test_x.py".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["app.py".to_string()],
+            &[],
+            &owned,
+        );
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    /// 受入条件 3: symlink / absolute / `..` paths are filtered upstream
+    /// at the `artifact_ownership::owned_test_artifacts` SSOT boundary
+    /// (see the dedicated unit tests in `artifact_ownership.rs`). At the
+    /// `VerifierCommand` constructor level we additionally require that
+    /// any unsafe path which somehow reached `bound_test_artifacts` is
+    /// rejected at execution time. This test pins the absolute-path
+    /// reject because that is the most likely path an LLM could
+    /// fabricate.
+    #[test]
+    fn e2e_651_003_unsafe_path_does_not_reach_execution() {
+        // VerifierCommand constructors take the path as-is from the
+        // upstream ownership filter. We simulate a leaked absolute
+        // path passing the constructor (e.g. a future regression in
+        // owned_test_artifacts) and assert that the execution-time
+        // validator rejects it.
+        let dir = tempdir().expect("tempdir");
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["/etc/passwd".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest accepts");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        let err = result.expect_err("absolute path must reject");
+        assert!(
+            err.contains("absolute"),
+            "expected absolute-path rejection, got {err}"
+        );
+    }
+
+    /// 受入条件 4: an auto-detected `cargo test` runner does NOT
+    /// silently satisfy the Issue #651 invariant when the owned test
+    /// artifact slice is empty — the dispatch returns `Missing`, not
+    /// `Runnable`, so the caller maps it to `verifier_missing`.
+    #[test]
+    fn e2e_651_004_auto_detected_cargo_test_with_no_owned_artifact_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("write");
+        // Cargo would otherwise be Runnable, but with an empty owned
+        // slice the entry-point guard (CB-001 defense-in-depth) flips
+        // it to Missing.
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &[]);
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    /// 受入条件 5: an LLM-fabricated shell-style command string never
+    /// reaches `Command::new(...).args(...)`. `VerifierCommand::new_allowlisted`
+    /// is the only allowlisted constructor, and it rejects:
+    ///   - runners outside the allowlist (e.g. `sh -lc ...`)
+    ///   - any arg containing shell metacharacters (`&&`, `|`, `;`, ...)
+    #[test]
+    fn e2e_651_005_llm_generated_verifier_command_string_never_reaches_shell() {
+        // sh outside the allowlist: caller cannot fabricate
+        // `sh -lc "rm -rf /"` even if it tries.
+        assert!(
+            VerifierCommand::new_allowlisted(
+                "sh",
+                vec!["-lc".to_string(), "rm -rf /".to_string()],
+                vec![],
+            )
+            .is_none(),
+            "sh must not be allowlisted"
+        );
+        // bash same — outside the allowlist.
+        assert!(
+            VerifierCommand::new_allowlisted(
+                "bash",
+                vec!["-c".to_string(), "cargo test".to_string()],
+                vec![],
+            )
+            .is_none(),
+            "bash must not be allowlisted"
+        );
+        // Allowlisted runner + shell-control args still reject.
+        let cases = vec![
+            vec!["test".to_string(), "&&".to_string(), "rm".to_string()],
+            vec!["test".to_string(), "|".to_string(), "cat".to_string()],
+            vec!["test".to_string(), ";".to_string(), "echo".to_string()],
+            vec!["test".to_string(), "`whoami`".to_string()],
+            vec!["test".to_string(), "$(id)".to_string()],
+        ];
+        for args in cases {
+            assert!(
+                VerifierCommand::new_allowlisted("cargo", args.clone(), vec![]).is_none(),
+                "args with shell control must be rejected: {args:?}"
+            );
+        }
     }
 }

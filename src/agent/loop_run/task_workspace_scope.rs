@@ -89,8 +89,14 @@ pub(super) enum ScopeMode {
     Greenfield,
 }
 
+// Issue #651 Task 3.1: visibility raised to `pub(crate)` so
+// `VerifierInputs::workspace_scope` (re-exported via `pub` because
+// `SkillInput::Verifier(VerifierInputs<'_>)` lives at the skills-layer
+// boundary) does not trip the `private_interfaces` lint. Skill-framework
+// crate code MUST NOT actually read the field — the DR1-007 contract is
+// documented on `VerifierInputs::workspace_scope` itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct TaskWorkspaceScope {
+pub(crate) struct TaskWorkspaceScope {
     pub(super) mode: ScopeMode,
 }
 
