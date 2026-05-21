@@ -29,6 +29,12 @@ use crate::tools::registry::{ToolContext, ToolRegistry};
 // *not* re-exported (DR3-001) — `turn.rs` and `task_contract.rs` are the
 // only in-crate consumers via `super::artifact_ownership::*`.
 mod artifact_ownership;
+// Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
+// `ArtifactAttemptOutcome` 4-variant taxonomy +
+// `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
+// *not* re-exported (DR3-001) — `turn.rs` is the only behavioral
+// in-crate consumer via `super::artifact_completion_job::*`.
+mod artifact_completion_job;
 pub(crate) mod auto_promote;
 mod auto_test;
 pub mod commands;
@@ -513,7 +519,48 @@ pub struct Agent {
     /// the start of every user turn; while populated, task-contract recovery
     /// can constrain file tools to this artifact without forcing focused-edit
     /// mode immediately.
+    ///
+    /// Issue #652 (DR1-003 / design judgement #2): `ArtifactCompletionJob` is
+    /// the new SSOT for the in-flight artifact completion task. While a job
+    /// exists in `artifact_completion_job` and its role is `Test` (the only
+    /// role driven by `requires_test_execution()` in this Issue), the
+    /// `current_artifact_recovery_target` value here is kept in sync by
+    /// writing the projection from `ArtifactCompletionJob::
+    /// projection_recovery_target()` at the same call sites — there is no
+    /// divergent independent assignment outside of `set_artifact_recovery_target_from_hint`.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
+    /// Issue #652: in-flight artifact-completion job (role-specific retry
+    /// budget, sanitized attempt history, wrong-target / no-tool / prose-only
+    /// / role-policy-violation taxonomy). Reset at every
+    /// `handle_user_message` head (per-turn cap pattern, DR3-003); populated
+    /// by `turn.rs` when a `Test` artifact is the missing required role.
+    /// Module is private (DR3-001) — `turn.rs` is the only behavioral
+    /// in-crate consumer.
+    artifact_completion_job:
+        Option<crate::agent::loop_run::artifact_completion_job::ArtifactCompletionJob>,
+    /// Issue #652 CB-002: per-turn flag set the first time
+    /// `record_artifact_completion_attempt` transitions the active job to
+    /// `Exhausted`. Read by the actor loop right after each `execute_tool_call`
+    /// to terminate with `MissingRepoEdits` so a wrong-target rejection at
+    /// the 3rd attempt does not silently continue the loop. Also gates
+    /// `maybe_emit_artifact_completion_failed_diagnostic` to a single emission
+    /// per turn (CB-002 duplicate diagnostic suppression). Reset at every
+    /// `handle_user_message` head (per-turn cap pattern).
+    pub(super) artifact_completion_exhausted_this_turn: bool,
+    /// Issue #652 CB2-003: per-turn flag set by
+    /// `maybe_emit_artifact_completion_failed_diagnostic` once it has emitted
+    /// the `artifact_completion_failed role=<role>` system note / log /
+    /// working-memory tuple in the current turn. Reset at every
+    /// `handle_user_message` head (per-turn cap pattern, DR3-003).
+    ///
+    /// Previously the dedup relied on `working_memory.unresolved_errors`
+    /// matching the `artifact_completion_failed role=<role>` prefix. That is
+    /// session state — `handle_user_message` does NOT clear it — so a
+    /// residual error from the prior turn would suppress the very first
+    /// emission of the current turn. The turn-local boolean removes that
+    /// cross-turn leakage while keeping the within-turn single-emit
+    /// guarantee that CB-002 relies on.
+    pub(super) artifact_completion_failed_diagnostic_emitted_this_turn: bool,
     /// Issue #623 follow-up / #625 / #627: verifier repair is a diagnostic phase.
     /// The context is turn-local control data, not conversation memory. It keeps
     /// verifier output, deterministic facts, and one bounded assessment so the
@@ -798,6 +845,9 @@ impl Agent {
             evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
+            artifact_completion_job: None,
+            artifact_completion_exhausted_this_turn: false,
+            artifact_completion_failed_diagnostic_emitted_this_turn: false,
             task_contract_verifier_repair_pending: false,
             task_contract_verifier_passed_this_actor_loop: false,
             repair_job: None,

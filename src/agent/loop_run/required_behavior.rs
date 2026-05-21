@@ -266,6 +266,20 @@ impl RequiredBehaviorContract {
         false
     }
 
+    /// Issue #652: judgement API — does this contract require a test artifact
+    /// to be exercised by the verifier?
+    ///
+    /// After Issue #651 landed the explicit `test_execution_required` boolean
+    /// (SSOT-aligned with `super::task_contract::request_asks_for_test_artifact`),
+    /// this helper just reads that field directly (DR1-007 / design judgement
+    /// #3). The call-site contract is unchanged; callers in `turn.rs` keep
+    /// using `requires_test_execution()` and the field stays a single source
+    /// of truth.
+    #[allow(dead_code)] // wired through unit tests today; #651 will land the explicit call site.
+    pub(super) fn requires_test_execution(&self) -> bool {
+        self.test_execution_required
+    }
+
     /// Issue #636: judgement API — does `excerpt` hit any of the
     /// `domain_terms`?
     ///
@@ -1495,5 +1509,38 @@ mod tests {
         assert_test_execution_required_matches_ssot(
             "FastAPIでCRUDのAPIを開発してください。テストも実装してください。",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Group G (Issue #652 / DR1-007): `requires_test_execution()` is a
+    // direct read of `test_execution_required` after #651 landed the
+    // explicit boolean.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn requires_test_execution_returns_false_when_field_is_false() {
+        let c = empty_contract();
+        assert!(!c.requires_test_execution());
+    }
+
+    #[test]
+    fn requires_test_execution_returns_true_when_field_is_true() {
+        let mut c = empty_contract();
+        c.test_execution_required = true;
+        assert!(c.requires_test_execution());
+    }
+
+    #[test]
+    fn requires_test_execution_is_independent_of_verification_kinds() {
+        // After DR1-007 swap, `verification` is no longer read by the
+        // helper — the explicit boolean is the SSOT.
+        let mut c = empty_contract();
+        c.verification = Some(vec![VerificationKind::Test]);
+        c.test_execution_required = false;
+        assert!(!c.requires_test_execution());
+
+        c.verification = Some(vec![VerificationKind::Build, VerificationKind::Run]);
+        c.test_execution_required = true;
+        assert!(c.requires_test_execution());
     }
 }

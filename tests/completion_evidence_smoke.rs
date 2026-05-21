@@ -385,3 +385,100 @@ fn verifier_command_persisted_with_secrets_is_redacted_round_trip() {
     assert!(!stored.contains("ghp_supersecretvalueABCDEFGHIJKLMNOP"));
     assert!(stored.contains("***"));
 }
+
+// ----------------------- Issue #652 acceptance smoke ----------------------
+
+/// Issue #652 AC-(a) — required role `test` does not turn an `impl` edit
+/// into completion evidence. The SSOT path classifier returns the role
+/// label that disambiguates `impl` from `test` paths; the per-turn
+/// task-contract evidence-set in `turn.rs` only admits the matching
+/// category (`role_from_repo_edit` SSOT, set #618 / #622).
+///
+/// This smoke pins the classifier output: `src/x.py` is `impl`, NOT
+/// `test`, so when the required role is `test` the `turn.rs` task
+/// contract gate will *not* push it as completion evidence.
+#[test]
+fn smoke_test_role_required_does_not_classify_impl_edit_as_test() {
+    assert_eq!(
+        classify_repo_edit_path_for_test(Path::new("src/x.py")),
+        "impl"
+    );
+    assert_eq!(
+        classify_repo_edit_path_for_test(Path::new("tests/test_x.py")),
+        "test"
+    );
+    // An impl-classified path can never satisfy a test-required artifact
+    // role, regardless of how many times the model writes to it — this is
+    // the core invariant Issue #652 enforces by recording `WrongTarget`
+    // attempts against the active `ArtifactCompletionJob`.
+    assert_ne!(
+        classify_repo_edit_path_for_test(Path::new("src/x.py")),
+        classify_repo_edit_path_for_test(Path::new("tests/test_x.py"))
+    );
+}
+
+/// Issue #652 AC-(b) — wrong-target classification routes through the
+/// SSOT path classifier and the role-mismatch is structurally observable
+/// at the integration layer.
+#[test]
+fn smoke_wrong_target_edit_can_be_distinguished_from_target_role() {
+    // Required role: Test. Allowed target: tests/test_x.py.
+    // Wrong-target attempts go against impl / docs / setup paths.
+    let target_role = classify_repo_edit_path_for_test(Path::new("tests/test_x.py"));
+    assert_eq!(target_role, "test");
+    for wrong in ["src/x.py", "src/main.rs", "docs/intro.md", "package.json"] {
+        let role = classify_repo_edit_path_for_test(Path::new(wrong));
+        assert_ne!(
+            role, target_role,
+            "wrong-target path {wrong} classifies as {role}, which collides with the test target role"
+        );
+    }
+}
+
+/// Issue #652 DR3-001 audit — Agent construction does not panic after
+/// `artifact_completion_job: Option<ArtifactCompletionJob>` is added to
+/// the `Agent` struct and the per-turn reset wiring is in place. Smoke
+/// check: a no-Ollama `Agent::new` + immediate drop must continue to
+/// succeed. The private module surface is not directly exercised here
+/// (DR3-001 keeps it inside `loop_run`), but the constructor path must
+/// remain panic-free.
+#[test]
+fn agent_construction_after_artifact_completion_job_wiring_does_not_panic() {
+    use anvil::agent::Agent;
+    use anvil::agent::loop_run::FooterHandle;
+    use anvil::config::Config;
+    use anvil::model_registry::RuntimeModels;
+    use anvil::ollama::client::OllamaClient;
+    use anvil::session::store::{SessionSnapshot, SessionStore};
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    std::fs::create_dir_all(state_root.join("sessions").join("test-652-agent-smoke")).unwrap();
+
+    let mut config = Config::default();
+    config.cwd = dir.path().to_path_buf();
+    config.photon_enabled = false;
+    config.requested_model = Some("test-model".to_string());
+    config.state_dir_override = Some(state_root.clone());
+    config.yes_mode = true;
+    config.max_iterations = 1;
+
+    let session = SessionSnapshot {
+        id: "test-652-agent-smoke".to_string(),
+        workspace_key: "anvil-652-smoke".to_string(),
+        ..Default::default()
+    };
+
+    let _agent = Agent::new(
+        config,
+        RuntimeModels {
+            main: "test-model".to_string(),
+            sidecar: None,
+        },
+        OllamaClient::new("http://127.0.0.1:19999".to_string()).unwrap(),
+        SessionStore::new(&state_root, "test-652-agent-smoke", "anvil-652-smoke"),
+        session,
+        FooterHandle::disabled(),
+    );
+}

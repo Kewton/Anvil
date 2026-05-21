@@ -202,6 +202,81 @@ pub(super) fn owned_test_artifacts(
     out
 }
 
+/// Issue #652 PR-002 SSOT: missing-tail parent / dangling-symlink ancestor
+/// validation for a candidate path.
+///
+/// First inspects the **candidate (leaf) itself** via `symlink_metadata`.
+/// PRR-001 (re-review v2): the previous version skipped this check and
+/// advanced straight to `candidate.parent()`, which let a dangling-symlink
+/// leaf (e.g. `tests/test_artifact.py -> /outside/missing.py`) slip through
+/// whenever the parent dir was inside `work_root`. A subsequent
+/// `std::fs::write` on the leaf dereferences the link and writes outside
+/// the workspace.
+///
+/// Behaviour:
+/// - If the candidate exists (per `symlink_metadata` — does NOT follow
+///   links): require `canonicalize(candidate)` to succeed and resolve to a
+///   path inside `canonicalize(work_root)`. A dangling symlink leaf
+///   (metadata succeeds, canonicalize fails) is rejected.
+/// - If the candidate does not exist (per `symlink_metadata`): walk up to
+///   the nearest existing ancestor and apply the same `canonicalize` +
+///   prefix check. A dangling-symlink ancestor is rejected.
+///
+/// Returns `false` when:
+/// - `canonicalize(work_root)` fails (defensive — work_root must exist);
+/// - the walk falls off the filesystem root before any ancestor is found;
+/// - any leaf-or-ancestor is a dangling symlink (`symlink_metadata().is_ok()`
+///   but `canonicalize` fails — CB2-002 / PRR-001);
+/// - the canonicalized leaf-or-ancestor escapes `work_root` via a symlink.
+///
+/// Callers: `artifact_completion_job::ArtifactCompletionJob::new`
+/// (missing-leaf creation target) and `turn.rs::
+/// tool_path_matches_target_via_workspace_ssot` (tool-argument match).
+/// `candidate` is the fully joined `work_root.join(relative_path)` for
+/// relative paths, or the raw absolute path for absolute inputs.
+pub(super) fn nearest_existing_ancestor_within_work_root(
+    work_root: &Path,
+    candidate: &Path,
+) -> bool {
+    let Ok(root_canon) = std::fs::canonicalize(work_root) else {
+        return false;
+    };
+    // PRR-001: inspect the leaf itself first. `symlink_metadata` does not
+    // follow links, so a dangling symlink leaf surfaces here as
+    // `Ok(meta)` while `canonicalize` will subsequently fail. A genuine
+    // file/dir at the leaf canonicalizes successfully — we still verify
+    // the canonical form is contained inside the workspace to block
+    // in-root symlinks pointing outside.
+    if candidate.symlink_metadata().is_ok() {
+        let Ok(canon) = std::fs::canonicalize(candidate) else {
+            // Dangling symlink leaf (metadata succeeds, canonicalize
+            // fails). Reject — a follow-up Write/Edit would dereference
+            // the link and escape the workspace.
+            return false;
+        };
+        return canon.starts_with(&root_canon);
+    }
+    // Candidate does not exist on disk — walk up to the nearest existing
+    // ancestor and apply the same containment check.
+    let mut cursor: &Path = candidate;
+    loop {
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => return false,
+        }
+        if cursor.symlink_metadata().is_ok() {
+            // First existing ancestor (per the link itself). `canonicalize`
+            // resolves symlinks AND fails on dangling links — both cases
+            // collapse cleanly here.
+            let Ok(canon) = std::fs::canonicalize(cursor) else {
+                return false;
+            };
+            return canon.starts_with(&root_canon);
+        }
+        // Ancestor is genuinely missing — keep walking up.
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::task_workspace_scope::{ScopeMode, TaskWorkspaceScope};
@@ -651,6 +726,152 @@ mod tests {
         assert!(
             owned.is_empty(),
             "CandidateOnly classification must be dropped, got {owned:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #652 PR-002 SSOT: nearest_existing_ancestor_within_work_root.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn nearest_existing_ancestor_accepts_missing_leaf_under_existing_parent() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        let candidate = dir.path().join("tests/test_new.py");
+        assert!(
+            nearest_existing_ancestor_within_work_root(dir.path(), &candidate),
+            "missing leaf with existing parent inside work_root must be accepted"
+        );
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_rejects_when_work_root_does_not_exist() {
+        let dir = tempdir().unwrap();
+        let phantom = dir.path().join("phantom_root");
+        let candidate = phantom.join("tests/test_new.py");
+        assert!(
+            !nearest_existing_ancestor_within_work_root(&phantom, &candidate),
+            "non-existent work_root must produce a defensive reject"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearest_existing_ancestor_rejects_dangling_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+        let work = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // Build a dangling symlink: outside/nonexistent does not exist.
+        symlink(
+            outside.path().join("nonexistent"),
+            work.path().join("dangle"),
+        )
+        .unwrap();
+        let candidate = work.path().join("dangle").join("file.py");
+        assert!(
+            !nearest_existing_ancestor_within_work_root(work.path(), &candidate),
+            "dangling-symlink ancestor must be rejected (CB2-002)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearest_existing_ancestor_rejects_symlinked_parent_escaping_root() {
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("tests")).unwrap();
+        let work = tempdir().unwrap();
+        symlink(outside.path().join("tests"), work.path().join("tests")).unwrap();
+        let candidate = work.path().join("tests/test_new.py");
+        assert!(
+            !nearest_existing_ancestor_within_work_root(work.path(), &candidate),
+            "symlinked parent that canonicalizes outside work_root must be rejected"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // PRR-001 (re-review v2): the **leaf** itself must be inspected.
+    // `nearest_existing_ancestor_within_work_root` previously advanced to
+    // `candidate.parent()` before any `symlink_metadata` check, which let a
+    // dangling-symlink leaf slip through (parent dir is inside work_root,
+    // so the function returned `true`). The follow-up Write/Edit would
+    // dereference the symlink and write outside the workspace.
+    // ----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn nearest_existing_ancestor_rejects_dangling_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+        let work = tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        let outside = tempdir().unwrap();
+        // Build a dangling symlink leaf: tests/test_artifact.py points at
+        // a path outside the workspace that does not exist.
+        symlink(
+            outside.path().join("missing.py"),
+            work.path().join("tests/test_artifact.py"),
+        )
+        .unwrap();
+        let candidate = work.path().join("tests/test_artifact.py");
+        assert!(
+            !nearest_existing_ancestor_within_work_root(work.path(), &candidate),
+            "PRR-001: dangling symlink leaf must be rejected even when the parent is inside work_root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearest_existing_ancestor_rejects_symlink_leaf_escaping_root() {
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.py"), "secret").unwrap();
+        let work = tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        // A symlink leaf that points to an existing file outside work_root.
+        // Even though canonicalize() succeeds, the canonical form escapes
+        // the workspace and must be rejected.
+        symlink(
+            outside.path().join("secret.py"),
+            work.path().join("tests/escape.py"),
+        )
+        .unwrap();
+        let candidate = work.path().join("tests/escape.py");
+        assert!(
+            !nearest_existing_ancestor_within_work_root(work.path(), &candidate),
+            "PRR-001: symlink leaf canonicalizing outside work_root must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearest_existing_ancestor_accepts_symlink_leaf_to_in_root_file() {
+        use std::os::unix::fs::symlink;
+        let work = tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        std::fs::write(work.path().join("tests/real.py"), "ok").unwrap();
+        // Symlink leaf pointing to an in-root file — canonicalize lands
+        // inside work_root, so this is safe to bind.
+        symlink(
+            work.path().join("tests/real.py"),
+            work.path().join("tests/alias.py"),
+        )
+        .unwrap();
+        let candidate = work.path().join("tests/alias.py");
+        assert!(
+            nearest_existing_ancestor_within_work_root(work.path(), &candidate),
+            "PRR-001: in-root symlink leaf canonicalizing inside work_root must be accepted"
+        );
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_accepts_real_existing_leaf_inside_root() {
+        let work = tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        std::fs::write(work.path().join("tests/real.py"), "ok").unwrap();
+        let candidate = work.path().join("tests/real.py");
+        assert!(
+            nearest_existing_ancestor_within_work_root(work.path(), &candidate),
+            "real existing leaf inside work_root must be accepted (regression guard)"
         );
     }
 }
