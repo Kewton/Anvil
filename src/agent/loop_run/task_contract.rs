@@ -608,7 +608,29 @@ impl TaskContract {
         CompletionDecision::Done
     }
 
+    /// Issue #652 PR-004: legacy generic retry budget for the
+    /// task-contract Continue loop. **Not** the role-specific
+    /// `ArtifactCompletionJob` budget — that one is owned by
+    /// `super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT`
+    /// and is the authoritative source of truth for the Test-role
+    /// completion job (consumed by `record_artifact_completion_attempt`
+    /// in `turn.rs::run_actor_loop`).
+    ///
+    /// The legacy value is intentionally **higher** than the job's 3 so
+    /// the job's exhaustion path (which emits the
+    /// `artifact_completion_failed` diagnostic + system note + eval log
+    /// trio) always fires first when a Test job is in flight. For
+    /// non-Test roles (Implementation / UsageDocs / Setup), no job is
+    /// installed today; this counter keeps the legacy "X attempts and
+    /// still no edit" exit working for them so the actor loop still
+    /// terminates cleanly. Read-only — no mutator on `TaskContract`.
     pub(super) fn artifact_completion_attempt_limit(&self) -> usize {
+        // SSOT redirect: keep `>= ARTIFACT_COMPLETION_ATTEMPT_LIMIT + 1`
+        // so the job's role-specific budget (3) always exhausts before
+        // the legacy counter (4). If the SSOT constant ever changes,
+        // this fallback must be re-tuned to preserve the invariant.
+        const _: () =
+            assert!(super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT < 4);
         4
     }
 }

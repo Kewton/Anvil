@@ -42,7 +42,10 @@
 
 use std::path::Path;
 
-use super::artifact_ownership::{ArtifactOwnership, OwnershipInputs, classify_ownership};
+use super::artifact_ownership::{
+    ArtifactOwnership, OwnershipInputs, classify_ownership,
+    nearest_existing_ancestor_within_work_root,
+};
 use super::semantic_failure::FailureClusterKey;
 use super::task_contract::{ArtifactRole, RecoveryTarget, RecoveryTargetHint};
 use super::task_workspace_scope::TaskWorkspaceScope;
@@ -344,7 +347,10 @@ impl ArtifactCompletionJob {
                 // ancestor canonicalizes inside `work_root` so a symlink
                 // parent cannot redirect a Write/Edit outside the
                 // workspace (DR4-002 / CB-001 symlink-parent escape).
-                if !nearest_existing_parent_within_work_root(work_root, &target_full) {
+                // PR-002 SSOT: defer to `artifact_ownership`'s
+                // `nearest_existing_ancestor_within_work_root` so the
+                // canonicalize policy lives in one module only.
+                if !nearest_existing_ancestor_within_work_root(work_root, &target_full) {
                     return Err(ArtifactCompletionJobError::InvalidTarget);
                 }
                 AllowedWriteActions::target_create_only()
@@ -359,7 +365,7 @@ impl ArtifactCompletionJob {
                     // checked canonicalized existing path, but a missing
                     // leaf takes the early-return path inside
                     // `canonical_escape`.
-                    if !nearest_existing_parent_within_work_root(work_root, &target_full) {
+                    if !nearest_existing_ancestor_within_work_root(work_root, &target_full) {
                         return Err(ArtifactCompletionJobError::InvalidTarget);
                     }
                     AllowedWriteActions::target_create_only()
@@ -604,56 +610,9 @@ fn neutralize_control_chars(s: &str) -> String {
         .collect()
 }
 
-/// CB-001 / CB2-002: walk up from `target_full` to the nearest existing
-/// ancestor (per `symlink_metadata`, NOT `exists()`) and verify it
-/// canonicalizes inside `canonicalize(work_root)`. Used for missing-leaf
-/// creation targets where the leaf path itself cannot be canonicalized.
-///
-/// Returns `false` when:
-/// - canonicalization of either the parent or the work_root fails
-///   (treated as a defensive reject),
-/// - the parent's canonical form escapes the work_root (e.g. via a
-///   symlinked directory), or
-/// - an ancestor is a **dangling symlink** (the link itself exists per
-///   `symlink_metadata`, but `canonicalize` fails because the target
-///   is absent). This last case is the CB2-002 TOCTOU class: with the
-///   old `Path::exists()`-based loop, a dangling symlink would be
-///   skipped (because `exists()` follows the link), the resolver
-///   would walk further up to `work_root`, accept the missing-leaf
-///   job, and then a Write/Edit between validation and execution
-///   could land outside `work_root` if the link target was created
-///   in the meantime.
-fn nearest_existing_parent_within_work_root(work_root: &Path, target_full: &Path) -> bool {
-    let Ok(root_canon) = std::fs::canonicalize(work_root) else {
-        return false;
-    };
-    let mut parent: &Path = target_full;
-    loop {
-        match parent.parent() {
-            Some(p) => parent = p,
-            None => return false,
-        }
-        // CB2-002: use `symlink_metadata` so a symlink ancestor is
-        // detected even when its target is dangling. `Path::exists()`
-        // returns false on a dangling symlink (because it follows the
-        // link), which would let the loop walk past it and accept a
-        // missing-leaf target whose actual write would be redirected
-        // outside `work_root` the moment the link target is created.
-        if parent.symlink_metadata().is_ok() {
-            break;
-        }
-        // Loop until we either find an existing ancestor (link or
-        // real) or fall off the root (handled by the `parent()`
-        // `None` branch above).
-    }
-    // `canonicalize` follows symlinks AND fails if the target is
-    // missing — so a dangling symlink ancestor takes this branch and
-    // is rejected, which is exactly the CB2-002 guarantee.
-    let Ok(parent_canon) = std::fs::canonicalize(parent) else {
-        return false;
-    };
-    parent_canon.starts_with(&root_canon)
-}
+// PR-002 (Issue #652) SSOT: the missing-tail parent / dangling-symlink
+// validator is now `artifact_ownership::nearest_existing_ancestor_within_work_root`.
+// The previous local copy in this module is removed — see the import block.
 
 #[cfg(test)]
 mod tests {
@@ -1258,7 +1217,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_nearest_existing_parent_returns_false_for_dangling_symlink_parent() {
-        // CB2-002: direct unit-level verification of the SSOT helper.
+        // CB2-002: direct unit-level verification of the SSOT helper
+        // (now hosted by `artifact_ownership::
+        // nearest_existing_ancestor_within_work_root` — PR-002 SSOT).
         // A dangling symlink ancestor must be detected (so the loop
         // stops at the link) and then rejected by the canonicalize
         // step. This is the same code path the artifact-directed
@@ -1275,7 +1236,7 @@ mod tests {
         .unwrap();
         let target = work.path().join("dangle").join("file.py");
         assert!(
-            !nearest_existing_parent_within_work_root(work.path(), &target),
+            !nearest_existing_ancestor_within_work_root(work.path(), &target),
             "dangling symlink parent must NOT canonicalize inside work_root"
         );
     }

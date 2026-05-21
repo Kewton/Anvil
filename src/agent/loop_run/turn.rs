@@ -109,6 +109,29 @@ const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 const ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT: &str =
     "artifact completion role-specific retry budget exhausted";
 
+/// Issue #652 PR-001 SSOT: outcome of
+/// `Agent::maybe_install_artifact_completion_job_for_hint`. The
+/// caller (`set_artifact_recovery_target_from_hint`) uses this to
+/// decide whether to commit the `current_artifact_recovery_target`
+/// projection (`InstalledOrSkipped`) or clear it atomically
+/// (`ValidationFailed`).
+///
+/// `ValidationFailed` is emitted ONLY for Test-role hints that did not
+/// pass `ArtifactCompletionJob::new` validation; non-Test roles always
+/// return `InstalledOrSkipped` because they do not install a job today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobInstallOutcome {
+    /// Either a new job was installed, an existing job's identity-refresh
+    /// was kept, or the hint role does not require a job. Caller may
+    /// commit the projection.
+    InstalledOrSkipped,
+    /// A Test-role hint failed `ArtifactCompletionJob::new` validation.
+    /// Caller MUST clear `current_artifact_recovery_target` as well so
+    /// the projection cannot survive without a backing job (PR-001 SSOT
+    /// invariant).
+    ValidationFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectiveToolPolicy {
     allowed_tools: Option<Vec<&'static str>>,
@@ -5597,6 +5620,27 @@ impl Agent {
                                 .as_ref()
                                 .map(|target| target.role)
                                 .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+                            // Issue #652 PR-004: record against the active
+                            // `ArtifactCompletionJob` FIRST so the role-
+                            // specific 3-attempt budget is the authoritative
+                            // exit signal when the Test job is in flight.
+                            // The legacy counter check below still runs for
+                            // backwards compatibility with non-Test roles
+                            // (no job is installed for them today), but it
+                            // can never short-circuit the job's exhaustion
+                            // path because that path breaks out of the
+                            // outer loop on its own.
+                            if self.record_artifact_completion_attempt(
+                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::RolePolicyViolation,
+                                vec!["focused_edit_batch_reject".to_string()],
+                            ) {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = format!(
+                                    "artifact completion role-policy violation budget exhausted for role {}",
+                                    role.label()
+                                );
+                                break 'outer;
+                            }
                             let artifact_attempt = increment_artifact_completion_role_attempt(
                                 &mut contract_completion_role_retries,
                                 role,
@@ -5628,24 +5672,6 @@ impl Agent {
                                     "[Artifact Completion] Previous tool call was rejected and was not executed. Missing role: {}. Emit exactly one allowed tool call on the current target path now. artifact_completion_attempt={artifact_attempt}/{attempt_limit}",
                                     role.label()
                                 ));
-                            }
-                            // Issue #652: classify the reject as a
-                            // `RolePolicyViolation` against the active job
-                            // (multi-tool batch / disallowed-tool / repeat
-                            // read all funnel through `FocusedEditBatchAction
-                            // ::Reject`). If the job exhausts as a result,
-                            // the diagnostic emission decides whether to
-                            // continue or break out via `MissingRepoEdits`.
-                            if self.record_artifact_completion_attempt(
-                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::RolePolicyViolation,
-                                vec!["focused_edit_batch_reject".to_string()],
-                            ) {
-                                exit_reason = ExitReason::MissingRepoEdits;
-                                error_text = format!(
-                                    "artifact completion role-policy violation budget exhausted for role {}",
-                                    role.label()
-                                );
-                                break 'outer;
                             }
                             continue;
                         }
@@ -6535,6 +6561,28 @@ impl Agent {
                                 .first()
                                 .copied()
                                 .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+                            // Issue #652 PR-003/PR-004: record the missing-
+                            // tool-call event against the active
+                            // `ArtifactCompletionJob` (no-op when no job
+                            // exists) BEFORE the legacy retry counter
+                            // budget check, so the role-specific 3-attempt
+                            // budget is the authoritative exit signal when
+                            // the Test job is in flight. Without this
+                            // recording, the legacy 4-attempt budget below
+                            // would race the job and exit first, skipping
+                            // the `artifact_completion_failed` diagnostic
+                            // emission (working_memory error, system note,
+                            // eval log event).
+                            let kind = if final_reply.is_empty() {
+                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool
+                            } else {
+                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly
+                            };
+                            if self.record_artifact_completion_attempt(kind, Vec::new()) {
+                                exit_reason = ExitReason::MissingRepoEdits;
+                                error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
+                                break 'outer;
+                            }
                             let artifact_attempt = increment_artifact_completion_role_attempt(
                                 &mut contract_completion_role_retries,
                                 role,
@@ -11393,29 +11441,58 @@ impl Agent {
         hint: super::task_contract::RecoveryTargetHint,
         attempt: usize,
     ) -> Option<super::task_contract::RecoveryTargetHint> {
-        let target = super::task_contract::RecoveryTarget::from_hint(hint.clone(), attempt);
-        let changed = self.current_artifact_recovery_target.as_ref() != Some(&target);
-        if changed {
-            log_llm_event(
-                "agent.artifact_recovery_target.selected",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "role": target.role.label(),
-                    "path": target.path,
-                    "reason": target.reason,
-                    "attempt": target.attempt,
-                }),
-            );
+        // Issue #652 PR-001: the `ArtifactCompletionJob` is the SSOT for
+        // target + role-specific retry budget. We must NOT update
+        // `current_artifact_recovery_target` before the job has been
+        // validated and installed — otherwise a validation failure would
+        // leave the projection set with no job attached, and
+        // `EffectiveToolPolicy::artifact_directed` would grant write
+        // access for a target with no role-specific budget. Ordering:
+        //   1. attempt to install / refresh the job for the hint
+        //   2. on success → commit the projection (atomic SWAP from any
+        //      prior state)
+        //   3. on failure (only possible for Test role) → clear BOTH
+        //      the projection and the job so no stale slot remains.
+        let install = self.maybe_install_artifact_completion_job_for_hint(&hint);
+        match install {
+            JobInstallOutcome::InstalledOrSkipped => {
+                let target = super::task_contract::RecoveryTarget::from_hint(hint.clone(), attempt);
+                let changed = self.current_artifact_recovery_target.as_ref() != Some(&target);
+                if changed {
+                    log_llm_event(
+                        "agent.artifact_recovery_target.selected",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "turn_index": self.current_turn_index,
+                            "role": target.role.label(),
+                            "path": target.path,
+                            "reason": target.reason,
+                            "attempt": target.attempt,
+                        }),
+                    );
+                }
+                self.current_artifact_recovery_target = Some(target);
+                Some(hint)
+            }
+            JobInstallOutcome::ValidationFailed => {
+                // PR-001 atomic clear: the new Test hint failed
+                // `ArtifactCompletionJob::new` validation. Drop the prior
+                // projection too — otherwise the artifact-directed
+                // policy would keep granting write permission for a
+                // target with no attached role-specific budget.
+                if self.current_artifact_recovery_target.take().is_some() {
+                    log_llm_event(
+                        "agent.artifact_recovery_target.cleared",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "turn_index": self.current_turn_index,
+                            "reason": "artifact_completion_job_validation_failed",
+                        }),
+                    );
+                }
+                None
+            }
         }
-        self.current_artifact_recovery_target = Some(target);
-        // Issue #652: when the recovery target is a Test artifact, build /
-        // refresh the SSOT `ArtifactCompletionJob` so wrong-target / no-tool
-        // / prose-only / role-policy-violation attempts can be tracked and
-        // role-specific retry budget can be enforced independently of the
-        // generic `repo_change_retries`.
-        self.maybe_install_artifact_completion_job_for_hint(&hint);
-        Some(hint)
     }
 
     fn clear_artifact_recovery_target(&mut self, reason: &'static str) {
@@ -11443,10 +11520,19 @@ impl Agent {
     /// — re-pointing at the same path leaves the existing job (and its
     /// retry budget) intact so wrong-target attempts already recorded keep
     /// counting.
+    ///
+    /// Returns:
+    /// - `InstalledOrSkipped` when the job was installed, the existing
+    ///   identity-refresh was kept, or the hint role does not require a
+    ///   job (non-Test). The caller may commit the projection.
+    /// - `ValidationFailed` ONLY when a Test-role hint did not pass
+    ///   `ArtifactCompletionJob::new` validation. The caller MUST clear
+    ///   `current_artifact_recovery_target` as well (PR-001 atomic clear)
+    ///   so no stale projection survives.
     fn maybe_install_artifact_completion_job_for_hint(
         &mut self,
         hint: &super::task_contract::RecoveryTargetHint,
-    ) {
+    ) -> JobInstallOutcome {
         if hint.role != super::task_contract::ArtifactRole::Test {
             // CB2-001: non-test roles fall back to the existing generic
             // recovery path (design judgement #11 —
@@ -11461,7 +11547,7 @@ impl Agent {
             // stale job here so role-changes always start with an empty
             // job slot for non-Test roles.
             self.artifact_completion_job = None;
-            return;
+            return JobInstallOutcome::InstalledOrSkipped;
         }
         let trimmed = hint.path.trim();
         // Identity refresh: same role + same target → keep the existing
@@ -11472,7 +11558,7 @@ impl Agent {
             && job.role() == hint.role
             && job.target_path() == trimmed
         {
-            return;
+            return JobInstallOutcome::InstalledOrSkipped;
         }
         // CB-005: when the new hint points at a *different* target than
         // the current job, the prior job's expected target is now
@@ -11480,11 +11566,10 @@ impl Agent {
         // a validation failure cannot leave the agent with a stale job
         // whose budget belongs to an old `current_artifact_recovery_target`.
         // The atomic ordering is: clear → validate-and-install. If the
-        // new hint validates, we install it (atomic SWAP). If it does
-        // NOT validate, we leave the agent without an active job — the
-        // new `current_artifact_recovery_target` is still recorded by
-        // the caller, but with NO job attached, so no stale-target
-        // budget can be consumed.
+        // new hint validates, we install it (atomic SWAP). PR-001: if
+        // it does NOT validate, the caller MUST also clear
+        // `current_artifact_recovery_target` so no stale projection
+        // remains (signalled by `JobInstallOutcome::ValidationFailed`).
         self.artifact_completion_job = None;
         let scope = self.current_workspace_scope();
         match super::artifact_completion_job::ArtifactCompletionJob::new(
@@ -11496,11 +11581,12 @@ impl Agent {
         ) {
             Ok(job) => {
                 self.artifact_completion_job = Some(job);
+                JobInstallOutcome::InstalledOrSkipped
             }
             Err(_) => {
-                // Invalid hint after clearing the prior job: leave the
-                // job slot empty so no stale budget is consumed by the
-                // new (now-disjoint) `current_artifact_recovery_target`.
+                // Validation failure for a Test-role hint: signal the
+                // caller to drop the projection too (PR-001 SSOT).
+                JobInstallOutcome::ValidationFailed
             }
         }
     }
@@ -11576,8 +11662,24 @@ impl Agent {
     }
 
     fn artifact_recovery_target_path(&self) -> Option<PathBuf> {
-        let target = self.current_artifact_recovery_target.as_ref()?;
-        resolve_user_path(&self.work_root, &target.path).ok()
+        // Issue #652 PR-001 SSOT: when an `ArtifactCompletionJob` is
+        // active, read the target straight from the job — that is the
+        // single source of truth for the in-flight artifact-completion
+        // task this turn. `current_artifact_recovery_target` is kept in
+        // sync at `set_artifact_recovery_target_from_hint` (atomic
+        // install + commit), but reading the job first makes the SSOT
+        // invariant explicit and means that any future drift between
+        // the two surfaces still resolves to the job's authoritative
+        // path. For non-Test roles (no attached job today) we still
+        // fall through to the legacy projection so the existing
+        // artifact-directed recovery semantics for Implementation /
+        // UsageDocs / Setup roles continue to work.
+        let path_str = if let Some(job) = self.artifact_completion_job.as_ref() {
+            job.target_path().to_string()
+        } else {
+            self.current_artifact_recovery_target.as_ref()?.path.clone()
+        };
+        resolve_user_path(&self.work_root, &path_str).ok()
     }
 
     fn scaffold_candidate_for_missing_role(
@@ -14727,6 +14829,157 @@ mod tests {
             job.attempts().len(),
             0,
             "new target must start with a fresh budget"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // PR-001 (Issue #652) regression: active job is the target/policy SSOT.
+    //
+    // The codex review (#657) reported that
+    // `set_artifact_recovery_target_from_hint` set
+    // `current_artifact_recovery_target` BEFORE attempting to install the
+    // `ArtifactCompletionJob`. On validation failure (e.g. ignored top
+    // dir), the projection field remained set even though the active job
+    // was `None`, allowing `EffectiveToolPolicy::artifact_directed` to
+    // confer write access for a target with no role-specific budget
+    // attached. Fix invariants:
+    //   1. Test-role hint validation failure clears BOTH the job AND
+    //      `current_artifact_recovery_target`.
+    //   2. Test-role hint validation success installs the job AND syncs
+    //      the projection (atomic SWAP from the prior state).
+    //   3. Non-Test roles continue to update the projection without an
+    //      attached job (existing semantics).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn pr001_test_role_invalid_hint_clears_both_target_and_job() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        // No filesystem setup: an ignored top dir hint MUST be rejected by
+        // `ArtifactCompletionJob::new`. Before PR-001, the projection
+        // would be set even though the job stayed `None`.
+        let bad_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "node_modules/evil/test.js".to_string(),
+            reason: "attacker-supplied".to_string(),
+        };
+        let result = agent.set_artifact_recovery_target_from_hint(bad_hint, 0);
+        assert!(
+            result.is_none(),
+            "PR-001: invalid Test hint must return None (no projection committed)"
+        );
+        assert!(
+            agent.current_artifact_recovery_target.is_none(),
+            "PR-001: invalid Test hint MUST NOT leave `current_artifact_recovery_target` set"
+        );
+        assert!(
+            agent.artifact_completion_job.is_none(),
+            "PR-001: invalid Test hint MUST NOT leave a job installed"
+        );
+    }
+
+    #[test]
+    fn pr001_test_role_valid_hint_installs_job_and_syncs_projection() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        let good_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/test_foo.py".to_string(),
+            reason: "missing test".to_string(),
+        };
+        let result = agent.set_artifact_recovery_target_from_hint(good_hint.clone(), 0);
+        assert!(result.is_some(), "valid Test hint must return Some(hint)");
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("valid Test hint installs a job");
+        assert_eq!(job.target_path(), "tests/test_foo.py");
+        // The projection MUST match the job (SSOT — active job is the
+        // single source of truth, projection mirrors it).
+        let projection = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("projection must mirror the active job");
+        assert_eq!(projection.role, ArtifactRole::Test);
+        assert_eq!(projection.path, "tests/test_foo.py");
+    }
+
+    #[test]
+    fn pr001_non_test_role_valid_hint_still_sets_projection_without_job() {
+        // Non-Test roles do not install an `ArtifactCompletionJob` today
+        // (only Test triggers the role-specific budget). The projection
+        // must still update so the legacy artifact-directed recovery
+        // notes keep firing — this confirms the SSOT invariant only
+        // narrows behavior for the Test role.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let impl_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "src/main.py".to_string(),
+            reason: "missing implementation".to_string(),
+        };
+        let result = agent.set_artifact_recovery_target_from_hint(impl_hint, 0);
+        assert!(
+            result.is_some(),
+            "valid non-Test hint must commit the projection"
+        );
+        assert!(
+            agent.artifact_completion_job.is_none(),
+            "non-Test hint must not install a job"
+        );
+        let projection = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("non-Test projection must commit");
+        assert_eq!(projection.role, ArtifactRole::Implementation);
+        assert_eq!(projection.path, "src/main.py");
+    }
+
+    #[test]
+    fn pr001_test_role_invalid_new_hint_clears_prior_target_and_job() {
+        // Scenario: a valid Test job was installed at "tests/initial.py";
+        // a subsequent invalid Test hint must clear BOTH so the prior
+        // target cannot leak its artifact-directed policy past the
+        // (failed) re-install attempt.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        let good_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/initial.py".to_string(),
+            reason: "missing test".to_string(),
+        };
+        agent.set_artifact_recovery_target_from_hint(good_hint, 0);
+        assert!(agent.artifact_completion_job.is_some());
+        assert!(agent.current_artifact_recovery_target.is_some());
+        // Now a bad new hint:
+        let bad_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "node_modules/evil/test.js".to_string(),
+            reason: "attacker-supplied".to_string(),
+        };
+        let result = agent.set_artifact_recovery_target_from_hint(bad_hint, 1);
+        assert!(result.is_none(), "PR-001: invalid Test hint returns None");
+        assert!(
+            agent.current_artifact_recovery_target.is_none(),
+            "PR-001: invalid new Test hint MUST clear the prior projection"
+        );
+        assert!(
+            agent.artifact_completion_job.is_none(),
+            "CB-005 (still required): invalid new Test hint MUST clear the prior job"
         );
     }
 }
@@ -19065,6 +19318,9 @@ fn tool_path_matches_target_via_workspace_ssot(
     // rejecting any side whose nearest existing ancestor is a
     // dangling symlink, the gate stays consistent with
     // `ArtifactCompletionJob::new`.
+    // PR-002 SSOT: route through
+    // `artifact_ownership::nearest_existing_ancestor_within_work_root`
+    // so the canonicalize policy lives in a single module.
     if !ancestor_chain_has_no_dangling_symlinks(work_root, raw_path) {
         return false;
     }
@@ -19074,56 +19330,22 @@ fn tool_path_matches_target_via_workspace_ssot(
     true
 }
 
-/// CB2-002: helper consulted by `tool_path_matches_target_via_workspace_ssot`
-/// to enforce that no ancestor of `raw_path` (resolved against `work_root`)
-/// is a **dangling symlink**. Returns `true` when every ancestor either
-/// (a) does not exist per `symlink_metadata`, or (b) canonicalizes
-/// successfully inside `canonicalize(work_root)`. Returns `false` when
-/// any ancestor is present per `symlink_metadata` but fails to
-/// canonicalize (the dangling-symlink class).
-///
-/// Mirrors the structure of
-/// `artifact_completion_job::nearest_existing_parent_within_work_root`
-/// but operates on the *tool argument* path (raw, possibly absolute)
-/// after stripping it through the path-guard.
+/// PR-002 (Issue #652) thin adapter that turns a raw tool-argument path
+/// (relative-or-absolute string) into the canonical candidate path that
+/// the SSOT helper `artifact_ownership::
+/// nearest_existing_ancestor_within_work_root` accepts. The canonicalize
+/// policy itself lives in `artifact_ownership` — this wrapper exists only
+/// because the tool-argument call-site has the path as `&str` and may
+/// pass an absolute path verbatim, while `ArtifactCompletionJob::new`
+/// always provides a `work_root.join(relative_path)` `PathBuf`.
 fn ancestor_chain_has_no_dangling_symlinks(work_root: &Path, raw_path: &str) -> bool {
-    let Ok(root_canon) = std::fs::canonicalize(work_root) else {
-        return false;
-    };
-    // We rebuild the would-be candidate path the same way
-    // `resolve_user_path` does: relative segments append to
-    // `work_root`. For absolute paths we use them verbatim.
     let input = Path::new(raw_path);
     let candidate: PathBuf = if input.is_absolute() {
         input.to_path_buf()
     } else {
         work_root.join(input)
     };
-    let mut cursor: &Path = candidate.as_path();
-    loop {
-        match cursor.parent() {
-            Some(p) => cursor = p,
-            None => return false,
-        }
-        match cursor.symlink_metadata() {
-            Ok(_) => {
-                // Ancestor exists per the link itself. Now confirm
-                // `canonicalize` (which resolves links AND requires
-                // the target to exist) succeeds and stays inside
-                // `work_root`. A dangling symlink ancestor fails
-                // here.
-                let Ok(canon) = std::fs::canonicalize(cursor) else {
-                    return false;
-                };
-                return canon.starts_with(&root_canon);
-            }
-            Err(_) => {
-                // Ancestor is genuinely missing (not a dangling
-                // symlink) — keep walking up.
-                continue;
-            }
-        }
-    }
+    super::artifact_ownership::nearest_existing_ancestor_within_work_root(work_root, &candidate)
 }
 
 fn restricted_tool_policy_error(
