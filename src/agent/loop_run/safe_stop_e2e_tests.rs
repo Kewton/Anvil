@@ -36,7 +36,7 @@ use crate::agent::loop_run::{
     emit_safe_stop_report_diagnostic_target_missing_for_test,
     emit_safe_stop_report_verifier_failed_safe_stop_for_test,
     emit_safe_stop_report_verifier_missing_for_test, emit_safe_stop_report_verifier_weak_for_test,
-    seed_turn_edited_relative_path_for_test,
+    seed_artifact_ledger_repo_edit_for_test,
 };
 use crate::config::Config;
 use crate::model_registry::RuntimeModels;
@@ -51,13 +51,21 @@ use crate::session::store::{SessionSnapshot, SessionStore};
 static LOG_DIR: OnceLock<TempDir> = OnceLock::new();
 
 fn shared_log_path() -> PathBuf {
-    let dir = LOG_DIR.get_or_init(|| {
+    // Issue #659 Phase 2 (DR3-003 follow-up): `init_logging` uses a global
+    // `OnceLock`, so when multiple in-crate `#[cfg(test)]` modules co-init
+    // only the first call wins. To stay robust under parallel test
+    // execution we eagerly attempt init here but always read back the
+    // path the global subscriber actually settled on via
+    // `crate::logging::llm_io_log_path()`.
+    let _ = LOG_DIR.get_or_init(|| {
         let dir = tempdir().expect("tempdir for shared log");
         let log_path = dir.path().join("llm-io.jsonl");
         let _ = crate::logging::init_logging(crate::config::LogLevel::Info, &log_path);
         dir
     });
-    dir.path().join("llm-io.jsonl")
+    crate::logging::llm_io_log_path()
+        .map(|p| p.to_path_buf())
+        .expect("logging must be initialised by this point")
 }
 
 /// Return all log records (one JSON value per line) whose `payload.session_id`
@@ -264,7 +272,7 @@ fn seed_owned_test_artifact(agent: &mut Agent, dir: &TempDir, name: &str) -> Str
     let file_path = tests_dir.join(name);
     std::fs::write(&file_path, "// seeded test artifact\n").expect("write test file");
     let rel = format!("tests/{name}");
-    seed_turn_edited_relative_path_for_test(agent, rel.clone());
+    seed_artifact_ledger_repo_edit_for_test(agent, rel.clone());
     rel
 }
 
@@ -474,7 +482,7 @@ mod verifier_missing {
         let owned_rel = seed_owned_test_artifact(&mut agent, &dir, "kept_smoke.rs");
 
         // A non-test path is filtered by `is_test_file` -> dropped.
-        seed_turn_edited_relative_path_for_test(&mut agent, "src/lib.rs".to_string());
+        seed_artifact_ledger_repo_edit_for_test(&mut agent, "src/lib.rs".to_string());
 
         emit_safe_stop_report_verifier_missing_for_test(&mut agent);
 

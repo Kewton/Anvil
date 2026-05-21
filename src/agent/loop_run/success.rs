@@ -181,7 +181,7 @@ impl Agent {
     /// Returns `(vec![], false)` when there is no active request — the
     /// structured Weak/Missing branch is then skipped and the legacy
     /// `detect_with_recent_successes -> run` path runs verbatim.
-    fn success_verifier_test_binding(&self) -> (Vec<String>, bool) {
+    fn success_verifier_test_binding(&mut self) -> (Vec<String>, bool) {
         let Some(request) = self.active_request_text() else {
             return (Vec::new(), false);
         };
