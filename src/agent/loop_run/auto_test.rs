@@ -592,6 +592,11 @@ impl AutoTestRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // PR-003: put the verifier in its own process group on Unix so
+        // `wait_with_auto_test_timeout` can SIGKILL the whole descendant
+        // tree on timeout. On non-Unix this is a no-op. SSOT lives in
+        // `crate::tools::bash::apply_unix_pgroup` (Issue #461).
+        crate::tools::bash::apply_unix_pgroup(&mut child_cmd);
         let output = wait_with_auto_test_timeout(
             &mut child_cmd,
             Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
@@ -737,6 +742,23 @@ pub(super) fn validate_bound_test_artifacts_for_execution(
 /// kill-on-timeout contract is unchanged) and joins both drain threads
 /// after `wait()` returns — whether due to natural exit, timeout, or
 /// poll error.
+///
+/// ## Issue #651 PR-003: process-group kill on Unix
+///
+/// `cargo test` / `pytest` can spawn descendant processes (test
+/// binaries, fixtures, server-style dev tools). The previous
+/// `child.kill()` only signaled the immediate child, leaving its
+/// descendants alive and holding ports / file handles into the next
+/// turn.
+///
+/// On Unix, callers MUST apply `crate::tools::bash::apply_unix_pgroup`
+/// to the `Command` before passing it in. That sets a `pre_exec` hook
+/// that calls `setpgid(0, 0)` in the forked child between `fork(2)`
+/// and `exec(2)`, putting the child in its own process group. On
+/// timeout / poll error, this helper then sends `SIGKILL` to
+/// `-pgid` (the whole group) so the test process tree is reaped.
+/// On non-Unix, `apply_unix_pgroup` is a no-op and `child.kill()`
+/// is the fallback contract (direct-child-only).
 #[allow(dead_code)]
 fn wait_with_auto_test_timeout(
     command: &mut Command,
@@ -778,7 +800,9 @@ fn wait_with_auto_test_timeout(
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
+                // PR-003: kill the whole process group on Unix so
+                // descendant test processes don't leak ports / files.
+                kill_auto_test_child_tree(&mut child);
                 let _ = child.wait();
                 break Err(format!(
                     "auto test command timed out after {}s",
@@ -787,7 +811,7 @@ fn wait_with_auto_test_timeout(
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(err) => {
-                let _ = child.kill();
+                kill_auto_test_child_tree(&mut child);
                 let _ = child.wait();
                 break Err(format!("failed while waiting for auto test command: {err}"));
             }
@@ -814,6 +838,53 @@ type DrainHandle = (
     std::thread::JoinHandle<()>,
     std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
 );
+
+/// Issue #651 PR-003: kill the structured auto-test child process and,
+/// on Unix, its entire process group so descendants (test binaries,
+/// dev servers, fixtures) cannot survive a timeout and hold ports /
+/// file handles into later turns.
+///
+/// The Unix path uses `libc::kill(-pgid, SIGKILL)` where `pgid` is the
+/// child's pid because `apply_unix_pgroup` (applied by the caller
+/// before spawn) ran `setpgid(0, 0)` in the forked child, making the
+/// child its own process-group leader. SIGKILL goes straight to all
+/// processes in that group — including descendants the child spawned.
+/// SIGTERM grace is not given: this is the timeout / fatal-error
+/// branch, so the caller has already decided to terminate.
+///
+/// On non-Unix targets `apply_unix_pgroup` is a no-op and we fall back
+/// to `child.kill()` (direct-child only). This is the documented
+/// limitation for Windows / WASI.
+///
+/// ## `unsafe` boundary
+///
+/// The single `unsafe` call is `libc::kill(...)`. It does not run in
+/// the forked child (unlike `pre_exec`), so the Rust async-signal
+/// safety rules do not apply. We deliberately avoid pulling in the
+/// `nix` crate — `Cargo.toml` is unchanged (CLAUDE.md "no new
+/// dependency" expectation).
+#[allow(dead_code)]
+fn kill_auto_test_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // Negative pid → process group. SAFETY: the libc call is FFI;
+        // no Rust state is mutated and the call is async-signal-safe.
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+        }
+        // Belt-and-suspenders: also kill the direct child in case
+        // `apply_unix_pgroup` was not applied (e.g. legacy callers).
+        // `child.kill()` is idempotent w.r.t. an already-killed child.
+        let _ = child.kill();
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Non-Unix: direct child only (documented limitation).
+        let _ = child.kill();
+    }
+}
 
 /// CB-003 helper: join a drain thread's channel and unwrap to bytes.
 /// Any IO / panic failure degrades to an empty buffer — we never let a
@@ -2948,6 +3019,95 @@ dev = [
     }
 
     // -----------------------------------------------------------------
+    // Issue #651 PR-003 (Medium): timeout must kill the entire process
+    // group on Unix, not just the immediate child. We spawn a shell
+    // that prints its own pid and the pid of a backgrounded sleep,
+    // forces a short timeout, then verifies both processes are gone.
+    // The shell is the direct child; its `sleep` descendant is what
+    // the old `child.kill()` would have leaked.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn run_structured_kills_process_group_on_unix_timeout() {
+        use std::io::{BufRead, BufReader};
+        use std::time::Instant;
+
+        // Spawn `sh -c 'sleep 120 & echo $!; wait'` so the shell prints
+        // the descendant's pid on stdout, then waits indefinitely. Old
+        // `child.kill()` would kill `sh` only, leaving `sleep` alive.
+        // The PR-003 fix sends SIGKILL to the negative pgid, so both
+        // the shell and the sleep go away.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            // `exec sleep ... & echo $!; wait $!` — `exec` is not used
+            // because we need the parent shell to print the pid AND
+            // remain alive long enough for the parent to read it.
+            .arg("sleep 120 & echo $! ; wait $!")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        // Apply the same pgroup setup `run_structured` uses.
+        crate::tools::bash::apply_unix_pgroup(&mut command);
+
+        let mut child = command.spawn().expect("spawn sh");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let descendant_pid: i32 = {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            // Bounded read so a misbehaving shell does not hang the test.
+            let read_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if Instant::now() > read_deadline {
+                    panic!("timed out reading descendant pid from shell stdout");
+                }
+                line.clear();
+                let n = reader.read_line(&mut line).expect("read line");
+                if n == 0 {
+                    panic!("shell closed stdout before printing descendant pid");
+                }
+                let trimmed = line.trim();
+                if let Ok(pid) = trimmed.parse::<i32>() {
+                    break pid;
+                }
+            }
+        };
+        assert!(descendant_pid > 0, "descendant pid must be positive");
+
+        // Now drive the kill path. Re-attach the (already-consumed)
+        // stdout role is not required for `kill_auto_test_child_tree`
+        // since it only signals; it does not drain output.
+        kill_auto_test_child_tree(&mut child);
+        let _ = child.wait();
+
+        // The shell PID and the sleep PID should both be gone now.
+        // `kill(0, SIG=0)` is the canonical existence check (signal 0
+        // is a no-op delivery, error 3 = ESRCH = no such process).
+        let descendant_alive_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            // SAFETY: libc FFI; no Rust state mutated.
+            let res = unsafe { libc::kill(descendant_pid, 0) };
+            if res != 0 {
+                // ESRCH expected — descendant is gone.
+                break;
+            }
+            if Instant::now() > descendant_alive_deadline {
+                // Try one more SIGKILL on the descendant directly so the
+                // test does not leave a stray sleep behind in the
+                // unlikely case the OS has not reaped yet, then fail.
+                unsafe {
+                    let _ = libc::kill(descendant_pid, libc::SIGKILL);
+                }
+                panic!(
+                    "PR-003 regression: descendant sleep pid {descendant_pid} survived process-group SIGKILL"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Issue #651 CB-001: empty owned_test_artifacts must produce
     // OwnedTestVerifierPlan::Missing (not Runnable, not Weak).
     // -----------------------------------------------------------------
@@ -3213,6 +3373,7 @@ dev = [
         evidence.push(CompletionEvidence::VerifierExitZero {
             class: crate::tools::bash::BashCommandClass::BuildTest,
             command: "python3 -m py_compile app.py".to_string(),
+            bound_test_artifacts_count: None,
         });
         let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
         assert_eq!(

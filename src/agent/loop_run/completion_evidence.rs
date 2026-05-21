@@ -84,9 +84,33 @@ pub(crate) enum CompletionEvidence {
     /// before persistence (T-2.x); for α-1 logging the raw normalized
     /// command is acceptable inside the in-process `EvidenceSet` because we
     /// never serialize the set itself in α-1.
+    ///
+    /// ## Issue #651 PR-001: `bound_test_artifacts_count` field
+    ///
+    /// `Some(n)` means the verifier was executed via the **structured**
+    /// `AutoTestRunner::run_structured` path with `n` owned test artifacts
+    /// bound to its `Command::new(runner).args(args)` invocation. The
+    /// args list is validated against `TaskWorkspaceScope` /
+    /// `validate_bound_test_artifacts_for_execution` before spawn, so the
+    /// verifier's input is structurally tied to the current task's owned
+    /// test paths.
+    ///
+    /// `None` (default) means the evidence came from the **legacy /
+    /// manual** path — typically a Bash `cargo test` outcome promoted to
+    /// `VerifierExitZero` by `build_verifier_exit_zero_evidence`, or the
+    /// shell-based `AutoTestRunner::run` legacy path. There is no
+    /// type-level proof the runner's argv contained any owned test path,
+    /// so `TaskContract::evaluate_with_owned_test_artifacts` refuses to
+    /// promote it to `Done` under `test_execution_required = true`.
+    ///
+    /// `#[serde(default)]` keeps existing `session.json` snapshots
+    /// readable: a persisted record that did not carry the field decodes
+    /// to `None` (treated as unbound), which is the conservative choice.
     VerifierExitZero {
         class: BashCommandClass,
         command: String,
+        #[serde(default)]
+        bound_test_artifacts_count: Option<usize>,
     },
     /// The model produced an answer-only reply (no tool calls). Reserved
     /// for AnswerOnly protocol acceptance.
@@ -362,6 +386,7 @@ mod tests {
         set.push(CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::BuildTest,
             command: "cargo test".to_string(),
+            bound_test_artifacts_count: None,
         });
         assert_eq!(set.len(), 2);
         assert!(!set.is_empty());

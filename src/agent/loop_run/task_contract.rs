@@ -525,16 +525,22 @@ impl TaskContract {
         self.evaluate_inner(evidence, EvaluateMode::Legacy)
     }
 
-    /// Issue #651 Task 4.1: evaluate completion with awareness of the
-    /// current task's owned test artifacts.
+    /// Issue #651 Task 4.1 / PR-001: evaluate completion with awareness
+    /// of the current task's owned test artifacts AND the structural
+    /// binding of the verifier evidence.
     ///
     /// Rule (only fires when `required_behavior.test_execution_required`):
-    /// - If all required artifacts are observed AND a verifier passed,
-    ///   but `owned_test_artifacts.is_empty()`, the verifier evidence
-    ///   may be unbound (legacy `cargo test` / shell-only run). The
-    ///   completion gate refuses to promote that to `Done` and instead
-    ///   returns `SafeStop { reason: VerifierMissing }`, so the agent
-    ///   stops without claiming success.
+    /// - If `owned_test_artifacts.is_empty()`, the verifier could not
+    ///   have bound to any owned path; return
+    ///   `SafeStop { reason: VerifierMissing }`.
+    /// - Else if no `VerifierExitZero { class: BuildTest, bound_test_artifacts_count: Some(_), .. }`
+    ///   evidence was observed this turn, the only verifier success we
+    ///   saw is the **unbound** kind (legacy manual `cargo test`,
+    ///   shell-based `AutoTestRunner::run` path). The verifier input is
+    ///   not structurally tied to the owned test artifact list, so the
+    ///   gate returns `SafeStop { reason: VerifierMissing }` rather than
+    ///   `Done`. This is PR-001: a manual `cargo test` that happens to
+    ///   coexist with a `tests/test_x.py` write must not satisfy Done.
     ///
     /// `test_execution_required == false` keeps the previous Done /
     /// Verify / Continue branches verbatim — this is the regression
@@ -574,11 +580,30 @@ impl TaskContract {
         // no ownership view yet) keep pre-#651 completion semantics.
         if let EvaluateMode::OwnedTestArtifacts(owned_test_artifacts) = mode
             && self.required_behavior.test_execution_required
-            && owned_test_artifacts.is_empty()
         {
-            return CompletionDecision::SafeStop {
-                reason: SafeStopReason::VerifierMissing,
-            };
+            // Sub-gate 1: empty owned slice → nothing for the verifier to
+            // have bound to. SafeStop unconditionally.
+            if owned_test_artifacts.is_empty() {
+                return CompletionDecision::SafeStop {
+                    reason: SafeStopReason::VerifierMissing,
+                };
+            }
+            // Sub-gate 2 (PR-001): even when the owned slice is non-empty,
+            // the only verifier success we accept as "Done" is one that
+            // came through the structured `AutoTestRunner::run_structured`
+            // path, which records
+            // `VerifierExitZero { class: BuildTest, bound_test_artifacts_count: Some(_), .. }`.
+            // A manual / legacy unbound `VerifierExitZero` (e.g. a Bash
+            // `cargo test` outcome with `bound_test_artifacts_count: None`)
+            // is NOT proof that the runner argv contained the owned test
+            // paths — it could be a stale workspace test suite that
+            // happens to pass while the new tests/test_x.py is ignored.
+            // Refuse to mark Done in that case.
+            if !has_bound_build_test_verifier(evidence) {
+                return CompletionDecision::SafeStop {
+                    reason: SafeStopReason::VerifierMissing,
+                };
+            }
         }
         CompletionDecision::Done
     }
@@ -865,6 +890,29 @@ fn has_build_test_verifier(evidence: &EvidenceSet) -> bool {
     })
 }
 
+/// Issue #651 PR-001: stricter sibling of `has_build_test_verifier`. True
+/// only when at least one BuildTest verifier evidence carries a
+/// `bound_test_artifacts_count: Some(_)`, i.e. came through the
+/// `AutoTestRunner::run_structured` path that re-validates owned test
+/// artifacts before spawning `Command::new(runner).args(args)`.
+///
+/// Manual `cargo test` / shell `AutoTestRunner::run` legacy paths record
+/// `bound_test_artifacts_count: None` and are not accepted as proof that
+/// the verifier input was structurally tied to the current task's owned
+/// test artifacts.
+fn has_bound_build_test_verifier(evidence: &EvidenceSet) -> bool {
+    evidence.iter().any(|item| {
+        matches!(
+            item,
+            CompletionEvidence::VerifierExitZero {
+                class: BashCommandClass::BuildTest,
+                bound_test_artifacts_count: Some(_),
+                ..
+            }
+        )
+    })
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -952,9 +1000,24 @@ mod tests {
     }
 
     fn build_test() -> CompletionEvidence {
+        // Default helper: legacy / unbound verifier evidence (no
+        // `bound_test_artifacts_count`). Tests that need to assert the
+        // PR-001 binding gate use `build_test_bound(n)` instead.
         CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::BuildTest,
             command: "pytest".to_string(),
+            bound_test_artifacts_count: None,
+        }
+    }
+
+    /// Issue #651 PR-001: structured / bound verifier evidence factory.
+    /// Mirrors what `AutoTestRunner::run_structured` produces via
+    /// `build_task_contract_verifier_exit_zero_evidence_bound`.
+    fn build_test_bound(bound_count: usize) -> CompletionEvidence {
+        CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "pytest tests/test_x.py".to_string(),
+            bound_test_artifacts_count: Some(bound_count),
         }
     }
 
@@ -1653,8 +1716,76 @@ mod tests {
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit(RepoEditCategory::Impl));
         evidence.push(repo_edit(RepoEditCategory::Test));
+        // PR-001: structured / bound verifier evidence — this is what
+        // `AutoTestRunner::run_structured` produces.
+        evidence.push(build_test_bound(1));
+        // Owned test artifact present + bound evidence → Done.
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 PR-001 (High): unbound `VerifierExitZero` evidence must
+    // not satisfy `Done` for a `test_execution_required` request — even
+    // when the owned test artifact slice is non-empty. This is the
+    // exact attack the Codex PR review identified: model writes
+    // `tests/test_x.py`, runs a manual `cargo test` whose exit-zero
+    // outcome was promoted to `VerifierExitZero { command: "cargo test",
+    // bound_test_artifacts_count: None, .. }`, and the legacy gate
+    // returned `Done` because the owned list was non-empty.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn evaluate_required_test_with_unbound_verifier_exit_zero_does_not_done() {
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        // Unbound verifier evidence (legacy manual Bash `cargo test`).
+        // `bound_test_artifacts_count: None` is the regression marker.
         evidence.push(build_test());
-        // Owned test artifact present → legacy Done.
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierMissing,
+            },
+            "unbound verifier evidence must not satisfy Done"
+        );
+    }
+
+    #[test]
+    fn evaluate_required_test_with_structured_verifier_exit_zero_done() {
+        // Regression complement of the PR-001 test above: with bound
+        // (structured) evidence, the same inputs MUST return Done.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test_bound(1));
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    #[test]
+    fn evaluate_required_test_with_mixed_evidence_accepts_bound() {
+        // PR-001: when BOTH an unbound (manual cargo test) and a bound
+        // (run_structured) verifier evidence are observed in the same
+        // turn, the bound one is enough to satisfy Done. The gate is
+        // "at least one bound BuildTest", not "all BuildTest evidence
+        // must be bound".
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test()); // unbound
+        evidence.push(build_test_bound(2)); // bound
         let owned = vec!["tests/test_x.py".to_string()];
         let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
         assert_eq!(decision, CompletionDecision::Done);

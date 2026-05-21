@@ -1455,11 +1455,34 @@ fn reply_looks_like_future_work(reply: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TaskContractVerifierOutcome {
-    Passed { command: String },
-    Failed { command: String, output: String },
+    Passed {
+        command: String,
+    },
+    Failed {
+        command: String,
+        output: String,
+    },
     NoVerifier,
     Disabled,
-    TransportError { error: String },
+    TransportError {
+        error: String,
+    },
+    /// Issue #651 PR-002: structured-runner SafeStop. Emitted by
+    /// `run_task_contract_verifier_once` when `OwnedTestVerifierPlan`
+    /// resolves to `Weak` / `Missing`. The mapping to
+    /// `ExitReason::SafeStopVerifier{Weak,Missing}` is performed by
+    /// `drive_task_contract_verifier` directly — the MissingVerifierJob
+    /// retry path is NOT entered, because Weak / Missing are not
+    /// "no verifier detected yet, retry after edit" — they are
+    /// "verifier cannot be structurally bound to the owned test
+    /// artifacts, stop without claiming Done".
+    ///
+    /// The `_ =>` fallback at every match site is intentionally banned
+    /// (CLAUDE.md design judgement #2) so a future `SafeStopReason`
+    /// variant lights up compile errors at every dispatch.
+    SafeStop {
+        reason: super::task_contract::SafeStopReason,
+    },
 }
 
 enum TaskContractVerifierFlowOutcome {
@@ -1485,6 +1508,29 @@ struct TaskContractVerifierFlowArgs<'a, 'b> {
     task_contract_verify_commands_collected: &'b mut Vec<String>,
     task_contract_verifier_passed_in_loop: &'b mut bool,
     last_iter: usize,
+}
+
+/// Issue #651 PR-002: pure mapping from
+/// `task_contract::SafeStopReason` to the surfacing pair
+/// `(ExitReason, "log_outcome" tag)` used by the task-contract verifier
+/// dispatch. Extracted from the inline match in
+/// `drive_task_contract_verifier` so unit tests can pin the mapping
+/// without spinning up an `Agent`.
+///
+/// `_ =>` fallback is forbidden so a future `SafeStopReason` variant
+/// lights up compile errors here (design judgement #2).
+fn task_contract_verifier_safe_stop_mapping(
+    reason: super::task_contract::SafeStopReason,
+) -> (ExitReason, &'static str) {
+    match reason {
+        super::task_contract::SafeStopReason::VerifierWeak => {
+            (ExitReason::SafeStopVerifierWeak, "safe_stop_verifier_weak")
+        }
+        super::task_contract::SafeStopReason::VerifierMissing => (
+            ExitReason::SafeStopVerifierMissing,
+            "safe_stop_verifier_missing",
+        ),
+    }
 }
 
 fn task_contract_needs_verification(
@@ -7527,6 +7573,12 @@ impl Agent {
             match owned_plan {
                 super::auto_test::OwnedTestVerifierPlan::Runnable { plan, command } => {
                     let display_command = command.to_display_string();
+                    // PR-001: snapshot the structurally-bound owned-test
+                    // count before consuming `command`. The structured
+                    // runner re-validates each path against the
+                    // TaskWorkspaceScope before spawning, so the count
+                    // here is what actually appeared in argv.
+                    let bound_test_artifacts_count = command.bound_test_artifacts().len();
                     let result = {
                         let _sp = Spinner::start("running verifier...".to_string());
                         AutoTestRunner::run_structured(
@@ -7559,7 +7611,13 @@ impl Agent {
                                 result.exit_code,
                             );
                             if result.passed {
-                                self.observe_task_contract_verifier_exit_zero(&result.command);
+                                // PR-001: structured (bound) evidence —
+                                // proof that the verifier argv contained
+                                // the owned test artifact paths.
+                                self.observe_task_contract_verifier_exit_zero_bound(
+                                    &result.command,
+                                    bound_test_artifacts_count,
+                                );
                                 TaskContractVerifierOutcome::Passed {
                                     command: result.command,
                                 }
@@ -7603,7 +7661,13 @@ impl Agent {
                     }
                     let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
                     self.session.record_feedback_if_unset(frame);
-                    return TaskContractVerifierOutcome::NoVerifier;
+                    // Issue #651 PR-002: surface Weak as SafeStop so the
+                    // dispatch maps to ExitReason::SafeStopVerifierWeak
+                    // directly, without re-entering the MissingVerifierJob
+                    // retry path (NoVerifier).
+                    return TaskContractVerifierOutcome::SafeStop {
+                        reason: super::task_contract::SafeStopReason::VerifierWeak,
+                    };
                 }
                 super::auto_test::OwnedTestVerifierPlan::Missing => {
                     if !self.session.verifier_safe_stop_emitted_this_turn {
@@ -7622,7 +7686,15 @@ impl Agent {
                     }
                     let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
                     self.session.record_feedback_if_unset(frame);
-                    return TaskContractVerifierOutcome::NoVerifier;
+                    // Issue #651 PR-002: structured Missing → SafeStop
+                    // (mapped to ExitReason::SafeStopVerifierMissing) so
+                    // the MissingVerifierJob retry budget is NOT consumed.
+                    // Missing means "no allowlisted structured runner",
+                    // which is unrecoverable via more retries in the same
+                    // workspace shape — stopping is the safe contract.
+                    return TaskContractVerifierOutcome::SafeStop {
+                        reason: super::task_contract::SafeStopReason::VerifierMissing,
+                    };
                 }
             }
         }
@@ -7932,6 +8004,30 @@ impl Agent {
                     error_text: error,
                 }
             }
+            // Issue #651 PR-002: structured-runner SafeStop. Map the
+            // type-level reason directly to ExitReason::SafeStopVerifier
+            // {Weak,Missing}, bypassing the MissingVerifierJob retry
+            // path. The mapping is delegated to the pure helper
+            // `task_contract_verifier_safe_stop_mapping` so the SafeStop
+            // dispatch can be unit tested without the surrounding agent
+            // harness.
+            TaskContractVerifierOutcome::SafeStop { reason } => {
+                let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
+                log_llm_event(
+                    "agent.task_contract.safe_stop",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "turn_index": self.current_turn_index,
+                        "iter": args.last_iter,
+                        "outcome": log_outcome,
+                        "source": "task_contract_verifier",
+                    }),
+                );
+                TaskContractVerifierFlowOutcome::Exit {
+                    reason: mapped_reason,
+                    error_text: mapped_reason.default_error_text().to_string(),
+                }
+            }
         }
     }
 
@@ -7960,6 +8056,36 @@ impl Agent {
                 serde_json::json!({
                     "command_class": "build_test",
                     "source": "task_contract_verifier",
+                }),
+            );
+        }
+    }
+
+    /// Issue #651 PR-001: structured-runner variant of
+    /// `observe_task_contract_verifier_exit_zero`. Records a verifier
+    /// success that came through `AutoTestRunner::run_structured`, i.e.
+    /// the runner's argv was validated against the owned test artifact
+    /// list. The recorded `bound_test_artifacts_count` is the only proof
+    /// `TaskContract::evaluate_with_owned_test_artifacts` accepts to
+    /// satisfy `test_execution_required = true`.
+    fn observe_task_contract_verifier_exit_zero_bound(
+        &mut self,
+        command: &str,
+        bound_count: usize,
+    ) {
+        if let Some(evidence) =
+            build_task_contract_verifier_exit_zero_evidence_bound(command, bound_count)
+        {
+            self.evidence_set_this_turn.push(evidence.clone());
+            self.task_contract_evidence_set_this_turn.push(evidence);
+            crate::logging::log_completion_evidence_observed(
+                self.current_turn_index,
+                0,
+                "verifier_exit_zero",
+                serde_json::json!({
+                    "command_class": "build_test",
+                    "source": "task_contract_verifier_structured",
+                    "bound_test_artifacts_count": bound_count,
                 }),
             );
         }
@@ -12314,10 +12440,16 @@ pub(super) fn build_verifier_exit_zero_evidence(
         return None;
     }
     let masked = super::completion_evidence::redact_verifier_command_for_storage(&outcome.command);
+    // PR-001: bash-hook / legacy path — `bound_test_artifacts_count: None`
+    // because we cannot prove the runner's argv contained any owned test
+    // path. `TaskContract::evaluate_with_owned_test_artifacts` treats this
+    // as unbound and refuses to promote to Done under
+    // `test_execution_required = true` (Issue #651 PR-001).
     Some(
         super::completion_evidence::CompletionEvidence::VerifierExitZero {
             class: outcome.class,
             command: masked,
+            bound_test_artifacts_count: None,
         },
     )
 }
@@ -12330,6 +12462,12 @@ fn build_task_contract_verifier_exit_zero_evidence(
     // Bash tool output, the command may include an internal setup segment
     // (`pip install ... && pytest`), so the shell-control evidence gate is not
     // the right trust boundary here.
+    //
+    // PR-001: this overload covers the **legacy** `AutoTestRunner::run`
+    // (shell-based) path which has no structural binding to owned test
+    // paths. It records `bound_test_artifacts_count: None`. The structured
+    // `AutoTestRunner::run_structured` path goes through
+    // `build_task_contract_verifier_exit_zero_evidence_bound(command, n)`.
     let masked = super::completion_evidence::redact_verifier_command_for_storage(command);
     if masked.trim().is_empty() {
         return None;
@@ -12338,24 +12476,58 @@ fn build_task_contract_verifier_exit_zero_evidence(
         super::completion_evidence::CompletionEvidence::VerifierExitZero {
             class: crate::tools::bash::BashCommandClass::BuildTest,
             command: masked,
+            bound_test_artifacts_count: None,
+        },
+    )
+}
+
+/// Issue #651 PR-001: build a **bound** `VerifierExitZero` evidence
+/// entry for the structured-runner path. The `bound_count` parameter is
+/// the size of `VerifierCommand::bound_test_artifacts()` at the time
+/// `AutoTestRunner::run_structured` succeeded — i.e. the number of
+/// scope-validated owned test paths that appeared in the child process's
+/// argv.
+///
+/// This entry is the only proof
+/// `TaskContract::evaluate_with_owned_test_artifacts` accepts as
+/// satisfying `test_execution_required = true`. Storing the count (not
+/// the path list) keeps the evidence payload bounded and avoids leaking
+/// path strings into the in-process EvidenceSet.
+fn build_task_contract_verifier_exit_zero_evidence_bound(
+    command: &str,
+    bound_count: usize,
+) -> Option<super::completion_evidence::CompletionEvidence> {
+    let masked = super::completion_evidence::redact_verifier_command_for_storage(command);
+    if masked.trim().is_empty() {
+        return None;
+    }
+    Some(
+        super::completion_evidence::CompletionEvidence::VerifierExitZero {
+            class: crate::tools::bash::BashCommandClass::BuildTest,
+            command: masked,
+            bound_test_artifacts_count: Some(bound_count),
         },
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ExitReason;
     use super::{
-        PlanExplorationKey, answer_only_reply_is_inadequate, answer_only_script_command_allowed,
-        answer_only_script_execution_fallback_response, assistant_model_for_mode,
-        build_task_contract_verifier_exit_zero_evidence, build_verifier_exit_zero_evidence,
+        PlanExplorationKey, TaskContractVerifierOutcome, answer_only_reply_is_inadequate,
+        answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
+        assistant_model_for_mode, build_task_contract_verifier_exit_zero_evidence,
+        build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
         deterministic_timeout_fallback_plan, effective_non_streaming_timeout_secs,
         latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
         normalize_exploration_path, normalize_plan_exploration_key,
         request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
         should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
+        task_contract_verifier_safe_stop_mapping,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
+    use crate::agent::loop_run::task_contract::SafeStopReason;
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use crate::session::store::ConversationMessage;
     use crate::tools::bash::{BashCommandClass, BashExecutionOutcome};
@@ -12386,9 +12558,15 @@ mod tests {
         let outcome = make_outcome("npm install", Some(0), BashCommandClass::EnvSetup);
         let evidence = build_verifier_exit_zero_evidence(&outcome).expect("EnvSetup success");
         match evidence {
-            CompletionEvidence::VerifierExitZero { class, command } => {
+            CompletionEvidence::VerifierExitZero {
+                class,
+                command,
+                bound_test_artifacts_count,
+            } => {
                 assert_eq!(class, BashCommandClass::EnvSetup);
                 assert_eq!(command, "npm install");
+                // PR-001: bash-hook / legacy path is unbound by construction.
+                assert_eq!(bound_test_artifacts_count, None);
             }
             other => panic!("expected VerifierExitZero, got {other:?}"),
         }
@@ -12423,9 +12601,40 @@ mod tests {
         )
         .expect("controller verifier success should record evidence");
         match evidence {
-            CompletionEvidence::VerifierExitZero { class, command } => {
+            CompletionEvidence::VerifierExitZero {
+                class,
+                command,
+                bound_test_artifacts_count,
+            } => {
                 assert_eq!(class, BashCommandClass::BuildTest);
                 assert!(command.contains("pytest"));
+                // PR-001: legacy shell-based AutoTestRunner::run path is unbound.
+                assert_eq!(bound_test_artifacts_count, None);
+            }
+            other => panic!("expected VerifierExitZero, got {other:?}"),
+        }
+    }
+
+    /// Issue #651 PR-001: structured-runner builder records the bound
+    /// owned-test artifact count so
+    /// `TaskContract::evaluate_with_owned_test_artifacts` can require it
+    /// for `Done` under `test_execution_required = true`.
+    #[test]
+    fn task_contract_verifier_exit_zero_bound_records_bound_count() {
+        let evidence = build_task_contract_verifier_exit_zero_evidence_bound(
+            "python3 -B -m pytest tests/test_x.py",
+            1,
+        )
+        .expect("bound structured verifier success should record evidence");
+        match evidence {
+            CompletionEvidence::VerifierExitZero {
+                class,
+                command,
+                bound_test_artifacts_count,
+            } => {
+                assert_eq!(class, BashCommandClass::BuildTest);
+                assert!(command.contains("pytest"));
+                assert_eq!(bound_test_artifacts_count, Some(1));
             }
             other => panic!("expected VerifierExitZero, got {other:?}"),
         }
@@ -13571,6 +13780,84 @@ mod tests {
         assert!(
             result.is_none(),
             "flag off で arithmetic patch が発火してはならない"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #651 PR-002 (High): task-contract structured Weak / Missing
+    // must surface as SafeStop, not as the MissingVerifierJob retry
+    // path (NoVerifier). The dispatch is split into two pieces:
+    //   1. `run_task_contract_verifier_once` returns
+    //      `TaskContractVerifierOutcome::SafeStop { reason }`.
+    //   2. `drive_task_contract_verifier`'s match arm maps that to
+    //      `ExitReason::SafeStopVerifier{Weak,Missing}` via the pure
+    //      helper `task_contract_verifier_safe_stop_mapping`.
+    // The helper exposes the mapping so we can pin it without spinning
+    // up an `Agent` (the surrounding dispatch needs &mut self).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn task_contract_verifier_with_structured_weak_returns_safe_stop_verifier_weak() {
+        let outcome = TaskContractVerifierOutcome::SafeStop {
+            reason: SafeStopReason::VerifierWeak,
+        };
+        // Pin the variant: it must carry the typed reason so downstream
+        // matches stay exhaustive (no `_ =>` fallback).
+        match outcome {
+            TaskContractVerifierOutcome::SafeStop { reason } => {
+                let (mapped, tag) = task_contract_verifier_safe_stop_mapping(reason);
+                assert_eq!(mapped, ExitReason::SafeStopVerifierWeak);
+                assert_eq!(tag, "safe_stop_verifier_weak");
+            }
+            other => panic!("expected SafeStop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_contract_verifier_with_structured_missing_returns_safe_stop_verifier_missing() {
+        let outcome = TaskContractVerifierOutcome::SafeStop {
+            reason: SafeStopReason::VerifierMissing,
+        };
+        match outcome {
+            TaskContractVerifierOutcome::SafeStop { reason } => {
+                let (mapped, tag) = task_contract_verifier_safe_stop_mapping(reason);
+                assert_eq!(mapped, ExitReason::SafeStopVerifierMissing);
+                assert_eq!(tag, "safe_stop_verifier_missing");
+            }
+            other => panic!("expected SafeStop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_contract_verifier_safe_stop_does_not_collide_with_no_verifier() {
+        // Regression guard: PR-002 must keep `NoVerifier` and `SafeStop`
+        // distinct so the dispatch can route them to MissingVerifierJob
+        // retry vs ExitReason::SafeStopVerifier* respectively.
+        let safe_stop_w = TaskContractVerifierOutcome::SafeStop {
+            reason: SafeStopReason::VerifierWeak,
+        };
+        let safe_stop_m = TaskContractVerifierOutcome::SafeStop {
+            reason: SafeStopReason::VerifierMissing,
+        };
+        let no_verifier = TaskContractVerifierOutcome::NoVerifier;
+        assert_ne!(safe_stop_w, no_verifier);
+        assert_ne!(safe_stop_m, no_verifier);
+        assert_ne!(safe_stop_w, safe_stop_m);
+    }
+
+    #[test]
+    fn task_contract_verifier_safe_stop_mapping_pure_fn() {
+        // Direct unit test of the pure helper.
+        assert_eq!(
+            task_contract_verifier_safe_stop_mapping(SafeStopReason::VerifierWeak),
+            (ExitReason::SafeStopVerifierWeak, "safe_stop_verifier_weak"),
+        );
+        assert_eq!(
+            task_contract_verifier_safe_stop_mapping(SafeStopReason::VerifierMissing),
+            (
+                ExitReason::SafeStopVerifierMissing,
+                "safe_stop_verifier_missing",
+            ),
         );
     }
 }
