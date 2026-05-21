@@ -525,4 +525,111 @@ mod pr003_mockito_e2e {
             );
         }
     }
+
+    /// PRR-002 (re-review v2): the raw `path` argument from a wrong-target
+    /// tool call can itself carry control characters / secret-like strings
+    /// / over-long content. `record_artifact_completion_attempt` stores
+    /// the path verbatim inside the `actual_actions` vector via
+    /// `format!("{name} on {actual_path}")`. After exhaustion, that vector
+    /// is rendered into the system note ("Recent actions: …") **and** into
+    /// the `agent.artifact_completion_failed` JSON log event. PRR-002
+    /// requires that BOTH downstream surfaces contain only sanitized
+    /// (mask_secrets + length cap + control-char neutralization +
+    /// mask_payload_inplace) versions of the path. We assert against the
+    /// system note in `session.messages` since the JSON event is logged
+    /// out-of-band; the same `sanitize_actions` pipeline feeds both
+    /// sinks (artifact_completion_job.rs::ArtifactAttemptOutcome::new).
+    #[test]
+    fn prr002_wrong_target_sanitizes_actual_actions_path_in_system_note() {
+        // Build a Write tool call whose `path` carries:
+        //   1. an `sk-…`-shaped secret (must be masked),
+        //   2. embedded `\n` / `\t` / `\r` control chars (must be neutralized),
+        //   3. a long suffix (must be byte-capped).
+        let secret = "sk-AAAAAAAAAAAAAAAAAAAAAAAAA";
+        let raw_path = format!(
+            "src/wrong{secret}\nline2\twith\ttabs\rmore/{}/file.py",
+            "x".repeat(200)
+        );
+        let payload = format!(
+            "<anvil_tool_call>{}</anvil_tool_call>",
+            serde_json::json!({
+                "name": "Write",
+                "arguments": {
+                    "path": raw_path,
+                    "content": "harmless",
+                },
+            })
+        );
+        let model_response = serde_json::json!({
+            "model": "test-model",
+            "response": payload,
+            "done": true,
+        });
+        let (mut agent, _dir, _server, mock) = build_test_role_exhaustion_fixture(
+            "prr002-actual-actions-sanitize",
+            "anvil-prr002-actions",
+            "tests/test_artifact.py",
+            "# scaffold body — bootstrap only\n",
+            model_response,
+            6,
+        );
+        let prompt = "Write tests for the calculator function.";
+        let _ = agent.process_line(prompt, false);
+
+        mock.assert();
+
+        // The exhaustion path must have fired the system note (sink #1 of
+        // emit_artifact_completion_failed_diagnostic_if_needed). The note
+        // is the rendered surface that carries `actual_actions` directly
+        // ("Recent actions: …"). Find the note and assert sanitization.
+        let artifact_notes: Vec<&String> = agent
+            .session_ref()
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .map(|m| &m.content)
+            .filter(|c| c.contains("[Artifact Completion Failed]"))
+            .collect();
+        assert!(
+            !artifact_notes.is_empty(),
+            "PRR-002: expected [Artifact Completion Failed] system note after exhaustion; \
+             messages={:?}",
+            agent
+                .session_ref()
+                .messages
+                .iter()
+                .map(|m| (
+                    m.role.as_str(),
+                    m.content.chars().take(80).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+        );
+        for note in &artifact_notes {
+            // (1) secret literal must be masked by the SSOT pipeline.
+            assert!(
+                !note.contains(secret),
+                "PRR-002: secret pattern leaked into [Artifact Completion Failed] system note: {note}"
+            );
+            // (2) control characters must be neutralized to spaces.
+            assert!(
+                !note.contains('\n'),
+                "PRR-002: newline survived into actual_actions render: {note:?}"
+            );
+            assert!(
+                !note.contains('\t'),
+                "PRR-002: tab survived into actual_actions render: {note:?}"
+            );
+            assert!(
+                !note.contains('\r'),
+                "PRR-002: CR survived into actual_actions render: {note:?}"
+            );
+            // (3) byte cap must apply. Note is wrapped with fixed prefix
+            // text — total length stays well under any reasonable bound.
+            assert!(
+                note.len() < 64 * 1024,
+                "PRR-002: system note must be byte-capped (len={})",
+                note.len()
+            );
+        }
+    }
 }

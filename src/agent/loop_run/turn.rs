@@ -406,6 +406,63 @@ impl EffectiveToolPolicy {
         }
     }
 
+    /// PRR-003 (re-review v2): job-projection constructor that derives the
+    /// allowed-tools set from the `ArtifactCompletionJob`'s explicit
+    /// `AllowedWriteActions` + `AllowedReadScope`, NOT from `target.is_file()`
+    /// alone. This wires the job's least-privilege projection through to
+    /// `EffectiveToolPolicy` instead of re-deriving it from filesystem
+    /// state, matching the Issue #652 design contract ("job is the
+    /// projection source").
+    ///
+    /// Behavioural mapping:
+    /// - `allow_create && !allow_modify`     → `Write`           (missing target)
+    /// - `allow_modify && !allow_create`     → `Write` + `Edit`  (existing target)
+    /// - `Read` is granted iff the read scope is `TargetOnly` AND
+    ///   `target_already_read == false`.
+    ///
+    /// For the variants the job actually produces today (`target_create_only`
+    /// / `target_modify_only` × `AllowedReadScope::TargetOnly`) this returns
+    /// the same `allowed_tools` set the legacy `artifact_directed`
+    /// constructor would derive from `target.is_file()`. The semantic
+    /// difference is that the SOURCE of truth is now the job's least-
+    /// privilege projection, so future writes/reads granularity changes
+    /// (Issue #653+) ripple through here automatically.
+    fn artifact_directed_from_job(
+        target: PathBuf,
+        target_already_read: bool,
+        allowed_write_actions: &super::artifact_completion_job::AllowedWriteActions,
+        allowed_read_scope: &super::artifact_completion_job::AllowedReadScope,
+    ) -> Self {
+        let mut allowed_tools: Vec<&'static str> = Vec::new();
+        // Read grant: read scope is TargetOnly and the target has not been
+        // read yet this conversation. TargetAndDeps is reserved for #653+
+        // and is not produced today; we treat it identically to TargetOnly
+        // for the Read grant (deps are still pinned to the target).
+        let read_scope_allows_target_read = matches!(
+            allowed_read_scope,
+            super::artifact_completion_job::AllowedReadScope::TargetOnly
+                | super::artifact_completion_job::AllowedReadScope::TargetAndDeps(_)
+        );
+        if read_scope_allows_target_read && !target_already_read {
+            allowed_tools.push("Read");
+        }
+        if allowed_write_actions.allow_create() || allowed_write_actions.allow_modify() {
+            allowed_tools.push("Write");
+        }
+        if allowed_write_actions.allow_modify() {
+            allowed_tools.push("Edit");
+        }
+        Self {
+            allowed_tools: Some(allowed_tools),
+            focused_edit: None,
+            artifact_directed: Some(ArtifactDirectedPolicy {
+                target,
+                target_already_read,
+            }),
+            reason: EffectiveToolPolicyReason::ArtifactDirectedRecovery,
+        }
+    }
+
     fn focused_edit(
         reason: EffectiveToolPolicyReason,
         allowed_tools: Vec<&'static str>,
@@ -9514,6 +9571,23 @@ impl Agent {
         if let Some(target) = self.artifact_recovery_target_path() {
             let target_already_read =
                 focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            // PRR-003 (re-review v2): when a Test-role `ArtifactCompletionJob`
+            // is active, project its `AllowedWriteActions` /
+            // `AllowedReadScope` into the policy so the job is the explicit
+            // source of truth for the allowed-tools set (least privilege).
+            // Non-Test roles (Implementation / UsageDocs / Setup) do not
+            // attach a job today and continue to use the legacy
+            // `target.is_file()`-derived constructor.
+            if let Some(job) = self.artifact_completion_job.as_ref()
+                && matches!(job.role(), super::task_contract::ArtifactRole::Test)
+            {
+                return EffectiveToolPolicy::artifact_directed_from_job(
+                    target,
+                    target_already_read,
+                    job.allowed_write_actions(),
+                    job.allowed_read_scope(),
+                );
+            }
             return EffectiveToolPolicy::artifact_directed(target, target_already_read);
         }
         if let Some(target) = self.focused_edit_recovery_target() {
@@ -27221,6 +27295,116 @@ export default function App() {
         }
     }
 
+    // ----------------------------------------------------------------
+    // PRR-003 (re-review v2): `EffectiveToolPolicy::artifact_directed_from_job`
+    // derives `allowed_tools` from the job's `AllowedWriteActions` /
+    // `AllowedReadScope` projection, NOT from `target.is_file()` alone.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn artifact_directed_from_job_target_create_only_grants_write_only() {
+        use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        let target = work_root.join("tests/test_new.py"); // missing leaf
+        let write_actions = AllowedWriteActions::target_create_only();
+        let read_scope = AllowedReadScope::TargetOnly;
+        let policy = EffectiveToolPolicy::artifact_directed_from_job(
+            target,
+            /*target_already_read=*/ false,
+            &write_actions,
+            &read_scope,
+        );
+        let allowed = policy.allowed_tool_names_for_prompt().unwrap();
+        // `target_create_only` => Write only (no Edit). Read is granted
+        // because the target has not yet been read.
+        assert!(allowed.contains(&"Read"), "expected Read; got {allowed:?}");
+        assert!(
+            allowed.contains(&"Write"),
+            "expected Write; got {allowed:?}"
+        );
+        assert!(
+            !allowed.contains(&"Edit"),
+            "PRR-003: target_create_only must NOT grant Edit; got {allowed:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_directed_from_job_target_modify_only_grants_write_and_edit() {
+        use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let target = work_root.join("tests/test_existing.py");
+        std::fs::write(&target, "def test_x(): pass\n").unwrap();
+        let write_actions = AllowedWriteActions::target_modify_only();
+        let read_scope = AllowedReadScope::TargetOnly;
+        let policy = EffectiveToolPolicy::artifact_directed_from_job(
+            target,
+            /*target_already_read=*/ false,
+            &write_actions,
+            &read_scope,
+        );
+        let allowed = policy.allowed_tool_names_for_prompt().unwrap();
+        // `target_modify_only` => Write + Edit. Read granted because not
+        // yet read.
+        assert!(allowed.contains(&"Read"));
+        assert!(allowed.contains(&"Write"));
+        assert!(allowed.contains(&"Edit"));
+    }
+
+    #[test]
+    fn artifact_directed_from_job_target_already_read_suppresses_read() {
+        use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let target = work_root.join("tests/test_existing.py");
+        std::fs::write(&target, "def test_x(): pass\n").unwrap();
+        let write_actions = AllowedWriteActions::target_modify_only();
+        let read_scope = AllowedReadScope::TargetOnly;
+        let policy = EffectiveToolPolicy::artifact_directed_from_job(
+            target,
+            /*target_already_read=*/ true,
+            &write_actions,
+            &read_scope,
+        );
+        let allowed = policy.allowed_tool_names_for_prompt().unwrap();
+        assert!(
+            !allowed.contains(&"Read"),
+            "PRR-003: Read must be suppressed when target_already_read=true; got {allowed:?}"
+        );
+        assert!(allowed.contains(&"Write"));
+        assert!(allowed.contains(&"Edit"));
+    }
+
+    #[test]
+    fn artifact_directed_from_job_records_artifact_directed_recovery_reason() {
+        use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("tests/test_x.py");
+        let policy = EffectiveToolPolicy::artifact_directed_from_job(
+            target.clone(),
+            false,
+            &AllowedWriteActions::target_create_only(),
+            &AllowedReadScope::TargetOnly,
+        );
+        // Reason / target / focused_edit invariants are preserved so the
+        // downstream policy gate (`tool_path_matches_target_via_workspace_ssot`
+        // + `restricted_tool_policy_error`) continues to function unchanged.
+        assert_eq!(
+            policy.reason(),
+            EffectiveToolPolicyReason::ArtifactDirectedRecovery
+        );
+        assert!(policy.focused_edit_policy().is_none());
+        assert_eq!(
+            policy
+                .artifact_directed_policy()
+                .map(|p| p.target.as_path()),
+            Some(target.as_path())
+        );
+    }
+
     #[test]
     fn artifact_directed_policy_rejects_exploration_tools_before_execution() {
         let temp = tempdir().unwrap();
@@ -27363,6 +27547,38 @@ export default function App() {
                 work_root,
             ),
             "CB2-002: dangling-symlink ancestor MUST NOT confer artifact-directed write permission"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_directed_policy_rejects_dangling_symlink_leaf_via_ssot() {
+        // PRR-001 (re-review v2): the **final leaf** itself can be a
+        // dangling symlink (parent dir inside work_root). Without the
+        // leaf check, the previous helper advanced to `candidate.parent()`,
+        // accepted the leaf, and the policy let a Write/Edit on the leaf
+        // pass — `std::fs::write` then dereferenced the link and escaped
+        // the workspace. Both sides (the tool arg AND the target string)
+        // must reject the dangling-symlink leaf so the gate stays
+        // consistent with `ArtifactCompletionJob::new`.
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        let outside = tempdir().unwrap();
+        symlink(
+            outside.path().join("missing.py"),
+            work_root.join("tests/test_artifact.py"),
+        )
+        .unwrap();
+        let target = work_root.join("tests/test_artifact.py");
+        assert!(
+            !super::tool_path_matches_target_via_workspace_ssot(
+                "tests/test_artifact.py",
+                &target,
+                work_root,
+            ),
+            "PRR-001: dangling symlink leaf MUST NOT confer artifact-directed write permission"
         );
     }
 

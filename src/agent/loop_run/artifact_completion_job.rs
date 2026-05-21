@@ -1242,6 +1242,77 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
+    // PRR-001 (re-review v2): the **final leaf** itself must be checked,
+    // not just the ancestor chain. A dangling symlink leaf (e.g.
+    // `tests/test_artifact.py -> /outside/missing.py`) used to be
+    // accepted because the previous helper advanced to `candidate.parent()`
+    // before any `symlink_metadata` check, and the parent was inside
+    // `work_root`. A subsequent `std::fs::write` on the leaf would
+    // dereference the link and escape the workspace.
+    // ----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_new_rejects_dangling_symlink_leaf() {
+        use std::os::unix::fs::symlink;
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // Final leaf is a dangling symlink — parent `tests/` is inside
+        // `work_root`. Pre-PRR-001 the helper walked to `tests/`, which
+        // canonicalized cleanly inside work_root, and the job installed.
+        symlink(
+            outside.path().join("missing.py"),
+            work.path().join("tests/test_artifact.py"),
+        )
+        .unwrap();
+        let scope = single_root_scope();
+        let err = ArtifactCompletionJob::new(
+            work.path(),
+            &scope,
+            make_hint("tests/test_artifact.py"),
+            /*edited_this_session=*/ false,
+            /*scaffold_changed=*/ false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactCompletionJobError::InvalidTarget,
+            "PRR-001: dangling symlink leaf MUST be rejected even when parent is inside work_root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_new_rejects_symlink_leaf_pointing_outside_work_root() {
+        use std::os::unix::fs::symlink;
+        let work = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.py"), "secret").unwrap();
+        // Leaf symlink resolves to an existing file outside work_root.
+        symlink(
+            outside.path().join("secret.py"),
+            work.path().join("tests/escape.py"),
+        )
+        .unwrap();
+        let scope = single_root_scope();
+        let err = ArtifactCompletionJob::new(
+            work.path(),
+            &scope,
+            make_hint("tests/escape.py"),
+            /*edited_this_session=*/ true,
+            /*scaffold_changed=*/ false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ArtifactCompletionJobError::InvalidTarget,
+            "PRR-001: symlink leaf that canonicalizes outside work_root MUST be rejected"
+        );
+    }
+
+    // ----------------------------------------------------------------
     // CB-004 regression: sanitize_single must neutralize \n / \t / NUL
     // simultaneously, along with mask_secrets + 4096 byte cap.
     // ----------------------------------------------------------------
