@@ -302,23 +302,15 @@ impl RepairJob {
             // Issue #638 (Task 1.6 / §5 Security boundary): only project path
             // when it passes syntactic safety. Symlink-escape is upstream's
             // responsibility (recovery_target_hint_for_existing_path).
-            target_path: self.target_hint.as_ref().and_then(|hint| {
-                let raw = hint.path.as_str();
-                // Reject absolute paths, `..` components, and ANY control char
-                // (C0 < 0x20 + DEL 0x7f) for parity with sanitize_repair_job_text
-                // (Codex CB-003 reflected).
-                if raw.is_empty()
-                    || raw.chars().any(|c| c.is_control())
-                    || Path::new(raw).is_absolute()
-                    || Path::new(raw)
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    None
-                } else {
-                    Some(PathBuf::from(raw))
-                }
-            }),
+            // Issue #654 / DR1-003: route through `safe_relative_path_string`
+            // SSOT so the syntactic safety check (absolute / `..` / control
+            // char / empty / non-UTF8) lives in one place. Behavior is
+            // equivalent to the prior inline check (Codex CB-003 reflected).
+            target_path: self
+                .target_hint
+                .as_ref()
+                .and_then(|hint| safe_relative_path_string(hint.path.as_str()))
+                .map(PathBuf::from),
             diagnostic_error: self
                 .diagnostic_error
                 .as_deref()
@@ -348,6 +340,19 @@ impl RepairJob {
     /// describe a pre-semantic-planning state.
     #[cfg(test)]
     pub(super) fn new_for_test() -> Self {
+        Self::empty_synthetic()
+    }
+
+    /// Issue #654 (E.2) — production-side minimal constructor used when an
+    /// `artifact_completion_failed` emit point needs to surface a
+    /// `SafeStopReport` without a verifier-driven `RepairJob`. All fields are
+    /// empty / `None` / `Unknown`; the safe-stop builder fills in the
+    /// `stop_reason` / `current_role` / `expected_target` from `SafeStopContext`
+    /// so the synthetic shell never leaks misleading verifier metadata.
+    ///
+    /// Callers MUST set `target_hint` after construction if they want the
+    /// `expected_target` field of the emitted payload to be populated.
+    pub(super) fn empty_synthetic() -> Self {
         Self {
             command: String::new(),
             output_excerpt: String::new(),
@@ -1224,6 +1229,428 @@ pub(super) fn rerun_outcome_with_cluster(
         (Some(prev), Some(curr)) if prev != curr => VerifierRepairRerunOutcome::NewFailure,
         _ => base_outcome,
     }
+}
+
+// ============================================================================
+// Issue #654 — Bounded Safe Stop Report
+// ============================================================================
+//
+// All types and helpers in this section are `pub(super)` (DR3-001). They are
+// consumed exclusively by `turn.rs::record_safe_stop_report` and unit tests
+// inside this module. They MUST NOT be re-exported from
+// `src/agent/loop_run.rs`.
+//
+// SSOT pipeline (defense-in-depth):
+//   raw -> sanitize_repair_job_text* -> safe_relative_path_string ->
+//          SafeStopReport::build_from -> build_safe_stop_payload ->
+//          log_llm_event -> mask_payload_inplace
+//
+// The `SafeStopReport` struct intentionally **flat-copies** the 4 overlapping
+// fields from `VerifierFailureSnapshot` (failure_signature / command /
+// output_excerpt / failure_type) for FromRepair input, so that the report has
+// no nested `Option<VerifierFailureSnapshot>` shape and the FromMissingVerifier
+// branch can default these fields explicitly (DR2-008).
+
+use super::task_contract::ArtifactRole;
+
+/// Hard upper bound on a single `safe_relative_path_string` projection (chars).
+/// `expected_target` / `owned_test_artifacts[]` are first projected through
+/// `safe_relative_path_string` and then re-sanitized through
+/// `sanitize_repair_job_text_with_char_cap(_, SAFE_STOP_PATH_CHAR_CAP)`
+/// (DR2-001).
+pub(super) const SAFE_STOP_PATH_CHAR_CAP: usize = 240;
+
+/// Hard upper bound on a single sanitized `actual_actions[]` entry (chars).
+pub(super) const SAFE_STOP_ACTION_CHAR_CAP: usize = 120;
+
+/// Maximum number of `actual_actions[]` entries kept after capping.
+pub(super) const SAFE_STOP_ACTUAL_ACTIONS_MAX: usize = 8;
+
+/// Maximum number of `owned_test_artifacts[]` entries kept after Owned-validation.
+pub(super) const SAFE_STOP_OWNED_TEST_ARTIFACTS_MAX: usize = 8;
+
+/// `last_repair_hypothesis` char cap (matches `MAX_REPAIR_HYPOTHESIS_CHARS`).
+pub(super) const SAFE_STOP_LAST_REPAIR_HYPOTHESIS_CHAR_CAP: usize = 240;
+
+/// Maximum number of clusters tracked in `ExhaustedAttemptsSummary.per_cluster`.
+pub(super) const SAFE_STOP_PER_CLUSTER_MAX: usize = 8;
+
+/// Maximum number of role labels per cluster in `ExhaustedAttemptsSummary.per_cluster`.
+pub(super) const SAFE_STOP_PER_CLUSTER_ROLE_MAX: usize = 4;
+
+/// Issue #654 — per-turn dedup key. Each variant maps 1:1 to a `stop_reason`
+/// label that appears in the `agent.safe_stop.report` event payload.
+///
+/// `Hash + Eq + Copy` allow `HashSet<StopReason>` to act as the per-turn
+/// dedup marker on `Agent` (DR1-006). The variant set is closed-fixed at 5
+/// so the overhead is negligible compared to a `&'static str` marker.
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+pub(super) enum StopReason {
+    ArtifactCompletionFailed,
+    VerifierFailedSafeStop,
+    VerifierWeak,
+    VerifierMissing,
+    DiagnosticTargetMissing,
+}
+
+impl StopReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            StopReason::ArtifactCompletionFailed => "artifact_completion_failed",
+            StopReason::VerifierFailedSafeStop => "verifier_failed_safe_stop",
+            StopReason::VerifierWeak => "verifier_weak",
+            StopReason::VerifierMissing => "verifier_missing",
+            StopReason::DiagnosticTargetMissing => "diagnostic_target_missing",
+        }
+    }
+}
+
+/// Issue #654 — why diagnostic target selection failed (4 priorities).
+/// Computed deterministically by `select_diagnostic_target_missing_reason`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum DiagnosticTargetMissingReason {
+    /// priority 1: at least one candidate exists, but ALL are rejected by scope.
+    ScopeExcluded,
+    /// priority 2: candidates exist but resolve/read failed for all.
+    AllCandidatesUnreadable,
+    /// priority 3: no successful Read history and no changed_file_hints.
+    ReadHistoryEmpty,
+    /// priority 4 (default fallback): assessment missing / parse failed / retry exhaust.
+    AssessmentMissing,
+}
+
+impl DiagnosticTargetMissingReason {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            DiagnosticTargetMissingReason::ScopeExcluded => "scope_excluded",
+            DiagnosticTargetMissingReason::AllCandidatesUnreadable => "all_candidates_unreadable",
+            DiagnosticTargetMissingReason::ReadHistoryEmpty => "read_history_empty",
+            DiagnosticTargetMissingReason::AssessmentMissing => "assessment_missing",
+        }
+    }
+}
+
+/// Issue #654 — bounded summary of `RepairJob.exhausted_attempts` for the
+/// safe stop report. std-only implementation (DR3-003): linear scans against
+/// small bounded `Vec`s instead of pulling in `indexmap` / `enumset`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExhaustedAttemptsSummary {
+    pub(super) total: usize,
+    /// `Vec<(cluster_key_16hex, Vec<role_label>)>` — preserves insertion
+    /// order, deduplicates within a cluster, and caps at
+    /// `SAFE_STOP_PER_CLUSTER_MAX` × `SAFE_STOP_PER_CLUSTER_ROLE_MAX`.
+    pub(super) per_cluster: Vec<(String, Vec<&'static str>)>,
+    /// Sanitized + 240-char-capped repair hypothesis. `None` when no plan / no hypothesis.
+    pub(super) last_repair_hypothesis: Option<String>,
+}
+
+impl ExhaustedAttemptsSummary {
+    /// Build a bounded summary from a `RepairJob` and an optional last
+    /// hypothesis text (raw, will be sanitized + capped here).
+    pub(super) fn from_repair_job(job: &RepairJob, last_hyp: Option<&str>) -> Self {
+        let total = job.exhausted_attempts.len();
+        let mut per_cluster: Vec<(String, Vec<&'static str>)> = Vec::new();
+        for (cluster_key, role) in job.exhausted_attempts.iter() {
+            let key_str = cluster_key.as_str().to_string();
+            let role_label = role.label();
+            match per_cluster.iter_mut().find(|(k, _)| k == &key_str) {
+                Some((_, roles)) => {
+                    if roles.len() < SAFE_STOP_PER_CLUSTER_ROLE_MAX && !roles.contains(&role_label)
+                    {
+                        roles.push(role_label);
+                    }
+                }
+                None => {
+                    if per_cluster.len() < SAFE_STOP_PER_CLUSTER_MAX {
+                        per_cluster.push((key_str, vec![role_label]));
+                    }
+                }
+            }
+        }
+        let last_repair_hypothesis = last_hyp.map(|raw| {
+            sanitize_repair_job_text_with_char_cap(raw, SAFE_STOP_LAST_REPAIR_HYPOTHESIS_CHAR_CAP)
+        });
+        Self {
+            total,
+            per_cluster,
+            last_repair_hypothesis,
+        }
+    }
+}
+
+/// Issue #654 / DR1-003 — single SSOT for the "raw path string -> safe
+/// workspace-relative String" projection. Returns `None` when the input is:
+/// - empty
+/// - contains any C0 / DEL control char
+/// - absolute path (Unix `/foo`, Windows `C:\…`, UNC `\\?\…` / `//host/share`)
+/// - contains a `\` backslash separator (Windows path style)
+/// - contains `..` (`ParentDir`) component after normalizing separators
+///
+/// CB-004 (Codex review, Issue #654): the previous implementation relied on
+/// `Path::components()`, which delegates to the host OS's path grammar. On
+/// Unix builds that means `..\secret`, `C:\Users\…`, `\\?\C:\foo`, and
+/// `//host/share` all pass as a single normal component. This helper now
+/// rejects backslash separators and Windows-style absolute prefixes at the
+/// string level before falling back to the host `Path` traversal check, so
+/// the projection is OS-independent.
+///
+/// The returned `String` is the raw projected path. Callers MUST then
+/// run it through `sanitize_repair_job_text_with_char_cap(_,
+/// SAFE_STOP_PATH_CHAR_CAP)` for byte-cap and secret-masking.
+pub(super) fn safe_relative_path_string(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    // CB-004: reject Windows path styles before the host `Path` parser sees
+    // them. The serialization-only consumers downstream still treat the
+    // emitted payload as workspace-relative POSIX paths, so any `\`,
+    // `<drive>:`, `\\?\`, or `//host/share` prefix is a hard reject.
+    if raw.contains('\\') {
+        return None;
+    }
+    if raw.starts_with("//") {
+        return None;
+    }
+    let mut chars = raw.chars();
+    if let (Some(first), Some(second)) = (chars.next(), chars.next())
+        && first.is_ascii_alphabetic()
+        && second == ':'
+    {
+        return None;
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return None;
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Issue #654 — sanitize + bound the `actual_actions[]` array. Takes the
+/// **most recent** entries up to `SAFE_STOP_ACTUAL_ACTIONS_MAX` and clamps
+/// each to `SAFE_STOP_ACTION_CHAR_CAP` characters via the existing
+/// `sanitize_repair_job_text_with_char_cap` SSOT.
+///
+/// Input order convention: oldest-first. Output preserves new-to-old order
+/// (i.e. the most recent action appears first) so downstream consumers see
+/// the freshest context up front.
+pub(super) fn build_actual_actions(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .rev()
+        .take(SAFE_STOP_ACTUAL_ACTIONS_MAX)
+        .map(|s| sanitize_repair_job_text_with_char_cap(s, SAFE_STOP_ACTION_CHAR_CAP))
+        .collect()
+}
+
+/// Issue #654 / DR1-002 — deterministic priority selector for the
+/// `diagnostic_target_missing_reason` field of a `SafeStopReport` produced by
+/// the `diagnostic_target_missing` path.
+///
+/// Priority order (first matching wins):
+/// 1. `ScopeExcluded` — at least one candidate path exists AND every candidate
+///    is rejected by `scope.contains(&str)`.
+/// 2. `AllCandidatesUnreadable` — at least one candidate exists (otherwise we
+///    would have stopped at priority 1) — reaching this branch means scope
+///    accepted at least one path but resolve/read still failed for all.
+/// 3. `ReadHistoryEmpty` — no candidates **and** no `latest_successful_read`
+///    **and** `job.changed_file_hints` is empty.
+/// 4. `AssessmentMissing` — fallback default.
+pub(super) fn select_diagnostic_target_missing_reason(
+    job: &RepairJob,
+    scope: &super::task_workspace_scope::TaskWorkspaceScope,
+    candidates: &[String],
+    latest_successful_read: Option<&Path>,
+) -> DiagnosticTargetMissingReason {
+    if !candidates.is_empty() && candidates.iter().all(|rel| !scope.contains(rel)) {
+        return DiagnosticTargetMissingReason::ScopeExcluded;
+    }
+    if !candidates.is_empty() {
+        return DiagnosticTargetMissingReason::AllCandidatesUnreadable;
+    }
+    if latest_successful_read.is_none() && job.changed_file_hints.is_empty() {
+        return DiagnosticTargetMissingReason::ReadHistoryEmpty;
+    }
+    DiagnosticTargetMissingReason::AssessmentMissing
+}
+
+/// Issue #654 / DR1-001 — bicephalous input to `SafeStopReport::build_from`.
+/// The two variants exist because `verifier_missing` (the only path that
+/// fires `MissingVerifierJob`) does not carry a `RepairJob`.
+pub(super) enum SafeStopInput<'a> {
+    FromRepair {
+        job: &'a RepairJob,
+        stop_reason: StopReason,
+        /// Owned-validated test artifact paths (verifier_weak / verifier_missing).
+        owned_test_artifacts: Vec<String>,
+    },
+    FromMissingVerifier {
+        #[allow(dead_code)]
+        job: &'a MissingVerifierJob,
+        owned_test_artifacts: Vec<String>,
+    },
+}
+
+impl SafeStopInput<'_> {
+    /// SSOT extractor for the `StopReason` carried by this input.
+    /// `FromMissingVerifier` is hard-coded to `StopReason::VerifierMissing`
+    /// (DR2-004).
+    pub(super) fn stop_reason(&self) -> StopReason {
+        match self {
+            SafeStopInput::FromRepair { stop_reason, .. } => *stop_reason,
+            SafeStopInput::FromMissingVerifier { .. } => StopReason::VerifierMissing,
+        }
+    }
+}
+
+/// Issue #654 — read-only context plumbed from `turn.rs` into `build_from`.
+/// Lifetimes mirror the borrowed view the caller already has (no clone).
+pub(super) struct SafeStopContext<'a> {
+    /// Resolved per §6.4 priority: semantic_plan -> task_contract -> None.
+    pub(super) current_role: Option<ArtifactRole>,
+    /// Raw expected-target path (caller-provided). Will be projected through
+    /// `safe_relative_path_string` + `sanitize_repair_job_text_with_char_cap`.
+    pub(super) expected_target: Option<&'a Path>,
+    /// Raw, unsanitized action labels (oldest-first). Will be capped/sanitized
+    /// by `build_actual_actions`.
+    pub(super) actual_actions_raw: Vec<String>,
+    /// For `diagnostic_target_missing` reason selection (DR1-002 / DR2-003).
+    /// Caller converts owned `PathBuf` to `&Path` via `.as_deref()`.
+    pub(super) latest_successful_read: Option<&'a Path>,
+    /// For `diagnostic_target_missing` reason selection (DR1-002).
+    pub(super) task_workspace_scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
+    /// Candidate paths considered during diagnostic target selection.
+    pub(super) candidates: Vec<String>,
+    /// For event-payload `session_id` and `turn_index` fields.
+    pub(super) session_id: &'a str,
+    pub(super) turn_index: u64,
+}
+
+/// Issue #654 — bounded structured safe stop report. Built by
+/// `SafeStopReport::build_from` and consumed by `build_safe_stop_payload`
+/// in `turn.rs`. All string fields are SSOT-sanitized (defense-in-depth).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SafeStopReport {
+    pub(super) failure_signature: String,
+    pub(super) command: String,
+    pub(super) output_excerpt: String,
+    pub(super) failure_type: VerifierFailureType,
+    pub(super) stop_reason: StopReason,
+    pub(super) current_role: Option<ArtifactRole>,
+    pub(super) expected_target: Option<String>,
+    pub(super) actual_actions: Vec<String>,
+    pub(super) exhausted_attempts_summary: Option<ExhaustedAttemptsSummary>,
+    pub(super) diagnostic_target_missing_reason: Option<DiagnosticTargetMissingReason>,
+    pub(super) owned_test_artifacts: Vec<String>,
+    pub(super) session_id: String,
+    pub(super) turn_index: u64,
+}
+
+impl SafeStopReport {
+    /// SSOT 5-path / 2-input-variant builder. All masking + capping happens
+    /// here, even when source data has already been sanitized upstream
+    /// (defense-in-depth, R7).
+    pub(super) fn build_from(input: SafeStopInput<'_>, ctx: SafeStopContext<'_>) -> Self {
+        let stop_reason = input.stop_reason();
+        let expected_target = ctx
+            .expected_target
+            .and_then(|p| p.to_str())
+            .and_then(safe_relative_path_string)
+            .map(|s| sanitize_repair_job_text_with_char_cap(&s, SAFE_STOP_PATH_CHAR_CAP));
+        let actual_actions = build_actual_actions(&ctx.actual_actions_raw);
+
+        match input {
+            SafeStopInput::FromRepair {
+                job,
+                stop_reason: _,
+                owned_test_artifacts,
+            } => {
+                // Re-use the existing `failure_snapshot()` SSOT — it already
+                // composes `sanitize_repair_job_text` /
+                // `redact_verifier_command_for_storage` and projects
+                // `target_path` through the same syntactic safety check.
+                let snapshot = job.failure_snapshot();
+                let mut failure_type = snapshot.failure_type;
+                // DR3-005: `DiagnosticTargetMissing` is only ever set by the
+                // diagnostic_target_missing emit path. Mapping helpers never
+                // produce this variant, so we set it here explicitly.
+                if stop_reason == StopReason::DiagnosticTargetMissing {
+                    failure_type = VerifierFailureType::DiagnosticTargetMissing;
+                }
+                let diagnostic_reason = if stop_reason == StopReason::DiagnosticTargetMissing {
+                    Some(select_diagnostic_target_missing_reason(
+                        job,
+                        ctx.task_workspace_scope,
+                        &ctx.candidates,
+                        ctx.latest_successful_read,
+                    ))
+                } else {
+                    None
+                };
+                let last_hyp = job
+                    .semantic_plan
+                    .as_ref()
+                    .map(|plan| plan.repair_hypothesis.as_str());
+                let summary = Some(ExhaustedAttemptsSummary::from_repair_job(job, last_hyp));
+                Self {
+                    failure_signature: snapshot.failure_signature,
+                    command: snapshot.command,
+                    output_excerpt: snapshot.output_excerpt,
+                    failure_type,
+                    stop_reason,
+                    current_role: ctx.current_role,
+                    expected_target,
+                    actual_actions,
+                    exhausted_attempts_summary: summary,
+                    diagnostic_target_missing_reason: diagnostic_reason,
+                    owned_test_artifacts: sanitize_and_filter_owned_paths(&owned_test_artifacts),
+                    session_id: ctx.session_id.to_string(),
+                    turn_index: ctx.turn_index,
+                }
+            }
+            SafeStopInput::FromMissingVerifier {
+                job: _,
+                owned_test_artifacts,
+            } => Self {
+                // Explicit defaults (R8): downstream consumers expect non-empty
+                // failure_signature / failure_type even for the missing-verifier
+                // path so empty-string detection in `/bug-fix` does not misfire.
+                failure_signature: "missing_verifier_or_config".to_string(),
+                command: String::new(),
+                output_excerpt: String::new(),
+                failure_type: VerifierFailureType::MissingVerifierOrConfig,
+                stop_reason,
+                current_role: ctx.current_role,
+                expected_target,
+                actual_actions,
+                exhausted_attempts_summary: None,
+                diagnostic_target_missing_reason: None,
+                owned_test_artifacts: sanitize_and_filter_owned_paths(&owned_test_artifacts),
+                session_id: ctx.session_id.to_string(),
+                turn_index: ctx.turn_index,
+            },
+        }
+    }
+}
+
+/// Issue #654 — defense-in-depth re-walk of caller-supplied owned test
+/// artifact paths. Each candidate must survive `safe_relative_path_string`
+/// before being sanitized + capped. Empty / `..` / absolute paths are
+/// silently dropped (caller is supposed to upstream-validate via
+/// `classify_ownership`; this is the last line of defense, DR2-006).
+fn sanitize_and_filter_owned_paths(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .filter_map(|p| safe_relative_path_string(p))
+        .map(|p| sanitize_repair_job_text_with_char_cap(&p, SAFE_STOP_PATH_CHAR_CAP))
+        .take(SAFE_STOP_OWNED_TEST_ARTIFACTS_MAX)
+        .collect()
 }
 
 #[cfg(test)]
@@ -4429,6 +4856,28 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // Issue #654 — Bounded Safe Stop Report unit tests
+    // ========================================================================
+
+    #[test]
+    fn stop_reason_as_str_covers_all_five_variants() {
+        assert_eq!(
+            StopReason::ArtifactCompletionFailed.as_str(),
+            "artifact_completion_failed"
+        );
+        assert_eq!(
+            StopReason::VerifierFailedSafeStop.as_str(),
+            "verifier_failed_safe_stop"
+        );
+        assert_eq!(StopReason::VerifierWeak.as_str(), "verifier_weak");
+        assert_eq!(StopReason::VerifierMissing.as_str(), "verifier_missing");
+        assert_eq!(
+            StopReason::DiagnosticTargetMissing.as_str(),
+            "diagnostic_target_missing"
+        );
+    }
+
     #[test]
     fn phase3_distinct_clusters_do_not_promote_exhausted() {
         let mut job = RepairJob::new_for_test();
@@ -4494,5 +4943,398 @@ mod tests {
             job.record_repair_attempt_outcome(outcome.clone());
         }
         assert_eq!(job.exhausted_attempts.len(), 1);
+    }
+
+    #[test]
+    fn stop_reason_supports_hashset_membership() {
+        // DR1-006: HashSet<StopReason> is the Agent dedup marker.
+        let mut set: std::collections::HashSet<StopReason> = std::collections::HashSet::new();
+        assert!(set.insert(StopReason::VerifierWeak));
+        // Inserting again should be a no-op.
+        assert!(!set.insert(StopReason::VerifierWeak));
+        assert!(set.contains(&StopReason::VerifierWeak));
+        assert!(!set.contains(&StopReason::VerifierMissing));
+    }
+
+    #[test]
+    fn diagnostic_target_missing_reason_as_str_covers_all_four_variants() {
+        assert_eq!(
+            DiagnosticTargetMissingReason::ScopeExcluded.as_str(),
+            "scope_excluded"
+        );
+        assert_eq!(
+            DiagnosticTargetMissingReason::AllCandidatesUnreadable.as_str(),
+            "all_candidates_unreadable"
+        );
+        assert_eq!(
+            DiagnosticTargetMissingReason::ReadHistoryEmpty.as_str(),
+            "read_history_empty"
+        );
+        assert_eq!(
+            DiagnosticTargetMissingReason::AssessmentMissing.as_str(),
+            "assessment_missing"
+        );
+    }
+
+    #[test]
+    fn safe_relative_path_string_rejects_unsafe_inputs() {
+        assert_eq!(safe_relative_path_string(""), None);
+        assert_eq!(safe_relative_path_string("/absolute/path"), None);
+        assert_eq!(safe_relative_path_string("../escape"), None);
+        assert_eq!(safe_relative_path_string("dir/../foo"), None);
+        assert_eq!(safe_relative_path_string("with\nnewline"), None);
+        assert_eq!(safe_relative_path_string("with\x00nul"), None);
+        assert_eq!(safe_relative_path_string("with\x7fdel"), None);
+    }
+
+    #[test]
+    fn safe_relative_path_string_rejects_windows_style_inputs() {
+        // CB-004 regression: the host `Path::components()` is OS-dependent.
+        // On Unix builds these inputs previously passed through as a single
+        // normal component; the SSOT now string-checks the grammar.
+        assert_eq!(safe_relative_path_string("..\\secret"), None);
+        assert_eq!(safe_relative_path_string("dir\\..\\foo"), None);
+        assert_eq!(safe_relative_path_string("dir\\file.rs"), None);
+        assert_eq!(safe_relative_path_string("C:\\Users\\me"), None);
+        assert_eq!(safe_relative_path_string("c:/Users/me"), None);
+        assert_eq!(safe_relative_path_string("D:foo"), None);
+        assert_eq!(safe_relative_path_string("\\\\?\\C:\\foo"), None);
+        assert_eq!(safe_relative_path_string("//host/share"), None);
+        assert_eq!(safe_relative_path_string("//foo/bar"), None);
+    }
+
+    #[test]
+    fn safe_relative_path_string_accepts_workspace_relative() {
+        assert_eq!(
+            safe_relative_path_string("src/lib.rs"),
+            Some("src/lib.rs".to_string())
+        );
+        assert_eq!(
+            safe_relative_path_string("tests/foo.rs"),
+            Some("tests/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn safe_relative_path_string_then_cap_clamps_long_paths() {
+        // DR2-001: 240 char cap is applied by caller via
+        // `sanitize_repair_job_text_with_char_cap(_, SAFE_STOP_PATH_CHAR_CAP)`.
+        let long = "a".repeat(300);
+        let raw = safe_relative_path_string(&long).expect("safe");
+        let capped = sanitize_repair_job_text_with_char_cap(&raw, SAFE_STOP_PATH_CHAR_CAP);
+        // 240 chars + 3-char ellipsis = 243 chars total.
+        assert!(capped.chars().count() <= SAFE_STOP_PATH_CHAR_CAP + 3);
+        assert!(capped.ends_with("..."));
+    }
+
+    #[test]
+    fn build_actual_actions_caps_to_eight_newest_first() {
+        let raw: Vec<String> = (0..12).map(|i| format!("action_{i}")).collect();
+        let out = build_actual_actions(&raw);
+        assert_eq!(out.len(), SAFE_STOP_ACTUAL_ACTIONS_MAX);
+        // Newest-first order: raw is oldest-first 0..12, so output starts at 11.
+        assert_eq!(out[0], "action_11");
+        assert_eq!(out[7], "action_4");
+    }
+
+    #[test]
+    fn build_actual_actions_handles_empty_input() {
+        let out = build_actual_actions(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn build_actual_actions_clamps_per_entry_chars() {
+        let long = "x".repeat(500);
+        let out = build_actual_actions(std::slice::from_ref(&long));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].chars().count() <= SAFE_STOP_ACTION_CHAR_CAP + 3);
+        assert!(out[0].ends_with("..."));
+    }
+
+    #[test]
+    fn exhausted_attempts_summary_deduplicates_and_caps() {
+        let mut job = RepairJob::new_for_test();
+        let key_a = make_cluster_key("aaaa");
+        let key_b = make_cluster_key("bbbb");
+        // Same (cluster, role) added twice — should dedup.
+        job.exhausted_attempts.push((
+            key_a.clone(),
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        job.exhausted_attempts.push((
+            key_a.clone(),
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        job.exhausted_attempts.push((
+            key_a.clone(),
+            super::super::task_contract::ArtifactRole::Test,
+        ));
+        job.exhausted_attempts.push((
+            key_b.clone(),
+            super::super::task_contract::ArtifactRole::Implementation,
+        ));
+        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, None);
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.per_cluster.len(), 2);
+        // Cluster A has 2 unique roles (Implementation + Test).
+        let (_k, roles) = summary
+            .per_cluster
+            .iter()
+            .find(|(k, _)| k == &key_a.as_str().to_string())
+            .expect("key_a present");
+        assert_eq!(roles.len(), 2);
+        assert!(roles.contains(&"implementation"));
+        assert!(roles.contains(&"test"));
+    }
+
+    #[test]
+    fn exhausted_attempts_summary_caps_hypothesis_to_240_chars() {
+        let job = RepairJob::new_for_test();
+        let hyp = "h".repeat(500);
+        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, Some(&hyp));
+        let stored = summary.last_repair_hypothesis.expect("hypothesis stored");
+        assert!(stored.chars().count() <= SAFE_STOP_LAST_REPAIR_HYPOTHESIS_CHAR_CAP + 3);
+    }
+
+    #[test]
+    fn select_diagnostic_target_missing_reason_priority_1_scope_excluded() {
+        let job = RepairJob::new_for_test();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::Explicit {
+                paths: vec![std::path::PathBuf::from("only/this/path")],
+            },
+        };
+        let candidates = vec!["other/path.rs".to_string()];
+        let reason = select_diagnostic_target_missing_reason(&job, &scope, &candidates, None);
+        assert_eq!(reason, DiagnosticTargetMissingReason::ScopeExcluded);
+    }
+
+    #[test]
+    fn select_diagnostic_target_missing_reason_priority_2_all_unreadable() {
+        let job = RepairJob::new_for_test();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let candidates = vec!["any/path.rs".to_string()];
+        let reason = select_diagnostic_target_missing_reason(&job, &scope, &candidates, None);
+        assert_eq!(
+            reason,
+            DiagnosticTargetMissingReason::AllCandidatesUnreadable
+        );
+    }
+
+    #[test]
+    fn select_diagnostic_target_missing_reason_priority_3_read_history_empty() {
+        let job = RepairJob::new_for_test();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let reason = select_diagnostic_target_missing_reason(&job, &scope, &[], None);
+        assert_eq!(reason, DiagnosticTargetMissingReason::ReadHistoryEmpty);
+    }
+
+    #[test]
+    fn select_diagnostic_target_missing_reason_priority_4_assessment_missing() {
+        let mut job = RepairJob::new_for_test();
+        job.changed_file_hints
+            .push(super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "src/foo.rs".to_string(),
+                reason: "hint".to_string(),
+            });
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let reason = select_diagnostic_target_missing_reason(&job, &scope, &[], None);
+        assert_eq!(reason, DiagnosticTargetMissingReason::AssessmentMissing);
+    }
+
+    #[test]
+    fn safe_stop_input_stop_reason_returns_carried_value_for_from_repair() {
+        let job = RepairJob::new_for_test();
+        let input = SafeStopInput::FromRepair {
+            job: &job,
+            stop_reason: StopReason::ArtifactCompletionFailed,
+            owned_test_artifacts: Vec::new(),
+        };
+        assert_eq!(input.stop_reason(), StopReason::ArtifactCompletionFailed);
+    }
+
+    #[test]
+    fn safe_stop_input_stop_reason_is_hard_coded_for_from_missing_verifier() {
+        // DR2-004: `FromMissingVerifier` always maps to `VerifierMissing`.
+        let job = MissingVerifierJob::new(3, 0);
+        let input = SafeStopInput::FromMissingVerifier {
+            job: &job,
+            owned_test_artifacts: Vec::new(),
+        };
+        assert_eq!(input.stop_reason(), StopReason::VerifierMissing);
+    }
+
+    #[test]
+    fn safe_stop_report_build_from_repair_propagates_snapshot_fields() {
+        // DR3-006: 4 overlapping fields (failure_signature / command /
+        // output_excerpt / failure_type) must match the snapshot exactly.
+        let mut job = RepairJob::new_for_test();
+        job.failure_signature = "pytest::test_foo::assertion".to_string();
+        job.command = "pytest -q".to_string();
+        job.output_excerpt = "AssertionError: 1 != 2".to_string();
+        job.failure_type = VerifierFailureType::AssertionFailure;
+        let snapshot = job.failure_snapshot();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let input = SafeStopInput::FromRepair {
+            job: &job,
+            stop_reason: StopReason::VerifierFailedSafeStop,
+            owned_test_artifacts: Vec::new(),
+        };
+        let ctx = SafeStopContext {
+            current_role: None,
+            expected_target: None,
+            actual_actions_raw: Vec::new(),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates: Vec::new(),
+            session_id: "session-1",
+            turn_index: 1,
+        };
+        let report = SafeStopReport::build_from(input, ctx);
+        assert_eq!(report.failure_signature, snapshot.failure_signature);
+        assert_eq!(report.command, snapshot.command);
+        assert_eq!(report.output_excerpt, snapshot.output_excerpt);
+        assert_eq!(report.failure_type, snapshot.failure_type);
+        assert_eq!(report.stop_reason, StopReason::VerifierFailedSafeStop);
+    }
+
+    #[test]
+    fn safe_stop_report_build_from_overrides_failure_type_for_diagnostic_target_missing() {
+        let mut job = RepairJob::new_for_test();
+        // Source failure_type is AssertionFailure (e.g. carried from a prior
+        // diagnostic). The builder must override it to DiagnosticTargetMissing
+        // (DR3-005) when the StopReason is DiagnosticTargetMissing.
+        job.failure_type = VerifierFailureType::AssertionFailure;
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let input = SafeStopInput::FromRepair {
+            job: &job,
+            stop_reason: StopReason::DiagnosticTargetMissing,
+            owned_test_artifacts: Vec::new(),
+        };
+        let ctx = SafeStopContext {
+            current_role: None,
+            expected_target: None,
+            actual_actions_raw: Vec::new(),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates: Vec::new(),
+            session_id: "s",
+            turn_index: 0,
+        };
+        let report = SafeStopReport::build_from(input, ctx);
+        assert_eq!(
+            report.failure_type,
+            VerifierFailureType::DiagnosticTargetMissing
+        );
+        // diagnostic_target_missing_reason should be populated.
+        assert!(report.diagnostic_target_missing_reason.is_some());
+    }
+
+    #[test]
+    fn safe_stop_report_build_from_missing_verifier_sets_explicit_defaults() {
+        // R8: builder default for FromMissingVerifier must populate
+        // failure_signature with the explicit "missing_verifier_or_config"
+        // marker so downstream consumers don't misfire on empty strings.
+        let job = MissingVerifierJob::new(3, 0);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let input = SafeStopInput::FromMissingVerifier {
+            job: &job,
+            owned_test_artifacts: vec!["tests/smoke.rs".to_string()],
+        };
+        let ctx = SafeStopContext {
+            current_role: None,
+            expected_target: None,
+            actual_actions_raw: Vec::new(),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates: Vec::new(),
+            session_id: "s",
+            turn_index: 0,
+        };
+        let report = SafeStopReport::build_from(input, ctx);
+        assert_eq!(report.failure_signature, "missing_verifier_or_config");
+        assert_eq!(report.command, "");
+        assert_eq!(
+            report.failure_type,
+            VerifierFailureType::MissingVerifierOrConfig
+        );
+        assert_eq!(report.stop_reason, StopReason::VerifierMissing);
+        assert!(report.exhausted_attempts_summary.is_none());
+        assert_eq!(report.owned_test_artifacts, vec!["tests/smoke.rs"]);
+    }
+
+    #[test]
+    fn safe_stop_report_build_from_rejects_unsafe_owned_test_artifacts() {
+        // DR2-006: defense-in-depth: build_from must drop unsafe paths even
+        // if upstream classification leaked them in.
+        let job = MissingVerifierJob::new(3, 0);
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope {
+            mode: super::super::task_workspace_scope::ScopeMode::SingleProjectRoot,
+        };
+        let input = SafeStopInput::FromMissingVerifier {
+            job: &job,
+            owned_test_artifacts: vec![
+                "tests/ok.rs".to_string(),
+                "/abs/escape.rs".to_string(),
+                "../traverse.rs".to_string(),
+                "control\nchar.rs".to_string(),
+            ],
+        };
+        let ctx = SafeStopContext {
+            current_role: None,
+            expected_target: None,
+            actual_actions_raw: Vec::new(),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates: Vec::new(),
+            session_id: "s",
+            turn_index: 0,
+        };
+        let report = SafeStopReport::build_from(input, ctx);
+        assert_eq!(report.owned_test_artifacts, vec!["tests/ok.rs"]);
+    }
+
+    /// Construct a `FailureClusterKey` for tests via the public parse path.
+    /// We only need a deterministic 16-hex value, not the full report.
+    fn make_cluster_key(seed: &str) -> super::super::semantic_failure::FailureClusterKey {
+        // Use the same `parse_semantic_failure_report` -> first cluster's
+        // `cluster_key` SSOT so we don't reach into private constructors.
+        let json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": format!("obs-{seed}"),
+                    "expected": "exp",
+                    "input_shape": "shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["test"],
+                    "affected_cases": ["case1"],
+                }
+            ],
+        });
+        super::super::semantic_failure::parse_semantic_failure_report(&json)
+            .expect("fixture parses")
+            .failure_clusters
+            .into_iter()
+            .next()
+            .expect("cluster present")
+            .cluster_key
     }
 }
