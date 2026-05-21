@@ -3761,6 +3761,11 @@ impl Agent {
         self.turn_edited_relative_paths.clear();
         self.turn_pre_tool_file_hashes.clear();
         self.missing_verifier_job = None;
+        // Issue #654: per-turn dedup marker reset (DR1-006 / DR2-005). The
+        // `agent.safe_stop.report` event is emitted at most once per
+        // StopReason per turn; clearing here lets a new user turn re-emit
+        // the same StopReason if the stop condition recurs.
+        self.safe_stop_report_emitted.clear();
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -5466,6 +5471,13 @@ impl Agent {
                             repair_attempt_outcome,
                         );
                         if verifier_repair_retries >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
+                            // Issue #654 (E.4): controller-applied repair pass
+                            // proposals exhausted the retry budget while every
+                            // proposal was rejected by validation (weakening
+                            // detector / candidate validator / parse failure).
+                            // Emit the structured `verifier_weak` safe stop
+                            // report through the bounded SSOT before exiting.
+                            self.emit_safe_stop_report_for_verifier_weak();
                             exit_reason = ExitReason::VerifierFailed;
                             error_text = error;
                             break 'outer;
@@ -5707,6 +5719,18 @@ impl Agent {
                                 .map(|contract| contract.artifact_completion_attempt_limit())
                                 .unwrap_or(4);
                             if artifact_attempt >= attempt_limit {
+                                // Issue #654 (E.2): role-specific retry budget
+                                // exhausted on a rejected artifact edit. Emit
+                                // the structured `artifact_completion_failed`
+                                // safe stop report before exiting.
+                                let expected_target = self
+                                    .current_artifact_recovery_target
+                                    .as_ref()
+                                    .map(|target| target.path.clone());
+                                self.emit_safe_stop_report_for_artifact_completion_failed(
+                                    role,
+                                    expected_target,
+                                );
                                 exit_reason = ExitReason::MissingRepoEdits;
                                 error_text = format!(
                                     "artifact edit rejected repeatedly for required role {}",
@@ -6646,6 +6670,21 @@ impl Agent {
                             );
                             let attempt_limit = contract.artifact_completion_attempt_limit();
                             if artifact_attempt >= attempt_limit {
+                                // Issue #654 (E.2): role-specific retry budget
+                                // exhausted before the assistant edited the
+                                // required artifact for the current role.
+                                let expected_target = target_hint
+                                    .as_ref()
+                                    .map(|hint| hint.path.clone())
+                                    .or_else(|| {
+                                        self.current_artifact_recovery_target
+                                            .as_ref()
+                                            .map(|target| target.path.clone())
+                                    });
+                                self.emit_safe_stop_report_for_artifact_completion_failed(
+                                    role,
+                                    expected_target,
+                                );
                                 exit_reason = ExitReason::MissingRepoEdits;
                                 error_text = format!(
                                     "assistant stopped before editing required artifact role {}",
@@ -6701,6 +6740,23 @@ impl Agent {
                         );
                         let attempt_limit = contract.artifact_completion_attempt_limit();
                         if artifact_attempt >= attempt_limit {
+                            // Issue #654 (E.2): role-specific retry budget
+                            // exhausted with the task contract still missing
+                            // required artifact(s). Emit a structured
+                            // `artifact_completion_failed` report carrying the
+                            // first missing role + target hint before exiting.
+                            let expected_target = target_hint
+                                .as_ref()
+                                .map(|hint| hint.path.clone())
+                                .or_else(|| {
+                                    self.current_artifact_recovery_target
+                                        .as_ref()
+                                        .map(|target| target.path.clone())
+                                });
+                            self.emit_safe_stop_report_for_artifact_completion_failed(
+                                role,
+                                expected_target,
+                            );
                             exit_reason = ExitReason::MissingRepoEdits;
                             error_text = format!(
                                 "task contract incomplete; missing required artifact(s): {}",
@@ -6751,6 +6807,30 @@ impl Agent {
                         verifier_repair_retries = self.repair_job_artifact_attempts;
                         if self.repair_job_artifact_attempts >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
                         {
+                            // Issue #654 (E.2): RepairArtifact retry budget
+                            // exhausted — the verifier-driven repair could not
+                            // produce the required edit. `repair_job` IS set
+                            // on this path so the emitted report carries real
+                            // failure_signature / command / output_excerpt.
+                            let role = self
+                                .current_artifact_recovery_target
+                                .as_ref()
+                                .map(|target| target.role)
+                                .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+                            let expected_target = self
+                                .current_artifact_recovery_target
+                                .as_ref()
+                                .map(|target| target.path.clone())
+                                .or_else(|| {
+                                    self.repair_job
+                                        .as_ref()
+                                        .and_then(|job| job.target_hint.as_ref())
+                                        .map(|hint| hint.path.clone())
+                                });
+                            self.emit_safe_stop_report_for_artifact_completion_failed(
+                                role,
+                                expected_target,
+                            );
                             exit_reason = ExitReason::MissingRepoEdits;
                             error_text = "assistant stopped before repairing the verifier failure"
                                 .to_string();
@@ -8166,6 +8246,13 @@ impl Agent {
                 let attempt_limit =
                     task_contract_verifier_failure_attempt_limit(previous_repair_context.as_ref());
                 if *args.contract_verification_retries >= attempt_limit {
+                    // Issue #654 (E.3): verifier failed and no safe alternative
+                    // remains — emit the bounded structured safe stop report
+                    // before exit. Stash the freshly-built repair_context onto
+                    // Agent so emit_safe_stop_report_for_verifier_failed_safe_stop
+                    // can build the report off it.
+                    self.repair_job = Some(repair_context);
+                    self.emit_safe_stop_report_for_verifier_failed_safe_stop();
                     return TaskContractVerifierFlowOutcome::Exit {
                         reason: ExitReason::VerifierFailed,
                         error_text: format!(
@@ -8291,6 +8378,10 @@ impl Agent {
                     .as_mut()
                     .is_some_and(|job| !job.record_retry());
                 if budget_exhausted {
+                    // Issue #654 (E.5): MissingVerifierJob budget exhausted —
+                    // emit the bounded structured safe stop report through
+                    // the FromMissingVerifier builder.
+                    self.emit_safe_stop_report_for_verifier_missing();
                     return TaskContractVerifierFlowOutcome::Exit {
                         reason: ExitReason::MissingVerification,
                         error_text:
@@ -10326,6 +10417,339 @@ impl Agent {
                 "error": error,
             }),
         );
+        // Issue #654: also emit the bounded structured safe stop report so
+        // downstream consumers (`/bug-fix`, semantic repair plan) can see
+        // role / expected target / actual actions / hypothesis ledger in a
+        // single structured event. Per-StopReason dedup is enforced by
+        // `record_safe_stop_report`.
+        self.emit_safe_stop_report_for_diagnostic_target_missing();
+    }
+
+    /// Issue #654 / CB-003 — `current_role` SSOT fallback for safe-stop
+    /// report emission. Resolves the per-§6.4 priority order so all five
+    /// emit paths (`diagnostic_target_missing`, `verifier_failed_safe_stop`,
+    /// `verifier_weak`, `verifier_missing`, `artifact_completion_failed`)
+    /// reach into the same single source of truth.
+    ///
+    /// Priority order (first hit wins; `None` only when every source is
+    /// silent):
+    /// 1. `repair_job.semantic_plan.preferred_repair_role`
+    ///    — the verifier-driven semantic planner's authoritative pick.
+    /// 2. `current_artifact_recovery_target.role`
+    ///    — the selected artifact recovery target the planner is currently
+    ///    driving toward.
+    /// 3. `repair_job.target_hint.role`
+    ///    — the explicit repair target hint carried on `RepairJob`.
+    /// 4. The first `required_artifact` of the active `TaskContract`
+    ///    reconstructed from the current request text.
+    ///
+    /// `explicit_role` allows the `artifact_completion_failed` path to
+    /// preempt the priority order with the role the host emit point already
+    /// has in hand (the role the retry budget exhausted on).
+    pub(super) fn resolve_current_role_for_safe_stop(
+        &self,
+        explicit_role: Option<super::task_contract::ArtifactRole>,
+    ) -> Option<super::task_contract::ArtifactRole> {
+        if let Some(role) = explicit_role {
+            return Some(role);
+        }
+        if let Some(job) = self.repair_job.as_ref()
+            && let Some(plan) = job.semantic_plan.as_ref()
+        {
+            return Some(plan.preferred_repair_role);
+        }
+        if let Some(target) = self.current_artifact_recovery_target.as_ref() {
+            return Some(target.role);
+        }
+        if let Some(job) = self.repair_job.as_ref()
+            && let Some(hint) = job.target_hint.as_ref()
+        {
+            return Some(hint.role);
+        }
+        let request = self.active_request_text().unwrap_or_default();
+        if !request.is_empty() {
+            let contract = super::task_contract::TaskContract::from_request(&request);
+            if let Some(role) = contract.required_artifacts.first().copied() {
+                return Some(role);
+            }
+        }
+        None
+    }
+
+    /// Issue #654 — diagnostic_target_missing path: build a
+    /// `SafeStopInput::FromRepair { DiagnosticTargetMissing }` and forward to
+    /// `record_safe_stop_report`. Pulled into a separate method so the
+    /// orchestration of context-collection from `Agent` state stays out of
+    /// the lifecycle of `record_verifier_diagnostic_unavailable`.
+    pub(super) fn emit_safe_stop_report_for_diagnostic_target_missing(&mut self) {
+        let Some(job) = self.repair_job.clone() else {
+            return;
+        };
+        let session_id = self.session_store.session_id().to_string();
+        let turn_index = self.current_turn_index as u64;
+        let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
+            &self.work_root,
+            self.active_request_text().unwrap_or_default().as_str(),
+        );
+        let candidates: Vec<String> = job
+            .changed_file_hints
+            .iter()
+            .map(|hint| hint.path.clone())
+            .collect();
+        let latest_read = latest_successful_read_existing_path(
+            &self.session.messages,
+            &self.work_root,
+            latest_verifier_repair_note_index(&self.session.messages),
+        );
+        let expected = job
+            .target_hint
+            .as_ref()
+            .map(|hint| std::path::PathBuf::from(&hint.path));
+        // CB-003: route through the §6.4 SSOT fallback chain so the
+        // diagnostic_target_missing path is not limited to semantic_plan.
+        let current_role = self.resolve_current_role_for_safe_stop(None);
+        let input = super::repair_job::SafeStopInput::FromRepair {
+            job: &job,
+            stop_reason: super::repair_job::StopReason::DiagnosticTargetMissing,
+            owned_test_artifacts: Vec::new(),
+        };
+        let ctx = super::repair_job::SafeStopContext {
+            current_role,
+            expected_target: expected.as_deref(),
+            actual_actions_raw: collect_recent_action_labels(&self.session.messages),
+            latest_successful_read: latest_read.as_deref(),
+            task_workspace_scope: &scope,
+            candidates,
+            session_id: &session_id,
+            turn_index,
+        };
+        self.record_safe_stop_report(input, ctx);
+    }
+
+    /// Issue #654 (Task D.4) — thin shell that dedups per StopReason, builds
+    /// the structured report via `SafeStopReport::build_from`, renders the
+    /// bounded payload via `build_safe_stop_payload`, and emits the
+    /// `agent.safe_stop.report` event through `log_llm_event` (which routes
+    /// through `mask_payload_inplace` — the final defense line).
+    pub(super) fn record_safe_stop_report(
+        &mut self,
+        input: super::repair_job::SafeStopInput<'_>,
+        ctx: super::repair_job::SafeStopContext<'_>,
+    ) {
+        let stop_reason = input.stop_reason();
+        if self.safe_stop_report_emitted.contains(&stop_reason) {
+            return;
+        }
+        let report = super::repair_job::SafeStopReport::build_from(input, ctx);
+        let payload = build_safe_stop_payload(&report);
+        log_llm_event("agent.safe_stop.report", payload);
+        self.safe_stop_report_emitted.insert(stop_reason);
+    }
+
+    /// Issue #654 (E.3) — `verifier_failed_safe_stop` emit shell. Builds a
+    /// `FromRepair { VerifierFailedSafeStop }` input from `self.repair_job`.
+    pub(super) fn emit_safe_stop_report_for_verifier_failed_safe_stop(&mut self) {
+        self.emit_repair_safe_stop_report(super::repair_job::StopReason::VerifierFailedSafeStop);
+    }
+
+    /// Issue #654 (E.2) — `artifact_completion_failed` emit shell. Unlike the
+    /// other shells, this path can fire BEFORE a verifier-driven `RepairJob`
+    /// has been built (the role-specific retry budget exhausts during pure
+    /// artifact-completion attempts). When `self.repair_job` is `None` we
+    /// fall back to a synthetic empty `RepairJob` whose only meaningful field
+    /// is `target_hint` (carried from the explicit role + path the caller
+    /// supplies) so the emitted payload still carries `current_role` and
+    /// `expected_target` for downstream `/bug-fix` consumers.
+    pub(super) fn emit_safe_stop_report_for_artifact_completion_failed(
+        &mut self,
+        role: super::task_contract::ArtifactRole,
+        expected_target_path: Option<String>,
+    ) {
+        if self
+            .safe_stop_report_emitted
+            .contains(&super::repair_job::StopReason::ArtifactCompletionFailed)
+        {
+            return;
+        }
+        let session_id = self.session_store.session_id().to_string();
+        let turn_index = self.current_turn_index as u64;
+        let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
+            &self.work_root,
+            self.active_request_text().unwrap_or_default().as_str(),
+        );
+        let owned_test_artifacts = self.collect_owned_test_artifacts();
+        // Prefer the real RepairJob (when one exists, e.g. the RepairArtifact
+        // exhaustion path at the verifier-repair stage) so failure_signature /
+        // command / output_excerpt remain accurate. Otherwise fall back to a
+        // synthetic shell whose only carried context is the target path the
+        // caller provided.
+        let job = match self.repair_job.clone() {
+            Some(job) => job,
+            None => {
+                let mut shell = super::repair_job::RepairJob::empty_synthetic();
+                if let Some(path) = expected_target_path.clone() {
+                    shell.target_hint = Some(super::task_contract::RecoveryTargetHint {
+                        role,
+                        path,
+                        reason: "artifact_completion_failed".to_string(),
+                    });
+                }
+                shell
+            }
+        };
+        let expected = expected_target_path
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                job.target_hint
+                    .as_ref()
+                    .map(|hint| std::path::PathBuf::from(&hint.path))
+            });
+        // CB-003: still preempt with the explicit role the caller supplied
+        // (the artifact-completion retry budget exhausted on this role), but
+        // route the no-explicit-role branches through the §6.4 helper so the
+        // priority order (semantic_plan -> recovery target -> target_hint ->
+        // contract) stays single-sourced.
+        let current_role = self.resolve_current_role_for_safe_stop(Some(role));
+        let candidates: Vec<String> = job
+            .changed_file_hints
+            .iter()
+            .map(|hint| hint.path.clone())
+            .collect();
+        let input = super::repair_job::SafeStopInput::FromRepair {
+            job: &job,
+            stop_reason: super::repair_job::StopReason::ArtifactCompletionFailed,
+            owned_test_artifacts,
+        };
+        let ctx = super::repair_job::SafeStopContext {
+            current_role,
+            expected_target: expected.as_deref(),
+            actual_actions_raw: collect_recent_action_labels(&self.session.messages),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates,
+            session_id: &session_id,
+            turn_index,
+        };
+        self.record_safe_stop_report(input, ctx);
+    }
+
+    /// Issue #654 (E.4) — `verifier_weak` emit shell. Fires at the terminal
+    /// `VerifierRepairPassOutcome::Invalid` exit (controller-applied repair
+    /// proposals were rejected by `validate_verifier_repair_intents` for the
+    /// full retry budget), which is the closest deterministic analogue to
+    /// "verifier output was judged weak / unactionable" in the current loop.
+    pub(super) fn emit_safe_stop_report_for_verifier_weak(&mut self) {
+        self.emit_repair_safe_stop_report(super::repair_job::StopReason::VerifierWeak);
+    }
+
+    /// Shared helper for repair-job-driven emit paths (E.2 / E.3 / E.4).
+    fn emit_repair_safe_stop_report(&mut self, stop_reason: super::repair_job::StopReason) {
+        let Some(job) = self.repair_job.clone() else {
+            return;
+        };
+        let session_id = self.session_store.session_id().to_string();
+        let turn_index = self.current_turn_index as u64;
+        let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
+            &self.work_root,
+            self.active_request_text().unwrap_or_default().as_str(),
+        );
+        let owned_test_artifacts = self.collect_owned_test_artifacts();
+        let expected = job
+            .target_hint
+            .as_ref()
+            .map(|hint| std::path::PathBuf::from(&hint.path));
+        // CB-003: route through the §6.4 SSOT fallback chain.
+        let current_role = self.resolve_current_role_for_safe_stop(None);
+        let candidates: Vec<String> = job
+            .changed_file_hints
+            .iter()
+            .map(|hint| hint.path.clone())
+            .collect();
+        let input = super::repair_job::SafeStopInput::FromRepair {
+            job: &job,
+            stop_reason,
+            owned_test_artifacts,
+        };
+        let ctx = super::repair_job::SafeStopContext {
+            current_role,
+            expected_target: expected.as_deref(),
+            actual_actions_raw: collect_recent_action_labels(&self.session.messages),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates,
+            session_id: &session_id,
+            turn_index,
+        };
+        self.record_safe_stop_report(input, ctx);
+    }
+
+    /// Issue #654 (E.5) — `verifier_missing` emit shell. Uses the
+    /// `FromMissingVerifier` builder so empty `failure_signature` fallback
+    /// detection by downstream consumers does not misfire (R8).
+    pub(super) fn emit_safe_stop_report_for_verifier_missing(&mut self) {
+        let Some(job) = self.missing_verifier_job.clone() else {
+            return;
+        };
+        let session_id = self.session_store.session_id().to_string();
+        let turn_index = self.current_turn_index as u64;
+        let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
+            &self.work_root,
+            self.active_request_text().unwrap_or_default().as_str(),
+        );
+        let owned_test_artifacts = self.collect_owned_test_artifacts();
+        let input = super::repair_job::SafeStopInput::FromMissingVerifier {
+            job: &job,
+            owned_test_artifacts,
+        };
+        // CB-003: verifier_missing has no `RepairJob`, so the helper falls
+        // through to current_artifact_recovery_target -> reconstructed
+        // TaskContract.required_artifacts.first() for downstream `/bug-fix`.
+        let current_role = self.resolve_current_role_for_safe_stop(None);
+        let ctx = super::repair_job::SafeStopContext {
+            current_role,
+            expected_target: None,
+            actual_actions_raw: collect_recent_action_labels(&self.session.messages),
+            latest_successful_read: None,
+            task_workspace_scope: &scope,
+            candidates: Vec::new(),
+            session_id: &session_id,
+            turn_index,
+        };
+        self.record_safe_stop_report(input, ctx);
+    }
+
+    /// Issue #654 (DR3-002 / Task D.6) — collect Owned-validated test artifact
+    /// relative paths from the current turn's edits, gated by
+    /// `classify_ownership`. Returns at most `SAFE_STOP_OWNED_TEST_ARTIFACTS_MAX`
+    /// paths; the builder re-applies syntactic safety as defense-in-depth.
+    fn collect_owned_test_artifacts(&self) -> Vec<String> {
+        let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
+            &self.work_root,
+            self.active_request_text().unwrap_or_default().as_str(),
+        );
+        let mut out: Vec<String> = Vec::new();
+        for rel in self.turn_edited_relative_paths.iter() {
+            // Only test files qualify.
+            if !crate::util::file_classify::is_test_file(std::path::Path::new(rel)) {
+                continue;
+            }
+            let inputs = super::artifact_ownership::OwnershipInputs {
+                work_root: &self.work_root,
+                relative_path: rel.as_str(),
+                scope: &scope,
+                edited_this_session: true,
+                scaffold_changed: false,
+                verifier_passed_in_scope: false,
+            };
+            if super::artifact_ownership::classify_ownership(inputs)
+                == super::artifact_ownership::ArtifactOwnership::Owned
+            {
+                out.push(rel.clone());
+            }
+        }
+        out.sort();
+        out.truncate(8);
+        out
     }
 
     fn run_verifier_repair_pass_and_apply(&mut self) -> VerifierRepairPassOutcome {
@@ -14839,6 +15263,78 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Issue #654 — build_safe_stop_payload unit tests (DR4-001)
+    // ========================================================================
+
+    use super::super::VerifierFailureType;
+    use super::super::repair_job::{
+        DiagnosticTargetMissingReason, ExhaustedAttemptsSummary, SafeStopReport, StopReason,
+    };
+    use super::super::task_contract::ArtifactRole;
+    use super::{SAFE_STOP_REPORT_EVENT_MAX_BYTES, build_safe_stop_payload};
+
+    fn minimal_report(
+        stop_reason: StopReason,
+        failure_type: VerifierFailureType,
+    ) -> SafeStopReport {
+        SafeStopReport {
+            failure_signature: "sig".to_string(),
+            command: "cmd".to_string(),
+            output_excerpt: "out".to_string(),
+            failure_type,
+            stop_reason,
+            current_role: Some(ArtifactRole::Implementation),
+            expected_target: Some("src/lib.rs".to_string()),
+            actual_actions: vec!["Read src/foo.rs".to_string()],
+            exhausted_attempts_summary: None,
+            diagnostic_target_missing_reason: None,
+            owned_test_artifacts: vec![],
+            session_id: "s".to_string(),
+            turn_index: 1,
+        }
+    }
+
+    #[test]
+    fn build_safe_stop_payload_emits_all_five_stop_reasons_with_failure_type() {
+        for (reason, ft) in [
+            (
+                StopReason::ArtifactCompletionFailed,
+                VerifierFailureType::Unknown,
+            ),
+            (
+                StopReason::VerifierFailedSafeStop,
+                VerifierFailureType::AssertionFailure,
+            ),
+            (StopReason::VerifierWeak, VerifierFailureType::Unknown),
+            (
+                StopReason::VerifierMissing,
+                VerifierFailureType::MissingVerifierOrConfig,
+            ),
+            (
+                StopReason::DiagnosticTargetMissing,
+                VerifierFailureType::DiagnosticTargetMissing,
+            ),
+        ] {
+            let report = minimal_report(reason, ft);
+            let payload = build_safe_stop_payload(&report);
+            assert_eq!(
+                payload.get("stop_reason").and_then(|v| v.as_str()),
+                Some(reason.as_str()),
+                "stop_reason for {:?}",
+                reason
+            );
+            assert_eq!(
+                payload.get("failure_type").and_then(|v| v.as_str()),
+                Some(ft.as_str())
+            );
+            assert_eq!(
+                payload.get("truncated").and_then(|v| v.as_bool()),
+                Some(false)
+            );
+        }
+    }
+
     #[test]
     fn non_test_role_change_via_set_artifact_recovery_target_clears_stale_job() {
         // CB2-001 follow-up: confirm the clearing also flows through
@@ -14956,6 +15452,84 @@ mod tests {
     }
 
     #[test]
+    fn build_safe_stop_payload_renders_null_for_absent_options() {
+        let report = SafeStopReport {
+            failure_signature: String::new(),
+            command: String::new(),
+            output_excerpt: String::new(),
+            failure_type: VerifierFailureType::MissingVerifierOrConfig,
+            stop_reason: StopReason::VerifierMissing,
+            current_role: None,
+            expected_target: None,
+            actual_actions: vec![],
+            exhausted_attempts_summary: None,
+            diagnostic_target_missing_reason: None,
+            owned_test_artifacts: vec![],
+            session_id: "s".to_string(),
+            turn_index: 0,
+        };
+        let payload = build_safe_stop_payload(&report);
+        assert!(payload.get("current_role").unwrap().is_null());
+        assert!(payload.get("expected_target").unwrap().is_null());
+        assert!(payload.get("exhausted_attempts_summary").unwrap().is_null());
+        assert!(
+            payload
+                .get("diagnostic_target_missing_reason")
+                .unwrap()
+                .is_null()
+        );
+        assert_eq!(
+            payload
+                .get("actual_actions")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn build_safe_stop_payload_enforces_4kb_cap_with_truncated_flag() {
+        // DR4-001: payload size MUST NOT exceed 4096 bytes; oversize trims
+        // optional fields and sets truncated=true.
+        let big = "x".repeat(8192);
+        let report = SafeStopReport {
+            failure_signature: big.clone(),
+            command: big.clone(),
+            output_excerpt: big.clone(),
+            failure_type: VerifierFailureType::AssertionFailure,
+            stop_reason: StopReason::VerifierFailedSafeStop,
+            current_role: None,
+            expected_target: Some(big.clone()),
+            actual_actions: (0..8).map(|_| big.clone()).collect(),
+            exhausted_attempts_summary: Some(ExhaustedAttemptsSummary {
+                total: 3,
+                per_cluster: vec![(big.clone(), vec!["implementation", "test"])],
+                last_repair_hypothesis: Some(big.clone()),
+            }),
+            diagnostic_target_missing_reason: Some(
+                DiagnosticTargetMissingReason::AssessmentMissing,
+            ),
+            owned_test_artifacts: (0..8).map(|_| big.clone()).collect(),
+            session_id: "s".to_string(),
+            turn_index: 0,
+        };
+        let payload = build_safe_stop_payload(&report);
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        assert!(
+            bytes.len() <= SAFE_STOP_REPORT_EVENT_MAX_BYTES,
+            "payload size {} > {}",
+            bytes.len(),
+            SAFE_STOP_REPORT_EVENT_MAX_BYTES
+        );
+        assert_eq!(
+            payload.get("truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn pr001_test_role_valid_hint_installs_job_and_syncs_projection() {
         use crate::agent::loop_run::commands::test_agent_with_config;
         use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
@@ -15055,6 +15629,265 @@ mod tests {
             agent.artifact_completion_job.is_none(),
             "CB-005 (still required): invalid new Test hint MUST clear the prior job"
         );
+    }
+
+    #[test]
+    fn build_safe_stop_payload_hard_cap_survives_oversized_session_id() {
+        // CB-002 (Codex review): the mandatory `session_id` field is
+        // unbounded above by the SafeStopReport schema. A 1 KB session_id +
+        // a large optional field set must NOT push the final Tier3 payload
+        // above the 4 KB invariant — the hard-cap fallback redacts the
+        // oversize mandatory string and re-asserts the bound.
+        let huge_session = "s".repeat(1024);
+        let big = "x".repeat(8192);
+        let report = SafeStopReport {
+            failure_signature: big.clone(),
+            command: big.clone(),
+            output_excerpt: big.clone(),
+            failure_type: VerifierFailureType::AssertionFailure,
+            stop_reason: StopReason::VerifierFailedSafeStop,
+            current_role: Some(ArtifactRole::Implementation),
+            expected_target: Some(big.clone()),
+            actual_actions: (0..8).map(|_| big.clone()).collect(),
+            exhausted_attempts_summary: Some(ExhaustedAttemptsSummary {
+                total: 3,
+                per_cluster: (0..3)
+                    .map(|_| (big.clone(), vec!["implementation", "test"]))
+                    .collect(),
+                last_repair_hypothesis: Some(big.clone()),
+            }),
+            diagnostic_target_missing_reason: Some(
+                DiagnosticTargetMissingReason::AssessmentMissing,
+            ),
+            owned_test_artifacts: (0..8).map(|_| big.clone()).collect(),
+            session_id: huge_session.clone(),
+            turn_index: u64::MAX,
+        };
+        let payload = build_safe_stop_payload(&report);
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        assert!(
+            bytes.len() <= SAFE_STOP_REPORT_EVENT_MAX_BYTES,
+            "Tier3 + hard-cap payload {} > {} bytes",
+            bytes.len(),
+            SAFE_STOP_REPORT_EVENT_MAX_BYTES
+        );
+        assert_eq!(
+            payload.get("truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // The mandatory `stop_reason` MUST still be carried even after the
+        // hard-cap projection so downstream consumers can demultiplex.
+        assert_eq!(
+            payload.get("stop_reason").and_then(|v| v.as_str()),
+            Some("verifier_failed_safe_stop")
+        );
+    }
+
+    #[test]
+    fn build_safe_stop_payload_hard_cap_caps_session_id_mandatory_string() {
+        // CB-002 follow-up: an attacker / misconfig that supplies a huge
+        // session_id must NOT bloat the emitted payload past 4 KB even
+        // when every optional field is empty. The hard-fallback caps the
+        // mandatory string to a safe limit.
+        let huge_session = "s".repeat(10_000);
+        let report = SafeStopReport {
+            failure_signature: String::new(),
+            command: String::new(),
+            output_excerpt: String::new(),
+            failure_type: VerifierFailureType::Unknown,
+            stop_reason: StopReason::VerifierWeak,
+            current_role: None,
+            expected_target: None,
+            actual_actions: vec![],
+            exhausted_attempts_summary: None,
+            diagnostic_target_missing_reason: None,
+            owned_test_artifacts: vec![],
+            session_id: huge_session,
+            turn_index: 0,
+        };
+        let payload = build_safe_stop_payload(&report);
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        assert!(
+            bytes.len() <= SAFE_STOP_REPORT_EVENT_MAX_BYTES,
+            "payload {} > {}",
+            bytes.len(),
+            SAFE_STOP_REPORT_EVENT_MAX_BYTES
+        );
+        let serialized_session = payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .expect("session_id is a string");
+        assert!(
+            serialized_session.chars().count() <= 240,
+            "hard-cap must clamp mandatory session_id; got {} chars",
+            serialized_session.chars().count(),
+        );
+    }
+
+    #[test]
+    fn build_safe_stop_payload_serializes_per_cluster_as_tuple_array() {
+        let report = SafeStopReport {
+            failure_signature: "sig".to_string(),
+            command: "cmd".to_string(),
+            output_excerpt: "out".to_string(),
+            failure_type: VerifierFailureType::AssertionFailure,
+            stop_reason: StopReason::VerifierFailedSafeStop,
+            current_role: None,
+            expected_target: None,
+            actual_actions: vec![],
+            exhausted_attempts_summary: Some(ExhaustedAttemptsSummary {
+                total: 2,
+                per_cluster: vec![(
+                    "a1b2c3d4e5f60718".to_string(),
+                    vec!["implementation", "test"],
+                )],
+                last_repair_hypothesis: Some("hypo".to_string()),
+            }),
+            diagnostic_target_missing_reason: None,
+            owned_test_artifacts: vec![],
+            session_id: "s".to_string(),
+            turn_index: 0,
+        };
+        let payload = build_safe_stop_payload(&report);
+        let summary = payload.get("exhausted_attempts_summary").unwrap();
+        assert_eq!(summary.get("total").and_then(|v| v.as_u64()), Some(2));
+        let per_cluster = summary.get("per_cluster").unwrap().as_array().unwrap();
+        assert_eq!(per_cluster.len(), 1);
+        let entry = per_cluster[0].as_array().unwrap();
+        assert_eq!(entry[0].as_str(), Some("a1b2c3d4e5f60718"));
+        assert_eq!(
+            entry[1].as_array().unwrap()[0].as_str(),
+            Some("implementation")
+        );
+    }
+
+    // =====================================================================
+    // CB-003 (Codex review): resolve_current_role_for_safe_stop SSOT
+    // fallback — semantic_plan -> recovery_target -> target_hint ->
+    // TaskContract.required_artifacts.first() -> None. The explicit-role
+    // preempt path is exercised separately so the artifact_completion_failed
+    // host-driven case stays intact.
+    // =====================================================================
+
+    use super::super::VerifierDiagnosticFailureKind;
+    use super::super::commands::test_agent_with_config;
+    use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+    use super::super::semantic_failure::parse_semantic_failure_report;
+    use super::super::spec_authority::SpecAuthority;
+    use super::super::task_contract::{RecoveryTarget, RecoveryTargetHint};
+    use crate::config::Config;
+
+    fn fixture_semantic_plan(role: ArtifactRole) -> SemanticRepairPlan {
+        let json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.5,
+            "preferred_repair_role": role.label(),
+            "repair_hypothesis": "hypothesis text",
+            "failure_clusters": [
+                {
+                    "observed": "obs",
+                    "expected": "exp",
+                    "input_shape": "shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["test"],
+                    "affected_cases": ["case1"],
+                }
+            ],
+        });
+        let report = parse_semantic_failure_report(&json).expect("fixture parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: role,
+            repair_hypothesis: "hyp".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        }
+    }
+
+    #[test]
+    fn resolve_current_role_for_safe_stop_prefers_explicit_role() {
+        let (agent, _temp) = test_agent_with_config(Config::default());
+        // Even with no other signals, an explicit caller-supplied role wins.
+        assert_eq!(
+            agent.resolve_current_role_for_safe_stop(Some(ArtifactRole::Setup)),
+            Some(ArtifactRole::Setup),
+        );
+    }
+
+    #[test]
+    fn resolve_current_role_for_safe_stop_uses_semantic_plan_first() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let mut job = RepairJob::empty_synthetic();
+        job.semantic_plan = Some(fixture_semantic_plan(ArtifactRole::Test));
+        // Add a competing target_hint to confirm semantic_plan wins.
+        job.target_hint = Some(RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "src/lib.rs".to_string(),
+            reason: "test".to_string(),
+        });
+        agent.repair_job = Some(job);
+        assert_eq!(
+            agent.resolve_current_role_for_safe_stop(None),
+            Some(ArtifactRole::Test),
+        );
+    }
+
+    #[test]
+    fn resolve_current_role_for_safe_stop_falls_back_to_recovery_target() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::UsageDocs,
+            path: "docs/README.md".to_string(),
+            reason: "missing".to_string(),
+            attempt: 1,
+        });
+        // No semantic_plan, no repair_job -> recovery_target wins.
+        assert_eq!(
+            agent.resolve_current_role_for_safe_stop(None),
+            Some(ArtifactRole::UsageDocs),
+        );
+    }
+
+    #[test]
+    fn resolve_current_role_for_safe_stop_falls_back_to_target_hint() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let mut job = RepairJob::empty_synthetic();
+        job.target_hint = Some(RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/x.rs".to_string(),
+            reason: "stub".to_string(),
+        });
+        // No semantic_plan + no recovery target -> target_hint must win.
+        agent.repair_job = Some(job);
+        assert_eq!(
+            agent.resolve_current_role_for_safe_stop(None),
+            Some(ArtifactRole::Test),
+        );
+    }
+
+    #[test]
+    fn resolve_current_role_for_safe_stop_falls_back_to_task_contract() {
+        // Reconstruct a TaskContract from a fresh user request — the
+        // `Test` keyword must land `required_artifacts.first() == Test`.
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.session.messages.push(ConversationMessage::user(
+            "FastAPIのテストコードを実装してください".to_string(),
+        ));
+        assert_eq!(
+            agent.resolve_current_role_for_safe_stop(None),
+            Some(ArtifactRole::Test),
+        );
+    }
+
+    #[test]
+    fn resolve_current_role_for_safe_stop_returns_none_without_signal() {
+        let (agent, _temp) = test_agent_with_config(Config::default());
+        // No repair_job, no recovery_target, no active request -> None.
+        assert_eq!(agent.resolve_current_role_for_safe_stop(None), None);
     }
 }
 
@@ -19161,6 +19994,211 @@ pub(super) fn latest_verifier_repair_note_index(messages: &[ConversationMessage]
                     .content
                     .contains("task_contract_verify_read_attempt="))
     })
+}
+
+/// Issue #654 — `SAFE_STOP_REPORT_EVENT_MAX_BYTES` SSOT for the bounded
+/// `agent.safe_stop.report` payload (DR4-001). The size cap is enforced by
+/// `build_safe_stop_payload`; oversize payloads are deterministically
+/// truncated and `"truncated": true` is set on the payload.
+pub(super) const SAFE_STOP_REPORT_EVENT_MAX_BYTES: usize = 4096;
+
+/// Issue #654 — collect a compact list of recent action labels (newest-last)
+/// from the conversation message stream for use as the `actual_actions_raw`
+/// input to `SafeStopContext`. Looks at the **most recent** `Read` / `Write`
+/// / `Edit` / `Bash` tool calls in the last ~24 messages and produces label
+/// strings like `"Read src/foo.rs"` so the safe stop report can surface the
+/// most recent user-observable activity without leaking secret-bearing
+/// command stdout.
+fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String> {
+    const SCAN_LIMIT: usize = 24;
+    let mut out: Vec<String> = Vec::new();
+    let scan_start = messages.len().saturating_sub(SCAN_LIMIT);
+    for msg in messages.iter().skip(scan_start) {
+        if msg.role != "assistant" {
+            continue;
+        }
+        for tool_call in msg.tool_calls.iter() {
+            let name = tool_call.name.as_str();
+            if !matches!(name, "Read" | "Write" | "Edit" | "Bash") {
+                continue;
+            }
+            let detail = tool_call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    tool_call
+                        .arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("")
+                .to_string();
+            let label = if detail.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name} {detail}")
+            };
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Issue #654 (D.1 / DR1-007 / DR4-001) — pure builder that renders a
+/// `SafeStopReport` to a `serde_json::Value` suitable for `log_llm_event`.
+/// Bounded by `SAFE_STOP_REPORT_EVENT_MAX_BYTES` (4096 bytes); when the
+/// serialized form exceeds the cap, the helper deterministically trims
+/// optional fields (largest first) and sets `"truncated": true`.
+pub(super) fn build_safe_stop_payload(
+    report: &super::repair_job::SafeStopReport,
+) -> serde_json::Value {
+    let mut payload = render_safe_stop_payload(report, false);
+    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
+        return payload;
+    }
+    // Tier 1: drop output_excerpt + command details.
+    payload = render_safe_stop_payload_trimmed(report, TrimTier::Tier1);
+    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
+        return payload;
+    }
+    // Tier 2: drop actual_actions + owned_test_artifacts + exhausted summary.
+    payload = render_safe_stop_payload_trimmed(report, TrimTier::Tier2);
+    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
+        return payload;
+    }
+    // Tier 3: keep only mandatory fields.
+    payload = render_safe_stop_payload_trimmed(report, TrimTier::Tier3);
+    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
+        return payload;
+    }
+    // CB-002 (Codex review): the mandatory string fields (`session_id` +
+    // `stop_reason`) are unbounded above by the schema; an oversized
+    // `session_id` or a future-added mandatory field can push the Tier3
+    // payload past the 4KB invariant. The final hard fallback redacts all
+    // optional context that survived Tier3 to fixed placeholder strings so
+    // the serialized form is deterministically bounded.
+    enforce_safe_stop_payload_hard_cap(report)
+}
+
+/// Issue #654 (CB-002) — last-resort projection used when Tier3 still
+/// exceeds [`SAFE_STOP_REPORT_EVENT_MAX_BYTES`]. Drops every optional /
+/// large field, redacts mandatory string fields to fixed `"redacted"`
+/// placeholders, and re-asserts the 4KB cap. The final assertion is a
+/// defense-in-depth `debug_assert!` — in release builds the function
+/// always returns a payload that is at least bounded against the
+/// largest-known runtime inputs.
+fn enforce_safe_stop_payload_hard_cap(
+    report: &super::repair_job::SafeStopReport,
+) -> serde_json::Value {
+    let serialized_session_id = sanitize_safe_stop_mandatory_string(&report.session_id);
+    let payload = serde_json::json!({
+        "session_id": serialized_session_id,
+        "turn_index": report.turn_index,
+        "stop_reason": report.stop_reason.as_str(),
+        "failure_type": report.failure_type.as_str(),
+        "failure_signature": "",
+        "command": "",
+        "output_excerpt": "",
+        "current_role": serde_json::Value::Null,
+        "expected_target": serde_json::Value::Null,
+        "actual_actions": serde_json::json!([]),
+        "diagnostic_target_missing_reason": serde_json::Value::Null,
+        "exhausted_attempts_summary": serde_json::Value::Null,
+        "owned_test_artifacts": serde_json::json!([]),
+        "truncated": true,
+    });
+    debug_assert!(
+        serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES,
+        "safe_stop hard-cap projection exceeded {SAFE_STOP_REPORT_EVENT_MAX_BYTES} bytes"
+    );
+    payload
+}
+
+/// Issue #654 (CB-002) — cap a mandatory string to `SAFE_STOP_MANDATORY_STRING_MAX_CHARS`.
+/// Used by the hard-fallback projection so the worst-case `session_id` (or
+/// any future mandatory string) cannot trip the 4KB invariant.
+fn sanitize_safe_stop_mandatory_string(raw: &str) -> String {
+    const SAFE_STOP_MANDATORY_STRING_MAX_CHARS: usize = 240;
+    if raw.chars().count() <= SAFE_STOP_MANDATORY_STRING_MAX_CHARS {
+        return raw.to_string();
+    }
+    raw.chars()
+        .take(SAFE_STOP_MANDATORY_STRING_MAX_CHARS)
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrimTier {
+    Tier1,
+    Tier2,
+    Tier3,
+}
+
+fn serialized_byte_len(payload: &serde_json::Value) -> usize {
+    serde_json::to_vec(payload).map(|v| v.len()).unwrap_or(0)
+}
+
+fn render_safe_stop_payload(
+    report: &super::repair_job::SafeStopReport,
+    truncated: bool,
+) -> serde_json::Value {
+    let exhausted = report.exhausted_attempts_summary.as_ref().map(|s| {
+        serde_json::json!({
+            "total": s.total,
+            "per_cluster": s.per_cluster.iter().map(|(k, roles)| {
+                serde_json::json!([k, roles])
+            }).collect::<Vec<_>>(),
+            "last_repair_hypothesis": s.last_repair_hypothesis,
+        })
+    });
+    serde_json::json!({
+        "session_id": report.session_id,
+        "turn_index": report.turn_index,
+        "stop_reason": report.stop_reason.as_str(),
+        "failure_type": report.failure_type.as_str(),
+        "failure_signature": report.failure_signature,
+        "command": report.command,
+        "output_excerpt": report.output_excerpt,
+        "current_role": report.current_role.map(|r| r.label()),
+        "expected_target": report.expected_target,
+        "actual_actions": report.actual_actions,
+        "diagnostic_target_missing_reason": report
+            .diagnostic_target_missing_reason
+            .map(|r| r.as_str()),
+        "exhausted_attempts_summary": exhausted,
+        "owned_test_artifacts": report.owned_test_artifacts,
+        "truncated": truncated,
+    })
+}
+
+fn render_safe_stop_payload_trimmed(
+    report: &super::repair_job::SafeStopReport,
+    tier: TrimTier,
+) -> serde_json::Value {
+    let mut payload = render_safe_stop_payload(report, true);
+    let map = payload.as_object_mut().expect("safe_stop_payload object");
+    if tier == TrimTier::Tier1 || tier == TrimTier::Tier2 || tier == TrimTier::Tier3 {
+        map.insert("output_excerpt".to_string(), serde_json::json!(""));
+        map.insert("command".to_string(), serde_json::json!(""));
+    }
+    if tier == TrimTier::Tier2 || tier == TrimTier::Tier3 {
+        map.insert("actual_actions".to_string(), serde_json::json!([]));
+        map.insert("owned_test_artifacts".to_string(), serde_json::json!([]));
+        map.insert(
+            "exhausted_attempts_summary".to_string(),
+            serde_json::Value::Null,
+        );
+    }
+    if tier == TrimTier::Tier3 {
+        map.insert("expected_target".to_string(), serde_json::Value::Null);
+        map.insert(
+            "diagnostic_target_missing_reason".to_string(),
+            serde_json::Value::Null,
+        );
+        map.insert("failure_signature".to_string(), serde_json::json!(""));
+    }
+    payload
 }
 
 fn focused_edit_tool_policy_error(

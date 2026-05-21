@@ -82,6 +82,12 @@ pub mod slash_commands;
 mod spec_authority;
 mod spinner;
 mod success;
+// Issue #654 (CB-001): in-crate `#[cfg(test)]` E2E suite for the bounded
+// safe-stop-report pipeline. The seam set above is `#[cfg(test)]`-only, so
+// the cross-crate `tests/bounded_safe_stop_report_e2e.rs` integration file
+// has been migrated here to keep the seams unreachable from release builds.
+#[cfg(test)]
+mod safe_stop_e2e_tests;
 mod summary;
 mod task_contract;
 // Issue #646: task workspace scope detection. Module is intentionally
@@ -255,6 +261,107 @@ impl Agent {
     pub fn session_mut(&mut self) -> &mut SessionSnapshot {
         &mut self.session
     }
+}
+
+// Issue #654 — in-crate `#[cfg(test)]` test seams for the bounded
+// safe-stop-report suite.
+//
+// CB-001 (Codex review, Issue #654): the original implementation exposed
+// these as `#[doc(hidden)] pub fn`, but `#[doc(hidden)]` is only a rustdoc
+// hint — `pub fn` widens access for any external crate. The seams are now
+// gated by `#[cfg(test)]` so they exist exclusively in the `cargo test` /
+// `#[cfg(test)] mod` graph and are dropped entirely from release builds.
+// The accompanying integration tests have been relocated to
+// `src/agent/loop_run/safe_stop_e2e_tests.rs` (in-crate `#[cfg(test)] mod`)
+// so they can still reach the seams while keeping production access closed.
+//
+// The seams are intentionally narrow and only accept what the corresponding
+// wired emit point supplies in production: `current_role` + `expected_target`
+// for `artifact_completion_failed`, no arguments for the four verifier-driven
+// paths.
+//
+// Production code MUST NOT call these; the wired emit points inside `turn.rs`
+// are the only legitimate callers in production.
+
+/// Issue #654 (E.1) test seam: invoke the `diagnostic_target_missing` emit
+/// shell. In production this fires from `record_verifier_diagnostic_unavailable`.
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_diagnostic_target_missing_for_test(agent: &mut Agent) {
+    if agent.repair_job.is_none() {
+        // The shell exits early when `repair_job` is None; preserve the
+        // production guarantee by ensuring callers see the same no-op path.
+        agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
+    }
+    agent.emit_safe_stop_report_for_diagnostic_target_missing();
+}
+
+/// Issue #654 (E.3) test seam: invoke the `verifier_failed_safe_stop` emit
+/// shell. In production this fires at `drive_task_contract_verifier`'s
+/// attempt-limit branch.
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_verifier_failed_safe_stop_for_test(agent: &mut Agent) {
+    if agent.repair_job.is_none() {
+        agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
+    }
+    agent.emit_safe_stop_report_for_verifier_failed_safe_stop();
+}
+
+/// Issue #654 (E.4) test seam: invoke the `verifier_weak` emit shell. In
+/// production this fires when `VerifierRepairPassOutcome::Invalid` exhausts
+/// the controller repair-pass retry budget.
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_verifier_weak_for_test(agent: &mut Agent) {
+    if agent.repair_job.is_none() {
+        agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
+    }
+    agent.emit_safe_stop_report_for_verifier_weak();
+}
+
+/// Issue #654 (E.5) test seam: invoke the `verifier_missing` emit shell
+/// (`FromMissingVerifier` builder).
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_verifier_missing_for_test(agent: &mut Agent) {
+    if agent.missing_verifier_job.is_none() {
+        agent.missing_verifier_job = Some(repair_job::MissingVerifierJob::new(1, 0));
+    }
+    agent.emit_safe_stop_report_for_verifier_missing();
+}
+
+/// Issue #654 (E.2) test seam: invoke the `artifact_completion_failed` emit
+/// shell. This path can fire without a verifier-driven `RepairJob`, mirroring
+/// the production wiring at the role-specific retry budget exit points.
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_artifact_completion_failed_for_test(
+    agent: &mut Agent,
+    role_label: &str,
+    expected_target: Option<String>,
+) {
+    let role = match role_label {
+        "test" => task_contract::ArtifactRole::Test,
+        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
+        "setup" => task_contract::ArtifactRole::Setup,
+        _ => task_contract::ArtifactRole::Implementation,
+    };
+    agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+}
+
+/// Issue #654 test seam: clear the per-turn dedup marker so a test can verify
+/// the reset path (re-emit after `handle_user_message`-style clear).
+#[cfg(test)]
+pub(crate) fn clear_safe_stop_report_dedup_for_test(agent: &mut Agent) {
+    agent.safe_stop_report_emitted.clear();
+}
+
+/// Issue #654 (CB-005) test seam: seed `turn_edited_relative_paths` with a
+/// caller-supplied workspace-relative path so the in-crate safe-stop e2e
+/// suite can simulate "agent edited this test file during the turn" without
+/// driving the entire actor loop. Used by `safe_stop_e2e_tests` to confirm
+/// that the `verifier_missing` / `verifier_weak` paths populate
+/// `owned_test_artifacts` from real Owned-validated edits, and that
+/// CandidateOnly / OutOfScope inputs are excluded.
+#[cfg(test)]
+pub(crate) fn seed_turn_edited_relative_path_for_test(agent: &mut Agent, path: String) {
+    agent.turn_edited_relative_paths.insert(path);
 }
 
 // Issue #576: expose WorkMode second-pass confirmation adapter surface so
@@ -633,6 +740,14 @@ pub struct Agent {
     /// artifacts cannot auto-promote themselves (Issue #646 §修正方針 2
     /// `Owned` rules).
     turn_edited_relative_paths: std::collections::HashSet<String>,
+    /// Issue #654 (DR1-006): per-turn dedup marker for the `agent.safe_stop.report`
+    /// event. `HashSet<StopReason>` provides type-safe membership tests
+    /// (typo detection at compile time). Reset at the head of every
+    /// `handle_user_message` so a new turn can re-emit the same StopReason.
+    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
+    /// persistence schemas are unchanged by Issue #654.
+    pub(in crate::agent::loop_run) safe_stop_report_emitted:
+        std::collections::HashSet<repair_job::StopReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,6 +777,11 @@ enum VerifierFailureType {
     AssertionFailure,
     MissingVerifierOrConfig,
     Unknown,
+    /// Issue #654: control-flow stop reason emitted when diagnostic target
+    /// selection failed (`record_safe_stop_report` sets this variant directly;
+    /// `verifier_failure_type_for_diagnostic_kind` /
+    /// `classify_verifier_failure_type` never map to this variant — DR3-005).
+    DiagnosticTargetMissing,
 }
 
 impl VerifierFailureType {
@@ -673,6 +793,7 @@ impl VerifierFailureType {
             Self::AssertionFailure => "assertion_failure",
             Self::MissingVerifierOrConfig => "missing_verifier_or_config",
             Self::Unknown => "unknown",
+            Self::DiagnosticTargetMissing => "diagnostic_target_missing",
         }
     }
 }
@@ -857,6 +978,7 @@ impl Agent {
             missing_verifier_job: None,
             turn_pre_tool_file_hashes: std::collections::HashMap::new(),
             turn_edited_relative_paths: std::collections::HashSet::new(),
+            safe_stop_report_emitted: std::collections::HashSet::new(),
         }
     }
 

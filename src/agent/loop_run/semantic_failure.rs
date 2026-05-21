@@ -155,8 +155,9 @@ pub(super) struct FailureCluster {
 pub(super) struct FailureClusterKey(String);
 
 impl FailureClusterKey {
-    /// Read-only access to the 16-hex representation.
-    #[allow(dead_code)]
+    /// Read-only access to the 16-hex representation. Consumed by Issue #654
+    /// (`ExhaustedAttemptsSummary::from_repair_job`) to surface cluster ids in
+    /// the `agent.safe_stop.report` event payload.
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
