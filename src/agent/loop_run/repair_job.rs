@@ -16,6 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
+use super::repair_attempt_outcome::{
+    MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, should_promote_to_exhausted_after_push,
+};
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority};
 use super::task_contract::RecoveryTargetHint;
@@ -159,6 +162,13 @@ pub(super) struct RepairJob {
     ///
     /// turn-local field (session.messages には persist しない)。
     pub(super) assessment_bound_cluster_id: Option<FailureClusterKey>,
+    /// Issue #653: per-job 累積 lifecycle ledger。
+    /// FIFO bounded (cap = `MAX_REPAIR_ATTEMPT_OUTCOMES = 16`)、
+    /// overflow は oldest drop + `tracing::warn!` metadata (S1-003)。
+    /// session 永続化対象外 (`Serialize`/`Deserialize` 非付与、S3-004)。
+    /// 同一 `(cluster, role, RejectedUnsafe { rejection })` が 2 回検出された
+    /// 時点で `exhausted_attempts` にも昇格 push する (S1-006(a))。
+    pub(super) repair_attempt_outcomes: Vec<RepairAttemptOutcome>,
 }
 
 /// Controller-internal decision used by `run_turn` to pick the next action
@@ -364,7 +374,58 @@ impl RepairJob {
             exhausted_attempts: Vec::new(),
             assessment_generation: 0,
             assessment_bound_cluster_id: None,
+            repair_attempt_outcomes: Vec::new(),
         }
+    }
+
+    /// Issue #653 (S7-003): ledger mutation SSOT (orchestration only)。
+    ///
+    /// 薄い orchestration として以下を担保する:
+    /// 1. FIFO cap (`MAX_REPAIR_ATTEMPT_OUTCOMES = 16`) — 超過時は oldest drop
+    ///    + `tracing::warn!` (件数 metadata のみ、内容は出さない)
+    /// 2. `repair_attempt_outcomes` に push
+    /// 3. `should_promote_to_exhausted_after_push` (pure-fn) を呼んで `Some` なら
+    ///    `exhausted_attempts` に push (idempotent — `contains` チェック)
+    /// 4. `assessment_generation` は **bump しない** (S3-005)
+    ///
+    /// 昇格判定本体は pure-fn 側 (`repair_attempt_outcome::should_promote_to_exhausted_after_push`)
+    /// にあるため、ここではフロー制御のみ。
+    #[allow(dead_code)] // wired into turn.rs by Phase 3 lifecycle hooks.
+    pub(super) fn record_repair_attempt_outcome(&mut self, outcome: RepairAttemptOutcome) {
+        // 1. FIFO cap → oldest drop + tracing::warn! (closed metadata, DR4-002)
+        if self.repair_attempt_outcomes.len() >= MAX_REPAIR_ATTEMPT_OUTCOMES {
+            self.repair_attempt_outcomes.remove(0);
+            // Issue #653 DR3-005 / DR4-002: structured event with closed metadata
+            // (event + count). cluster key / hypothesis / WeakeningPattern / LLM
+            // text は payload に含めない。
+            tracing::warn!(
+                event = "agent.repair_attempt_outcomes.fifo_drop",
+                count = MAX_REPAIR_ATTEMPT_OUTCOMES,
+                "repair_attempt_outcomes FIFO drop: oldest entry evicted"
+            );
+        }
+
+        // 2. push
+        self.repair_attempt_outcomes.push(outcome.clone());
+
+        // 3. pure-fn predicate で昇格判定 → 必要なら exhausted_attempts に push
+        if let Some(entry) =
+            should_promote_to_exhausted_after_push(&self.repair_attempt_outcomes, &outcome)
+            && !self.exhausted_attempts.contains(&entry)
+        {
+            self.exhausted_attempts.push(entry);
+        }
+        // 4. assessment_generation 不変 (no bump — S3-005)
+    }
+
+    /// Issue #653 (S1-007, DR1-006 命名統一): #654 (bounded stop report) が消費する
+    /// read-only snapshot。`pub` への昇格はしない (DR3-001)。
+    ///
+    /// field 名 `repair_attempt_outcomes` と揃え、命名を
+    /// `snapshot_repair_attempt_outcomes` に統一。
+    #[allow(dead_code)] // consumed by #654 (bounded verifier_failed_safe_stop report).
+    pub(super) fn snapshot_repair_attempt_outcomes(&self) -> Vec<RepairAttemptOutcome> {
+        self.repair_attempt_outcomes.clone()
     }
 }
 
@@ -4267,5 +4328,172 @@ mod tests {
                 .is_none_or(|h| h.path != stale_path),
             "stale cluster A path must not remain as repair_target_hint",
         );
+    }
+
+    // ---- Issue #653 (Phase 2): RepairAttemptOutcome ledger ---- //
+
+    use super::super::repair_attempt_outcome::{
+        MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, RepairAttemptOutcomeKind,
+        RepairRejectionKind,
+    };
+    use super::super::semantic_failure::cluster_key_for_test;
+    use super::super::spec_authority::WeakeningPattern;
+    use super::super::task_contract::ArtifactRole;
+
+    fn outcome_rejected_unsafe(
+        cluster_label: &str,
+        role: ArtifactRole,
+        rejection: RepairRejectionKind,
+        pattern: WeakeningPattern,
+    ) -> RepairAttemptOutcome {
+        RepairAttemptOutcome::for_test(
+            cluster_key_for_test(cluster_label),
+            role,
+            RepairAttemptOutcomeKind::RejectedUnsafe { rejection, pattern },
+        )
+    }
+
+    fn outcome_applied_no_progress(
+        cluster_label: &str,
+        role: ArtifactRole,
+    ) -> RepairAttemptOutcome {
+        RepairAttemptOutcome::for_test(
+            cluster_key_for_test(cluster_label),
+            role,
+            RepairAttemptOutcomeKind::AppliedNoProgress,
+        )
+    }
+
+    #[test]
+    fn phase3_record_repair_attempt_outcome_initial_state() {
+        let mut job = RepairJob::new_for_test();
+        assert!(job.repair_attempt_outcomes.is_empty());
+        let outcome = outcome_applied_no_progress("A", ArtifactRole::Implementation);
+        job.record_repair_attempt_outcome(outcome.clone());
+        assert_eq!(job.repair_attempt_outcomes.len(), 1);
+        assert_eq!(job.repair_attempt_outcomes[0], outcome);
+    }
+
+    #[test]
+    fn phase3_record_repair_attempt_outcome_fifo_cap_at_16() {
+        let mut job = RepairJob::new_for_test();
+        // Push 17 distinct outcomes (Applied so they never promote).
+        for i in 0..(MAX_REPAIR_ATTEMPT_OUTCOMES + 1) {
+            let label = format!("cluster-{i}");
+            let outcome = outcome_applied_no_progress(&label, ArtifactRole::Implementation);
+            job.record_repair_attempt_outcome(outcome);
+        }
+        // Cap respected and oldest dropped (FIFO).
+        assert_eq!(
+            job.repair_attempt_outcomes.len(),
+            MAX_REPAIR_ATTEMPT_OUTCOMES
+        );
+        let first_cluster = cluster_key_for_test("cluster-1");
+        assert_eq!(job.repair_attempt_outcomes[0].cluster, first_cluster);
+    }
+
+    #[test]
+    fn phase3_record_repair_attempt_outcome_does_not_bump_assessment_generation() {
+        let mut job = RepairJob::new_for_test();
+        job.assessment_generation = 7;
+        let outcome = outcome_applied_no_progress("A", ArtifactRole::Test);
+        job.record_repair_attempt_outcome(outcome);
+        assert_eq!(job.assessment_generation, 7, "S3-005: no bump");
+    }
+
+    #[test]
+    fn phase3_repeated_test_weakening_promotes_to_exhausted_attempts_after_two_pushes() {
+        let mut job = RepairJob::new_for_test();
+        let outcome = outcome_rejected_unsafe(
+            "A",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        );
+        job.record_repair_attempt_outcome(outcome.clone());
+        assert!(
+            job.exhausted_attempts.is_empty(),
+            "1 outcome must not promote"
+        );
+        job.record_repair_attempt_outcome(outcome.clone());
+        assert_eq!(
+            job.exhausted_attempts,
+            vec![(cluster_key_for_test("A"), ArtifactRole::Test)],
+            "2 outcomes must promote"
+        );
+        // idempotent: 3rd push must not duplicate.
+        job.record_repair_attempt_outcome(outcome);
+        assert_eq!(
+            job.exhausted_attempts,
+            vec![(cluster_key_for_test("A"), ArtifactRole::Test)],
+            "3rd push must remain idempotent"
+        );
+    }
+
+    #[test]
+    fn phase3_distinct_clusters_do_not_promote_exhausted() {
+        let mut job = RepairJob::new_for_test();
+        job.record_repair_attempt_outcome(outcome_rejected_unsafe(
+            "A",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        ));
+        job.record_repair_attempt_outcome(outcome_rejected_unsafe(
+            "B",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        ));
+        assert!(job.exhausted_attempts.is_empty());
+    }
+
+    #[test]
+    fn phase3_applied_outcomes_do_not_promote_exhausted() {
+        let mut job = RepairJob::new_for_test();
+        for _ in 0..5 {
+            job.record_repair_attempt_outcome(outcome_applied_no_progress(
+                "A",
+                ArtifactRole::Implementation,
+            ));
+        }
+        assert!(job.exhausted_attempts.is_empty());
+    }
+
+    #[test]
+    fn phase3_snapshot_repair_attempt_outcomes_returns_clone() {
+        let mut job = RepairJob::new_for_test();
+        let outcome = outcome_applied_no_progress("A", ArtifactRole::Implementation);
+        job.record_repair_attempt_outcome(outcome);
+        let mut snapshot = job.snapshot_repair_attempt_outcomes();
+        snapshot.clear();
+        assert_eq!(
+            job.repair_attempt_outcomes.len(),
+            1,
+            "mutating snapshot must not affect ledger"
+        );
+    }
+
+    #[test]
+    fn phase3_new_for_test_initializes_empty_ledger() {
+        let job = RepairJob::new_for_test();
+        assert!(job.repair_attempt_outcomes.is_empty());
+    }
+
+    #[test]
+    fn phase3_record_repair_attempt_outcome_idempotent_exhausted_push() {
+        // Issue #653 T4.2: same RejectedUnsafe pushed 3 times → exhausted_attempts
+        // contains exactly 1 entry (idempotent `contains` guard).
+        let mut job = RepairJob::new_for_test();
+        let outcome = outcome_rejected_unsafe(
+            "A",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        );
+        for _ in 0..3 {
+            job.record_repair_attempt_outcome(outcome.clone());
+        }
+        assert_eq!(job.exhausted_attempts.len(), 1);
     }
 }
