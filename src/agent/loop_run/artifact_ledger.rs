@@ -156,6 +156,31 @@ impl<'a> LedgerAdmissionContext<'a> {
     }
 }
 
+/// Issue #659 PR-001: observability log context for `event_recorded` /
+/// `turn_summary` payloads. Stored inside the `ArtifactLedger` itself so
+/// existing record-call signatures stay untouched while turn-level dataset
+/// consumers (Issue #660 / #661 / #663) can join ledger events with the
+/// owning session / turn.
+///
+/// `session_id` defaults to an empty string and `turn_index` to `0` for
+/// tests and code paths that construct an `ArtifactLedger` directly without
+/// going through `turn.rs` (the production seed of the context happens in
+/// `clear_per_turn_ledger_state`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ArtifactLedgerLogContext {
+    pub(super) session_id: String,
+    pub(super) turn_index: u32,
+}
+
+impl ArtifactLedgerLogContext {
+    pub(super) fn new(session_id: impl Into<String>, turn_index: u32) -> Self {
+        Self {
+            session_id: session_id.into(),
+            turn_index,
+        }
+    }
+}
+
 /// Append-only event. `path` is always present (never `Option<String>`); the
 /// `ArtifactState::changed(...)` rows that carry `path: None` are skipped at
 /// admission time (Issue #659 §3 / DR2-002).
@@ -205,6 +230,10 @@ pub(super) struct ArtifactLedger {
     dropped_count: u32,
     overflowed: bool,
     next_seq: u32,
+    /// Issue #659 PR-001: observability log context (session_id / turn_index)
+    /// propagated into every `event_recorded` / `turn_summary` payload so
+    /// dataset consumers can join per-turn (Section 7.1 of design policy).
+    log_context: ArtifactLedgerLogContext,
 }
 
 /// Summary returned by [`ArtifactLedger::turn_summary`] for end-of-turn
@@ -224,12 +253,35 @@ impl ArtifactLedger {
     /// Per-turn reset. Caller (`turn.rs::handle_user_message` head) must
     /// invoke this alongside the existing `turn_edited_relative_paths.clear()`
     /// / `turn_pre_tool_file_hashes.clear()` (CLAUDE.md per-turn rule).
+    ///
+    /// The observability `log_context` is intentionally **preserved** across
+    /// `clear()` — `turn.rs` calls `set_log_context()` separately so a new
+    /// turn's session_id / turn_index are stamped on the per-turn event
+    /// stream. Tests that reuse a ledger across virtual turns can call
+    /// `set_log_context()` themselves to mirror the production sequencing.
     pub(super) fn clear(&mut self) {
         self.events.clear();
         self.verifier_observations.clear();
         self.dropped_count = 0;
         self.overflowed = false;
         self.next_seq = 0;
+    }
+
+    /// Issue #659 PR-001: stamp the observability log context for the
+    /// current turn. `turn.rs::clear_per_turn_ledger_state` calls this with
+    /// `(session_store.session_id(), current_turn_index)` so subsequent
+    /// `event_recorded` / `turn_summary` emits carry the turn-level join
+    /// keys defined in Section 7.1 of the design policy.
+    pub(super) fn set_log_context(&mut self, ctx: ArtifactLedgerLogContext) {
+        self.log_context = ctx;
+    }
+
+    /// Read-only accessor for the current observability log context. Test
+    /// helpers may use this to confirm the context propagated through a
+    /// turn-level wiring path.
+    #[allow(dead_code)]
+    pub(super) fn log_context(&self) -> &ArtifactLedgerLogContext {
+        &self.log_context
     }
 
     // --- record helpers --------------------------------------------------
@@ -378,7 +430,7 @@ impl ArtifactLedger {
         };
         self.events.push(event);
         let appended = self.events.last().expect("just pushed");
-        emit_event_recorded(appended, self.overflowed);
+        emit_event_recorded(appended, self.overflowed, &self.log_context);
         Some(appended)
     }
 
@@ -427,6 +479,11 @@ impl ArtifactLedger {
     /// Emit `agent.artifact_ledger.turn_summary`. Caller (`turn.rs`) is
     /// responsible for invoking this exactly once per turn at the
     /// SafeStop / Done confirmation point (Phase 2 task 2.2).
+    ///
+    /// Section 7.1 contract: payload carries `turn_index` / `session_id`
+    /// (from the stored `log_context`) plus `event_count` / `dropped_count`
+    /// / `overflowed` and per-{origin,role,ownership} counts. Raw paths are
+    /// never emitted.
     pub(super) fn emit_turn_summary(&self) {
         let summary = self.turn_summary();
         let mut origin_counts: BTreeMap<&'static str, u32> = BTreeMap::new();
@@ -442,6 +499,8 @@ impl ArtifactLedger {
         log_llm_event(
             "agent.artifact_ledger.turn_summary",
             json!({
+                "session_id": self.log_context.session_id,
+                "turn_index": self.log_context.turn_index,
                 "event_count": summary.event_count,
                 "dropped_count": summary.dropped_count,
                 "overflowed": summary.overflowed,
@@ -645,7 +704,11 @@ fn ownership_label(o: ArtifactOwnership) -> &'static str {
 // Observability hook (per Issue #659 §7.1)
 // ---------------------------------------------------------------------------
 
-fn emit_event_recorded(event: &ArtifactLedgerEvent, overflowed: bool) {
+fn emit_event_recorded(
+    event: &ArtifactLedgerEvent,
+    overflowed: bool,
+    ctx: &ArtifactLedgerLogContext,
+) {
     // path_hash is derived from the *masked* workspace-relative path so a
     // secret accidentally embedded in the path can never surface via the
     // hash. Raw path is NEVER included in the payload.
@@ -654,6 +717,8 @@ fn emit_event_recorded(event: &ArtifactLedgerEvent, overflowed: bool) {
     log_llm_event(
         "agent.artifact_ledger.event_recorded",
         json!({
+            "session_id": ctx.session_id,
+            "turn_index": ctx.turn_index,
             "seq": event.recorded_at_seq,
             "origin": event.origin.label(),
             "role": event.role.label(),
@@ -673,6 +738,30 @@ fn stable_path_hash(masked_path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     masked_path.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Issue #659 PR-001: bounded, masked path-hash projection helper. Each
+/// path is passed through `mask_secrets` and then `stable_path_hash` so the
+/// hash space matches `event_recorded.path_hash` exactly (dataset consumers
+/// can join the divergence list back to per-event rows). Output is hard-
+/// capped at `MAX_DIVERGENCE_PATH_HASHES = 16` entries to bound payload
+/// size — beyond the cap, additional paths are silently dropped (counts
+/// still reflect the true totals).
+pub(super) const MAX_DIVERGENCE_PATH_HASHES: usize = 16;
+
+/// Build a bounded list of masked path hashes for divergence payloads.
+/// Accepts any `IntoIterator<Item = &str>` so call sites can pass a
+/// `BTreeSet<String>` iterator (deterministic order) without intermediate
+/// allocation.
+pub(super) fn bounded_masked_path_hashes<'a, I>(paths: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    paths
+        .into_iter()
+        .take(MAX_DIVERGENCE_PATH_HASHES)
+        .map(|p| stable_path_hash(&mask_secrets(p)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,5 +1747,63 @@ mod tests {
             MAX_ARTIFACT_LEDGER_OBSERVATIONS, MAX_ARTIFACT_LEDGER_EVENTS,
             "observation cap and event cap must stay symmetric (CB-003 design contract)"
         );
+    }
+
+    // ---- Issue #659 PR-001: log_context schema alignment -----------------
+    // Section 7.1 contract:
+    //   * `event_recorded` payload carries `turn_index` + `session_id`
+    //   * `turn_summary` payload carries `turn_index` + `session_id`
+    //   * `divergence_detected` payload carries bounded masked path-hash
+    //     lists (max 16, see `MAX_DIVERGENCE_PATH_HASHES`)
+    //
+    // The first two are exercised here at the module level; the third is
+    // exercised end-to-end from `artifact_ledger_phase2_tests` (it lives
+    // in `turn.rs`, not in this module).
+
+    #[test]
+    fn log_context_defaults_to_empty_then_set_log_context_updates_it() {
+        let mut ledger = ArtifactLedger::new();
+        let default_ctx = ledger.log_context().clone();
+        assert_eq!(default_ctx, ArtifactLedgerLogContext::default());
+        ledger.set_log_context(ArtifactLedgerLogContext::new("sess-abc", 7));
+        let got = ledger.log_context().clone();
+        assert_eq!(got.session_id, "sess-abc");
+        assert_eq!(got.turn_index, 7);
+    }
+
+    #[test]
+    fn clear_preserves_log_context_so_seed_call_order_is_independent() {
+        // `turn.rs::clear_per_turn_ledger_state` calls `clear()` once per
+        // turn and `set_log_context()` separately. The order is
+        // documented in `clear()`'s doc comment — verify clear() does NOT
+        // wipe the context so callers can stamp it before or after the
+        // reset without changing the per-event payload.
+        let mut ledger = ArtifactLedger::new();
+        ledger.set_log_context(ArtifactLedgerLogContext::new("sess-keep", 9));
+        ledger.clear();
+        assert_eq!(ledger.log_context().session_id, "sess-keep");
+        assert_eq!(ledger.log_context().turn_index, 9);
+    }
+
+    #[test]
+    fn bounded_masked_path_hashes_caps_at_sixteen_and_masks() {
+        // 20 distinct paths -> 16 entries.
+        let inputs: Vec<String> = (0..20).map(|i| format!("tests/test_{i}.py")).collect();
+        let hashes = bounded_masked_path_hashes(inputs.iter().map(String::as_str));
+        assert_eq!(hashes.len(), MAX_DIVERGENCE_PATH_HASHES);
+        for h in &hashes {
+            assert_eq!(h.len(), 16, "stable_path_hash returns 16-char hex");
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn bounded_masked_path_hashes_matches_event_recorded_path_hash_shape() {
+        // Hash space MUST match `event_recorded.path_hash` exactly so a
+        // dataset consumer can join divergence rows against per-event rows.
+        let path = "tests/test_join.py";
+        let expected = stable_path_hash(&mask_secrets(path));
+        let hashes = bounded_masked_path_hashes([path].iter().copied());
+        assert_eq!(hashes, vec![expected]);
     }
 }

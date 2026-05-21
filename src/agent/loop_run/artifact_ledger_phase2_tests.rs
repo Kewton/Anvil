@@ -514,3 +514,194 @@ fn divergence_panic_message_does_not_leak_raw_paths() {
         "panic message must include count-only fields (CB-004); got: {panic_text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #659 PR-001: payload schema alignment with Section 7.1 of the design
+// policy.
+//
+// Three regression tests pin the new contract:
+//   * `event_recorded` payload carries `turn_index` + `session_id`
+//   * `turn_summary`   payload carries `turn_index` + `session_id`
+//   * `divergence_detected` payload carries bounded masked path-hash
+//     lists (`legacy_path_hashes` / `ledger_path_hashes`, max 16 each)
+//
+// All three round-trip through the on-disk JSONL log so the
+// `mask_payload_inplace` final-defence path is exercised end-to-end.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn event_recorded_payload_includes_turn_index_pr001() {
+    let session_id = unique_session_id("pr001-event-recorded");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+    let unique = format!(
+        "pr001-evt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let path = format!("tests/test_{unique}.py");
+    std::fs::write(work_root.join(&path), "").unwrap();
+    let scope = single_root_scope();
+
+    // Production sequencing: clear_per_turn_ledger_state stamps the
+    // observability log context with the agent's current turn_index +
+    // session_id. We drive `current_turn_index = 5` to exercise the
+    // u32 narrowing path in the seed helper.
+    agent.current_turn_index = 5;
+    agent.clear_per_turn_ledger_state();
+    agent.seed_artifact_ledger_repo_edit(&path, ArtifactRole::Test, &scope);
+
+    // Compute the expected path_hash (mask_secrets→DefaultHasher→16-hex).
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let masked = crate::session::feedback::mask_secrets(&path);
+    let mut hasher = DefaultHasher::new();
+    masked.hash(&mut hasher);
+    let expected_path_hash = format!("{:016x}", hasher.finish());
+
+    let events = read_log_events_by_event_name("agent.artifact_ledger.event_recorded");
+    // Filter to events whose path_hash matches the one we just seeded so
+    // this test stays stable under parallel cargo test execution.
+    let our = events
+        .iter()
+        .find(|ev| {
+            ev.get("payload")
+                .and_then(|p| p.get("path_hash"))
+                .and_then(|v| v.as_str())
+                == Some(expected_path_hash.as_str())
+        })
+        .expect("event_recorded for the seeded path must exist");
+    let payload = our.get("payload").expect("payload");
+    assert_eq!(
+        payload.get("turn_index").and_then(|v| v.as_u64()),
+        Some(5),
+        "PR-001: event_recorded payload must carry turn_index per §7.1"
+    );
+    assert_eq!(
+        payload.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id.as_str()),
+        "PR-001: event_recorded payload must carry session_id per §7.1"
+    );
+}
+
+#[test]
+fn turn_summary_payload_includes_turn_index_pr001() {
+    let session_id = unique_session_id("pr001-turn-summary");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+    let path = "tests/test_summary_pr001.py";
+    std::fs::write(work_root.join(path), "").unwrap();
+    let scope = single_root_scope();
+
+    agent.current_turn_index = 11;
+    agent.clear_per_turn_ledger_state();
+    agent.seed_artifact_ledger_repo_edit(path, ArtifactRole::Test, &scope);
+
+    let before = read_log_events_by_event_name("agent.artifact_ledger.turn_summary").len();
+    agent.record_turn_end_artifact_ledger_summary();
+    let events = read_log_events_by_event_name("agent.artifact_ledger.turn_summary");
+    assert_eq!(
+        events.len(),
+        before + 1,
+        "exactly one turn_summary event must be emitted per call"
+    );
+    let payload = events
+        .last()
+        .expect("emitted")
+        .get("payload")
+        .expect("payload");
+    assert_eq!(
+        payload.get("turn_index").and_then(|v| v.as_u64()),
+        Some(11),
+        "PR-001: turn_summary payload must carry turn_index per §7.1"
+    );
+    assert_eq!(
+        payload.get("session_id").and_then(|v| v.as_str()),
+        Some(session_id.as_str()),
+        "PR-001: turn_summary payload must carry session_id per §7.1"
+    );
+}
+
+#[test]
+fn divergence_detected_payload_includes_bounded_masked_path_hashes_pr001() {
+    let session_id = unique_session_id("pr001-divergence");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+
+    // Seed the legacy set with 20 distinct paths so the bounded list cap
+    // (16) is exercised. Use the legacy set directly (not the
+    // write-through seed) so the divergence is unambiguous.
+    let mut legacy_paths: Vec<String> = Vec::new();
+    for i in 0..20 {
+        let p = format!("tests/test_pr001_div_{i}.py");
+        std::fs::write(work_root.join(&p), "").unwrap();
+        legacy_paths.push(p);
+    }
+    for p in &legacy_paths {
+        agent.turn_edited_relative_paths.insert(p.clone());
+    }
+
+    let before = read_log_events_by_event_name("agent.artifact_ledger.divergence_detected").len();
+    agent.emit_artifact_ledger_divergence_if_any();
+    let events = read_log_events_by_event_name("agent.artifact_ledger.divergence_detected");
+    assert!(
+        events.len() > before,
+        "divergence_detected event must be emitted when sources diverge"
+    );
+    let payload = events
+        .last()
+        .expect("emitted")
+        .get("payload")
+        .expect("payload");
+
+    let legacy_hashes = payload
+        .get("legacy_path_hashes")
+        .and_then(|v| v.as_array())
+        .expect("PR-001: divergence payload must carry legacy_path_hashes per §7.1");
+    let ledger_hashes = payload
+        .get("ledger_path_hashes")
+        .and_then(|v| v.as_array())
+        .expect("PR-001: divergence payload must carry ledger_path_hashes per §7.1");
+
+    assert!(
+        legacy_hashes.len() <= 16,
+        "PR-001: legacy_path_hashes must be bounded at 16 entries (got {})",
+        legacy_hashes.len()
+    );
+    assert!(
+        ledger_hashes.len() <= 16,
+        "PR-001: ledger_path_hashes must be bounded at 16 entries (got {})",
+        ledger_hashes.len()
+    );
+    // 20 distinct paths seeded -> exactly 16 (the cap) on the legacy side,
+    // 0 on the ledger side (we did not seed it).
+    assert_eq!(
+        legacy_hashes.len(),
+        16,
+        "PR-001: cap must hard-bound legacy_path_hashes at 16"
+    );
+    assert_eq!(
+        ledger_hashes.len(),
+        0,
+        "ledger has no seeded paths in this test"
+    );
+    // All hashes are 16-char hex.
+    for h in legacy_hashes {
+        let s = h.as_str().expect("hash string");
+        assert_eq!(s.len(), 16);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+    // Raw paths must not leak into the payload string.
+    let payload_str = serde_json::to_string(payload).expect("payload json");
+    for p in &legacy_paths {
+        assert!(
+            !payload_str.contains(p),
+            "PR-001: raw path leaked into divergence_detected payload: {p}"
+        );
+    }
+}
