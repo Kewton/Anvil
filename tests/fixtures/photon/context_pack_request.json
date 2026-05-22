@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "task": "Fix the login bug",
+  "repo_path": "/workspace/test-repo",
+  "branch": "feature/example",
+  "commit": "abc123def456",
+  "working_memory": "Working on auth module.",
+  "touched_files": ["src/auth.rs", "tests/auth_test.rs"],
+  "recent_tool_summary": [
+    {"name": "Read", "args_summary": "{\"path\":\"src/auth.rs\"}"}
+  ],
+  "selected_cases": [],
+  "selected_anti_patterns": [],
+  "selected_precautions": []
+}

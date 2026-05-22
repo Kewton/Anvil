@@ -1,0 +1,12 @@
+{
+  "context_pack_id": "cpid-test-001",
+  "items": [
+    {
+      "kind": "summary",
+      "summary": "Previously fixed a similar auth bug by checking token expiry.",
+      "source": "case-abc123"
+    }
+  ],
+  "admission_decision": "accepted",
+  "warnings": []
+}

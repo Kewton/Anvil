@@ -248,34 +248,138 @@ fn is_plan_wrapper_or_approval_text(text: &str) -> bool {
         || lower.starts_with("create an implementation plan")
 }
 
-pub(super) fn implementation_quality_issue_for_request(
-    request: &str,
-    content: &str,
-) -> Option<String> {
+// ---------------------------------------------------------------------------
+// Issue #580: first-pass observation types (SSoT for quality-gate analysis)
+// ---------------------------------------------------------------------------
+
+/// Reason why the quality gate's 5-step first-pass fast-fail short-circuited
+/// without reaching the count-evidence verdict. These are *deterministic*
+/// failures that the second-pass LLM should NOT be allowed to override
+/// (DR1-005). Per `QualityFirstPassObservation` semantics they are mutually
+/// exclusive with `ConfirmationEligible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityEarlyFailReason {
+    /// (1) `looks_like_ui_marker_spam` detected superficial marker spam.
+    UiMarkerSpam,
+    /// (2) `placeholder_hits >= 2` — scaffold / placeholder markers persist.
+    Placeholder,
+    /// (4) `requires_strict_semantic_quality` and `semantic_hits < 5`.
+    StrictSemantic,
+    /// (5) Game request whose body is a low-fidelity slice.
+    LowFidelityGame,
+}
+
+impl QualityEarlyFailReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UiMarkerSpam => "ui_marker_spam",
+            Self::Placeholder => "placeholder",
+            Self::StrictSemantic => "strict_semantic",
+            Self::LowFidelityGame => "low_fidelity_game",
+        }
+    }
+}
+
+/// Whether second-pass confirmation is allowed for this first-pass outcome.
+///
+/// * `ConfirmationEligible` — adapter MAY consult the sidecar LLM (the
+///   final go/no-go also depends on `should_request_quality_confirmation`
+///   which inspects the count tuple).
+/// * `EarlyFail { reason }` — quality.rs already decided this is not
+///   interactive UI for a deterministic reason; second-pass must NOT be
+///   invoked (DR1-005 / S7-001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityFirstPassGate {
+    ConfirmationEligible,
+    EarlyFail { reason: QualityEarlyFailReason },
+}
+
+impl QualityFirstPassGate {
+    pub fn confirmation_eligible(&self) -> bool {
+        matches!(self, Self::ConfirmationEligible)
+    }
+}
+
+/// Aggregated first-pass observation. `issue` retains the original wrapper
+/// semantics (returned by `implementation_quality_issue_for_request`), while
+/// `gate` is the independent eligibility signal for `quality_confirm.rs`.
+///
+/// DR2-002: the two are intentionally orthogonal — Type-B rescue
+/// (state_hits=0 but other categories hit) produces
+/// `issue = Some(_), gate = ConfirmationEligible` so the adapter can flip
+/// `issue` to `None` after LLM confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityFirstPassObservation {
+    pub issue: Option<String>,
+    pub interaction_hits: usize,
+    pub state_hits: usize,
+    pub feedback_hits: usize,
+    pub gate: QualityFirstPassGate,
+}
+
+/// Issue #580 / DR1-010 SSoT: full 5-step first-pass analysis of a generated
+/// UI implementation. `implementation_quality_issue_for_request` is now a
+/// thin wrapper around this function — they share the same logic exactly
+/// once.
+pub fn quality_first_pass_observation(request: &str, content: &str) -> QualityFirstPassObservation {
     let intent = RequestIntent::from_request(request);
     let profile = FeatureProfile::from_request(request);
     let request_lower = request.to_lowercase();
     let normalized = content.to_lowercase();
+
+    // (1) UI marker spam (early fail).
     if looks_like_ui_marker_spam(&normalized) {
-        return Some(
-            "it contains superficial UI quality marker spam without executable interaction, state, and feedback evidence"
-                .to_string(),
-        );
+        return QualityFirstPassObservation {
+            issue: Some(
+                "it contains superficial UI quality marker spam without executable interaction, state, and feedback evidence"
+                    .to_string(),
+            ),
+            interaction_hits: count_ui_interaction_hits(&normalized),
+            state_hits: count_ui_state_hits(&normalized),
+            feedback_hits: count_ui_feedback_hits(&normalized),
+            gate: QualityFirstPassGate::EarlyFail {
+                reason: QualityEarlyFailReason::UiMarkerSpam,
+            },
+        };
     }
+
+    // (2) Placeholder hits (early fail).
     let placeholder_hits = placeholder_hit_count(intent.framework, &normalized);
     if placeholder_hits >= 2 {
-        return Some(
-            "it still contains multiple scaffold or generic placeholder markers".to_string(),
-        );
+        return QualityFirstPassObservation {
+            issue: Some(
+                "it still contains multiple scaffold or generic placeholder markers".to_string(),
+            ),
+            interaction_hits: count_ui_interaction_hits(&normalized),
+            state_hits: count_ui_state_hits(&normalized),
+            feedback_hits: count_ui_feedback_hits(&normalized),
+            gate: QualityFirstPassGate::EarlyFail {
+                reason: QualityEarlyFailReason::Placeholder,
+            },
+        };
     }
+
+    // (3) Count-evidence — second-pass eligible (Type-B rescue lane).
     let interaction_hits = count_ui_interaction_hits(&normalized);
     let state_hits = count_ui_state_hits(&normalized);
     let feedback_hits = count_ui_feedback_hits(&normalized);
     if interaction_hits == 0 || state_hits == 0 || feedback_hits == 0 {
-        return Some(format!(
+        let issue = Some(format!(
             "it lacks an interactive vertical slice; expected executable input handling, state, and visible feedback evidence (input={interaction_hits}, state={state_hits}, feedback={feedback_hits})"
         ));
+        // Confirmation eligible: at least one category may still be Some — the
+        // adapter consults `should_request_quality_confirmation` for the final
+        // gate (all_zero → skip, all_strong is impossible here, otherwise call LLM).
+        return QualityFirstPassObservation {
+            issue,
+            interaction_hits,
+            state_hits,
+            feedback_hits,
+            gate: QualityFirstPassGate::ConfirmationEligible,
+        };
     }
+
+    // (4) Strict semantic quality (early fail).
     if profile.requires_strict_semantic_quality(&request_lower) {
         let semantic_hits = count_any(
             &normalized,
@@ -293,18 +397,52 @@ pub(super) fn implementation_quality_issue_for_request(
             ],
         );
         if semantic_hits < 5 {
-            return Some(format!(
-                "it lacks requested semantic business primitives; expected validation, calculation, visualization, persistence, and accessible feedback markers (semantic_hits={semantic_hits})"
-            ));
+            return QualityFirstPassObservation {
+                issue: Some(format!(
+                    "it lacks requested semantic business primitives; expected validation, calculation, visualization, persistence, and accessible feedback markers (semantic_hits={semantic_hits})"
+                )),
+                interaction_hits,
+                state_hits,
+                feedback_hits,
+                gate: QualityFirstPassGate::EarlyFail {
+                    reason: QualityEarlyFailReason::StrictSemantic,
+                },
+            };
         }
     }
+
+    // (5) Low-fidelity game slice (early fail).
     if intent.game_experience && looks_like_low_fidelity_game_slice(&normalized) {
-        return Some(
-            "it is a low-fidelity game slice; expected a real-time render loop with canvas, keyboard input, and visible restart/status feedback"
-                .to_string(),
-        );
+        return QualityFirstPassObservation {
+            issue: Some(
+                "it is a low-fidelity game slice; expected a real-time render loop with canvas, keyboard input, and visible restart/status feedback"
+                    .to_string(),
+            ),
+            interaction_hits,
+            state_hits,
+            feedback_hits,
+            gate: QualityFirstPassGate::EarlyFail {
+                reason: QualityEarlyFailReason::LowFidelityGame,
+            },
+        };
     }
-    None
+
+    // First-pass pass — second-pass eligible (Type-A rescue lane: LLM may
+    // override None → Some if counts look strong but UI is actually static).
+    QualityFirstPassObservation {
+        issue: None,
+        interaction_hits,
+        state_hits,
+        feedback_hits,
+        gate: QualityFirstPassGate::ConfirmationEligible,
+    }
+}
+
+pub(super) fn implementation_quality_issue_for_request(
+    request: &str,
+    content: &str,
+) -> Option<String> {
+    quality_first_pass_observation(request, content).issue
 }
 
 pub(super) fn deterministic_playable_ui_fallback(
@@ -826,6 +964,110 @@ The input CSV must include `Category` and `Amount` columns. Use `--category` and
     ])
 }
 
+pub(super) fn deterministic_fastapi_scaffold_files(
+    request: &str,
+) -> Option<Vec<(PathBuf, String)>> {
+    let lower = request.to_ascii_lowercase();
+    let asks_fastapi = lower.contains("fastapi");
+    let asks_build = lower.contains("create")
+        || lower.contains("build")
+        || lower.contains("develop")
+        || lower.contains("implement")
+        || lower.contains("backend")
+        || request.contains("作成")
+        || request.contains("開発")
+        || request.contains("実装")
+        || request.contains("バックエンド");
+    if !asks_fastapi || !asks_build {
+        return None;
+    }
+
+    Some(vec![
+        (
+            PathBuf::from("pyproject.toml"),
+            r#"[project]
+name = "fastapi-app"
+version = "0.1.0"
+description = "FastAPI application scaffold"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.25",
+    "pytest>=7",
+]
+"#
+            .to_string(),
+        ),
+        (PathBuf::from("app/__init__.py"), String::new()),
+        (
+            PathBuf::from("app/main.py"),
+            r#"from fastapi import FastAPI
+
+
+app = FastAPI(title="FastAPI Application")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("tests/test_health.py"),
+            r#"from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+client = TestClient(app)
+
+
+def test_health():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("README.md"),
+            r#"# FastAPI Application Scaffold
+
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install fastapi "uvicorn[standard]" httpx pytest
+```
+
+## Run
+
+```bash
+uvicorn app.main:app --reload
+```
+
+## API
+
+- `GET /health` returns service status.
+
+## Test
+
+```bash
+pytest
+```
+"#
+            .to_string(),
+        ),
+    ])
+}
+
 fn safe_generated_filename(candidate: &str, required_suffix: &str) -> Option<String> {
     let trimmed = candidate
         .trim()
@@ -922,6 +1164,117 @@ pub(super) fn request_explicitly_requires_tests(request: &str) -> bool {
         || lower.contains("unittest")
         || request.contains("テスト")
         || request.contains("検証")
+}
+
+/// Issue #607: pure text → bool. True when the request reads as a pure
+/// "install dependencies" instruction (e.g. `npm install してください` /
+/// `please install dependencies`) and **does not** also ask for tests, code
+/// edits, or running anything beyond the install step. Used by `success.rs`
+/// to suppress post-loop AutoTest / Tester / NoVerifier dispatch when the
+/// user only asked to install deps (BP-02, BP-03, BP-04a).
+///
+/// Detection strategy (kept lexical, no state / cache, DR1-001):
+///   1. Require at least one install keyword (`install`, `インストール`,
+///      `依存`, etc.) so plain replies like `"please fix bug"` stay false.
+///   2. Reject any token that signals tests, fixes, runs, or build verbs —
+///      these turn the request into setup+verify and should keep the
+///      verifier on.
+///
+/// **CB-002 (Issue #607 review)**: the negation list is split into two
+/// classes:
+///   * `english_verb_tokens` — checked with ASCII word-boundary semantics so
+///     `run.` / `,run` / sentence-final `run` all match (previously the
+///     space-padded substring check only caught ` run ` surrounded by
+///     whitespace).
+///   * `substring_keywords` — checked as raw substrings for Japanese
+///     (`実行`, `動作確認`, …) and for English verb stems that always need
+///     a trailing space anyway (`fix `, `add `, …).
+pub(super) fn request_is_env_setup_only(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    let has_install_keyword = lower.contains("install")
+        || lower.contains("依存")
+        || request.contains("インストール")
+        || request.contains("セットアップ");
+    if !has_install_keyword {
+        return false;
+    }
+    // Tests / verification asks always disqualify setup-only.
+    if request_explicitly_requires_tests(request) {
+        return false;
+    }
+
+    // CB-002: word-boundary aware negation for English verbs.
+    // Matches `verify`, `run`, etc. even when adjacent to ASCII
+    // punctuation or sentence boundaries (`run.`, `,verify`, etc.).
+    const ENGLISH_VERB_TOKENS: &[&str] = &[
+        "run", "start", "build", "lint", "serve", "dev", "deploy", "verify", "validate", "check",
+    ];
+    if contains_ascii_word(&lower, ENGLISH_VERB_TOKENS) {
+        return false;
+    }
+
+    // Substring keywords retain the original semantics: Japanese (no
+    // ASCII boundaries) and English action verbs that always take an
+    // object (`fix `, `add `, …) so the trailing space prevents matching
+    // unrelated words like `fixture`, `additional`, …
+    const SUBSTRING_KEYWORDS: &[&str] = &[
+        "実行",
+        "起動",
+        "ビルド",
+        "修正",
+        "動作確認",
+        "確認",
+        "fix ",
+        "add ",
+        "create ",
+        "write ",
+        "implement ",
+    ];
+    if SUBSTRING_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(kw) || request.contains(kw))
+    {
+        return false;
+    }
+    true
+}
+
+/// CB-002 (Issue #607 review): word-boundary aware ASCII token detection.
+/// A token matches when it appears as a maximal ASCII alphanumeric /
+/// underscore run, regardless of surrounding punctuation / whitespace /
+/// sentence boundaries. Non-ASCII bytes (Japanese, emoji) are treated as
+/// word boundaries — they never match these English tokens and never
+/// merge two ASCII tokens together.
+///
+/// Pure / no allocations beyond the search needles. Caller is responsible
+/// for lowercasing `haystack`; the tokens are matched as-is.
+fn contains_ascii_word(haystack: &str, tokens: &[&str]) -> bool {
+    let bytes = haystack.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Skip non-word bytes (anything not ASCII alphanumeric / _).
+        while i < len && !is_ascii_word_byte(bytes[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < len && is_ascii_word_byte(bytes[i]) {
+            i += 1;
+        }
+        if start == i {
+            continue;
+        }
+        let word = &haystack[start..i];
+        if tokens.contains(&word) {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 pub(super) fn package_json_with_requested_port(
@@ -3425,6 +3778,34 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_fastapi_scaffold_is_framework_only() {
+        let files = deterministic_fastapi_scaffold_files(
+            "FastAPIでCRUD APIを開発してREADMEとテストコードも実装してください。",
+        )
+        .expect("fastapi scaffold files");
+        let paths = files
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"app/main.py".to_string()));
+        assert!(paths.contains(&"tests/test_health.py".to_string()));
+        assert!(paths.contains(&"README.md".to_string()));
+        assert!(paths.contains(&"pyproject.toml".to_string()));
+        let main_py = files
+            .iter()
+            .find(|(path, _)| path == &PathBuf::from("app/main.py"))
+            .map(|(_, content)| content.as_str())
+            .expect("main.py content");
+        assert!(main_py.contains("@app.get(\"/health\")"));
+        assert!(!main_py.contains("ItemCreate"));
+        assert!(!main_py.contains("/items"));
+        assert!(!main_py.contains("Todo"));
+        assert!(!main_py.contains("/todos"));
+        assert!(deterministic_fastapi_scaffold_files("PythonでCSVを集計するCLIを作成").is_none());
+    }
+
+    #[test]
     fn deterministic_python_cli_accepts_safe_project_names() {
         let files = deterministic_empty_python_cli_files_with_names(
             "PythonでCSVを集計するCLIを作成してください。",
@@ -3993,5 +4374,145 @@ export default function App(){
         let nuxt_output =
             package_json_with_requested_port(nuxt_request, nuxt_package).expect("nuxt package");
         assert!(nuxt_output.contains(r#""dev": "nuxt dev -p 3011""#));
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607: request_is_env_setup_only pure helper.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn request_is_env_setup_only_accepts_pure_install_requests() {
+        assert!(request_is_env_setup_only("依存をインストールしてください"));
+        assert!(request_is_env_setup_only("npm install してください"));
+        assert!(request_is_env_setup_only("please install dependencies"));
+        assert!(request_is_env_setup_only("pnpm install"));
+        assert!(request_is_env_setup_only("依存パッケージのセットアップ"));
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_setup_plus_test_requests() {
+        assert!(!request_is_env_setup_only("npm install してから npm test"));
+        assert!(!request_is_env_setup_only("install and test"));
+        assert!(!request_is_env_setup_only(
+            "依存をインストールしてからテストを実行"
+        ));
+        assert!(!request_is_env_setup_only("install deps and run pytest"));
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_non_setup_requests() {
+        assert!(!request_is_env_setup_only("fix bug in login"));
+        assert!(!request_is_env_setup_only("add tests for the auth module"));
+        assert!(!request_is_env_setup_only("write a new feature"));
+    }
+
+    #[test]
+    fn request_is_env_setup_only_independent_of_requires_tests() {
+        let req = "install dependencies";
+        assert!(request_is_env_setup_only(req));
+        assert!(!request_explicitly_requires_tests(req));
+
+        let both_signals = "install and test";
+        assert!(!request_is_env_setup_only(both_signals));
+        assert!(request_explicitly_requires_tests(both_signals));
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #607 (Codex CB-002): word-boundary aware negation. Natural
+    // English requests that combine install with verify / validate /
+    // check / run / start / serve / dev keywords must NOT be classified
+    // as setup-only, even when the keyword is not space-padded (sentence
+    // start, punctuation, contractions).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn request_is_env_setup_only_rejects_install_plus_verify_phrase() {
+        // English verify/validate/check combos.
+        assert!(
+            !request_is_env_setup_only("install dependencies and verify it works"),
+            "verify keyword must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies and validate"),
+            "validate keyword must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies and check it"),
+            "check keyword must disqualify setup-only"
+        );
+        // Sentence-final punctuation (the previous space-padded match
+        // would let this slip through).
+        assert!(
+            !request_is_env_setup_only("please install dependencies and run."),
+            "trailing 'run.' must still disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install deps and run."),
+            "trailing 'run.' must still disqualify setup-only"
+        );
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_japanese_verify_combos() {
+        // 動作確認 / 確認 etc. — natural Japanese combo for setup + verify.
+        assert!(
+            !request_is_env_setup_only("依存をインストールして動作確認"),
+            "動作確認 must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("依存をインストールして確認してください"),
+            "確認 must disqualify setup-only"
+        );
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_install_plus_run_variants() {
+        // Sentence start / sentence end / punctuated variants.
+        assert!(
+            !request_is_env_setup_only("install dependencies, then run npm start"),
+            "comma-separated run must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies; start the dev server"),
+            "semicolon-separated start must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install and serve"),
+            "serve keyword must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install dependencies. dev mode please"),
+            "trailing dev mode must disqualify setup-only"
+        );
+    }
+
+    #[test]
+    fn request_is_env_setup_only_still_accepts_pure_install_after_cb002() {
+        // Regression pin: the CB-002 token-boundary tightening must not
+        // accidentally disqualify natural pure-install phrases. The word
+        // "running" / "served" / "checked" inside dependency descriptions
+        // is not a verify request.
+        assert!(request_is_env_setup_only("please install dependencies"));
+        assert!(request_is_env_setup_only("install the npm dependencies"));
+        assert!(request_is_env_setup_only("依存をインストールしてください"));
+        // "installer" / "installation" must NOT trip the install keyword
+        // either — but those are not asking to install; verify they
+        // still flow through the helper as expected (these contain the
+        // substring "install" so they may be true; the original helper
+        // already accepts them and we are not in scope to change that).
+    }
+
+    #[test]
+    fn request_is_env_setup_only_rejects_verify_the_installation_phrase() {
+        // "verify the installation" combines verify + installation —
+        // user wants a check, not a setup-only install.
+        assert!(
+            !request_is_env_setup_only("verify the installation"),
+            "verify + installation must disqualify setup-only"
+        );
+        assert!(
+            !request_is_env_setup_only("install the package and check installation"),
+            "check + installation must disqualify setup-only"
+        );
     }
 }

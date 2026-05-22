@@ -1226,6 +1226,19 @@ mod tests {
             state_dir_override: None,
             resume: Default::default(),
             footer: enabled,
+            photon_enabled: false,
+            photon_url: "http://127.0.0.1:3030".to_string(),
+            photon_shadow_mode: true,
+            photon_canary: 0,
+            photon_timeout_ms: 200,
+            photon_rollout_min_eval_turns: 100,
+            photon_respect_warnings: true,
+            photon_common_seed_enabled: false,
+            photon_auto_promote: true,
+            photon_no_auto_promote: false,
+            photon_auto_promote_dry_run: true,
+            photon_auto_promote_scrub_mode: "strict".to_string(),
+            experimental_specialized_fallback: false,
         }
     }
 

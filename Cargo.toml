@@ -23,7 +23,7 @@ crossterm = { version = "0.28", default-features = false, features = ["events"] 
 globset = "0.4"
 ignore = "0.4"
 libc = "0.2"
-regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,4 +34,5 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 uuid = { version = "1", default-features = false, features = ["v7", "std"] }
 
 [dev-dependencies]
+mockito = "1"
 tempfile = "3"

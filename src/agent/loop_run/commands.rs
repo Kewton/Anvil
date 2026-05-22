@@ -8,7 +8,7 @@ use super::summary::{ExitReason, format_run_summary};
 use super::*;
 use crate::config::LogLevel;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{PlanStage, TaskProfile, classify_work_mode_json};
+use crate::modes::plan_act::{PlanStage, TaskProfile};
 use crate::ollama::xml_fallback::strip_think_tags;
 use crate::session::precaution::{
     AddPrecautionOutcome, Precaution, PrecautionSource, PrecautionStatus, Severity,
@@ -904,27 +904,16 @@ impl Agent {
             return Ok(None);
         }
 
-        let classification = classify_work_mode_json(input);
-        let work_mode = classification.work_mode;
-        self.session.mode_state.work_mode = work_mode;
-        log_llm_event(
-            "agent.work_mode.classified",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "input": input,
-                "stage": "auto_plan_precheck",
-                "work_mode": classification.work_mode.as_str(),
-                "intent": classification.intent,
-                "confidence": classification.confidence,
-                "ambiguity": classification.ambiguity,
-                "alternative_gap": classification.alternative_gap,
-                "allows_file_edits": classification.allows_file_edits,
-                "requires_tests": classification.requires_tests,
-                "reason": classification.reason,
-                "evidence": &classification.evidence,
-                "alternatives": &classification.alternatives,
-            }),
-        );
+        // Issue #576: classify + second-pass confirmation via the shared
+        // wrapper. `classify_with_confirmation` is the SSoT site for the
+        // existing `agent.work_mode.classified` event emission (now including
+        // `turn_index`), and it also drives the
+        // `agent.work_mode.{confirmed,skipped,fallback}` events via
+        // `maybe_invoke_work_mode_confirm`. After it returns, the final
+        // work_mode (LLM-corrected when applicable) lives in
+        // `self.session.mode_state.work_mode`.
+        let _classification = self.classify_with_confirmation(input, "auto_plan_precheck");
+        let work_mode = self.session.mode_state.work_mode;
         let policy = work_mode.policy();
         if !policy.repo_edit_required {
             self.session.mode_state.task_profile = TaskProfile::Research;
@@ -940,7 +929,10 @@ impl Agent {
             return Ok(None);
         }
 
-        if (policy.allow_python_deterministic_fallback
+        // Issue #634: Python bypass を experimental flag 経由で隔離。
+        // Docs ブランチ (`allow_docs_deterministic_fallback`) は本 Issue では
+        // touch せず、既存挙動を維持 (OR 構造保持)。
+        if (super::policy_allows_python_specialized_fallback(&policy, &self.config)
             && deterministic_empty_python_cli_files(input).is_some()
             && Self::command_workspace_appears_empty(&self.work_root))
             || (policy.allow_docs_deterministic_fallback
@@ -1310,6 +1302,17 @@ impl Agent {
         if input.trim().is_empty() {
             return Ok(AgentEvent::Continue(None));
         }
+
+        // Issue #576 / DR2-002: reset the per-user-input cap for the WorkMode
+        // second-pass confirmation. Reset must happen here (before
+        // `maybe_auto_plan_prompt` and the Plan approval / rejection early
+        // returns) so a Plan-approved-via-`execute_approved_plan` turn does
+        // not inherit a stale `true` from the previous turn (DR3-003).
+        self.work_mode_confirm_called_this_turn = false;
+        // Issue #592: reset the photon user-feedback per-turn cap on the same
+        // boundary. Must run BEFORE Plan-mode early returns so the thumbs/
+        // correct/rule commands are dispatchable even from Plan mode.
+        self.photon_user_feedback_called_this_turn = false;
 
         let trimmed = input.trim();
 
@@ -1774,6 +1777,28 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             }
             "/precautions" => self.handle_precautions_command(rest),
             "/tests" => self.handle_tests_command(rest),
+            // Issue #594: photon seed lineage for the last turn.
+            "/photon-why" => Ok(AgentEvent::Continue(Some(build_photon_why_message(
+                self.last_photon_context_pack_status,
+                &self.last_injected_seed_provenance,
+            )))),
+            // Issue #592: user-explicit photon feedback commands.
+            "/photon-thumbs-up" => {
+                let msg = super::photon_user_feedback::handle_thumbs_up(self)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
+            "/photon-thumbs-down" => {
+                let msg = super::photon_user_feedback::handle_thumbs_down(self)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
+            "/photon-correct" => {
+                let msg = super::photon_user_feedback::handle_correct(self, rest)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
+            "/photon-rule" => {
+                let msg = super::photon_user_feedback::handle_rule(self, rest)?;
+                Ok(AgentEvent::Continue(Some(msg)))
+            }
             "/checkpoint" | "/rollback" | "/watch" | "/autotest" | "/skills" | "/skill"
             | "/mcp" | "/parallel" => Ok(AgentEvent::Continue(Some(format!(
                 "{command} is unavailable in the v0.1.0 core rebuild"
@@ -1784,6 +1809,61 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             )))),
         }
     }
+}
+
+/// Issue #594: format the `/photon-why` slash command response.
+///
+/// Pure function — takes the post-turn lineage state and renders a
+/// user-facing message. Lives at the module level (not on `Agent`) so unit
+/// tests can drive every status variant without constructing a full agent.
+///
+/// As a defensive measure (DR4-001) the final composed string is passed
+/// through `mask_secrets` one more time before being handed back to the REPL,
+/// even though each provenance field has already been sanitized upstream.
+pub fn build_photon_why_message(
+    status: super::PhotonContextPackStatus,
+    provenance: &[crate::photon::provenance::SeedProvenanceSummary],
+) -> String {
+    use super::PhotonContextPackStatus::*;
+    let body = match status {
+        NoTurn => "No photon turn has been executed yet.".to_string(),
+        ShadowMode => "Shadow mode active; provenance not surfaced.".to_string(),
+        CanarySkipped => "Photon disabled (canary=0); no seeds were considered.".to_string(),
+        PlanMode => "Plan mode; photon context not consulted.".to_string(),
+        Failed => "Photon context_pack fetch failed in the last turn.".to_string(),
+        NoInjection => "No seeds were injected in the last turn.".to_string(),
+        Injected => {
+            let n = provenance.len();
+            if n == 0 {
+                // Defensive: the status state machine should keep `Injected`
+                // and an empty vec mutually exclusive (invariant PV-01), but
+                // we still render a non-empty message for the REPL.
+                "No seeds were injected in the last turn.".to_string()
+            } else {
+                let mut out = if n == 1 {
+                    "Last turn injected 1 seed:\n".to_string()
+                } else {
+                    format!("Last turn injected {n} seeds:\n")
+                };
+                for (i, s) in provenance.iter().enumerate() {
+                    let sid = s.summary_id.as_deref().unwrap_or("(no id)");
+                    let tier = s.trust_tier.unwrap_or("unspecified");
+                    let created = s.created_at.as_deref().unwrap_or("(no timestamp)");
+                    out.push_str(&format!(
+                        "  {}. {}\n     source: {} (trust: {}) status: {}\n     created: {}\n",
+                        i + 1,
+                        sid,
+                        s.source,
+                        tier,
+                        s.provenance_status,
+                        created,
+                    ));
+                }
+                out
+            }
+        }
+    };
+    crate::session::feedback::mask_secrets(&body)
 }
 
 fn precautions_usage() -> &'static str {
@@ -1904,18 +1984,66 @@ fn tighten_history_perms(path: &Path) {
     }
 }
 
+/// Issue #634: shared test helper. `test_agent` の Config 差し替え版で、
+/// `experimental_specialized_fallback` / `deterministic_fallback` 等を
+/// テスト側から自由に渡せる。required Config 値 (cwd / requested_model /
+/// ollama_host / state_dir_override) は `test_agent` と同等の SSOT を持ち、
+/// 呼び出し側からは差分のみ与える。
+///
+/// `pub(crate)` + `#[cfg(test)]` 構成で `commands::tests` 以外の
+/// loop_run 配下 test module からも参照できる (例: `turn.rs::tests`)。
+#[cfg(test)]
+pub(crate) fn test_agent_with_config(
+    mut cfg: crate::config::Config,
+) -> (super::Agent, tempfile::TempDir) {
+    use super::FooterHandle;
+    use crate::model_registry::RuntimeModels;
+    use crate::ollama::client::OllamaClient;
+    use crate::session::store::{SessionSnapshot, SessionStore};
+    use tempfile::tempdir;
+
+    let temp = tempdir().unwrap();
+    let state_root = temp.path().join(".anvil-state");
+    let session_id = "0199fe00-0000-7000-8000-000000000454";
+    let workspace_key = "test-workspace";
+    cfg.cwd = temp.path().to_path_buf();
+    if cfg.requested_model.is_none() {
+        cfg.requested_model = Some("test-model".to_string());
+    }
+    if cfg.ollama_host.is_empty() {
+        cfg.ollama_host = "http://127.0.0.1:11434".to_string();
+    }
+    if cfg.state_dir_override.is_none() {
+        cfg.state_dir_override = Some(state_root.clone());
+    }
+    let client = OllamaClient::new(cfg.ollama_host.clone()).unwrap();
+    let session = SessionSnapshot {
+        id: session_id.to_string(),
+        workspace_key: workspace_key.to_string(),
+        ..SessionSnapshot::default()
+    };
+    let agent = super::Agent::new(
+        cfg,
+        RuntimeModels {
+            main: "test-model".to_string(),
+            sidecar: None,
+        },
+        client,
+        SessionStore::new(&state_root, session_id, workspace_key),
+        session,
+        FooterHandle::disabled(),
+    );
+    (agent, temp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::loop_run::FooterHandle;
     use crate::config::Config;
-    use crate::model_registry::RuntimeModels;
     use crate::modes::plan_act::ExecutionMode;
-    use crate::ollama::client::OllamaClient;
-    use crate::session::store::{SessionSnapshot, SessionStore};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
-    use tempfile::{TempDir, tempdir};
+    use tempfile::TempDir;
 
     /// Serialize env-mutating tests within this module so `cargo test`'s
     /// default parallel runner cannot race on `NO_COLOR`.
@@ -1973,36 +2101,10 @@ mod tests {
     }
 
     fn test_agent(yes_mode: bool) -> (Agent, TempDir) {
-        let temp = tempdir().unwrap();
-        let state_root = temp.path().join(".anvil-state");
-        let session_id = "0199fe00-0000-7000-8000-000000000454";
-        let workspace_key = "test-workspace";
-        let config = Config {
-            cwd: temp.path().to_path_buf(),
-            requested_model: Some("test-model".to_string()),
-            ollama_host: "http://127.0.0.1:11434".to_string(),
+        super::test_agent_with_config(Config {
             yes_mode,
-            state_dir_override: Some(state_root.clone()),
             ..Config::default()
-        };
-        let client = OllamaClient::new(config.ollama_host.clone()).unwrap();
-        let session = SessionSnapshot {
-            id: session_id.to_string(),
-            workspace_key: workspace_key.to_string(),
-            ..SessionSnapshot::default()
-        };
-        let agent = Agent::new(
-            config,
-            RuntimeModels {
-                main: "test-model".to_string(),
-                sidecar: None,
-            },
-            client,
-            SessionStore::new(&state_root, session_id, workspace_key),
-            session,
-            FooterHandle::disabled(),
-        );
-        (agent, temp)
+        })
     }
 
     fn continue_message(event: AgentEvent) -> String {
@@ -2024,6 +2126,40 @@ mod tests {
             .session
             .working_memory
             .format_for_prompt_with_precautions(&selected)
+    }
+
+    /// Issue #604 Task 3.2 (DR2-006 / Issue §AP-12 S7-001): a freshly
+    /// constructed `Agent` must initialize `last_auto_promote_outcome` to
+    /// `None`. Task 5.1 will populate it; Task 5.2 will reset it at the
+    /// top of every `handle_user_message`.
+    #[test]
+    fn fresh_agent_has_no_last_auto_promote_outcome() {
+        let (agent, _temp) = test_agent(false);
+        assert!(
+            agent.last_auto_promote_outcome.is_none(),
+            "Agent::new must initialize last_auto_promote_outcome to None"
+        );
+    }
+
+    /// Issue #604 Task 3.2: `last_auto_promote_outcome` is a plain
+    /// `Option<AutoPromoteOutcomeSummary>`; assigning a value preserves
+    /// the 3 SSOT fields verbatim until Task 5.2 resets it.
+    #[test]
+    fn last_auto_promote_outcome_round_trips_a_summary() {
+        use crate::agent::loop_run::auto_promote::AutoPromoteOutcomeSummary;
+        let (mut agent, _temp) = test_agent(false);
+        agent.last_auto_promote_outcome = Some(AutoPromoteOutcomeSummary {
+            decision: "promoted".into(),
+            skip_reason: None,
+            summary_id: Some("anvil-case-fixture".into()),
+        });
+        let read = agent
+            .last_auto_promote_outcome
+            .as_ref()
+            .expect("just set above");
+        assert_eq!(read.decision, "promoted");
+        assert!(read.skip_reason.is_none());
+        assert_eq!(read.summary_id.as_deref(), Some("anvil-case-fixture"));
     }
 
     #[test]

@@ -73,6 +73,32 @@ anvil --fresh-session
 Avoid `--yes` unless you trust the repository and prompt. Review proposed Bash
 commands before approving them. Keep secrets out of prompts and fixture files.
 
+## Photon サイドカーの trust boundary
+
+Photon サイドカーは localhost 専用の外部プロセスとして扱われる。
+
+**Trust boundary**:
+
+context_pack レスポンスから生成されたプロンプトセクションには
+`[Photon External Memory — untrusted, read-only context]` ラベルが付与される。
+Photon が返すデータはモデル出力と同様に untrusted として扱われ、prompt injection 検査パイプラインを通過した上でのみプロンプトに注入される。
+
+**Secret masking**:
+
+context_pack リクエストには `mask_secrets`（トークン・KV・URL 形式のシークレット除去）と `mask_payload_inplace`（ペイロード全体への最終防衛線マスク）が適用される。これはシークレット情報の除去であり匿名化ではない。非シークレットの機微情報（タスク内容、ファイルパス、working memory 等）は送信される可能性がある。
+
+**Localhost constraint**:
+
+`validate_localhost_url` により、`ANVIL_PHOTON_URL` は localhost / 127.0.0.1 / ::1 かつ http/https スキームかつ credentials なしの URL のみ許可される。外部ホストへの送信はできない。
+
+**shadow_mode / canary の役割**:
+
+`ANVIL_PHOTON_SHADOW_MODE` と `ANVIL_PHOTON_CANARY` はプロンプト注入の gate であり、privacy gate ではない。mapper 経路（データ収集用）は shadow_mode=true でも送信を継続する。全送信を停止するには `ANVIL_PHOTON_ENABLED=false` または `--offline` を使用する。
+
+**pre-turn 経路のペイロード**:
+
+pre-turn hook（プロンプト注入用）が送信するペイロードは `session_id` と `turn_index` のみ（minimal）。リッチなコンテキスト（task / working_memory 等）は mapper 経路のみが送信する。
+
 ## Known Limits
 
 - A local model can still suggest unsafe changes or commands.

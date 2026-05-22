@@ -43,6 +43,31 @@ pub fn run(path: &Path, old: &str, new: &str, replace_all: bool) -> Result<Strin
     Ok(format!("edited {}{}", path.display(), suffix))
 }
 
+pub fn apply_exact_once(contents: &str, old: &str, new: &str) -> Result<String, String> {
+    if old.is_empty() {
+        return Err("old_string must not be empty".to_string());
+    }
+    if old == new {
+        return Err("old_string and new_string are identical".to_string());
+    }
+    let count = contents.matches(old).count();
+    if count == 0 {
+        return Err("old_string was not found".to_string());
+    }
+    if count > 1 {
+        return Err("old_string matched more than once".to_string());
+    }
+    Ok(contents.replacen(old, new, 1))
+}
+
+pub fn run_exact_once(path: &Path, old: &str, new: &str) -> Result<String, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let updated = apply_exact_once(&contents, old, new)?;
+    fs::write(path, updated).map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(format!("edited {}", path.display()))
+}
+
 #[derive(Clone, Copy)]
 struct LineSpan<'a> {
     start: usize,
@@ -186,7 +211,7 @@ fn extract_tokens(input: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{apply_exact_once, run, run_exact_once};
     use std::fs;
     use tempfile::tempdir;
 
@@ -197,6 +222,45 @@ mod tests {
         fs::write(&path, "fn main() {}\n").unwrap();
         let err = run(&path, "fn main() {}", "fn main() {}", false).unwrap_err();
         assert!(err.contains("identical"));
+    }
+
+    #[test]
+    fn exact_edit_requires_single_match() {
+        let updated = apply_exact_once("alpha\nbeta\n", "beta", "gamma").unwrap();
+        assert_eq!(updated, "alpha\ngamma\n");
+        assert!(
+            apply_exact_once("alpha\n", "", "gamma")
+                .unwrap_err()
+                .contains("empty")
+        );
+        assert!(
+            apply_exact_once("alpha\n", "missing", "gamma")
+                .unwrap_err()
+                .contains("not found")
+        );
+        assert!(
+            apply_exact_once("alpha\nalpha\n", "alpha", "gamma")
+                .unwrap_err()
+                .contains("more than once")
+        );
+        assert!(
+            apply_exact_once("alpha\n", "alpha", "alpha")
+                .unwrap_err()
+                .contains("identical")
+        );
+    }
+
+    #[test]
+    fn exact_edit_writes_without_fallbacks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        run_exact_once(&path, "println!(\"hello\");", "println!(\"bye\");").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("println!(\"bye\");"));
+        let err = run_exact_once(&path, "fn main() {\nprintln!(\"bye\");\n}", "fn main() {}")
+            .unwrap_err();
+        assert!(err.contains("not found"));
     }
 
     #[test]

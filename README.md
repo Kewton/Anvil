@@ -20,7 +20,7 @@ Ollama 直結の local-first コーディングエージェント。multi-provid
 | --- | --- |
 | Stable | Ollama 直結、Plan / Act、built-in tools、session resume、approval、XML fallback、workspace path guard、localhost host validation |
 | Stable | `sessions list/show/clean`、structured logs、`ANVIL.md` project instruction、WorkMode policy、AutoTest candidate selection |
-| Experimental | Tester Skill、Temporary Test Workspace、Case Memory、AntiPattern、RepoGraph、Verifier/Reminder skill、dataset export |
+| Experimental | Tester Skill、Temporary Test Workspace、Case Memory、AntiPattern、RepoGraph、Verifier/Reminder skill、dataset export、Photon サイドカー連携（context_pack / evaluate）（詳細: [docs/photon-ops.md](docs/photon-ops.md)） |
 | Not implemented | 実 MCP transport、tool-enabled subagent delegation、重い full-screen TUI |
 | Known limitations | live Ollama E2E はモデル・量子化・ローカル toolchain に揺らぐ。Bash は完全 sandbox ではなくユーザー権限で実行される |
 
@@ -290,6 +290,7 @@ workdir 側の `.anvil/logs/` `.anvil/sessions/` `.anvil/plans/` は上記への
 
 `scripts/` 配下のハーネス群で 5-run ベンチマークと集計レポートを生成できる。
 実践的な E2E/UAT の評価設計は `docs/e2e-uat-evaluation.md` にまとめている。
+Photon の cross-lingual 効果を測る場合は `--scenario-set cross_lingual`（日本語/英語ペア 6 シナリオ）と `photon_warning_blocked_count` 列を併用する（詳細: [docs/e2e-uat-evaluation.md](docs/e2e-uat-evaluation.md#cross-lingual-eval-run)）。
 CI / release confidence checks は [docs/ci.md](docs/ci.md) にまとめている。
 Git 管理に含める artifacts の方針は [docs/repository-hygiene.md](docs/repository-hygiene.md) にまとめている。
 

@@ -10,6 +10,7 @@ pub(crate) fn build_system_prompt(
     protocol: ToolProtocol,
     plan_stage: Option<PlanStage>,
     next_sections: &[&str],
+    allowed_tools: Option<&[&str]>,
 ) -> String {
     let tool_call_instruction = if protocol.native_tools_enabled() {
         "IMPORTANT: Never output <think> tags. Use native tool calls exclusively.".to_string()
@@ -19,6 +20,18 @@ pub(crate) fn build_system_prompt(
             protocol.fallback_example()
         )
     };
+    let bash_available = allowed_tools.is_none_or(|tools| tools.contains(&"Bash"));
+    let shell_rule = if bash_available {
+        "5. NEVER tell the user to run a command. YOU run it with Bash."
+    } else {
+        "5. NEVER tell the user to run a command. Bash is not available in this turn; use only the listed tool(s)."
+    };
+    let dependency_rule = if bash_available {
+        "7. Install dependencies BEFORE running: Bash(npm install X) first, THEN Bash(npx X ...)."
+    } else {
+        "7. Do not install dependencies in this restricted turn. Continue only with the listed tool(s)."
+    };
+    let tool_catalog = render_tool_catalog(allowed_tools);
     let mut prompt = format!(
         "You are Anvil, a local-first coding agent. You EXECUTE tasks using tools and explain results clearly.\n\
 {tool_call_instruction}\n\
@@ -28,9 +41,9 @@ CORE RULES:\n\
 2. After a tool result, give a clear, concise summary in 2-3 sentences. No bullet points or numbered lists.\n\
 3. NEVER end with a question like \"何か必要ですか？\" or \"Would you like me to ...?\". Just finish and wait.\n\
 4. NEVER say \"I cannot\" or \"申し訳ありません\" — always try with a tool first.\n\
-5. NEVER tell the user to run a command. YOU run it with Bash.\n\
+{shell_rule}\n\
 6. If a tool fails, diagnose the error and immediately try a different approach. NEVER give up, NEVER ask the user. Only report a failure after 3 different attempts.\n\
-7. Install dependencies BEFORE running: Bash(npm install X) first, THEN Bash(npx X ...).\n\
+{dependency_rule}\n\
 8. Scripts using input()/stdin CANNOT run in Bash (gets EOFError). Write non-interactive versions (HTML/JS, CLI flags) instead.\n\
 9. For GUI or visual apps, prefer HTML/CSS/JS in a browser over desktop toolkits. For Next.js apps, the user-facing UI usually lives in app/page.tsx or src/app/page.tsx; follow the actual repo layout and implement the requested feature there.\n\
 10. NEVER use sudo unless the user explicitly asks.\n\
@@ -47,13 +60,7 @@ CORE RULES:\n\
 WRONG: \"何か特定の操作が必要ですか？\"\n\
 RIGHT: [finish your response, wait silently]\n\
 \n\
-TOOLS:\n\
-- Bash(command): run a shell command in the project directory\n\
-- Read(path[, start_line, end_line]): read a file or list a directory\n\
-- Write(path, content): create or overwrite a file\n\
-- Edit(path, old_string, new_string[, replace_all]): replace exact text in an existing file\n\
-- Glob(pattern): find files by glob pattern\n\
-- Grep(pattern[, glob, case_sensitive]): search repository text\n",
+{tool_catalog}\n",
     );
 
     if mode == ExecutionMode::Plan {
@@ -179,8 +186,124 @@ For research work, gather only the evidence needed, verify key claims, and evalu
     prompt
 }
 
+fn render_tool_catalog(allowed_tools: Option<&[&str]>) -> String {
+    let mut out = String::new();
+    match allowed_tools {
+        Some(tools) => {
+            out.push_str("TOOLS AVAILABLE NOW:\n");
+            if tools.is_empty() {
+                out.push_str("- No tools are available in this turn.\n");
+            } else {
+                for tool in tools {
+                    if let Some(description) = tool_catalog_description(tool) {
+                        out.push_str(description);
+                        out.push('\n');
+                    }
+                }
+            }
+            out.push_str(
+                "Only the tools listed above are available in this turn. Do not call any omitted tool.",
+            );
+        }
+        None => {
+            out.push_str("TOOLS:\n");
+            for tool in ["Bash", "Read", "Write", "Edit", "Glob", "Grep"] {
+                if let Some(description) = tool_catalog_description(tool) {
+                    out.push_str(description);
+                    out.push('\n');
+                }
+            }
+            if out.ends_with('\n') {
+                out.pop();
+            }
+        }
+    }
+    out
+}
+
+fn tool_catalog_description(name: &str) -> Option<&'static str> {
+    match name {
+        "Bash" => Some("- Bash(command): run a shell command in the project directory"),
+        "Read" => Some("- Read(path[, start_line, end_line]): read a file or list a directory"),
+        "Write" => Some("- Write(path, content): create or overwrite a file"),
+        "Edit" => Some(
+            "- Edit(path, old_string, new_string[, replace_all]): replace exact text in an existing file",
+        ),
+        "Glob" => Some("- Glob(pattern): find files by glob pattern"),
+        "Grep" => Some("- Grep(pattern[, glob, case_sensitive]): search repository text"),
+        _ => None,
+    }
+}
+
 fn plan_file_alias(path: &Path) -> String {
     path.file_name()
         .map(|name| format!("plans/{}", name.to_string_lossy()))
         .unwrap_or_else(|| "plans/plan.md".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restricted_tool_catalog_lists_only_allowed_tools() {
+        let prompt = build_system_prompt(
+            ExecutionMode::Act,
+            None,
+            TaskProfile::Generic,
+            ToolProtocol::Native,
+            None,
+            &[],
+            Some(&["Edit"]),
+        );
+
+        assert!(prompt.contains("TOOLS AVAILABLE NOW:"));
+        assert!(prompt.contains("- Edit(path"));
+        assert!(prompt.contains("Only the tools listed above are available"));
+        assert!(prompt.contains("Bash is not available in this turn"));
+        assert!(prompt.contains("Do not install dependencies in this restricted turn"));
+        assert!(!prompt.contains("YOU run it with Bash"));
+        assert!(!prompt.contains("Bash(npm install X)"));
+        assert!(!prompt.contains("- Bash(command)"));
+        assert!(!prompt.contains("- Read(path"));
+        assert!(!prompt.contains("- Write(path"));
+    }
+
+    #[test]
+    fn unrestricted_tool_catalog_preserves_normal_act_tools() {
+        let prompt = build_system_prompt(
+            ExecutionMode::Act,
+            None,
+            TaskProfile::Generic,
+            ToolProtocol::Native,
+            None,
+            &[],
+            None,
+        );
+
+        assert!(prompt.contains("TOOLS:"));
+        assert!(prompt.contains("- Bash(command)"));
+        assert!(prompt.contains("- Read(path"));
+        assert!(prompt.contains("- Write(path"));
+        assert!(prompt.contains("- Edit(path"));
+    }
+
+    #[test]
+    fn plan_prompt_keeps_existing_plan_guidance_when_unrestricted() {
+        let path = Path::new("/tmp/anvil-plan-test/plans/plan.md");
+        let prompt = build_system_prompt(
+            ExecutionMode::Plan,
+            Some(path),
+            TaskProfile::Generic,
+            ToolProtocol::Native,
+            Some(PlanStage::Stage2),
+            &["Goal"],
+            None,
+        );
+
+        assert!(prompt.contains("PLAN MODE:"));
+        assert!(prompt.contains("plans/plan.md"));
+        assert!(prompt.contains("- Bash(command)"));
+        assert!(prompt.contains("Bash is disabled"));
+    }
 }

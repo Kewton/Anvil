@@ -13,6 +13,8 @@ use crate::safety::host_validation::validate_localhost_url;
 /// `EnvFilter` directive that silences DEBUG/TRACE noise from hyper/reqwest/rustls.
 pub const NOISY_CRATES_FILTER: &str = "hyper_util=warn,reqwest=warn,hyper=warn,rustls=warn";
 
+pub const DEFAULT_PHOTON_ROLLOUT_MIN_EVAL_TURNS: u32 = 100;
+
 /// 3-level log verbosity. The `Info < Verbose < Trace` ordering is part of the
 /// public contract (callers use comparisons like `log_level >= Verbose`) and
 /// must not be reordered.
@@ -237,6 +239,71 @@ pub struct Config {
     /// disabled by `--no-footer`, `ANVIL_NO_FOOTER` (non-empty), or
     /// `.anvil/config` `footer=false`. See issue #430 §5.
     pub footer: bool,
+    pub photon_enabled: bool,
+    pub photon_url: String,
+    pub photon_shadow_mode: bool,
+    pub photon_canary: u16,
+    pub photon_timeout_ms: u64,
+    /// Minimum number of shadow-mode evaluate turns required before canary rollout.
+    /// Default: 100. Env: ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS.
+    pub photon_rollout_min_eval_turns: u32,
+    /// Issue #583: whether `context_pack` warnings should be respected to filter
+    /// premature-termination seeds before prompt injection. Default: `true` via
+    /// `Config::load` (the struct's derived `Default` leaves this `false`; the
+    /// production path goes through `Config::load` which fills in `true`).
+    ///
+    /// Issue #589: when enabled, admission_reason-handled IDs are subtracted
+    /// from the block set. No new env/config flag is added; the existing
+    /// `photon_respect_warnings` gate governs the entire two-stage pipeline.
+    pub photon_respect_warnings: bool,
+    /// Issue #592: when `true`, `/photon-rule` persists a `PhotonSeedDraft` and
+    /// ships it to the photon sidecar as a rule-promotion seed (i.e. potentially
+    /// adopted into the common photon corpus). When `false` (default), the
+    /// command runs as a dry-run that only records the rule locally without
+    /// hitting `/v1/evaluate`. Env: `ANVIL_PHOTON_COMMON_SEED`. Config file key:
+    /// `photon_common_seed_enabled`.
+    pub photon_common_seed_enabled: bool,
+    /// Issue #604 (AP-07): post-loop photon auto-promote hook 機能フラグ。
+    /// Default: `true`。env: `ANVIL_PHOTON_AUTO_PROMOTE`、config key:
+    /// `photon_auto_promote`。Phase 1 rollout 中は本フラグだけでなく
+    /// `photon_auto_promote_dry_run=true` で HTTP skip するため、本フラグ
+    /// `true` 単独では実際の photon 投入は走らない。
+    pub photon_auto_promote: bool,
+    /// Issue #604 (AP-07): 緊急 disable kill-switch。`true` の場合
+    /// `photon_auto_promote` の値に関わらず hook を強制 disable する
+    /// (`AutoPromoteSkipReason::Disabled { sub_reason: None }`)。Default:
+    /// `false`。env: `ANVIL_PHOTON_NO_AUTO_PROMOTE` (POSIX `NO_COLOR` 慣例:
+    /// 非空値で disable)、config key: `photon_no_auto_promote`。
+    pub photon_no_auto_promote: bool,
+    /// Issue #604 (AP-07 / DR-AP-5): Phase 1 rollout 中の HTTP skip フラグ。
+    /// Default: **`true`** (Phase 1 dry-run period)。`true` の場合
+    /// eligibility 判定を通過しても photon `/v1/summary/upsert` POST を
+    /// skip し、`agent.photon_auto_promote.skipped {reason: dry_run}` event
+    /// だけ emit する (per-turn cap は立てる / S7-004 #3)。env:
+    /// `ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN`、config key:
+    /// `photon_auto_promote_dry_run`。
+    pub photon_auto_promote_dry_run: bool,
+    /// Issue #604 (AP-07 / DR1-015): scrub mode の **文字列保持**。
+    /// config 層は session 層 `ScrubMode` enum を import せず、生文字列で
+    /// 保持する (既存 photon 系 primitive 流儀)。Default: `"strict"`
+    /// (= `DEFAULT_SCRUB_MODE`)。`"warn"` を許容、それ以外は agent 層 hook
+    /// 内で `ScrubMode::from_env_str_or_default` を通したときに warn log を
+    /// 出して `Strict` にフォールバックする (DR1-016)。env:
+    /// `ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE`、config key:
+    /// `photon_auto_promote_scrub_mode`。
+    pub photon_auto_promote_scrub_mode: String,
+    /// Issue #634: 特化 fallback (FastAPI scaffold / Python CSV / FizzBuzz /
+    /// 固定 arithmetic patch / qwen3.5 固有 deterministic edit) の experimental
+    /// gate。Default: `false`。env: `ANVIL_EXPERIMENTAL_SPECIALIZED_FALLBACK`、
+    /// config key: `experimental_specialized_fallback`、CLI:
+    /// `--experimental-specialized-fallback`。
+    ///
+    /// `DeterministicFallbackMode::FullTemplate` の意味は変えない。
+    /// template 系特化 fallback は本 flag と `FullTemplate` の AND 条件で発火
+    /// (`specialized_template_fallback_enabled()` 参照)。
+    /// edit 系 (arithmetic patch) は本 flag のみで gate
+    /// (`specialized_fallback_enabled()` 参照)。
+    pub experimental_specialized_fallback: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -260,9 +327,55 @@ pub struct PartialConfig {
     /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
     /// `None` means "no opinion" so default (`true`) wins.
     pub footer: Option<bool>,
+    pub photon_enabled: Option<bool>,
+    pub photon_url: Option<String>,
+    pub photon_shadow_mode: Option<bool>,
+    pub photon_canary: Option<u16>,
+    pub photon_timeout_ms: Option<u64>,
+    pub photon_rollout_min_eval_turns: Option<u32>,
+    /// Issue #583: optional override for the warning filter (None = use default).
+    pub photon_respect_warnings: Option<bool>,
+    /// Issue #592: optional override for the common-seed (photon-rule) gate
+    /// (None = use default `false`).
+    pub photon_common_seed_enabled: Option<bool>,
+    /// Issue #604: optional override for the auto-promote hook feature flag
+    /// (None = use default `true`).
+    pub photon_auto_promote: Option<bool>,
+    /// Issue #604: optional override for the emergency kill-switch
+    /// (None = use default `false`).
+    pub photon_no_auto_promote: Option<bool>,
+    /// Issue #604: optional override for the dry-run gate
+    /// (None = use default `true` — Phase 1 rollout).
+    pub photon_auto_promote_dry_run: Option<bool>,
+    /// Issue #604: optional override for the scrub mode string
+    /// (None = use default `"strict"`). Unknown strings are accepted at this
+    /// layer and validated only when the agent layer constructs `ScrubMode`
+    /// (DR1-015 / DR1-016).
+    pub photon_auto_promote_scrub_mode: Option<String>,
+    /// Issue #634: optional override for the experimental specialized fallback
+    /// gate (None = use default `false`).
+    pub experimental_specialized_fallback: Option<bool>,
 }
 
 impl Config {
+    /// Issue #634: experimental flag そのもの。edit 系特化 fallback
+    /// (固定 arithmetic patch 等) の gate に使う。call site で必要に応じて
+    /// `MinimalPatch` 以上か等の追加判定と AND する。本メソッドは agent 層
+    /// (`src/agent/loop_run/*`) のみが参照する想定 (DR3-002)。
+    pub fn specialized_fallback_enabled(&self) -> bool {
+        self.experimental_specialized_fallback
+    }
+
+    /// Issue #634: template 系特化 fallback (FastAPI / Python CLI / FizzBuzz
+    /// scaffold) が発火可能か。`experimental_specialized_fallback=true` かつ
+    /// `DeterministicFallbackMode::FullTemplate` の AND 条件で true。
+    /// `FullTemplate` の意味は変えず (後方互換)、本 flag を ON にしない限り
+    /// production 完了 path には反映されない。
+    pub fn specialized_template_fallback_enabled(&self) -> bool {
+        self.experimental_specialized_fallback
+            && self.deterministic_fallback.allows_template_completion()
+    }
+
     pub fn load(args: CliArgs) -> Result<(Self, Vec<String>), String> {
         let cwd = match args.cwd.clone() {
             Some(path) => path,
@@ -295,13 +408,40 @@ impl Config {
             // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
             // omission emits None so file/env/default can still apply.
             footer: args.no_footer.then_some(false),
+            // photon settings are not configurable via CLI flags in A1
+            photon_enabled: None,
+            photon_url: None,
+            photon_shadow_mode: None,
+            photon_canary: None,
+            photon_timeout_ms: None,
+            photon_rollout_min_eval_turns: None,
+            photon_respect_warnings: None,
+            photon_common_seed_enabled: None,
+            // Issue #604: auto-promote hook env-only (no CLI flags).
+            photon_auto_promote: None,
+            photon_no_auto_promote: None,
+            photon_auto_promote_dry_run: None,
+            photon_auto_promote_scrub_mode: None,
+            // Issue #634: CLI flag for the experimental specialized fallback gate.
+            experimental_specialized_fallback: args.experimental_specialized_fallback,
         };
         let merged = merge_partial_configs(&[file_config, env_config, cli_config]);
         let ollama_host = validate_localhost_url(
             merged
                 .ollama_host
                 .unwrap_or_else(|| "http://127.0.0.1:11434".to_string()),
+            "ollama host",
         )?;
+        let photon_url_raw = merged
+            .photon_url
+            .unwrap_or_else(|| "http://127.0.0.1:3030".to_string());
+        let photon_url = validate_localhost_url(photon_url_raw, "photon_url")?;
+
+        let offline = merged.offline.unwrap_or(false);
+        if offline && merged.photon_enabled.unwrap_or(false) {
+            warnings.push("photon_enabled is forced false because offline=true".to_string());
+        }
+        let photon_enabled = !offline && merged.photon_enabled.unwrap_or(false);
 
         let config = Self {
             cwd,
@@ -318,13 +458,49 @@ impl Config {
             fresh_session: merged.fresh_session.unwrap_or(false),
             oneshot: args.oneshot || args.prompt.is_some(),
             auto_plan: merged.auto_plan.unwrap_or(false),
-            offline: merged.offline.unwrap_or(false),
+            offline,
             deterministic_fallback: merged.deterministic_fallback.unwrap_or_default(),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
             // Default true; any disable signal (file/env/CLI) lands as Some(false).
             footer: merged.footer.unwrap_or(true),
+            photon_enabled,
+            photon_url,
+            photon_shadow_mode: merged.photon_shadow_mode.unwrap_or(true),
+            photon_canary: merged.photon_canary.unwrap_or(0),
+            photon_timeout_ms: merged.photon_timeout_ms.unwrap_or(200),
+            photon_rollout_min_eval_turns: merged.photon_rollout_min_eval_turns.unwrap_or(100),
+            // Default true (Issue #583); explicit Some(false) from env/file
+            // disables the warning filter (escape hatch for canary rollback).
+            photon_respect_warnings: merged.photon_respect_warnings.unwrap_or(true),
+            // Default false (Issue #592); explicit Some(true) from env/file
+            // enables shipping `/photon-rule` drafts to the sidecar evaluate.
+            photon_common_seed_enabled: merged.photon_common_seed_enabled.unwrap_or(false),
+            // Issue #604 (AP-07): post-loop auto-promote hook. Default true:
+            // the feature is on, but Phase 1 rollout still relies on
+            // `photon_auto_promote_dry_run=true` for HTTP skip.
+            photon_auto_promote: merged.photon_auto_promote.unwrap_or(true),
+            // Issue #604 (AP-07): emergency kill-switch. Default false; any
+            // non-empty `ANVIL_PHOTON_NO_AUTO_PROMOTE` sets Some(true) via
+            // `load_env_config` so the disable wins.
+            photon_no_auto_promote: merged.photon_no_auto_promote.unwrap_or(false),
+            // Issue #604 (AP-07 / DR-AP-5): Phase 1 rollout default = true
+            // (dry-run / HTTP skip). Switching to false enables real photon
+            // upserts (deferred to a later rollout phase / separate issue).
+            photon_auto_promote_dry_run: merged.photon_auto_promote_dry_run.unwrap_or(true),
+            // Issue #604 (AP-07 / DR1-015 / DR1-018): default `"strict"`
+            // matches `DEFAULT_SCRUB_MODE` (Strict). Unknown strings fall
+            // back to Strict with a `tracing::warn!` in the agent layer when
+            // `ScrubMode::from_env_str_or_default` is invoked.
+            photon_auto_promote_scrub_mode: merged
+                .photon_auto_promote_scrub_mode
+                .unwrap_or_else(|| "strict".to_string()),
+            // Issue #634: default false. Production builds keep specialized
+            // fallback paths gated unless the operator explicitly opts in.
+            experimental_specialized_fallback: merged
+                .experimental_specialized_fallback
+                .unwrap_or(false),
         };
         Ok((config, warnings))
     }
@@ -381,6 +557,45 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.footer.is_some() {
             merged.footer = config.footer;
         }
+        if config.photon_enabled.is_some() {
+            merged.photon_enabled = config.photon_enabled;
+        }
+        if config.photon_url.is_some() {
+            merged.photon_url = config.photon_url.clone();
+        }
+        if config.photon_shadow_mode.is_some() {
+            merged.photon_shadow_mode = config.photon_shadow_mode;
+        }
+        if config.photon_canary.is_some() {
+            merged.photon_canary = config.photon_canary;
+        }
+        if config.photon_timeout_ms.is_some() {
+            merged.photon_timeout_ms = config.photon_timeout_ms;
+        }
+        if config.photon_rollout_min_eval_turns.is_some() {
+            merged.photon_rollout_min_eval_turns = config.photon_rollout_min_eval_turns;
+        }
+        if config.photon_respect_warnings.is_some() {
+            merged.photon_respect_warnings = config.photon_respect_warnings;
+        }
+        if config.photon_common_seed_enabled.is_some() {
+            merged.photon_common_seed_enabled = config.photon_common_seed_enabled;
+        }
+        if config.photon_auto_promote.is_some() {
+            merged.photon_auto_promote = config.photon_auto_promote;
+        }
+        if config.photon_no_auto_promote.is_some() {
+            merged.photon_no_auto_promote = config.photon_no_auto_promote;
+        }
+        if config.photon_auto_promote_dry_run.is_some() {
+            merged.photon_auto_promote_dry_run = config.photon_auto_promote_dry_run;
+        }
+        if config.photon_auto_promote_scrub_mode.is_some() {
+            merged.photon_auto_promote_scrub_mode = config.photon_auto_promote_scrub_mode.clone();
+        }
+        if config.experimental_specialized_fallback.is_some() {
+            merged.experimental_specialized_fallback = config.experimental_specialized_fallback;
+        }
     }
     merged
 }
@@ -434,6 +649,38 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
             .get("footer")
             .and_then(|value| parse_bool(value))
             .and_then(|enabled| (!enabled).then_some(false)),
+        photon_enabled: map.get("photon_enabled").and_then(|v| parse_bool(v)),
+        // photon_url empty string is skipped by parse_key_value_config, so None means unset
+        photon_url: map.get("photon_url").cloned(),
+        photon_shadow_mode: map.get("photon_shadow_mode").and_then(|v| parse_bool(v)),
+        photon_canary: map
+            .get("photon_canary")
+            .and_then(|v| parse_photon_canary(v, warnings)),
+        photon_timeout_ms: map
+            .get("photon_timeout_ms")
+            .and_then(|v| parse_photon_timeout_ms(v, warnings)),
+        photon_rollout_min_eval_turns: map
+            .get("photon_rollout_min_eval_turns")
+            .and_then(|v| parse_photon_rollout_min_eval_turns(v, warnings)),
+        photon_respect_warnings: map
+            .get("photon_respect_warnings")
+            .and_then(|v| parse_bool(v)),
+        photon_common_seed_enabled: map
+            .get("photon_common_seed_enabled")
+            .and_then(|v| parse_bool(v)),
+        // Issue #604 auto-promote config keys.
+        photon_auto_promote: map.get("photon_auto_promote").and_then(|v| parse_bool(v)),
+        photon_no_auto_promote: map
+            .get("photon_no_auto_promote")
+            .and_then(|v| parse_bool(v)),
+        photon_auto_promote_dry_run: map
+            .get("photon_auto_promote_dry_run")
+            .and_then(|v| parse_bool(v)),
+        photon_auto_promote_scrub_mode: map.get("photon_auto_promote_scrub_mode").cloned(),
+        // Issue #634: experimental specialized fallback opt-in.
+        experimental_specialized_fallback: map
+            .get("experimental_specialized_fallback")
+            .and_then(|v| parse_bool(v)),
     })
 }
 
@@ -490,6 +737,83 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         footer: env::var("ANVIL_NO_FOOTER")
             .ok()
             .and_then(|value| (!value.is_empty()).then_some(false)),
+        photon_enabled: env::var("ANVIL_PHOTON_ENABLED")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_url: env::var("ANVIL_PHOTON_URL").ok(),
+        photon_shadow_mode: env::var("ANVIL_PHOTON_SHADOW_MODE")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_canary: env::var("ANVIL_PHOTON_CANARY")
+            .ok()
+            .and_then(|v| parse_photon_canary(&v, warnings)),
+        photon_timeout_ms: env::var("ANVIL_PHOTON_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| parse_photon_timeout_ms(&v, warnings)),
+        photon_rollout_min_eval_turns: env::var("ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS")
+            .ok()
+            .and_then(|v| parse_photon_rollout_min_eval_turns(&v, warnings)),
+        photon_respect_warnings: env::var("ANVIL_PHOTON_RESPECT_WARNINGS")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_common_seed_enabled: env::var("ANVIL_PHOTON_COMMON_SEED")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        // Issue #604 (AP-07) auto-promote env knobs.
+        photon_auto_promote: env::var("ANVIL_PHOTON_AUTO_PROMOTE")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        // POSIX `NO_COLOR` convention: any non-empty value disables; matches
+        // `ANVIL_NO_FOOTER` / `ANVIL_NO_SPINNER` / `ANVIL_NO_INTERRUPT`.
+        photon_no_auto_promote: env::var("ANVIL_PHOTON_NO_AUTO_PROMOTE")
+            .ok()
+            .and_then(|v| (!v.is_empty()).then_some(true)),
+        photon_auto_promote_dry_run: env::var("ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
+        photon_auto_promote_scrub_mode: env::var("ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE")
+            .ok()
+            .filter(|v| !v.trim().is_empty()),
+        // Issue #634: experimental specialized fallback opt-in.
+        experimental_specialized_fallback: env::var("ANVIL_EXPERIMENTAL_SPECIALIZED_FALLBACK")
+            .ok()
+            .and_then(|value| parse_bool(&value)),
+    }
+}
+
+fn parse_photon_canary(s: &str, warnings: &mut Vec<String>) -> Option<u16> {
+    match s.trim().parse::<u16>() {
+        Ok(n) if n <= 1000 => Some(n),
+        _ => {
+            warnings.push(format!(
+                "invalid ANVIL_PHOTON_CANARY={s}, must be 0-1000, using default (0)"
+            ));
+            None
+        }
+    }
+}
+
+fn parse_photon_timeout_ms(s: &str, warnings: &mut Vec<String>) -> Option<u64> {
+    match s.trim().parse::<u64>() {
+        Ok(n) if (1..=60_000).contains(&n) => Some(n),
+        _ => {
+            warnings.push(format!(
+                "invalid ANVIL_PHOTON_TIMEOUT_MS={s}, must be 1-60000, using default (200)"
+            ));
+            None
+        }
+    }
+}
+
+fn parse_photon_rollout_min_eval_turns(s: &str, warnings: &mut Vec<String>) -> Option<u32> {
+    match s.trim().parse::<u32>() {
+        Ok(n) if (1..=10_000).contains(&n) => Some(n),
+        _ => {
+            warnings.push(format!(
+                "invalid photon_rollout_min_eval_turns={s}, must be 1-10000, using default ({DEFAULT_PHOTON_ROLLOUT_MIN_EVAL_TURNS})"
+            ));
+            None
+        }
     }
 }
 
@@ -526,4 +850,21 @@ pub fn parse_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Resolve `photon_rollout_min_eval_turns` without running full `Config::load`.
+/// Priority: env > .anvil/config > default (100).
+pub fn resolve_photon_rollout_min_eval_turns(
+    workspace_root: &Path,
+    warnings: &mut Vec<String>,
+) -> u32 {
+    let file_val = load_config_file(&workspace_root.join(".anvil").join("config"), warnings)
+        .unwrap_or_default()
+        .photon_rollout_min_eval_turns;
+    let env_val = env::var("ANVIL_PHOTON_ROLLOUT_MIN_EVAL_TURNS")
+        .ok()
+        .and_then(|v| parse_photon_rollout_min_eval_turns(&v, warnings));
+    env_val
+        .or(file_val)
+        .unwrap_or(DEFAULT_PHOTON_ROLLOUT_MIN_EVAL_TURNS)
 }

@@ -16,6 +16,7 @@ Anvil は Ollama 前提の local-first coding agent。
 - AutoTest / Tester / temporary test workspace
 - RepoGraph / Case Memory / AntiPattern
 - structured eval log
+- Photon サイドカー連携（context_pack / evaluate / shadow mode / canary）
 
 ## Non-Goals For This Rewrite
 

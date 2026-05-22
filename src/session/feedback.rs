@@ -75,6 +75,33 @@ impl FeedbackKind {
                 | NoToolCall
         )
     }
+
+    /// Issue #579 / DR2-001: snake-case tag string SSoT for this kind. The
+    /// match here mirrors `#[serde(rename_all = "snake_case")]` exactly so
+    /// callers (e.g. `feedback_kind_confirm` adapter) can embed the tag into
+    /// prompts / log payloads without round-tripping through `serde_json`.
+    /// `feedback_kind_as_str_matches_serde_tag` pins parity across all 17
+    /// variants.
+    pub fn as_str(&self) -> &'static str {
+        use FeedbackKind::*;
+        match self {
+            BuildPass => "build_pass",
+            TestPass => "test_pass",
+            CompileError => "compile_error",
+            TestFailure => "test_failure",
+            TypeError => "type_error",
+            LintFailure => "lint_failure",
+            Timeout => "timeout",
+            ToolProtocolFailure => "tool_protocol_failure",
+            EditFailure => "edit_failure",
+            NoRepoProgress => "no_repo_progress",
+            UnsafeCommandBlocked => "unsafe_command_blocked",
+            NoVerifierAvailable => "no_verifier_available",
+            NoToolCall => "no_tool_call",
+            SkillPermissionDenied => "skill_permission_denied",
+            UnknownFailure => "unknown_failure",
+        }
+    }
 }
 
 /// Sealed runtime feedback record. Text fields (`command` / `stdout_excerpt`
@@ -235,6 +262,100 @@ pub fn mask_secrets(input: &str) -> String {
     });
     let s3 = url_credential_regex().replace_all(&s2, "$1***:***@");
     s3.into_owned()
+}
+
+/// Issue #608 Phase α-2 (CB-001): mask HTTP header-family credential lines
+/// (`Authorization: Bearer …`, `Cookie: …`, `X-API-Key: …`, `X-Auth-Token:
+/// …`) inside arbitrary text. This is intentionally a thin wrapper around
+/// [`auth_header_regex`] WITHOUT the 4096-byte cap that
+/// `redact_verifier_command_for_storage` applies — it is meant for text
+/// bodies (test output / failed test names) where length-capping is the
+/// caller's responsibility.
+///
+/// Header lines are rewritten to `Header: <REDACTED>`. The header *name*
+/// is preserved so log readers still see why a redaction happened.
+///
+/// Pure / safe to call on any UTF-8 string. Stack with [`mask_secrets`]
+/// for full coverage: `mask_header_family(mask_secrets(s))`.
+pub fn mask_header_family(input: &str) -> String {
+    auth_header_regex()
+        .replace_all(input, "$1: <REDACTED>")
+        .into_owned()
+}
+
+// --- Issue #608 (Phase α-2 / DR4-002 SSOT): verifier command redactor -------
+
+/// Issue #608 Phase α-2 (design 設計判断 #7): SSOT redactor for verifier
+/// command strings stored in `SessionSnapshot.last_verifier_command` /
+/// `VerifierInvocationRecord.command`, and the in-process
+/// `CompletionEvidence::VerifierExitZero.command` (via the agent layer
+/// `completion_evidence::redact_verifier_command_for_storage` wrapper which
+/// delegates to this function).
+///
+/// Pipeline (design 設計判断 #7):
+///   1. [`mask_secrets`] — token-prefix / kv / URL-userinfo redaction.
+///   2. Authorization / Cookie / X-API-Key header family redaction —
+///      `Authorization: Bearer ...` → `Authorization: <REDACTED>` so the
+///      credential tail is removed even when it doesn't look like one of
+///      the `kv_secret_regex` keywords.
+///   3. Control-char neutralization — ASCII `\x00..=\x1f` plus DEL (`\x7f`)
+///      get collapsed to a single space so an embedded `\n` / `\r` / `\t`
+///      can't break log lines or hide trailing operators in display.
+///   4. UTF-8 safe 4096-byte cap (design 設計判断 #7 / Stage 4 DiD). A
+///      capped command is still stored for audit / display, but the
+///      caller's `runnable_eligibility_guard` (turn.rs) rejects cap-hit
+///      commands as runnable hints.
+///
+/// Pure / safe to call on any UTF-8 string. All save / field-level
+/// deserialize / direct-deserialize / prompt-injection sites that touch
+/// `last_verifier_command` MUST funnel through this function.
+pub fn redact_verifier_command_for_storage(cmd: &str) -> String {
+    // Steps 1+2: mask_secrets then auth header family (delegated to
+    // [`mask_header_family`] SSOT — no duplicate regex).
+    let s2 = mask_header_family(&mask_secrets(cmd));
+    // Step 3: control-char neutralization (ASCII C0 + DEL → space).
+    let s3: String = s2
+        .chars()
+        .map(|c| {
+            if (c as u32) < 0x20 || c == '\x7f' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Step 4: UTF-8 safe 4096-byte cap.
+    cap_to_4096_bytes_utf8_safe(&s3)
+}
+
+/// Maximum byte length of a redacted verifier command (Stage 4 / DiD).
+pub const MAX_VERIFIER_COMMAND_BYTES: usize = 4096;
+
+/// UTF-8 safe cap to [`MAX_VERIFIER_COMMAND_BYTES`] bytes.
+fn cap_to_4096_bytes_utf8_safe(s: &str) -> String {
+    if s.len() <= MAX_VERIFIER_COMMAND_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_VERIFIER_COMMAND_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Auth header family regex (Authorization / Cookie / X-API-Key /
+/// X-Auth-Token). Mirrors the agent-layer regex in `completion_evidence.rs`;
+/// kept here as part of the session-layer SSOT so the agent helper can become
+/// a thin wrapper. The `regex` crate is built without `unicode-case`, so
+/// ASCII case is spelled explicitly.
+fn auth_header_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk][Ii][Ee]|[Xx]-[Aa][Pp][Ii]-[Kk][Ee][Yy]|[Xx]-[Aa][Uu][Tt][Hh]-[Tt][Oo][Kk][Ee][Nn])\s*[:=]\s*[^'"\n\r]+"#,
+        )
+        .expect("valid static auth header regex")
+    })
 }
 
 // --- Excerpt truncation ---------------------------------------------------
@@ -473,6 +594,44 @@ mod tests {
     fn unknown_feedback_kind_deserializes_as_unknown_failure() {
         let kind: FeedbackKind = serde_json::from_str("\"future_unseen_kind\"").unwrap();
         assert_eq!(kind, FeedbackKind::UnknownFailure);
+    }
+
+    /// Issue #579 / DR2-001: `FeedbackKind::as_str()` returns the same
+    /// snake_case tag that serde emits for every variant. Pins parity so
+    /// the adapter layer (`feedback_kind_confirm`) can rely on `as_str()`
+    /// for prompt embedding and log payloads without round-tripping through
+    /// `serde_json`.
+    #[test]
+    fn feedback_kind_as_str_matches_serde_tag() {
+        use FeedbackKind::*;
+        let all = [
+            BuildPass,
+            TestPass,
+            CompileError,
+            TestFailure,
+            TypeError,
+            LintFailure,
+            Timeout,
+            ToolProtocolFailure,
+            EditFailure,
+            NoRepoProgress,
+            UnsafeCommandBlocked,
+            NoVerifierAvailable,
+            NoToolCall,
+            SkillPermissionDenied,
+            UnknownFailure,
+        ];
+        for k in &all {
+            let serde_tag = serde_json::to_value(k).unwrap();
+            let serde_str = serde_tag
+                .as_str()
+                .unwrap_or_else(|| panic!("variant {k:?} did not serialise as string"));
+            assert_eq!(
+                k.as_str(),
+                serde_str,
+                "as_str() vs serde tag mismatch for {k:?}",
+            );
+        }
     }
 
     /// Issue #455 / D1: NoToolCall serializes to snake_case "no_tool_call".
@@ -946,5 +1105,36 @@ mod tests {
         };
         let dir = tempdir().unwrap();
         let _frame = build_feedback_frame(draft, dir.path());
+    }
+
+    // --- Issue #608 Phase α-2 (DR4-002 SSOT): verifier command redactor ----
+
+    /// Pins the session-layer SSOT redactor: mask_secrets + auth header +
+    /// control-char neutralization + UTF-8 safe 4096-byte cap.
+    #[test]
+    fn redact_verifier_command_for_storage_runs_full_pipeline() {
+        let out = redact_verifier_command_for_storage(
+            "cargo test --env api_key=ghp_supersecretvalueABCDEFGHIJKLMNOP\necho bad",
+        );
+        // mask_secrets handled the kv path.
+        assert!(out.contains("api_key=***"));
+        // Control-char neutralization: newline → space.
+        assert!(!out.contains('\n'));
+    }
+
+    #[test]
+    fn redact_verifier_command_for_storage_redacts_auth_header() {
+        let out = redact_verifier_command_for_storage(
+            "curl -H 'Authorization: Bearer abc123def456' http://x",
+        );
+        assert!(!out.contains("abc123def456"));
+        assert!(out.contains("Authorization") && out.contains("<REDACTED>"));
+    }
+
+    #[test]
+    fn redact_verifier_command_for_storage_caps_at_4096_bytes() {
+        let huge = "a".repeat(MAX_VERIFIER_COMMAND_BYTES + 100);
+        let out = redact_verifier_command_for_storage(&huge);
+        assert!(out.len() <= MAX_VERIFIER_COMMAND_BYTES);
     }
 }

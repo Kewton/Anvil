@@ -48,6 +48,12 @@ pub struct CliArgs {
     /// legacy full template recovery. `support-only` and `full` remain aliases.
     #[arg(long = "deterministic-fallback", value_enum)]
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    /// Issue #634: experimental opt-in for specialized fallback paths
+    /// (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch /
+    /// qwen3.5 固有 deterministic edit). Default off. Template 系は
+    /// `--deterministic-fallback full-template` との AND 条件で発火。
+    #[arg(long = "experimental-specialized-fallback")]
+    pub experimental_specialized_fallback: Option<bool>,
     /// Disable the fixed footer status bar (mode / token usage / log level).
     #[arg(long = "no-footer")]
     pub no_footer: bool,
@@ -132,6 +138,39 @@ pub enum SessionsAction {
         /// Export a specific session by id.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+    },
+    /// Check Photon rollout readiness conditions (Issue #561).
+    PhotonRolloutCheck {},
+    /// Promote successful CaseRecord entries to photon seed format
+    /// (Issue #593, Phase A — manual CLI + dry-run + JSONL local output).
+    /// Exactly one of --session / --case-id / --all is required. --session
+    /// is currently UNSUPPORTED in Phase A (CaseRecord does not carry the
+    /// originating session id on disk).
+    PhotonPromote {
+        /// (Phase A: UNSUPPORTED, returns error). Reserved for Phase B
+        /// where CaseRecord will carry the originating session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Promote a single case by id.
+        #[arg(long = "case-id")]
+        case_id: Option<String>,
+        /// Promote every successful CaseRecord in this workspace
+        /// (explicit opt-in; required when neither --session nor
+        /// --case-id is given).
+        #[arg(long)]
+        all: bool,
+        /// Show what would be promoted without writing log or output file.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Confirm promotion (required for non-dry-run mode).
+        #[arg(long)]
+        yes: bool,
+        /// Print the full ActionSummary JSON for the matched case(s).
+        #[arg(long = "print-summary")]
+        print_summary: bool,
+        /// Write JSONL output to FILE (0600 perm, new file only).
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -248,6 +287,7 @@ mod tests {
             auto_plan: false,
             offline: false,
             deterministic_fallback: None,
+            experimental_specialized_fallback: None,
             no_footer: false,
             resume: None,
             cwd: None,

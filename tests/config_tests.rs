@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
+use anvil::cli::CliArgs;
 use anvil::config::{
-    DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
+    Config, DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
     merge_partial_configs, parse_key_value_config,
 };
 
@@ -141,6 +142,46 @@ fn merge_deterministic_fallback_prefers_later_sources() {
     assert_eq!(
         merged.deterministic_fallback,
         Some(DeterministicFallbackMode::Off)
+    );
+}
+
+/// Issue #634: merge precedence for the experimental specialized fallback flag.
+/// CLI (last source) wins; absent sources don't clobber explicit values.
+#[test]
+fn merge_experimental_specialized_fallback_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            experimental_specialized_fallback: Some(false),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            experimental_specialized_fallback: Some(true),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.experimental_specialized_fallback, Some(true));
+
+    // Absent later sources don't clobber.
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            experimental_specialized_fallback: Some(true),
+            ..PartialConfig::default()
+        },
+        PartialConfig::default(),
+    ]);
+    assert_eq!(merged.experimental_specialized_fallback, Some(true));
+}
+
+/// Issue #634: `parse_key_value_config` accepts the new
+/// `experimental_specialized_fallback` key (parsed downstream by
+/// `load_config_file`).
+#[test]
+fn parses_experimental_specialized_fallback_from_config_file() {
+    let map = parse_key_value_config("experimental_specialized_fallback = true\n");
+    assert_eq!(
+        map.get("experimental_specialized_fallback")
+            .map(String::as_str),
+        Some("true")
     );
 }
 
@@ -482,4 +523,488 @@ fn merge_log_level_prefers_later_source() {
         },
     ]);
     assert_eq!(merged.log_level, Some(LogLevel::Trace));
+}
+
+// --- photon config (issue #553) ---
+
+fn minimal_args(cwd: &std::path::Path) -> CliArgs {
+    CliArgs {
+        cwd: Some(cwd.to_path_buf()),
+        prompt: None,
+        model: None,
+        sidecar_model: None,
+        ollama_host: None,
+        context_budget: None,
+        max_iterations: None,
+        chat_timeout_secs: None,
+        chat_retries: None,
+        verbose: false,
+        trace: false,
+        debug: false,
+        stream: false,
+        yes: false,
+        fresh_session: false,
+        oneshot: false,
+        auto_plan: false,
+        offline: false,
+        deterministic_fallback: None,
+        experimental_specialized_fallback: None,
+        no_footer: false,
+        resume: None,
+        state_dir: None,
+        command: None,
+    }
+}
+
+const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
+    ("ANVIL_PHOTON_ENABLED", None),
+    ("ANVIL_PHOTON_URL", None),
+    ("ANVIL_PHOTON_SHADOW_MODE", None),
+    ("ANVIL_PHOTON_CANARY", None),
+    ("ANVIL_PHOTON_TIMEOUT_MS", None),
+    ("ANVIL_OFFLINE", None),
+    // Issue #583: keep this entry at the tail so existing index-based
+    // overrides (PHOTON_ENV_VARS[0..=4]) remain stable.
+    ("ANVIL_PHOTON_RESPECT_WARNINGS", None),
+];
+
+#[test]
+fn photon_disabled_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PHOTON_ENV_VARS, || {
+        let (cfg, _warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(!cfg.photon_enabled);
+        assert_eq!(cfg.photon_canary, 0);
+        assert_eq!(cfg.photon_timeout_ms, 200);
+        assert_eq!(cfg.photon_url, "http://127.0.0.1:3030");
+    });
+}
+
+#[test]
+fn photon_shadow_mode_default_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PHOTON_ENV_VARS, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(cfg.photon_shadow_mode);
+    });
+}
+
+#[test]
+fn env_photon_enabled_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PHOTON_ENABLED", Some("true"));
+    with_env(&vars, || {
+        let (cfg, warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(cfg.photon_enabled);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    });
+}
+
+#[test]
+fn env_photon_url_invalid_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[1] = ("ANVIL_PHOTON_URL", Some("not-a-url"));
+    with_env(&vars, || {
+        let result = Config::load(minimal_args(tmp.path()));
+        assert!(result.is_err(), "expected Err for invalid URL");
+    });
+}
+
+#[test]
+fn env_photon_url_external_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[1] = ("ANVIL_PHOTON_URL", Some("http://example.com:3030"));
+    with_env(&vars, || {
+        let result = Config::load(minimal_args(tmp.path()));
+        assert!(result.is_err(), "expected Err for external URL");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("photon_url"),
+            "expected 'photon_url' in error, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn env_photon_canary_out_of_range_warns_and_defaults() {
+    with_env(&[("ANVIL_PHOTON_CANARY", Some("1001"))], || {
+        let mut warnings = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.photon_canary, None, "out-of-range should be None");
+        assert!(
+            warnings.iter().any(|w| w.contains("ANVIL_PHOTON_CANARY")),
+            "expected ANVIL_PHOTON_CANARY warning: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("using default (0)")),
+            "expected default value in warning: {warnings:?}"
+        );
+    });
+}
+
+#[test]
+fn env_photon_timeout_zero_warns_and_defaults() {
+    with_env(&[("ANVIL_PHOTON_TIMEOUT_MS", Some("0"))], || {
+        let mut warnings = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.photon_timeout_ms, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ANVIL_PHOTON_TIMEOUT_MS")),
+            "expected ANVIL_PHOTON_TIMEOUT_MS warning: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("using default (200)")),
+            "expected default value in warning: {warnings:?}"
+        );
+    });
+}
+
+#[test]
+fn env_photon_timeout_too_large_warns_and_defaults() {
+    with_env(&[("ANVIL_PHOTON_TIMEOUT_MS", Some("60001"))], || {
+        let mut warnings = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.photon_timeout_ms, None);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ANVIL_PHOTON_TIMEOUT_MS")),
+            "expected ANVIL_PHOTON_TIMEOUT_MS warning: {warnings:?}"
+        );
+    });
+}
+
+#[test]
+fn config_file_photon_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "photon_enabled=true\n").unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_enabled, Some(true));
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn merge_photon_env_overrides_file() {
+    let file_config = PartialConfig {
+        photon_enabled: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_enabled: Some(true),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_enabled, Some(true));
+}
+
+#[test]
+fn merge_photon_invalid_higher_priority_leaves_lower() {
+    // env has invalid canary (→ None from load_env_config); file has valid 500
+    // After merge, the file's valid value should win because env contributed None
+    let file_config = PartialConfig {
+        photon_canary: Some(500),
+        ..PartialConfig::default()
+    };
+    // simulate env producing None for invalid canary
+    let env_config = PartialConfig {
+        photon_canary: None,
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_canary, Some(500));
+}
+
+#[test]
+fn offline_forces_photon_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PHOTON_ENABLED", Some("true"));
+    vars.push(("ANVIL_OFFLINE", Some("true")));
+    with_env(&vars, || {
+        let (cfg, warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.photon_enabled,
+            "offline should force photon_enabled=false"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("photon_enabled")),
+            "expected offline override warning: {warnings:?}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Issue #583: photon_respect_warnings (CW-01〜CW-04)
+// ---------------------------------------------------------------------------
+
+/// CW-01: default value is `true` when no override is provided.
+#[test]
+fn cw01_photon_respect_warnings_default_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PHOTON_ENV_VARS, || {
+        let (cfg, warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            cfg.photon_respect_warnings,
+            "photon_respect_warnings must default to true"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    });
+}
+
+/// CW-02: `ANVIL_PHOTON_RESPECT_WARNINGS=false` disables the filter.
+#[test]
+fn cw02_env_photon_respect_warnings_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PHOTON_ENV_VARS.to_vec();
+    // tail position is the respect_warnings slot (see PHOTON_ENV_VARS comment)
+    let idx = vars.len() - 1;
+    vars[idx] = ("ANVIL_PHOTON_RESPECT_WARNINGS", Some("false"));
+    with_env(&vars, || {
+        let (cfg, _warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.photon_respect_warnings,
+            "ANVIL_PHOTON_RESPECT_WARNINGS=false must disable the filter"
+        );
+    });
+}
+
+/// CW-03: `.anvil/config` `photon_respect_warnings=false` is honoured.
+#[test]
+fn cw03_config_file_photon_respect_warnings_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "photon_respect_warnings=false\n").unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_respect_warnings, Some(false));
+    assert!(warnings.is_empty());
+}
+
+/// CW-04: env overrides config-file when both are present.
+#[test]
+fn cw04_merge_photon_respect_warnings_env_overrides_file() {
+    let file_config = PartialConfig {
+        photon_respect_warnings: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_respect_warnings: Some(true),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_respect_warnings, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #592: photon_common_seed_enabled regression tests
+// ---------------------------------------------------------------------------
+
+/// CS-01: default is None (PartialConfig) so Config::load resolves to false.
+#[test]
+fn cs01_photon_common_seed_default_is_none() {
+    let p = PartialConfig::default();
+    assert_eq!(p.photon_common_seed_enabled, None);
+}
+
+/// CS-02: config-file key parses bool.
+#[test]
+fn cs02_config_file_photon_common_seed_enabled_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(&path, "photon_common_seed_enabled=true\n").unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_common_seed_enabled, Some(true));
+    assert!(warnings.is_empty());
+}
+
+/// CS-03: env var parses bool.
+#[test]
+fn cs03_env_photon_common_seed_enabled() {
+    use anvil::config::parse_bool;
+    // We test the parsing path directly because mutating process env in a
+    // parallel test is racy. parse_bool is the same SSOT load_env_config uses.
+    assert_eq!(parse_bool("true"), Some(true));
+    assert_eq!(parse_bool("1"), Some(true));
+    assert_eq!(parse_bool("false"), Some(false));
+}
+
+/// CS-04: env overrides config-file when both are present.
+#[test]
+fn cs04_merge_photon_common_seed_env_overrides_file() {
+    let file_config = PartialConfig {
+        photon_common_seed_enabled: Some(false),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_common_seed_enabled: Some(true),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_common_seed_enabled, Some(true));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #604 (AP-07): auto-promote hook config (4 env keys)
+// ---------------------------------------------------------------------------
+
+/// AP07-01: PartialConfig defaults for all 4 auto-promote keys are None.
+#[test]
+fn ap07_01_partial_config_defaults_to_none_for_all_auto_promote_keys() {
+    let p = PartialConfig::default();
+    assert_eq!(p.photon_auto_promote, None);
+    assert_eq!(p.photon_no_auto_promote, None);
+    assert_eq!(p.photon_auto_promote_dry_run, None);
+    assert_eq!(p.photon_auto_promote_scrub_mode, None);
+}
+
+/// AP07-02: config-file keys parse for all 4 auto-promote knobs.
+#[test]
+fn ap07_02_config_file_parses_all_auto_promote_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config");
+    std::fs::write(
+        &path,
+        "photon_auto_promote=false\n\
+         photon_no_auto_promote=true\n\
+         photon_auto_promote_dry_run=false\n\
+         photon_auto_promote_scrub_mode=warn\n",
+    )
+    .unwrap();
+    let mut warnings = Vec::new();
+    let cfg = load_config_file(&path, &mut warnings).unwrap();
+    assert_eq!(cfg.photon_auto_promote, Some(false));
+    assert_eq!(cfg.photon_no_auto_promote, Some(true));
+    assert_eq!(cfg.photon_auto_promote_dry_run, Some(false));
+    assert_eq!(cfg.photon_auto_promote_scrub_mode.as_deref(), Some("warn"));
+    assert!(warnings.is_empty());
+}
+
+/// AP07-03: env var override beats config-file via merge_partial_configs.
+#[test]
+fn ap07_03_env_auto_promote_overrides_file_through_merge() {
+    let file_config = PartialConfig {
+        photon_auto_promote: Some(true),
+        photon_auto_promote_dry_run: Some(true),
+        photon_auto_promote_scrub_mode: Some("strict".to_string()),
+        ..PartialConfig::default()
+    };
+    let env_config = PartialConfig {
+        photon_auto_promote: Some(false),
+        photon_no_auto_promote: Some(true),
+        photon_auto_promote_dry_run: Some(false),
+        photon_auto_promote_scrub_mode: Some("warn".to_string()),
+        ..PartialConfig::default()
+    };
+    let merged = merge_partial_configs(&[file_config, env_config]);
+    assert_eq!(merged.photon_auto_promote, Some(false));
+    assert_eq!(merged.photon_no_auto_promote, Some(true));
+    assert_eq!(merged.photon_auto_promote_dry_run, Some(false));
+    assert_eq!(
+        merged.photon_auto_promote_scrub_mode.as_deref(),
+        Some("warn")
+    );
+}
+
+/// AP07-04: env knobs read from real `std::env` and apply correctly. Verifies
+/// the POSIX-style `ANVIL_PHOTON_NO_AUTO_PROMOTE=1` "any non-empty disables"
+/// shape (matches `ANVIL_NO_COLOR` / `ANVIL_NO_FOOTER`).
+#[test]
+fn ap07_04_env_config_reads_all_auto_promote_keys() {
+    with_env(
+        &[
+            ("ANVIL_PHOTON_AUTO_PROMOTE", Some("false")),
+            ("ANVIL_PHOTON_NO_AUTO_PROMOTE", Some("1")),
+            ("ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN", Some("false")),
+            ("ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE", Some("warn")),
+        ],
+        || {
+            let mut warnings: Vec<String> = Vec::new();
+            let cfg = load_env_config(&mut warnings);
+            assert_eq!(cfg.photon_auto_promote, Some(false));
+            assert_eq!(
+                cfg.photon_no_auto_promote,
+                Some(true),
+                "NO_AUTO_PROMOTE=1 → Some(true)"
+            );
+            assert_eq!(cfg.photon_auto_promote_dry_run, Some(false));
+            assert_eq!(cfg.photon_auto_promote_scrub_mode.as_deref(), Some("warn"));
+        },
+    );
+}
+
+/// AP07-05: when env vars are unset, the env partial is None for every
+/// auto-promote knob (so the file → CLI cascade can decide; defaults are
+/// applied only in `Config::load`).
+#[test]
+fn ap07_05_env_config_returns_none_for_unset_auto_promote_keys() {
+    with_env(
+        &[
+            ("ANVIL_PHOTON_AUTO_PROMOTE", None),
+            ("ANVIL_PHOTON_NO_AUTO_PROMOTE", None),
+            ("ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN", None),
+            ("ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE", None),
+        ],
+        || {
+            let mut warnings: Vec<String> = Vec::new();
+            let cfg = load_env_config(&mut warnings);
+            assert_eq!(cfg.photon_auto_promote, None);
+            assert_eq!(cfg.photon_no_auto_promote, None);
+            assert_eq!(cfg.photon_auto_promote_dry_run, None);
+            assert!(cfg.photon_auto_promote_scrub_mode.is_none());
+        },
+    );
+}
+
+/// AP07-06: `ANVIL_PHOTON_NO_AUTO_PROMOTE=""` (empty) does NOT disable; only
+/// non-empty values count (POSIX `NO_COLOR` convention). Matches the
+/// `ANVIL_NO_FOOTER` precedent.
+#[test]
+fn ap07_06_env_no_auto_promote_empty_string_does_not_disable() {
+    with_env(&[("ANVIL_PHOTON_NO_AUTO_PROMOTE", Some(""))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(
+            cfg.photon_no_auto_promote, None,
+            "empty value must not flip the kill-switch"
+        );
+    });
+}
+
+/// AP07-07: full `Config::load` resolves defaults — auto_promote=true,
+/// no_auto_promote=false, dry_run=true (Phase 1), scrub_mode="strict".
+#[test]
+fn ap07_07_config_load_defaults_match_phase1_rollout() {
+    // Sweep every relevant env to ensure unset, then run the full Config::load
+    // path. Anvil_LOG_LEVEL / similar env vars are not relevant here.
+    with_env(
+        &[
+            ("ANVIL_PHOTON_AUTO_PROMOTE", None),
+            ("ANVIL_PHOTON_NO_AUTO_PROMOTE", None),
+            ("ANVIL_PHOTON_AUTO_PROMOTE_DRY_RUN", None),
+            ("ANVIL_PHOTON_AUTO_PROMOTE_SCRUB_MODE", None),
+            // Avoid clashes with other photon env vars in the smoke layer.
+            ("ANVIL_OFFLINE", None),
+            ("ANVIL_PHOTON_ENABLED", None),
+            ("ANVIL_PHOTON_URL", None),
+        ],
+        || {
+            let tmp = tempfile::tempdir().unwrap();
+            let (cfg, _warnings) = Config::load(minimal_args(tmp.path())).unwrap();
+            assert!(cfg.photon_auto_promote, "default = true");
+            assert!(!cfg.photon_no_auto_promote, "default = false");
+            assert!(
+                cfg.photon_auto_promote_dry_run,
+                "Phase 1 default = true (DR-AP-5)"
+            );
+            assert_eq!(cfg.photon_auto_promote_scrub_mode, "strict");
+        },
+    );
 }

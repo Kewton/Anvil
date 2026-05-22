@@ -5,10 +5,25 @@ pub(super) enum ExitReason {
     EmptyResponses,
     NoToolCalls,
     MissingRepoEdits,
+    MissingVerification,
+    VerifierFailed,
     PlanIncomplete,
     ToolCallFormatError,
     TransportError,
     Interrupted,
+    /// Issue #651 Task 4.2: `CompletionDecision::SafeStop` with the
+    /// `VerifierWeak` reason — a structurally runnable verifier was
+    /// detected, but the current task's owned test artifact could not
+    /// be bound to its argv. The agent stops without claiming Done so
+    /// we never report false-positive completion. Distinct from
+    /// `VerifierFailed` (verifier ran and the suite failed) and from
+    /// `MissingVerification` (no verifier evidence was recorded yet).
+    SafeStopVerifierWeak,
+    /// Issue #651 Task 4.2: `CompletionDecision::SafeStop` with the
+    /// `VerifierMissing` reason — either no allowlisted runner was
+    /// detected at all, or the request literally asked for tests but
+    /// no owned test artifact is staged on the verifier command line.
+    SafeStopVerifierMissing,
 }
 
 impl ExitReason {
@@ -23,9 +38,13 @@ impl ExitReason {
                 | ExitReason::EmptyResponses
                 | ExitReason::NoToolCalls
                 | ExitReason::MissingRepoEdits
+                | ExitReason::MissingVerification
+                | ExitReason::VerifierFailed
                 | ExitReason::PlanIncomplete
                 | ExitReason::ToolCallFormatError
                 | ExitReason::Interrupted
+                | ExitReason::SafeStopVerifierWeak
+                | ExitReason::SafeStopVerifierMissing
         )
     }
 
@@ -36,10 +55,14 @@ impl ExitReason {
             ExitReason::EmptyResponses => "empty_responses",
             ExitReason::NoToolCalls => "no_tool_calls",
             ExitReason::MissingRepoEdits => "missing_repo_edits",
+            ExitReason::MissingVerification => "missing_verification",
+            ExitReason::VerifierFailed => "verifier_failed",
             ExitReason::PlanIncomplete => "plan_incomplete",
             ExitReason::ToolCallFormatError => "tool_call_format_error",
             ExitReason::TransportError => "transport_error",
             ExitReason::Interrupted => "interrupted",
+            ExitReason::SafeStopVerifierWeak => "safe_stop_verifier_weak",
+            ExitReason::SafeStopVerifierMissing => "safe_stop_verifier_missing",
         }
     }
 
@@ -54,6 +77,10 @@ impl ExitReason {
             ExitReason::MissingRepoEdits => {
                 "assistant kept stopping before making the requested repository edits"
             }
+            ExitReason::MissingVerification => {
+                "assistant completed repository artifacts but did not obtain required verification"
+            }
+            ExitReason::VerifierFailed => "required verifier failed after repository edits",
             ExitReason::PlanIncomplete => {
                 "assistant did not finish the plan after repeated planning retries"
             }
@@ -62,6 +89,12 @@ impl ExitReason {
             }
             ExitReason::TransportError => "transport error: request failed after retries",
             ExitReason::Interrupted => "",
+            ExitReason::SafeStopVerifierWeak => {
+                "assistant stopped: structured verifier could not bind the task's owned test artifact"
+            }
+            ExitReason::SafeStopVerifierMissing => {
+                "assistant stopped: request asks for test execution but no owned test artifact reached the verifier"
+            }
         }
     }
 }
@@ -218,10 +251,14 @@ mod tests {
             ExitReason::EmptyResponses,
             ExitReason::NoToolCalls,
             ExitReason::MissingRepoEdits,
+            ExitReason::MissingVerification,
+            ExitReason::VerifierFailed,
             ExitReason::PlanIncomplete,
             ExitReason::ToolCallFormatError,
             ExitReason::TransportError,
             ExitReason::Interrupted,
+            ExitReason::SafeStopVerifierWeak,
+            ExitReason::SafeStopVerifierMissing,
         ];
         let labels: Vec<_> = reasons.iter().map(|r| r.label()).collect();
         let unique: std::collections::HashSet<_> = labels.iter().collect();
@@ -235,10 +272,33 @@ mod tests {
         assert!(!ExitReason::EmptyResponses.is_success());
         assert!(!ExitReason::NoToolCalls.is_success());
         assert!(!ExitReason::MissingRepoEdits.is_success());
+        assert!(!ExitReason::MissingVerification.is_success());
+        assert!(!ExitReason::VerifierFailed.is_success());
         assert!(!ExitReason::PlanIncomplete.is_success());
         assert!(!ExitReason::ToolCallFormatError.is_success());
         assert!(!ExitReason::TransportError.is_success());
         assert!(!ExitReason::Interrupted.is_success());
+        assert!(!ExitReason::SafeStopVerifierWeak.is_success());
+        assert!(!ExitReason::SafeStopVerifierMissing.is_success());
+    }
+
+    #[test]
+    fn safe_stop_variants_keep_repl_alive() {
+        assert!(ExitReason::SafeStopVerifierWeak.keeps_repl_alive());
+        assert!(ExitReason::SafeStopVerifierMissing.keeps_repl_alive());
+    }
+
+    #[test]
+    fn safe_stop_variants_have_distinct_default_error_text() {
+        // Issue #651 Task 4.2: each reason must communicate the
+        // structured-verifier failure mode to the user so the run
+        // summary explains *why* the agent stopped without claiming
+        // completion.
+        let weak = ExitReason::SafeStopVerifierWeak.default_error_text();
+        let missing = ExitReason::SafeStopVerifierMissing.default_error_text();
+        assert!(!weak.is_empty());
+        assert!(!missing.is_empty());
+        assert_ne!(weak, missing);
     }
 
     #[test]
@@ -260,6 +320,8 @@ mod tests {
         assert!(ExitReason::EmptyResponses.keeps_repl_alive());
         assert!(ExitReason::NoToolCalls.keeps_repl_alive());
         assert!(ExitReason::MissingRepoEdits.keeps_repl_alive());
+        assert!(ExitReason::MissingVerification.keeps_repl_alive());
+        assert!(ExitReason::VerifierFailed.keeps_repl_alive());
         assert!(ExitReason::PlanIncomplete.keeps_repl_alive());
         assert!(ExitReason::ToolCallFormatError.keeps_repl_alive());
         assert!(ExitReason::Interrupted.keeps_repl_alive());

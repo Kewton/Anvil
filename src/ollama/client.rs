@@ -161,6 +161,14 @@ impl OllamaClient {
         self.generate_impl(model, messages, None, false, |_| Ok(()))
     }
 
+    pub fn chat_text_control(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        self.chat_impl(model, messages, &[], false, |_| Ok(()))
+    }
+
     pub fn summarize_conversation(
         &self,
         model: &str,

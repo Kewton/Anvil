@@ -12,11 +12,16 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::cli::{SessionsAction, TmpTestsAction};
+use crate::config::resolve_photon_rollout_min_eval_turns;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::compact::is_compact_summary;
 use crate::session::discovery::{SessionDirEntry, iter_session_dirs};
 use crate::session::export::{
     ExportConfig, ExportFilter, ExportOutput, ExportScope, MAX_EXPORT_JSONL_BYTES, run_export,
+};
+use crate::session::rollout_policy::{
+    ConditionStatus, RolloutPolicyConfig, collect_rollout_stats_from_state,
+    evaluate_rollout_conditions,
 };
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::session::tmp_tests;
@@ -488,6 +493,347 @@ pub fn dispatch(
             };
             run_export(&config).map(|_| ())
         }
+        SessionsAction::PhotonRolloutCheck {} => {
+            run_photon_rollout_check(state_root, workspace_root)
+        }
+        SessionsAction::PhotonPromote {
+            session,
+            case_id,
+            all,
+            dry_run,
+            yes,
+            print_summary,
+            output,
+        } => run_photon_promote(
+            workspace_root,
+            state_root,
+            session,
+            case_id,
+            all,
+            dry_run,
+            yes,
+            print_summary,
+            output,
+        )
+        .map(|_| ()),
+    }
+}
+
+pub fn run_photon_rollout_check(state_root: &Path, workspace_root: &Path) -> Result<(), String> {
+    let mut warnings = Vec::new();
+    let min_turns = resolve_photon_rollout_min_eval_turns(workspace_root, &mut warnings);
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let stats = collect_rollout_stats_from_state(state_root)?;
+    let status = evaluate_rollout_conditions(
+        &stats,
+        RolloutPolicyConfig {
+            min_eval_turns: min_turns,
+        },
+    );
+
+    for cond in &status.conditions {
+        let mark = match &cond.status {
+            ConditionStatus::Ok => "OK",
+            ConditionStatus::Ng(_) => "NG",
+            ConditionStatus::ManualRequired(_) => "ManualRequired",
+        };
+        println!("[{mark}] Condition {}: {}", cond.id, cond.label);
+        match &cond.status {
+            ConditionStatus::Ng(reason) => println!("    reason: {reason}"),
+            ConditionStatus::ManualRequired(reason) => println!("    manual: {reason}"),
+            ConditionStatus::Ok => {}
+        }
+        if let Some(note) = &cond.note {
+            println!("    note: {note}");
+        }
+    }
+
+    if status.ready_for_canary {
+        println!("\nRollout READY (shadow_mode=false, photon_canary>0 に設定可能)");
+    } else if status.manual_required {
+        println!("\nRollout BLOCKED: manual verification required before canary");
+    } else {
+        println!("\nRollout NOT READY (移行条件を満たしていません)");
+    }
+    Ok(())
+}
+
+/// `anvil sessions photon-promote` handler (Issue #593, Phase A).
+///
+/// Promotes successful `CaseRecord` entries to photon `ActionSummary` v0.2
+/// format. Phase A is local-only: no HTTP POST, dry-run or `--output FILE`.
+///
+/// Selector contract (CB-003, codex review fix): **exactly one** of
+/// `--session` / `--case-id` / `--all` MUST be supplied. Supplying zero
+/// or two-or-more selectors is rejected with a descriptive error, so a
+/// caller running `anvil sessions photon-promote --print-summary` cannot
+/// accidentally expose every CaseRecord's `ActionSummary` to stdout.
+///
+/// `--session` is currently **unsupported**: Phase A's on-disk `CaseRecord`
+/// does not carry the originating session id, so the selector cannot be
+/// honored without leaking unrelated cases. Use `--case-id <id>` for a
+/// single case or `--all` for an explicit all-cases run.
+///
+/// Non-dry-run without `--yes` falls back to dry-run with a stderr warning
+/// so misconfigured CI jobs cannot silently write the dedup log.
+#[allow(clippy::too_many_arguments)]
+pub fn run_photon_promote(
+    workspace_root: &Path,
+    state_root: &Path,
+    session: Option<String>,
+    case_id: Option<String>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+    print_summary: bool,
+    output: Option<PathBuf>,
+) -> Result<i32, String> {
+    use crate::session::case_photon_bridge::{
+        ActionSummary, BridgeOutcome, MAX_ACTION_SUMMARY_BYTES, PromoteLogEntry, PromotedEntry,
+        SkipReason, SkippedEntry, append_promote_log_entry, check_quality_gate,
+        convert_case_to_action_summary, format_rfc3339_utc, read_promote_log, write_jsonl_output,
+    };
+    use crate::session::case_record::{CaseRecord, iter_case_files, validate_case_id};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let _ = workspace_root;
+
+    // CB-003: selector exactly-one. Reject:
+    //   * `chosen == 0` — accidental "promote everything" via no flag.
+    //   * `chosen >= 2` — ambiguous selection.
+    let mut chosen = 0;
+    if session.is_some() {
+        chosen += 1;
+    }
+    if case_id.is_some() {
+        chosen += 1;
+    }
+    if all {
+        chosen += 1;
+    }
+    if chosen == 0 {
+        return Err(
+            "exactly one of --session, --case-id, --all must be specified; \
+             use --all to promote every successful CaseRecord explicitly"
+                .to_string(),
+        );
+    }
+    if chosen > 1 {
+        return Err("--session, --case-id, --all are mutually exclusive".to_string());
+    }
+
+    // CB-003: --session is intentionally unsupported in Phase A. CaseRecord
+    // does not store the originating session id on disk, so we cannot scope
+    // the operation to a single session without leaking unrelated cases.
+    // Reject explicitly so users see the limitation immediately instead of
+    // discovering it via a silently-broadened scope.
+    if session.is_some() {
+        return Err(
+            "--session filtering is not yet supported; use --case-id <id> or --all".to_string(),
+        );
+    }
+
+    // Validate --case-id (allowlist) before scanning.
+    if let Some(ref id) = case_id
+        && !validate_case_id(id)
+    {
+        return Err(format!("invalid --case-id: {id}"));
+    }
+
+    // Step 0: capture a single timestamp for all summaries this run.
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let extracted_at = format_rfc3339_utc(now_unix);
+
+    // Fail-safe: non-dry-run requires --yes. Otherwise downgrade to dry-run.
+    let effective_dry_run = if !dry_run && !yes {
+        eprintln!("warning: non-dry-run promotion requires --yes; falling back to dry-run");
+        true
+    } else {
+        dry_run
+    };
+
+    // Step 1: dedup set.
+    let already_promoted = read_promote_log(state_root)?;
+
+    // Step 2: enumerate candidate cases.
+    let entries = iter_case_files(state_root);
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|e| match &case_id {
+            Some(id) => &e.case_id == id,
+            None => true,
+        })
+        .collect();
+
+    // Resolve session filter early: filter is applied per-CaseRecord later.
+    let session_filter = session.clone();
+
+    // Phase A: --session is informational only. CaseRecord does not store the
+    // session id, so we cannot filter by it from disk. The flag is preserved
+    // for forward compatibility (Phase B will store session_id on CaseRecord).
+    let _ = session_filter.is_some();
+
+    let session_label = session.clone().unwrap_or_else(|| "unknown".to_string());
+
+    let mut outcome = BridgeOutcome {
+        promoted: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let mut promoted_summaries: Vec<ActionSummary> = Vec::new();
+
+    // Step 3: load + gate + convert each case.
+    for entry in filtered {
+        let bytes = match std::fs::read(&entry.path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let case: CaseRecord = match serde_json::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if let Err(reason) = check_quality_gate(&case, &already_promoted, now_unix) {
+            outcome.skipped.push(SkippedEntry {
+                case_id: case.case_id.clone(),
+                reason,
+            });
+            continue;
+        }
+
+        let summary = convert_case_to_action_summary(&case, &session_label, &extracted_at);
+        let serialized = match serde_json::to_vec(&summary) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to serialize ActionSummary for {}: {err}",
+                    case.case_id
+                );
+                continue;
+            }
+        };
+        let byte_size = serialized.len();
+        if byte_size > MAX_ACTION_SUMMARY_BYTES {
+            outcome.skipped.push(SkippedEntry {
+                case_id: case.case_id.clone(),
+                reason: SkipReason::Oversize,
+            });
+            continue;
+        }
+
+        outcome.promoted.push(PromotedEntry {
+            case_id: case.case_id.clone(),
+            summary_id: summary.summary_id.clone(),
+            confidence_prior: summary
+                .provenance
+                .as_ref()
+                .map(|p| p.confidence_prior)
+                .unwrap_or(0.0),
+            byte_size,
+        });
+        promoted_summaries.push(summary);
+    }
+
+    // Step 4: dry-run table OR step 5: write outputs.
+    if effective_dry_run {
+        print_dry_run_table(&outcome);
+    }
+
+    if print_summary {
+        for summary in &promoted_summaries {
+            match serde_json::to_string(summary) {
+                Ok(s) => println!("{s}"),
+                Err(err) => eprintln!("warning: failed to serialize summary: {err}"),
+            }
+        }
+    }
+
+    if !effective_dry_run {
+        if let Some(out_path) = &output {
+            write_jsonl_output(out_path, &promoted_summaries)?;
+        }
+        // Step 6: append to dedup log (promoted + skipped).
+        for entry in &outcome.promoted {
+            let log = PromoteLogEntry {
+                case_id: entry.case_id.clone(),
+                summary_id: entry.summary_id.clone(),
+                extracted_at: extracted_at.clone(),
+                outcome: "promoted".to_string(),
+                reason: None,
+            };
+            append_promote_log_entry(state_root, &log)?;
+        }
+        for entry in &outcome.skipped {
+            let log = PromoteLogEntry {
+                case_id: entry.case_id.clone(),
+                summary_id: format!(
+                    "{}{}",
+                    crate::session::case_photon_bridge::SUMMARY_ID_PREFIX,
+                    entry.case_id
+                ),
+                extracted_at: extracted_at.clone(),
+                outcome: "skipped".to_string(),
+                reason: Some(entry.reason.as_str().to_string()),
+            };
+            append_promote_log_entry(state_root, &log)?;
+        }
+    }
+
+    // Step 7: stderr summary.
+    eprintln!(
+        "photon-promote: promoted={} skipped={} (dry_run={})",
+        outcome.promoted.len(),
+        outcome.skipped.len(),
+        effective_dry_run
+    );
+
+    Ok(0)
+}
+
+fn print_dry_run_table(outcome: &crate::session::case_photon_bridge::BridgeOutcome) {
+    println!(
+        "{:<32} {:<48} {:>6} {:>7} status",
+        "case_id", "summary_id", "conf", "bytes"
+    );
+    println!("{}", "-".repeat(110));
+    for entry in &outcome.promoted {
+        println!(
+            "{:<32} {:<48} {:>6.2} {:>7} promoted",
+            truncate_for_table(&entry.case_id, 32),
+            truncate_for_table(&entry.summary_id, 48),
+            entry.confidence_prior,
+            entry.byte_size,
+        );
+    }
+    for entry in &outcome.skipped {
+        println!(
+            "{:<32} {:<48} {:>6} {:>7} skipped:{}",
+            truncate_for_table(&entry.case_id, 32),
+            "-",
+            "-",
+            "-",
+            entry.reason.as_str(),
+        );
+    }
+    println!(
+        "total: promoted={} skipped={}",
+        outcome.promoted.len(),
+        outcome.skipped.len()
+    );
+}
+
+fn truncate_for_table(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -1096,19 +1442,11 @@ mod tests {
                 ConversationMessage::assistant("hi".into(), vec![]),
             ],
             checkpoints: vec!["cp1".into()],
-            native_tools_disabled: false,
-            working_memory: Default::default(),
-            last_feedback: None,
-            eligible_feedback_recorded_this_turn: false,
-            last_anvil_score: None,
-            unsafe_blocks_this_turn: 0,
-            consecutive_no_progress_turns: 0,
-            repo_edit_succeeded_this_turn: false,
-            touched_files_at_turn_start: Vec::new(),
-            case_record_extracted_this_turn: false,
-            case_retrieval_invoked_this_turn: false,
-            anti_pattern_extracted_this_turn: false,
-            anti_pattern_retrieval_invoked_this_turn: false,
+            // Issue #608 (VR-13): converted the previously fully-enumerated
+            // SessionSnapshot literal to a struct-update-syntax form so new
+            // turn-local / persistence fields don't break the fixture on each
+            // schema growth.
+            ..SessionSnapshot::default()
         };
         let v = ShowView::from_snapshot(&snap);
         assert_eq!(v.id, "sid");
