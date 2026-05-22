@@ -395,6 +395,155 @@ pub(crate) fn emit_safe_stop_report_verifier_weak_for_test(agent: &mut Agent) {
     agent.emit_safe_stop_report_for_verifier_weak();
 }
 
+/// Issue #662 test seam: invoke the `repair_exhausted` emit shell. In
+/// production this fires when `record_repair_attempt_outcome` reports
+/// `PromotionResult.all_clusters_exhausted = true` at either the Applied
+/// path (`turn.rs::drive_task_contract_verifier`) or the Invalid path
+/// (`record_controller_verifier_repair_invalid`).
+///
+/// `#[cfg(test)] pub(crate)` scoping matches the existing 5 stop-reason
+/// in-crate E2E seams introduced by Codex review v1 / CB-001 (the
+/// `safe_stop_e2e_tests.rs` precedent — production binary excludes the test
+/// mod, the seam is invisible to release builds, and DR3-001 holds because
+/// no internal `pub(super)` type leaks across the `pub(crate)` boundary).
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_repair_exhausted_for_test(agent: &mut Agent) {
+    if agent.repair_job.is_none() {
+        agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
+    }
+    agent.emit_safe_stop_report_for_repair_exhausted();
+}
+
+/// Issue #662 (Codex CB-002): production-path test seam that drives the
+/// full Applied / Invalid caller observation pipeline. The Codex review v1
+/// CB-002 finding was that the Applied caller in `drive_task_contract_verifier`
+/// and the Invalid caller in `record_controller_verifier_repair_invalid`
+/// independently observed `PromotionResult` and called the emit shell — a
+/// CB-002-style regression in either site would leak past the unit test
+/// surface. This seam pairs the **production** `record_repair_attempt_outcome`
+/// and `maybe_emit_repair_exhausted_from_promotion` helpers so the in-crate
+/// E2E suite exercises the actual production observation/emit pair.
+///
+///   1. seed `Agent.repair_job` with a `RepairJob` whose `semantic_plan`
+///      carries a single cluster bound to `cluster_label` + `role_label` so
+///      the `record_repair_attempt_outcome` precondition (`semantic_plan =
+///      Some`) is satisfied;
+///   2. push two outcomes (the caller picks the variants as `kind_labels`
+///      so the test can cover Applied caller paths
+///      (`applied_no_progress` / `applied_worsened`) or Invalid caller
+///      paths (`rejected_noop` / `rejected_malformed` / `rejected_duplicate`));
+///   3. after each push, invoke the **production**
+///      `Agent::maybe_emit_repair_exhausted_from_promotion` helper — the
+///      very same observation/emit pair the Applied caller (in
+///      `drive_task_contract_verifier`) and the Invalid caller (in
+///      `record_controller_verifier_repair_invalid`) call in production.
+///
+/// **`#[cfg(test)] pub(crate)` scoping (DR3-001 / `private_interfaces`)**:
+/// only `&mut Agent` and string literals cross the `pub(crate)` boundary,
+/// so the internal types (`ArtifactRole` / `RepairAttemptOutcomeKind` /
+/// `SemanticRepairPlan`) stay `pub(super)` to the `loop_run` module,
+/// mirroring `emit_safe_stop_report_artifact_completion_failed_for_test`'s
+/// `role_label: &str` convention. The seam is invisible to release builds.
+///
+/// Unknown labels are mapped to a deterministic fallback (Implementation
+/// role / RejectedNoop kind) so a typo never silently produces a different
+/// behavioural path than the test intended.
+#[cfg(test)]
+pub(crate) fn drive_record_repair_attempt_outcomes_for_test(
+    agent: &mut Agent,
+    cluster_label: &str,
+    role_label: &str,
+    kind_labels: &[&str],
+) {
+    use repair_attempt_outcome::{RepairAttemptOutcome, RepairAttemptOutcomeKind};
+    use repair_job::{RepairJob, SemanticRepairPlan};
+    use semantic_failure::{cluster_key_for_test, parse_semantic_failure_report};
+    use spec_authority::SpecAuthority;
+
+    let role = match role_label {
+        "test" => task_contract::ArtifactRole::Test,
+        "setup" => task_contract::ArtifactRole::Setup,
+        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
+        // Implementation is the deterministic fallback for unknown labels.
+        _ => task_contract::ArtifactRole::Implementation,
+    };
+
+    // Build a minimal semantic_report with exactly one cluster bound to
+    // `cluster_label` so `next_repairable_cluster` returns `None` (= all
+    // clusters exhausted) as soon as the `(cluster, role)` lands in
+    // `exhausted_attempts`. The cluster's `cluster_key` is overridden to
+    // match `cluster_key_for_test(cluster_label)`, mirroring the existing
+    // `semantic_report_fixture_with_cluster` repair_job.rs helper.
+    let json = serde_json::json!({
+        "failure_kind": "assertion_mismatch",
+        "confidence": 0.7,
+        "preferred_repair_role": role_label,
+        "repair_hypothesis": "hypothesis text",
+        "failure_clusters": [
+            {
+                "observed": cluster_label,
+                "expected": "exp",
+                "input_shape": "shape",
+                "assertion_shape": "AssertEq",
+                "involved_artifacts": ["test"],
+                "affected_cases": ["case1"],
+            }
+        ],
+    });
+    let mut report = parse_semantic_failure_report(&json).expect("fixture parses");
+    let cluster_key = cluster_key_for_test(cluster_label);
+    if let Some(cluster) = report.failure_clusters.get_mut(0) {
+        cluster.cluster_key = cluster_key.clone();
+        cluster
+            .admitted_cluster_targets
+            .push(task_contract::RecoveryTargetHint {
+                role,
+                path: format!("tests/{cluster_label}_smoke.rs"),
+                reason: "CB-002 fixture".to_string(),
+            });
+    }
+    let plan = SemanticRepairPlan {
+        semantic_report: report,
+        failure_cluster_id: cluster_key.clone(),
+        semantic_cause: crate::agent::loop_run::VerifierDiagnosticFailureKind::AssertionMismatch,
+        spec_authority: SpecAuthority::BehaviorContract,
+        preferred_repair_role: role,
+        repair_hypothesis: "h".to_string(),
+        expected_improvement: None,
+        assessment_generation_at_creation: 0,
+    };
+    let job = RepairJob {
+        semantic_plan: Some(plan),
+        ..RepairJob::new_for_test()
+    };
+    agent.repair_job = Some(job);
+
+    // Drive each pushed outcome through the production observation/emit
+    // pair (`record_repair_attempt_outcome` + `maybe_emit_repair_exhausted_
+    // from_promotion`). The second push (count >= 2 for the same (cluster,
+    // role)) is what flips `all_clusters_exhausted` to `true` for this
+    // single-cluster fixture.
+    for label in kind_labels {
+        // Map the test-supplied label to the internal kind. Unknown labels
+        // fall through to `RejectedNoop` (safe default — Invalid caller
+        // path, no weakening metadata required).
+        let kind = match *label {
+            "applied_no_progress" => RepairAttemptOutcomeKind::AppliedNoProgress,
+            "applied_worsened" => RepairAttemptOutcomeKind::AppliedWorsened,
+            "rejected_noop" => RepairAttemptOutcomeKind::RejectedNoop,
+            "rejected_duplicate" => RepairAttemptOutcomeKind::RejectedDuplicate,
+            "rejected_malformed" => RepairAttemptOutcomeKind::RejectedMalformed,
+            _ => RepairAttemptOutcomeKind::RejectedNoop,
+        };
+        let outcome = RepairAttemptOutcome::for_test(cluster_key.clone(), role, kind);
+        let promotion = agent
+            .repair_job
+            .as_mut()
+            .map(|job| job.record_repair_attempt_outcome(outcome));
+        agent.maybe_emit_repair_exhausted_from_promotion(promotion);
+    }
+}
+
 /// Issue #654 (E.5) test seam: invoke the `verifier_missing` emit shell
 /// (`FromMissingVerifier` builder).
 #[cfg(test)]
@@ -975,6 +1124,11 @@ enum VerifierFailureType {
     /// `verifier_failure_type_for_diagnostic_kind` /
     /// `classify_verifier_failure_type` never map to this variant — DR3-005).
     DiagnosticTargetMissing,
+    /// Issue #662: control-flow failure_type emitted when `StopReason::RepairExhausted`
+    /// fires. `SafeStopReport::build_from` sets this variant directly via the
+    /// same `if stop_reason == ...` upgrade pattern used for
+    /// `DiagnosticTargetMissing`; classifier helpers never map to this variant.
+    RepairExhausted,
 }
 
 impl VerifierFailureType {
@@ -987,6 +1141,7 @@ impl VerifierFailureType {
             Self::MissingVerifierOrConfig => "missing_verifier_or_config",
             Self::Unknown => "unknown",
             Self::DiagnosticTargetMissing => "diagnostic_target_missing",
+            Self::RepairExhausted => "repair_exhausted",
         }
     }
 }

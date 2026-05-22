@@ -282,6 +282,39 @@ pub(super) struct VerifierFailureSnapshot {
     pub(super) applied_repair_intent_count: u32,
 }
 
+/// Issue #662: structured return type for `record_repair_attempt_outcome`.
+///
+/// **Precondition** (enforced by caller via `record_repair_attempt_outcome`):
+/// `RepairJob.semantic_plan = Some(_)` at the moment of the push. The
+/// `debug_assert!` in `record_repair_attempt_outcome` will trip in debug
+/// builds when the precondition is violated; release builds short-circuit
+/// to `PromotionResult { promoted: false, all_clusters_exhausted: false }`.
+///
+/// **Postcondition** (fields):
+/// - `promoted = true` when this push caused a new `(cluster, role)` to land
+///   in `exhausted_attempts` (idempotent on duplicates — `contains`-guarded
+///   inside `record_repair_attempt_outcome`).
+/// - `all_clusters_exhausted = true` when, after the push, no cluster in
+///   `semantic_plan.semantic_report` remains repairable under the plan's
+///   `preferred_repair_role` (= `next_repairable_cluster` returns `None`).
+///   When `semantic_plan = None` (release-build precondition violation),
+///   this field is `false`.
+///
+/// **Caller contract** (`turn.rs::maybe_emit_repair_exhausted_from_promotion`,
+/// the single chokepoint called from both production observation sites —
+/// Applied path in `drive_task_contract_verifier` and Invalid path in
+/// `record_controller_verifier_repair_invalid`):
+/// observe `all_clusters_exhausted` and, if `true`, emit
+/// `StopReason::RepairExhausted` via the existing `record_safe_stop_report`
+/// SSOT. The Issue #654 `Agent.safe_stop_report_emitted: HashSet<StopReason>`
+/// dedup makes the call safe to repeat from multiple caller sites in the
+/// same turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PromotionResult {
+    pub(super) promoted: bool,
+    pub(super) all_clusters_exhausted: bool,
+}
+
 impl RepairJob {
     /// Build a `VerifierFailureSnapshot` for #638 / event-log transfer.
     /// Re-runs `sanitize_repair_job_text` / `redact_verifier_command_for_storage`
@@ -383,7 +416,7 @@ impl RepairJob {
         }
     }
 
-    /// Issue #653 (S7-003): ledger mutation SSOT (orchestration only)。
+    /// Issue #653 (S7-003) / #662 (S5-003): ledger mutation SSOT (orchestration only)。
     ///
     /// 薄い orchestration として以下を担保する:
     /// 1. FIFO cap (`MAX_REPAIR_ATTEMPT_OUTCOMES = 16`) — 超過時は oldest drop
@@ -392,10 +425,28 @@ impl RepairJob {
     /// 3. `should_promote_to_exhausted_after_push` (pure-fn) を呼んで `Some` なら
     ///    `exhausted_attempts` に push (idempotent — `contains` チェック)
     /// 4. `assessment_generation` は **bump しない** (S3-005)
+    /// 5. Issue #662: `PromotionResult { promoted, all_clusters_exhausted }`
+    ///    を返す。caller (`turn.rs`) は `all_clusters_exhausted = true` 時に
+    ///    `record_safe_stop_report(SafeStopInput::FromRepair { stop_reason:
+    ///    StopReason::RepairExhausted, .. }, ctx)` を呼ぶ。
+    ///
+    /// **Precondition (Issue #662 DR1-001)**: `self.semantic_plan = Some` 経路
+    /// に限定。legacy path (semantic_plan = None) では outcome を作らず本関数
+    /// は呼ばれない。debug build では `debug_assert!` で gate、release build
+    /// では `all_clusters_exhausted = false` を返すフォールバック。
     ///
     /// 昇格判定本体は pure-fn 側 (`repair_attempt_outcome::should_promote_to_exhausted_after_push`)
     /// にあるため、ここではフロー制御のみ。
-    pub(super) fn record_repair_attempt_outcome(&mut self, outcome: RepairAttemptOutcome) {
+    pub(super) fn record_repair_attempt_outcome(
+        &mut self,
+        outcome: RepairAttemptOutcome,
+    ) -> PromotionResult {
+        debug_assert!(
+            self.semantic_plan.is_some(),
+            "record_repair_attempt_outcome must be called only when semantic_plan = Some \
+             (Issue #662 5-3 precondition)"
+        );
+
         // 1. FIFO cap → oldest drop + tracing::warn! (closed metadata, DR4-002)
         if self.repair_attempt_outcomes.len() >= MAX_REPAIR_ATTEMPT_OUTCOMES {
             self.repair_attempt_outcomes.remove(0);
@@ -413,13 +464,34 @@ impl RepairJob {
         self.repair_attempt_outcomes.push(outcome.clone());
 
         // 3. pure-fn predicate で昇格判定 → 必要なら exhausted_attempts に push
+        let mut promoted = false;
         if let Some(entry) =
             should_promote_to_exhausted_after_push(&self.repair_attempt_outcomes, &outcome)
             && !self.exhausted_attempts.contains(&entry)
         {
             self.exhausted_attempts.push(entry);
+            promoted = true;
         }
         // 4. assessment_generation 不変 (no bump — S3-005)
+
+        // 5. Issue #662: detect "all repairable clusters in the active plan are
+        // now exhausted under their preferred role". `next_repairable_cluster`
+        // returns `None` when no cluster remains repairable. legacy `None`
+        // path (precondition violation in release build) returns false.
+        let all_clusters_exhausted = match self.semantic_plan.as_ref() {
+            Some(plan) => next_repairable_cluster(
+                &plan.semantic_report,
+                plan.preferred_repair_role,
+                &self.exhausted_attempts,
+            )
+            .is_none(),
+            None => false,
+        };
+
+        PromotionResult {
+            promoted,
+            all_clusters_exhausted,
+        }
     }
 
     /// Issue #653 (S1-007, DR1-006 命名統一): #654 (bounded stop report) が消費する
@@ -1282,15 +1354,22 @@ pub(super) const SAFE_STOP_PER_CLUSTER_ROLE_MAX: usize = 4;
 /// label that appears in the `agent.safe_stop.report` event payload.
 ///
 /// `Hash + Eq + Copy` allow `HashSet<StopReason>` to act as the per-turn
-/// dedup marker on `Agent` (DR1-006). The variant set is closed-fixed at 5
-/// so the overhead is negligible compared to a `&'static str` marker.
+/// dedup marker on `Agent` (DR1-006). Issue #662 added `RepairExhausted`,
+/// bringing the closed-fixed cardinality to 6 variants.
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub(super) enum StopReason {
     ArtifactCompletionFailed,
     VerifierFailedSafeStop,
     VerifierWeak,
     VerifierMissing,
     DiagnosticTargetMissing,
+    /// Issue #662: same (cluster, role) failure was attacked >= 2 times via
+    /// any promotion bucket (NoProgress / Worsened / Malformed / Noop /
+    /// Duplicate / Unsafe) and all repairable clusters in the active
+    /// `SemanticRepairPlan` are now in `exhausted_attempts`. Emit happens at
+    /// the production caller observing `PromotionResult.all_clusters_exhausted`.
+    RepairExhausted,
 }
 
 impl StopReason {
@@ -1301,6 +1380,7 @@ impl StopReason {
             StopReason::VerifierWeak => "verifier_weak",
             StopReason::VerifierMissing => "verifier_missing",
             StopReason::DiagnosticTargetMissing => "diagnostic_target_missing",
+            StopReason::RepairExhausted => "repair_exhausted",
         }
     }
 }
@@ -1583,6 +1663,17 @@ impl SafeStopReport {
                 // produce this variant, so we set it here explicitly.
                 if stop_reason == StopReason::DiagnosticTargetMissing {
                     failure_type = VerifierFailureType::DiagnosticTargetMissing;
+                }
+                // Issue #662 (design judgment #5 (b)): `RepairExhausted` is a
+                // meta-state ("same failure attacked >= 2 times") distinct
+                // from the underlying verifier failure type. Upgrade the
+                // payload's `failure_type` here so downstream `/bug-fix`
+                // consumers can branch on `failure_type == "repair_exhausted"`
+                // without inspecting `stop_reason`. The original
+                // `failure_signature` / `output_excerpt` continue to carry the
+                // root-cause verifier text.
+                if stop_reason == StopReason::RepairExhausted {
+                    failure_type = VerifierFailureType::RepairExhausted;
                 }
                 let diagnostic_reason = if stop_reason == StopReason::DiagnosticTargetMissing {
                     Some(select_diagnostic_target_missing_reason(
@@ -4790,24 +4881,107 @@ mod tests {
         )
     }
 
+    /// Issue #662: build a `RepairJob` with `semantic_plan = Some(...)` so the
+    /// `record_repair_attempt_outcome` precondition (`debug_assert!`) is
+    /// satisfied. `cluster_label` becomes the active plan's
+    /// `failure_cluster_id` and `role` is its `preferred_repair_role`.
+    /// `cluster_label` MUST match the outcome.cluster the test plans to push,
+    /// otherwise `next_repairable_cluster` will report the test cluster as
+    /// still repairable and `all_clusters_exhausted` will be false.
+    #[cfg(test)]
+    fn semantic_repair_job_for_test(cluster_label: &str, role: ArtifactRole) -> RepairJob {
+        let report = semantic_report_fixture_with_cluster(
+            cluster_label,
+            VerifierDiagnosticFailureKind::AssertionMismatch,
+            0.7,
+        );
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: role,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        RepairJob {
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        }
+    }
+
+    /// Issue #662: like `semantic_report_fixture` but with caller-supplied
+    /// `cluster_label` and a synthetic admitted target so the cluster is
+    /// considered repairable by `next_repairable_cluster`.
+    ///
+    /// The cluster's `cluster_key` is overridden to match
+    /// `cluster_key_for_test(cluster_label)` (the test SSOT used by outcome
+    /// fixtures) and `admitted_cluster_targets` is seeded with a single
+    /// synthetic `RecoveryTargetHint`. In production these targets are
+    /// populated by `turn.rs` after parsing; the test fixture short-circuits
+    /// that step.
+    #[cfg(test)]
+    fn semantic_report_fixture_with_cluster(
+        cluster_label: &str,
+        kind: VerifierDiagnosticFailureKind,
+        confidence: f32,
+    ) -> super::super::semantic_failure::SemanticFailureReport {
+        let json = serde_json::json!({
+            "failure_kind": kind_label(kind),
+            "confidence": confidence,
+            "preferred_repair_role": "implementation",
+            "repair_hypothesis": "hypothesis text",
+            "failure_clusters": [
+                {
+                    "observed": cluster_label,
+                    "expected": "exp",
+                    "input_shape": "shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["test"],
+                    "affected_cases": ["case1"],
+                }
+            ],
+        });
+        let mut report = super::super::semantic_failure::parse_semantic_failure_report(&json)
+            .expect("fixture parses");
+        // Override the cluster_key so it matches `cluster_key_for_test(cluster_label)`
+        // (which is the deterministic test SSOT used across outcome fixtures).
+        // Also seed admitted_cluster_targets with a synthetic hint so
+        // `next_repairable_cluster` considers the cluster repairable until
+        // it lands in `exhausted_attempts`.
+        if let Some(cluster) = report.failure_clusters.get_mut(0) {
+            cluster.cluster_key = cluster_key_for_test(cluster_label);
+            cluster.admitted_cluster_targets.push(
+                super::super::task_contract::RecoveryTargetHint {
+                    role: super::super::task_contract::ArtifactRole::Implementation,
+                    path: format!("tests/{cluster_label}_smoke.rs"),
+                    reason: "semantic fixture".to_string(),
+                },
+            );
+        }
+        report
+    }
+
     #[test]
     fn phase3_record_repair_attempt_outcome_initial_state() {
-        let mut job = RepairJob::new_for_test();
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Implementation);
         assert!(job.repair_attempt_outcomes.is_empty());
         let outcome = outcome_applied_no_progress("A", ArtifactRole::Implementation);
-        job.record_repair_attempt_outcome(outcome.clone());
+        let _ = job.record_repair_attempt_outcome(outcome.clone());
         assert_eq!(job.repair_attempt_outcomes.len(), 1);
         assert_eq!(job.repair_attempt_outcomes[0], outcome);
     }
 
     #[test]
     fn phase3_record_repair_attempt_outcome_fifo_cap_at_16() {
-        let mut job = RepairJob::new_for_test();
-        // Push 17 distinct outcomes (Applied so they never promote).
+        let mut job = semantic_repair_job_for_test("seed", ArtifactRole::Implementation);
+        // Push 17 distinct outcomes (distinct clusters so no promotion fires).
         for i in 0..(MAX_REPAIR_ATTEMPT_OUTCOMES + 1) {
             let label = format!("cluster-{i}");
             let outcome = outcome_applied_no_progress(&label, ArtifactRole::Implementation);
-            job.record_repair_attempt_outcome(outcome);
+            let _ = job.record_repair_attempt_outcome(outcome);
         }
         // Cap respected and oldest dropped (FIFO).
         assert_eq!(
@@ -4820,35 +4994,35 @@ mod tests {
 
     #[test]
     fn phase3_record_repair_attempt_outcome_does_not_bump_assessment_generation() {
-        let mut job = RepairJob::new_for_test();
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Test);
         job.assessment_generation = 7;
         let outcome = outcome_applied_no_progress("A", ArtifactRole::Test);
-        job.record_repair_attempt_outcome(outcome);
+        let _ = job.record_repair_attempt_outcome(outcome);
         assert_eq!(job.assessment_generation, 7, "S3-005: no bump");
     }
 
     #[test]
     fn phase3_repeated_test_weakening_promotes_to_exhausted_attempts_after_two_pushes() {
-        let mut job = RepairJob::new_for_test();
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Test);
         let outcome = outcome_rejected_unsafe(
             "A",
             ArtifactRole::Test,
             RepairRejectionKind::TestWeakening,
             WeakeningPattern::AssertionDeleted,
         );
-        job.record_repair_attempt_outcome(outcome.clone());
+        let _ = job.record_repair_attempt_outcome(outcome.clone());
         assert!(
             job.exhausted_attempts.is_empty(),
             "1 outcome must not promote"
         );
-        job.record_repair_attempt_outcome(outcome.clone());
+        let _ = job.record_repair_attempt_outcome(outcome.clone());
         assert_eq!(
             job.exhausted_attempts,
             vec![(cluster_key_for_test("A"), ArtifactRole::Test)],
             "2 outcomes must promote"
         );
         // idempotent: 3rd push must not duplicate.
-        job.record_repair_attempt_outcome(outcome);
+        let _ = job.record_repair_attempt_outcome(outcome);
         assert_eq!(
             job.exhausted_attempts,
             vec![(cluster_key_for_test("A"), ArtifactRole::Test)],
@@ -4857,11 +5031,11 @@ mod tests {
     }
 
     // ========================================================================
-    // Issue #654 — Bounded Safe Stop Report unit tests
+    // Issue #654 / #662 — Bounded Safe Stop Report unit tests
     // ========================================================================
 
     #[test]
-    fn stop_reason_as_str_covers_all_five_variants() {
+    fn stop_reason_as_str_covers_all_six_variants() {
         assert_eq!(
             StopReason::ArtifactCompletionFailed.as_str(),
             "artifact_completion_failed"
@@ -4876,18 +5050,19 @@ mod tests {
             StopReason::DiagnosticTargetMissing.as_str(),
             "diagnostic_target_missing"
         );
+        assert_eq!(StopReason::RepairExhausted.as_str(), "repair_exhausted");
     }
 
     #[test]
     fn phase3_distinct_clusters_do_not_promote_exhausted() {
-        let mut job = RepairJob::new_for_test();
-        job.record_repair_attempt_outcome(outcome_rejected_unsafe(
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Test);
+        let _ = job.record_repair_attempt_outcome(outcome_rejected_unsafe(
             "A",
             ArtifactRole::Test,
             RepairRejectionKind::TestWeakening,
             WeakeningPattern::AssertionDeleted,
         ));
-        job.record_repair_attempt_outcome(outcome_rejected_unsafe(
+        let _ = job.record_repair_attempt_outcome(outcome_rejected_unsafe(
             "B",
             ArtifactRole::Test,
             RepairRejectionKind::TestWeakening,
@@ -4897,22 +5072,28 @@ mod tests {
     }
 
     #[test]
-    fn phase3_applied_outcomes_do_not_promote_exhausted() {
-        let mut job = RepairJob::new_for_test();
+    fn phase3_applied_no_progress_promotes_under_issue_662() {
+        // Issue #662: expectation flip — `AppliedNoProgress` x 2 now promotes
+        // (was: never promoted under Issue #653).
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Implementation);
         for _ in 0..5 {
-            job.record_repair_attempt_outcome(outcome_applied_no_progress(
+            let _ = job.record_repair_attempt_outcome(outcome_applied_no_progress(
                 "A",
                 ArtifactRole::Implementation,
             ));
         }
-        assert!(job.exhausted_attempts.is_empty());
+        assert_eq!(
+            job.exhausted_attempts,
+            vec![(cluster_key_for_test("A"), ArtifactRole::Implementation)],
+            "Issue #662: AppliedNoProgress x 5 must promote"
+        );
     }
 
     #[test]
     fn phase3_snapshot_repair_attempt_outcomes_returns_clone() {
-        let mut job = RepairJob::new_for_test();
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Implementation);
         let outcome = outcome_applied_no_progress("A", ArtifactRole::Implementation);
-        job.record_repair_attempt_outcome(outcome);
+        let _ = job.record_repair_attempt_outcome(outcome);
         let mut snapshot = job.snapshot_repair_attempt_outcomes();
         snapshot.clear();
         assert_eq!(
@@ -4932,7 +5113,7 @@ mod tests {
     fn phase3_record_repair_attempt_outcome_idempotent_exhausted_push() {
         // Issue #653 T4.2: same RejectedUnsafe pushed 3 times → exhausted_attempts
         // contains exactly 1 entry (idempotent `contains` guard).
-        let mut job = RepairJob::new_for_test();
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Test);
         let outcome = outcome_rejected_unsafe(
             "A",
             ArtifactRole::Test,
@@ -4940,9 +5121,42 @@ mod tests {
             WeakeningPattern::AssertionDeleted,
         );
         for _ in 0..3 {
-            job.record_repair_attempt_outcome(outcome.clone());
+            let _ = job.record_repair_attempt_outcome(outcome.clone());
         }
         assert_eq!(job.exhausted_attempts.len(), 1);
+    }
+
+    #[test]
+    fn record_repair_attempt_outcome_returns_all_clusters_exhausted_when_last_cluster_promoted() {
+        // Issue #662: the active semantic_plan has exactly 1 repairable
+        // cluster ("A"). After 2 same-bucket outcomes that cluster lands in
+        // `exhausted_attempts`, `next_repairable_cluster` returns `None`, and
+        // the second push reports `all_clusters_exhausted = true`.
+        let mut job = semantic_repair_job_for_test("A", ArtifactRole::Implementation);
+        let outcome = outcome_applied_no_progress("A", ArtifactRole::Implementation);
+
+        let first = job.record_repair_attempt_outcome(outcome.clone());
+        assert!(!first.promoted, "1st push must not promote");
+        assert!(
+            !first.all_clusters_exhausted,
+            "1st push must leave cluster repairable"
+        );
+
+        let second = job.record_repair_attempt_outcome(outcome.clone());
+        assert!(second.promoted, "2nd push must promote");
+        assert!(
+            second.all_clusters_exhausted,
+            "2nd push exhausts the only repairable cluster"
+        );
+
+        // Idempotent: 3rd push must not re-promote but all_clusters_exhausted
+        // remains true (the ledger still says no clusters left).
+        let third = job.record_repair_attempt_outcome(outcome);
+        assert!(!third.promoted, "3rd push must be idempotent");
+        assert!(
+            third.all_clusters_exhausted,
+            "exhaustion is sticky across idempotent pushes"
+        );
     }
 
     #[test]
