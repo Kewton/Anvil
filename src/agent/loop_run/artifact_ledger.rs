@@ -667,7 +667,14 @@ fn emit_event_recorded(event: &ArtifactLedgerEvent, overflowed: bool) {
     );
 }
 
-fn stable_path_hash(masked_path: &str) -> String {
+/// Stable 16-hex hash of a `mask_secrets`-redacted path.
+///
+/// SSOT for path correlator hashing across `loop_run/*`. Promoted from
+/// private to `pub(super)` for Issue #666 so `job_report.rs` and
+/// `active_job_arbiter.rs` tests use one implementation. Production callers
+/// outside `loop_run` are forbidden by DR3-001; do NOT re-export from
+/// `loop_run.rs`.
+pub(super) fn stable_path_hash(masked_path: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();

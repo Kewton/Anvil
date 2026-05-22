@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod eval_log;
 pub mod export;
 pub mod feedback;
+pub(crate) mod job_report;
 pub mod precaution;
 pub mod rollout_policy;
 pub mod sessions_cli;

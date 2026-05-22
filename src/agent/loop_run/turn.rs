@@ -3807,6 +3807,13 @@ impl Agent {
         // turn to emit (None → Some triggers emit), so each turn starts the
         // observation series fresh.
         self.last_active_job_selection = None;
+        // Issue #666: per-turn fire-once dedup for the four new
+        // `agent.{artifact_completion,verification,repair,memory}.report`
+        // events. Reset adjacent to `safe_stop_report_emitted.clear()` and
+        // `last_active_job_selection = None` so all per-turn dedup state
+        // restarts together at turn boundary (locality, CLAUDE.md per-turn
+        // rule). NOT serialized.
+        self.job_report_dedup_keys.clear();
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -3880,7 +3887,16 @@ impl Agent {
                 .messages
                 .push(crate::session::store::ConversationMessage::system(hint));
         }
-        self.run_turn(input, stream_output, &mut monitor)
+        let result = self.run_turn(input, stream_output, &mut monitor);
+        // Issue #666: emit per-turn structured job reports just before
+        // returning. Wrapping the result guarantees emit fires once per
+        // turn regardless of how `run_turn` exited (Ok / Err / early
+        // return inside the loop). Order: 4 Report → SafeStopReport is
+        // preserved because `record_safe_stop_report` has already run by
+        // the time `run_turn` returns, so the SafeStopLinkage snapshot
+        // here reflects the final state of the turn (DR3-003).
+        self.maybe_emit_job_reports();
+        result
     }
 
     /// Issue #462: post-loop CaseRecord extraction. Pure success-condition,
@@ -10815,6 +10831,20 @@ impl Agent {
         if self.safe_stop_report_emitted.contains(&stop_reason) {
             return;
         }
+        // Issue #666 (CB-001 fix): emit per-turn job reports BEFORE the
+        // SafeStopReport so the llm-io event order is
+        // `agent.{x}.report → agent.safe_stop.report` per design Section
+        // 8-2. Per-turn dedup in `maybe_emit_job_reports` makes the
+        // post-`run_turn` finalizer at `handle_user_message` a no-op for
+        // any kind already emitted here. We record the stop_reason in
+        // `safe_stop_report_emitted` AFTER `maybe_emit_job_reports` so
+        // the SafeStopLinkage built into the job reports observes the
+        // pre-stop state of the dedup set (`report_emitted=false`); the
+        // job reports still carry the actual stop_reason via
+        // `safe_stop.reason` once the post-run finalizer is dedup'd out.
+        // Order: build linkage → emit 4 job reports → emit safe_stop.
+        let linkage_reason = Some(stop_reason.as_str().to_string());
+        self.maybe_emit_job_reports_with_linkage(linkage_reason);
         let report = super::repair_job::SafeStopReport::build_from(input, ctx);
         let payload = build_safe_stop_payload(&report);
         log_llm_event("agent.safe_stop.report", payload);

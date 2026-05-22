@@ -352,28 +352,12 @@ pub(super) fn project_policy(selection: &ActiveJobSelection) -> EffectiveToolPol
         .unwrap_or_else(EffectiveToolPolicy::unrestricted)
 }
 
-/// Stable, non-cryptographic correlator for masked workspace-relative
-/// paths. **NOT** a secret-hiding hash: the legitimate path-secrecy
-/// defence is `mask_secrets` + `mask_payload_inplace` (CLAUDE.md Security
-/// Invariants); this helper merely lets dataset consumers correlate
-/// observations about the same path across `agent.active_job.*` events
-/// without leaking the literal path.
-///
-/// Algorithm (must match `artifact_ledger.rs::stable_path_hash` —
-/// `DefaultHasher` → `{:016x}`). The two SSOTs are duplicated by design
-/// (DR2-003 / DR4-004): `artifact_ledger.rs::stable_path_hash` is module-
-/// private and intentionally not re-exported, so importing it here would
-/// require widening that mod's visibility surface and break the
-/// "ledger has no consumers outside turn.rs" rule. Future change must
-/// update **both** sites; the doc-comment alignment is the SSOT contract.
-#[cfg(test)]
-fn stable_path_hash(masked_path: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    masked_path.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+// Path-hash SSOT (Issue #666): `stable_path_hash` lives in
+// `super::artifact_ledger` with `pub(super)` visibility (formerly a
+// `#[cfg(test)]` duplicate lived here, tracked by DR2-003 / DR4-004
+// doc-comment alignment). The duplicate was removed to eliminate 3-way
+// drift risk (DR3-001 / Issue #666 §10-2). Tests below call the SSOT
+// directly via `super::super::artifact_ledger::stable_path_hash`.
 
 // ---------------------------------------------------------------------------
 // Unit tests
@@ -729,6 +713,8 @@ mod tests {
 
     #[test]
     fn stable_path_hash_is_deterministic_and_16_hex() {
+        // Issue #666: call the SSOT in `super::artifact_ledger` directly.
+        use super::super::artifact_ledger::stable_path_hash;
         let h1 = stable_path_hash("src/lib.rs");
         let h2 = stable_path_hash("src/lib.rs");
         assert_eq!(h1, h2);

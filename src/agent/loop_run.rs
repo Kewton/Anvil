@@ -128,6 +128,36 @@ mod success;
 // has been migrated here to keep the seams unreachable from release builds.
 #[cfg(test)]
 mod safe_stop_e2e_tests;
+// Issue #666: structured per-turn job reports
+// (ArtifactCompletion/Verification/Repair/Memory). Private mod, no
+// facade re-export (DR3-001). `turn.rs` is the only in-crate consumer
+// via `super::job_report::*`.
+mod job_report;
+// Issue #666: in-crate `#[cfg(test)]` E2E suite (CB-001 fix pattern,
+// safe_stop_e2e_tests.rs precedent). Production binary does not include
+// this module.
+#[cfg(test)]
+mod job_report_e2e_tests;
+
+/// Test seam (#[cfg(test)] only): drive
+/// `Agent::maybe_emit_job_reports_with_linkage` from
+/// `job_report_e2e_tests` without widening the production API.
+///
+/// CB-004 fix: empty turns produce no Reports by design. The test seam
+/// passes a synthetic linkage reason so the 3 linked Reports (Artifact,
+/// Verification, Repair) are forced observable for channel-wiring
+/// tests, and pre-seeds Memory observability via
+/// `last_injected_summary_ids`. Production callers go through
+/// `maybe_emit_job_reports` (no linkage override).
+#[cfg(test)]
+pub(crate) fn maybe_emit_job_reports_for_test(agent: &mut Agent) {
+    if agent.last_injected_summary_ids.is_empty() {
+        agent
+            .last_injected_summary_ids
+            .push("test-seed-summary-id".to_string());
+    }
+    agent.maybe_emit_job_reports_with_linkage(Some("test_synthetic".to_string()));
+}
 mod summary;
 mod task_contract;
 // Issue #646: task workspace scope detection. Module is intentionally
@@ -847,6 +877,17 @@ pub struct Agent {
     /// ledger lives only on `Agent`, never on `SessionSnapshot`.
     pub(in crate::agent::loop_run) artifact_ledger:
         crate::agent::loop_run::artifact_ledger::ArtifactLedger,
+    /// Issue #666: per-turn fire-once dedup keys for the four new
+    /// `agent.{artifact_completion,verification,repair,memory}.report`
+    /// events. Single namespaced HashSet — keys are
+    /// `"{event_name}::{report_dedup_key}"`. Reset at the head of every
+    /// `handle_user_message` adjacent to `safe_stop_report_emitted.clear()`
+    /// (CLAUDE.md per-turn rule).
+    ///
+    /// NOT serialized — same pattern as `safe_stop_report_emitted` and
+    /// `last_active_job_selection`. `SessionSnapshot` / `CaseRecord` /
+    /// `EvalTurnRecord` persistence schemas remain unchanged by Issue #666.
+    pub(in crate::agent::loop_run) job_report_dedup_keys: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1080,6 +1121,7 @@ impl Agent {
             safe_stop_report_emitted: std::collections::HashSet::new(),
             last_active_job_selection: None,
             artifact_ledger: artifact_ledger::ArtifactLedger::new(),
+            job_report_dedup_keys: std::collections::HashSet::new(),
         }
     }
 
