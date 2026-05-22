@@ -307,12 +307,50 @@ impl super::Agent {
             || self.artifact_completion_failed_diagnostic_emitted_this_turn
             || safe_stop.report_emitted;
         if acr_observable {
+            // Issue #663 (Phase D / AD6): the `budget_state` JSON is the
+            // additive 5-state projection of `ArtifactCompletionStatus`
+            // plus role / attempts / target_present / projection overflow.
+            // `PAYLOAD_SCHEMA_VERSION` stays at `1` (additive only).
+            // Raw target path NEVER included — `target_path_hash` is the
+            // only correlator (CLAUDE.md Security Invariants).
+            let budget_state = self.artifact_completion_job.as_ref().map(|job| {
+                use crate::logging::stable_path_hash;
+                use crate::session::feedback::mask_secrets;
+                let status_label: &'static str = match job.status() {
+                    super::artifact_completion_job::ArtifactCompletionStatus::PendingTarget => {
+                        "PendingTarget"
+                    }
+                    super::artifact_completion_job::ArtifactCompletionStatus::AwaitingEdit => {
+                        "AwaitingEdit"
+                    }
+                    super::artifact_completion_job::ArtifactCompletionStatus::EvidenceObserved => {
+                        "EvidenceObserved"
+                    }
+                    super::artifact_completion_job::ArtifactCompletionStatus::Satisfied => {
+                        "Satisfied"
+                    }
+                    super::artifact_completion_job::ArtifactCompletionStatus::Exhausted {
+                        ..
+                    } => "Exhausted",
+                };
+                let target_path_hash = stable_path_hash(&mask_secrets(job.target_path()));
+                serde_json::json!({
+                    "state": status_label,
+                    "role": job.role().label(),
+                    "remaining_budget": job.remaining_budget() as u32,
+                    "attempts_used": job.attempts().len() as u32,
+                    "attempts_limit": super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT as u32,
+                    "target_present": !job.target_path().is_empty(),
+                    "target_path_hash": target_path_hash,
+                    "projection_overflowed": self.artifact_ledger.overflowed(),
+                })
+            });
             let acr = ArtifactCompletionReport {
                 turn_index,
                 job_present: self.artifact_completion_job.is_some(),
                 attempt_outcomes: Vec::new(),
                 role_policy_violation: None,
-                budget_state: None,
+                budget_state,
                 artifact_projection_status: default_projection_status(),
                 safe_stop: safe_stop.clone(),
             };
@@ -383,17 +421,32 @@ impl super::Agent {
     /// Read the SafeStopLinkage from per-turn dedup state.
     ///
     /// The `safe_stop_report_emitted` HashSet holds every StopReason
-    /// emitted in this turn. We surface the first reason via its `.label()`
-    /// (stable across versions) for the linkage `reason` field.
+    /// emitted in this turn. We surface ONE reason for the linkage's
+    /// `reason` field via a **fixed priority order** (Issue #663 CB-003
+    /// fix) so the linkage carried by downstream Reports / persisted JSONL
+    /// is deterministic across runs even when multiple terminal causes
+    /// were inserted in the same turn. The priority mirrors the
+    /// actor-loop "first terminal cause" intent: artifact completion
+    /// failure is observed before any verifier-driven stop, which in
+    /// turn precedes repair exhaustion.
     fn snapshot_safe_stop_linkage(&self) -> SafeStopLinkage {
+        use super::repair_job::StopReason;
         if self.safe_stop_report_emitted.is_empty() {
             return SafeStopLinkage::default();
         }
-        let reason = self
-            .safe_stop_report_emitted
+        // Fixed priority order — first hit wins. NOTE: must be updated if a
+        // new `StopReason` variant is added.
+        const PRIORITY: &[StopReason] = &[
+            StopReason::ArtifactCompletionFailed,
+            StopReason::VerifierFailedSafeStop,
+            StopReason::VerifierWeak,
+            StopReason::VerifierMissing,
+            StopReason::DiagnosticTargetMissing,
+            StopReason::RepairExhausted,
+        ];
+        let reason = PRIORITY
             .iter()
-            .next()
-            .copied()
+            .find(|r| self.safe_stop_report_emitted.contains(*r))
             .map(|r| r.as_str().to_string());
         SafeStopLinkage {
             reason,

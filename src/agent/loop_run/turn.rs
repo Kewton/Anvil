@@ -463,6 +463,14 @@ impl EffectiveToolPolicy {
         }
     }
 
+    /// Issue #663 (CB-001 fix): test-only legacy constructor. Production
+    /// builds drive ArtifactRecovery exclusively via
+    /// `artifact_directed_from_job` so that `AllowedWriteActions` /
+    /// `AllowedReadScope` always originate from a validated
+    /// `ArtifactCompletionJob`. This constructor is retained behind
+    /// `cfg(test)` to keep regression tests for the legacy filesystem-
+    /// derived projection compilable.
+    #[cfg(test)]
     pub(super) fn artifact_directed(target: PathBuf, target_already_read: bool) -> Self {
         let allowed_tools = if !target.is_file() {
             vec!["Write"]
@@ -4224,6 +4232,15 @@ impl Agent {
                 .push(crate::session::store::ConversationMessage::system(hint));
         }
         let result = self.run_turn(input, stream_output, &mut monitor);
+        // Issue #663 (Phase B / AD2 / DR1-001): refresh the active
+        // `ArtifactCompletionJob` Satisfied state from the ledger
+        // projection. This is the SSOT chokepoint — no status guard
+        // here, the guard lives inside
+        // `ArtifactCompletionJob::record_satisfied_from_ledger`
+        // (DR1-001 SSOT集約). Runs BEFORE `maybe_emit_job_reports` so
+        // the job state emitted in `ArtifactCompletionReport` reflects
+        // ledger-driven Satisfied transitions for the turn.
+        self.refresh_artifact_completion_satisfied();
         // Issue #666: emit per-turn structured job reports just before
         // returning. Wrapping the result guarantees emit fires once per
         // turn regardless of how `run_turn` exited (Ok / Err / early
@@ -4233,6 +4250,33 @@ impl Agent {
         // here reflects the final state of the turn (DR3-003).
         self.maybe_emit_job_reports();
         result
+    }
+
+    /// Issue #663 (AD2 / AD9 / DR1-001): SSOT chokepoint for the
+    /// ledger-driven Satisfied transition. Status guard is intentionally
+    /// absent here — it lives inside
+    /// `ArtifactCompletionJob::record_satisfied_from_ledger`. The function
+    /// computes the projection once and delegates to every active job.
+    ///
+    /// Today the Agent still holds a single `Option<ArtifactCompletionJob>`
+    /// (the BTreeMap migration tracked in AD9 is staged for the legacy
+    /// counter cleanup follow-up PR); the function therefore iterates the
+    /// single-entry option but is shaped so the future BTreeMap
+    /// substitution is a single-line replacement.
+    pub(super) fn refresh_artifact_completion_satisfied(&mut self) {
+        if self.artifact_completion_job.is_none() {
+            return;
+        }
+        let task_contract = match self.active_request_text() {
+            Some(req) => super::task_contract::TaskContract::from_request(&req),
+            None => return,
+        };
+        let projection = self
+            .artifact_ledger
+            .required_artifacts_completed_projection(&task_contract);
+        if let Some(job) = self.artifact_completion_job.as_mut() {
+            job.record_satisfied_from_ledger(&projection);
+        }
     }
 
     /// Issue #462: post-loop CaseRecord extraction. Pure success-condition,
@@ -10353,31 +10397,30 @@ impl Agent {
         }
 
         // Priority 3: ArtifactRecovery.
-        if let Some(target) = self.artifact_recovery_target_path() {
+        // Issue #663 (Phase C / AD5 / DR1-006 / CB-001 fix): ArtifactRecovery
+        // candidate is generated ONLY when an `ArtifactCompletionJob` is
+        // installed. The job is the single source of truth for
+        // `AllowedWriteActions` / `AllowedReadScope` / role-specific budget,
+        // and the policy is always built via `artifact_directed_from_job`.
+        // The previous fallback to the generic write-capable
+        // `artifact_directed` policy (when target was set but job was None)
+        // bypassed target validation and role-specific budget, so it is
+        // removed: a bare `current_artifact_recovery_target` without a job
+        // produces no write-capable candidate.
+        if let (Some(target), Some(job)) = (
+            self.artifact_recovery_target_path(),
+            self.artifact_completion_job.as_ref(),
+        ) {
             let target_already_read =
                 focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            let policy = if let Some(job) = self.artifact_completion_job.as_ref()
-                && matches!(job.role(), super::task_contract::ArtifactRole::Test)
-            {
-                EffectiveToolPolicy::artifact_directed_from_job(
-                    target.clone(),
-                    target_already_read,
-                    job.allowed_write_actions(),
-                    job.allowed_read_scope(),
-                )
-            } else {
-                EffectiveToolPolicy::artifact_directed(target.clone(), target_already_read)
-            };
-            let (write_actions, read_scope) = match self.artifact_completion_job.as_ref() {
-                Some(job) if matches!(job.role(), super::task_contract::ArtifactRole::Test) => (
-                    job.allowed_write_actions().clone(),
-                    job.allowed_read_scope().clone(),
-                ),
-                _ => (
-                    super::artifact_completion_job::AllowedWriteActions::target_create_only(),
-                    super::artifact_completion_job::AllowedReadScope::TargetOnly,
-                ),
-            };
+            let policy = EffectiveToolPolicy::artifact_directed_from_job(
+                target.clone(),
+                target_already_read,
+                job.allowed_write_actions(),
+                job.allowed_read_scope(),
+            );
+            let write_actions = job.allowed_write_actions().clone();
+            let read_scope = job.allowed_read_scope().clone();
             candidates.push(JobCandidate {
                 kind: ActiveJobKind::ArtifactRecovery,
                 desired_action: DesiredAction::ArtifactDirected {
@@ -12004,7 +12047,11 @@ impl Agent {
         if matches!(
             status_after,
             super::artifact_completion_job::ArtifactCompletionStatus::Exhausted { .. }
-        ) {
+        )
+        // Issue #663 (Phase A): with 5 variants the `Exhausted` match
+        // remains the only terminal-failure trigger; new states do not
+        // alter the diagnostic surface.
+        {
             // CB-002: tag the turn so the actor loop terminates with
             // `MissingRepoEdits` even on call paths that previously
             // dropped the return value (artifact-directed policy
@@ -13551,22 +13598,14 @@ impl Agent {
         &mut self,
         hint: &super::task_contract::RecoveryTargetHint,
     ) -> JobInstallOutcome {
-        if hint.role != super::task_contract::ArtifactRole::Test {
-            // CB2-001: non-test roles fall back to the existing generic
-            // recovery path (design judgement #11 —
-            // `role_from_repo_edit(Other)` semantics), BUT a prior Test
-            // job's expected target is now stale relative to the new
-            // (Implementation / UsageDocs / Setup) `current_artifact_
-            // recovery_target`. Leaving the Test job in place would let
-            // subsequent NoTool / ProseOnly / RolePolicyViolation events
-            // consume the old Test budget and fire
-            // `artifact_completion_failed role=test` for a target that no
-            // longer represents the agent's recovery focus. Drop the
-            // stale job here so role-changes always start with an empty
-            // job slot for non-Test roles.
-            self.artifact_completion_job = None;
-            return JobInstallOutcome::InstalledOrSkipped;
-        }
+        // Issue #663 (Phase C / AD5): the legacy `hint.role != Test`
+        // early-return is removed — all required roles (Implementation /
+        // Test / UsageDocs / Setup) install/refresh an
+        // `ArtifactCompletionJob` so the role-specific budget and
+        // attempt-history apply uniformly. The previous "drop the stale
+        // Test job" behaviour for non-Test roles is preserved below by
+        // the identity-refresh + atomic-clear ordering, which now applies
+        // to every role.
         let trimmed = hint.path.trim();
         // Identity refresh: same role + same target → keep the existing
         // job (and its retry budget) intact. Same-target hints must NOT
@@ -16762,23 +16801,31 @@ mod tests {
         ] {
             let (mut agent, _temp) = test_agent_with_config(Config::default());
             std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+            std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+            std::fs::create_dir_all(agent.work_root.join("docs")).unwrap();
             install_artifact_completion_job_for_test(&mut agent, "tests/test_foo.py");
             assert!(
                 agent.artifact_completion_job.is_some(),
                 "fixture invariant: initial Test job installs ({new_role:?})"
             );
-            // Now point the recovery target at a non-Test role. The
-            // path itself is irrelevant — the function early-returns
-            // on non-Test BEFORE consulting the path validator.
+            // Issue #663 (Phase C / AD5): non-Test roles also install a
+            // job (the Test-only early-return is lifted). The prior Test
+            // job is dropped and replaced by the new role's job.
             let non_test_hint = RecoveryTargetHint {
                 role: new_role,
                 path: "src/main.py".to_string(),
                 reason: "role change".to_string(),
             };
             agent.maybe_install_artifact_completion_job_for_hint(&non_test_hint);
-            assert!(
-                agent.artifact_completion_job.is_none(),
-                "CB2-001: non-Test hint ({new_role:?}) MUST clear the prior Test job"
+            let job = agent
+                .artifact_completion_job
+                .as_ref()
+                .expect("Issue #663: non-Test hint MUST install a job for the new role");
+            assert_eq!(job.role(), new_role, "new job carries the new role");
+            assert_eq!(
+                job.target_path(),
+                "src/main.py",
+                "new job points at the new hint's path",
             );
         }
     }
@@ -16880,6 +16927,7 @@ mod tests {
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
         let test_hint = RecoveryTargetHint {
             role: ArtifactRole::Test,
             path: "tests/test_foo.py".to_string(),
@@ -16896,10 +16944,14 @@ mod tests {
             reason: "missing implementation".to_string(),
         };
         agent.set_artifact_recovery_target_from_hint(impl_hint, 0);
-        assert!(
-            agent.artifact_completion_job.is_none(),
-            "CB2-001: switching the recovery target from Test to Implementation MUST clear the Test job"
-        );
+        // Issue #663 (Phase C / AD5): non-Test roles also install a job.
+        // The Test job is replaced by the new Implementation job.
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("Issue #663: Implementation hint MUST install a job for the new role");
+        assert_eq!(job.role(), ArtifactRole::Implementation);
+        assert_eq!(job.target_path(), "src/main.py");
     }
 
     #[test]
@@ -17430,17 +17482,17 @@ mod tests {
     }
 
     #[test]
-    fn pr001_non_test_role_valid_hint_still_sets_projection_without_job() {
-        // Non-Test roles do not install an `ArtifactCompletionJob` today
-        // (only Test triggers the role-specific budget). The projection
-        // must still update so the legacy artifact-directed recovery
-        // notes keep firing — this confirms the SSOT invariant only
-        // narrows behavior for the Test role.
+    fn pr001_non_test_role_valid_hint_installs_job_for_role() {
+        // Issue #663 (Phase C / AD5): non-Test roles now ALSO install an
+        // `ArtifactCompletionJob`. The Test-only early-return is lifted,
+        // so a valid Implementation hint (or UsageDocs / Setup) installs
+        // a job carrying the role's budget exactly the same way Test did.
         use crate::agent::loop_run::commands::test_agent_with_config;
         use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTargetHint};
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
         let impl_hint = RecoveryTargetHint {
             role: ArtifactRole::Implementation,
             path: "src/main.py".to_string(),
@@ -17451,10 +17503,12 @@ mod tests {
             result.is_some(),
             "valid non-Test hint must commit the projection"
         );
-        assert!(
-            agent.artifact_completion_job.is_none(),
-            "non-Test hint must not install a job"
-        );
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("Issue #663: valid Implementation hint installs a job");
+        assert_eq!(job.role(), ArtifactRole::Implementation);
+        assert_eq!(job.target_path(), "src/main.py");
         let projection = agent
             .current_artifact_recovery_target
             .as_ref()
@@ -17837,8 +17891,9 @@ mod tests {
 
     #[test]
     fn issue660_phase_d_artifact_recovery_selected_skips_generic_small_edit_fallback() {
+        use super::super::artifact_completion_job::ArtifactCompletionJob;
         use super::super::commands::test_agent_with_config;
-        use super::super::task_contract::{ArtifactRole, RecoveryTarget};
+        use super::super::task_contract::{ArtifactRole, RecoveryTarget, RecoveryTargetHint};
         use crate::config::{Config, DeterministicFallbackMode};
 
         let cfg = Config {
@@ -17847,13 +17902,26 @@ mod tests {
         };
         let (mut agent, _temp) = test_agent_with_config(cfg);
 
-        // Install ArtifactRecovery via a non-Test role (Implementation) so
-        // we do not need to attach an `ArtifactCompletionJob` (which would
-        // require Test-role artifact path validation). The arbiter still
-        // routes the turn through `artifact_recovery_target_path()` and
-        // returns an `artifact_directed` policy.
+        // Issue #663 (Phase C / CB-001 fix): ArtifactRecovery requires BOTH
+        // `current_artifact_recovery_target` AND an `ArtifactCompletionJob`.
+        // Without a job the arbiter no longer produces a write-capable
+        // candidate (regression guard for write policy bypass).
         std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
         std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
+        let scope = agent.current_workspace_scope();
+        let job = ArtifactCompletionJob::new(
+            &agent.work_root,
+            &scope,
+            RecoveryTargetHint {
+                role: ArtifactRole::Implementation,
+                path: "src/main.py".to_string(),
+                reason: "missing implementation".to_string(),
+            },
+            true,
+            false,
+        )
+        .expect("Implementation-role job for src/main.py must be installable");
+        agent.artifact_completion_job = Some(job);
         agent.current_artifact_recovery_target = Some(RecoveryTarget {
             role: ArtifactRole::Implementation,
             path: "src/main.py".to_string(),
@@ -17883,6 +17951,112 @@ mod tests {
             "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
              ArtifactRecovery is the active job; got {result:?}"
         );
+    }
+
+    /// Issue #663 (CB-001 regression guard): when
+    /// `current_artifact_recovery_target` is set but no
+    /// `ArtifactCompletionJob` is installed, the arbiter MUST NOT produce
+    /// an `ArtifactDirectedRecovery` policy. The previous fallback to the
+    /// write-capable generic `artifact_directed` policy bypassed
+    /// role-specific `AllowedWriteActions` and budget validation; this
+    /// test pins the post-fix invariant.
+    #[test]
+    fn issue663_cb001_artifact_recovery_without_job_produces_no_artifact_directed_policy() {
+        use super::super::active_job_arbiter::ActiveJobKind;
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{ArtifactRole, RecoveryTarget};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+        std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Implementation,
+            path: "src/main.py".to_string(),
+            reason: "missing implementation".to_string(),
+            attempt: 1,
+        });
+        // Intentionally do NOT install an ArtifactCompletionJob.
+        assert!(agent.artifact_completion_job.is_none());
+
+        let policy = agent.effective_tool_policy();
+        assert_ne!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::ArtifactDirectedRecovery,
+            "CB-001: bare recovery target without a job MUST NOT yield ArtifactDirectedRecovery"
+        );
+
+        let selection = agent.current_active_job_selection();
+        let chose_artifact_recovery = selection
+            .selected
+            .as_ref()
+            .is_some_and(|j| matches!(j.kind, ActiveJobKind::ArtifactRecovery));
+        assert!(
+            !chose_artifact_recovery,
+            "CB-001: ArtifactRecovery candidate MUST NOT be selected without a job"
+        );
+    }
+
+    /// Issue #663 (Codex CB-004 regression guard): `collect_recent_action_labels`
+    /// MUST emit hashed correlators (`<16-hex>`) instead of raw paths or raw
+    /// bash commands. Verifies that a secret-shaped path and a workspace path
+    /// are both replaced by hashes in the label output.
+    #[test]
+    fn issue663_cb004_collect_recent_action_labels_uses_hashed_correlators() {
+        use crate::ollama::xml_fallback::ToolCall;
+        use crate::session::store::ConversationMessage;
+        use serde_json::json;
+
+        let secret_path = "src/secret-sk-AAAAAAAAAAAAAAAAAAAAAAAAA/foo.rs";
+        let workspace_path = "src/main.rs";
+        let bash_cmd = "echo sk-BBBBBBBBBBBBBBBBBBBBBBBBB > /tmp/leak.txt";
+
+        let messages = vec![ConversationMessage::assistant(
+            String::new(),
+            vec![
+                ToolCall {
+                    id: "tc-read".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path": workspace_path}),
+                },
+                ToolCall {
+                    id: "tc-write".to_string(),
+                    name: "Write".to_string(),
+                    arguments: json!({"path": secret_path}),
+                },
+                ToolCall {
+                    id: "tc-bash".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": bash_cmd}),
+                },
+            ],
+        )];
+
+        let labels = super::collect_recent_action_labels(&messages);
+        assert_eq!(labels.len(), 3, "all three tool calls produce labels");
+        for label in &labels {
+            assert!(
+                !label.contains(workspace_path),
+                "CB-004: raw workspace path leaked into label: {label:?}"
+            );
+            assert!(
+                !label.contains(secret_path),
+                "CB-004: raw secret-shaped path leaked into label: {label:?}"
+            );
+            assert!(
+                !label.contains(bash_cmd),
+                "CB-004: raw bash command leaked into label: {label:?}"
+            );
+            assert!(
+                !label.contains("sk-"),
+                "CB-004: secret-shaped fragment leaked into label: {label:?}"
+            );
+            // Hash form: `<NAME> <16-hex>` with angle brackets.
+            assert!(
+                label.contains('<') && label.contains('>'),
+                "CB-004: label must use the `<hash>` correlator form, got: {label:?}"
+            );
+        }
     }
 
     #[test]
@@ -23105,12 +23279,21 @@ pub(super) const SAFE_STOP_REPORT_EVENT_MAX_BYTES: usize = 4096;
 
 /// Issue #654 — collect a compact list of recent action labels (newest-last)
 /// from the conversation message stream for use as the `actual_actions_raw`
-/// input to `SafeStopContext`. Looks at the **most recent** `Read` / `Write`
+/// input to `SafeStopContext`.
+///
+/// Issue #663 (Codex CB-004 fix): looks at the most recent `Read` / `Write`
 /// / `Edit` / `Bash` tool calls in the last ~24 messages and produces label
-/// strings like `"Read src/foo.rs"` so the safe stop report can surface the
-/// most recent user-observable activity without leaking secret-bearing
-/// command stdout.
+/// strings whose `detail` is a 16-hex `stable_path_hash` of the
+/// mask-sanitized argument — NOT the raw path or raw command. This prevents
+/// raw workspace paths and raw bash commands from appearing in the
+/// `agent.safe_stop.report.actual_actions` surface (or in downstream
+/// persisted JSONL), independent of the downstream `mask_secrets` +
+/// `mask_payload_inplace` defence-in-depth. The hash is non-cryptographic
+/// (`DefaultHasher`) but is the existing correlator SSOT (`stable_path_hash`)
+/// so log consumers can correlate by hash if they retain workspace context.
 fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String> {
+    use crate::logging::stable_path_hash;
+    use crate::session::feedback::mask_secrets;
     const SCAN_LIMIT: usize = 24;
     let mut out: Vec<String> = Vec::new();
     let scan_start = messages.len().saturating_sub(SCAN_LIMIT);
@@ -23123,7 +23306,11 @@ fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String>
             if !matches!(name, "Read" | "Write" | "Edit" | "Bash") {
                 continue;
             }
-            let detail = tool_call
+            // CB-004: derive a hashed correlator (never the raw value) for
+            // the argument that names the action's target. `Read` / `Write`
+            // / `Edit` use `path`; `Bash` uses `command`. Empty / missing
+            // arguments emit a name-only label.
+            let raw_detail = tool_call
                 .arguments
                 .get("path")
                 .and_then(serde_json::Value::as_str)
@@ -23133,12 +23320,19 @@ fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String>
                         .get("command")
                         .and_then(serde_json::Value::as_str)
                 })
-                .unwrap_or("")
-                .to_string();
-            let label = if detail.is_empty() {
+                .unwrap_or("");
+            let label = if raw_detail.is_empty() {
                 name.to_string()
             } else {
-                format!("{name} {detail}")
+                // `stable_path_hash` is the existing SSOT (16-hex
+                // DefaultHasher) and is documented to be applied after
+                // `mask_secrets`. The same convention is used by
+                // `artifact_ledger`'s observability events and by
+                // `active_job_arbiter`. Bash commands are not paths but
+                // share the same correlator surface — re-using the SSOT
+                // keeps the hash space stable.
+                let hash = stable_path_hash(&mask_secrets(raw_detail));
+                format!("{name} <{hash}>")
             };
             out.push(label);
         }
