@@ -3788,11 +3788,6 @@ impl Agent {
         // a prior turn cannot mask the next turn's first write.
         self.turn_edited_relative_paths.clear();
         self.turn_pre_tool_file_hashes.clear();
-        // Issue #659 (Task 2.2): per-turn ArtifactLedger reset. Lives at
-        // the same per-turn boundary as `turn_edited_relative_paths` /
-        // `turn_pre_tool_file_hashes` so all artifact-observation state
-        // restarts together on a fresh user turn (CLAUDE.md per-turn rule).
-        self.clear_per_turn_ledger_state();
         self.missing_verifier_job = None;
         // Issue #654: per-turn dedup marker reset (DR1-006 / DR2-005). The
         // `agent.safe_stop.report` event is emitted at most once per
@@ -3842,7 +3837,24 @@ impl Agent {
         // dataset export can join `agent.reminder.completed` with
         // `agent.anvil_score.computed` events by `(session_id, turn_index)`.
         // Saturating add defends against pathological session lengths.
+        //
+        // Issue #659 PR-002 (Option B): perform the increment **before** the
+        // per-turn ArtifactLedger reset so the upcoming turn index is the
+        // post-increment value. Decoupling the increment from the stamp
+        // timing prevents an off-by-one where `event_recorded` /
+        // `turn_summary` carry `N-1` while every other observability event
+        // emitted during the same user turn carries `N`.
         self.current_turn_index = self.current_turn_index.saturating_add(1);
+        // Issue #659 (Task 2.2 / PR-002): per-turn ArtifactLedger reset.
+        // Lives at the same per-turn boundary as
+        // `turn_edited_relative_paths.clear()` / `turn_pre_tool_file_hashes.clear()`
+        // above so all artifact-observation state restarts together on a
+        // fresh user turn (CLAUDE.md per-turn rule). The upcoming turn
+        // index is passed explicitly so the ledger log context stamp
+        // shares `(session_id, turn_index)` join keys with sibling
+        // observability events.
+        let upcoming_turn_index = u32::try_from(self.current_turn_index).unwrap_or(u32::MAX);
+        self.clear_per_turn_ledger_state_for_turn(upcoming_turn_index);
         // Issue #556: clear per-turn photon context_pack response.
         self.photon_context_pack_response = None;
         // Issue #558: clear context_pack_id (turn boundary).
@@ -11965,8 +11977,43 @@ impl Agent {
     /// resets. Kept as its own helper so the test seam in
     /// `artifact_ledger_phase2_tests` can drive the reset without spinning
     /// up the full `handle_user_message` pipeline.
-    pub(super) fn clear_per_turn_ledger_state(&mut self) {
+    ///
+    /// Issue #659 PR-001: after the reset, stamp the per-turn observability
+    /// log context (`session_id`, `turn_index`) so every subsequent
+    /// `event_recorded` / `turn_summary` payload carries the join keys
+    /// required by Section 7.1 of the design policy.
+    ///
+    /// Issue #659 PR-002 (Option B): callers pass `upcoming_turn_index`
+    /// **explicitly** rather than letting this helper read
+    /// `self.current_turn_index`. Decoupling production sequencing
+    /// (`current_turn_index.saturating_add(1)` happens later in
+    /// `handle_user_message`) from stamp timing fixes the off-by-one that
+    /// caused `event_recorded` / `turn_summary` to carry a `turn_index`
+    /// one less than the matching `agent.work_mode.classified` and other
+    /// observability events on the same user turn. The parameter is
+    /// `u32` because the ledger payload schema declares `turn_index` as
+    /// `u32`; callers using `usize` should narrow via `try_into`, saturating
+    /// to `u32::MAX` for pathological session lengths beyond 4B turns
+    /// (losing granularity is acceptable; wrapping is not).
+    pub(super) fn clear_per_turn_ledger_state_for_turn(&mut self, upcoming_turn_index: u32) {
         self.artifact_ledger.clear();
+        let session_id = self.session_store.session_id().to_string();
+        self.artifact_ledger.set_log_context(
+            super::artifact_ledger::ArtifactLedgerLogContext::new(session_id, upcoming_turn_index),
+        );
+    }
+
+    /// Issue #659 PR-002 — back-compat shim for unit tests that already
+    /// position `self.current_turn_index` to the value they want stamped
+    /// before calling the per-turn reset. Production code MUST use
+    /// `clear_per_turn_ledger_state_for_turn(upcoming_turn_index)` so the
+    /// upcoming index is explicit at the call site (decoupling production
+    /// sequencing from stamp timing). This shim narrows `current_turn_index`
+    /// the same way the original helper did.
+    #[cfg(test)]
+    pub(super) fn clear_per_turn_ledger_state(&mut self) {
+        let upcoming = u32::try_from(self.current_turn_index).unwrap_or(u32::MAX);
+        self.clear_per_turn_ledger_state_for_turn(upcoming);
     }
 
     /// Issue #659 (Task 2.2) — emit the end-of-turn
@@ -12166,6 +12213,16 @@ impl Agent {
     ) {
         let only_legacy: Vec<String> = legacy.difference(ledger).cloned().collect();
         let only_ledger: Vec<String> = ledger.difference(legacy).cloned().collect();
+        // Issue #659 PR-001: emit bounded masked path-hash lists per
+        // Section 7.1 of the design policy. The hash space matches
+        // `event_recorded.path_hash` exactly (mask_secrets → DefaultHasher,
+        // 16-char hex) so dataset consumers can join divergence rows back
+        // to per-event rows. Hard cap at 16 entries each (raw path is
+        // never emitted).
+        let legacy_path_hashes =
+            super::artifact_ledger::bounded_masked_path_hashes(legacy.iter().map(String::as_str));
+        let ledger_path_hashes =
+            super::artifact_ledger::bounded_masked_path_hashes(ledger.iter().map(String::as_str));
         log_llm_event(
             "agent.artifact_ledger.divergence_detected",
             serde_json::json!({
@@ -12176,6 +12233,8 @@ impl Agent {
                 "ledger_count": ledger.len() as u32,
                 "only_legacy_count": only_legacy.len() as u32,
                 "only_ledger_count": only_ledger.len() as u32,
+                "legacy_path_hashes": legacy_path_hashes,
+                "ledger_path_hashes": ledger_path_hashes,
             }),
         );
     }
@@ -12456,11 +12515,25 @@ impl Agent {
     /// ledger-projection derivations of `task_contract_artifact_states`
     /// disagree. `authority="legacy"` is preserved per Phase 6.1 of the
     /// design policy. No raw paths are emitted; only role / kind counts.
+    ///
+    /// Issue #659 PR-001: also emit bounded masked path-hash lists (max
+    /// 16 entries each, deterministic order via BTreeSet) so dataset
+    /// consumers can join divergence rows back to per-event rows. Rows
+    /// without a path (`ArtifactState::changed(role)`) are skipped per
+    /// DR2-002 — only path-bearing states contribute.
     fn emit_artifact_state_projection_divergence(
         &self,
         legacy: &[super::task_contract::ArtifactState],
         ledger: &[super::task_contract::ArtifactState],
     ) {
+        let legacy_paths: std::collections::BTreeSet<&str> =
+            legacy.iter().filter_map(|s| s.path.as_deref()).collect();
+        let ledger_paths: std::collections::BTreeSet<&str> =
+            ledger.iter().filter_map(|s| s.path.as_deref()).collect();
+        let legacy_path_hashes =
+            super::artifact_ledger::bounded_masked_path_hashes(legacy_paths.iter().copied());
+        let ledger_path_hashes =
+            super::artifact_ledger::bounded_masked_path_hashes(ledger_paths.iter().copied());
         log_llm_event(
             "agent.artifact_ledger.divergence_detected",
             serde_json::json!({
@@ -12470,6 +12543,8 @@ impl Agent {
                 "projection": "task_contract_artifact_states",
                 "legacy_count": legacy.len() as u32,
                 "ledger_count": ledger.len() as u32,
+                "legacy_path_hashes": legacy_path_hashes,
+                "ledger_path_hashes": ledger_path_hashes,
             }),
         );
     }
@@ -12537,11 +12612,23 @@ impl Agent {
     /// ledger-projection derivations of `owned_test_artifacts_for_verifier`
     /// disagree. `authority="legacy"` is preserved per Phase 6.1 of the
     /// design policy. No raw paths are emitted; only role / count metadata.
+    ///
+    /// Issue #659 PR-001: also emit bounded masked path-hash lists (max
+    /// 16 entries each, deterministic order via BTreeSet) so dataset
+    /// consumers can join divergence rows back to per-event rows.
     fn emit_owned_test_artifacts_projection_divergence(
         &self,
         legacy: &[String],
         ledger: &[String],
     ) {
+        let legacy_set: std::collections::BTreeSet<&str> =
+            legacy.iter().map(String::as_str).collect();
+        let ledger_set: std::collections::BTreeSet<&str> =
+            ledger.iter().map(String::as_str).collect();
+        let legacy_path_hashes =
+            super::artifact_ledger::bounded_masked_path_hashes(legacy_set.iter().copied());
+        let ledger_path_hashes =
+            super::artifact_ledger::bounded_masked_path_hashes(ledger_set.iter().copied());
         log_llm_event(
             "agent.artifact_ledger.divergence_detected",
             serde_json::json!({
@@ -12551,6 +12638,8 @@ impl Agent {
                 "projection": "owned_test_artifacts_for_verifier",
                 "legacy_count": legacy.len() as u32,
                 "ledger_count": ledger.len() as u32,
+                "legacy_path_hashes": legacy_path_hashes,
+                "ledger_path_hashes": ledger_path_hashes,
             }),
         );
     }
