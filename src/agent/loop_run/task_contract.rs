@@ -688,6 +688,185 @@ impl TaskContract {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #664 (AD13 / AD18 / AD22 / DR1-002 SSOT): Setup signal accessors and
+// VerifierPrerequisiteSignal newtype. `pub(super)` limited; external callers
+// (only `active_job_arbiter::should_install_setup_bootstrap`) read the
+// accessors and never iterate `TaskContract.required_artifacts` directly.
+// #663 `RequiredArtifactsProjection` pattern (DC5-001) is mirrored here:
+// constructor / mutation paths stay inside this module, callers consume
+// `bool` accessors only.
+// ---------------------------------------------------------------------------
+
+/// Primary Setup-signal accessor (AD13). Returns `true` iff
+/// `TaskContract.required_artifacts` carries `ArtifactRole::Setup` —
+/// the pure-Install intent path. No confidence gate; the
+/// SetupBootstrap decision tree (`should_install_setup_bootstrap`)
+/// only consults this AFTER `artifact_ledger_overflowed` fail-closed.
+pub(super) fn has_required_setup_artifact(contract: &TaskContract) -> bool {
+    contract
+        .required_artifacts
+        .iter()
+        .any(|role| matches!(role, ArtifactRole::Setup))
+}
+
+/// AD18 accessor: returns `true` iff `optional_artifacts::Setup` is
+/// present OR the verifier prerequisite signal is active. Caller
+/// (`should_install_setup_bootstrap`) only consults this AFTER the
+/// confidence gate has been satisfied — see §3 AD22.
+///
+/// Issue #664 iteration-2 (CB-001): the OR-composed `verifier_signal.is_prerequisite_required()`
+/// path is no longer consulted by `should_install_setup_bootstrap` (the
+/// decision tree uses the finer-grained `stage_a_live()` for step 2 +
+/// `behavior_projection_has_setup_label` for step 4 to suppress
+/// false positives on plain "add tests"). This accessor is retained as
+/// the AD18 SSOT for system-prompt rendering and other consumers that
+/// still need the OR composition; pinned by tests today.
+#[allow(dead_code)] // CB-001: still pinned by tests; AD18 system-prompt consumer pending follow-up.
+pub(super) fn has_optional_setup_or_verifier_prerequisite(
+    contract: &TaskContract,
+    verifier_signal: &VerifierPrerequisiteSignal,
+) -> bool {
+    let optional_setup = contract
+        .optional_artifacts
+        .iter()
+        .any(|role| matches!(role, ArtifactRole::Setup));
+    optional_setup || verifier_signal.is_prerequisite_required()
+}
+
+/// Issue #664 (AD18 / AD22 / DR2-003): Stage A + Stage B OR-composed
+/// signal for "the current task requires a verifier prerequisite before
+/// proceeding". `task_contract.rs` does NOT import `auto_test.rs`; the
+/// caller (`turn.rs::build_arbiter_candidates`) normalizes
+/// `OwnedTestVerifierPlan::Missing` into a `bool` and passes it via
+/// `from_sources(...)` (Stage A). Stage B (`required_behavior` capability
+/// label fallback) is folded in through the `Option<&BehaviorContractProjection>`
+/// parameter — substring evaluation lives in
+/// `required_behavior::behavior_projection_has_verifier_capability`.
+///
+/// `pub(super)` newtype + private inner `bool`: external callers cannot
+/// construct nor mutate the state; they consume `is_prerequisite_required()`
+/// only (#663 `RequiredArtifactsProjection` forgeability-safe pattern).
+///
+/// Issue #664 iteration-2 (CB-001): the newtype is internally split into
+/// the two source flags (`stage_a_live` / `stage_b_label`) so consumers
+/// can distinguish a live verifier observation from a deterministic label
+/// fallback when refining the SetupBootstrap decision (false-positive
+/// suppression on plain "add tests" requests where only Stage B fires
+/// from a derived `verification_expectations = ["test"]` label).
+///
+/// The OR-composed `is_prerequisite_required()` accessor preserves the
+/// iteration-1 wire contract for callers that only need the boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VerifierPrerequisiteSignal {
+    stage_a_live: bool,
+    stage_b_label: bool,
+}
+
+impl VerifierPrerequisiteSignal {
+    /// Build the signal from the two source signals. Stage A is the
+    /// authoritative live observation (`OwnedTestVerifierPlan::Missing`
+    /// → `true`), Stage B is the deterministic label fallback.
+    pub(super) fn from_sources(
+        owned_test_verifier_missing: bool,
+        projection: Option<&super::required_behavior::BehaviorContractProjection>,
+    ) -> Self {
+        let stage_b = projection
+            .map(super::required_behavior::behavior_projection_has_verifier_capability)
+            .unwrap_or(false);
+        Self {
+            stage_a_live: owned_test_verifier_missing,
+            stage_b_label: stage_b,
+        }
+    }
+
+    /// Accessor: returns `true` iff at least one of the two source
+    /// signals fired. Fail-closed when both are absent.
+    ///
+    /// Wire-contract preservation (iteration-1): consumers that don't
+    /// distinguish Stage A live from Stage B label keep the legacy OR
+    /// composition. The SetupBootstrap decision tree (CB-001) calls the
+    /// finer-grained accessors below to apply the false-positive
+    /// suppression on plain "add tests" requests.
+    #[allow(dead_code)] // CB-001: production caller (should_install_setup_bootstrap) now uses stage_a_live(); pinned by tests.
+    pub(super) fn is_prerequisite_required(&self) -> bool {
+        self.stage_a_live || self.stage_b_label
+    }
+
+    /// Issue #664 iteration-2 (CB-001): true iff Stage A (live
+    /// `OwnedTestVerifierPlan::Missing` observation) fired. Used by the
+    /// SetupBootstrap decision to treat the live observation as the
+    /// strong signal that overrides the Stage B label-only weak signal.
+    pub(super) fn stage_a_live(&self) -> bool {
+        self.stage_a_live
+    }
+
+    /// Issue #664 iteration-2 (CB-001): true iff Stage B (label fallback)
+    /// fired. Exposed for the decision tree's "Stage B alone is too weak"
+    /// gate; consumers that only need the OR-composed value MUST use
+    /// `is_prerequisite_required()` instead.
+    #[allow(dead_code)] // Phase consumer: should_install_setup_bootstrap (CB-001).
+    pub(super) fn stage_b_label(&self) -> bool {
+        self.stage_b_label
+    }
+}
+
+/// Issue #664 iteration-4 (CB3-001): forgeability-safe request-binding key
+/// for the cross-turn Stage A carryover.
+///
+/// The iteration-3 carryover was a plain `bool`, which let a `Missing`-
+/// verifier SafeStop signal grant the Bash-only `setup_bootstrap` policy
+/// to **any** subsequent high-confidence request — even one that has
+/// switched topic away from the originating verifier-failure context.
+/// Binding the carryover to a stable 16-hex digest of the originating
+/// request text re-introduces the "same request still active?" check the
+/// boolean lacked, while never persisting the raw request string.
+///
+/// `pub(super)` newtype + private inner `String`: external callers cannot
+/// construct nor inspect the key directly (forgeability-safe, #663
+/// `RequiredArtifactsProjection` precedent). Two `RequestCarryoverKey`
+/// values are equal iff their canonical-redacted-then-hashed request
+/// digests match, which is the exact equivalence the actor-loop head
+/// promotion needs.
+///
+/// Security Invariants (CLAUDE.md):
+/// - Raw request text is NEVER stored in the key — `from_request` always
+///   pipes through `session::feedback::mask_secrets` first (the same
+///   secret-redaction SSOT used by the artifact ledger / active-job
+///   selected payloads / verifier-invoked payloads).
+/// - The 16-hex digest uses `logging::stable_path_hash`, the project-wide
+///   non-cryptographic correlator SSOT. `DefaultHasher` is intra-process
+///   stable, which is all the cross-turn promotion needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RequestCarryoverKey {
+    /// 16-hex `DefaultHasher` digest of `mask_secrets(request_text)`.
+    /// Never the raw request text. The field is private so external
+    /// callers cannot inspect the hash (e.g. for log emission); they can
+    /// only test equality through the derived `PartialEq`.
+    originating_request_hash: String,
+}
+
+impl RequestCarryoverKey {
+    /// Build a `RequestCarryoverKey` from a request text. The constructor
+    /// is the ONLY admission point — it pipes through `mask_secrets`
+    /// first so raw secrets in the request never reach the digest, then
+    /// hashes with the `stable_path_hash` SSOT.
+    pub(super) fn from_request(text: &str) -> Self {
+        let masked = crate::session::feedback::mask_secrets(text);
+        Self {
+            originating_request_hash: crate::logging::stable_path_hash(&masked),
+        }
+    }
+
+    /// Test-only accessor returning the 16-hex digest. Production code
+    /// MUST NOT depend on the hash shape — equality through `PartialEq`
+    /// is the only supported contract.
+    #[cfg(test)]
+    pub(super) fn originating_request_hash_for_test(&self) -> &str {
+        &self.originating_request_hash
+    }
+}
+
 pub(super) fn render_contract_recovery_note_with_hint(
     decision: &CompletionDecision,
     request: &str,
@@ -893,18 +1072,257 @@ pub(super) fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
     )
 }
 
+/// Issue #664 (CB-002): English setup-marker substring set. Each marker is
+/// matched with a **token boundary** check (`contains_setup_token_ascii`)
+/// plus a **negation-prefix guard** (`negation_prefix_within_window`) so
+/// negated phrasings ("uninstall dependencies", "do not install", "no setup",
+/// "without dependencies", "disable setup", etc.) do NOT trip the
+/// `required_artifacts::Setup` Bash job policy.
+///
+/// Pinned to ASCII lowercase needles only — Japanese markers live in
+/// `JP_SETUP_NEEDLES` and use a separate negation-suffix guard.
+const SETUP_MARKER_NEEDLES_ASCII: &[&str] = &[
+    "install",
+    "dependency",
+    "dependencies",
+    "requirements",
+    "package.json",
+    "setup",
+];
+
+/// Issue #664 (CB-002): Japanese setup-marker substrings. Matched verbatim
+/// (no token-boundary equivalent in JP), but a trailing-suffix negation
+/// guard (`否定しない`, `不要`, `無し`, `しない`) prevents false positives.
+const SETUP_MARKER_NEEDLES_JP: &[&str] = &["依存", "インストール", "セットアップ"];
+
+/// Issue #664 (CB-002): English negation-prefix tokens that, when present
+/// in a window before the matched needle, suppress the setup-intent signal.
+/// Each entry is lowercase and is checked against the haystack window with
+/// `ends_with` after lowercasing.
+const SETUP_NEGATION_PREFIXES_ASCII: &[&str] = &[
+    "un",       // "uninstall ..."
+    "do not ",  // "do not install ..."
+    "don't ",   // "don't install ..."
+    "no ",      // "no dependencies"
+    "without ", // "without dependencies"
+    "disable ", // "disable setup"
+    "remove ",  // "remove dependencies" (uninstall semantics)
+    "skip ",    // "skip setup"
+    "avoid ",   // "avoid install"
+];
+
+/// Issue #664 (CB-002): pure-fn token-boundary match for ASCII setup markers
+/// with English negation-prefix suppression. Returns `true` iff `lower`
+/// contains `needle` as a word-bounded token AND the lookback window of
+/// up to [`SETUP_NEGATION_LOOKBACK_BYTES`] characters preceding the match
+/// neither
+///   - **ends with** any multi-character prefix in
+///     [`SETUP_NEGATION_PREFIXES_ASCII`] (e.g. `"do not "`,
+///     `"don't "`, `"without "`, `"disable "`, …), nor
+///   - **contains** any documented negation phrase anywhere in the
+///     lookback window — Issue #664 iteration-3 (CB2-002) phrase-span
+///     extension: `"do not install dependencies"` would otherwise match
+///     the `dependencies` marker because the lookback ends with
+///     `"install "` (not `"do not "`). The phrase-span scan catches
+///     `"do not "` anywhere in the 24-byte window so any marker carried
+///     downstream of a negation in the same phrase is suppressed, nor
+///   - **carries** an immediately-preceding token that **starts with**
+///     `"un"` (covering `"uninstall"`, `"unset"`, `"undo"`, etc.) — the
+///     `un` prefix in the negation list is interpreted as a leading
+///     morpheme of the preceding word rather than a free-standing token.
+///
+/// Issue #664 iteration-3 (CB2-002) suffix-compound extension: a marker
+/// followed by `-free` / `less` (e.g. `dependency-free`, `dependencyless`)
+/// or any of [`SETUP_NEGATION_SUFFIXES_COMPOUND_ASCII`] is treated as a
+/// suffix-form negation and suppressed at the right boundary.
+///
+/// Pre-condition: `needle` is already lowercase ASCII; `lower` is the
+/// caller's pre-computed lowercase form of the request.
+pub(super) fn lower_contains_setup_token_unnegated(lower: &str, needle: &str) -> bool {
+    lower.match_indices(needle).any(|(idx, _)| {
+        // 1. Token boundary on the right (after the needle).
+        let after_idx = idx + needle.len();
+        let after_rest = &lower[after_idx..];
+        let after_ok = after_rest
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if !after_ok {
+            return false;
+        }
+        // CB2-002: suffix-compound negation. `dependency-free`,
+        // `dependencyless`, `setup-less`, etc. — the marker is followed
+        // by a negation morpheme that the original prefix-only guard
+        // missed. Check the byte-slice immediately after the needle
+        // against the documented suffix set.
+        if SETUP_NEGATION_SUFFIXES_COMPOUND_ASCII
+            .iter()
+            .any(|suffix| after_rest.starts_with(suffix))
+        {
+            return false;
+        }
+        // 2. Token boundary on the left + negation-prefix lookback. The
+        // window is a small ASCII byte-count anchored to the left edge.
+        let lookback_start = idx.saturating_sub(SETUP_NEGATION_LOOKBACK_BYTES);
+        // Walk forward to a char boundary; the haystack is `lower`
+        // (pre-lowered), so we operate on byte offsets but
+        // `is_char_boundary` keeps UTF-8 safety.
+        let mut window_start = lookback_start;
+        while window_start < idx && !lower.is_char_boundary(window_start) {
+            window_start += 1;
+        }
+        let window = &lower[window_start..idx];
+        // Token boundary on the left: the char immediately before `idx`
+        // (if any) must NOT be alphanumeric. "uninstall" → "install"
+        // starts directly after "un" which IS alphanumeric → fails the
+        // token-boundary check here.
+        let left_token_ok = window
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        if !left_token_ok {
+            return false;
+        }
+        // 3a. Negation-prefix lookback (immediately-preceding match):
+        // if any documented multi-char prefix (e.g. "do not ") occurs
+        // at the tail of the window, the signal is negated.
+        let multi_char_negated = SETUP_NEGATION_PREFIXES_ASCII
+            .iter()
+            .filter(|p| p.len() > 2) // skip the bare "un" — handled below
+            .any(|prefix| window.ends_with(prefix));
+        if multi_char_negated {
+            return false;
+        }
+        // 3b. CB2-002 phrase-span negation: scan the entire lookback
+        // window for any documented negation phrase. This catches
+        // cases like `"do not install dependencies"` where the
+        // `dependencies` marker is at byte offset N and the
+        // immediately-preceding token is `install ` (which is not in
+        // the negation prefix set), but `"do not "` sits earlier in
+        // the same window. By scanning the window with `contains`
+        // (token-bounded at both ends of the phrase against
+        // whitespace / window start), the marker downstream of any
+        // documented negation is suppressed.
+        if phrase_span_window_contains_negation(window) {
+            return false;
+        }
+        // 3c. Detect "un"-prefixed preceding token by walking back from
+        // `idx` to the nearest non-alphanumeric byte (or window start)
+        // and checking the resulting prev-word slice. Whitespace /
+        // punctuation breaks the search; embedded numerals are treated
+        // as part of the word for symmetry with the boundary check.
+        if previous_word_starts_with_un_prefix(window) {
+            return false;
+        }
+        true
+    })
+}
+
+/// Issue #664 iteration-3 (CB2-002) helper: scan the lookback window
+/// for a documented negation phrase appearing anywhere in the window,
+/// not just at its tail. Each phrase is matched with a left token
+/// boundary (start of window OR preceded by whitespace / punctuation)
+/// so substrings inside larger tokens (`"undo "`-inside-some-word) do
+/// not falsely suppress positive markers.
+///
+/// Multi-character phrases (length > 2) are tested via this scan; the
+/// bare `"un"` is handled separately by
+/// `previous_word_starts_with_un_prefix` because it requires
+/// preceding-token semantics, not free-standing whitespace boundary.
+fn phrase_span_window_contains_negation(window: &str) -> bool {
+    let bytes = window.as_bytes();
+    SETUP_NEGATION_PREFIXES_ASCII
+        .iter()
+        .filter(|p| p.len() > 2)
+        .any(|phrase| {
+            let phrase: &str = phrase;
+            // Find every occurrence and check left token boundary.
+            window.match_indices(phrase).any(|(idx, _)| {
+                if idx == 0 {
+                    return true;
+                }
+                let prev = bytes[idx - 1];
+                // Left boundary: whitespace, punctuation, or any non-
+                // alphanumeric ASCII byte. Avoid matching inside a
+                // larger alphabetic token (`"random-do not "` would
+                // already split on `-`; this guard catches contiguous
+                // letters like `"redo not "` accidentally matching).
+                !prev.is_ascii_alphanumeric()
+            })
+        })
+}
+
+/// Issue #664 iteration-3 (CB2-002) suffix-compound negation morphemes.
+/// Each entry is matched against the byte-slice **immediately after**
+/// the setup marker. The morphemes are intentionally minimal and only
+/// cover the documented suffix-form patterns (`-free` / `less`); future
+/// additions go here and stay covered by
+/// `request_asks_for_setup_dependency_free_compound_suffix`.
+const SETUP_NEGATION_SUFFIXES_COMPOUND_ASCII: &[&str] = &["-free", "-less", "less"];
+
+/// CB-002 helper: returns `true` iff the last (rightmost) ASCII-token
+/// in `window` starts with the negation morpheme `"un"`. Whitespace and
+/// non-alphanumeric characters split tokens. Used to suppress markers
+/// like `"uninstall dependencies"` where the prior token is `"uninstall"`
+/// (treated as a negation of `"install"` and adjacent markers).
+fn previous_word_starts_with_un_prefix(window: &str) -> bool {
+    // Walk back to find the rightmost token: skip trailing non-alnum
+    // separators, then collect contiguous alnum chars.
+    let bytes = window.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && !bytes[end - 1].is_ascii_alphanumeric() {
+        end -= 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        start -= 1;
+    }
+    let token = &window[start..end];
+    token.starts_with("un")
+}
+
+/// Issue #664 (CB-002): byte window for ASCII negation-prefix lookback.
+/// 24 bytes covers all documented prefixes plus typical preceding
+/// whitespace / punctuation; keep it tight to avoid matching distant
+/// negations.
+const SETUP_NEGATION_LOOKBACK_BYTES: usize = 24;
+
+/// Issue #664 (CB-002): Japanese negation-suffix tokens that, when they
+/// appear in a short trailing window after a JP setup marker, suppress
+/// the setup-intent signal.
+const SETUP_NEGATION_SUFFIXES_JP: &[&str] =
+    &["しない", "禁止", "不要", "無し", "なし", "せず", "無効"];
+
+/// Issue #664 (CB-002): characters (bytes) examined after a JP marker.
+const SETUP_NEGATION_LOOKAHEAD_BYTES_JP: usize = 32;
+
+/// Issue #664 (CB-002): pure-fn negation-aware check for the JP marker set.
+fn request_contains_jp_setup_marker_unnegated(request: &str, needle: &str) -> bool {
+    request.match_indices(needle).any(|(idx, _)| {
+        let after_idx = idx + needle.len();
+        let lookahead_end = (after_idx + SETUP_NEGATION_LOOKAHEAD_BYTES_JP).min(request.len());
+        let mut window_end = lookahead_end;
+        while window_end > after_idx && !request.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
+        let window = &request[after_idx..window_end];
+        let negated = SETUP_NEGATION_SUFFIXES_JP
+            .iter()
+            .any(|suffix| window.contains(suffix));
+        !negated
+    })
+}
+
 pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "install",
-            "dependency",
-            "dependencies",
-            "requirements",
-            "package.json",
-            "setup",
-        ],
-    ) || contains_any(request, &["依存", "インストール", "セットアップ"])
+    SETUP_MARKER_NEEDLES_ASCII
+        .iter()
+        .any(|needle| lower_contains_setup_token_unnegated(lower, needle))
+        || SETUP_MARKER_NEEDLES_JP
+            .iter()
+            .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
 fn request_asks_for_verification(request: &str, lower: &str) -> bool {
@@ -2204,5 +2622,345 @@ mod tests {
         evidence.push(repo_edit(RepoEditCategory::Test));
         evidence.push(build_test_bound_zero());
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: Setup signal accessors + VerifierPrerequisiteSignal
+    // -----------------------------------------------------------------
+
+    /// Setup-as-required-artifact (`TaskIntent::Install` + `asks_for_setup`).
+    /// The accessor returns `true` only when `ArtifactRole::Setup` is in
+    /// `required_artifacts`.
+    #[test]
+    fn has_required_setup_artifact_returns_true_only_when_required_contains_setup() {
+        // Pure install intent ("install requirements") routes Setup to required.
+        let install_only =
+            TaskContract::from_request("Install the dependencies listed in requirements.txt.");
+        assert!(matches!(install_only.intent, TaskIntent::Install));
+        assert!(
+            install_only
+                .required_artifacts
+                .contains(&ArtifactRole::Setup)
+        );
+        assert!(has_required_setup_artifact(&install_only));
+
+        // Build intent that mentions setup → Setup is optional, not required.
+        let build_with_setup = TaskContract::from_request(
+            "FastAPIでcrudのAPIを開発してください。テストコードも実装してください。",
+        );
+        assert!(!has_required_setup_artifact(&build_with_setup));
+    }
+
+    /// `has_optional_setup_or_verifier_prerequisite` returns true when
+    /// `optional_artifacts::Setup` is present even with a "false" verifier signal.
+    #[test]
+    fn has_optional_setup_or_verifier_prerequisite_covers_optional_setup() {
+        let mut contract = TaskContract::from_request("Build feature X");
+        // Inject Setup into optional_artifacts for the test.
+        contract.optional_artifacts.push(ArtifactRole::Setup);
+        let no_verifier_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        assert!(has_optional_setup_or_verifier_prerequisite(
+            &contract,
+            &no_verifier_signal
+        ));
+    }
+
+    /// `has_optional_setup_or_verifier_prerequisite` returns true when the
+    /// verifier prerequisite signal alone is active, even with empty
+    /// `optional_artifacts`.
+    #[test]
+    fn has_optional_setup_or_verifier_prerequisite_covers_verifier_signal() {
+        let contract = TaskContract::from_request("Build feature X");
+        assert!(!contract.optional_artifacts.contains(&ArtifactRole::Setup));
+        let verifier_signal = VerifierPrerequisiteSignal::from_sources(true, None);
+        assert!(verifier_signal.is_prerequisite_required());
+        assert!(has_optional_setup_or_verifier_prerequisite(
+            &contract,
+            &verifier_signal
+        ));
+    }
+
+    /// Stage A (owned_test_verifier_missing == true) alone activates the
+    /// signal, even with no projection.
+    #[test]
+    fn verifier_prerequisite_signal_stage_a_activates_alone() {
+        let signal = VerifierPrerequisiteSignal::from_sources(true, None);
+        assert!(signal.is_prerequisite_required());
+    }
+
+    /// Default state: neither Stage A nor Stage B fires → fail-closed false.
+    #[test]
+    fn verifier_prerequisite_signal_no_sources_is_false() {
+        let signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        assert!(!signal.is_prerequisite_required());
+    }
+
+    /// Stage A + Stage B OR-composition: Stage A true even when projection
+    /// would not fire keeps the signal true.
+    #[test]
+    fn verifier_prerequisite_signal_from_sources_or_composes_stage_a_and_stage_b() {
+        // Stage A true beats Stage B unknown
+        let s = VerifierPrerequisiteSignal::from_sources(true, None);
+        assert!(s.is_prerequisite_required());
+
+        // Stage A false + Stage B unknown (no projection) → false
+        let s2 = VerifierPrerequisiteSignal::from_sources(false, None);
+        assert!(!s2.is_prerequisite_required());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664 iteration-2 (CB-002): `request_asks_for_setup`
+    // token boundary + negation guard regression tests.
+    // -----------------------------------------------------------------
+
+    /// Positive baseline: "install dependencies" must match (no negation).
+    #[test]
+    fn request_asks_for_setup_positive_install_dependencies_matches() {
+        let req = "Please install dependencies before running tests.";
+        let lower = req.to_ascii_lowercase();
+        assert!(request_asks_for_setup(req, &lower));
+    }
+
+    /// Positive baseline: "setup the project" must match (no negation,
+    /// token-bounded).
+    #[test]
+    fn request_asks_for_setup_positive_setup_dependencies_matches() {
+        let req = "Setup the project dependencies for fresh checkout.";
+        let lower = req.to_ascii_lowercase();
+        assert!(request_asks_for_setup(req, &lower));
+    }
+
+    /// CB-002 token boundary + negation: "uninstall dependencies" must
+    /// NOT classify as asking for Setup. Two suppressions cooperate:
+    ///   - `install` fails the token-boundary check (leading `un` is
+    ///     alphanumeric, so `install` is not a free-standing token).
+    ///   - `dependencies` is matched verbatim BUT the preceding token
+    ///     `uninstall` starts with the negation morpheme `"un"`, so
+    ///     `previous_word_starts_with_un_prefix` suppresses the marker.
+    #[test]
+    fn request_asks_for_setup_token_boundary_uninstall_not_match() {
+        let req = "uninstall dependencies and reinstall a clean build";
+        let lower = req.to_ascii_lowercase();
+        // The `install` token-boundary failure is the primary defense.
+        assert!(
+            !lower_contains_setup_token_unnegated(&lower, "install"),
+            "leading 'un' must break the 'install' token boundary"
+        );
+        // The `dependencies` marker is suppressed because the preceding
+        // token `uninstall` starts with `"un"` (CB-002 negation
+        // morpheme).
+        assert!(
+            !lower_contains_setup_token_unnegated(&lower, "dependencies"),
+            "preceding 'uninstall' must suppress the 'dependencies' marker via un-prefix detection"
+        );
+        // Therefore the public API correctly returns false for the full
+        // request — no false positive on uninstall phrasing.
+        assert!(
+            !request_asks_for_setup(req, &lower),
+            "full 'uninstall dependencies ...' request must NOT classify as asking for Setup"
+        );
+    }
+
+    /// CB-002 negation prefix: "do not install dependencies" must NOT
+    /// classify as asking for Setup (negation prefix "do not " precedes
+    /// the matched needle window).
+    #[test]
+    fn request_asks_for_setup_negation_do_not_install_not_match() {
+        let req = "Please do not install dependencies for this branch.";
+        let lower = req.to_ascii_lowercase();
+        // The `install` lookback window ends with "do not " → suppressed.
+        assert!(!lower_contains_setup_token_unnegated(&lower, "install"));
+    }
+
+    /// CB-002 negation prefix: "don't install dependencies" must NOT
+    /// classify as asking for Setup.
+    #[test]
+    fn request_asks_for_setup_negation_dont_install_not_match() {
+        let req = "Don't install dependencies; the runner already has them.";
+        let lower = req.to_ascii_lowercase();
+        assert!(!lower_contains_setup_token_unnegated(&lower, "install"));
+    }
+
+    /// CB-002 negation prefix: "without dependencies" must NOT match the
+    /// `dependencies` marker — the leading "without " is a documented
+    /// negation prefix.
+    #[test]
+    fn request_asks_for_setup_negation_without_dependencies_not_match() {
+        let req = "Build the binary without dependencies on system libs.";
+        let lower = req.to_ascii_lowercase();
+        assert!(!lower_contains_setup_token_unnegated(
+            &lower,
+            "dependencies"
+        ));
+    }
+
+    /// CB-002 negation prefix: "disable setup" must NOT classify as
+    /// asking for Setup.
+    #[test]
+    fn request_asks_for_setup_negation_disable_setup_not_match() {
+        let req = "Disable setup hooks during release packaging.";
+        let lower = req.to_ascii_lowercase();
+        assert!(!lower_contains_setup_token_unnegated(&lower, "setup"));
+    }
+
+    /// CB-002 negation prefix: "no setup" / "no dependencies" rejected.
+    #[test]
+    fn request_asks_for_setup_negation_no_setup_not_match() {
+        let req = "No setup steps are required for this command.";
+        let lower = req.to_ascii_lowercase();
+        assert!(!lower_contains_setup_token_unnegated(&lower, "setup"));
+    }
+
+    /// CB2-002 phrase-span: "do not install dependencies" must NOT
+    /// classify as asking for Setup. iteration-2 already suppressed the
+    /// `install` marker via the `"do not "` lookback prefix, but the
+    /// `dependencies` marker downstream of `install` was still tripped
+    /// because its lookback ends with `"install "` (not `"do not "`).
+    /// iteration-3 extends the guard to a phrase-span scan so any
+    /// documented negation phrase appearing anywhere in the 24-byte
+    /// lookback suppresses the marker.
+    #[test]
+    fn request_asks_for_setup_phrase_negation_do_not_install_dependencies() {
+        let req = "Please do not install dependencies for this branch.";
+        let lower = req.to_ascii_lowercase();
+        // BOTH markers must be suppressed via the iteration-3 phrase-
+        // span guard: `install` via the lookback-tail match (iteration-2)
+        // and `dependencies` via the phrase-span scan (iteration-3).
+        assert!(!lower_contains_setup_token_unnegated(&lower, "install"));
+        assert!(
+            !lower_contains_setup_token_unnegated(&lower, "dependencies"),
+            "phrase-span scan must suppress 'dependencies' carried in a 'do not install' phrase (CB2-002)"
+        );
+        assert!(
+            !request_asks_for_setup(req, &lower),
+            "full 'do not install dependencies' phrase must NOT classify as asking for Setup"
+        );
+    }
+
+    /// CB2-002 phrase-span: "don't install dependencies" — same shape
+    /// as the previous test but with the contracted "don't" negation.
+    #[test]
+    fn request_asks_for_setup_phrase_negation_dont_install_dependencies() {
+        let req = "Don't install dependencies; the runner already has them.";
+        let lower = req.to_ascii_lowercase();
+        assert!(!lower_contains_setup_token_unnegated(&lower, "install"));
+        assert!(
+            !lower_contains_setup_token_unnegated(&lower, "dependencies"),
+            "phrase-span scan must suppress 'dependencies' carried in a \"don't install\" phrase (CB2-002)"
+        );
+        assert!(
+            !request_asks_for_setup(req, &lower),
+            "full \"don't install dependencies\" phrase must NOT classify as asking for Setup"
+        );
+    }
+
+    /// CB2-002 suffix-compound: "dependency-free X" classifies as a
+    /// negation via the `-free` suffix morpheme. iteration-3 extends
+    /// the guard to detect suffix-form negations at the right boundary
+    /// of the marker so this no longer trips the setup signal.
+    #[test]
+    fn request_asks_for_setup_dependency_free_compound_suffix() {
+        let req = "Build a dependency-free binary.";
+        let lower = req.to_ascii_lowercase();
+        assert!(
+            !lower_contains_setup_token_unnegated(&lower, "dependency"),
+            "suffix-compound `-free` must suppress the `dependency` marker (CB2-002)"
+        );
+        assert!(
+            !request_asks_for_setup(req, &lower),
+            "dependency-free phrase must NOT classify as asking for Setup"
+        );
+    }
+
+    /// CB2-002 baseline: positive `install dependencies` (no negation)
+    /// must still match — phrase-span guard is conservative and only
+    /// fires when a documented negation phrase is present in the
+    /// 24-byte window.
+    #[test]
+    fn request_asks_for_setup_positive_install_dependencies_baseline() {
+        let req = "Please install dependencies for the feature work.";
+        let lower = req.to_ascii_lowercase();
+        // Phrase-span guard MUST NOT over-suppress: install + dependencies
+        // both match because no negation phrase is in the lookback
+        // window.
+        assert!(lower_contains_setup_token_unnegated(&lower, "install"));
+        assert!(lower_contains_setup_token_unnegated(&lower, "dependencies"));
+        assert!(request_asks_for_setup(req, &lower));
+    }
+
+    /// Compositional regression: the public `request_asks_for_setup` API
+    /// must return `false` for the canonical negated phrasings even when
+    /// other unrelated text is present.
+    #[test]
+    fn request_asks_for_setup_composite_negated_phrasings_return_false() {
+        let negated_phrasings = [
+            "do not install anything",
+            "don't install the package",
+            "without setup hooks",
+            "disable setup",
+            "no setup needed",
+            "skip setup",
+            "avoid install of optional crates",
+        ];
+        for phrasing in negated_phrasings {
+            let lower = phrasing.to_ascii_lowercase();
+            // None of the documented negated phrasings should pass the
+            // helper at the token-bounded marker level.
+            for needle in SETUP_MARKER_NEEDLES_ASCII {
+                assert!(
+                    !lower_contains_setup_token_unnegated(&lower, needle),
+                    "negated phrasing {phrasing:?} unexpectedly matched needle {needle:?}"
+                );
+            }
+        }
+    }
+
+    /// Issue #664 iteration-2 (CB-001): regression anchor confirming the
+    /// derivation chain that drives Stage B. A plain "add tests" request
+    /// yields `intent = Build` (no Setup intent), `required_artifacts =
+    /// [Test]`, and a behavior projection whose only verifier-capability
+    /// label is the derived "test" string from `VerificationKind::Test`.
+    /// This shape is the input to the false-positive suppression test
+    /// `setup_bootstrap_does_not_overfire_on_plain_add_test_request` in
+    /// `bash_policy_e2e_tests.rs`.
+    #[test]
+    fn plain_add_tests_request_shape_pins_stage_b_input() {
+        let contract = TaskContract::from_request("Add tests for module X");
+        // Build intent (no Install / Fix / etc.).
+        assert!(matches!(contract.intent, TaskIntent::Build));
+        // Test required, Setup absent.
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(!contract.required_artifacts.contains(&ArtifactRole::Setup));
+        assert!(!contract.optional_artifacts.contains(&ArtifactRole::Setup));
+        let rb = &contract.required_behavior;
+        // verification fires (Test) → confidence = 1.0, projection != None.
+        assert!(rb.confidence >= 0.5);
+        // verification_expectations carries the derived "test" bounded label.
+        let exp = rb.verification_expectations.as_ref();
+        assert!(exp.is_some(), "verification_expectations populated");
+    }
+
+    /// Regression: positive phrasings must still pass through the new
+    /// token-boundary path so iteration-1 acceptance is preserved.
+    #[test]
+    fn request_asks_for_setup_composite_positive_phrasings_return_true() {
+        let positive_phrasings = [
+            "install dependencies",
+            "setup the requirements",
+            "please install the package",
+            // Legacy substring path matched "configure" via the
+            // SETUP_LABEL_NEEDLES set in `required_behavior.rs`; the
+            // `task_contract.rs` `request_asks_for_setup` SSOT only
+            // inspects the marker list above, so we pin a needle from
+            // that closed set here.
+            "install requirements.txt",
+        ];
+        for phrasing in positive_phrasings {
+            let lower = phrasing.to_ascii_lowercase();
+            assert!(
+                request_asks_for_setup(phrasing, &lower),
+                "positive phrasing {phrasing:?} regressed to false"
+            );
+        }
     }
 }

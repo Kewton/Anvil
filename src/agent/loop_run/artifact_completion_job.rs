@@ -162,6 +162,98 @@ pub(super) enum ArtifactAttemptOutcomeKind {
     RolePolicyViolation,
 }
 
+impl ArtifactAttemptOutcomeKind {
+    /// Issue #664 (AD10 / §6.2): stable snake_case wire label for the
+    /// structured report projection (`attempt_outcome_to_json_value`).
+    /// `kind` is emitted as a `kind: "..."` JSON field alongside `category`
+    /// and `actual_actions`.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ArtifactAttemptOutcomeKind::WrongTarget => "wrong_target",
+            ArtifactAttemptOutcomeKind::NoTool => "no_tool",
+            ArtifactAttemptOutcomeKind::ProseOnly => "prose_only",
+            ArtifactAttemptOutcomeKind::RolePolicyViolation => "role_policy_violation",
+        }
+    }
+}
+
+/// Issue #664 (AD10 / §4.4 / §6.2 / DR1-004 / OCP forward compatibility):
+/// fixed enum of `category` labels emitted by `attempt_outcome_to_json_value`
+/// for `RolePolicyViolation` outcomes. Private to the module; never
+/// re-exported. Adding a label is additive — `PAYLOAD_SCHEMA_VERSION = 1`
+/// stays unchanged. Removing / renaming a label requires a bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashPolicyViolationCategory {
+    /// Bash policy violation captured under an active SetupBootstrap or
+    /// artifact-directed Bash reject gate. Issue #664 iteration-2 (CB-003)
+    /// wires the production caller via
+    /// `ArtifactAttemptOutcome::new_bash_policy_violation`.
+    BashOutOfPolicy,
+    /// Non-Bash role policy violation (the legacy generic case).
+    OtherRoleViolation,
+}
+
+impl BashPolicyViolationCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            BashPolicyViolationCategory::BashOutOfPolicy => "bash_out_of_policy",
+            BashPolicyViolationCategory::OtherRoleViolation => "other_role_violation",
+        }
+    }
+}
+
+/// Issue #664 (AD10 / §4.4 / §6.2 / S3-006): project a single attempt
+/// outcome into the structured `agent.artifact_completion.report`
+/// `attempt_outcomes[i]` JSON object. Pure function.
+///
+/// **Output schema (`PAYLOAD_SCHEMA_VERSION = 1` 不変)**:
+/// ```jsonc
+/// {
+///   "kind": "wrong_target" | "no_tool" | "prose_only" | "role_policy_violation",
+///   "category": "bash_out_of_policy" | "other_role_violation", // RolePolicyViolation only
+///   "actual_actions": ["<16-hex correlator>", ...]              // raw command / path NEVER included
+/// }
+/// ```
+///
+/// **Security (AD5 / CB-004)**: each `actual_action` is run through
+/// `mask_secrets` → `stable_path_hash` 16-hex correlator. Raw command /
+/// raw path NEVER appear in the projection. The 16-hex correlator is a
+/// deterministic non-cryptographic identifier suitable for dataset join
+/// keys without leaking the underlying string.
+pub(super) fn attempt_outcome_to_json_value(o: &ArtifactAttemptOutcome) -> serde_json::Value {
+    let actual_actions: Vec<String> = o
+        .actual_actions
+        .iter()
+        .map(|action| {
+            let masked = mask_secrets(action);
+            crate::logging::stable_path_hash(&masked)
+        })
+        .collect();
+    let mut obj = serde_json::json!({
+        "kind": o.kind.as_str(),
+        "actual_actions": actual_actions,
+    });
+    // `category` is only meaningful for `RolePolicyViolation`.
+    //
+    // Issue #664 iteration-2 (CB-003): the non-raw `bash_policy_violation`
+    // marker carried on `ArtifactAttemptOutcome` selects between
+    // `BashOutOfPolicy` and `OtherRoleViolation`. The marker is set ONLY
+    // by `ArtifactAttemptOutcome::new_bash_policy_violation` at the
+    // `turn.rs::effective_tool_policy_error_for_call_with_scope` Bash
+    // rejection chokepoint, so the projection cannot leak raw command
+    // bytes — `actual_actions` is still hashed via `stable_path_hash`
+    // (AD5 / CB-004).
+    if matches!(o.kind, ArtifactAttemptOutcomeKind::RolePolicyViolation) {
+        let category = if o.bash_policy_violation {
+            BashPolicyViolationCategory::BashOutOfPolicy
+        } else {
+            BashPolicyViolationCategory::OtherRoleViolation
+        };
+        obj["category"] = serde_json::Value::String(category.as_str().to_string());
+    }
+    obj
+}
+
 /// One recorded attempt against an `ArtifactCompletionJob`.
 ///
 /// All string fields are sanitized at `new()` / `with_failure_cluster()`
@@ -177,6 +269,18 @@ pub(super) struct ArtifactAttemptOutcome {
     actual_actions: Vec<String>,
     /// Masked / capped expected target path.
     expected_target: String,
+    /// Issue #664 iteration-2 (CB-003): non-raw classification marker
+    /// indicating that this attempt's `actual_actions` originated from a
+    /// **Bash policy rejection** (SetupBootstrap branch or artifact-directed
+    /// `Bash` reject). When set, `attempt_outcome_to_json_value` emits
+    /// `category = "bash_out_of_policy"` so the structured
+    /// `artifact_completion_report` consumer can identify Bash policy
+    /// violations without inspecting the raw command (which is hashed by
+    /// `stable_path_hash` before emit, AD5 / CB-004).
+    ///
+    /// The field is `pub(super)` for the projection accessor only —
+    /// consumers MUST NOT mutate it.
+    bash_policy_violation: bool,
 }
 
 impl ArtifactAttemptOutcome {
@@ -194,7 +298,71 @@ impl ArtifactAttemptOutcome {
             cluster_key: None,
             actual_actions: sanitize_actions(actual_actions),
             expected_target: sanitize_single(expected_target.into()),
+            bash_policy_violation: false,
         }
+    }
+
+    /// Issue #664 iteration-2 (CB-003): build a `RolePolicyViolation`
+    /// outcome that carries the **non-raw** Bash policy classification
+    /// marker (`bash_policy_violation = true`). Caller is the policy-
+    /// rejection chokepoint in `turn.rs::effective_tool_policy_error_*`
+    /// after the Bash command has been masked / hashed.
+    ///
+    /// Issue #664 iteration-3 (CB2-004): the raw Bash command is hashed
+    /// to a 16-hex correlator at record-time **before** entering
+    /// `actual_actions` — the underlying bytes never reach
+    /// `failure_snapshot`, the `artifact_completion_failed` system note,
+    /// the `agent.artifact_completion_failed` JSON event, or any other
+    /// downstream sink. Each raw command is wrapped as
+    /// `"BashOutOfPolicy:<16-hex>"` so the marker prefix preserves the
+    /// classification semantic for human / log inspection while the
+    /// payload bytes are reduced to a non-cryptographic correlator
+    /// (`stable_path_hash(mask_secrets(cmd))`).
+    ///
+    /// `attempt_outcome_to_json_value` re-hashes the marker as a
+    /// defensive second pass (`stable_path_hash` over the marker
+    /// string), which is idempotent — the hex digits inside are already
+    /// hash-shape, and `mask_secrets` is a no-op on them. Storing the
+    /// raw command and deferring hashing until projection-time would
+    /// leak the bytes through `failure_snapshot.actual_actions` (AD5
+    /// violation, CB2-004).
+    ///
+    /// `kind` is fixed to `RolePolicyViolation` so consumers retain the
+    /// same `kind` wire label (`role_policy_violation`); the marker only
+    /// refines the `category` field (`bash_out_of_policy` vs the default
+    /// `other_role_violation`).
+    pub(super) fn new_bash_policy_violation(
+        actual_actions: Vec<String>,
+        expected_target: impl Into<String>,
+    ) -> Self {
+        // CB2-004: hash each raw command BEFORE it enters the outcome
+        // ledger. Subsequent `sanitize_actions` is a no-op on the marker
+        // (mask_secrets + length cap on a hex correlator is idempotent),
+        // but we apply the full pipeline anyway so any caller that
+        // sneaks a non-hashed value through gets the same defensive
+        // treatment as `new()`.
+        let hashed_actions: Vec<String> = actual_actions
+            .into_iter()
+            .map(|cmd| {
+                let masked = mask_secrets(&cmd);
+                let correlator = crate::logging::stable_path_hash(&masked);
+                format!("BashOutOfPolicy:{correlator}")
+            })
+            .collect();
+        let mut out = Self::new(
+            ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            hashed_actions,
+            expected_target,
+        );
+        out.bash_policy_violation = true;
+        out
+    }
+
+    /// Issue #664 iteration-2 (CB-003): non-raw classification accessor.
+    /// `attempt_outcome_to_json_value` is the only in-crate consumer.
+    #[allow(dead_code)] // surfaced via `attempt_outcome_to_json_value`; pinned by tests.
+    pub(super) fn bash_policy_violation(&self) -> bool {
+        self.bash_policy_violation
     }
 
     /// Build an attempt outcome carrying a deterministic
@@ -1667,5 +1835,109 @@ mod tests {
             assert!(!action.contains('\t'), "action contains tab: {action:?}");
             assert!(!action.contains('\r'), "action contains CR: {action:?}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: `attempt_outcome_to_json_value` projection (Task 4.1).
+    // -----------------------------------------------------------------
+
+    /// `attempt_outcome_to_json_value` runs each `actual_action` through
+    /// `mask_secrets` + `stable_path_hash` (16-hex). Raw command never
+    /// appears in the projection. (AD5 / CB-004 / Acceptance (f))
+    #[test]
+    fn attempt_outcome_to_json_value_bash_violation_uses_stable_path_hash_correlator() {
+        let outcome = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            vec!["bash:cargo install ripgrep".to_string()],
+            "src/lib.rs",
+        );
+        let value = attempt_outcome_to_json_value(&outcome);
+        let actions = value
+            .get("actual_actions")
+            .and_then(|v| v.as_array())
+            .expect("actual_actions must be array");
+        assert_eq!(actions.len(), 1);
+        let correlator = actions[0].as_str().expect("must be string");
+        assert_eq!(
+            correlator.len(),
+            16,
+            "stable_path_hash correlator must be 16 hex chars, got: {correlator:?}"
+        );
+        assert!(
+            correlator.chars().all(|c| c.is_ascii_hexdigit()),
+            "must be hex"
+        );
+        // Raw command MUST NOT leak into the payload.
+        let payload_text = value.to_string();
+        assert!(
+            !payload_text.contains("cargo install"),
+            "raw command must NOT appear in payload, got: {payload_text}"
+        );
+    }
+
+    /// `kind` field is the snake_case label.
+    #[test]
+    fn attempt_outcome_to_json_value_emits_kind_as_str() {
+        let outcome = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["edit:other/file.rs".to_string()],
+            "src/lib.rs",
+        );
+        let value = attempt_outcome_to_json_value(&outcome);
+        assert_eq!(
+            value.get("kind").and_then(|v| v.as_str()),
+            Some("wrong_target")
+        );
+    }
+
+    /// Acceptance (f): `category` field is exactly one of the fixed enum
+    /// values for `RolePolicyViolation` outcomes; absent for other kinds.
+    #[test]
+    fn attempt_outcome_category_label_is_fixed_enum() {
+        let role_policy = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            vec!["focused_edit_batch_reject".to_string()],
+            "src/lib.rs",
+        );
+        let v = attempt_outcome_to_json_value(&role_policy);
+        let category = v
+            .get("category")
+            .and_then(|c| c.as_str())
+            .expect("RolePolicyViolation must have category");
+        assert!(
+            category == "bash_out_of_policy" || category == "other_role_violation",
+            "category must be fixed-enum, got: {category:?}"
+        );
+
+        // For non-RolePolicyViolation kinds the `category` field is absent.
+        let wrong_target = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["edit:other/file.rs".to_string()],
+            "src/lib.rs",
+        );
+        let v2 = attempt_outcome_to_json_value(&wrong_target);
+        assert!(
+            v2.get("category").is_none(),
+            "non-RolePolicyViolation should not emit category"
+        );
+    }
+
+    /// Acceptance (h): `PAYLOAD_SCHEMA_VERSION = 1` (set in `job_report.rs`)
+    /// remains stable; `attempt_outcome_to_json_value` only adds additive
+    /// fields.
+    #[test]
+    fn attempt_outcome_to_json_value_schema_v1_additive_only() {
+        let outcome = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::ProseOnly,
+            vec!["prose only attempt".to_string()],
+            "src/lib.rs",
+        );
+        let v = attempt_outcome_to_json_value(&outcome);
+        // Required keys present.
+        assert!(v.get("kind").is_some());
+        assert!(v.get("actual_actions").is_some());
+        // Existing top-level schema version is set externally; here we
+        // confirm the projection emits an object (not array / scalar).
+        assert!(v.is_object());
     }
 }

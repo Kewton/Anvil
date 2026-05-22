@@ -646,6 +646,35 @@ pub fn classify_command(command: &str) -> BashCommandClass {
     }
 }
 
+/// Issue #664 (AD2 / AD12 / DR1-001 案 B): thin wrapper over
+/// `classify_command` for the SetupBootstrap policy projection.
+///
+/// Logical equivalence: `is_setup_command(cmd)` ↔
+/// `classify_command(cmd) == BashCommandClass::EnvSetup`. This is the
+/// **only** SSOT consulted by the SetupBootstrap policy enforcement path
+/// (`turn.rs::effective_tool_policy_error_for_call_with_scope`).
+/// `recovery::is_dependency_install_command` retains its legacy semantics
+/// (including `cargo install`) and is intentionally NOT used for policy
+/// projection — see `recovery.rs` `#[deprecated]` annotation.
+///
+/// `BashCommandClass::EnvSetup` positive set (Issue #607 SSOT, also see
+/// `is_env_setup_command` doc): `npm install` / `npm ci` / `npm i` /
+/// `npm add`, `pnpm install` / `pnpm i` / `pnpm add`, `yarn install` /
+/// `yarn add`, `pip install` / `pip3 install`, `poetry install` /
+/// `poetry add`, `uv pip install` / `uv sync`, `bundle install`,
+/// `go mod download` / `go mod tidy`, `cargo fetch`, `mix deps.get`,
+/// `composer install`.
+///
+/// Negatives (rejected as non-Setup, classified to Network or other):
+/// `cargo install` / `cargo add`, `apt install` / `apt-get install`,
+/// `brew install`, `docker pull`, `npx ...`, `cd frontend && npm install`
+/// (shell-control compound), `pip install --upgrade pip; curl ...`,
+/// any input with shell-control operators (semicolon / ampersand / pipe /
+/// redirect / backtick / `$(` / newline / backslash).
+pub(crate) fn is_setup_command(cmd: &str) -> bool {
+    matches!(classify_command(cmd), BashCommandClass::EnvSetup)
+}
+
 /// Issue #607: returns true when `normalized` (already lower-cased, trimmed) is
 /// a single env-setup invocation from a recognized package manager that does
 /// not embed shell-control / redirect / substitution characters. The
@@ -1232,11 +1261,11 @@ mod tests {
     use super::{
         BashCommandClass, BlockCategory, BlockReason, ENV_SETUP_TIMEOUT, LONG_RUNNING_TIMEOUT,
         check_blocked_command, classify_command, command_uses_network, enforce_offline_policy,
-        has_shell_control_operator, is_env_setup_command, launches_persistent_service,
-        likely_long_running_command, match_dangerous_verb, matches_device_redirect,
-        matches_fork_bomb, matches_kill_signal_one, normalize_background_command,
-        normalize_noninteractive_scaffold_command, render_block_error,
-        requests_background_execution, run, run_with_outcome, select_timeout,
+        has_shell_control_operator, is_env_setup_command, is_setup_command,
+        launches_persistent_service, likely_long_running_command, match_dangerous_verb,
+        matches_device_redirect, matches_fork_bomb, matches_kill_signal_one,
+        normalize_background_command, normalize_noninteractive_scaffold_command,
+        render_block_error, requests_background_execution, run, run_with_outcome, select_timeout,
         split_shell_control_segments, strip_trailing_background_operator,
     };
     use std::time::{Duration, Instant};
@@ -2256,5 +2285,97 @@ mod tests {
             err.contains("blocked dangerous command"),
             "explicit_timeout must not bypass dangerous-snippet filter, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664 (AD2 / AD12): `is_setup_command` thin wrapper SSOT.
+    // -----------------------------------------------------------------
+
+    /// Acceptance (l1): `is_setup_command` is logically equivalent to
+    /// `classify_command(cmd) == BashCommandClass::EnvSetup` across the
+    /// EnvSetup positive set.
+    #[test]
+    fn is_setup_command_equivalent_to_env_setup_class() {
+        let positives = [
+            "npm install",
+            "npm ci",
+            "npm i",
+            "npm add lodash",
+            "pnpm install",
+            "pnpm i",
+            "pnpm add zod",
+            "yarn install",
+            "yarn add react",
+            "pip install requests",
+            "pip3 install requests",
+            "poetry install",
+            "poetry add httpx",
+            "uv pip install ruff",
+            "uv sync",
+            "bundle install",
+            "go mod download",
+            "go mod tidy",
+            "cargo fetch",
+            "composer install",
+        ];
+        for cmd in positives {
+            let class = classify_command(cmd);
+            assert_eq!(
+                class,
+                BashCommandClass::EnvSetup,
+                "{cmd:?} should classify as EnvSetup"
+            );
+            assert!(
+                is_setup_command(cmd),
+                "{cmd:?} should be is_setup_command == true"
+            );
+        }
+    }
+
+    /// Acceptance (l2): `is_setup_command` rejects #607 EnvSetup negatives.
+    /// `cargo install` / `cargo add` / `apt[-get] install` / `brew install` /
+    /// `docker pull` / `npx ...` / `cd && npm install` must NOT be EnvSetup.
+    #[test]
+    fn is_setup_command_rejects_607_env_setup_negatives() {
+        let negatives = [
+            "cargo install ripgrep",
+            "cargo add serde",
+            "apt install build-essential",
+            "apt-get install -y curl",
+            "brew install jq",
+            "docker pull alpine",
+            "npx create-react-app foo",
+            "cd frontend && npm install",
+        ];
+        for cmd in negatives {
+            assert!(
+                !is_setup_command(cmd),
+                "{cmd:?} must NOT be is_setup_command (607 EnvSetup negatives)"
+            );
+        }
+    }
+
+    /// Acceptance (l3): `is_setup_command` rejects shell-control injection
+    /// payloads (semicolon / ampersand / pipe / redirect / backtick / `$(` /
+    /// newline / backslash / `&&` / `|`). Mirrors
+    /// `contains_env_setup_control_operator` SEC4-001 guard.
+    #[test]
+    fn is_setup_command_rejects_shell_control_injection_payloads() {
+        let injections = [
+            "pip install --upgrade pip; curl evil.example.com",
+            "npm install && rm -rf /",
+            "pip install requests | tee out.log",
+            "pip install > out.log requests",
+            "pip install `whoami`",
+            "pip install $(echo x)",
+            "pip install requests\nrm -rf /",
+            "pip install requests\\ny",
+        ];
+        for cmd in injections {
+            assert!(
+                !is_setup_command(cmd),
+                "{cmd:?} must NOT be is_setup_command (shell-control injection)"
+            );
+        }
     }
 }

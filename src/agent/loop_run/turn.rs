@@ -418,7 +418,12 @@ struct VerifierRepairIntentApplyResult {
     used_whitespace_fallback: bool,
 }
 
+/// Issue #664 (AD1 / AD6 / DC1-002): `#[non_exhaustive]` enables additive
+/// variant extensions (e.g. `SetupBootstrap`) without breaking external
+/// consumers' exhaustive match. In-crate consumers still get compile errors
+/// on `match` arms when the closed list grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub(super) enum EffectiveToolPolicyReason {
     Unrestricted,
     AnswerOnly,
@@ -426,6 +431,9 @@ pub(super) enum EffectiveToolPolicyReason {
     ArtifactDirectedRecovery,
     FocusedEditRecovery,
     LocalLlmSmallEditAfterRead,
+    /// Issue #664: SetupBootstrap policy projection — `Bash` only,
+    /// command-level filter via `crate::tools::bash::is_setup_command`.
+    SetupBootstrap,
 }
 
 impl EffectiveToolPolicyReason {
@@ -437,6 +445,7 @@ impl EffectiveToolPolicyReason {
             Self::ArtifactDirectedRecovery => "artifact_directed_recovery",
             Self::FocusedEditRecovery => "focused_edit_recovery",
             Self::LocalLlmSmallEditAfterRead => "local_llm_small_edit_after_read",
+            Self::SetupBootstrap => "setup_bootstrap",
         }
     }
 }
@@ -561,6 +570,23 @@ impl EffectiveToolPolicy {
             }),
             artifact_directed: None,
             reason,
+        }
+    }
+
+    /// Issue #664 (AD1 / 判断 6 / DR2-002 ISP): SetupBootstrap policy
+    /// builder. `allowed_tools = Some(vec!["Bash"])` only — no Read /
+    /// Write / Edit. The command-level filter
+    /// (`crate::tools::bash::is_setup_command`) is applied at tool
+    /// enforcement time in
+    /// `effective_tool_policy_error_for_call_with_scope`. Separated from
+    /// `artifact_directed_from_job` (Read/Write/Edit) per ISP — a future
+    /// extension does NOT widen this builder's signature.
+    pub(super) fn setup_bootstrap() -> Self {
+        Self {
+            allowed_tools: Some(vec!["Bash"]),
+            focused_edit: None,
+            artifact_directed: None,
+            reason: EffectiveToolPolicyReason::SetupBootstrap,
         }
     }
 
@@ -5651,6 +5677,49 @@ impl Agent {
         // so the next user turn can emit `agent.verifier.weak` /
         // `agent.verifier.missing` again if the failure mode repeats.
         self.session.verifier_safe_stop_emitted_this_turn = false;
+        // Issue #664 iteration-2 (CB-001): reset the per-turn Stage A
+        // observation flag. The flag is set when
+        // `run_task_contract_verifier_once` observes
+        // `OwnedTestVerifierPlan::Missing` (single producer); read by
+        // `build_arbiter_candidates` as the SetupBootstrap signal Stage A.
+        //
+        // Issue #664 iteration-3 (CB2-001): consume the cross-turn
+        // carryover **before** the per-turn reset clears it. The
+        // carryover is set on the previous turn's
+        // `OwnedTestVerifierPlan::Missing` arm (which immediately
+        // exits via `SafeStop`), so the **only** opportunity for the
+        // SetupBootstrap arbiter to see the signal is the head of the
+        // next user-message turn. Promote the carryover into
+        // `_this_turn`, then clear the carryover so it never
+        // accumulates across multiple SafeStop cycles.
+        //
+        // Issue #664 iteration-4 (CB3-001): the promotion is now
+        // request-bound. Compute the current turn's
+        // `RequestCarryoverKey` (16-hex digest of
+        // `mask_secrets(active_request_text)`) and compare to the
+        // stored key. Promote only on equality — a topic switch
+        // clears the carryover without promotion so the stale
+        // Stage A signal cannot grant the Bash-only
+        // `setup_bootstrap` policy to an unrelated request. The
+        // carryover field is always cleared so it is consumed
+        // exactly once (single-shot invariant preserved from
+        // iteration-3).
+        let promoted = match (
+            self.owned_test_verifier_missing_observed_carryover.take(),
+            self.active_request_text(),
+        ) {
+            (Some(stored), Some(current)) => {
+                let current_key = super::task_contract::RequestCarryoverKey::from_request(&current);
+                stored == current_key
+            }
+            // Missing stored key OR missing current request text → fail
+            // closed and do not promote (`active_request_text()` is
+            // `None` only when the session has no user-driving
+            // message, which can never match a key produced from a
+            // real request).
+            _ => false,
+        };
+        self.owned_test_verifier_missing_observed_this_turn = promoted;
         // Issue #606 (T-1.8): reset the per-turn completion-evidence set so
         // observations never bleed across turns. Push-only `EvidenceSet`
         // populated by the Bash / Edit / Write hooks below; consumed by
@@ -6393,6 +6462,10 @@ impl Agent {
                         } else {
                             false
                         };
+                    // Issue #664: `recovery::should_block_bash_command` is the
+                    // legacy recovery-side semantics (DR1-001 案 B). SetupBootstrap
+                    // policy projection uses `bash::is_setup_command` instead.
+                    #[allow(deprecated)]
                     let block_bash_loop = tool_name == "Bash"
                         && recovery::should_block_bash_command(
                             &bash_command,
@@ -6615,7 +6688,13 @@ impl Agent {
                         )
                     } else if tool_name == "Bash" {
                         recent_bash_commands.push(bash_command.clone());
-                        if recovery::is_dependency_install_command(&bash_command) {
+                        // Issue #664: legacy recovery-side classifier; retains
+                        // `cargo install` semantics for the install-loop counter.
+                        // SetupBootstrap policy projection uses
+                        // `bash::is_setup_command` instead.
+                        #[allow(deprecated)]
+                        let is_install = recovery::is_dependency_install_command(&bash_command);
+                        if is_install {
                             install_commands_seen += 1;
                         }
                         if block_bash_loop {
@@ -8618,6 +8697,42 @@ impl Agent {
                     };
                 }
                 super::auto_test::OwnedTestVerifierPlan::Missing => {
+                    // Issue #664 iteration-2 (CB-001): set the per-turn
+                    // Stage A flag so `build_arbiter_candidates` can
+                    // consult `OwnedTestVerifierPlan::Missing` via the
+                    // `VerifierPrerequisiteSignal` Stage A path. This is
+                    // the single producer site; the flag is reset at
+                    // `handle_user_message` head (per-turn rule).
+                    self.owned_test_verifier_missing_observed_this_turn = true;
+                    // Issue #664 iteration-3 (CB2-001): also set the
+                    // cross-turn carryover so the **next** turn's
+                    // `build_arbiter_candidates` can promote the
+                    // signal into `_this_turn` and install a
+                    // SetupBootstrap candidate. The current turn
+                    // immediately returns `SafeStop` below, which
+                    // ends the actor loop — without the carryover the
+                    // signal is reset before any arbiter cycle could
+                    // consume it (CB2-001 lifecycle gap).
+                    //
+                    // Issue #664 iteration-4 (CB3-001): bind the
+                    // carryover to a 16-hex digest of the originating
+                    // request text via `mask_secrets` +
+                    // `stable_path_hash`. The next-turn consumer
+                    // compares the stored key with the current
+                    // turn's request key; a topic switch clears the
+                    // carryover without promotion, closing the
+                    // false-positive grant of `setup_bootstrap`
+                    // policy to unrelated high-confidence requests.
+                    //
+                    // When the active request text is absent (rare —
+                    // verifier ran with no driving message), skip
+                    // the carryover entirely: an unbound carryover
+                    // would degrade into the iteration-3 boolean
+                    // semantics CB3-001 explicitly rejects.
+                    self.owned_test_verifier_missing_observed_carryover = self
+                        .active_request_text()
+                        .as_deref()
+                        .map(super::task_contract::RequestCarryoverKey::from_request);
                     if !self.session.verifier_safe_stop_emitted_this_turn {
                         self.session.verifier_safe_stop_emitted_this_turn = true;
                         log_llm_event(
@@ -10278,6 +10393,151 @@ impl Agent {
         messages
     }
 
+    /// Issue #664 test seam: `pub(super)` wrapper over the private
+    /// `effective_tool_policy()` so `loop_run.rs`'s `#[cfg(test)]`
+    /// `effective_tool_policy_for_test` seam can reach the production
+    /// path without widening the `loop_run` module surface (DR3-001 /
+    /// AD19). Returns the raw `EffectiveToolPolicy`; the seam in
+    /// `loop_run.rs` projects it to `(Vec<String>, String)` primitives
+    /// before crossing the `pub(crate)` boundary.
+    #[cfg(test)]
+    pub(super) fn effective_tool_policy_pub_for_test(&self) -> EffectiveToolPolicy {
+        self.effective_tool_policy()
+    }
+
+    /// Issue #664 test seam: `pub(super)` wrapper over the private
+    /// `build_arbiter_candidates()` so the `loop_run.rs` seam can read
+    /// the candidate list without widening visibility. The returned
+    /// `Vec<JobCandidate>` stays inside `loop_run`; `loop_run.rs::
+    /// build_arbiter_candidates_for_test` projects each element into a
+    /// 4-field primitive DTO before the `pub(crate)` boundary.
+    #[cfg(test)]
+    pub(super) fn build_arbiter_candidates_pub_for_test(
+        &self,
+    ) -> Vec<super::active_job_arbiter::JobCandidate> {
+        self.build_arbiter_candidates()
+    }
+
+    /// Issue #664 iteration-3 (CB2-003) test seam: drive the
+    /// `effective_tool_policy_error_for_call_with_scope` rejection +
+    /// `record_artifact_completion_bash_violation` chokepoint under a
+    /// caller-provided `EffectiveToolPolicy` and tool arguments. Mirrors
+    /// the exact branching inside `execute_tool_call` without any
+    /// network / cancellation / approval side effects.
+    ///
+    /// Returns `(error_string, bash_violation_recorded_count_delta)`.
+    /// The count delta is observed by comparing the active job's
+    /// `attempts().len()` before/after the call, which captures both
+    /// the artifact-directed Bash branch (CB2-003) and the SetupBootstrap
+    /// branch (CB-003 iteration-2). The error string is the same value
+    /// `execute_tool_call` would surface to the LLM (sans
+    /// `lifecycle::format_tool_error` cosmetic wrapping).
+    ///
+    /// Visibility: `pub(super)` only; `loop_run.rs` projects this
+    /// through a primitive-tuple test seam.
+    #[cfg(test)]
+    pub(super) fn drive_policy_error_for_test(
+        &mut self,
+        policy: &EffectiveToolPolicy,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> (Option<String>, usize) {
+        let before = self
+            .artifact_completion_job
+            .as_ref()
+            .map(|j| j.attempts().len())
+            .unwrap_or(0);
+        let scope_for_policy = if self.missing_verifier_job.is_some() {
+            Some(self.current_workspace_scope())
+        } else {
+            None
+        };
+        let err = effective_tool_policy_error_for_call_with_scope(
+            policy,
+            name,
+            arguments,
+            &self.work_root,
+            scope_for_policy.as_ref(),
+        );
+        if let Some(err) = err.as_ref() {
+            // Mirror the recording branch in `execute_tool_call` so the
+            // test seam exercises the exact production wiring.
+            if err.contains("artifact-directed recovery rejected") {
+                if name == "Bash" {
+                    let command_arg = arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+                } else {
+                    let actual_path = arguments
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let _ = self.record_artifact_completion_attempt(
+                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                        vec![format!("{name} on {actual_path}")],
+                    );
+                }
+            } else if err.starts_with("setup bootstrap")
+                && name == "Bash"
+                && self.artifact_completion_job.is_some()
+            {
+                let command_arg = arguments
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+            }
+        }
+        let after = self
+            .artifact_completion_job
+            .as_ref()
+            .map(|j| j.attempts().len())
+            .unwrap_or(0);
+        (err, after.saturating_sub(before))
+    }
+
+    /// Issue #664 iteration-3 (CB2-003) test seam: build an
+    /// `artifact_directed_from_job` policy from the active
+    /// `ArtifactCompletionJob`. Returns `None` when no job is installed.
+    #[cfg(test)]
+    pub(super) fn artifact_directed_policy_for_test(&self) -> Option<EffectiveToolPolicy> {
+        let job = self.artifact_completion_job.as_ref()?;
+        let target = self.artifact_recovery_target_path()?;
+        let target_already_read =
+            focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+        Some(EffectiveToolPolicy::artifact_directed_from_job(
+            target,
+            target_already_read,
+            job.allowed_write_actions(),
+            job.allowed_read_scope(),
+        ))
+    }
+
+    /// Issue #664 iteration-3 (CB2-003) test seam: inspect the latest
+    /// recorded attempt's `bash_policy_violation` marker. `None` when no
+    /// job / no attempts. Mirrors the projection-time `category` field
+    /// without exposing `ArtifactAttemptOutcome`.
+    #[cfg(test)]
+    pub(super) fn last_attempt_bash_policy_violation_for_test(&self) -> Option<bool> {
+        let job = self.artifact_completion_job.as_ref()?;
+        let attempts = job.attempts();
+        attempts.last().map(|a| a.bash_policy_violation())
+    }
+
+    /// Issue #664 iteration-3 (CB2-003) test seam: count the number of
+    /// recorded attempts on the active job. `None` when no job.
+    #[cfg(test)]
+    pub(super) fn artifact_completion_job_attempts_len_for_test(&self) -> Option<usize> {
+        self.artifact_completion_job
+            .as_ref()
+            .map(|j| j.attempts().len())
+    }
+
     fn effective_tool_policy(&self) -> EffectiveToolPolicy {
         // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
         // in §4 of the design policy). The arbiter never sees it; we early-
@@ -10434,7 +10694,64 @@ impl Agent {
             });
         }
 
-        // Priority 4: FocusedEditRecovery.
+        // Issue #664 (Priority 4 / AD22): SetupBootstrap candidate. Built
+        // pure from `TaskContract` + behavior projection + verifier
+        // prerequisite signal + ledger overflow. `should_install_setup_bootstrap`
+        // is the SSOT decision tree (pure-fn; arbiter does not observe
+        // Agent state).
+        //
+        // **Issue #664 iteration-2 (CB-001) — Stage A + Stage B both wired**:
+        //
+        // - **Stage A live observation**: `OwnedTestVerifierPlan::Missing`
+        //   is observed in `run_task_contract_verifier_once` and recorded
+        //   into the per-turn flag `owned_test_verifier_missing_observed_this_turn`
+        //   (single producer). Reading the flag from `&self` is O(1) so the
+        //   pure-`&self` candidate builder can consume the live signal at
+        //   every `effective_tool_policy()` evaluation without traversing
+        //   the workspace. Reset at `handle_user_message` head (per-turn
+        //   rule).
+        //
+        // - **Stage B (BehaviorContractProjection verifier capability label)**:
+        //   the behavior projection is passed to
+        //   `VerifierPrerequisiteSignal::from_sources(stage_a, Some(&p))`.
+        //   `should_install_setup_bootstrap` refines the OR-composed
+        //   signal so Stage B alone (label-only) is insufficient — it
+        //   only fires via the Setup-label fallback (step 4) when the
+        //   projection also carries an explicit setup keyword. This
+        //   suppresses the false positive on plain "add tests" requests
+        //   where `verification_expectations = ["test"]` would otherwise
+        //   trip step (2). Stage A live alone always passes step (2);
+        //   `required_artifacts::Setup` is unaffected (step 1, no gate).
+        if let Some(request) = self.active_request_text() {
+            let task_contract = super::task_contract::TaskContract::from_request(&request);
+            let behavior_projection =
+                super::required_behavior::project_behavior_contract(&task_contract);
+            // Stage A live observation (CB-001): read the per-turn flag
+            // set by `run_task_contract_verifier_once` when it observes
+            // `OwnedTestVerifierPlan::Missing`. The flag is reset at
+            // `handle_user_message` head.
+            let owned_test_verifier_missing = self.owned_test_verifier_missing_observed_this_turn;
+            let verifier_signal = super::task_contract::VerifierPrerequisiteSignal::from_sources(
+                owned_test_verifier_missing,
+                behavior_projection.as_ref(),
+            );
+            let ledger_overflowed = self.artifact_ledger.overflowed();
+            if super::active_job_arbiter::should_install_setup_bootstrap(
+                &task_contract,
+                behavior_projection.as_ref(),
+                &verifier_signal,
+                ledger_overflowed,
+            ) {
+                candidates.push(JobCandidate {
+                    kind: ActiveJobKind::SetupBootstrap,
+                    desired_action: DesiredAction::SetupBash,
+                    policy: EffectiveToolPolicy::setup_bootstrap(),
+                    budget: Budget::Unbounded,
+                });
+            }
+        }
+
+        // Priority 5: FocusedEditRecovery.
         if let Some(target) = self.focused_edit_recovery_target() {
             let policy = self.focused_edit_policy_for_target(
                 target.clone(),
@@ -10453,7 +10770,7 @@ impl Agent {
             });
         }
 
-        // Priority 5: LocalLlmSmallEditAfterRead.
+        // Priority 6: LocalLlmSmallEditAfterRead.
         if let Some(target) = self.local_llm_small_edit_target() {
             let policy = self.focused_edit_policy_for_target(
                 target.clone(),
@@ -12040,6 +12357,39 @@ impl Agent {
             actual_actions,
             expected_target,
         );
+        self.record_artifact_completion_outcome(outcome)
+    }
+
+    /// Issue #664 iteration-2 (CB-003): record a Bash policy violation
+    /// against the active `ArtifactCompletionJob`. The outcome carries the
+    /// non-raw `bash_policy_violation = true` marker so
+    /// `attempt_outcome_to_json_value` emits
+    /// `category = "bash_out_of_policy"`.
+    ///
+    /// Raw command bytes are NOT stored verbatim — `actual_actions` is
+    /// sanitized at `ArtifactAttemptOutcome::new` (`mask_secrets` + length
+    /// cap + control-char neutralize) and hashed via `stable_path_hash`
+    /// at projection time (AD5 / CB-004).
+    fn record_artifact_completion_bash_violation(&mut self, actual_actions: Vec<String>) -> bool {
+        let expected_target = match self.artifact_completion_job.as_ref() {
+            Some(job) => job.target_path().to_string(),
+            None => return false,
+        };
+        let outcome =
+            super::artifact_completion_job::ArtifactAttemptOutcome::new_bash_policy_violation(
+                actual_actions,
+                expected_target,
+            );
+        self.record_artifact_completion_outcome(outcome)
+    }
+
+    /// Shared core: append `outcome` to the active job's attempt history
+    /// and trigger the turn-local exhaustion diagnostic when the job
+    /// transitions to `Exhausted`.
+    fn record_artifact_completion_outcome(
+        &mut self,
+        outcome: super::artifact_completion_job::ArtifactAttemptOutcome,
+    ) -> bool {
         let status_after = match self.artifact_completion_job.as_mut() {
             Some(job) => job.record_attempt(outcome),
             None => return false,
@@ -12331,31 +12681,75 @@ impl Agent {
         if let Some(err) = effective_policy_error {
             self.session.working_memory.note_error(err.clone());
             // Issue #652: classify "artifact-directed recovery rejected …"
-            // policy errors as `WrongTarget` attempts against the active
+            // policy errors as attempts against the active
             // `ArtifactCompletionJob`. Path-string matching is intentional
             // — the policy gate's error format is the SSOT for this class
             // of rejection (see `artifact_directed_tool_policy_error`).
             // No-op when the err is from a different policy gate or when
             // no job is installed.
+            //
+            // Issue #664 iteration-2 (CB-003): split the artifact-directed
+            // rejection into two routes:
+            //   - `name == "Bash"`: Bash policy violation → record via
+            //     `record_artifact_completion_bash_violation` so the
+            //     attempt projection emits
+            //     `category = "bash_out_of_policy"`. The raw command is
+            //     never stored — `ArtifactAttemptOutcome::new` sanitizes
+            //     and `attempt_outcome_to_json_value` hashes via
+            //     `stable_path_hash` (AD5).
+            //   - Otherwise: legacy `WrongTarget` Read/Write/Edit reject
+            //     against the active target.
             if err.contains("artifact-directed recovery rejected") {
-                let actual_path = arguments
-                    .get("path")
+                if name == "Bash" {
+                    let command_arg = arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    // CB-003: actual_actions carries the (masked + hashed)
+                    // Bash command preview. ArtifactAttemptOutcome::new
+                    // applies `mask_secrets` + length cap + control-char
+                    // neutralize; the projection further hashes via
+                    // `stable_path_hash` (16-hex correlator). Raw bytes
+                    // never appear in the structured report.
+                    let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+                } else {
+                    let actual_path = arguments
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    // CB-002: capture the exhaustion signal so the actor
+                    // loop can break with `MissingRepoEdits` instead of
+                    // continuing past a budget-exhausted WrongTarget. The
+                    // `artifact_completion_exhausted_this_turn` flag is the
+                    // SSOT and is also flipped by NoTool / ProseOnly /
+                    // RolePolicyViolation paths (those break the loop via
+                    // the returned bool directly; this WrongTarget path is
+                    // inside `execute_tool_call` and propagates via the
+                    // flag instead).
+                    let _ = self.record_artifact_completion_attempt(
+                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                        vec![format!("{name} on {actual_path}")],
+                    );
+                }
+            } else if err.starts_with("setup bootstrap")
+                && name == "Bash"
+                && self.artifact_completion_job.is_some()
+            {
+                // Issue #664 iteration-2 (CB-003): SetupBootstrap branch
+                // rejection of a non-EnvSetup Bash command. When an
+                // ArtifactCompletionJob happens to be installed alongside,
+                // record the violation against it for audit. SetupBootstrap
+                // and ArtifactCompletionJob are normally disjoint (different
+                // ActiveJobKind priorities), but the recording is idempotent
+                // when no job is present (returns false).
+                let command_arg = arguments
+                    .get("command")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                // CB-002: capture the exhaustion signal so the actor
-                // loop can break with `MissingRepoEdits` instead of
-                // continuing past a budget-exhausted WrongTarget. The
-                // `artifact_completion_exhausted_this_turn` flag is the
-                // SSOT and is also flipped by NoTool / ProseOnly /
-                // RolePolicyViolation paths (those break the loop via
-                // the returned bool directly; this WrongTarget path is
-                // inside `execute_tool_call` and propagates via the
-                // flag instead).
-                let _ = self.record_artifact_completion_attempt(
-                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
-                    vec![format!("{name} on {actual_path}")],
-                );
+                let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
             }
             return lifecycle::format_tool_error(&err);
         }
@@ -13835,7 +14229,11 @@ impl Agent {
             .get("command")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if !recovery::is_scaffold_command(command) {
+        // Issue #664: legacy recovery-side scaffold detector.
+        // SetupBootstrap policy projection uses `bash::is_setup_command`.
+        #[allow(deprecated)]
+        let scaffold_ok = recovery::is_scaffold_command(command);
+        if !scaffold_ok {
             return Some(format!(
                 "Error: empty workspace {label} tasks require one scaffold Bash command first. Do not use cd, ls, manual bootstrap commands, or deprecated scaffolds. {}",
                 requested_framework.scaffold_hint()
@@ -19579,12 +19977,15 @@ fn recent_scaffold_command_seen(messages: &[ConversationMessage]) -> bool {
                 return false;
             }
             message.tool_calls.iter().rev().any(|tool_call| {
-                tool_call.name == "Bash"
+                // Issue #664: legacy recovery-side scaffold detector.
+                #[allow(deprecated)]
+                let is_scaffold = tool_call.name == "Bash"
                     && tool_call
                         .arguments
                         .get("command")
                         .and_then(serde_json::Value::as_str)
-                        .is_some_and(recovery::is_scaffold_command)
+                        .is_some_and(recovery::is_scaffold_command);
+                is_scaffold
             })
         })
 }
@@ -23793,12 +24194,57 @@ fn effective_tool_policy_error_for_call_with_scope(
     if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt()
         && !allowed_tools.contains(&name)
     {
+        // Issue #664 iteration-3 (CB2-003): when the LLM calls `Bash`
+        // under an artifact-directed recovery policy (Read/Write/Edit-
+        // only allow set), the allow-list check fires *before* the
+        // SetupBootstrap branch below could classify the rejection as a
+        // BashOutOfPolicy. To keep the caller-side string-match in
+        // `execute_tool_call_with_optional_policy_resolution` reachable
+        // (which routes the rejection through
+        // `record_artifact_completion_bash_violation` so the structured
+        // report emits `category = "bash_out_of_policy"`), we emit the
+        // same `"artifact-directed recovery rejected Bash"` shape that
+        // the artifact-directed path uses. Otherwise the rejection
+        // would surface as the generic `"tool policy rejected Bash"`
+        // string and the BashOutOfPolicy branch would be unreachable.
+        if policy.reason() == EffectiveToolPolicyReason::ArtifactDirectedRecovery && name == "Bash"
+        {
+            let target_display = policy_target_path(policy)
+                .map(|target| {
+                    target
+                        .strip_prefix(work_root)
+                        .unwrap_or(target)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .unwrap_or_else(|| "the active target".to_string());
+            return Some(format!(
+                "artifact-directed recovery rejected Bash; only allows Read, Write, or Edit on {target_display}"
+            ));
+        }
         return Some(restricted_tool_policy_error(
             policy,
             name,
             allowed_tools,
             work_root,
         ));
+    }
+
+    // Issue #664 (DS1-001 二段防衛): SetupBootstrap allows `Bash` only at
+    // the tool-name layer, but `cargo test` / `echo hi` / `curl ...` would
+    // pass the allowlist. The command-level allow set is decided here via
+    // `crate::tools::bash::is_setup_command`. Non-Setup commands are
+    // rejected with a clear error.
+    if policy.reason() == EffectiveToolPolicyReason::SetupBootstrap && name == "Bash" {
+        let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) else {
+            return Some("setup bootstrap bash requires a string `command` argument".to_string());
+        };
+        if !crate::tools::bash::is_setup_command(command) {
+            return Some(
+                "setup bootstrap only allows dependency-install Bash commands (BashCommandClass::EnvSetup)"
+                    .to_string(),
+            );
+        }
     }
 
     if let Some(focused) = policy.focused_edit_policy() {
@@ -35932,6 +36378,85 @@ export default function App() {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: SetupBootstrap command-level filter (Task 3.3 / DS1-001).
+    // -----------------------------------------------------------------
+
+    /// `policy.reason() == SetupBootstrap && name == "Bash"` with a Setup
+    /// command (`npm install`) → no policy error.
+    #[test]
+    fn effective_tool_policy_setup_bootstrap_branch_accepts_env_setup_commands() {
+        let policy = super::EffectiveToolPolicy::setup_bootstrap();
+        let args = serde_json::json!({ "command": "npm install" });
+        let temp = tempdir().unwrap();
+        let err = effective_tool_policy_error_for_call_with_scope(
+            &policy,
+            "Bash",
+            &args,
+            temp.path(),
+            None,
+        );
+        assert!(err.is_none(), "expected no error, got: {:?}", err);
+    }
+
+    /// SetupBootstrap + Bash + non-Setup command (`cargo test`) → policy error.
+    #[test]
+    fn effective_tool_policy_setup_bootstrap_branch_filters_non_env_setup_commands() {
+        let policy = super::EffectiveToolPolicy::setup_bootstrap();
+        let args = serde_json::json!({ "command": "cargo test" });
+        let temp = tempdir().unwrap();
+        let err = effective_tool_policy_error_for_call_with_scope(
+            &policy,
+            "Bash",
+            &args,
+            temp.path(),
+            None,
+        )
+        .expect("non-Setup bash must be rejected");
+        assert!(
+            err.contains("setup bootstrap"),
+            "expected setup bootstrap rejection, got: {err}"
+        );
+    }
+
+    /// SetupBootstrap + Bash + missing `command` field → policy error.
+    #[test]
+    fn effective_tool_policy_setup_bootstrap_branch_rejects_missing_command_arg() {
+        let policy = super::EffectiveToolPolicy::setup_bootstrap();
+        let args = serde_json::json!({});
+        let temp = tempdir().unwrap();
+        let err = effective_tool_policy_error_for_call_with_scope(
+            &policy,
+            "Bash",
+            &args,
+            temp.path(),
+            None,
+        )
+        .expect("missing command arg must be rejected");
+        assert!(err.contains("setup bootstrap"), "got: {err}");
+    }
+
+    /// SetupBootstrap + non-Bash tool → restricted_tool_policy_error path
+    /// (since `allowed_tools = vec!["Bash"]` and the call is not Bash).
+    #[test]
+    fn effective_tool_policy_setup_bootstrap_branch_rejects_non_bash_tools() {
+        let policy = super::EffectiveToolPolicy::setup_bootstrap();
+        let args = serde_json::json!({ "path": "src/lib.rs" });
+        let temp = tempdir().unwrap();
+        let err = effective_tool_policy_error_for_call_with_scope(
+            &policy,
+            "Read",
+            &args,
+            temp.path(),
+            None,
+        )
+        .expect("non-Bash tool under SetupBootstrap must be rejected");
+        assert!(
+            !err.is_empty(),
+            "expected non-empty restricted-tool error, got: {err}"
+        );
     }
 }
 
