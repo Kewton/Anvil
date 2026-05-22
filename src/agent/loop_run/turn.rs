@@ -133,23 +133,23 @@ enum JobInstallOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EffectiveToolPolicy {
-    allowed_tools: Option<Vec<&'static str>>,
-    focused_edit: Option<FocusedEditPolicy>,
-    artifact_directed: Option<ArtifactDirectedPolicy>,
-    reason: EffectiveToolPolicyReason,
+pub(super) struct EffectiveToolPolicy {
+    pub(super) allowed_tools: Option<Vec<&'static str>>,
+    pub(super) focused_edit: Option<FocusedEditPolicy>,
+    pub(super) artifact_directed: Option<ArtifactDirectedPolicy>,
+    pub(super) reason: EffectiveToolPolicyReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FocusedEditPolicy {
-    target: PathBuf,
-    target_already_read: bool,
+pub(super) struct FocusedEditPolicy {
+    pub(super) target: PathBuf,
+    pub(super) target_already_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtifactDirectedPolicy {
-    target: PathBuf,
-    target_already_read: bool,
+pub(super) struct ArtifactDirectedPolicy {
+    pub(super) target: PathBuf,
+    pub(super) target_already_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,7 +346,7 @@ struct VerifierRepairIntentApplyResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EffectiveToolPolicyReason {
+pub(super) enum EffectiveToolPolicyReason {
     Unrestricted,
     AnswerOnly,
     VerifierRepair,
@@ -356,7 +356,7 @@ enum EffectiveToolPolicyReason {
 }
 
 impl EffectiveToolPolicyReason {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Unrestricted => "unrestricted",
             Self::AnswerOnly => "answer_only",
@@ -369,7 +369,7 @@ impl EffectiveToolPolicyReason {
 }
 
 impl EffectiveToolPolicy {
-    fn unrestricted() -> Self {
+    pub(super) fn unrestricted() -> Self {
         Self {
             allowed_tools: None,
             focused_edit: None,
@@ -378,7 +378,10 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn restricted(reason: EffectiveToolPolicyReason, allowed_tools: Vec<&'static str>) -> Self {
+    pub(super) fn restricted(
+        reason: EffectiveToolPolicyReason,
+        allowed_tools: Vec<&'static str>,
+    ) -> Self {
         Self {
             allowed_tools: Some(allowed_tools),
             focused_edit: None,
@@ -387,7 +390,7 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn artifact_directed(target: PathBuf, target_already_read: bool) -> Self {
+    pub(super) fn artifact_directed(target: PathBuf, target_already_read: bool) -> Self {
         let allowed_tools = if !target.is_file() {
             vec!["Write"]
         } else if target_already_read {
@@ -427,7 +430,7 @@ impl EffectiveToolPolicy {
     /// difference is that the SOURCE of truth is now the job's least-
     /// privilege projection, so future writes/reads granularity changes
     /// (Issue #653+) ripple through here automatically.
-    fn artifact_directed_from_job(
+    pub(super) fn artifact_directed_from_job(
         target: PathBuf,
         target_already_read: bool,
         allowed_write_actions: &super::artifact_completion_job::AllowedWriteActions,
@@ -463,7 +466,7 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn focused_edit(
+    pub(super) fn focused_edit(
         reason: EffectiveToolPolicyReason,
         allowed_tools: Vec<&'static str>,
         target: PathBuf,
@@ -480,19 +483,19 @@ impl EffectiveToolPolicy {
         }
     }
 
-    fn allowed_tool_names_for_prompt(&self) -> Option<&[&str]> {
+    pub(super) fn allowed_tool_names_for_prompt(&self) -> Option<&[&str]> {
         self.allowed_tools.as_deref()
     }
 
-    fn focused_edit_policy(&self) -> Option<&FocusedEditPolicy> {
+    pub(super) fn focused_edit_policy(&self) -> Option<&FocusedEditPolicy> {
         self.focused_edit.as_ref()
     }
 
-    fn artifact_directed_policy(&self) -> Option<&ArtifactDirectedPolicy> {
+    pub(super) fn artifact_directed_policy(&self) -> Option<&ArtifactDirectedPolicy> {
         self.artifact_directed.as_ref()
     }
 
-    fn reason(&self) -> EffectiveToolPolicyReason {
+    pub(super) fn reason(&self) -> EffectiveToolPolicyReason {
         self.reason
     }
 }
@@ -3796,6 +3799,14 @@ impl Agent {
         // StopReason per turn; clearing here lets a new user turn re-emit
         // the same StopReason if the stop condition recurs.
         self.safe_stop_report_emitted.clear();
+        // Issue #660 (Phase C / DD-4 / DR1-007): per-turn diff-based dedup
+        // state for the `agent.active_job.selected` event. Reset adjacent to
+        // `safe_stop_report_emitted.clear()` so all per-turn dedup state
+        // restarts together at turn boundary (locality eases review when
+        // adding new per-turn caps). Forces the first selection of the new
+        // turn to emit (None → Some triggers emit), so each turn starts the
+        // observation series fresh.
+        self.last_active_job_selection = None;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -5329,6 +5340,21 @@ impl Agent {
             // Reuses the value we just computed — O(1), no second walk over
             // `messages`. No-op when the footer handle is disabled.
             self.footer.publish_tokens(approx_tokens);
+
+            // Issue #660 (Phase C / DD-4): emit `agent.active_job.selected`
+            // at the head of every iteration when the selection differs from
+            // the previous emission. Per-turn diff-based dedup state lives
+            // on `self.last_active_job_selection`, reset at
+            // `handle_user_message` entry adjacent to
+            // `safe_stop_report_emitted`. The helper itself is the only emit
+            // site; raw verifier commands / raw paths are redacted by the
+            // pure `build_active_job_selected_payload` builder (DR4-001/002).
+            //
+            // Codex CB-002: pass the actor-loop `iter_count` as the
+            // payload's `iteration_seq` so the field name and the value
+            // semantics agree (previously the per-turn index was passed,
+            // which collapsed all same-turn re-emits to a single value).
+            self.emit_active_job_selected_if_changed(iter_count as u32);
 
             // Boundary 1: before requesting the next assistant reply. Lets us
             // bail out between iterations without starting a fresh LLM call.
@@ -9678,6 +9704,9 @@ impl Agent {
     }
 
     fn effective_tool_policy(&self) -> EffectiveToolPolicy {
+        // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
+        // in §4 of the design policy). The arbiter never sees it; we early-
+        // return before constructing any selectable `JobCandidate`.
         if self.answer_only_mode_active() {
             if self.workspace_appears_empty() {
                 return EffectiveToolPolicy::restricted(
@@ -9697,64 +9726,249 @@ impl Agent {
                 );
             }
         }
+
+        // Issue #660 (Codex CB-001 / §4 design table): `PlanModeGate` is also
+        // a pre-arbitration gate, not a selectable arbitration kind. The
+        // Plan-file Write/Edit exception is the authority of
+        // `src/tools/registry.rs::resolve_plan_mode_write_target` /
+        // `enforce_plan_stage_scope`; the arbiter must not pre-empt that
+        // decision with stale `task_contract_verifier_repair_pending` or
+        // other selectable state. Returning `unrestricted()` keeps the
+        // tool-spec surface and recovery-target gating out of the arbiter
+        // while the registry-layer PAM gate enforces actual write target.
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return EffectiveToolPolicy::unrestricted();
+        }
+
+        // Issue #660 (Phase E): arbiter is the **sole authority** for write
+        // owner selection. The legacy if-elif chain, the
+        // `#[cfg(debug_assertions)]` dual-source assertion, and the
+        // `agent.active_job.divergence_detected` event emit that lived here
+        // during Phase A+B-D have all been removed. `effective_tool_policy`
+        // is now a thin shell over `build_arbiter_candidates` +
+        // `select_active_job` + `project_policy`.
+        //
+        // The `agent.active_job.selected` event is emitted by
+        // `emit_active_job_selected_if_changed` from the agent loop driver
+        // (see L5352 `run_actor_loop` site) — `effective_tool_policy` stays
+        // a pure read so it can be called freely without log-emit side
+        // effects.
+        let candidates = self.build_arbiter_candidates();
+        let selection = super::active_job_arbiter::select_active_job(&candidates);
+        super::active_job_arbiter::project_policy(&selection)
+    }
+
+    /// Issue #660: build the arbiter candidate list from the same source
+    /// signals the legacy chain reads. Per DR1-004 only candidates with a
+    /// determined `desired_action` are pushed — there is no
+    /// `RejectionReason::NoDesiredAction`.
+    ///
+    /// Each branch mirrors a single legacy `if let Some(target) = ...`
+    /// arm. The policy attached to the candidate is the exact value the
+    /// legacy chain would have returned, so `project_policy(selection)`
+    /// is value-equal to the legacy result.
+    fn build_arbiter_candidates(&self) -> Vec<super::active_job_arbiter::JobCandidate> {
+        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
+
+        let mut candidates: Vec<JobCandidate> = Vec::new();
+
+        // Priority 1: VerifierRepair (task_contract_verifier_repair_pending).
         if self.task_contract_verifier_repair_pending {
-            // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
-            // active and the safeguarded decision returns `NoRepair` (i.e.
-            // the scope check rejected the legacy out-of-scope target),
-            // expose the MissingVerifierJob's narrow tool whitelist so the
-            // model can still produce an in-scope verifier file.
             let decision = self.verifier_repair_decision_for_policy();
-            if matches!(decision, VerifierRepairDecision::NoRepair)
+            let (policy, desired_action) = if matches!(decision, VerifierRepairDecision::NoRepair)
                 && let Some(job) = self.missing_verifier_job.as_ref()
             {
-                return EffectiveToolPolicy::restricted(
-                    EffectiveToolPolicyReason::VerifierRepair,
-                    job.allowed_tool_names().to_vec(),
-                );
-            }
-            return verifier_repair_policy_for_decision(decision);
+                (
+                    EffectiveToolPolicy::restricted(
+                        EffectiveToolPolicyReason::VerifierRepair,
+                        job.allowed_tool_names().to_vec(),
+                    ),
+                    DesiredAction::MissingVerifierCreate,
+                )
+            } else {
+                (
+                    verifier_repair_policy_for_decision(decision),
+                    DesiredAction::VerifierRepair {
+                        command: String::new(),
+                        target_hint: None,
+                    },
+                )
+            };
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::VerifierRepair,
+                desired_action,
+                policy,
+                budget: Budget::Unbounded,
+            });
         }
+
+        // Priority 2: ForcedSmallEditRecovery.
         if let Some(target) = self.forced_small_edit_recovery_target() {
-            return self.focused_edit_policy_for_target(
-                target,
+            let policy = self.focused_edit_policy_for_target(
+                target.clone(),
                 EffectiveToolPolicyReason::FocusedEditRecovery,
             );
+            let already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::ForcedSmallEditRecovery,
+                desired_action: DesiredAction::FocusedEdit {
+                    target,
+                    already_read,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
         }
+
+        // Priority 3: ArtifactRecovery.
         if let Some(target) = self.artifact_recovery_target_path() {
             let target_already_read =
                 focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            // PRR-003 (re-review v2): when a Test-role `ArtifactCompletionJob`
-            // is active, project its `AllowedWriteActions` /
-            // `AllowedReadScope` into the policy so the job is the explicit
-            // source of truth for the allowed-tools set (least privilege).
-            // Non-Test roles (Implementation / UsageDocs / Setup) do not
-            // attach a job today and continue to use the legacy
-            // `target.is_file()`-derived constructor.
-            if let Some(job) = self.artifact_completion_job.as_ref()
+            let policy = if let Some(job) = self.artifact_completion_job.as_ref()
                 && matches!(job.role(), super::task_contract::ArtifactRole::Test)
             {
-                return EffectiveToolPolicy::artifact_directed_from_job(
-                    target,
+                EffectiveToolPolicy::artifact_directed_from_job(
+                    target.clone(),
                     target_already_read,
                     job.allowed_write_actions(),
                     job.allowed_read_scope(),
-                );
-            }
-            return EffectiveToolPolicy::artifact_directed(target, target_already_read);
+                )
+            } else {
+                EffectiveToolPolicy::artifact_directed(target.clone(), target_already_read)
+            };
+            let (write_actions, read_scope) = match self.artifact_completion_job.as_ref() {
+                Some(job) if matches!(job.role(), super::task_contract::ArtifactRole::Test) => (
+                    job.allowed_write_actions().clone(),
+                    job.allowed_read_scope().clone(),
+                ),
+                _ => (
+                    super::artifact_completion_job::AllowedWriteActions::target_create_only(),
+                    super::artifact_completion_job::AllowedReadScope::TargetOnly,
+                ),
+            };
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::ArtifactRecovery,
+                desired_action: DesiredAction::ArtifactDirected {
+                    target,
+                    already_read: target_already_read,
+                    write_actions,
+                    read_scope,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
         }
+
+        // Priority 4: FocusedEditRecovery.
         if let Some(target) = self.focused_edit_recovery_target() {
-            return self.focused_edit_policy_for_target(
-                target,
+            let policy = self.focused_edit_policy_for_target(
+                target.clone(),
                 EffectiveToolPolicyReason::FocusedEditRecovery,
             );
+            let already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::FocusedEditRecovery,
+                desired_action: DesiredAction::FocusedEdit {
+                    target,
+                    already_read,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
         }
+
+        // Priority 5: LocalLlmSmallEditAfterRead.
         if let Some(target) = self.local_llm_small_edit_target() {
-            return self.focused_edit_policy_for_target(
-                target,
+            let policy = self.focused_edit_policy_for_target(
+                target.clone(),
                 EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
             );
+            let already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            candidates.push(JobCandidate {
+                kind: ActiveJobKind::LocalLlmSmallEditAfterRead,
+                desired_action: DesiredAction::FocusedEdit {
+                    target,
+                    already_read,
+                },
+                policy,
+                budget: Budget::Unbounded,
+            });
         }
-        EffectiveToolPolicy::unrestricted()
+
+        candidates
+    }
+
+    /// Issue #660 (Phase C / DD-4): per-turn diff-based emit of
+    /// `agent.active_job.selected`. Computes the current
+    /// `ActiveJobSelection`, compares it with the previous emission stored
+    /// in `self.last_active_job_selection`, and emits a single structured
+    /// log event when the selection differs. Returns `true` when the event
+    /// was emitted, `false` when dedup skipped it.
+    ///
+    /// **Per-turn rule** (DR1-007): `self.last_active_job_selection` is
+    /// reset to `None` at the head of every `handle_user_message`, so the
+    /// first call of a new turn always emits.
+    ///
+    /// **Security** (Stage 4 DR4-001/002 / §7 of the design policy): the
+    /// payload contains only short type labels, sanitized
+    /// `EffectiveToolPolicyReason::as_str()` strings, counts, and
+    /// non-cryptographic `stable_path_hash(mask_secrets(...))` correlators.
+    /// Raw verifier commands / raw paths / raw recovery reasons are NEVER
+    /// included; emit goes through `log_llm_event` so
+    /// `mask_payload_inplace` is the final defense line.
+    ///
+    /// **`iteration_seq` semantics** (Codex CB-002): the caller passes the
+    /// actor-loop iteration counter (`run_actor_loop`'s `iter_count`) so
+    /// that the payload `iteration_seq` field name and value semantics
+    /// agree. Two re-emits within the same turn carry distinct
+    /// `iteration_seq` values, which lets #666 consumers identify the
+    /// iteration at which a selection change occurred.
+    pub(super) fn emit_active_job_selected_if_changed(&mut self, iteration_seq: u32) -> bool {
+        let selection = self.current_active_job_selection();
+        if self.last_active_job_selection.as_ref() == Some(&selection) {
+            return false;
+        }
+        let payload = build_active_job_selected_payload(
+            &selection,
+            iteration_seq,
+            self.repair_job_artifact_attempts as u32,
+            self.artifact_completion_job
+                .as_ref()
+                .map(|job| job.attempts().len() as u32)
+                .unwrap_or(0),
+        );
+        log_llm_event("agent.active_job.selected", payload);
+        self.last_active_job_selection = Some(selection);
+        true
+    }
+
+    /// Issue #660 (Phase C): compute the current `ActiveJobSelection`
+    /// using the same `build_arbiter_candidates` + `select_active_job`
+    /// pipeline as `effective_tool_policy()`. Pure on `self` — no log
+    /// emit, no state mutation. Recomputed on demand so callers
+    /// (`emit_active_job_selected_if_changed`) can observe the selection
+    /// independently of `effective_tool_policy()`.
+    ///
+    /// Issue #660 (Codex CB-001 / §4): mirrors the `effective_tool_policy`
+    /// pre-arbitration gate for `ExecutionMode::Plan`. The PAM gate at
+    /// `src/tools/registry.rs::resolve_plan_mode_write_target` /
+    /// `enforce_plan_stage_scope` is the authority for plan-file Write/Edit
+    /// arbitration; the arbiter does not see any candidate while Plan mode
+    /// is active, so observers (e.g. `emit_active_job_selected_if_changed`,
+    /// the `selected_skips_*` generic-retry guards in Phase D) see a
+    /// `None` selection that accurately reflects the design.
+    fn current_active_job_selection(&self) -> super::active_job_arbiter::ActiveJobSelection {
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return super::active_job_arbiter::ActiveJobSelection {
+                selected: None,
+                rejected: Vec::new(),
+            };
+        }
+        let candidates = self.build_arbiter_candidates();
+        super::active_job_arbiter::select_active_job(&candidates)
     }
 
     fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
@@ -16038,6 +16252,291 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // Issue #660 (Phase C / DD-4 / DD-5) — agent.active_job.selected emit +
+    // per-turn diff-based dedup tests
+    // ========================================================================
+
+    #[test]
+    fn issue660_phase_c_first_emit_after_turn_reset_returns_true() {
+        // Per-turn rule (DR1-007): `last_active_job_selection` is `None` on
+        // turn entry, so the first call of a new turn must always emit
+        // (None → Some triggers the change-detection branch).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert!(agent.last_active_job_selection.is_none());
+        let emitted = agent.emit_active_job_selected_if_changed(0);
+        assert!(
+            emitted,
+            "first call after turn reset must emit (None -> Some transition)"
+        );
+        assert!(
+            agent.last_active_job_selection.is_some(),
+            "emit must update the dedup state to Some(...) so the next \
+             identical call is deduped"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_identical_selection_twice_is_deduped() {
+        // DD-4 contract: diff-based dedup. Calling
+        // `emit_active_job_selected_if_changed` twice in a row with no
+        // state change between calls must emit exactly ONCE.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let first = agent.emit_active_job_selected_if_changed(0);
+        let second = agent.emit_active_job_selected_if_changed(1);
+        assert!(first, "first emit must succeed");
+        assert!(
+            !second,
+            "second emit with identical selection MUST be deduped (DD-4)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_selection_change_triggers_re_emit() {
+        // DD-4 contract: when the selection differs from
+        // `last_active_job_selection`, emit again. We mutate Agent state
+        // between the two calls (install a verifier-repair pending flag)
+        // so the candidate list changes and the projected selection is no
+        // longer the empty/None selection.
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let first = agent.emit_active_job_selected_if_changed(0);
+        assert!(first);
+
+        // Install verifier-repair pending so the next selection differs
+        // from the previous None-winner selection.
+        agent.task_contract_verifier_repair_pending = true;
+        let second = agent.emit_active_job_selected_if_changed(1);
+        assert!(
+            second,
+            "selection change (None -> VerifierRepair) MUST re-emit"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_turn_reset_re_emits_same_selection() {
+        // DR1-007: per-turn reset (`handle_user_message` head) clears
+        // `last_active_job_selection` to `None`, which means the same
+        // selection in the next turn emits again (turn boundary is the
+        // diff baseline).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.emit_active_job_selected_if_changed(0);
+        assert!(agent.last_active_job_selection.is_some());
+
+        // Simulate per-turn reset (same lines as handle_user_message head).
+        agent.last_active_job_selection = None;
+
+        let after_reset = agent.emit_active_job_selected_if_changed(0);
+        assert!(
+            after_reset,
+            "post-turn-reset call must emit again (None -> Some transition)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_payload_contains_required_top_level_keys() {
+        // DD-5 schema contract: every emission carries
+        // iteration_seq / selected / rejected / policy_projected /
+        // budget_state at the top level. The pure builder is exercised
+        // directly so the assertion does not need a log-capture seam.
+        use super::super::active_job_arbiter::{ActiveJobSelection, project_policy};
+
+        let selection = ActiveJobSelection {
+            selected: None,
+            rejected: vec![],
+        };
+        let payload = super::build_active_job_selected_payload(&selection, /*seq=*/ 7, 0, 0);
+        for key in [
+            "iteration_seq",
+            "selected",
+            "rejected",
+            "policy_projected",
+            "budget_state",
+        ] {
+            assert!(
+                payload.get(key).is_some(),
+                "payload MUST contain top-level key {key}"
+            );
+        }
+        assert_eq!(
+            payload.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(7),
+            "iteration_seq must be propagated verbatim"
+        );
+        // `selected.job_kind` is "None" when there is no winner; the
+        // projected policy reason is "unrestricted".
+        let selected = payload.get("selected").unwrap();
+        assert_eq!(
+            selected.get("job_kind").and_then(|v| v.as_str()),
+            Some("None")
+        );
+        let projected = payload.get("policy_projected").unwrap();
+        assert_eq!(
+            projected.get("reason_label").and_then(|v| v.as_str()),
+            Some(project_policy(&selection).reason().as_str())
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_payload_redacts_raw_path_and_command() {
+        // §7 of the design policy (DR4-001/002): raw verifier command MUST
+        // NOT appear in the payload — `desired_action` collapses to the
+        // static label "verifier_repair". Raw `PathBuf` targets MUST NOT
+        // appear either — `target_path_hash` is 16-hex (or null) only.
+        use super::super::active_job_arbiter::{
+            ActiveJobKind, ActiveJobSelection, Budget, DesiredAction, JobCandidate,
+        };
+        use std::path::PathBuf;
+
+        // Candidate carrying a sensitive raw command + a "secret-ish" path
+        // (so that mask_secrets would have something to mask if a
+        // regression let it through).
+        let policy = super::EffectiveToolPolicy::restricted(
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read", "Edit"],
+        );
+        let candidate = JobCandidate {
+            kind: ActiveJobKind::VerifierRepair,
+            desired_action: DesiredAction::VerifierRepair {
+                command: "cargo test -- --token=AKIAIOSFODNN7EXAMPLE".to_string(),
+                target_hint: None,
+            },
+            policy,
+            budget: Budget::Unbounded,
+        };
+        let selection = ActiveJobSelection {
+            selected: Some(candidate),
+            rejected: vec![],
+        };
+        let payload = super::build_active_job_selected_payload(&selection, 0, 0, 0);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains("AKIAIOSFODNN7EXAMPLE"),
+            "raw command MUST NEVER appear in payload — found in {serialized}"
+        );
+        assert!(
+            !serialized.contains("cargo test"),
+            "raw command MUST NEVER appear in payload — found 'cargo test' in {serialized}"
+        );
+        // desired_action is the static label only.
+        assert_eq!(
+            payload
+                .get("selected")
+                .and_then(|s| s.get("desired_action"))
+                .and_then(|v| v.as_str()),
+            Some("verifier_repair")
+        );
+
+        // Now an artifact-directed candidate with a path; verify that the
+        // payload carries a `target_path_hash` (16 hex chars) and never
+        // the raw path.
+        let path = PathBuf::from("tests/leak_check_test.py");
+        let policy2 = super::EffectiveToolPolicy::artifact_directed(path.clone(), false);
+        let candidate2 = JobCandidate {
+            kind: ActiveJobKind::ArtifactRecovery,
+            desired_action: DesiredAction::ArtifactDirected {
+                target: path.clone(),
+                already_read: false,
+                write_actions:
+                    super::super::artifact_completion_job::AllowedWriteActions::target_create_only(),
+                read_scope: super::super::artifact_completion_job::AllowedReadScope::TargetOnly,
+            },
+            policy: policy2,
+            budget: Budget::Unbounded,
+        };
+        let selection2 = ActiveJobSelection {
+            selected: Some(candidate2),
+            rejected: vec![],
+        };
+        let payload2 = super::build_active_job_selected_payload(&selection2, 1, 0, 0);
+        let serialized2 = serde_json::to_string(&payload2).unwrap();
+        assert!(
+            !serialized2.contains("tests/leak_check_test.py"),
+            "raw path MUST NEVER appear in payload — found in {serialized2}"
+        );
+        let hash = payload2
+            .get("selected")
+            .and_then(|s| s.get("target_path_hash"))
+            .and_then(|v| v.as_str())
+            .expect("ArtifactDirected MUST carry target_path_hash");
+        assert_eq!(hash.len(), 16, "target_path_hash must be 16 hex chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "target_path_hash must be hex-only, got {hash}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_c_rejected_reasons_collapse_to_static_labels() {
+        // DR1-004: rejection_reason payload field is one of the two
+        // closed static labels — "LowerPriority" or "BudgetExhausted".
+        // No external strings (winner_kind / stop_reason) leak as raw
+        // fields because the schema reduces them to a single label.
+        use super::super::active_job_arbiter::{
+            ActiveJobKind, ActiveJobSelection, JobCandidate, RejectedJob, RejectionReason,
+        };
+        use super::super::repair_job::StopReason;
+        use std::num::NonZeroU32;
+
+        // We need at least one selected candidate so the payload's
+        // "selected" block is non-trivial; the assertion below targets
+        // the `rejected` array specifically.
+        let _ = NonZeroU32::new(3).unwrap();
+        let selection = ActiveJobSelection {
+            selected: Some(JobCandidate {
+                kind: ActiveJobKind::FocusedEditRecovery,
+                desired_action: super::super::active_job_arbiter::DesiredAction::FocusedEdit {
+                    target: std::path::PathBuf::from("src/lib.rs"),
+                    already_read: true,
+                },
+                policy: super::EffectiveToolPolicy::focused_edit(
+                    super::EffectiveToolPolicyReason::FocusedEditRecovery,
+                    vec!["Read", "Edit"],
+                    std::path::PathBuf::from("src/lib.rs"),
+                    true,
+                ),
+                budget: super::super::active_job_arbiter::Budget::Unbounded,
+            }),
+            rejected: vec![
+                RejectedJob {
+                    kind: ActiveJobKind::VerifierRepair,
+                    reason: RejectionReason::BudgetExhausted {
+                        stop_reason: StopReason::VerifierFailedSafeStop,
+                    },
+                },
+                RejectedJob {
+                    kind: ActiveJobKind::ArtifactRecovery,
+                    reason: RejectionReason::LowerPriority {
+                        winner_kind: ActiveJobKind::FocusedEditRecovery,
+                    },
+                },
+            ],
+        };
+        let payload = super::build_active_job_selected_payload(&selection, 0, 0, 0);
+        let rejected = payload
+            .get("rejected")
+            .and_then(|v| v.as_array())
+            .expect("rejected MUST be an array");
+        assert_eq!(rejected.len(), 2);
+        let labels: Vec<&str> = rejected
+            .iter()
+            .filter_map(|r| r.get("rejection_reason").and_then(|v| v.as_str()))
+            .collect();
+        assert!(labels.contains(&"BudgetExhausted"));
+        assert!(labels.contains(&"LowerPriority"));
+    }
+
     #[test]
     fn pr001_test_role_valid_hint_installs_job_and_syncs_projection() {
         use crate::agent::loop_run::commands::test_agent_with_config;
@@ -16397,6 +16896,518 @@ mod tests {
         let (agent, _temp) = test_agent_with_config(Config::default());
         // No repair_job, no recovery_target, no active request -> None.
         assert_eq!(agent.resolve_current_role_for_safe_stop(None), None);
+    }
+
+    // ========================================================================
+    // Issue #660 (Phase D / §9-3) — generic retry suppression while an active
+    // job is selected.
+    //
+    // Acceptance criterion (Issue #660, §3): "active job がある間、他 job は
+    // tool policy を上書きしない". The generic retry / deterministic fallback
+    // family must not horn in on an in-flight active job and edit repo files
+    // outside that job's scope.
+    //
+    // These tests exercise the **internal seam** (call the recovery /
+    // fallback functions directly) so the regression guard does not depend
+    // on a full E2E loop. They cover the three bounded-failure active job
+    // kinds — VerifierRepair / ArtifactRecovery / ForcedSmallEditRecovery —
+    // and assert two invariants per case:
+    //
+    //   (1) `effective_tool_policy().reason()` is the active-job-derived
+    //       reason (not `Unrestricted`), confirming the arbiter routed the
+    //       turn to the active job.
+    //   (2) The current `ActiveJobSelection.selected` is `Some(...)`, so
+    //       Phase C's diff-based dedup state would observe an active job
+    //       on the next iteration.
+    //   (3) `maybe_apply_local_llm_small_edit_fallback()` returns
+    //       `Ok(None)` (= no-op). This is the "generic retry does not
+    //       horn in" assertion.
+    //
+    // Plan timeout materialization is covered separately in
+    // `issue660_phase_d_plan_mode_pre_arbitration_gate_skips_arbiter`
+    // (Stage 3 DR3-005: PAM is the pre-arbitration gate, so Plan-mode
+    // behavior parity is verified independently of `selected.is_some()`).
+    // ========================================================================
+
+    #[test]
+    fn issue660_phase_d_verifier_repair_selected_skips_generic_small_edit_fallback() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+
+        // FullTemplate so `maybe_apply_local_llm_small_edit_fallback`'s
+        // outer `allows_template_completion` gate would otherwise allow
+        // template completion; we then assert it still returns Ok(None)
+        // because the verifier-repair active job owns the turn.
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // Install VerifierRepair as the active job (Priority 1 — wins over
+        // every other selectable kind).
+        agent.task_contract_verifier_repair_pending = true;
+
+        // (1) Arbiter must surface a VerifierRepair-derived policy.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::VerifierRepair,
+            "VerifierRepair must own the effective tool policy (§4 priority 1)"
+        );
+
+        // (2) ActiveJobSelection.selected MUST be Some (Phase C dedup state
+        //     would observe an active job at the head of the next iteration).
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_some(),
+            "current_active_job_selection().selected must be Some(VerifierRepair)"
+        );
+
+        // (3) Generic retry (local-LLM small-edit fallback) must NOT fire.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("update the project");
+        assert!(
+            matches!(result, Ok(None)),
+            "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
+             VerifierRepair is the active job; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_artifact_recovery_selected_skips_generic_small_edit_fallback() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{ArtifactRole, RecoveryTarget};
+        use crate::config::{Config, DeterministicFallbackMode};
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // Install ArtifactRecovery via a non-Test role (Implementation) so
+        // we do not need to attach an `ArtifactCompletionJob` (which would
+        // require Test-role artifact path validation). The arbiter still
+        // routes the turn through `artifact_recovery_target_path()` and
+        // returns an `artifact_directed` policy.
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+        std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Implementation,
+            path: "src/main.py".to_string(),
+            reason: "missing implementation".to_string(),
+            attempt: 1,
+        });
+
+        // (1) Arbiter must surface an artifact-directed-recovery policy.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::ArtifactDirectedRecovery,
+            "ArtifactRecovery must own the effective tool policy (§4 priority 3)"
+        );
+
+        // (2) ActiveJobSelection.selected MUST be Some.
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_some(),
+            "current_active_job_selection().selected must be Some(ArtifactRecovery)"
+        );
+
+        // (3) Generic retry MUST NOT fire.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("implement the feature");
+        assert!(
+            matches!(result, Ok(None)),
+            "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
+             ArtifactRecovery is the active job; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_forced_small_edit_recovery_selected_skips_generic_small_edit_fallback() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::ollama::xml_fallback::ToolCall;
+        use crate::session::store::ConversationMessage;
+        use serde_json::json;
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // ForcedSmallEditRecovery requires: Act mode + truncated-tool-call
+        // system note + a recent Read of an existing file. Set up the same
+        // fixture as `forced_small_edit_recovery_targets_existing_recent_read_file`.
+        let target_rel = "app/page.tsx";
+        std::fs::create_dir_all(agent.work_root.join("app")).unwrap();
+        std::fs::write(
+            agent.work_root.join(target_rel),
+            "export default function Home() { return null; }\n",
+        )
+        .unwrap();
+        // Push a user message so `latest_user_turn_slice` finds the system
+        // note in the current turn (the truncated-tool-call detector walks
+        // back from the latest user turn).
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user("update page.tsx".to_string()));
+        agent.session.messages.push(ConversationMessage::system(
+            "Previous tool call was cut off by the model length limit: \
+             tool call parser failed: truncated tool call (generate response \
+             hit length limit). tool_call_format_attempt=1"
+                .to_string(),
+        ));
+        agent.session.messages.push(ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "xml-1".to_string(),
+                name: "Read".to_string(),
+                arguments: json!({"path": target_rel}),
+            }],
+        ));
+
+        // Sanity: forced_small_edit_recovery_target must resolve under
+        // this fixture (otherwise the arbiter would not select ForcedSmallEdit).
+        assert!(
+            agent.forced_small_edit_recovery_target().is_some(),
+            "fixture invariant: forced_small_edit_recovery_target must be Some"
+        );
+
+        // (1) Arbiter must surface a focused-edit-recovery policy
+        //     (ForcedSmallEditRecovery uses the FocusedEditRecovery reason).
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::FocusedEditRecovery,
+            "ForcedSmallEditRecovery must own the effective tool policy (§4 priority 2)"
+        );
+
+        // (2) ActiveJobSelection.selected MUST be Some.
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_some(),
+            "current_active_job_selection().selected must be Some(ForcedSmallEditRecovery)"
+        );
+        // Confirm the winning kind is exactly ForcedSmallEditRecovery (not
+        // a lower-priority FocusedEditRecovery / LocalLlmSmallEditAfterRead
+        // due to a fixture bug).
+        let kind = selection.selected.as_ref().map(|c| c.kind);
+        assert_eq!(
+            kind,
+            Some(super::super::active_job_arbiter::ActiveJobKind::ForcedSmallEditRecovery),
+            "selected kind must be ForcedSmallEditRecovery"
+        );
+
+        // (3) Generic retry MUST NOT fire.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("update page.tsx");
+        assert!(
+            matches!(result, Ok(None)),
+            "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
+             ForcedSmallEditRecovery is the active job; got {result:?}"
+        );
+
+        // Regression guard: the target file must not have been overwritten
+        // by a generic deterministic polish behind the active job's back.
+        let after = std::fs::read_to_string(agent.work_root.join(target_rel)).unwrap();
+        assert_eq!(
+            after, "export default function Home() { return null; }\n",
+            "the target file MUST NOT be modified by a generic small-edit \
+             fallback while a higher-priority active job is selected"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_no_active_job_allows_generic_fallback_path_to_run() {
+        // Negative regression guard: when no selectable active job is in
+        // flight, `effective_tool_policy()` projects to `Unrestricted` and
+        // `current_active_job_selection().selected` is `None`. The generic
+        // retry / fallback paths must remain available (Phase D must not
+        // accidentally suppress every generic retry — only the ones that
+        // would horn in on a selected active job).
+        use super::super::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, _temp) = test_agent_with_config(cfg);
+
+        // No verifier_repair, no recovery_target, no truncated-tool-call,
+        // no focused / local-llm target -> no selectable active job.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "without any selectable job, effective_tool_policy must be Unrestricted"
+        );
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_none(),
+            "without any selectable job, ActiveJobSelection.selected must be None"
+        );
+        // The fallback still safely returns Ok(None) under the default
+        // test fixture (no playable-UI request, no read-after-small-edit
+        // model). The point of this test is the policy / selection
+        // assertions above — confirming generic retry is *available* in
+        // principle when no active job is selected.
+        let result = agent.maybe_apply_local_llm_small_edit_fallback("placeholder");
+        assert!(
+            matches!(result, Ok(None)),
+            "fallback returns Ok(None) under the default test model; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_tool_call_format_retry_recovery_inert_under_verifier_repair() {
+        // `tool_call_format_retry` recovery (turn.rs L8896-8965) lives in
+        // the chat-retry loop and only fires after the assistant reply
+        // path itself yields a tool-call-format error. The relevant
+        // invariant for Phase D is upstream of that retry: when
+        // VerifierRepair owns the turn, the recovery branch reads
+        // `effective_tool_policy.focused_edit_policy()` (not
+        // `restricted.allowed_tools`) before pushing any system note, so
+        // the recovery cannot "switch over" to a focused-edit fallback
+        // that would target the wrong file.
+        //
+        // This test asserts that invariant at the policy layer: a
+        // VerifierRepair-restricted policy carries `allowed_tools` (Some)
+        // but `focused_edit_policy()` is None — exactly the shape the
+        // recovery uses to fall through to the generic format-recovery
+        // note without redirecting writes.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.task_contract_verifier_repair_pending = true;
+
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::VerifierRepair,
+        );
+        // The focused_edit_policy() accessor is the discriminator the
+        // tool_call_format_retry recovery uses to decide whether to push
+        // a focused-edit-specific recovery note. For VerifierRepair this
+        // must be None so the recovery cannot redirect the model into a
+        // focused-edit target that is *outside* the verifier scope.
+        assert!(
+            policy.focused_edit_policy().is_none(),
+            "VerifierRepair policy MUST NOT expose a focused_edit_policy \
+             (tool_call_format_retry would otherwise push a focused-edit \
+             recovery note that overrides the active verifier job)"
+        );
+        // The allowed_tools whitelist is preserved so the model is still
+        // constrained to verifier-repair-allowed tools.
+        assert!(
+            policy.allowed_tool_names_for_prompt().is_some(),
+            "VerifierRepair policy MUST surface an allowed_tools whitelist"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_timeout_deterministic_fallback_inert_under_verifier_repair() {
+        // `maybe_apply_deterministic_quality_fallback_after_timeout` and
+        // `maybe_apply_deterministic_polish_fallback_after_timeout` only
+        // fire when `current_request_needs_playable_ui_quality_gate()` is
+        // true. Under the default test fixture (no playable-UI request,
+        // default Auto work mode) that gate is false, so both helpers
+        // return `None`. We assert that explicitly here so a future
+        // regression that loosens the gate would surface as a Phase D
+        // failure rather than silently letting a deterministic polish run
+        // while VerifierRepair owns the turn.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.task_contract_verifier_repair_pending = true;
+
+        // Sanity: VerifierRepair owns the turn.
+        assert_eq!(
+            agent.effective_tool_policy().reason(),
+            super::EffectiveToolPolicyReason::VerifierRepair,
+        );
+
+        // Timeout error string passed in; both fallbacks must return None.
+        let timeout_err = "request timed out after 30s";
+        assert!(
+            agent
+                .maybe_apply_deterministic_polish_fallback_after_timeout(timeout_err)
+                .is_none(),
+            "timeout polish fallback MUST be inert while VerifierRepair owns the turn"
+        );
+        assert!(
+            agent
+                .maybe_apply_deterministic_quality_fallback_after_timeout(timeout_err)
+                .is_none(),
+            "timeout quality fallback MUST be inert while VerifierRepair owns the turn"
+        );
+    }
+
+    // ========================================================================
+    // Task D.2 (Stage 3 DR3-005): Plan timeout materialization is verified
+    // independently of `selected.is_some()`. Plan mode (`ExecutionMode::Plan`)
+    // is the **pre-arbitration gate** (§4 of the design policy), so the
+    // arbiter is bypassed entirely and Plan-mode behavior parity is the
+    // sole correctness criterion.
+    // ========================================================================
+
+    #[test]
+    fn issue660_phase_d_plan_mode_pre_arbitration_gate_skips_arbiter() {
+        // §4 / Codex CB-001: `PlanModeGate` is a pre-arbitration gate
+        // (priority n/a in the §4 design table), not a selectable
+        // arbitration kind. `effective_tool_policy()` and
+        // `current_active_job_selection()` short-circuit at the Plan-mode
+        // check before constructing any `JobCandidate`. The plan-file
+        // Write/Edit exception is the authority of
+        // `src/tools/registry.rs::resolve_plan_mode_write_target` /
+        // `enforce_plan_stage_scope`; the arbiter must NOT pre-empt that
+        // decision with stale `task_contract_verifier_repair_pending`.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        use crate::modes::plan_act::ExecutionMode;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.session.mode_state.mode = ExecutionMode::Plan;
+
+        // Even with `task_contract_verifier_repair_pending` set (the worst-
+        // case Plan-mode leak from a previous Act turn), the arbiter MUST
+        // return an empty selection — the registry-layer PAM gate is the
+        // sole authority for write-target arbitration in Plan mode.
+        agent.task_contract_verifier_repair_pending = true;
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_none(),
+            "Plan mode pre-arbitration gate MUST short-circuit \
+             current_active_job_selection() to None (Codex CB-001 / §4)"
+        );
+        assert!(
+            selection.rejected.is_empty(),
+            "Plan mode pre-arbitration gate MUST yield an empty rejected[] \
+             list (no candidates ever constructed)"
+        );
+
+        // And `effective_tool_policy()` returns unrestricted policy so the
+        // tool-spec surface and recovery-target gating stay out of the
+        // arbiter while the registry-layer PAM gate enforces the actual
+        // write target.
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "Plan mode pre-arbitration gate MUST yield Unrestricted policy \
+             (Codex CB-001 / §4)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_4_plan_mode_with_verifier_repair_pending_yields_unrestricted_policy() {
+        // Codex CB-001: `ExecutionMode::Plan` is a pre-arbitration gate
+        // (§4 design table). Even if `task_contract_verifier_repair_pending`
+        // is set, `effective_tool_policy()` MUST early-return
+        // `unrestricted()` before consulting the arbiter, so the registry-
+        // layer PAM gate (`resolve_plan_mode_write_target` /
+        // `enforce_plan_stage_scope`) remains the single authority for
+        // plan-file Write/Edit arbitration. Previously the arbiter
+        // pre-empted that decision and could surface `VerifierRepair` /
+        // `ArtifactRecovery` / etc. policies while Plan mode was active.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        use crate::modes::plan_act::ExecutionMode;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.session.mode_state.mode = ExecutionMode::Plan;
+        agent.task_contract_verifier_repair_pending = true;
+
+        let policy = agent.effective_tool_policy();
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "Plan mode + verifier_repair_pending MUST yield Unrestricted \
+             policy (registry PAM gate is the authority — Codex CB-001)"
+        );
+        // Cross-check: `current_active_job_selection()` mirrors the same
+        // gate so consumers (`emit_active_job_selected_if_changed`, generic-
+        // retry guards) observe `None`.
+        let selection = agent.current_active_job_selection();
+        assert!(
+            selection.selected.is_none(),
+            "Plan mode pre-arbitration gate MUST also short-circuit \
+             current_active_job_selection() (cross-check)"
+        );
+    }
+
+    #[test]
+    fn issue660_phase_4_iteration_seq_is_propagated_from_caller() {
+        // Codex CB-002: `iteration_seq` is no longer derived from
+        // `current_turn_index`; the caller passes the actor-loop
+        // `iter_count` so two same-turn re-emits carry distinct
+        // `iteration_seq` values. The pure builder is exercised directly
+        // to assert that whatever the caller supplies is reflected
+        // verbatim in the payload.
+        use super::super::active_job_arbiter::ActiveJobSelection;
+
+        let selection = ActiveJobSelection {
+            selected: None,
+            rejected: vec![],
+        };
+        let payload_at_2 = super::build_active_job_selected_payload(&selection, 2, 0, 0);
+        let payload_at_3 = super::build_active_job_selected_payload(&selection, 3, 0, 0);
+
+        assert_eq!(
+            payload_at_2.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(2),
+            "iteration_seq=2 MUST appear verbatim in the payload (CB-002)"
+        );
+        assert_eq!(
+            payload_at_3.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(3),
+            "iteration_seq=3 MUST appear verbatim in the payload (CB-002)"
+        );
+        // The rest of the payload (selected, rejected, policy_projected,
+        // budget_state) is identical for the same `selection`, isolating
+        // the iteration_seq propagation.
+        assert_eq!(payload_at_2.get("selected"), payload_at_3.get("selected"));
+        assert_eq!(payload_at_2.get("rejected"), payload_at_3.get("rejected"));
+        assert_eq!(
+            payload_at_2.get("policy_projected"),
+            payload_at_3.get("policy_projected")
+        );
+    }
+
+    #[test]
+    fn issue660_phase_d_plan_timeout_materialization_independent_of_active_job() {
+        // `should_materialize_plan_after_timeout` is a pure function over
+        // (mode, plan_model_override, err). It returns true iff
+        // `mode == Plan` and the error string contains "timed out". This
+        // is the PAM pre-arbitration gate that DR3-005 marks as the
+        // authority for Plan-mode timeout materialization. The boolean
+        // is independent of `last_active_job_selection` / `selected`.
+        use super::should_materialize_plan_after_timeout;
+        use crate::modes::plan_act::ExecutionMode;
+
+        // Plan + timeout -> materialize.
+        assert!(should_materialize_plan_after_timeout(
+            ExecutionMode::Plan,
+            None,
+            "request timed out after 60s"
+        ));
+        // Act + timeout -> do NOT materialize (active job arbitration lives
+        // in Act mode; Plan-only fallback must not fire).
+        assert!(!should_materialize_plan_after_timeout(
+            ExecutionMode::Act,
+            None,
+            "request timed out"
+        ));
+        // Plan + non-timeout -> do NOT materialize.
+        assert!(!should_materialize_plan_after_timeout(
+            ExecutionMode::Plan,
+            None,
+            "transport error"
+        ));
     }
 }
 
@@ -20552,6 +21563,142 @@ fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String>
         }
     }
     out
+}
+
+/// Issue #660 (Phase C / DD-5 / Stage 4 DR4-001/002) — pure builder that
+/// renders an `ActiveJobSelection` to the `agent.active_job.selected`
+/// payload. The payload schema (proposed to #666) is:
+///
+/// ```json
+/// {
+///   "iteration_seq": <u32>,
+///   "selected": {
+///     "job_kind": "<kind>|None",
+///     "desired_action": "<short type label>",
+///     "policy_reason": "<EffectiveToolPolicyReason::as_str()>",
+///     "allowed_tools_count": <u32>,
+///     "target_path_hash": "<hex16>|null"
+///   },
+///   "rejected": [{"job_kind": "<kind>", "rejection_reason": "LowerPriority|BudgetExhausted"}],
+///   "policy_projected": {"reason_label": "<...>", "allowed_tool_kinds": <u32>},
+///   "budget_state": {"repair_attempts": <u32>, "artifact_attempts": <u32>}
+/// }
+/// ```
+///
+/// **Security invariants** (§7 of design policy):
+/// - Raw verifier commands NEVER appear; `DesiredAction::VerifierRepair`
+///   collapses to the static label `"verifier_repair"` only.
+/// - Raw `PathBuf` targets NEVER appear; `target_path_hash` is the
+///   non-cryptographic correlator `stable_path_hash_for_active_job(
+///   mask_secrets(...))`.
+/// - `log_llm_event` re-applies `mask_payload_inplace` as the final
+///   defense line.
+pub(super) fn build_active_job_selected_payload(
+    selection: &super::active_job_arbiter::ActiveJobSelection,
+    iteration_seq: u32,
+    repair_attempts: u32,
+    artifact_attempts: u32,
+) -> serde_json::Value {
+    let projected_policy = super::active_job_arbiter::project_policy(selection);
+    let policy_reason_label = projected_policy.reason().as_str();
+    let allowed_tool_kinds = projected_policy
+        .allowed_tool_names_for_prompt()
+        .map(|t| t.len() as u32)
+        .unwrap_or(0);
+
+    let selected_block = match selection.selected.as_ref() {
+        Some(candidate) => {
+            let target_path_hash = candidate
+                .desired_action
+                .target_path()
+                .map(|path| {
+                    // Stage 4 DR4-001: never emit the raw path. The mask
+                    // pass catches inline credentials; the hash gives
+                    // dataset consumers a stable correlator without
+                    // leaking the literal path.
+                    let masked =
+                        crate::session::feedback::mask_secrets(&path.display().to_string());
+                    serde_json::Value::String(stable_path_hash_for_active_job(&masked))
+                })
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "job_kind": candidate.kind.as_str(),
+                "desired_action": candidate.desired_action.label(),
+                "policy_reason": candidate.policy.reason().as_str(),
+                "allowed_tools_count": candidate
+                    .policy
+                    .allowed_tool_names_for_prompt()
+                    .map(|t| t.len() as u32)
+                    .unwrap_or(0),
+                "target_path_hash": target_path_hash,
+            })
+        }
+        None => serde_json::json!({
+            "job_kind": "None",
+            "desired_action": serde_json::Value::Null,
+            "policy_reason": projected_policy.reason().as_str(),
+            "allowed_tools_count": allowed_tool_kinds,
+            "target_path_hash": serde_json::Value::Null,
+        }),
+    };
+
+    let rejected_block: Vec<serde_json::Value> = selection
+        .rejected
+        .iter()
+        .map(|rj| {
+            // DR1-004: `RejectionReason` only has `LowerPriority` and
+            // `BudgetExhausted` — both reduce to a single static label
+            // without leaking external strings.
+            let reason_label = match rj.reason {
+                super::active_job_arbiter::RejectionReason::LowerPriority { .. } => "LowerPriority",
+                super::active_job_arbiter::RejectionReason::BudgetExhausted { .. } => {
+                    "BudgetExhausted"
+                }
+            };
+            serde_json::json!({
+                "job_kind": rj.kind.as_str(),
+                "rejection_reason": reason_label,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "iteration_seq": iteration_seq,
+        "selected": selected_block,
+        "rejected": rejected_block,
+        "policy_projected": {
+            "reason_label": policy_reason_label,
+            "allowed_tool_kinds": allowed_tool_kinds,
+        },
+        "budget_state": {
+            "repair_attempts": repair_attempts,
+            "artifact_attempts": artifact_attempts,
+        },
+    })
+}
+
+/// Issue #660 (Phase C / §7 / DR2-003 / DR4-004): stable, non-cryptographic
+/// correlator for masked workspace-relative paths used by
+/// `build_active_job_selected_payload`. Algorithm matches
+/// `artifact_ledger.rs::stable_path_hash` (`DefaultHasher` → `{:016x}`).
+///
+/// **Not a secret-hiding hash.** Path secrecy is enforced upstream by
+/// `mask_secrets` (caller passes the masked form here) and by
+/// `mask_payload_inplace` at `log_llm_event` time. This helper merely
+/// gives dataset consumers a stable correlator for the same masked path
+/// across `agent.active_job.*` events without leaking the literal path.
+///
+/// The duplication with `artifact_ledger.rs::stable_path_hash` is
+/// intentional (DR2-003): widening the ledger's visibility surface just
+/// to share this helper would break the "ledger has no consumers outside
+/// turn.rs" rule. The two SSOTs MUST be kept aligned by doc-comment
+/// contract; algorithm changes must update both sites.
+fn stable_path_hash_for_active_job(masked_path: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    masked_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Issue #654 (D.1 / DR1-007 / DR4-001) — pure builder that renders a

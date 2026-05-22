@@ -62,6 +62,13 @@ mod artifact_ledger_phase4_tests;
 // CB-001 fix pattern shared with `safe_stop_e2e_tests`).
 #[cfg(test)]
 mod artifact_ledger_phase5_tests;
+// Issue #660: active-job arbitration SSOT. Pure function
+// (`select_active_job`) + `EffectiveToolPolicy` projection
+// (`project_policy`) used by `turn.rs::effective_tool_policy()` to pick
+// at most one write-owner job per turn. Module is intentionally *not*
+// re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
+// `super::active_job_arbiter::*`.
+mod active_job_arbiter;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -814,6 +821,19 @@ pub struct Agent {
     /// persistence schemas are unchanged by Issue #654.
     pub(in crate::agent::loop_run) safe_stop_report_emitted:
         std::collections::HashSet<repair_job::StopReason>,
+    /// Issue #660 (Phase C / DD-4): per-turn diff-based dedup state for the
+    /// `agent.active_job.selected` structured log event. Holds the
+    /// `ActiveJobSelection` most recently passed to
+    /// `emit_active_job_selected_if_changed`; the helper re-emits only when
+    /// the new selection differs. Reset at the head of every
+    /// `handle_user_message` adjacent to `safe_stop_report_emitted.clear()`
+    /// (per DR1-007 — per-turn reset group locality).
+    ///
+    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
+    /// persistence schemas are unchanged by Issue #660 (in-memory only,
+    /// same pattern as `safe_stop_report_emitted` and `artifact_ledger`).
+    pub(in crate::agent::loop_run) last_active_job_selection:
+        Option<active_job_arbiter::ActiveJobSelection>,
     /// Issue #659 (Phase 2): per-turn SSOT for artifact observations
     /// (Existing / Scaffold / RepoEdit) + verifier observations bound by
     /// path. Adapter-period contract: `turn_edited_relative_paths` remains
@@ -1058,6 +1078,7 @@ impl Agent {
             turn_pre_tool_file_hashes: std::collections::HashMap::new(),
             turn_edited_relative_paths: std::collections::HashSet::new(),
             safe_stop_report_emitted: std::collections::HashSet::new(),
+            last_active_job_selection: None,
             artifact_ledger: artifact_ledger::ArtifactLedger::new(),
         }
     }
