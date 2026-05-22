@@ -325,6 +325,10 @@ impl ArtifactCompletionJob {
             edited_this_session,
             scaffold_changed,
             verifier_passed_in_scope: false,
+            // Issue #661 (Task 3.1): ArtifactCompletionJob is not one of
+            // the 4 verifier-path SSOT sites — keep `disabled()` so this
+            // caller's nested-test-subdir semantics stay unchanged.
+            nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
         });
         // CB-001: accept only `Owned` for an existing target, or treat
         // a missing leaf as a creation target after canonicalizing the

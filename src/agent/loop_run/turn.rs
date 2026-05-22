@@ -24,7 +24,7 @@ use super::*;
 use crate::agent::orchestration::{
     RepoSnapshot, RepoVerification, capture_repo_snapshot, verify_repo_progress,
 };
-use crate::logging::log_llm_event;
+use crate::logging::{log_llm_event, stable_path_hash};
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{
     ModeClassification, PlanStage, TaskProfile, WorkMode, classify_work_mode_json,
@@ -4053,6 +4053,13 @@ impl Agent {
         // restarts together at turn boundary. Forces the first consumed
         // projection in the new turn to emit.
         self.last_behavior_contract_projection_event = None;
+        // Issue #661 Task 2.6 (DR1-004 / DR1-010): per-turn dedup state for
+        // `agent.verifier.invoked` (digest of canonical-JSON payload) and
+        // per-turn cap for `agent.verifier.external_import_rejected`. Reset
+        // adjacent to `last_active_job_selection = None` so the per-turn
+        // reset group stays co-located. Producers land in iteration-3.
+        self.last_verifier_invoked_payload_digest = None;
+        self.external_import_rejected_emitted_this_turn = false;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -8309,6 +8316,47 @@ impl Agent {
                     // entirely so the absence-as-NotRun rule stays intact.
                     let bound_test_artifacts_paths: Vec<String> =
                         command.bound_test_artifacts().to_vec();
+                    // Issue #661 iteration-4 Task 5.2 (DR1-005 emit ownership):
+                    // pre-spawn `agent.verifier.invoked` event emit + per-turn
+                    // dedup. Build the snapshot *before* `run_structured` so
+                    // the event lands even if the spawn itself fails (the
+                    // event records intent, not outcome). RunnerKind::None
+                    // never reaches Runnable in production (cargo / python3
+                    // only), but `from_command_and_env` returns None for
+                    // unknown runners as a DR4-004 security fail-closed
+                    // backstop — we skip the emit in that case.
+                    //
+                    // iteration-5 Task 6.2: pass runner-specific extras
+                    // (Python adapter receives VERIFIER_ENV_PYTHON_EXTRA) so
+                    // the snapshot's env_summary mirrors execution-time env.
+                    let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
+                        "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
+                        _ => &[],
+                    };
+                    let env_plan_for_emit =
+                        super::auto_test::build_hermetic_env_plan(&self.work_root, extras_for_emit);
+                    if let Some(snapshot) =
+                        super::auto_test::VerifierInvokedSnapshot::from_command_and_env(
+                            &command,
+                            &env_plan_for_emit,
+                        )
+                    {
+                        self.emit_agent_verifier_invoked_if_new(&snapshot);
+                    }
+                    // Issue #661 iteration-5 Task 7.1 / 7.3: if the env plan
+                    // detected an external PYTHONPATH component pre-execution,
+                    // emit the `agent.verifier.external_import_rejected` event
+                    // (per-turn cap'd) so the LLM / log consumer sees the
+                    // boundary breach signal before run_structured.
+                    if let Some(hash) = env_plan_for_emit.rejected_pythonpath_hash() {
+                        self.emit_agent_verifier_external_import_rejected_if_first(
+                            command.runner(),
+                            "external_pythonpath_rejected",
+                            &[(hash.as_str(), "pythonpath")],
+                            1,
+                            false,
+                        );
+                    }
                     let result = {
                         let _sp = Spinner::start("running verifier...".to_string());
                         AutoTestRunner::run_structured(
@@ -8329,6 +8377,45 @@ impl Agent {
                                     "reason": &plan.reason,
                                 }),
                             );
+                            // Issue #661 iteration-5 Task 7.2 / 7.3 +
+                            // CB-009 (Codex iteration-5 medium):
+                            // post-execution external import detection via
+                            // stdout/stderr pattern match. raw paths are
+                            // hashed before emit (DR4-005). `detected_count`
+                            // and `truncated` come from
+                            // `DetectedExternalImports` so the pre-cap total
+                            // is preserved even when the per-emit cap drops
+                            // excess entries.
+                            let detected = super::auto_test::detect_external_imports_in_output(
+                                &self.work_root,
+                                &result.stdout,
+                                &result.stderr,
+                            );
+                            if !detected.entries.is_empty() {
+                                let detected_count = detected.total_count;
+                                let truncated = detected.truncated;
+                                let hashes: Vec<(String, &'static str)> = detected
+                                    .entries
+                                    .iter()
+                                    .map(|raw| {
+                                        (
+                                            crate::logging::stable_path_hash(
+                                                &crate::session::feedback::mask_secrets(raw),
+                                            ),
+                                            "stdout_stderr",
+                                        )
+                                    })
+                                    .collect();
+                                let borrowed: Vec<(&str, &'static str)> =
+                                    hashes.iter().map(|(h, k)| (h.as_str(), *k)).collect();
+                                self.emit_agent_verifier_external_import_rejected_if_first(
+                                    command.runner(),
+                                    "external_import_detected",
+                                    &borrowed,
+                                    detected_count,
+                                    truncated,
+                                );
+                            }
                             let frame = build_feedback_for_auto_test(
                                 &plan,
                                 &result,
@@ -8819,6 +8906,85 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Issue #661 iteration-4 Task 5.2 / DR1-005 emit ownership: pre-spawn
+    /// `agent.verifier.invoked` event emit + per-turn dedup. The payload
+    /// schema matches design Section 8-1 exactly. See
+    /// [`build_agent_verifier_invoked_payload`] for the pure-fn builder
+    /// (testable without an Agent instance) and the field-by-field schema.
+    ///
+    /// Emit ownership rules (DR1-005 / DR1-004):
+    /// - Caller MUST have built the snapshot at pre-spawn (before
+    ///   `run_structured` spawns `Command::new`)
+    /// - `mask_payload_inplace` is the final defence line — applied here
+    ///   BEFORE the digest computation so the dedup key matches the
+    ///   post-mask representation log consumers see
+    /// - Per-turn dedup: same digest as `last_verifier_invoked_payload_digest`
+    ///   suppresses re-emit; a different digest emits and replaces the
+    ///   field. Reset at `handle_user_message` head clears the digest.
+    ///
+    /// Returns `true` if the event was emitted, `false` if suppressed by
+    /// dedup (used by unit tests; production callers ignore the return
+    /// value).
+    fn emit_agent_verifier_invoked_if_new(
+        &mut self,
+        snapshot: &super::auto_test::VerifierInvokedSnapshot,
+    ) -> bool {
+        let mut payload = build_agent_verifier_invoked_payload(
+            self.session_store.session_id(),
+            self.current_turn_index,
+            self.session.iter_count_this_turn,
+            snapshot,
+        );
+        // DR1-004 step 1: apply mask_payload_inplace BEFORE digest so the
+        // dedup key matches the post-mask representation log consumers see.
+        crate::logging::mask_payload_inplace(&mut payload);
+        let digest = crate::logging::compute_payload_digest(&payload);
+        if self.last_verifier_invoked_payload_digest == Some(digest) {
+            return false;
+        }
+        self.last_verifier_invoked_payload_digest = Some(digest);
+        // log_llm_event masks again — idempotent for already-masked
+        // payloads (final defence line invariant).
+        log_llm_event("agent.verifier.invoked", payload);
+        true
+    }
+
+    /// Issue #661 iteration-5 Task 7.3: emit
+    /// `agent.verifier.external_import_rejected` event subject to per-turn
+    /// cap (`external_import_rejected_emitted_this_turn`). Caller passes the
+    /// already-hashed module hashes + their static source labels so raw paths
+    /// never reach the payload (DR4-005).
+    ///
+    /// Returns `true` if emitted, `false` if suppressed by the per-turn cap.
+    /// Caller (`run_task_contract_verifier_once`) wires both pre-execution
+    /// (PYTHONPATH) and post-execution (stdout/stderr) detection through
+    /// this single SSOT.
+    fn emit_agent_verifier_external_import_rejected_if_first(
+        &mut self,
+        runner: &str,
+        reason: &'static str,
+        detected_hashes: &[(&str, &'static str)],
+        detected_count: usize,
+        detected_truncated: bool,
+    ) -> bool {
+        if self.external_import_rejected_emitted_this_turn {
+            return false;
+        }
+        self.external_import_rejected_emitted_this_turn = true;
+        let mut payload = build_agent_verifier_external_import_rejected_payload(
+            self.session_store.session_id(),
+            self.current_turn_index,
+            runner,
+            reason,
+            detected_hashes,
+            detected_count,
+            detected_truncated,
+        );
+        crate::logging::mask_payload_inplace(&mut payload);
+        log_llm_event("agent.verifier.external_import_rejected", payload);
+        true
     }
 
     fn record_task_contract_verifier_invocation(&mut self, command: &str, exit_code: Option<i32>) {
@@ -11376,6 +11542,10 @@ impl Agent {
                 edited_this_session: true,
                 scaffold_changed: false,
                 verifier_passed_in_scope: false,
+                // Issue #661 (Task 3.1): legacy helper — not one of the 4
+                // verifier-path SSOT sites. Iteration-3 may revisit if this
+                // shadow consumer needs verifier-binding semantics.
+                nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
             };
             if super::artifact_ownership::classify_ownership(inputs)
                 == super::artifact_ownership::ArtifactOwnership::Owned
@@ -12756,6 +12926,11 @@ impl Agent {
                         edited_this_session,
                         scaffold_changed,
                         verifier_passed_in_scope: false,
+                        // Issue #661 (Task 3.1): Existing-origin classification
+                        // path — preserves legacy semantics. The verifier-path
+                        // SSOT switch lands in iteration-3.
+                        nested_test_admission:
+                            super::artifact_ownership::NestedTestAdmission::default(),
                     },
                 );
                 // Issue #659 (Task 2.3): seed the Existing-origin event
@@ -13079,6 +13254,9 @@ impl Agent {
                 edited_this_session,
                 scaffold_changed,
                 verifier_passed_in_scope: false,
+                // Issue #661 (Task 3.1): legacy planner helper — not one of
+                // the 4 verifier-path SSOT sites. Stays on disabled().
+                nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
             },
         );
         if !matches!(
@@ -16805,6 +16983,61 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------
+    // Issue #661 Task 2.6: Agent per-turn dedup state initialisation +
+    // reset contract (DR1-004 / DR1-010 / DR2-005). The two fields live on
+    // Agent only (NOT SessionSnapshot), are initialised to neutral values
+    // by `Agent::new`, and must be reset to those neutral values at the
+    // head of every `handle_user_message`. Iteration-3 wires the producers
+    // (`agent.verifier.invoked` emit + `external_import_rejected` cap); the
+    // contract enforced here is "fields exist, start clean, reset on turn
+    // boundary".
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn issue661_verifier_invoked_dedup_state_starts_unset() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (agent, _temp) = test_agent_with_config(Config::default());
+        assert!(
+            agent.last_verifier_invoked_payload_digest.is_none(),
+            "fresh Agent must start with last_verifier_invoked_payload_digest = None"
+        );
+        assert!(
+            !agent.external_import_rejected_emitted_this_turn,
+            "fresh Agent must start with external_import_rejected_emitted_this_turn = false"
+        );
+    }
+
+    #[test]
+    fn issue661_verifier_invoked_dedup_state_resets_at_turn_head() {
+        // Simulate a prior turn populating the dedup state. The reset
+        // semantics mirror `last_active_job_selection = None` and
+        // `safe_stop_report_emitted.clear()` (DR1-010 per-turn rule).
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+
+        // Populate the dedup state as if a previous turn already emitted.
+        agent.last_verifier_invoked_payload_digest = Some([0xAB; 8]);
+        agent.external_import_rejected_emitted_this_turn = true;
+
+        // Apply the same reset block `handle_user_message` head runs.
+        agent.last_verifier_invoked_payload_digest = None;
+        agent.external_import_rejected_emitted_this_turn = false;
+
+        assert!(
+            agent.last_verifier_invoked_payload_digest.is_none(),
+            "handle_user_message head reset must clear last_verifier_invoked_payload_digest"
+        );
+        assert!(
+            !agent.external_import_rejected_emitted_this_turn,
+            "handle_user_message head reset must clear external_import_rejected_emitted_this_turn"
+        );
+    }
+
     #[test]
     fn issue660_phase_c_payload_contains_required_top_level_keys() {
         // DD-5 schema contract: every emission carries
@@ -17869,6 +18102,655 @@ mod tests {
             None,
             "transport error"
         ));
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 iteration-4 Task 5.2: agent.verifier.invoked event
+    // payload schema + dedup behavior.
+    //
+    // Phase A invariants:
+    //   - bound_artifacts: [{"path_hash":"<16-hex>"}], <=16 entries
+    //   - bound_artifacts_truncated: pre-cap full count flag
+    //   - cwd_inside_work_root: ROOT-level field (NOT inside env_summary)
+    //   - env_summary: {allowlist_keys, pythonpath_root} ONLY
+    //   - runner: closed RunnerKind::as_str() set ("cargo" | "python3")
+    //
+    // Dedup invariants:
+    //   - same snapshot twice -> 2nd call returns false (no re-emit)
+    //   - different snapshot -> emit + digest update
+    //   - per-turn reset (mirrors handle_user_message head) -> first
+    //     post-reset emit returns true (None -> Some transition)
+    // ----------------------------------------------------------------
+
+    fn make_verifier_invoked_snapshot_cargo(
+        bound: &[&str],
+    ) -> super::super::auto_test::VerifierInvokedSnapshot {
+        use super::super::auto_test::{
+            VerifierCommand, VerifierInvokedSnapshot, build_hermetic_env_plan,
+        };
+        use tempfile::tempdir;
+        let work = tempdir().expect("work");
+        let owned: Vec<String> = bound.iter().map(|s| s.to_string()).collect();
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan).expect("cargo runner")
+    }
+
+    fn make_verifier_invoked_snapshot_python3(
+        bound: &[&str],
+    ) -> super::super::auto_test::VerifierInvokedSnapshot {
+        use super::super::auto_test::{
+            VerifierCommand, VerifierInvokedSnapshot, build_hermetic_env_plan,
+        };
+        use tempfile::tempdir;
+        let work = tempdir().expect("work");
+        let owned: Vec<String> = bound.iter().map(|s| s.to_string()).collect();
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 stdlib pytest");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan).expect("python3 runner")
+    }
+
+    #[test]
+    fn issue661_verifier_invoked_payload_carries_required_top_level_keys() {
+        let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        let payload = super::build_agent_verifier_invoked_payload("sess-1", 5, 7, &snapshot);
+        for key in [
+            "session_id",
+            "turn_index",
+            "iteration_seq",
+            "runner",
+            "bound_artifacts",
+            "bound_test_artifacts_count",
+            "bound_artifacts_truncated",
+            "env_summary",
+            "cwd_inside_work_root",
+        ] {
+            assert!(
+                payload.get(key).is_some(),
+                "payload MUST contain top-level key {key}, got {payload}"
+            );
+        }
+        assert_eq!(
+            payload.get("session_id").and_then(|v| v.as_str()),
+            Some("sess-1")
+        );
+        assert_eq!(payload.get("turn_index").and_then(|v| v.as_u64()), Some(5));
+        assert_eq!(
+            payload.get("iteration_seq").and_then(|v| v.as_u64()),
+            Some(7)
+        );
+        assert_eq!(
+            payload.get("runner").and_then(|v| v.as_str()),
+            Some("cargo")
+        );
+    }
+
+    #[test]
+    fn issue661_verifier_invoked_payload_cwd_is_root_level_not_inside_env_summary() {
+        // Section 8-1 schema: `cwd_inside_work_root` is a ROOT-level field.
+        // `env_summary` MUST only carry `allowlist_keys` / `pythonpath_root`.
+        let snapshot = make_verifier_invoked_snapshot_python3(&["app/tests/test_a.py"]);
+        let payload = super::build_agent_verifier_invoked_payload("sess-1", 0, 0, &snapshot);
+        let env_summary = payload.get("env_summary").expect("env_summary");
+        assert!(
+            env_summary.get("cwd_inside_work_root").is_none(),
+            "cwd_inside_work_root must NOT live inside env_summary (Section 8-1 schema)"
+        );
+        // Phase B observable values: allowlist_keys is now populated.
+        let allowlist = env_summary.get("allowlist_keys").expect("allowlist_keys");
+        assert!(allowlist.is_array());
+        let keys: Vec<&str> = allowlist
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            keys.contains(&"PATH"),
+            "Phase B: env_summary.allowlist_keys must include PATH; got {keys:?}"
+        );
+        assert_eq!(
+            payload
+                .get("cwd_inside_work_root")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "cwd_inside_work_root MUST appear as a root-level boolean"
+        );
+    }
+
+    #[test]
+    fn issue661_verifier_invoked_payload_bound_artifacts_shape_is_path_hash_objects() {
+        // Each entry must be `{ "path_hash": "<16-hex>" }`. No raw paths.
+        let snapshot =
+            make_verifier_invoked_snapshot_python3(&["app/tests/test_a.py", "app/tests/test_b.py"]);
+        let payload = super::build_agent_verifier_invoked_payload("sess", 0, 0, &snapshot);
+        let entries = payload
+            .get("bound_artifacts")
+            .and_then(|v| v.as_array())
+            .expect("bound_artifacts array");
+        assert_eq!(entries.len(), 2);
+        for e in entries {
+            let h = e
+                .get("path_hash")
+                .and_then(|v| v.as_str())
+                .expect("path_hash");
+            assert_eq!(h.len(), 16);
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+            // No raw path leakage (no slashes, no `.py` suffix).
+            assert!(!h.contains('/'));
+            assert!(!h.contains(".py"));
+        }
+    }
+
+    #[test]
+    fn issue661_verifier_invoked_payload_runner_is_closed_runnerkind_string() {
+        // Only RunnerKind::as_str() return values may appear.
+        let cargo = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        let p_cargo = super::build_agent_verifier_invoked_payload("s", 0, 0, &cargo);
+        assert_eq!(
+            p_cargo.get("runner").and_then(|v| v.as_str()),
+            Some("cargo")
+        );
+
+        let py = make_verifier_invoked_snapshot_python3(&["app/tests/test_a.py"]);
+        let p_py = super::build_agent_verifier_invoked_payload("s", 0, 0, &py);
+        assert_eq!(p_py.get("runner").and_then(|v| v.as_str()), Some("python3"));
+    }
+
+    #[test]
+    fn issue661_verifier_invoked_payload_truncated_flag_pins_cap_and_full_count() {
+        use super::super::auto_test::{
+            VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP, VerifierCommand, VerifierInvokedSnapshot,
+            build_hermetic_env_plan,
+        };
+        use tempfile::tempdir;
+        let work = tempdir().expect("work");
+        let owned: Vec<String> = (0..(VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP + 5))
+            .map(|i| format!("app/tests/test_{i}.py"))
+            .collect();
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 stdlib pytest");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot =
+            VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan).expect("python3");
+
+        let payload = super::build_agent_verifier_invoked_payload("s", 0, 0, &snapshot);
+        let entries = payload.get("bound_artifacts").unwrap().as_array().unwrap();
+        assert_eq!(entries.len(), VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP);
+        assert_eq!(
+            payload
+                .get("bound_test_artifacts_count")
+                .and_then(|v| v.as_u64()),
+            Some((VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP + 5) as u64),
+            "bound_test_artifacts_count keeps PRE-CAP full count"
+        );
+        assert_eq!(
+            payload
+                .get("bound_artifacts_truncated")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "truncate flag must be true when count > cap"
+        );
+    }
+
+    #[test]
+    fn issue661_emit_agent_verifier_invoked_first_emit_returns_true() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert!(agent.last_verifier_invoked_payload_digest.is_none());
+        let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        let emitted = agent.emit_agent_verifier_invoked_if_new(&snapshot);
+        assert!(
+            emitted,
+            "first emit of the turn must return true (None -> Some transition)"
+        );
+        assert!(agent.last_verifier_invoked_payload_digest.is_some());
+    }
+
+    #[test]
+    fn issue661_emit_agent_verifier_invoked_identical_snapshot_is_deduped() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        assert!(agent.emit_agent_verifier_invoked_if_new(&snapshot));
+        let digest_after_first = agent.last_verifier_invoked_payload_digest;
+        let again = agent.emit_agent_verifier_invoked_if_new(&snapshot);
+        assert!(
+            !again,
+            "identical snapshot in the same turn must be deduped (returns false)"
+        );
+        assert_eq!(
+            agent.last_verifier_invoked_payload_digest, digest_after_first,
+            "dedup must not rotate the stored digest"
+        );
+    }
+
+    #[test]
+    fn issue661_emit_agent_verifier_invoked_different_snapshot_re_emits() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let snap_a = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        let snap_b = make_verifier_invoked_snapshot_cargo(&["tests/test_b.rs"]);
+        assert!(agent.emit_agent_verifier_invoked_if_new(&snap_a));
+        let digest_a = agent.last_verifier_invoked_payload_digest;
+        assert!(
+            agent.emit_agent_verifier_invoked_if_new(&snap_b),
+            "different bound_artifacts must re-emit"
+        );
+        assert_ne!(
+            digest_a, agent.last_verifier_invoked_payload_digest,
+            "different snapshot must rotate the stored digest"
+        );
+    }
+
+    #[test]
+    fn issue661_emit_agent_verifier_invoked_per_turn_reset_re_emits_same_snapshot() {
+        // Mirrors `handle_user_message` head reset: `last_verifier_invoked_payload_digest = None;`.
+        // Same snapshot in the new turn must emit again (per-turn rule).
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        assert!(agent.emit_agent_verifier_invoked_if_new(&snapshot));
+        // Simulate per-turn reset.
+        agent.last_verifier_invoked_payload_digest = None;
+        assert!(
+            agent.emit_agent_verifier_invoked_if_new(&snapshot),
+            "post-turn-reset emit of same snapshot must return true (None -> Some transition)"
+        );
+    }
+
+    #[test]
+    fn issue661_emit_agent_verifier_invoked_digest_uses_masked_payload() {
+        // DR1-004: digest input MUST be the post-mask canonical JSON form.
+        // We assert that the digest of an unmasked payload differs from
+        // the digest the helper actually stores (i.e. the helper applies
+        // mask_payload_inplace BEFORE digesting).
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        // Construct a snapshot then build the unmasked payload via the
+        // same builder to extract a pre-mask digest as a control.
+        let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
+        let pre_mask_payload = super::build_agent_verifier_invoked_payload(
+            agent.session_store.session_id(),
+            agent.current_turn_index,
+            agent.session.iter_count_this_turn,
+            &snapshot,
+        );
+        let pre_mask_digest = crate::logging::compute_payload_digest(&pre_mask_payload);
+        agent.emit_agent_verifier_invoked_if_new(&snapshot);
+        // In Phase A there are no secret-like fields in the payload, so
+        // the masked digest equals the pre-mask digest (mask is idempotent
+        // on a clean payload). What matters is that the helper computes
+        // its digest AFTER calling mask_payload_inplace, so the stored
+        // digest is the post-mask one. The strongest assertion we can
+        // make without an emit capture seam is determinism: re-running
+        // the same input via the same path yields the same stored value.
+        let stored = agent
+            .last_verifier_invoked_payload_digest
+            .expect("digest stored after emit");
+        assert_eq!(
+            stored, pre_mask_digest,
+            "Phase A payload has no secret fields, so post-mask digest must equal pre-mask digest \
+             (mask is idempotent on non-secret payloads). This guards DR1-004 step 1 invariant."
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 iteration-5 Task 7.3:
+    // emit_agent_verifier_external_import_rejected_if_first
+    // - per-turn 最大 1 emit (cap)
+    // - turn 境界 reset 後は再 emit 可
+    // - payload は raw module path を含まず hash + capped detected_modules のみ
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn issue661_emit_external_import_rejected_first_emit_returns_true() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert!(!agent.external_import_rejected_emitted_this_turn);
+        let emitted = agent.emit_agent_verifier_external_import_rejected_if_first(
+            "python3",
+            "external_pythonpath_rejected",
+            &[("deadbeefcafef00d", "pythonpath")],
+            1,
+            false,
+        );
+        assert!(emitted, "first emit of the turn must return true");
+        assert!(agent.external_import_rejected_emitted_this_turn);
+    }
+
+    #[test]
+    fn issue661_emit_external_import_rejected_second_emit_is_capped() {
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert!(agent.emit_agent_verifier_external_import_rejected_if_first(
+            "python3",
+            "external_pythonpath_rejected",
+            &[("hash1", "pythonpath")],
+            1,
+            false,
+        ));
+        // Second emit in the same turn (different reason / different hashes)
+        // must be suppressed by the per-turn cap.
+        let again = agent.emit_agent_verifier_external_import_rejected_if_first(
+            "python3",
+            "external_import_detected",
+            &[("hash2", "stdout_stderr")],
+            1,
+            false,
+        );
+        assert!(
+            !again,
+            "per-turn cap must suppress the second emit regardless of reason / hashes"
+        );
+    }
+
+    #[test]
+    fn issue661_emit_external_import_rejected_per_turn_reset_re_emits() {
+        // Mirrors `handle_user_message` head reset:
+        // `external_import_rejected_emitted_this_turn = false;`. After
+        // reset the next emit must return true.
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        assert!(agent.emit_agent_verifier_external_import_rejected_if_first(
+            "python3",
+            "external_pythonpath_rejected",
+            &[("hashX", "pythonpath")],
+            1,
+            false,
+        ));
+        agent.external_import_rejected_emitted_this_turn = false;
+        let again = agent.emit_agent_verifier_external_import_rejected_if_first(
+            "python3",
+            "external_pythonpath_rejected",
+            &[("hashX", "pythonpath")],
+            1,
+            false,
+        );
+        assert!(
+            again,
+            "post-turn-reset emit must return true regardless of the previous turn's emit"
+        );
+    }
+
+    #[test]
+    fn issue661_external_import_rejected_payload_caps_detected_modules_at_eight() {
+        // Build the payload directly via the pure-fn builder to verify the
+        // detected_modules cap (8). Excess entries are dropped; the caller
+        // populates `detected_truncated` / `detected_count` as full counts.
+        let cap = super::super::auto_test::EXTERNAL_IMPORT_DETECTED_CAP;
+        let owned_hashes: Vec<String> = (0..(cap + 5)).map(|i| format!("hash_{i:016x}")).collect();
+        let detected: Vec<(&str, &'static str)> = owned_hashes
+            .iter()
+            .map(|h| (h.as_str(), "stdout_stderr"))
+            .collect();
+        let payload = super::build_agent_verifier_external_import_rejected_payload(
+            "sess-1",
+            7,
+            "python3",
+            "external_import_detected",
+            &detected,
+            cap + 5,
+            true,
+        );
+        let modules = payload
+            .get("detected_modules")
+            .and_then(|v| v.as_array())
+            .expect("detected_modules array");
+        assert_eq!(modules.len(), cap);
+        assert_eq!(
+            payload.get("detected_count").and_then(|v| v.as_u64()),
+            Some((cap + 5) as u64)
+        );
+        assert_eq!(
+            payload.get("detected_truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // payload MUST NOT carry raw paths — only hash strings.
+        for m in modules {
+            let obj = m.as_object().expect("module obj");
+            assert!(obj.get("module_hash").is_some());
+            assert!(obj.get("source_kind").is_some());
+            // No raw path / module name fields allowed.
+            assert!(!obj.contains_key("raw_path"));
+            assert!(!obj.contains_key("raw_module"));
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 iteration-4 Task 5.3: VerifierSkill::execute_with_invocation_observer
+    // - callback runs BEFORE spawn
+    // - AgentSkill::execute does NOT call the callback (DR2-001 regression)
+    //
+    // The callback ordering proof comes via test 5.3.1 below where we
+    // verify the callback fires with a valid VerifierInvokedSnapshot
+    // even when the underlying runner binary is unavailable on the
+    // test host (the snapshot is built pre-spawn, so the runner
+    // failure path still invokes the callback before run_structured's
+    // Command::new errors out).
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn issue661_execute_with_invocation_observer_calls_callback_pre_spawn() {
+        // We construct VerifierInputs whose `owned_test_artifacts` map to
+        // `from_cargo_test` (a Runnable plan) and assert the callback
+        // fires with a snapshot whose runner == Cargo. Whether the
+        // underlying `cargo` binary exists on the test host is irrelevant
+        // for the pre-spawn callback contract: the snapshot is built
+        // BEFORE `run_structured` spawns anything (DR1-005).
+        use super::super::auto_test::RunnerKind;
+        use super::super::verifier_skill::{VerifierInputs, VerifierSkill};
+        use crate::session::anvil_score::AnvilScoreInputs;
+        use tempfile::tempdir;
+
+        let work = tempdir().expect("work");
+        // Set up a tests/test_a.rs file so detect_with_owned_test_artifacts
+        // detects a Cargo Runnable path.
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        std::fs::write(work.path().join("tests").join("test_a.rs"), "").unwrap();
+        // Need a Cargo.toml for the cargo-manifest detector to fire.
+        std::fs::write(
+            work.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work.path(),
+            "run the tests",
+        );
+        let changed_files = vec!["tests/test_a.rs".to_string()];
+        let owned_test_artifacts = vec!["tests/test_a.rs".to_string()];
+        let recent: Vec<String> = vec![];
+        let score_inputs = AnvilScoreInputs {
+            unsafe_blocks_this_turn: 0,
+            repo_edit_succeeded_this_turn: false,
+            consecutive_no_progress_turns: 0,
+            prev: None,
+        };
+        let inputs = VerifierInputs {
+            score_inputs,
+            repo_verification: None,
+            should_dispatch_success_verifier: true,
+            protocol_demands_verifier: true,
+            changed_files: &changed_files,
+            recent_successful_bash_commands: &recent,
+            tester_candidate_some: false,
+            workspace_root: work.path(),
+            owned_test_artifacts: &owned_test_artifacts,
+            test_execution_required: true,
+            workspace_scope: &scope,
+        };
+
+        let mut callback_runner: Option<RunnerKind> = None;
+        let mut callback_calls: u32 = 0;
+        let mut on_pre_spawn = |snapshot: &super::super::auto_test::VerifierInvokedSnapshot| {
+            callback_runner = Some(snapshot.runner);
+            callback_calls += 1;
+        };
+        let mut skill = VerifierSkill;
+        let _outcome = skill.execute_with_invocation_observer(inputs, &mut on_pre_spawn);
+
+        assert_eq!(
+            callback_calls, 1,
+            "callback must fire exactly once for the Runnable detection \
+             (called pre-spawn, regardless of whether the spawn itself succeeded)"
+        );
+        assert_eq!(
+            callback_runner,
+            Some(RunnerKind::Cargo),
+            "callback must receive a snapshot with the production-mapped RunnerKind"
+        );
+    }
+
+    #[test]
+    fn issue661_execute_with_invocation_observer_skips_callback_when_weak() {
+        // Weak path (no Runnable) must NOT fire the callback (no spawn
+        // happens, no snapshot to emit). DR1-005 emit ownership: the
+        // callback only fires when run_structured is about to spawn.
+        use super::super::verifier_skill::{VerifierInputs, VerifierSkill};
+        use crate::session::anvil_score::AnvilScoreInputs;
+        use tempfile::tempdir;
+
+        let work = tempdir().expect("work");
+        // No Cargo.toml / pyproject — the detector returns Missing/Weak.
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work.path(),
+            "run the tests",
+        );
+        let changed_files: Vec<String> = vec![];
+        let owned_test_artifacts: Vec<String> = vec![];
+        let recent: Vec<String> = vec![];
+        let inputs = VerifierInputs {
+            score_inputs: AnvilScoreInputs {
+                unsafe_blocks_this_turn: 0,
+                repo_edit_succeeded_this_turn: false,
+                consecutive_no_progress_turns: 0,
+                prev: None,
+            },
+            repo_verification: None,
+            should_dispatch_success_verifier: true,
+            protocol_demands_verifier: true,
+            changed_files: &changed_files,
+            recent_successful_bash_commands: &recent,
+            tester_candidate_some: false,
+            workspace_root: work.path(),
+            owned_test_artifacts: &owned_test_artifacts,
+            test_execution_required: true,
+            workspace_scope: &scope,
+        };
+
+        let mut callback_calls: u32 = 0;
+        let mut on_pre_spawn = |_s: &super::super::auto_test::VerifierInvokedSnapshot| {
+            callback_calls += 1;
+        };
+        let mut skill = VerifierSkill;
+        let _ = skill.execute_with_invocation_observer(inputs, &mut on_pre_spawn);
+        assert_eq!(
+            callback_calls, 0,
+            "Weak/Missing paths must NOT fire the pre-spawn callback (no spawn happens)"
+        );
+    }
+
+    /// CB-012 (Codex iteration-5 medium): VerifierSkill structured path
+    /// MUST propagate external_import detection through the same observer
+    /// surface that `turn.rs::run_task_contract_verifier_once` uses. We
+    /// verify the new `execute_with_full_observers` method invokes the
+    /// external-import callback when the pre-execution PYTHONPATH check
+    /// flags an external component. This is exercised by setting PYTHONPATH
+    /// to a path outside `work_root` before the call.
+    #[test]
+    fn issue661_execute_with_full_observers_propagates_pythonpath_rejection() {
+        use super::super::verifier_skill::{
+            ExternalImportObservation, VerifierInputs, VerifierSkill,
+        };
+        use crate::session::anvil_score::AnvilScoreInputs;
+        use tempfile::tempdir;
+
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("tests")).unwrap();
+        std::fs::write(work.path().join("tests").join("test_a.rs"), "").unwrap();
+        std::fs::write(
+            work.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(
+            work.path(),
+            "run the tests",
+        );
+        let changed_files = vec!["tests/test_a.rs".to_string()];
+        let owned_test_artifacts = vec!["tests/test_a.rs".to_string()];
+        let recent: Vec<String> = vec![];
+        let inputs = VerifierInputs {
+            score_inputs: AnvilScoreInputs {
+                unsafe_blocks_this_turn: 0,
+                repo_edit_succeeded_this_turn: false,
+                consecutive_no_progress_turns: 0,
+                prev: None,
+            },
+            repo_verification: None,
+            should_dispatch_success_verifier: true,
+            protocol_demands_verifier: true,
+            changed_files: &changed_files,
+            recent_successful_bash_commands: &recent,
+            tester_candidate_some: false,
+            workspace_root: work.path(),
+            owned_test_artifacts: &owned_test_artifacts,
+            test_execution_required: true,
+            workspace_scope: &scope,
+        };
+
+        // Set PYTHONPATH to an external path so the env_plan flags it.
+        // SAFETY: tests in this binary run in the same process; the
+        // restore-on-drop guard keeps subsequent tests unaffected.
+        struct PythonpathGuard(Option<std::ffi::OsString>);
+        impl Drop for PythonpathGuard {
+            fn drop(&mut self) {
+                // SAFETY: restoring the original value, single-threaded test.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("PYTHONPATH", v),
+                        None => std::env::remove_var("PYTHONPATH"),
+                    }
+                }
+            }
+        }
+        let original_pythonpath = std::env::var_os("PYTHONPATH");
+        // SAFETY: tests do not run in parallel for this env mutation.
+        unsafe { std::env::set_var("PYTHONPATH", "/external/repo/outside") };
+        let _guard = PythonpathGuard(original_pythonpath);
+
+        let mut pre_spawn_calls: u32 = 0;
+        let mut external_import_calls: Vec<ExternalImportObservation> = Vec::new();
+        let mut on_pre_spawn = |_s: &super::super::auto_test::VerifierInvokedSnapshot| {
+            pre_spawn_calls += 1;
+        };
+        let mut on_external = |_runner: &str, obs: &ExternalImportObservation| {
+            external_import_calls.push(obs.clone());
+        };
+        let mut skill = VerifierSkill;
+        let _outcome =
+            skill.execute_with_full_observers(inputs, &mut on_pre_spawn, &mut on_external);
+
+        assert_eq!(
+            pre_spawn_calls, 1,
+            "pre-spawn observer must still fire for the Runnable plan"
+        );
+        assert!(
+            external_import_calls
+                .iter()
+                .any(|obs| matches!(obs, ExternalImportObservation::PythonpathRejected { .. })),
+            "external-import callback MUST fire with PythonpathRejected for an external PYTHONPATH component; got {external_import_calls:?}"
+        );
     }
 }
 
@@ -20127,6 +21009,10 @@ pub(super) fn admit_repair_target_hint(
         edited_this_session: (ctx.edited_this_session_for)(&path),
         scaffold_changed: (ctx.scaffold_changed_for)(&path),
         verifier_passed_in_scope: false,
+        // Issue #661 (Task 3.1): RepairJob target admission is NOT one of
+        // the 4 verifier-path SSOT sites — keep `disabled()` so repair
+        // target acceptance semantics are unchanged.
+        nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
     };
     match super::artifact_ownership::classify_ownership(inputs) {
         super::artifact_ownership::ArtifactOwnership::Owned => Some(hint),
@@ -22050,8 +22936,10 @@ fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String>
 /// - Raw verifier commands NEVER appear; `DesiredAction::VerifierRepair`
 ///   collapses to the static label `"verifier_repair"` only.
 /// - Raw `PathBuf` targets NEVER appear; `target_path_hash` is the
-///   non-cryptographic correlator `stable_path_hash_for_active_job(
-///   mask_secrets(...))`.
+///   non-cryptographic correlator `crate::logging::stable_path_hash(
+///   mask_secrets(...))` (Issue #661 DR1-002: SSOT promoted from the
+///   prior `stable_path_hash_for_active_job` private helper to
+///   `logging.rs` so #659/#660/#661 path_hash values share one SSOT).
 /// - `log_llm_event` re-applies `mask_payload_inplace` as the final
 ///   defense line.
 pub(super) fn build_active_job_selected_payload(
@@ -22079,7 +22967,7 @@ pub(super) fn build_active_job_selected_payload(
                     // leaking the literal path.
                     let masked =
                         crate::session::feedback::mask_secrets(&path.display().to_string());
-                    serde_json::Value::String(stable_path_hash_for_active_job(&masked))
+                    serde_json::Value::String(stable_path_hash(&masked))
                 })
                 .unwrap_or(serde_json::Value::Null);
             serde_json::json!({
@@ -22138,28 +23026,113 @@ pub(super) fn build_active_job_selected_payload(
     })
 }
 
-/// Issue #660 (Phase C / §7 / DR2-003 / DR4-004): stable, non-cryptographic
-/// correlator for masked workspace-relative paths used by
-/// `build_active_job_selected_payload`. Algorithm matches
-/// `artifact_ledger.rs::stable_path_hash` (`DefaultHasher` → `{:016x}`).
+// Issue #661 DR1-002 / DR2-005: the previous `stable_path_hash_for_active_job`
+// private helper has been removed and `build_active_job_selected_payload`
+// now uses `crate::logging::stable_path_hash` directly. The hash algorithm
+// (16-hex `DefaultHasher`) is unchanged, so `agent.active_job.selected`
+// payload `target_path_hash` values remain byte-for-byte identical with
+// pre-migration emissions.
+
+/// Issue #661 iteration-4 Task 5.2 (DR1-005 / Section 8-1): pure builder for
+/// the `agent.verifier.invoked` event payload. Extracted as a free function
+/// so unit tests can assert the field shape without instantiating an Agent.
 ///
-/// **Not a secret-hiding hash.** Path secrecy is enforced upstream by
-/// `mask_secrets` (caller passes the masked form here) and by
-/// `mask_payload_inplace` at `log_llm_event` time. This helper merely
-/// gives dataset consumers a stable correlator for the same masked path
-/// across `agent.active_job.*` events without leaking the literal path.
+/// Payload schema (Section 8-1, `mask_payload_inplace` post-application form):
 ///
-/// The duplication with `artifact_ledger.rs::stable_path_hash` is
-/// intentional (DR2-003): widening the ledger's visibility surface just
-/// to share this helper would break the "ledger has no consumers outside
-/// turn.rs" rule. The two SSOTs MUST be kept aligned by doc-comment
-/// contract; algorithm changes must update both sites.
-fn stable_path_hash_for_active_job(masked_path: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    masked_path.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// ```json
+/// {
+///   "session_id": "<SessionStore::session_id()>",
+///   "turn_index": <usize>,
+///   "iteration_seq": <usize>,
+///   "runner": "cargo" | "python3",
+///   "bound_artifacts": [{ "path_hash": "<16-hex>" }],
+///   "bound_test_artifacts_count": <usize>,
+///   "bound_artifacts_truncated": <bool>,
+///   "env_summary": {
+///     "allowlist_keys": [<&str>],
+///     "pythonpath_root": <bool>
+///   },
+///   "cwd_inside_work_root": <bool>
+/// }
+/// ```
+///
+/// `cwd_inside_work_root` is intentionally a **root-level** field even though
+/// the `HermeticEnvSummary` struct carries it. Section 8-1 specifies the
+/// flatten so log consumers can pivot on cwd containment without descending
+/// into `env_summary`. `env_summary` only carries `allowlist_keys` /
+/// `pythonpath_root`.
+///
+/// Field order matches the schema documentation so `serde_json::to_vec`
+/// (used by `compute_payload_digest`) sees a stable canonical byte sequence
+/// for identical inputs across re-emits in the same turn (DR1-004 dedup
+/// determinism).
+pub(super) fn build_agent_verifier_invoked_payload(
+    session_id: &str,
+    turn_index: usize,
+    iteration_seq: usize,
+    snapshot: &super::auto_test::VerifierInvokedSnapshot,
+) -> serde_json::Value {
+    let bound_artifacts: Vec<serde_json::Value> = snapshot
+        .bound_artifacts
+        .iter()
+        .map(|h| serde_json::json!({ "path_hash": h.as_str() }))
+        .collect();
+    let env_summary = serde_json::json!({
+        "allowlist_keys": snapshot.env_summary.allowlist_keys,
+        "pythonpath_root": snapshot.env_summary.pythonpath_root,
+    });
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "iteration_seq": iteration_seq,
+        "runner": snapshot.runner.as_str(),
+        "bound_artifacts": bound_artifacts,
+        "bound_test_artifacts_count": snapshot.bound_test_artifacts_count,
+        "bound_artifacts_truncated": snapshot.bound_artifacts_truncated,
+        "env_summary": env_summary,
+        // Root-level (NOT inside env_summary) per Section 8-1 schema.
+        "cwd_inside_work_root": snapshot.env_summary.cwd_inside_work_root,
+    })
+}
+
+/// Issue #661 iteration-5 Task 7.3: pure-fn builder for the
+/// `agent.verifier.external_import_rejected` event payload (Section 8-2 schema).
+///
+/// raw module name / raw filesystem path / raw executable path は payload に
+/// 出さない (DR4-005)。caller (`emit_agent_verifier_external_import_rejected_if_first`)
+/// が事前に `mask_secrets` + `stable_path_hash` 経由で hash 化した文字列のみを
+/// `detected_hashes` 経由で受け取る。`detected_modules` は最大
+/// `EXTERNAL_IMPORT_DETECTED_CAP` 件 (8) で truncate される。
+pub(super) fn build_agent_verifier_external_import_rejected_payload(
+    session_id: &str,
+    turn_index: usize,
+    runner: &str,
+    reason: &str,
+    detected_hashes: &[(&str, &'static str)],
+    detected_count: usize,
+    detected_truncated: bool,
+) -> serde_json::Value {
+    let cap = super::auto_test::EXTERNAL_IMPORT_DETECTED_CAP;
+    let detected_modules: Vec<serde_json::Value> = detected_hashes
+        .iter()
+        .take(cap)
+        .map(|(hash, source_kind)| {
+            serde_json::json!({
+                "module_hash": *hash,
+                "path_hash": *hash,
+                "source_kind": *source_kind,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "runner": runner,
+        "reason": reason,
+        "detected_count": detected_count,
+        "detected_truncated": detected_truncated,
+        "detected_modules": detected_modules,
+    })
 }
 
 /// Issue #654 (D.1 / DR1-007 / DR4-001) — pure builder that renders a

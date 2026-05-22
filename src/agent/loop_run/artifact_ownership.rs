@@ -18,6 +18,55 @@ use std::path::Path;
 use super::task_contract::{ArtifactRole, ArtifactState, ArtifactStateKind};
 use super::task_workspace_scope::{ScopeMode, TaskWorkspaceScope};
 
+/// Issue #661 (Task 2.1 / DR1-003): admission flag for `classify_ownership`
+/// that lets the **verifier-local** 4 propagation paths
+/// (`record_repo_edit_event` / `projection::owned_test_artifacts` /
+/// `validate_bound_test_artifacts_for_execution` /
+/// `seed_artifact_ledger_verifier_observation`) treat nested test subdirs
+/// such as `app/tests/foo.py` as `Owned`, while every other caller continues
+/// to receive the legacy reject behaviour through `Default::default()` /
+/// `disabled()`.
+///
+/// The single private boolean field is **not** public; callers must use the
+/// named constructors `disabled()` / `enabled()` so the flag cannot be
+/// confused with arbitrary booleans flowing through plumbing code.
+///
+/// Iteration-2 introduces the type only; the `OwnershipInputs` field that
+/// consumes it lands in Task 3.1 below, and the 4 verifier-path callers that
+/// pass `enabled()` are wired up in iteration-3 (Task 3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NestedTestAdmission(bool);
+
+impl NestedTestAdmission {
+    /// Reject nested test subdirs (legacy / default behaviour). All callers
+    /// outside the 4 verifier-path SSOT sites pass this.
+    pub(super) const fn disabled() -> Self {
+        Self(false)
+    }
+
+    /// Admit nested test subdirs as `Owned`. Only the 4 verifier-path
+    /// callers in iteration-3 use this constructor.
+    #[allow(dead_code)] // Iteration-3 wires the verifier-path callers; until then the constructor has no production caller other than dedicated unit tests.
+    pub(super) const fn enabled() -> Self {
+        Self(true)
+    }
+
+    /// Read accessor. Marked `self` (by-value) because `NestedTestAdmission`
+    /// is `Copy`; callers don't need to think about lifetimes.
+    pub(super) fn allow_nested_test_subdirs(self) -> bool {
+        self.0
+    }
+}
+
+impl Default for NestedTestAdmission {
+    /// `disabled()` — preserves existing caller semantics when
+    /// `OwnershipInputs` is constructed without explicitly setting the
+    /// admission field.
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ArtifactOwnership {
     /// The current task owns this file — counts as completion evidence.
@@ -49,6 +98,15 @@ pub(super) struct OwnershipInputs<'a> {
     /// `false` here is safe today.
     #[allow(dead_code)]
     pub(super) verifier_passed_in_scope: bool,
+    /// Issue #661 (Task 3.1 / DR2-003): admission flag that lets the 4
+    /// verifier-path SSOT sites treat nested test subdirs such as
+    /// `app/tests/foo.py` as `Owned` when an edit/scaffold signal is
+    /// present. Every non-verifier caller passes `Default::default()`
+    /// (= `disabled()`), preserving the legacy reject behaviour. The flag
+    /// never bypasses workspace-relative / symlink containment /
+    /// ignored_top_dir / role re-confirm; those checks remain
+    /// authoritative.
+    pub(super) nested_test_admission: NestedTestAdmission,
 }
 
 /// Classify a single workspace-relative artifact path.
@@ -82,12 +140,47 @@ pub(super) fn classify_ownership(inputs: OwnershipInputs<'_>) -> ArtifactOwnersh
     // (c) Anvil scaffold + post-scaffold delta
     // (d) active scope 内 verifier 成功
     let promoted_by_explicit_scope = matches!(inputs.scope.mode, ScopeMode::Explicit { .. });
-    if promoted_by_explicit_scope
+    let has_promotion_signal = promoted_by_explicit_scope
         || inputs.edited_this_session
         || inputs.scaffold_changed
-        || inputs.verifier_passed_in_scope
-    {
+        || inputs.verifier_passed_in_scope;
+    // Issue #661 (Task 3.3 / 判断 #1 / DR2-003): the verifier-local 4
+    // propagation paths pass `nested_test_admission.enabled()` to opt the
+    // verifier binding SSOT into treating nested test subdirs (e.g.
+    // `app/tests/foo.py`) as `Owned`. Every other caller keeps
+    // `Default::default()` (= `disabled()`), preserving the legacy reject
+    // behaviour exactly. The admission only triggers when the path is
+    // recognised as a test file by `util::file_classify::is_test_file`
+    // (which already enumerates `/tests/` substrings, `__tests__`,
+    // `_test.` / `.test.` / `.spec.`, `test_` prefix). Workspace-relative
+    // / symlink / ignored_top_dir / scope.contains checks above remain
+    // authoritative — admission cannot bypass any of them.
+    if has_promotion_signal {
         ArtifactOwnership::Owned
+    } else if inputs.nested_test_admission.allow_nested_test_subdirs()
+        && crate::util::file_classify::is_test_file(Path::new(inputs.relative_path))
+    {
+        // Verifier-binding SSOT path: the planner needs to bind nested
+        // `app/tests/...` style paths to the structured verifier even
+        // when no explicit edit signal has been recorded on the path
+        // (e.g. an existing test file the model now wants to run). Other
+        // callers (which always pass `disabled()`) preserve the legacy
+        // CandidateOnly outcome.
+        //
+        // CB-003 mitigation: `canonical_escape` above returns `false` for
+        // missing leaves (the file may legitimately not exist yet on the
+        // edit signal path). For the no-signal `nested_test_admission`
+        // branch, however, we have no separate signal that guarantees the
+        // path lives under work_root. Walk the nearest existing ancestor
+        // through `nearest_existing_ancestor_within_work_root` so a
+        // dangling-symlink parent (e.g. `app/tests` → /outside) cannot
+        // smuggle a not-yet-created test leaf into `Owned` classification.
+        let target_full = inputs.work_root.join(inputs.relative_path);
+        if !nearest_existing_ancestor_within_work_root(inputs.work_root, &target_full) {
+            ArtifactOwnership::OutOfScope
+        } else {
+            ArtifactOwnership::Owned
+        }
     } else {
         ArtifactOwnership::CandidateOnly
     }
@@ -190,6 +283,12 @@ pub(super) fn owned_test_artifacts(
             edited_this_session: edited_this_session_for(path),
             scaffold_changed: scaffold_changed_for(path),
             verifier_passed_in_scope: false,
+            // Issue #661 (Task 3.1 / 判断 #1 path #2): projection trusts the
+            // admission decision already encoded by `record_repo_edit_event`
+            // / `record_verifier_observation`; do NOT re-evaluate the flag
+            // here. Iteration-3 leaves this `disabled()` and the 4 verifier
+            // entry points switch to `enabled()` instead (Task 3.4).
+            nested_test_admission: NestedTestAdmission::default(),
         });
         if !matches!(ownership, ArtifactOwnership::Owned) {
             continue;
@@ -311,6 +410,7 @@ mod tests {
             edited_this_session: false,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::OutOfScope);
     }
@@ -327,6 +427,7 @@ mod tests {
             edited_this_session: false,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::CandidateOnly);
     }
@@ -343,6 +444,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::Owned);
     }
@@ -358,6 +460,7 @@ mod tests {
             edited_this_session: false,
             scaffold_changed: true,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::Owned);
     }
@@ -373,6 +476,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::OutOfScope);
     }
@@ -388,6 +492,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::OutOfScope);
     }
@@ -403,6 +508,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::OutOfScope);
     }
@@ -427,6 +533,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::OutOfScope);
     }
@@ -451,6 +558,7 @@ mod tests {
             edited_this_session: false,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::Owned);
     }
@@ -474,6 +582,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(during_turn, ArtifactOwnership::Owned);
 
@@ -486,6 +595,7 @@ mod tests {
             edited_this_session: false,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(after_turn_boundary, ArtifactOwnership::CandidateOnly);
     }
@@ -506,6 +616,7 @@ mod tests {
             edited_this_session: false,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::CandidateOnly);
     }
@@ -524,6 +635,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::Owned);
     }
@@ -542,6 +654,7 @@ mod tests {
             edited_this_session: true,
             scaffold_changed: false,
             verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
         });
         assert_eq!(out, ArtifactOwnership::Owned);
     }
@@ -873,5 +986,298 @@ mod tests {
             nearest_existing_ancestor_within_work_root(work.path(), &candidate),
             "real existing leaf inside work_root must be accepted (regression guard)"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 Task 2.1: NestedTestAdmission newtype contract.
+    // DR1-003: public field を持たない named constructors により誤伝播を
+    // 型レベルで防ぐ。`Default::default()` は `disabled()` を返し、既存
+    // caller の意味論を破壊しない。
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn nested_test_admission_default_is_disabled() {
+        let admission: NestedTestAdmission = NestedTestAdmission::default();
+        assert!(
+            !admission.allow_nested_test_subdirs(),
+            "Default::default() must return disabled() = false"
+        );
+    }
+
+    #[test]
+    fn nested_test_admission_disabled_constructor_returns_false() {
+        let admission = NestedTestAdmission::disabled();
+        assert!(
+            !admission.allow_nested_test_subdirs(),
+            "disabled() must return false"
+        );
+    }
+
+    #[test]
+    fn nested_test_admission_enabled_constructor_returns_true() {
+        let admission = NestedTestAdmission::enabled();
+        assert!(
+            admission.allow_nested_test_subdirs(),
+            "enabled() must return true"
+        );
+    }
+
+    #[test]
+    fn nested_test_admission_is_copy_clone() {
+        // Compile-time test: NestedTestAdmission must be Copy + Clone so it
+        // can be passed by value to `OwnershipInputs` constructors without
+        // ownership friction. Verified by relying on a `Copy` move pattern.
+        let admission = NestedTestAdmission::enabled();
+        let copy = admission;
+        let clone = admission;
+        assert!(copy.allow_nested_test_subdirs());
+        assert!(clone.allow_nested_test_subdirs());
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 Task 3.1: `OwnershipInputs.nested_test_admission` field
+    // shape contract. The field MUST exist, accept a `NestedTestAdmission`
+    // by value, and default to `disabled()` so any caller that omits an
+    // explicit setting (`..Default::default()` / field initializer
+    // shorthand inside `OwnershipInputs::default()` test stubs) keeps the
+    // legacy "reject nested test subdirs" behaviour.
+    //
+    // The Red phase for Task 3.3 (admission enables nested test Owned) is
+    // co-located below this section so the two tasks share fixtures.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn ownership_inputs_accepts_explicit_admission_field() {
+        // Compile-time + runtime: the new field must exist on
+        // `OwnershipInputs` and accept a `NestedTestAdmission` value. Pass
+        // `enabled()` here so the test asserts the field is consumed (the
+        // helper does not panic / does not silently drop the value).
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Hello\n").unwrap();
+        let scope = single_root_scope();
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "README.md",
+            scope: &scope,
+            edited_this_session: true,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::enabled(),
+        });
+        // Non-test path: admission has no effect, the file is Owned via
+        // `edited_this_session`. This pins the field's signature only.
+        assert_eq!(out, ArtifactOwnership::Owned);
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 Task 3.3: `classify_ownership` honours the admission flag
+    // for nested test subdirs. `app/tests/foo.py` matches
+    // `util::file_classify::is_test_file` (contains `/tests/`).
+    //   - `enabled()` + edit signal → Owned
+    //   - `disabled()` (default) + edit signal → CandidateOnly (current
+    //     behaviour: the path is in scope but the legacy code does NOT
+    //     promote it as a verifier-bindable test artifact)
+    // Workspace-relative / symlink containment / ignored_top_dir / role
+    // re-confirm のすべては既存挙動を維持。
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn classify_ownership_admits_nested_test_with_admission_enabled() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/tests")).unwrap();
+        std::fs::write(dir.path().join("app/tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope();
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "app/tests/test_a.py",
+            scope: &scope,
+            edited_this_session: true,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::enabled(),
+        });
+        assert_eq!(
+            out,
+            ArtifactOwnership::Owned,
+            "enabled() + edit signal must Own nested test subdirs (app/tests/...)"
+        );
+    }
+
+    #[test]
+    fn classify_ownership_rejects_nested_test_when_admission_disabled_without_signal() {
+        // default() = disabled(). A pre-existing test under app/tests/
+        // without any edit/scaffold signal must NOT promote to Owned (it
+        // stays CandidateOnly, preserving the existing semantics for the
+        // non-verifier callers).
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/tests")).unwrap();
+        std::fs::write(dir.path().join("app/tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope();
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "app/tests/test_a.py",
+            scope: &scope,
+            edited_this_session: false,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::default(),
+        });
+        assert_eq!(
+            out,
+            ArtifactOwnership::CandidateOnly,
+            "default() (disabled()) keeps pre-existing nested test as CandidateOnly"
+        );
+    }
+
+    #[test]
+    fn classify_ownership_preserves_symlink_containment_under_admission_enabled() {
+        // DR2-003 invariant: workspace-relative / symlink containment /
+        // ignored_top_dir / role re-confirm のいずれも admission flag で
+        // bypass しない。symlink escape は enabled() でも OutOfScope。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempdir().unwrap();
+            std::fs::write(outside.path().join("evil_test.py"), "").unwrap();
+            let work = tempdir().unwrap();
+            std::fs::create_dir_all(work.path().join("app/tests")).unwrap();
+            symlink(
+                outside.path().join("evil_test.py"),
+                work.path().join("app/tests/test_a.py"),
+            )
+            .unwrap();
+            let scope = single_root_scope();
+            let out = classify_ownership(OwnershipInputs {
+                work_root: work.path(),
+                relative_path: "app/tests/test_a.py",
+                scope: &scope,
+                edited_this_session: true,
+                scaffold_changed: false,
+                verifier_passed_in_scope: false,
+                nested_test_admission: NestedTestAdmission::enabled(),
+            });
+            assert_eq!(
+                out,
+                ArtifactOwnership::OutOfScope,
+                "symlink escape must remain OutOfScope even with enabled()"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_ownership_preserves_ignored_top_dir_under_admission_enabled() {
+        // node_modules is always rejected regardless of admission flag.
+        let dir = tempdir().unwrap();
+        let scope = single_root_scope();
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "node_modules/foo/tests/test_a.py",
+            scope: &scope,
+            edited_this_session: true,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::enabled(),
+        });
+        assert_eq!(
+            out,
+            ArtifactOwnership::OutOfScope,
+            "node_modules ignored_top_dir must remain OutOfScope even with enabled()"
+        );
+    }
+
+    /// CB-004 regression: ensure the new no-signal `nested_test_admission`
+    /// branch (not the existing `has_promotion_signal` branch) is exercised.
+    /// Without any edit/scaffold/verifier signal, an existing nested test
+    /// path should still promote to `Owned` when admission is `enabled()`.
+    #[test]
+    fn classify_ownership_admits_nested_test_without_signal_under_enabled_admission() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/tests")).unwrap();
+        std::fs::write(dir.path().join("app/tests/test_existing.py"), "").unwrap();
+        let scope = single_root_scope();
+        let out = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "app/tests/test_existing.py",
+            scope: &scope,
+            edited_this_session: false,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::enabled(),
+        });
+        assert_eq!(
+            out,
+            ArtifactOwnership::Owned,
+            "enabled() should Own existing nested test even without explicit signal"
+        );
+    }
+
+    /// CB-003 regression: a dangling-symlink parent directory must not let
+    /// a not-yet-created nested test leaf pass `Owned` classification via
+    /// the no-signal `nested_test_admission` branch. `canonical_escape`
+    /// returns `false` for missing leaves, so we must additionally walk
+    /// the nearest existing ancestor through
+    /// `nearest_existing_ancestor_within_work_root`.
+    #[test]
+    fn classify_ownership_rejects_symlinked_parent_with_missing_leaf_under_enabled_admission() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempdir().unwrap();
+            std::fs::create_dir_all(outside.path().join("evil_tests")).unwrap();
+            let work = tempdir().unwrap();
+            std::fs::create_dir_all(work.path().join("app")).unwrap();
+            // Make `app/tests` a symlink pointing to outside-of-work_root.
+            symlink(
+                outside.path().join("evil_tests"),
+                work.path().join("app/tests"),
+            )
+            .unwrap();
+            let scope = single_root_scope();
+            // Leaf does NOT exist; canonical_escape returns false.
+            let out = classify_ownership(OwnershipInputs {
+                work_root: work.path(),
+                relative_path: "app/tests/test_missing.py",
+                scope: &scope,
+                edited_this_session: false,
+                scaffold_changed: false,
+                verifier_passed_in_scope: false,
+                nested_test_admission: NestedTestAdmission::enabled(),
+            });
+            assert_eq!(
+                out,
+                ArtifactOwnership::OutOfScope,
+                "symlinked parent + missing leaf must remain OutOfScope even with enabled()"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_ownership_disabled_admission_matches_legacy_non_test_path() {
+        // Regression guard: for a non-test path the admission flag has no
+        // effect — same Owned/CandidateOnly decision as before iteration-2.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        let scope = single_root_scope();
+
+        let with_disabled = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "README.md",
+            scope: &scope,
+            edited_this_session: true,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::disabled(),
+        });
+        let with_enabled = classify_ownership(OwnershipInputs {
+            work_root: dir.path(),
+            relative_path: "README.md",
+            scope: &scope,
+            edited_this_session: true,
+            scaffold_changed: false,
+            verifier_passed_in_scope: false,
+            nested_test_admission: NestedTestAdmission::enabled(),
+        });
+        assert_eq!(with_disabled, ArtifactOwnership::Owned);
+        assert_eq!(with_enabled, ArtifactOwnership::Owned);
     }
 }

@@ -352,12 +352,14 @@ pub(super) fn project_policy(selection: &ActiveJobSelection) -> EffectiveToolPol
         .unwrap_or_else(EffectiveToolPolicy::unrestricted)
 }
 
-// Path-hash SSOT (Issue #666): `stable_path_hash` lives in
-// `super::artifact_ledger` with `pub(super)` visibility (formerly a
-// `#[cfg(test)]` duplicate lived here, tracked by DR2-003 / DR4-004
-// doc-comment alignment). The duplicate was removed to eliminate 3-way
-// drift risk (DR3-001 / Issue #666 §10-2). Tests below call the SSOT
-// directly via `super::super::artifact_ledger::stable_path_hash`.
+// Issue #661 DR1-002 / DR2-005: the previous `#[cfg(test)]` private
+// `stable_path_hash` helper has been removed. The shared 16-hex
+// `DefaultHasher` correlator now lives at `crate::logging::stable_path_hash`
+// as the single SSOT for `agent.artifact_ledger.*` / `agent.active_job.*` /
+// `agent.verifier.invoked` payload `path_hash` values. Issue #666
+// `job_report.rs` correlator emits also route through the same SSOT.
+// The unit tests below reach into the SSOT directly via the
+// `crate::logging` import.
 
 // ---------------------------------------------------------------------------
 // Unit tests
@@ -709,12 +711,11 @@ mod tests {
         assert_eq!(d.label(), "artifact_directed");
     }
 
-    // -------- stable_path_hash --------
+    // -------- stable_path_hash (Issue #661 DR1-002: SSOT in logging.rs) --------
 
     #[test]
     fn stable_path_hash_is_deterministic_and_16_hex() {
-        // Issue #666: call the SSOT in `super::artifact_ledger` directly.
-        use super::super::artifact_ledger::stable_path_hash;
+        use crate::logging::stable_path_hash;
         let h1 = stable_path_hash("src/lib.rs");
         let h2 = stable_path_hash("src/lib.rs");
         assert_eq!(h1, h2);
