@@ -181,8 +181,11 @@ pub(super) enum Budget {
         attempts_used: u32,
         attempts_limit: NonZeroU32,
         /// Stop reason emitted when the budget is exhausted. Must be one
-        /// of the existing 5 `StopReason` variants (§4 — no new variants
-        /// introduced by this Issue).
+        /// of the existing 6 `StopReason` variants (Issue #660 introduced
+        /// the closed enum, Issue #662 added `RepairExhausted`). #662
+        /// intentionally does NOT switch `VerifierRepair` to a
+        /// `Bounded::RepairExhausted` budget — that path is reserved for a
+        /// follow-up Issue (design judgment #1 (b) deferred).
         exhausted_stop_reason: StopReason,
     },
 }

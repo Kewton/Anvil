@@ -238,15 +238,48 @@ struct ValidationWeakening {
     pattern: super::spec_authority::WeakeningPattern,
 }
 
+/// Issue #662: structured "non-unsafe" rejection signal carried inside
+/// `ValidationFailure`. `Noop` / `Duplicate` flow through
+/// `validate_verifier_repair_intents`; `Malformed` is produced when
+/// `parse_verifier_repair_intents_reply` fails. Each maps 1:1 to a
+/// `RepairAttemptOutcomeKind` variant for ledger push.
+///
+/// **Detection-order SSOT (5-4-1 priority)**:
+///   - priority 1 `Malformed`  → `RepairAttemptOutcomeKind::RejectedMalformed`
+///   - priority 2 `Noop`       → `RepairAttemptOutcomeKind::RejectedNoop`
+///   - priority 3 `Duplicate`  → `RepairAttemptOutcomeKind::RejectedDuplicate`
+///   - priority 4 (weakening, carried by `ValidationFailure.weakening`)
+///     → `RepairAttemptOutcomeKind::RejectedUnsafe { .. }`
+///   - priority 5 (Applied — no signal, fed by rerun classification)
+///     → `RepairAttemptOutcomeKind::Applied*`
+///
+/// Priorities 1-3 live in this enum; priorities 4 / 5 live elsewhere in
+/// `ValidationFailure.weakening` / the rerun classification path. The
+/// translation into `RepairAttemptOutcomeKind` happens in
+/// `build_verifier_repair_pass_ledger_outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairRejectionSignal {
+    Noop,
+    Duplicate,
+    Malformed,
+}
+
 /// Issue #653 (DR1-001 / DR3-001): `validate_verifier_repair_intents` の
 /// 構造化 Err 型。`outcome` は既存 `CheapCheckOutcome` の文字列互換性を維持し、
 /// `weakening` は `Some(...)` の場合のみ ledger 対象 (`RejectedUnsafe`)。
-/// parse error / exact match 失敗 / duplicate / cheap syntax check 失敗は
-/// `weakening = None` (S5-003 — ledger 非対象)。
+/// parse error / exact match 失敗 / cheap syntax check 失敗は `weakening = None`
+/// かつ `rejection_signal = None` (S5-003 — ledger 非対象 / 旧挙動)。
+///
+/// Issue #662: `rejection_signal` field を additive 追加。`weakening` と直交
+/// する non-unsafe rejection (Noop / Duplicate / Malformed) を carry する。
+/// 同時に両方が `Some` になることはなく、`build_verifier_repair_pass_ledger_outcome`
+/// 内で `weakening` が優先される (検出順序 SSOT priority 4 が priority 1-3 より
+/// 後段で計算されるため、実装上 weakening を後で上書きする経路は存在しない)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidationFailure {
     outcome: CheapCheckOutcome,
     weakening: Option<ValidationWeakening>,
+    rejection_signal: Option<RepairRejectionSignal>,
 }
 
 impl ValidationFailure {
@@ -254,6 +287,19 @@ impl ValidationFailure {
         Self {
             outcome: CheapCheckOutcome::Failed(message),
             weakening: None,
+            rejection_signal: None,
+        }
+    }
+
+    /// Issue #662: build a `Failed` ValidationFailure carrying a non-unsafe
+    /// rejection signal (Noop / Duplicate). Used inside
+    /// `validate_verifier_repair_intents` so the caller can build a
+    /// `RepairAttemptOutcomeKind::Rejected{Noop,Duplicate}` outcome.
+    fn failed_with_signal(message: String, signal: RepairRejectionSignal) -> Self {
+        Self {
+            outcome: CheapCheckOutcome::Failed(message),
+            weakening: None,
+            rejection_signal: Some(signal),
         }
     }
 }
@@ -269,6 +315,7 @@ impl From<CheapCheckOutcome> for ValidationFailure {
         Self {
             outcome,
             weakening: None,
+            rejection_signal: None,
         }
     }
 }
@@ -289,34 +336,60 @@ impl ValidationFailure {
     }
 }
 
-/// Issue #653 (CB-001): pure helper that derives the per-attempt ledger
-/// outcome for a single iteration of `run_verifier_repair_pass_and_apply`'s
-/// retry loop.
+/// Issue #653 (CB-001) / #662 (5-4-1): pure helper that derives the
+/// per-attempt ledger outcome for a single iteration of
+/// `run_verifier_repair_pass_and_apply`'s retry loop.
 ///
 /// Contract:
-/// - Returns `Some(RejectedUnsafe { .. })` **only** when the current attempt
-///   detected a weakening pattern AND the repair job has an active semantic
-///   plan (legacy path with `semantic_plan = None` stays ledger-non-target,
-///   S5-004).
-/// - Returns `None` for every other attempt result (parse error / duplicate
-///   / exact match failure / apply failure / LLM request failure / unexpected
-///   tool calls / `Unavailable`), so the caller can rely on
+/// - Returns `Some(RejectedUnsafe { .. })` when `weakening = Some(...)` AND
+///   the repair job has an active semantic plan (priority 4, S5-003).
+/// - Returns `Some(Rejected{Malformed,Noop,Duplicate})` when
+///   `rejection_signal = Some(...)` AND the repair job has an active
+///   semantic plan (Issue #662 priorities 1-3).
+/// - When **both** are `Some(...)`, `weakening` wins — that mirrors the
+///   detection-order SSOT (5-4-1 priority 4 wins inside
+///   `validate_verifier_repair_intents` because the weakening detector runs
+///   only after the per-intent / fingerprint detectors have all passed,
+///   so this branch is structurally unreachable; the explicit precedence
+///   here is purely a defence-in-depth tie-breaker).
+/// - Returns `None` for every other attempt result (legacy path /
+///   exact-match failure / apply failure / LLM request failure / unexpected
+///   tool calls / `Unavailable`) so the caller can rely on
 ///   `last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(...)`
-///   as an unconditional assignment per attempt, without stale outcomes from
-///   prior attempts leaking into `VerifierRepairPassOutcome::Invalid`.
+///   as an unconditional assignment per attempt, without stale outcomes
+///   from prior attempts leaking into `VerifierRepairPassOutcome::Invalid`.
 fn build_verifier_repair_pass_ledger_outcome(
     weakening: Option<ValidationWeakening>,
+    rejection_signal: Option<RepairRejectionSignal>,
     semantic_plan: Option<&super::repair_job::SemanticRepairPlan>,
 ) -> Option<super::repair_attempt_outcome::RepairAttemptOutcome> {
-    let weakening = weakening?;
     let plan = semantic_plan?;
+    if let Some(w) = weakening {
+        return Some(super::repair_attempt_outcome::RepairAttemptOutcome {
+            cluster: plan.failure_cluster_id.clone(),
+            role: plan.preferred_repair_role,
+            kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
+                rejection: w.rejection,
+                pattern: w.pattern,
+            },
+        });
+    }
+    let signal = rejection_signal?;
+    let kind = match signal {
+        RepairRejectionSignal::Noop => {
+            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoop
+        }
+        RepairRejectionSignal::Duplicate => {
+            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedDuplicate
+        }
+        RepairRejectionSignal::Malformed => {
+            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedMalformed
+        }
+    };
     Some(super::repair_attempt_outcome::RepairAttemptOutcome {
         cluster: plan.failure_cluster_id.clone(),
         role: plan.preferred_repair_role,
-        kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
-            rejection: weakening.rejection,
-            pattern: weakening.pattern,
-        },
+        kind,
     })
 }
 
@@ -8730,6 +8803,12 @@ impl Agent {
                 // 差し替わる可能性があり、旧 `(cluster, role)` を保持できなく
                 // なるため。`semantic_plan = None` の legacy path は ledger
                 // 非対象 (S5-004)。
+                //
+                // Issue #662: `PromotionResult.all_clusters_exhausted` の観察を
+                // この block 内で行い、emit は `self.repair_job = Some(...)` 後に
+                // 行う (emit shell は `self.repair_job` を参照するため)。
+                let mut applied_outcome_promotion: Option<super::repair_job::PromotionResult> =
+                    None;
                 {
                     // S5-002: `SameFailureRemaining` と `NewFailure` は
                     // どちらも progress なしとして同一 variant に畳む。
@@ -8746,6 +8825,10 @@ impl Agent {
                         ),
                         None => None,
                     };
+                    // Issue #662: observe `PromotionResult.all_clusters_exhausted`
+                    // and defer the safe-stop emit until `self.repair_job =
+                    // Some(repair_context)` runs below — the emit shell reads
+                    // `self.repair_job` which is None at this point.
                     if let (Some(kind), Some(plan)) =
                         (kind_opt, repair_context.semantic_plan.as_ref())
                     {
@@ -8754,7 +8837,8 @@ impl Agent {
                             role: plan.preferred_repair_role,
                             kind,
                         };
-                        repair_context.record_repair_attempt_outcome(outcome);
+                        applied_outcome_promotion =
+                            Some(repair_context.record_repair_attempt_outcome(outcome));
                     }
                 }
                 super::repair_job::apply_semantic_repair_dispatch_after_rerun(
@@ -8778,6 +8862,15 @@ impl Agent {
                     );
                 }
                 self.repair_job = Some(repair_context);
+                // Issue #662: emit `StopReason::RepairExhausted` once the
+                // ledger lives on `self.repair_job`. `record_safe_stop_report`
+                // dedups internally via `safe_stop_report_emitted`, so no
+                // caller-side `contains` guard is needed. The shared helper
+                // keeps this Applied caller in lockstep with the Invalid
+                // caller (`record_controller_verifier_repair_invalid`) so a
+                // CB-002 regression in either observation site is caught by
+                // the in-crate E2E suite.
+                self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
                 *args.repo_change_retries = 0;
                 *args.verifier_repair_retries = 0;
                 // Issue #637 (CB-001): a new verifier failure starts a fresh
@@ -11444,6 +11537,44 @@ impl Agent {
         self.emit_repair_safe_stop_report(super::repair_job::StopReason::VerifierWeak);
     }
 
+    /// Issue #662 — `repair_exhausted` emit shell. Fires when
+    /// `record_repair_attempt_outcome` reports `all_clusters_exhausted = true`
+    /// (= every repairable cluster in `semantic_plan.semantic_report` now
+    /// lives in `exhausted_attempts` under its preferred role). The shell
+    /// reuses the shared `FromRepair` SSOT pipeline so the `failure_type`
+    /// upgrade in `SafeStopReport::build_from` (design judgment #5 (b))
+    /// flows through automatically. `record_safe_stop_report` internally
+    /// dedups via `safe_stop_report_emitted: HashSet<StopReason>` so the
+    /// caller does not need to gate this call.
+    pub(super) fn emit_safe_stop_report_for_repair_exhausted(&mut self) {
+        self.emit_repair_safe_stop_report(super::repair_job::StopReason::RepairExhausted);
+    }
+
+    /// Issue #662 (Codex CB-002): single chokepoint consumed by **both**
+    /// production `PromotionResult`-observing call sites:
+    ///   - Applied caller in `drive_task_contract_verifier` (after the
+    ///     rerun has been classified and the outcome pushed via
+    ///     `record_repair_attempt_outcome`),
+    ///   - Invalid caller in `record_controller_verifier_repair_invalid`
+    ///     (after a rejected repair-intent attempt pushes a non-target
+    ///     outcome through the same SSOT push entry point).
+    ///
+    /// Emits the `repair_exhausted` safe-stop report iff the supplied
+    /// promotion result reports `all_clusters_exhausted = true`. Pulling
+    /// the observation / emit pair into a single helper keeps the two
+    /// call sites in lockstep — a CB-002-style regression in either site
+    /// (e.g. one caller forgetting to observe `all_clusters_exhausted`)
+    /// is caught by the in-crate E2E suite, which drives the production
+    /// helper via `drive_record_repair_attempt_outcomes_for_test`.
+    pub(super) fn maybe_emit_repair_exhausted_from_promotion(
+        &mut self,
+        promotion: Option<super::repair_job::PromotionResult>,
+    ) {
+        if promotion.map(|p| p.all_clusters_exhausted).unwrap_or(false) {
+            self.emit_safe_stop_report_for_repair_exhausted();
+        }
+    }
+
     /// Shared helper for repair-job-driven emit paths (E.2 / E.3 / E.4).
     fn emit_repair_safe_stop_report(&mut self, stop_reason: super::repair_job::StopReason) {
         let Some(job) = self.repair_job.clone() else {
@@ -11648,8 +11779,17 @@ impl Agent {
                 // non-weakening validation failures stay ledger-non-target
                 // (`weakening: None`), only weakening detections carry
                 // `ValidationWeakening` metadata for ledger push (S5-003).
+                // Issue #662 (5-4-1 priority 1): parse-stage `RejectedMalformed`
+                // — the LLM reply could not be projected into a
+                // `Vec<VerifierRepairIntent>`. Carry the signal through to the
+                // outcome builder so the ledger learns of the malformed reply.
                 let validation = parse_verifier_repair_intents_reply(&reply.content)
-                    .map_err(ValidationFailure::from)
+                    .map_err(|message| {
+                        ValidationFailure::failed_with_signal(
+                            message,
+                            RepairRejectionSignal::Malformed,
+                        )
+                    })
                     .and_then(|intents| {
                         validate_verifier_repair_intents(
                             &self.work_root,
@@ -11691,15 +11831,19 @@ impl Agent {
                     Err(ValidationFailure {
                         outcome: CheapCheckOutcome::Failed(message),
                         weakening,
+                        rejection_signal,
                     }) => {
-                        // Issue #653 (DR1-001 / S5-003): weakening = Some(...) の
-                        // 時のみ ledger 対象。active plan が無い (semantic_plan
-                        // = None) legacy path は ledger 非対象 (S5-004)。
+                        // Issue #653 (DR1-001 / S5-003) / #662 (5-4-1):
+                        // weakening = Some(...) または rejection_signal =
+                        // Some(...) の場合に ledger 対象。active plan が無い
+                        // (semantic_plan = None) legacy path は ledger 非対象
+                        // (S5-004)。
                         // CB-001: `last_invalid_outcome` は loop top で `None`
                         // にリセット済 — ここで `Some(...)` を入れた場合のみ
                         // 最終 `Invalid` outcome に伝播する。
                         last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(
                             weakening,
+                            rejection_signal,
                             context.semantic_plan.as_ref(),
                         );
                         last_error = message;
@@ -11786,12 +11930,20 @@ impl Agent {
         // so the verifier_repair_pass payload's `previous_repair_error` field
         // never carries raw secrets / Authorization headers / control chars.
         let compact = super::repair_job::sanitize_repair_job_text_with_char_cap(error, 360);
+        let mut promotion_result: Option<super::repair_job::PromotionResult> = None;
         if let Some(context) = self.repair_job.as_mut() {
             context.repair_error = Some(compact.clone());
             // Issue #653 (S7-003): ledger mutation は helper 集約。
             // `outcome = Some(...)` の場合のみ ledger に push される。
+            //
+            // Issue #662: `record_repair_attempt_outcome` returns
+            // `PromotionResult`; observe `all_clusters_exhausted` and emit the
+            // `RepairExhausted` safe stop afterwards. `semantic_plan = None`
+            // path skips the precondition gate via the existing
+            // `if let Some(o) = outcome` guard (callers only build outcomes
+            // when `semantic_plan = Some`).
             if let Some(o) = outcome {
-                context.record_repair_attempt_outcome(o);
+                promotion_result = Some(context.record_repair_attempt_outcome(o));
             }
         }
         self.session.working_memory.note_error(compact.clone());
@@ -11804,6 +11956,12 @@ impl Agent {
                 // 出さない (variant 名のみで mask 不要だが、出力経路を増やさない)。
             }),
         );
+        // Issue #662: emit `StopReason::RepairExhausted` after the ledger
+        // mutation. `record_safe_stop_report` dedups internally via the
+        // `safe_stop_report_emitted` HashSet — no caller `contains` guard
+        // needed. The shared helper keeps the Invalid caller in lockstep
+        // with the Applied caller (CB-002 fix anchor).
+        self.maybe_emit_repair_exhausted_from_promotion(promotion_result);
     }
 
     fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
@@ -16658,7 +16816,12 @@ mod tests {
     }
 
     #[test]
-    fn build_safe_stop_payload_emits_all_five_stop_reasons_with_failure_type() {
+    fn build_safe_stop_payload_emits_all_six_stop_reasons_with_failure_type() {
+        // Issue #662 (Codex CB-002): extended from 5 → 6 stop_reason cases so
+        // the `RepairExhausted` + `VerifierFailureType::RepairExhausted`
+        // upgrade pair (design judgment #5 (b)) is regression-anchored
+        // directly in the payload builder unit test, not only via the
+        // higher-level E2E `safe_stop_e2e_tests::repair_exhausted` cases.
         for (reason, ft) in [
             (
                 StopReason::ArtifactCompletionFailed,
@@ -16676,6 +16839,11 @@ mod tests {
             (
                 StopReason::DiagnosticTargetMissing,
                 VerifierFailureType::DiagnosticTargetMissing,
+            ),
+            // Issue #662: 6th documented (stop_reason, failure_type) pair.
+            (
+                StopReason::RepairExhausted,
+                VerifierFailureType::RepairExhausted,
             ),
         ] {
             let report = minimal_report(reason, ft);
@@ -20254,8 +20422,29 @@ fn validate_verifier_repair_intents(
         .to_string_lossy()
         .replace('\\', "/");
 
+    // Issue #662 (Codex CB-001): split the per-intent loop into two phases so
+    // the duplicate fingerprint check (priority 3) runs **before** the
+    // in-memory apply. The previous single-pass loop fused per-intent input
+    // validation (path / size / markdown / secret / shell — and the `Noop`
+    // priority-2 check) **with** the in-memory `apply_exact_once`. In the
+    // production replay scenario the same intent is re-proposed after a
+    // previous successful apply: the file on disk now holds `new_string`, so
+    // `apply_exact_once(old_string, new_string)` fails first (unsigned
+    // `repair intent exact edit rejected: ...`) and `RepairRejectionSignal::
+    // Duplicate` is never produced — `record_controller_verifier_repair_invalid`
+    // then records a ledger-non-target outcome and the `count >= 2`
+    // promotion to `exhausted_attempts` never fires.
+    //
+    // Phase 1 below validates each intent against its own bytes (no file
+    // read). Phase 2 (after the fingerprint duplicate check) runs the
+    // in-memory apply. The detection-order SSOT (5-4-1: Malformed →
+    // **Noop → Duplicate** → Unsafe → Applied) is preserved because the
+    // priority-2 Noop check stays in Phase 1.
+
+    // ---- Phase 1: per-intent input-only validation (no file read /
+    // ---- no on-disk apply). Each check inspects only the intent's own
+    // ---- bytes plus the previously-resolved canonical target path.
     let mut total_edit_bytes = 0usize;
-    let mut used_whitespace_fallback = false;
     for intent in &intents {
         if !verifier_repair_path_input_is_safe(&intent.path) {
             return Err(ValidationFailure::failed(
@@ -20276,9 +20465,14 @@ fn validate_verifier_repair_intents(
                 "repair intent old_string must not be empty".to_string(),
             ));
         }
+        // Issue #662 (5-4-1 priority 2): per-intent noop detector.
+        // `old_string == new_string` means the intent is a no-op — it would
+        // not change the file contents even if applied. Stays in Phase 1
+        // so Noop (priority 2) still beats Duplicate (priority 3).
         if intent.old_string == intent.new_string {
-            return Err(ValidationFailure::failed(
+            return Err(ValidationFailure::failed_with_signal(
                 "repair intent old_string and new_string are identical".to_string(),
+                RepairRejectionSignal::Noop,
             ));
         }
         total_edit_bytes = total_edit_bytes
@@ -20309,6 +20503,36 @@ fn validate_verifier_repair_intents(
                 "repair intent contains suspicious shell-control payload".to_string(),
             ));
         }
+    }
+
+    // Issue #662 (5-4-1 priority 3, Codex CB-001): history-driven duplicate
+    // detector. Runs **before** the in-memory apply so a replay of an
+    // already-applied intent surfaces as `RepairRejectionSignal::Duplicate`
+    // (and feeds the `count >= 2` promotion path) instead of being absorbed
+    // by an unsigned `exact edit rejected` failure when the on-disk file
+    // already holds `new_string`. The fingerprint inputs (`failure_signature`,
+    // `relative_path`, each intent's `old_string` / `new_string` /
+    // `replace_all`) are all available without touching the on-disk
+    // post-apply state, so this is a pure-input check.
+    //
+    // The fingerprint deliberately excludes raw `old_string` / `new_string`
+    // from outcome payloads downstream (see
+    // `RepairAttemptOutcomeKind::RejectedDuplicate`).
+    let fingerprint = verifier_repair_intents_fingerprint(context, &relative_path, &intents);
+    if context.applied_repair_intents.contains(&fingerprint) {
+        return Err(ValidationFailure::failed_with_signal(
+            "duplicate repair edit intent for the same failure".to_string(),
+            RepairRejectionSignal::Duplicate,
+        ));
+    }
+
+    // Phase 2: in-memory apply. Per-intent input validation has already
+    // passed; remaining failures here surface as unsigned
+    // `apply_exact_once` / `apply_bounded_replace_all` rejections (which
+    // remain `ledger-non-target` by design — they are reported via
+    // `record_controller_verifier_repair_invalid(outcome = None)`).
+    let mut used_whitespace_fallback = false;
+    for intent in &intents {
         contents = if intent.replace_all {
             apply_bounded_replace_all(&contents, &intent.old_string, &intent.new_string)
                 .map_err(|err| format!("repair intent replace_all rejected: {err}"))?
@@ -20327,6 +20551,17 @@ fn validate_verifier_repair_intents(
             used_whitespace_fallback |= result.used_whitespace_fallback;
             result.updated_contents
         };
+    }
+    // Issue #662 (5-4-1 priority 2 — apply-side noop branch): all per-intent
+    // edits applied cleanly but the resulting file contents are identical to
+    // the pre-edit snapshot (e.g. multiple intents that cancel out). This is
+    // a no-op outcome that should still cost the same `count >= 2` promotion
+    // budget as the per-intent noop branch above.
+    if contents == original_contents {
+        return Err(ValidationFailure::failed_with_signal(
+            "repair intent applied but produced no net change to the file".to_string(),
+            RepairRejectionSignal::Noop,
+        ));
     }
     // Issue #647 (MF3 / codex final review): SemanticRepairPlan gate for test
     // edits. Test files (`is_test_file`) may only be edited when the
@@ -20411,6 +20646,7 @@ fn validate_verifier_repair_intents(
         return Err(ValidationFailure {
             outcome: CheapCheckOutcome::Failed(message),
             weakening: weakening_meta,
+            rejection_signal: None,
         });
     }
     validate_verifier_repair_candidate_contents(
@@ -20419,12 +20655,10 @@ fn validate_verifier_repair_intents(
         used_whitespace_fallback,
     )?;
 
-    let fingerprint = verifier_repair_intents_fingerprint(context, &relative_path, &intents);
-    if context.applied_repair_intents.contains(&fingerprint) {
-        return Err(ValidationFailure::failed(
-            "duplicate repair edit intent for the same failure".to_string(),
-        ));
-    }
+    // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran
+    // **before** the in-memory apply above. The remaining branches here
+    // (weakening detector / candidate content check) cannot trigger a
+    // duplicate signal, so no further fingerprint comparison is needed.
     Ok(ValidatedVerifierRepairEdit {
         relative_path,
         canonical_path: canonical,
@@ -24834,8 +25068,9 @@ mod progress_tests {
     };
     use super::{
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
-        VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
-        VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS, VerifierRepairDecision, VerifierRepairIntent,
+        RepairRejectionSignal, VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
+        VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
+        ValidationFailure, VerifierRepairDecision, VerifierRepairIntent,
         apply_validated_verifier_repair_edit, artifact_directed_tool_policy_error,
         classify_verifier_failure_type, deterministic_empty_framework_app_files,
         deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
@@ -24875,10 +25110,11 @@ mod progress_tests {
         verifier_diagnostic_messages, verifier_file_excerpt_for_line,
         verifier_repair_context_from_failure, verifier_repair_decision,
         verifier_repair_effective_target_hint, verifier_repair_intent_fingerprint,
-        verifier_repair_pass_messages, verifier_repair_pass_retry_message,
-        verifier_repair_policy_for_decision, verifier_repair_preferred_local_import_source,
-        verifier_repair_stale_assertion_test_target, verifier_repair_target_candidate_from_output,
-        verifier_repair_target_hint_from_output, workspace_appears_empty,
+        verifier_repair_intents_fingerprint, verifier_repair_pass_messages,
+        verifier_repair_pass_retry_message, verifier_repair_policy_for_decision,
+        verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
+        verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
+        workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -26625,6 +26861,204 @@ mod progress_tests {
         };
         let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
         assert!(edit.updated_contents.contains("value = 2"));
+    }
+
+    /// Issue #662 (5-4-1 priority 2): per-intent `old_string == new_string`
+    /// → `RepairRejectionSignal::Noop`. `validation` returns
+    /// `Err(ValidationFailure { rejection_signal: Some(Noop), .. })` and the
+    /// file is left untouched.
+    #[test]
+    fn issue662_validate_intents_rejects_intent_with_identical_old_and_new_string_as_noop() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    value = 1\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n".to_string(),
+            new_string: "    value = 1\n".to_string(),
+            reason: "noop intent".to_string(),
+            replace_all: false,
+        };
+        let failure = validate_verifier_repair_intents(work_root, &context, &target, vec![intent])
+            .unwrap_err();
+        assert!(
+            failure.contains("identical"),
+            "expected per-intent noop message, got: {failure}"
+        );
+        assert_eq!(
+            failure.rejection_signal,
+            Some(RepairRejectionSignal::Noop),
+            "noop signal must propagate to the outcome builder"
+        );
+        assert!(
+            failure.weakening.is_none(),
+            "weakening must not be set on a noop reject"
+        );
+        // File on disk unchanged.
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("app/main.py")).unwrap(),
+            original
+        );
+    }
+
+    /// Issue #662 (5-4-1 priority 3): the intents fingerprint already lives in
+    /// `applied_repair_intents` → `RepairRejectionSignal::Duplicate`.
+    #[test]
+    fn issue662_validate_intents_rejects_duplicate_fingerprint_with_signal() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        let original = "def run():\n    value = 1\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), original).unwrap();
+        let mut context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n    return value\n".to_string(),
+            new_string: "    value = 2\n    return value\n".to_string(),
+            reason: "fix value".to_string(),
+            replace_all: false,
+        };
+        // Seed the fingerprint to mimic a previously-applied identical intent.
+        // We compute the same fingerprint the validator computes — at the same
+        // canonicalized relative path.
+        let root = std::fs::canonicalize(work_root).unwrap();
+        let canonical = std::fs::canonicalize(work_root.join("app/main.py")).unwrap();
+        let relative_path = canonical
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let fingerprint = verifier_repair_intents_fingerprint(
+            &context,
+            &relative_path,
+            std::slice::from_ref(&intent),
+        );
+        context.applied_repair_intents.push(fingerprint);
+        let failure = validate_verifier_repair_intents(work_root, &context, &target, vec![intent])
+            .unwrap_err();
+        assert_eq!(
+            failure.rejection_signal,
+            Some(RepairRejectionSignal::Duplicate),
+            "duplicate signal must propagate to the outcome builder"
+        );
+        assert!(failure.contains("duplicate"));
+    }
+
+    /// Issue #662 (Codex CB-001): production replay scenario — a previously
+    /// applied repair intent is re-proposed verbatim. On disk the file is now
+    /// in the post-apply state (`new_string` content), so a naive
+    /// `apply_exact_once` would fail because `old_string` no longer matches.
+    /// The duplicate fingerprint check MUST run **before** the in-memory apply
+    /// so the rejection still surfaces as `RepairRejectionSignal::Duplicate`
+    /// (instead of falling through to an unsigned exact-edit rejection that is
+    /// `ledger-non-target` and never promotes the (cluster, role) to
+    /// `exhausted_attempts`).
+    #[test]
+    fn issue662_codex_cb001_validate_intents_returns_duplicate_when_file_already_contains_new_string()
+     {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        // File on disk already reflects the post-apply state (`value = 2`)
+        // because the previous attempt already wrote it.
+        let post_apply = "def run():\n    value = 2\n    return value\n";
+        std::fs::write(work_root.join("app/main.py"), post_apply).unwrap();
+        let mut context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        // Same intent the LLM proposed last attempt: `old_string` no longer
+        // exists on disk (the file already shows `value = 2`).
+        let intent = VerifierRepairIntent {
+            path: "app/main.py".to_string(),
+            old_string: "    value = 1\n    return value\n".to_string(),
+            new_string: "    value = 2\n    return value\n".to_string(),
+            reason: "fix value".to_string(),
+            replace_all: false,
+        };
+        // Seed the fingerprint to mimic the previous identical apply (the
+        // `applied_repair_intents` ledger lives on the RepairJob and survives
+        // across retries within a turn).
+        let root = std::fs::canonicalize(work_root).unwrap();
+        let canonical = std::fs::canonicalize(work_root.join("app/main.py")).unwrap();
+        let relative_path = canonical
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let fingerprint = verifier_repair_intents_fingerprint(
+            &context,
+            &relative_path,
+            std::slice::from_ref(&intent),
+        );
+        context.applied_repair_intents.push(fingerprint);
+
+        let failure = validate_verifier_repair_intents(work_root, &context, &target, vec![intent])
+            .unwrap_err();
+
+        // Production-shape assertion: the duplicate signal MUST surface even
+        // when the file content has already been written through (CB-001).
+        // Previously the exact-edit reject at apply time fired first and the
+        // failure leaked through as `rejection_signal = None`.
+        assert_eq!(
+            failure.rejection_signal,
+            Some(RepairRejectionSignal::Duplicate),
+            "duplicate must be detected BEFORE the in-memory apply tries the now-stale old_string"
+        );
+        assert!(
+            failure.contains("duplicate"),
+            "duplicate message must surface; got: {failure}"
+        );
+        // File on disk is left untouched (no apply attempted).
+        assert_eq!(
+            std::fs::read_to_string(work_root.join("app/main.py")).unwrap(),
+            post_apply
+        );
+    }
+
+    /// Issue #662 (5-4-1 priority 1): malformed LLM reply → parse error path.
+    /// `parse_verifier_repair_intents_reply` returns `Err(String)` and the
+    /// caller maps it through `ValidationFailure::failed_with_signal(_,
+    /// RepairRejectionSignal::Malformed)`. We exercise the parse step plus
+    /// the explicit mapping here so the production wire stays tested even
+    /// though it is just a closure in the retry loop.
+    #[test]
+    fn issue662_parse_failure_maps_to_rejected_malformed_signal() {
+        // Reply that cannot be projected into a VerifierRepairIntent — the
+        // parser requires either a JSON object or list of objects with the
+        // documented keys. Empty / non-JSON falls through to Err.
+        let err = parse_verifier_repair_intents_reply("not a json reply").unwrap_err();
+        let failure = ValidationFailure::failed_with_signal(err, RepairRejectionSignal::Malformed);
+        assert_eq!(
+            failure.rejection_signal,
+            Some(RepairRejectionSignal::Malformed),
+            "malformed signal must be carried by the production-wire ValidationFailure"
+        );
+        assert!(failure.weakening.is_none());
     }
 
     /// DR3-002: non-test / non-impl file paths (e.g. JSON) must not invoke
@@ -30702,11 +31136,17 @@ export default function App() {
         // Issue #653 (S3-001): `verifier_repair_context_from_failure` carries
         // `repair_attempt_outcomes` over from `previous_context` (clone), or
         // starts with empty Vec when `previous_context = None`.
+        //
+        // Issue #662: `record_repair_attempt_outcome` requires
+        // `semantic_plan = Some` (5-3 precondition). Inject a synthetic plan
+        // into `first` so the test seam exercises the production path.
+        use crate::agent::loop_run::VerifierDiagnosticFailureKind;
         use crate::agent::loop_run::repair_attempt_outcome::{
             RepairAttemptOutcome, RepairAttemptOutcomeKind, RepairRejectionKind,
         };
+        use crate::agent::loop_run::repair_job::SemanticRepairPlan;
         use crate::agent::loop_run::semantic_failure::cluster_key_for_test;
-        use crate::agent::loop_run::spec_authority::WeakeningPattern;
+        use crate::agent::loop_run::spec_authority::{SpecAuthority, WeakeningPattern};
         use crate::agent::loop_run::task_contract::ArtifactRole;
 
         let temp = tempdir().unwrap();
@@ -30731,8 +31171,51 @@ export default function App() {
             "fresh RepairJob must start with empty ledger"
         );
 
+        // Issue #662: precondition gate — seed a synthetic semantic_plan whose
+        // `failure_cluster_id` matches the outcome we push.
+        let report_json = serde_json::json!({
+            "failure_kind": "assertion_mismatch",
+            "confidence": 0.7,
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "h",
+            "failure_clusters": [
+                {
+                    "observed": "A",
+                    "expected": "exp",
+                    "input_shape": "shape",
+                    "assertion_shape": "AssertEq",
+                    "involved_artifacts": ["test"],
+                    "affected_cases": ["case1"],
+                }
+            ],
+        });
+        let mut report =
+            crate::agent::loop_run::semantic_failure::parse_semantic_failure_report(&report_json)
+                .expect("synthetic semantic report parses");
+        if let Some(c) = report.failure_clusters.get_mut(0) {
+            c.cluster_key = cluster_key_for_test("A");
+            c.admitted_cluster_targets.push(
+                crate::agent::loop_run::task_contract::RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "app/test_smoke.py".to_string(),
+                    reason: "synthetic carryover fixture".to_string(),
+                },
+            );
+        }
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        first.semantic_plan = Some(SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: ArtifactRole::Test,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        });
+
         // Push an outcome into `first` so we can verify carryover to `second`.
-        first.record_repair_attempt_outcome(RepairAttemptOutcome::for_test(
+        let _ = first.record_repair_attempt_outcome(RepairAttemptOutcome::for_test(
             cluster_key_for_test("A"),
             ArtifactRole::Test,
             RepairAttemptOutcomeKind::RejectedUnsafe {
@@ -30801,7 +31284,9 @@ export default function App() {
         use super::super::semantic_failure::parse_semantic_failure_report;
         use super::super::spec_authority::{SpecAuthority, WeakeningPattern};
         use super::super::task_contract::ArtifactRole;
-        use super::{ValidationWeakening, build_verifier_repair_pass_ledger_outcome};
+        use super::{
+            RepairRejectionSignal, ValidationWeakening, build_verifier_repair_pass_ledger_outcome,
+        };
 
         // Build a minimal SemanticRepairPlan (active plan, ledger eligible).
         let json = serde_json::json!({
@@ -30836,7 +31321,8 @@ export default function App() {
             rejection: RepairRejectionKind::TestWeakening,
             pattern: WeakeningPattern::AssertionDeleted,
         });
-        let attempt_1 = build_verifier_repair_pass_ledger_outcome(weakening_attempt_1, Some(&plan));
+        let attempt_1 =
+            build_verifier_repair_pass_ledger_outcome(weakening_attempt_1, None, Some(&plan));
         let attempt_1_outcome = attempt_1.expect("attempt 1 must produce RejectedUnsafe outcome");
         assert_eq!(attempt_1_outcome.cluster, cluster_id);
         assert_eq!(attempt_1_outcome.role, ArtifactRole::Implementation);
@@ -30849,12 +31335,13 @@ export default function App() {
         }
 
         // Attempt 2 — every ledger-non-target failure modeled by the helper
-        // (weakening = None) MUST return None regardless of whether a plan is
-        // active. This is the property that prevents the cross-attempt leak.
-        let attempt_2_parse_error = build_verifier_repair_pass_ledger_outcome(None, Some(&plan));
+        // (weakening = None, rejection_signal = None) MUST return None
+        // regardless of whether a plan is active.
+        let attempt_2_parse_error =
+            build_verifier_repair_pass_ledger_outcome(None, None, Some(&plan));
         assert!(
             attempt_2_parse_error.is_none(),
-            "ledger-non-target attempt (e.g. parse error / duplicate / exact match \
+            "ledger-non-target attempt (e.g. exact match \
              failure / apply failure / LLM request failure) must NOT inherit a \
              stale ledger outcome from a prior attempt, even when an active \
              SemanticRepairPlan exists",
@@ -30868,6 +31355,7 @@ export default function App() {
                 pattern: WeakeningPattern::EarlyReturnBypass,
             }),
             None,
+            None,
         );
         assert!(
             legacy_weakening.is_none(),
@@ -30876,7 +31364,68 @@ export default function App() {
         );
 
         // No weakening AND no plan: trivially None.
-        assert!(build_verifier_repair_pass_ledger_outcome(None, None).is_none());
+        assert!(build_verifier_repair_pass_ledger_outcome(None, None, None).is_none());
+
+        // Issue #662: rejection_signal = Some(Noop) + active plan → RejectedNoop.
+        let noop = build_verifier_repair_pass_ledger_outcome(
+            None,
+            Some(RepairRejectionSignal::Noop),
+            Some(&plan),
+        )
+        .expect("Noop signal + active plan must produce outcome");
+        assert!(matches!(noop.kind, RepairAttemptOutcomeKind::RejectedNoop));
+        assert_eq!(noop.cluster, cluster_id);
+        assert_eq!(noop.role, ArtifactRole::Implementation);
+
+        // Issue #662: rejection_signal = Some(Duplicate) + active plan → RejectedDuplicate.
+        let dup = build_verifier_repair_pass_ledger_outcome(
+            None,
+            Some(RepairRejectionSignal::Duplicate),
+            Some(&plan),
+        )
+        .expect("Duplicate signal + active plan must produce outcome");
+        assert!(matches!(
+            dup.kind,
+            RepairAttemptOutcomeKind::RejectedDuplicate
+        ));
+
+        // Issue #662: rejection_signal = Some(Malformed) + active plan → RejectedMalformed.
+        let mal = build_verifier_repair_pass_ledger_outcome(
+            None,
+            Some(RepairRejectionSignal::Malformed),
+            Some(&plan),
+        )
+        .expect("Malformed signal + active plan must produce outcome");
+        assert!(matches!(
+            mal.kind,
+            RepairAttemptOutcomeKind::RejectedMalformed
+        ));
+
+        // Issue #662: rejection_signal = Some(_) but no active plan → None.
+        let no_plan = build_verifier_repair_pass_ledger_outcome(
+            None,
+            Some(RepairRejectionSignal::Noop),
+            None,
+        );
+        assert!(
+            no_plan.is_none(),
+            "legacy path (semantic_plan = None) must stay ledger-non-target for non-unsafe signals too"
+        );
+
+        // Issue #662 priority tie-breaker: weakening wins over rejection_signal.
+        let tie = build_verifier_repair_pass_ledger_outcome(
+            Some(ValidationWeakening {
+                rejection: RepairRejectionKind::TestWeakening,
+                pattern: WeakeningPattern::AssertionDeleted,
+            }),
+            Some(RepairRejectionSignal::Duplicate),
+            Some(&plan),
+        )
+        .expect("tie-break outcome must be Some");
+        assert!(
+            matches!(tie.kind, RepairAttemptOutcomeKind::RejectedUnsafe { .. }),
+            "weakening must win when both are present (defence-in-depth tie-break)"
+        );
     }
 
     #[test]

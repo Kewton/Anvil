@@ -260,3 +260,69 @@ fn memory_report_has_no_safe_stop_linkage() {
         "MemoryReport must NOT carry safe_stop linkage (DR1-004 asymmetry)"
     );
 }
+
+/// Issue #662: when the production safe-stop emit fires with `RepairExhausted`,
+/// the 4 job reports must observe the linkage (`safe_stop.reason =
+/// "repair_exhausted"`) on the 3 non-Memory reports and leave the Memory
+/// report untouched (S7-003 DR1-004 asymmetry preserved).
+#[test]
+fn repair_exhausted_linkage_propagates_to_three_reports() {
+    use crate::agent::loop_run::emit_safe_stop_report_repair_exhausted_for_test;
+
+    let session_id = unique_session_id("re-link");
+    let _ = shared_log_path();
+    let (mut agent, _td) = build_live_agent(&session_id);
+
+    // Production safe-stop emit emits the 4 job reports first (CB-001 order)
+    // with the linkage built in, then the safe_stop.report event.
+    emit_safe_stop_report_repair_exhausted_for_test(&mut agent);
+
+    // ArtifactCompletionReport / VerificationReport / RepairReport carry the
+    // linkage; MemoryReport does not. The llm-io record nests as:
+    //   record.payload (envelope) → envelope.payload (Report) → Report.safe_stop.
+    for event in [EVENT_AC, EVENT_VE, EVENT_RE] {
+        let recs = events_by_name(&session_id, event);
+        assert!(
+            !recs.is_empty(),
+            "{event} must be emitted at least once via the production path"
+        );
+        let envelope = recs[0].get("payload").unwrap();
+        let report = envelope
+            .get("payload")
+            .unwrap_or_else(|| panic!("{event} envelope must carry an inner payload"));
+        let safe_stop = report
+            .get("safe_stop")
+            .unwrap_or_else(|| panic!("{event} must carry safe_stop linkage"));
+        let reason = safe_stop.get("reason").and_then(|v| v.as_str());
+        assert_eq!(
+            reason,
+            Some("repair_exhausted"),
+            "{event} safe_stop.reason must equal the 6th documented label"
+        );
+        let report_emitted = safe_stop
+            .get("report_emitted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(
+            report_emitted,
+            "{event} safe_stop.report_emitted must be true when emitted with linkage override"
+        );
+    }
+
+    // MemoryReport asymmetry (S7-003 / DR1-004): even if Memory is emitted
+    // for any reason on this turn, the report payload must not carry a
+    // `safe_stop` field. When the safe-stop emit path is the only trigger,
+    // Memory does NOT get emitted (it requires PAM-observable state), so
+    // the absence-of-records case is also acceptable.
+    let me_recs = events_by_name(&session_id, EVENT_ME);
+    for rec in &me_recs {
+        let me_envelope = rec.get("payload").unwrap();
+        let me_report = me_envelope
+            .get("payload")
+            .expect("memory envelope must carry an inner payload");
+        assert!(
+            me_report.get("safe_stop").is_none(),
+            "MemoryReport must NOT carry safe_stop linkage even for repair_exhausted (S7-003)"
+        );
+    }
+}
