@@ -1,3 +1,9 @@
+// Issue #664: `is_dependency_install_command` / `is_scaffold_command` /
+// `should_block_bash_command` are `#[deprecated]` for the SetupBootstrap
+// policy projection (DR1-001 案 B / AD12). The recovery-side legacy
+// semantics are preserved and exercised by these integration tests.
+#![allow(deprecated)]
+
 use anvil::agent::recovery::{
     ActionExpectation, artifact_directed_recovery_note, broad_restart_discovery_error,
     classify_action_expectation, empty_response_recovery_note, empty_workspace_scaffold_note,

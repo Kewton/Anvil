@@ -31,15 +31,27 @@ use std::path::PathBuf;
 
 use super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
 use super::repair_job::StopReason;
-use super::task_contract::RecoveryTargetHint;
+use super::required_behavior::{
+    BehaviorContractProjection, LOW_CONFIDENCE_THRESHOLD, behavior_projection_has_setup_label,
+};
+use super::task_contract::{
+    ArtifactRole, RecoveryTargetHint, TaskContract, VerifierPrerequisiteSignal,
+    has_required_setup_artifact,
+};
 use super::turn::EffectiveToolPolicy;
 
-/// Arbitration-selectable job kinds (priority 1-5 in §4 of the design
-/// policy). `AnswerOnlyMode` / `PlanModeGate` / `SetupBootstrap` are
-/// pre-arbitration gates and do NOT appear here.
+/// Arbitration-selectable job kinds. `AnswerOnlyMode` / `PlanModeGate`
+/// are pre-arbitration gates and do NOT appear here.
 ///
-/// `#[non_exhaustive]`: future jobs (e.g. SetupBootstrap promotion in #664)
-/// can be added without a breaking match (DR1-008).
+/// Issue #664 (AD1 / AD6 / 判断 5): `SetupBootstrap` is added as the
+/// 6th selectable variant with priority rank = 4 (between ArtifactRecovery
+/// and FocusedEditRecovery). The legacy variants below are renumbered
+/// (FocusedEditRecovery 4→5, LocalLlmSmallEditAfterRead 5→6); the
+/// **relative order** of the 5 legacy variants is preserved so the #660
+/// pairwise priority tests are unchanged.
+///
+/// `#[non_exhaustive]`: additive variants can be added without breaking
+/// in-crate matches (DR1-008 / DR1-003).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub(super) enum ActiveJobKind {
@@ -49,22 +61,26 @@ pub(super) enum ActiveJobKind {
     ForcedSmallEditRecovery,
     /// Priority 3: artifact-recovery (missing required artifact role).
     ArtifactRecovery,
-    /// Priority 4: focused-edit recovery (heuristic last-read target).
+    /// Issue #664: Priority 4: setup bootstrap (environment provisioning).
+    SetupBootstrap,
+    /// Priority 5: focused-edit recovery (heuristic last-read target).
     FocusedEditRecovery,
-    /// Priority 5: local-LLM small-edit fallback (generic retry path).
+    /// Priority 6: local-LLM small-edit fallback (generic retry path).
     LocalLlmSmallEditAfterRead,
 }
 
 impl ActiveJobKind {
-    /// Lower number = higher priority. §4 of the design policy fixes
-    /// the order (VerifierRepair=1, ..., LocalLlmSmallEditAfterRead=5).
+    /// Lower number = higher priority. Issue #664 (判断 5): SetupBootstrap
+    /// is rank 4 (between ArtifactRecovery and FocusedEditRecovery); the
+    /// legacy 5 variants retain their relative order.
     fn priority_rank(self) -> u8 {
         match self {
             ActiveJobKind::VerifierRepair => 1,
             ActiveJobKind::ForcedSmallEditRecovery => 2,
             ActiveJobKind::ArtifactRecovery => 3,
-            ActiveJobKind::FocusedEditRecovery => 4,
-            ActiveJobKind::LocalLlmSmallEditAfterRead => 5,
+            ActiveJobKind::SetupBootstrap => 4,
+            ActiveJobKind::FocusedEditRecovery => 5,
+            ActiveJobKind::LocalLlmSmallEditAfterRead => 6,
         }
     }
 
@@ -77,6 +93,7 @@ impl ActiveJobKind {
             ActiveJobKind::VerifierRepair => "VerifierRepair",
             ActiveJobKind::ForcedSmallEditRecovery => "ForcedSmallEditRecovery",
             ActiveJobKind::ArtifactRecovery => "ArtifactRecovery",
+            ActiveJobKind::SetupBootstrap => "SetupBootstrap",
             ActiveJobKind::FocusedEditRecovery => "FocusedEditRecovery",
             ActiveJobKind::LocalLlmSmallEditAfterRead => "LocalLlmSmallEditAfterRead",
         }
@@ -127,6 +144,12 @@ pub(super) enum DesiredAction {
         #[allow(dead_code)]
         read_scope: AllowedReadScope,
     },
+    /// Issue #664 (AD14 / S5-003): SetupBootstrap marker variant. The
+    /// command-level allow set is decided at tool enforcement time by
+    /// `crate::tools::bash::is_setup_command(arguments["command"])`;
+    /// the arbiter NEVER observes the raw bash command and therefore
+    /// stores no `command` / `target` payload on this variant.
+    SetupBash,
 }
 
 impl DesiredAction {
@@ -139,18 +162,21 @@ impl DesiredAction {
             DesiredAction::MissingVerifierCreate => "missing_verifier_create",
             DesiredAction::FocusedEdit { .. } => "focused_edit",
             DesiredAction::ArtifactDirected { .. } => "artifact_directed",
+            DesiredAction::SetupBash => "setup_bash",
         }
     }
 
     /// Optional workspace-relative target path. `None` for action variants
-    /// with no path semantic (`VerifierRepair` / `MissingVerifierCreate`).
-    /// Consumed by the Phase C `agent.active_job.selected` payload builder
-    /// to derive `target_path_hash` via
+    /// with no path semantic (`VerifierRepair` / `MissingVerifierCreate` /
+    /// `SetupBash`). Consumed by the Phase C `agent.active_job.selected`
+    /// payload builder to derive `target_path_hash` via
     /// `stable_path_hash(mask_secrets(...))`. The raw path MUST NOT be
     /// logged — callers route through the redaction pipeline.
     pub(super) fn target_path(&self) -> Option<&PathBuf> {
         match self {
-            DesiredAction::VerifierRepair { .. } | DesiredAction::MissingVerifierCreate => None,
+            DesiredAction::VerifierRepair { .. }
+            | DesiredAction::MissingVerifierCreate
+            | DesiredAction::SetupBash => None,
             DesiredAction::FocusedEdit { target, .. } => Some(target),
             DesiredAction::ArtifactDirected { target, .. } => Some(target),
         }
@@ -342,6 +368,90 @@ pub(super) fn select_active_job(candidates: &[JobCandidate]) -> ActiveJobSelecti
     ActiveJobSelection { selected, rejected }
 }
 
+/// Issue #664 (AD22 / §3 / DR1-003 SSOT): SetupBootstrap candidate install
+/// decision tree. Caller (`turn.rs::build_arbiter_candidates`) is the
+/// **sole** consumer; source iter() inlining at the caller is forbidden
+/// (DR4-002 SSOT bypass防止).
+///
+/// Evaluation order (short-circuit OR):
+/// 0. `artifact_ledger_overflowed == true` → false (Stage 4 fail-closed /
+///    DR4-001). Ledger overflow means artifact state is ambiguous; we MUST
+///    NOT freshly install Bash permission on top of unknown state.
+/// 1. `has_required_setup_artifact(contract)` → true. Primary (AD13), no
+///    confidence gate — `required_artifacts::Setup` is the strong pure-Install
+///    intent signal.
+/// 2. Confidence gate: if `BehaviorContractProjection` is absent OR
+///    `confidence < LOW_CONFIDENCE_THRESHOLD` → false (DR4-001 fail-closed).
+///    The remaining secondary / fallback signals require deterministic
+///    behavior coverage to keep false-positives bounded.
+/// 3. **Secondary (CB-001 refined / AD18)**: `optional_artifacts::Setup`
+///    is present OR Stage A live (`OwnedTestVerifierPlan::Missing`)
+///    fired. Stage B (label-only) is NOT sufficient here — a derived
+///    `verification_expectations = ["test"]` label from a plain "add tests"
+///    request would otherwise overfire. Stage B may still fire step (4)
+///    via the Setup-label fallback when corroborated by Setup keywords.
+/// 4. `behavior_projection_has_setup_label(p)` → true. Tertiary fallback
+///    (旧 AD9 / AD13 で格下げ, label substring on
+///    `required_capabilities` / `verification_expectations`).
+/// 5. Otherwise → false.
+pub(super) fn should_install_setup_bootstrap(
+    contract: &TaskContract,
+    projection: Option<&BehaviorContractProjection>,
+    verifier_signal: &VerifierPrerequisiteSignal,
+    artifact_ledger_overflowed: bool,
+) -> bool {
+    // (0) Ledger overflow fail-closed.
+    if artifact_ledger_overflowed {
+        return false;
+    }
+
+    // (1) Primary: required artifacts (no confidence gate).
+    if has_required_setup_artifact(contract) {
+        return true;
+    }
+
+    // Confidence gate guards (2)-(4).
+    let Some(p) = projection else {
+        return false;
+    };
+    if !p.confidence.is_finite() || p.confidence < LOW_CONFIDENCE_THRESHOLD {
+        return false;
+    }
+
+    // (2) Secondary (CB-001 refined): `optional_artifacts::Setup` or Stage
+    // A live observation. We intentionally do NOT call
+    // `has_optional_setup_or_verifier_prerequisite` here (which OR-composes
+    // Stage A + Stage B); instead we ask `verifier_signal.stage_a_live()`
+    // for the strong live signal only. Stage B (label-derived) flows into
+    // step (4) where it is corroborated by a Setup label.
+    //
+    // The AD18 accessor `has_optional_setup_or_verifier_prerequisite`
+    // remains the SSOT for other consumers (e.g. system prompt rendering)
+    // — `should_install_setup_bootstrap` is the only call site that
+    // refines the signal for false-positive suppression on plain "add
+    // tests" requests.
+    let optional_setup_present = contract
+        .optional_artifacts
+        .iter()
+        .any(|role| matches!(role, ArtifactRole::Setup));
+    if optional_setup_present || verifier_signal.stage_a_live() {
+        return true;
+    }
+
+    // (3) Tertiary fallback: label substring on capabilities /
+    // verification expectations. This is where Stage B (label-only) can
+    // legitimately fire — when the projection ALSO carries a Setup label
+    // the SetupBootstrap install is corroborated by the user's setup
+    // wording (旧 AD9). Pure verifier-capability labels without a Setup
+    // anchor (e.g. derived "test" from `Add tests`) cannot reach step
+    // (4) so the false-positive surface is bounded.
+    if behavior_projection_has_setup_label(p) {
+        return true;
+    }
+
+    false
+}
+
 /// Pure projection: `ActiveJobSelection` → `EffectiveToolPolicy`.
 ///
 /// DR1-001: `JobCandidate.policy` already IS the `EffectiveToolPolicy`
@@ -403,6 +513,11 @@ mod tests {
                     read_scope: AllowedReadScope::TargetOnly,
                 },
             ),
+            // Issue #664: SetupBootstrap synthesises Bash-only policy.
+            ActiveJobKind::SetupBootstrap => (
+                EffectiveToolPolicyReason::SetupBootstrap,
+                DesiredAction::SetupBash,
+            ),
             ActiveJobKind::FocusedEditRecovery => (
                 EffectiveToolPolicyReason::FocusedEditRecovery,
                 DesiredAction::FocusedEdit {
@@ -418,7 +533,10 @@ mod tests {
                 },
             ),
         };
-        let policy = EffectiveToolPolicy::restricted(policy_reason, vec!["Read", "Edit"]);
+        let policy = match kind {
+            ActiveJobKind::SetupBootstrap => EffectiveToolPolicy::setup_bootstrap(),
+            _ => EffectiveToolPolicy::restricted(policy_reason, vec!["Read", "Edit"]),
+        };
         JobCandidate {
             kind,
             desired_action,
@@ -748,5 +866,274 @@ mod tests {
         let kind = c.kind;
         let sel = select_active_job(std::slice::from_ref(&c));
         assert_eq!(sel.selected.as_ref().map(|s| s.kind), Some(kind));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: SetupBootstrap variant + priority_rank tests.
+    // -----------------------------------------------------------------
+
+    /// Acceptance (g): `ActiveJobKind::SetupBootstrap` is present and the
+    /// enum retains `#[non_exhaustive]`. The presence assertion uses the
+    /// `as_str()` SSOT (label is "SetupBootstrap").
+    #[test]
+    fn active_job_kind_includes_setup_bootstrap_non_exhaustive() {
+        assert_eq!(ActiveJobKind::SetupBootstrap.as_str(), "SetupBootstrap");
+    }
+
+    /// `DesiredAction::SetupBash` is a marker variant — no `command` /
+    /// `target` fields.
+    #[test]
+    fn desired_action_setup_bash_is_marker_variant_no_command_field() {
+        let a = DesiredAction::SetupBash;
+        // No payload — clone is value-equal.
+        assert_eq!(a.clone(), DesiredAction::SetupBash);
+    }
+
+    /// `DesiredAction::SetupBash.label()` returns "setup_bash".
+    #[test]
+    fn desired_action_label_returns_setup_bash() {
+        assert_eq!(DesiredAction::SetupBash.label(), "setup_bash");
+    }
+
+    /// `DesiredAction::SetupBash.target_path()` returns `None`.
+    #[test]
+    fn desired_action_target_path_returns_none_for_setup_bash() {
+        assert!(DesiredAction::SetupBash.target_path().is_none());
+    }
+
+    /// 判断 5 (a): the 5 legacy variants' **relative order** is preserved
+    /// after SetupBootstrap is inserted at rank 4. Rank numbers shift
+    /// (FocusedEditRecovery 4→5, LocalLlmSmallEditAfterRead 5→6) but the
+    /// comparison ordering is unchanged.
+    #[test]
+    fn other_active_job_kinds_priority_rank_preserved() {
+        let ordered = [
+            ActiveJobKind::VerifierRepair,
+            ActiveJobKind::ForcedSmallEditRecovery,
+            ActiveJobKind::ArtifactRecovery,
+            ActiveJobKind::FocusedEditRecovery,
+            ActiveJobKind::LocalLlmSmallEditAfterRead,
+        ];
+        for window in ordered.windows(2) {
+            assert!(
+                window[0].priority_rank() < window[1].priority_rank(),
+                "legacy order {:?} -> {:?} broken",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    /// 判断 5 (b): SetupBootstrap sits strictly between ArtifactRecovery
+    /// and FocusedEditRecovery.
+    #[test]
+    fn setup_bootstrap_priority_rank_between_artifact_recovery_and_focused_edit() {
+        let setup = ActiveJobKind::SetupBootstrap.priority_rank();
+        assert!(ActiveJobKind::ArtifactRecovery.priority_rank() < setup);
+        assert!(setup < ActiveJobKind::FocusedEditRecovery.priority_rank());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: EffectiveToolPolicy::setup_bootstrap() builder.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn effective_tool_policy_setup_bootstrap_allows_only_bash() {
+        let policy = EffectiveToolPolicy::setup_bootstrap();
+        assert_eq!(policy.reason(), EffectiveToolPolicyReason::SetupBootstrap);
+        assert_eq!(policy.allowed_tool_names_for_prompt(), Some(&["Bash"][..]));
+        assert!(policy.focused_edit_policy().is_none());
+        assert!(policy.artifact_directed_policy().is_none());
+    }
+
+    #[test]
+    fn effective_tool_policy_reason_setup_bootstrap_as_str_returns_setup_bootstrap() {
+        assert_eq!(
+            EffectiveToolPolicyReason::SetupBootstrap.as_str(),
+            "setup_bootstrap"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: `should_install_setup_bootstrap` decision tree.
+    // -----------------------------------------------------------------
+
+    use super::super::required_behavior::{BoundedLabelWithExcerpt, project_behavior_contract};
+    use super::super::task_contract::TaskContract;
+
+    fn install_contract() -> TaskContract {
+        // Pure install intent — `ArtifactRole::Setup` in `required_artifacts`.
+        TaskContract::from_request("Install the dependencies listed in requirements.txt.")
+    }
+
+    fn build_contract_no_setup() -> TaskContract {
+        TaskContract::from_request("FastAPIでcrudのAPIを開発してください。")
+    }
+
+    fn projection_with_setup_label() -> BehaviorContractProjection {
+        BehaviorContractProjection {
+            confidence: 0.9,
+            fields_used: vec!["required_capabilities"],
+            behavior_goal: None,
+            required_capabilities: vec![BoundedLabelWithExcerpt {
+                label: "install dependencies".to_string(),
+                excerpt: None,
+            }],
+            verification_expectations: vec![],
+            non_goals: vec![],
+        }
+    }
+
+    fn projection_low_confidence() -> BehaviorContractProjection {
+        BehaviorContractProjection {
+            confidence: 0.3,
+            fields_used: vec!["required_capabilities"],
+            behavior_goal: None,
+            required_capabilities: vec![BoundedLabelWithExcerpt {
+                label: "install dependencies".to_string(),
+                excerpt: None,
+            }],
+            verification_expectations: vec![],
+            non_goals: vec![],
+        }
+    }
+
+    fn projection_no_setup_label() -> BehaviorContractProjection {
+        BehaviorContractProjection {
+            confidence: 0.9,
+            fields_used: vec!["required_capabilities"],
+            behavior_goal: None,
+            required_capabilities: vec![BoundedLabelWithExcerpt {
+                label: "draw chart".to_string(),
+                excerpt: None,
+            }],
+            verification_expectations: vec![],
+            non_goals: vec![],
+        }
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_true_when_required_artifact_setup_present() {
+        let contract = install_contract();
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        // Primary path: no projection needed
+        assert!(should_install_setup_bootstrap(
+            &contract, None, &no_signal, false
+        ));
+        // Even with low confidence projection — primary short-circuits
+        let p = projection_low_confidence();
+        assert!(should_install_setup_bootstrap(
+            &contract,
+            Some(&p),
+            &no_signal,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_fails_closed_when_artifact_ledger_overflowed() {
+        let contract = install_contract();
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        // ledger overflow beats primary required_artifact_setup
+        assert!(!should_install_setup_bootstrap(
+            &contract, None, &no_signal, true
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_false_when_behavior_projection_none_and_no_required_setup() {
+        let contract = build_contract_no_setup();
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        // No required Setup + no projection → fail-closed false (DR4-001).
+        assert!(!should_install_setup_bootstrap(
+            &contract, None, &no_signal, false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_false_when_confidence_below_threshold() {
+        let contract = build_contract_no_setup();
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        let p = projection_low_confidence();
+        // confidence < 0.5 → fail-closed even with a matching setup label.
+        assert!(!should_install_setup_bootstrap(
+            &contract,
+            Some(&p),
+            &no_signal,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_true_when_verifier_prerequisite_required_and_confidence_above_threshold()
+     {
+        let contract = build_contract_no_setup();
+        let verifier_signal = VerifierPrerequisiteSignal::from_sources(true, None);
+        let p = projection_no_setup_label();
+        // Verifier prerequisite Stage A active + sufficient confidence → install.
+        assert!(should_install_setup_bootstrap(
+            &contract,
+            Some(&p),
+            &verifier_signal,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_falls_back_to_label_substring_only_with_confidence_gate() {
+        let contract = build_contract_no_setup();
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        // High confidence + setup label fallback → install.
+        let p = projection_with_setup_label();
+        assert!(should_install_setup_bootstrap(
+            &contract,
+            Some(&p),
+            &no_signal,
+            false
+        ));
+        // Same projection but no setup label → false (no fallback signal).
+        let p_no = projection_no_setup_label();
+        assert!(!should_install_setup_bootstrap(
+            &contract,
+            Some(&p_no),
+            &no_signal,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_true_for_optional_setup_and_confidence_above_threshold() {
+        // Force `optional_artifacts::Setup` and a high-confidence projection
+        // without a setup label so optional Setup is the only fallback driver.
+        let mut contract = build_contract_no_setup();
+        contract
+            .optional_artifacts
+            .push(super::super::task_contract::ArtifactRole::Setup);
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        let p = projection_no_setup_label();
+        assert!(should_install_setup_bootstrap(
+            &contract,
+            Some(&p),
+            &no_signal,
+            false
+        ));
+    }
+
+    /// Regression: AD20 — `BehaviorContractProjection == None` (e.g. low
+    /// confidence at extraction time) must still allow `required_artifacts::Setup`
+    /// primary to install SetupBootstrap. `project_behavior_contract` may
+    /// return `None` for a contract whose `required_behavior.confidence` is
+    /// below threshold; SetupBootstrap primary still fires.
+    #[test]
+    fn setup_bootstrap_install_succeeds_when_behavior_projection_none() {
+        let contract = install_contract();
+        let proj = project_behavior_contract(&contract);
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+        assert!(should_install_setup_bootstrap(
+            &contract,
+            proj.as_ref(),
+            &no_signal,
+            false
+        ));
     }
 }

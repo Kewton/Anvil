@@ -138,6 +138,12 @@ mod job_report;
 // this module.
 #[cfg(test)]
 mod job_report_e2e_tests;
+// Issue #664: in-crate `#[cfg(test)]` E2E suite for Bash/Setup policy
+// wiring (CB-001 fix pattern, `safe_stop_e2e_tests.rs` /
+// `job_report_e2e_tests.rs` / `behavior_contract_projection_e2e_tests.rs`
+// precedent). Production binary does not include this module (DR3-001).
+#[cfg(test)]
+mod bash_policy_e2e_tests;
 
 /// Test seam (#[cfg(test)] only): drive
 /// `Agent::maybe_emit_job_reports_with_linkage` from
@@ -624,6 +630,269 @@ pub(crate) fn seed_artifact_ledger_repo_edit_for_test(agent: &mut Agent, path: S
     agent.seed_artifact_ledger_repo_edit(&path, role, &scope);
 }
 
+// Issue #664 — in-crate `#[cfg(test)]` test seams for the Bash/Setup
+// policy E2E suite. The seams follow the precedent established by
+// #654 (`emit_safe_stop_report_*_for_test`) / #659
+// (`seed_artifact_ledger_repo_edit_for_test`) / #666
+// (`maybe_emit_job_reports_for_test`): `#[cfg(test)] pub(crate)`-only,
+// signature accepts primitives + `&{,mut} Agent`, never leaks an
+// internal `pub(super)` type across the boundary (DR3-001 / AD19 /
+// S7-003 / DR2-005). Production code MUST NOT reach into these.
+
+/// Issue #664 test seam: install a freshly built `ArtifactCompletionJob`
+/// for the requested role on the agent so the structured report
+/// projection pipeline (Phase 4 `attempt_outcome_to_json_value` +
+/// `job_report.rs::maybe_emit_job_reports`) can be exercised without
+/// driving the full recovery target plumbing. Accepts a role label
+/// string + workspace-relative path (primitives only — `ArtifactRole`
+/// stays `pub(super)`).
+///
+/// The seam:
+/// 1. Maps the role string to `ArtifactRole` via the same vocabulary
+///    used by `emit_safe_stop_report_artifact_completion_failed_for_test`.
+/// 2. Materialises the path as a real file under `agent.work_root` so
+///    `ArtifactCompletionJob::new` succeeds (it canonicalises the path
+///    via `classify_ownership`).
+/// 3. Installs the resulting job at `agent.artifact_completion_job`.
+#[cfg(test)]
+pub(crate) fn seed_artifact_completion_job_pending_for_test(
+    agent: &mut Agent,
+    role_label: &str,
+    relative_path: &str,
+) {
+    use std::fs;
+    let role = match role_label {
+        "test" => task_contract::ArtifactRole::Test,
+        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
+        "setup" => task_contract::ArtifactRole::Setup,
+        _ => task_contract::ArtifactRole::Implementation,
+    };
+
+    // Materialise the file under work_root so `ArtifactCompletionJob::new`
+    // accepts the target. Parent directories are created best-effort.
+    let target_full = agent.work_root.join(relative_path);
+    if let Some(parent) = target_full.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&target_full, "// seeded for bash_policy_e2e_tests\n");
+
+    let hint = task_contract::RecoveryTargetHint {
+        role,
+        path: relative_path.to_string(),
+        reason: "664 e2e seed".to_string(),
+    };
+
+    let scope = agent.current_workspace_scope();
+    let work_root = agent.work_root.clone();
+    if let Ok(job) = artifact_completion_job::ArtifactCompletionJob::new(
+        &work_root, &scope, hint, true,  // edited_this_session
+        false, // scaffold_changed
+    ) {
+        agent.artifact_completion_job = Some(job);
+    }
+}
+
+/// Issue #664 iteration-2 (CB-001) test seam: drive the per-turn Stage A
+/// observation flag (`owned_test_verifier_missing_observed_this_turn`)
+/// so `bash_policy_e2e_tests.rs` can exercise both halves of the
+/// SetupBootstrap decision tree without spinning up a real verifier
+/// run. Production code sets the flag in
+/// `run_task_contract_verifier_once`'s `OwnedTestVerifierPlan::Missing`
+/// arm; this seam mirrors that producer for unit-level E2E.
+///
+/// The seam takes a `bool` so it can also un-set the flag — useful for
+/// pinning the Stage-A-false branch (false-positive suppression
+/// regression) from the same fixture.
+#[cfg(test)]
+pub(crate) fn seed_owned_test_verifier_missing_for_test(agent: &mut Agent, observed: bool) {
+    agent.owned_test_verifier_missing_observed_this_turn = observed;
+}
+
+/// Issue #664 iteration-3 (CB2-001) test seam: drive the cross-turn
+/// carryover for the Stage A observation. Mirrors the production
+/// setter inside `run_task_contract_verifier_once`'s
+/// `OwnedTestVerifierPlan::Missing` arm without requiring a live
+/// verifier run + SafeStop cycle.
+///
+/// Issue #664 iteration-4 (CB3-001): the seam takes an
+/// `Option<&str>` so tests can bind the carryover to a specific
+/// originating request text (`Some`) or clear it (`None`). The raw
+/// text is immediately piped through `mask_secrets` +
+/// `stable_path_hash` inside `RequestCarryoverKey::from_request`, so
+/// the seam never persists the raw string on the Agent.
+#[cfg(test)]
+pub(crate) fn seed_owned_test_verifier_missing_carryover_for_test(
+    agent: &mut Agent,
+    originating_request_text: Option<&str>,
+) {
+    agent.owned_test_verifier_missing_observed_carryover =
+        originating_request_text.map(task_contract::RequestCarryoverKey::from_request);
+}
+
+/// Issue #664 iteration-3 (CB2-001) test seam: simulate the next-turn
+/// entry into `run_actor_loop` so unit tests can drive the carryover
+/// → `_this_turn` promotion without spinning up the full actor loop.
+///
+/// Issue #664 iteration-4 (CB3-001): the seam now takes
+/// `current_request_text: Option<&str>` to mirror the
+/// request-bound consume semantics implemented in
+/// `run_actor_loop`'s head. The carryover promotes into
+/// `_this_turn` iff the current-turn key equals the stored key;
+/// otherwise the carryover is cleared without promotion (topic
+/// switch / unrelated request).
+#[cfg(test)]
+pub(crate) fn consume_carryover_at_actor_loop_head_for_test(
+    agent: &mut Agent,
+    current_request_text: Option<&str>,
+) {
+    let promoted = match (
+        agent.owned_test_verifier_missing_observed_carryover.take(),
+        current_request_text,
+    ) {
+        (Some(stored), Some(current)) => {
+            let current_key = task_contract::RequestCarryoverKey::from_request(current);
+            stored == current_key
+        }
+        // No stored carryover OR no current request text → no promotion.
+        _ => false,
+    };
+    agent.owned_test_verifier_missing_observed_this_turn = promoted;
+}
+
+/// Issue #664 iteration-3 (CB2-001) test seam: read both Stage A
+/// flags as a primitive `(observed_this_turn, carryover_present)`
+/// tuple. Used by `bash_policy_e2e_tests` to assert the consume-once
+/// invariant.
+///
+/// Issue #664 iteration-4 (CB3-001): the second tuple slot is now
+/// `carryover.is_some()` rather than a raw bool field — the seam
+/// never returns the underlying `RequestCarryoverKey` so the hash
+/// digest stays inside the `pub(super)` boundary (DR3-001 /
+/// forgeability-safe).
+#[cfg(test)]
+pub(crate) fn owned_test_verifier_missing_flags_for_test(agent: &Agent) -> (bool, bool) {
+    (
+        agent.owned_test_verifier_missing_observed_this_turn,
+        agent
+            .owned_test_verifier_missing_observed_carryover
+            .is_some(),
+    )
+}
+
+/// Issue #664 iteration-4 (CB3-001) test seam: assert that the raw
+/// request text is never directly stored in the carryover field.
+/// Returns `true` iff a carryover is present AND its 16-hex
+/// `originating_request_hash` is NOT equal to the raw `needle`
+/// text — proving the carryover key passed through
+/// `mask_secrets` + `stable_path_hash` (the hash digest differs
+/// from any raw input).
+///
+/// Returns `false` (= "raw text NOT detected"; the safe outcome) if
+/// the carryover is absent.
+#[cfg(test)]
+pub(crate) fn carryover_key_raw_text_not_stored_for_test(agent: &Agent, needle: &str) -> bool {
+    match &agent.owned_test_verifier_missing_observed_carryover {
+        Some(key) => {
+            let hash = key.originating_request_hash_for_test();
+            !hash.contains(needle) && hash != needle
+        }
+        None => true,
+    }
+}
+
+/// Issue #664 test seam: project the production `build_arbiter_candidates`
+/// output into a primitive 4-field DTO array (`kind` /
+/// `desired_action_label` / `allowed_tool_names` / `budget_kind`).
+///
+/// The seam never returns the internal `pub(super)` types
+/// (`JobCandidate` / `EffectiveToolPolicy` / `Budget` etc.) so DR3-001 /
+/// AD19 / DR2-005 are upheld at the type level (the return type itself
+/// is the contract — see `test_seam_return_type_is_primitive_only`).
+///
+/// Each element shape:
+/// ```jsonc
+/// {
+///   "kind": "VerifierRepair" | "ForcedSmallEditRecovery" | ... | "SetupBootstrap",
+///   "desired_action_label": "verifier_repair" | ... | "setup_bash",
+///   "allowed_tool_names": ["Bash"]   // None policy → empty array
+///   "budget_kind": "unbounded" | "bounded"
+/// }
+/// ```
+#[cfg(test)]
+pub(crate) fn build_arbiter_candidates_for_test(agent: &Agent) -> Vec<serde_json::Value> {
+    let candidates = agent.build_arbiter_candidates_pub_for_test();
+    candidates
+        .into_iter()
+        .map(|c| {
+            let allowed_tool_names: Vec<String> = c
+                .policy
+                .allowed_tool_names_for_prompt()
+                .map(|tools| tools.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default();
+            let budget_kind = match c.budget {
+                active_job_arbiter::Budget::Unbounded => "unbounded",
+                active_job_arbiter::Budget::Bounded { .. } => "bounded",
+            };
+            serde_json::json!({
+                "kind": c.kind.as_str(),
+                "desired_action_label": c.desired_action.label(),
+                "allowed_tool_names": allowed_tool_names,
+                "budget_kind": budget_kind,
+            })
+        })
+        .collect()
+}
+
+/// Issue #664 test seam: project the production `effective_tool_policy()`
+/// into a primitive `(Vec<String>, String)` tuple
+/// (`(allowed_tool_names, reason_label)`).
+///
+/// As with `build_arbiter_candidates_for_test`, the return type carries
+/// only primitives so the internal `EffectiveToolPolicy` /
+/// `EffectiveToolPolicyReason` types stay private to the `loop_run`
+/// module (DR3-001 / DR2-005).
+#[cfg(test)]
+pub(crate) fn effective_tool_policy_for_test(agent: &Agent) -> (Vec<String>, String) {
+    let policy = agent.effective_tool_policy_pub_for_test();
+    let allowed_tool_names: Vec<String> = policy
+        .allowed_tool_names_for_prompt()
+        .map(|tools| tools.iter().map(|s| (*s).to_string()).collect())
+        .unwrap_or_default();
+    let reason_label = policy.reason().as_str().to_string();
+    (allowed_tool_names, reason_label)
+}
+
+/// Issue #664 iteration-3 (CB2-003) test seam: drive the
+/// `effective_tool_policy_error_for_call_with_scope` rejection +
+/// `record_artifact_completion_bash_violation` chokepoint under an
+/// `artifact_directed_from_job` policy that was built from the currently-
+/// installed `ArtifactCompletionJob`.
+///
+/// Returns
+/// `Some((error_string, bash_policy_violation_marker, attempts_after))`
+/// — `bash_policy_violation_marker` is the marker observed on the
+/// **latest** attempt (`None` when no attempt was recorded). Returns
+/// `None` when no `ArtifactCompletionJob` is installed (the seam refuses
+/// to fabricate a policy without a real job).
+///
+/// All return values are primitive types (`String` / `bool` / `usize`)
+/// so `EffectiveToolPolicy` / `ArtifactAttemptOutcome` stay private to
+/// the `loop_run` module (DR3-001 / AD19 / DR2-005).
+#[cfg(test)]
+pub(crate) fn drive_artifact_directed_policy_error_for_test(
+    agent: &mut Agent,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Option<(Option<String>, Option<bool>, usize)> {
+    let policy = agent.artifact_directed_policy_for_test()?;
+    let (err, _delta) = agent.drive_policy_error_for_test(&policy, name, &arguments);
+    let marker = agent.last_attempt_bash_policy_violation_for_test();
+    let attempts_after = agent
+        .artifact_completion_job_attempts_len_for_test()
+        .unwrap_or(0);
+    Some((err, marker, attempts_after))
+}
+
 // Issue #576: expose WorkMode second-pass confirmation adapter surface so
 // `tests/work_mode_confirm_smoke.rs` can drive `run_work_mode_confirm_with_strategy`
 // (the closure-DI boundary) without an Ollama dependency. Production paths in
@@ -1090,6 +1359,54 @@ pub struct Agent {
     #[allow(dead_code)]
     // Iteration-3 wires the production producer (external_import detection in run_structured); until then only the per-turn reset semantics are exercised.
     pub(in crate::agent::loop_run) external_import_rejected_emitted_this_turn: bool,
+    /// Issue #664 iteration-2 (CB-001): per-turn observation flag set when
+    /// `run_task_contract_verifier_once` observes
+    /// `OwnedTestVerifierPlan::Missing`. Read by
+    /// `build_arbiter_candidates` as Stage A of the
+    /// `VerifierPrerequisiteSignal` (the live observation path,
+    /// distinguished from Stage B label fallback).
+    ///
+    /// Reset to `false` at the head of every `handle_user_message`
+    /// (alongside `verifier_safe_stop_emitted_this_turn`) so a previous
+    /// turn's verifier-missing observation cannot leak into the current
+    /// turn's SetupBootstrap decision tree (CLAUDE.md per-turn rule).
+    ///
+    /// NOT serialized (per-turn runtime state only).
+    pub(in crate::agent::loop_run) owned_test_verifier_missing_observed_this_turn: bool,
+    /// Issue #664 iteration-3 (CB2-001): cross-turn carryover for the
+    /// Stage A `OwnedTestVerifierPlan::Missing` observation. The
+    /// iteration-2 flag was reset at `run_actor_loop` head, but the
+    /// only production setter is the `Missing` arm in
+    /// `run_task_contract_verifier_once` which immediately returns
+    /// `TaskContractVerifierOutcome::SafeStop` — the same turn never
+    /// reaches a subsequent `build_arbiter_candidates` cycle that
+    /// could consume the signal. Without a carryover, the next user
+    /// message starts a fresh turn that resets the flag before any
+    /// arbiter call can see it (`Stage A live observation set only on
+    /// a terminal SafeStop path` — Codex CB2-001).
+    ///
+    /// The carryover preserves the Stage A observation across exactly
+    /// one turn boundary so the next `handle_user_message` can promote
+    /// it into `owned_test_verifier_missing_observed_this_turn` at the
+    /// head of `run_actor_loop`, before the per-turn reset would
+    /// otherwise drop it. The carryover is consumed exactly once and
+    /// reset on the same turn so it never accumulates across multiple
+    /// safe-stop cycles.
+    ///
+    /// Issue #664 iteration-4 (CB3-001): the carryover is now a
+    /// `RequestCarryoverKey` (16-hex digest of `mask_secrets(originating
+    /// request text)`) instead of a plain `bool`. The actor-loop head
+    /// consumer promotes the carryover into
+    /// `owned_test_verifier_missing_observed_this_turn` only when the
+    /// **current** turn's request still hashes to the same key. A topic
+    /// switch (different request text) clears the carryover and does
+    /// NOT promote, closing the false-positive grant of the
+    /// `setup_bootstrap` Bash-only policy to unrelated requests.
+    ///
+    /// NOT serialized (cross-turn runtime state only; #659 / #663 ledger
+    /// is the authority for any persisted ownership / completion data).
+    pub(in crate::agent::loop_run) owned_test_verifier_missing_observed_carryover:
+        Option<task_contract::RequestCarryoverKey>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1336,6 +1653,10 @@ impl Agent {
             // Reset at handle_user_message head; producers land in iteration-3.
             last_verifier_invoked_payload_digest: None,
             external_import_rejected_emitted_this_turn: false,
+            // Issue #664 iteration-2 (CB-001): per-turn Stage A observation.
+            owned_test_verifier_missing_observed_this_turn: false,
+            // Issue #664 iteration-4 (CB3-001): request-bound carryover.
+            owned_test_verifier_missing_observed_carryover: None,
         }
     }
 

@@ -389,6 +389,18 @@ pub fn broad_restart_discovery_error(tool_name: &str) -> String {
     )
 }
 
+/// Issue #664 (DR1-001 案 B / AD12): legacy recovery-side dependency
+/// install detector. **DO NOT** use this for the SetupBootstrap policy
+/// projection. The `cargo install` / `cargo add` / `bundle add` /
+/// `composer require` entries here are intentionally NOT classified as
+/// `BashCommandClass::EnvSetup` (they belong to Network / Mutating), so
+/// substituting `bash::is_setup_command` here would change semantics for
+/// the recovery-side callers (`turn.rs` L6618 / L13838 / L19587). The
+/// SSOT for SetupBootstrap policy projection is
+/// `crate::tools::bash::is_setup_command`.
+#[deprecated(
+    note = "Use bash.rs::is_setup_command for SetupBootstrap policy projection; this helper retains legacy semantics including `cargo install` for recovery-side callers only"
+)]
 pub fn is_dependency_install_command(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
     normalized.contains("npm install")
@@ -405,6 +417,13 @@ pub fn is_dependency_install_command(command: &str) -> bool {
         || normalized.contains("composer require")
 }
 
+/// Issue #664 (DR1-001 案 B / AD12): legacy recovery-side scaffold detector.
+/// **DO NOT** use for SetupBootstrap policy projection — scaffold commands
+/// are out of scope for the SetupBootstrap allow-set (they fall under
+/// `BashCommandClass::Network` / `Mutating`, not `EnvSetup`).
+#[deprecated(
+    note = "Use bash.rs::is_setup_command for SetupBootstrap policy projection; this helper retains legacy semantics for recovery-side callers only"
+)]
 pub fn is_scaffold_command(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
     normalized.contains("create-next-app")
@@ -425,6 +444,14 @@ pub fn is_workspace_reset_command(command: &str) -> bool {
         || normalized.contains("rm -rf package-lock.json")
 }
 
+/// Issue #664 (DR1-001 案 B / AD12): legacy recovery-side Bash gating used
+/// by `turn.rs` recovery branches. **NOT** used for the SetupBootstrap
+/// policy projection. SetupBootstrap policy projection uses
+/// `crate::tools::bash::is_setup_command` + the registry preflight
+/// (`bash::check_blocked_command`, `enforce_mode`, approval, offline) only.
+#[deprecated(
+    note = "Use bash.rs::is_setup_command (and the registry preflight) for SetupBootstrap policy projection; this helper retains legacy semantics for recovery-side callers only"
+)]
 pub fn should_block_bash_command(
     command: &str,
     recent_bash_commands: &[String],
@@ -440,6 +467,7 @@ pub fn should_block_bash_command(
     {
         return true;
     }
+    #[allow(deprecated)]
     if is_scaffold_command(&normalized)
         && recent_bash_commands
             .iter()
@@ -447,7 +475,9 @@ pub fn should_block_bash_command(
     {
         return true;
     }
-    is_dependency_install_command(&normalized) && install_commands_seen >= 2
+    #[allow(deprecated)]
+    let install_block = is_dependency_install_command(&normalized) && install_commands_seen >= 2;
+    install_block
 }
 
 pub fn tool_call_counts_as_repo_edit(name: &str) -> bool {
@@ -459,6 +489,10 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // Issue #664: legacy helpers (`is_scaffold_command` /
+// `is_dependency_install_command` / `should_block_bash_command`) are
+// `#[deprecated]` for SetupBootstrap policy projection but retain legacy
+// semantics for recovery-side regression coverage.
 mod tests {
     use super::{
         artifact_directed_recovery_note, empty_workspace_scaffold_note,

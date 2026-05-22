@@ -343,6 +343,65 @@ pub(super) fn project_behavior_contract(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Issue #664 (AD13 / AD18 / AD22 / Stage B fallback helpers).
+//
+// Label-substring helpers closed over the `BehaviorContractProjection`
+// surface so the substring evaluation lives in this module rather than
+// leaking into `active_job_arbiter.rs` / `task_contract.rs`. Both helpers
+// are `pub(super)` and consumed solely from
+// `active_job_arbiter::should_install_setup_bootstrap` (Setup label fallback)
+// and `task_contract::VerifierPrerequisiteSignal::from_sources` (verifier
+// capability Stage B fallback).
+// ---------------------------------------------------------------------------
+
+/// Set of substring needles classified as a `Setup` capability / expectation
+/// label (旧 AD9 補助 fallback / AD13 で格下げ). Lowercased ASCII-only;
+/// callers must lowercase before matching. The deterministic order is
+/// pinned via the slice literal so future additions are review-visible.
+const SETUP_LABEL_NEEDLES: &[&str] = &[
+    "install",
+    "setup",
+    "bootstrap",
+    "configure",
+    "dependency",
+    "environment",
+];
+
+/// Set of substring needles classified as a `Verifier prerequisite`
+/// capability label (Stage B / 候補 b for AD18 verifier prerequisite signal).
+const VERIFIER_CAPABILITY_NEEDLES: &[&str] = &["test", "verify"];
+
+/// `true` iff the projection carries any `required_capabilities` /
+/// `verification_expectations` label whose lower-cased form contains
+/// one of [`SETUP_LABEL_NEEDLES`]. Used by `should_install_setup_bootstrap`
+/// as the last-resort fallback when neither `required_artifacts::Setup`
+/// nor `optional_artifacts::Setup` / verifier prerequisite signal fired.
+pub(super) fn behavior_projection_has_setup_label(p: &BehaviorContractProjection) -> bool {
+    label_set_hits_needle(&p.required_capabilities, SETUP_LABEL_NEEDLES)
+        || label_set_hits_needle(&p.verification_expectations, SETUP_LABEL_NEEDLES)
+}
+
+/// `true` iff the projection carries any `required_capabilities` /
+/// `verification_expectations` label whose lower-cased form contains
+/// one of [`VERIFIER_CAPABILITY_NEEDLES`]. Used as Stage B of the
+/// verifier prerequisite signal (AD18 / candidate (b)) — the `task_contract.rs`
+/// `VerifierPrerequisiteSignal::from_sources` constructor folds this in
+/// when caller has no live `OwnedTestVerifierPlan::Missing` observation.
+pub(super) fn behavior_projection_has_verifier_capability(p: &BehaviorContractProjection) -> bool {
+    label_set_hits_needle(&p.required_capabilities, VERIFIER_CAPABILITY_NEEDLES)
+        || label_set_hits_needle(&p.verification_expectations, VERIFIER_CAPABILITY_NEEDLES)
+}
+
+/// Pure helper: returns true iff any `BoundedLabelWithExcerpt::label` in
+/// `entries`, lower-cased, contains any string in `needles`.
+fn label_set_hits_needle(entries: &[BoundedLabelWithExcerpt], needles: &[&str]) -> bool {
+    entries.iter().any(|entry| {
+        let lower = entry.label.to_ascii_lowercase();
+        needles.iter().any(|needle| lower.contains(needle))
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Operation {
     Create,
@@ -2760,5 +2819,85 @@ mod tests {
         c.verification = Some(vec![VerificationKind::Build, VerificationKind::Run]);
         c.test_execution_required = true;
         assert!(c.requires_test_execution());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: Stage B substring helpers for SetupBootstrap signal.
+    // -----------------------------------------------------------------
+
+    fn projection_with_capabilities(labels: &[&str]) -> BehaviorContractProjection {
+        let caps: Vec<BoundedLabelWithExcerpt> = labels
+            .iter()
+            .map(|s| BoundedLabelWithExcerpt {
+                label: (*s).to_string(),
+                excerpt: None,
+            })
+            .collect();
+        BehaviorContractProjection {
+            confidence: 0.8,
+            fields_used: vec!["required_capabilities"],
+            behavior_goal: None,
+            required_capabilities: caps,
+            verification_expectations: vec![],
+            non_goals: vec![],
+        }
+    }
+
+    fn projection_with_verification_expectations(labels: &[&str]) -> BehaviorContractProjection {
+        let verifs: Vec<BoundedLabelWithExcerpt> = labels
+            .iter()
+            .map(|s| BoundedLabelWithExcerpt {
+                label: (*s).to_string(),
+                excerpt: None,
+            })
+            .collect();
+        BehaviorContractProjection {
+            confidence: 0.8,
+            fields_used: vec!["verification_expectations"],
+            behavior_goal: None,
+            required_capabilities: vec![],
+            verification_expectations: verifs,
+            non_goals: vec![],
+        }
+    }
+
+    #[test]
+    fn behavior_projection_has_setup_label_detects_install_setup_dependency() {
+        // Each needle must be detected from required_capabilities.
+        for needle in [
+            "install dependencies",
+            "setup environment",
+            "bootstrap project",
+            "configure database",
+            "manage dependency tree",
+            "prepare environment",
+        ] {
+            let p = projection_with_capabilities(&[needle]);
+            assert!(
+                behavior_projection_has_setup_label(&p),
+                "{needle:?} should match setup label"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_projection_has_setup_label_is_false_for_no_match() {
+        let p = projection_with_capabilities(&["draw chart", "render gui"]);
+        assert!(!behavior_projection_has_setup_label(&p));
+    }
+
+    #[test]
+    fn behavior_projection_has_verifier_capability_detects_test_verify() {
+        let p = projection_with_capabilities(&["run test suite"]);
+        assert!(behavior_projection_has_verifier_capability(&p));
+
+        let p2 = projection_with_verification_expectations(&["verify outputs"]);
+        assert!(behavior_projection_has_verifier_capability(&p2));
+    }
+
+    #[test]
+    fn behavior_projection_has_verifier_capability_is_false_for_no_match() {
+        let p = projection_with_capabilities(&["draw chart", "save file"]);
+        assert!(!behavior_projection_has_verifier_capability(&p));
     }
 }

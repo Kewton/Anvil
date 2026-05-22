@@ -345,10 +345,25 @@ impl super::Agent {
                     "projection_overflowed": self.artifact_ledger.overflowed(),
                 })
             });
+            // Issue #664 (AD10 / Task 4.2): emit the real `attempt_outcomes`
+            // projection. Each attempt is projected via
+            // `attempt_outcome_to_json_value` (SSOT for the JSON shape
+            // including `kind` / `category` / `actual_actions` with
+            // `stable_path_hash` 16-hex correlator — AD5 / CB-004).
+            let attempt_outcomes: Vec<serde_json::Value> = self
+                .artifact_completion_job
+                .as_ref()
+                .map(|job| {
+                    job.attempts()
+                        .iter()
+                        .map(super::artifact_completion_job::attempt_outcome_to_json_value)
+                        .collect()
+                })
+                .unwrap_or_default();
             let acr = ArtifactCompletionReport {
                 turn_index,
                 job_present: self.artifact_completion_job.is_some(),
-                attempt_outcomes: Vec::new(),
+                attempt_outcomes,
                 role_policy_violation: None,
                 budget_state,
                 artifact_projection_status: default_projection_status(),
