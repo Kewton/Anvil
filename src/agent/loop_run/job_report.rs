@@ -225,19 +225,17 @@ const TRUNCATE_MARKER: &str = "...<truncated>";
 
 fn truncate_strings_in_place(v: &mut serde_json::Value, truncated: &mut bool) {
     match v {
-        serde_json::Value::String(s) => {
-            if s.len() > MAX_FIELD_BYTES {
-                // Reserve room for the marker INSIDE the cap so the final
-                // string is ≤ MAX_FIELD_BYTES (design Section 4-3 / 11-1).
-                let payload_cap = MAX_FIELD_BYTES.saturating_sub(TRUNCATE_MARKER.len());
-                let mut end = payload_cap;
-                while !s.is_char_boundary(end) && end > 0 {
-                    end -= 1;
-                }
-                s.truncate(end);
-                s.push_str(TRUNCATE_MARKER);
-                *truncated = true;
+        serde_json::Value::String(s) if s.len() > MAX_FIELD_BYTES => {
+            // Reserve room for the marker INSIDE the cap so the final
+            // string is ≤ MAX_FIELD_BYTES (design Section 4-3 / 11-1).
+            let payload_cap = MAX_FIELD_BYTES.saturating_sub(TRUNCATE_MARKER.len());
+            let mut end = payload_cap;
+            while !s.is_char_boundary(end) && end > 0 {
+                end -= 1;
             }
+            s.truncate(end);
+            s.push_str(TRUNCATE_MARKER);
+            *truncated = true;
         }
         serde_json::Value::Array(arr) => {
             for item in arr.iter_mut() {
