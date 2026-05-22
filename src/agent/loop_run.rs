@@ -158,6 +158,14 @@ pub(crate) fn maybe_emit_job_reports_for_test(agent: &mut Agent) {
     }
     agent.maybe_emit_job_reports_with_linkage(Some("test_synthetic".to_string()));
 }
+
+// Issue #665 (Phase 8 / S7-001 / CB-001): in-crate E2E test module for
+// `BehaviorContractProjection` consumer wiring + `agent.behavior_contract.projected`
+// observability event. `#[cfg(test)]` ensures production binary does NOT
+// include the module. Rust does not auto-discover sibling test files, so
+// this explicit `mod` declaration is REQUIRED.
+#[cfg(test)]
+mod behavior_contract_projection_e2e_tests;
 mod summary;
 mod task_contract;
 // Issue #646: task workspace scope detection. Module is intentionally
@@ -864,6 +872,23 @@ pub struct Agent {
     /// same pattern as `safe_stop_report_emitted` and `artifact_ledger`).
     pub(in crate::agent::loop_run) last_active_job_selection:
         Option<active_job_arbiter::ActiveJobSelection>,
+    /// Issue #665 (Phase 6 / S5-006 / S7-002): per-turn diff-based dedup state
+    /// for the `agent.behavior_contract.projected` structured log event. Holds
+    /// the **payload-shaped key** (NOT the raw `BehaviorContractProjection`)
+    /// most recently emitted. The emit helper re-emits only when the new key
+    /// differs from this one. Reset at the head of every `handle_user_message`
+    /// adjacent to `last_active_job_selection.take()`.
+    ///
+    /// **Why payload-shaped, not raw projection (S5-006)**: dedup state must
+    /// not retain attacker-controlled `label` / `excerpt` content across turns.
+    /// `BehaviorProjectionEventKey` contains only the `schema_version` /
+    /// `consumer` / `confidence_bucket` / `fields_used` metadata, which is
+    /// what the emitted event payload actually keys on.
+    ///
+    /// NOT serialized — in-memory only, same pattern as
+    /// `last_active_job_selection`.
+    pub(in crate::agent::loop_run) last_behavior_contract_projection_event:
+        Option<required_behavior::BehaviorProjectionEventKey>,
     /// Issue #659 (Phase 2): per-turn SSOT for artifact observations
     /// (Existing / Scaffold / RepoEdit) + verifier observations bound by
     /// path. Adapter-period contract: `turn_edited_relative_paths` remains
@@ -1120,6 +1145,7 @@ impl Agent {
             turn_edited_relative_paths: std::collections::HashSet::new(),
             safe_stop_report_emitted: std::collections::HashSet::new(),
             last_active_job_selection: None,
+            last_behavior_contract_projection_event: None,
             artifact_ledger: artifact_ledger::ArtifactLedger::new(),
             job_report_dedup_keys: std::collections::HashSet::new(),
         }

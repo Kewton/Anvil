@@ -78,6 +78,18 @@ fn read_log_events_by_event_name(event_name: &str) -> Vec<Value> {
         .collect()
 }
 
+fn read_log_events_by_event_name_and_session(event_name: &str, session_id: &str) -> Vec<Value> {
+    read_log_events_by_event_name(event_name)
+        .into_iter()
+        .filter(|rec| {
+            rec.get("payload")
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                == Some(session_id)
+        })
+        .collect()
+}
+
 fn unique_session_id(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -180,6 +192,7 @@ fn handle_user_message_clears_ledger_at_turn_start() {
 fn turn_summary_emitted_once_at_turn_end() {
     let session_id = unique_session_id("summary-once");
     let (mut agent, dir) = build_agent(&session_id);
+    agent.clear_per_turn_ledger_state();
     let work_root = dir.path();
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_b.py"), "").unwrap();
@@ -192,9 +205,17 @@ fn turn_summary_emitted_once_at_turn_end() {
         true,
     );
 
-    let before_count = read_log_events_by_event_name("agent.artifact_ledger.turn_summary").len();
+    let before_count = read_log_events_by_event_name_and_session(
+        "agent.artifact_ledger.turn_summary",
+        &session_id,
+    )
+    .len();
     agent.record_turn_end_artifact_ledger_summary();
-    let after_count = read_log_events_by_event_name("agent.artifact_ledger.turn_summary").len();
+    let after_count = read_log_events_by_event_name_and_session(
+        "agent.artifact_ledger.turn_summary",
+        &session_id,
+    )
+    .len();
     assert_eq!(
         after_count,
         before_count + 1,
@@ -601,9 +622,16 @@ fn turn_summary_payload_includes_turn_index_pr001() {
     agent.clear_per_turn_ledger_state();
     agent.seed_artifact_ledger_repo_edit(path, ArtifactRole::Test, &scope);
 
-    let before = read_log_events_by_event_name("agent.artifact_ledger.turn_summary").len();
+    let before = read_log_events_by_event_name_and_session(
+        "agent.artifact_ledger.turn_summary",
+        &session_id,
+    )
+    .len();
     agent.record_turn_end_artifact_ledger_summary();
-    let events = read_log_events_by_event_name("agent.artifact_ledger.turn_summary");
+    let events = read_log_events_by_event_name_and_session(
+        "agent.artifact_ledger.turn_summary",
+        &session_id,
+    );
     assert_eq!(
         events.len(),
         before + 1,

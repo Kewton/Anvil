@@ -889,6 +889,11 @@ mod tests {
             verification: None,
             confidence: 0.0,
             test_execution_required: false,
+            // Issue #665: explicit None per DR2-006 (literal site policy).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
         }
     }
 
