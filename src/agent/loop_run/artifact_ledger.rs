@@ -165,7 +165,8 @@ impl<'a> LedgerAdmissionContext<'a> {
 /// `session_id` defaults to an empty string and `turn_index` to `0` for
 /// tests and code paths that construct an `ArtifactLedger` directly without
 /// going through `turn.rs` (the production seed of the context happens in
-/// `clear_per_turn_ledger_state`).
+/// `clear_per_turn_ledger_state_for_turn`, the PR-002 helper that takes the
+/// upcoming turn index as an explicit argument).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ArtifactLedgerLogContext {
     pub(super) session_id: String,
@@ -267,11 +268,15 @@ impl ArtifactLedger {
         self.next_seq = 0;
     }
 
-    /// Issue #659 PR-001: stamp the observability log context for the
-    /// current turn. `turn.rs::clear_per_turn_ledger_state` calls this with
-    /// `(session_store.session_id(), current_turn_index)` so subsequent
-    /// `event_recorded` / `turn_summary` emits carry the turn-level join
-    /// keys defined in Section 7.1 of the design policy.
+    /// Issue #659 PR-001 / PR-002: stamp the observability log context for
+    /// the current turn. `turn.rs::clear_per_turn_ledger_state_for_turn`
+    /// calls this with `(session_store.session_id(), upcoming_turn_index)`
+    /// so subsequent `event_recorded` / `turn_summary` emits carry the
+    /// turn-level join keys defined in Section 7.1 of the design policy.
+    /// The upcoming index is passed explicitly (rather than read from
+    /// `current_turn_index`) so production sequencing — the increment
+    /// happens before the reset in `handle_user_message` — is decoupled
+    /// from stamp timing.
     pub(super) fn set_log_context(&mut self, ctx: ArtifactLedgerLogContext) {
         self.log_context = ctx;
     }
@@ -1773,8 +1778,8 @@ mod tests {
 
     #[test]
     fn clear_preserves_log_context_so_seed_call_order_is_independent() {
-        // `turn.rs::clear_per_turn_ledger_state` calls `clear()` once per
-        // turn and `set_log_context()` separately. The order is
+        // `turn.rs::clear_per_turn_ledger_state_for_turn` calls `clear()`
+        // once per turn and `set_log_context()` separately. The order is
         // documented in `clear()`'s doc comment — verify clear() does NOT
         // wipe the context so callers can stamp it before or after the
         // reset without changing the per-event payload.

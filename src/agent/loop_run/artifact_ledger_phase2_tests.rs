@@ -705,3 +705,111 @@ fn divergence_detected_payload_includes_bounded_masked_path_hashes_pr001() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #659 PR-002: production sequencing for ledger log-context stamping.
+//
+// `handle_user_message` head clears the per-turn ledger state BEFORE the
+// `current_turn_index.saturating_add(1)` line runs (see turn.rs §"Issue #473").
+// The previous wiring stamped `current_turn_index` as-is at clear time, which
+// produced an off-by-one for the upcoming turn (`event_recorded` /
+// `turn_summary` carried `N-1` while every other observability event sharing
+// the same user input carried `N`).
+//
+// Option B fix: `clear_per_turn_ledger_state_for_turn(upcoming_turn_index)`
+// takes the upcoming turn index explicitly so callers cannot accidentally
+// stamp the stale counter. The production sequencing test below mirrors the
+// real `handle_user_message` order — increment FIRST, then call the helper
+// with `current_turn_index as u32`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handle_user_message_stamps_upcoming_turn_index_on_ledger() {
+    let session_id = unique_session_id("pr002-upcoming-turn-index");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+    let unique = format!(
+        "pr002-evt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let path = format!("tests/test_{unique}.py");
+    std::fs::write(work_root.join(&path), "").unwrap();
+    let scope = single_root_scope();
+
+    // Production sequencing: at the head of `handle_user_message`, the
+    // previous turn's `current_turn_index` is still in place when the per-
+    // turn resets fire. Drive the agent into that exact state so the
+    // off-by-one regression would surface as a stamped `turn_index` of 6
+    // instead of the expected upcoming 7.
+    let previous_turn_index: usize = 6;
+    let upcoming_turn_index: usize = previous_turn_index + 1;
+    agent.current_turn_index = previous_turn_index;
+
+    // Mirror the production order exactly: increment THEN stamp.
+    agent.current_turn_index = agent.current_turn_index.saturating_add(1);
+    let upcoming_u32 = u32::try_from(agent.current_turn_index).unwrap_or(u32::MAX);
+    agent.clear_per_turn_ledger_state_for_turn(upcoming_u32);
+
+    agent.seed_artifact_ledger_repo_edit(&path, ArtifactRole::Test, &scope);
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let masked = crate::session::feedback::mask_secrets(&path);
+    let mut hasher = DefaultHasher::new();
+    masked.hash(&mut hasher);
+    let expected_path_hash = format!("{:016x}", hasher.finish());
+
+    // `event_recorded` must carry the upcoming (post-increment) turn_index,
+    // not the stale pre-increment one. Filter by `path_hash` so the test
+    // stays stable under parallel `cargo test` (multiple tests share the
+    // OnceLock-bound log path).
+    let events = read_log_events_by_event_name("agent.artifact_ledger.event_recorded");
+    let our = events
+        .iter()
+        .find(|ev| {
+            ev.get("payload")
+                .and_then(|p| p.get("path_hash"))
+                .and_then(|v| v.as_str())
+                == Some(expected_path_hash.as_str())
+        })
+        .expect("event_recorded for the seeded path must exist");
+    let payload = our.get("payload").expect("payload");
+    let event_turn_index = payload
+        .get("turn_index")
+        .and_then(|v| v.as_u64())
+        .expect("event_recorded payload must carry turn_index");
+    assert_eq!(
+        event_turn_index, upcoming_turn_index as u64,
+        "PR-002: event_recorded turn_index must equal the upcoming (post-increment) \
+         turn_index, matching `agent.work_mode.classified` and other observability \
+         events emitted during the same user turn"
+    );
+    assert_ne!(
+        event_turn_index, previous_turn_index as u64,
+        "PR-002 regression guard: stamping must NOT capture the stale pre-increment \
+         counter"
+    );
+    // session_id pin via the same uniquely identifying event row.
+    let event_session_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("event_recorded payload must carry session_id");
+    assert_eq!(
+        event_session_id,
+        session_id.as_str(),
+        "PR-002: stamped session_id must mirror the agent's SessionStore id"
+    );
+
+    // Note: this test intentionally does NOT call
+    // `record_turn_end_artifact_ledger_summary()` — `turn_summary` events
+    // are not keyed by `path_hash`, so emitting one here would race with the
+    // sibling PR-001 turn_summary assertion under parallel cargo test (both
+    // tests scan the shared OnceLock-bound log file). The `event_recorded`
+    // assertion above already pins the per-turn stamp on a uniquely keyed
+    // event row; PR-001's `turn_summary_payload_includes_turn_index_pr001`
+    // independently covers the turn_summary stamping path.
+}
