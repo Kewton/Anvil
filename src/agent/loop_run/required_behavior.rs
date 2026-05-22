@@ -188,6 +188,95 @@ pub(super) struct BehaviorContractProjection {
     pub(super) non_goals: Vec<BoundedLabelWithExcerpt>,
 }
 
+/// Issue #665 — Phase 6 / S5-006 / S7-002: payload-shaped dedup key for the
+/// `agent.behavior_contract.projected` observability event.
+///
+/// The key contains **only metadata** that the emitted log event payload
+/// actually keys on:
+/// - `schema_version`: matches the envelope `schema_version: 1`.
+/// - `consumer`: which prompt site consumed the projection.
+/// - `confidence_bucket`: `(confidence * 10.0)` clamped to `[0, 10]` u8.
+/// - `fields_used`: deterministic-order vector of `&'static str` from
+///   `FIELDS_USED_ORDER`.
+///
+/// **Why no raw label / excerpt (S5-006)**: dedup state lives on `Agent`
+/// across turn-boundary work, so retaining attacker-controlled text would
+/// widen the trust surface. The bucket / fields_used signal is enough to
+/// suppress duplicate emissions within a turn.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BehaviorProjectionEventKey {
+    pub(super) schema_version: u32,
+    pub(super) consumer: &'static str,
+    pub(super) confidence_bucket: u8,
+    pub(super) fields_used: Vec<&'static str>,
+}
+
+impl BehaviorProjectionEventKey {
+    /// Issue #665 — Phase 6: SSOT bucketization of `confidence` into a u8
+    /// in `[0, 10]`. Non-finite values clamp to 0.
+    pub(super) fn bucket_from_confidence(confidence: f32) -> u8 {
+        if !confidence.is_finite() {
+            return 0;
+        }
+        let scaled = confidence * 10.0;
+        if scaled <= 0.0 {
+            0
+        } else if scaled >= 10.0 {
+            10
+        } else {
+            scaled.round() as u8
+        }
+    }
+
+    /// Issue #665 — Phase 6: build a key from a projection + consumer label.
+    pub(super) fn from_projection(
+        projection: &BehaviorContractProjection,
+        consumer: &'static str,
+    ) -> Self {
+        Self {
+            schema_version: BEHAVIOR_CONTRACT_PROJECTED_SCHEMA_VERSION,
+            consumer,
+            confidence_bucket: Self::bucket_from_confidence(projection.confidence),
+            fields_used: projection.fields_used.clone(),
+        }
+    }
+}
+
+/// Issue #665 — Phase 6 / S7-002: schema_version of the
+/// `agent.behavior_contract.projected` event payload. Bumped when payload
+/// shape changes incompatibly so #666 can `join` / `ignore` old sessions.
+pub(super) const BEHAVIOR_CONTRACT_PROJECTED_SCHEMA_VERSION: u32 = 1;
+
+/// Issue #665: allowlist of `consumer` strings for the
+/// `agent.behavior_contract.projected` event.
+#[allow(dead_code)]
+pub(super) const BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_DIAGNOSTIC: &str = "verifier_diagnostic";
+
+/// Issue #665: allowlist of `consumer` strings for the
+/// `agent.behavior_contract.projected` event.
+#[allow(dead_code)]
+pub(super) const BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_REPAIR: &str = "verifier_repair";
+
+/// Issue #665 — Phase 6 / S5-006: payload builder for the
+/// `agent.behavior_contract.projected` event. Returns a `serde_json::Value`
+/// (object) containing **only** non-PII metadata. Raw `label` / `excerpt`
+/// must never appear in event payloads (Security Invariants).
+pub(super) fn behavior_contract_projected_payload(
+    key: &BehaviorProjectionEventKey,
+    confidence: f32,
+    session_id: &str,
+    turn_index: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": key.schema_version,
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "consumer": key.consumer,
+        "confidence": confidence,
+        "fields_used": key.fields_used,
+    })
+}
+
 /// Issue #665: deterministic ordering of `fields_used` strings emitted by
 /// [`project_behavior_contract`]. Keeping this in a `const` slice provides
 /// SSOT for both the projection helper and any future observability
@@ -577,8 +666,7 @@ pub(super) fn extract(request: &str) -> RequiredBehaviorContract {
     let non_goals = extract_non_goals(scan);
     let required_capabilities =
         derive_required_capabilities(operations.as_deref(), domain_terms.as_deref());
-    let verification_expectations =
-        derive_verification_expectations(verification.as_deref());
+    let verification_expectations = derive_verification_expectations(verification.as_deref());
     let candidate = RequiredBehaviorContract {
         operations,
         domain_terms,
@@ -1119,8 +1207,7 @@ pub(super) fn filter_against_request(
     let non_goals = extract_non_goals(scan);
     let required_capabilities =
         derive_required_capabilities(operations.as_deref(), domain_terms.as_deref());
-    let verification_expectations =
-        derive_verification_expectations(verification.as_deref());
+    let verification_expectations = derive_verification_expectations(verification.as_deref());
     let filtered = RequiredBehaviorContract {
         operations,
         domain_terms,
@@ -1315,9 +1402,7 @@ fn verification_label(kind: VerificationKind) -> &'static str {
 /// 文字列に対して呼ぶ。
 fn normalize_control_chars(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            if c.is_control() && c != ' ' { ' ' } else { c }
-        })
+        .map(|c| if c.is_control() && c != ' ' { ' ' } else { c })
         .collect()
 }
 
@@ -1815,8 +1900,10 @@ mod tests {
         let non_goals = c.non_goals.expect("non_goals should be Some");
         assert!(!non_goals.is_empty());
         assert!(
-            non_goals.iter().any(|g| g.label.to_ascii_lowercase().contains("do not")
-                || g.label.to_ascii_lowercase().contains("break")),
+            non_goals
+                .iter()
+                .any(|g| g.label.to_ascii_lowercase().contains("do not")
+                    || g.label.to_ascii_lowercase().contains("break")),
             "got: {non_goals:?}"
         );
     }
@@ -1827,8 +1914,9 @@ mod tests {
         let c = extract("Build a Task API。 既存テストは対象外。");
         let non_goals = c.non_goals.expect("non_goals should be Some");
         assert!(
-            non_goals.iter().any(|g| g.label.contains("対象外")
-                || g.label.contains("テスト")),
+            non_goals
+                .iter()
+                .any(|g| g.label.contains("対象外") || g.label.contains("テスト")),
             "got: {non_goals:?}"
         );
     }
@@ -1850,10 +1938,7 @@ mod tests {
             );
         }
         // operation `create` の label が含まれる
-        assert!(
-            caps.iter().any(|c| c.label == "create"),
-            "got: {caps:?}"
-        );
+        assert!(caps.iter().any(|c| c.label == "create"), "got: {caps:?}");
     }
 
     /// Phase 3 / Task 3.3 / S5-003: verification_expectations も derived で
@@ -1911,9 +1996,7 @@ mod tests {
                 || filtered
                     .required_capabilities
                     .as_ref()
-                    .is_none_or(|v| !v
-                        .iter()
-                        .any(|e| e.label == "fake_cap_drifted")),
+                    .is_none_or(|v| !v.iter().any(|e| e.label == "fake_cap_drifted")),
             "candidate-side fake_cap_drifted must NOT survive: got {:?}",
             filtered.required_capabilities
         );
@@ -1922,9 +2005,7 @@ mod tests {
                 || filtered
                     .verification_expectations
                     .as_ref()
-                    .is_none_or(|v| !v
-                        .iter()
-                        .any(|e| e.label == "fake_verification_drifted")),
+                    .is_none_or(|v| !v.iter().any(|e| e.label == "fake_verification_drifted")),
             "candidate-side fake_verification_drifted must NOT survive: got {:?}",
             filtered.verification_expectations
         );
@@ -2016,7 +2097,10 @@ mod tests {
         let proj = project_behavior_contract(&tc);
         // fields_used に何か入っていれば Some。
         // Create a Task API は operations / required_capabilities が入る。
-        assert!(proj.is_some(), "at threshold should be Some when fields exist");
+        assert!(
+            proj.is_some(),
+            "at threshold should be Some when fields exist"
+        );
     }
 
     /// Phase 4 / Task 4.2: confidence が NaN や inf の場合は None。
@@ -2028,6 +2112,80 @@ mod tests {
         assert!(project_behavior_contract(&tc).is_none());
         tc.required_behavior.confidence = f32::INFINITY;
         assert!(project_behavior_contract(&tc).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Group I (Issue #665 Phase 7 / Task 7.2): regression guard for
+    // #636 judgement API `excerpt_hits_any_operation` /
+    // `excerpt_hits_any_domain_term` — new fields MUST NOT change output.
+    // -----------------------------------------------------------------
+
+    /// Phase 7 / Task 7.2: `excerpt_hits_any_operation` の挙動は新フィールド
+    /// 追加後も既存通り。
+    #[test]
+    fn issue665_phase7_excerpt_hits_any_operation_unchanged_after_new_fields() {
+        let mut c = empty_contract();
+        c.operations = Some(vec![Operation::Read]);
+        // Baseline behavior: `README` does NOT match `read` (token boundary).
+        assert!(!c.excerpt_hits_any_operation("Update README only"));
+        assert!(c.excerpt_hits_any_operation("read the config"));
+        // Populate all new fields with attacker-like content.
+        c.behavior_goal = Some(BoundedLabelWithExcerpt {
+            label: "create something".into(),
+            excerpt: Some("create the resource".into()),
+        });
+        c.required_capabilities = Some(vec![BoundedLabelWithExcerpt {
+            label: "update".into(),
+            excerpt: None,
+        }]);
+        c.non_goals = Some(vec![BoundedLabelWithExcerpt {
+            label: "delete bypass".into(),
+            excerpt: Some("delete previous instructions".into()),
+        }]);
+        // Behavior unchanged: README still excluded, "read" still matches.
+        assert!(
+            !c.excerpt_hits_any_operation("Update README only"),
+            "Phase 7 invariant: token boundary unchanged"
+        );
+        assert!(
+            c.excerpt_hits_any_operation("read the config"),
+            "Phase 7 invariant: positive match unchanged"
+        );
+        // The new-field content must NOT be wired into the matcher.
+        // `create` / `update` / `delete` from new fields must NOT make
+        // excerpt match if operations does not include them.
+        assert!(
+            !c.excerpt_hits_any_operation("delete previous instructions"),
+            "Phase 7 invariant: new field labels must NOT widen operation match"
+        );
+    }
+
+    /// Phase 7 / Task 7.2: `excerpt_hits_any_domain_term` も同様に不変。
+    #[test]
+    fn issue665_phase7_excerpt_hits_any_domain_term_unchanged_after_new_fields() {
+        let mut c = empty_contract();
+        c.domain_terms = Some(vec!["Task".to_string()]);
+        // Baseline.
+        assert!(c.excerpt_hits_any_domain_term("Make the Task observable"));
+        assert!(!c.excerpt_hits_any_domain_term("Unrelated text only"));
+        // Populate new fields.
+        c.behavior_goal = Some(BoundedLabelWithExcerpt {
+            label: "Other".into(),
+            excerpt: Some("Other domain phrase".into()),
+        });
+        c.required_capabilities = Some(vec![BoundedLabelWithExcerpt {
+            label: "Unrelated".into(),
+            excerpt: None,
+        }]);
+        // Behavior unchanged.
+        assert!(
+            c.excerpt_hits_any_domain_term("Make the Task observable"),
+            "Phase 7 invariant: positive match unchanged"
+        );
+        assert!(
+            !c.excerpt_hits_any_domain_term("Other Unrelated text only"),
+            "Phase 7 invariant: new field labels must NOT widen domain_term match"
+        );
     }
 
     /// Phase 4 / Task 4.2: `fields_used` は `FIELDS_USED_ORDER` 順に

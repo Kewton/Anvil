@@ -1890,7 +1890,10 @@ fn task_contract_verifier_target_discovery_note(attempt: usize, attempt_limit: u
     )
 }
 
-fn verifier_repair_diagnostic_pending_note(context: &super::repair_job::RepairJob) -> String {
+fn verifier_repair_diagnostic_pending_note(
+    context: &super::repair_job::RepairJob,
+    behavior_projection: Option<&super::required_behavior::BehaviorContractProjection>,
+) -> String {
     let failure_location = context
         .target_hint
         .as_ref()
@@ -1906,17 +1909,181 @@ fn verifier_repair_diagnostic_pending_note(context: &super::repair_job::RepairJo
         .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
         .collect::<Vec<_>>()
         .join(", ");
+    // Issue #665 (S5-005): system note には raw label / excerpt を載せない。
+    // confidence / fields_used metadata のみを 1 行で添える (no PII / no
+    // attacker-controlled text). 存在しない場合は note 末尾に何も付けない。
+    let behavior_suffix = behavior_projection
+        .map(|proj| {
+            let fields = proj.fields_used.join(",");
+            format!(
+                " BehaviorContract metadata: confidence={:.2}, fields_used=[{fields}].",
+                proj.confidence
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "[Verifier Repair Diagnostic] A verifier failure is pending and the controller must run a short-lived diagnostic pass before editing. Do not infer a repair target from this note alone. Initial failure_type={}. Failure location: {failure_location}. Current repair candidate: {repair_target}. Changed candidates: [{}].",
+        "[Verifier Repair Diagnostic] A verifier failure is pending and the controller must run a short-lived diagnostic pass before editing. Do not infer a repair target from this note alone. Initial failure_type={}. Failure location: {failure_location}. Current repair candidate: {repair_target}. Changed candidates: [{}].{behavior_suffix}",
         context.failure_type.as_str(),
         changed
     )
+}
+
+/// Issue #665 (S5-005 / S7-003): build the `behavior_contract` JSON value to
+/// inject into diagnostic / repair user-message payloads. Caller-side
+/// projection (`super::required_behavior::project_behavior_contract`) is
+/// taken as-is when present, then the **serialized** size is capped at
+/// `MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES`. When the cap is exceeded the
+/// low-priority fields are dropped in this order:
+/// 1. `non_goals` (lowest priority — diagnostic prompts care less about
+///    "do not")
+/// 2. `verification_expectations`
+/// 3. `required_capabilities`
+/// 4. `behavior_goal` (highest priority — kept whenever possible)
+///
+/// If even the smallest envelope exceeds the cap, returns `null`. A
+/// `truncated=true` metadata key is added when any field was dropped.
+/// Returns `serde_json::Value::Null` when `projection` is `None`.
+fn behavior_contract_payload_value(
+    projection: Option<&super::required_behavior::BehaviorContractProjection>,
+) -> serde_json::Value {
+    let Some(proj) = projection else {
+        return serde_json::Value::Null;
+    };
+    fn label_excerpt_value(
+        item: &super::required_behavior::BoundedLabelWithExcerpt,
+    ) -> serde_json::Value {
+        match item.excerpt.as_ref() {
+            Some(ex) => serde_json::json!({"label": item.label, "excerpt": ex}),
+            None => serde_json::json!({"label": item.label}),
+        }
+    }
+    fn vec_value(items: &[super::required_behavior::BoundedLabelWithExcerpt]) -> serde_json::Value {
+        serde_json::Value::Array(items.iter().map(label_excerpt_value).collect())
+    }
+    let mut behavior_goal = proj.behavior_goal.as_ref().map(label_excerpt_value);
+    let mut required_capabilities = vec_value(&proj.required_capabilities);
+    let mut verification_expectations = vec_value(&proj.verification_expectations);
+    let mut non_goals = vec_value(&proj.non_goals);
+    let mut truncated = false;
+    let cap = super::required_behavior::MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES;
+
+    fn assemble(
+        confidence: f32,
+        fields_used: &[&'static str],
+        behavior_goal: &Option<serde_json::Value>,
+        required_capabilities: &serde_json::Value,
+        verification_expectations: &serde_json::Value,
+        non_goals: &serde_json::Value,
+        truncated: bool,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("confidence".to_string(), serde_json::json!(confidence));
+        obj.insert("fields_used".to_string(), serde_json::json!(fields_used));
+        if let Some(g) = behavior_goal {
+            obj.insert("behavior_goal".to_string(), g.clone());
+        } else {
+            obj.insert("behavior_goal".to_string(), serde_json::Value::Null);
+        }
+        obj.insert(
+            "required_capabilities".to_string(),
+            required_capabilities.clone(),
+        );
+        obj.insert(
+            "verification_expectations".to_string(),
+            verification_expectations.clone(),
+        );
+        obj.insert("non_goals".to_string(), non_goals.clone());
+        if truncated {
+            obj.insert("truncated".to_string(), serde_json::Value::Bool(true));
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    let serialize_size = |v: &serde_json::Value| -> usize {
+        serde_json::to_string(v)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX)
+    };
+
+    let mut value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 1. Drop non_goals
+    non_goals = serde_json::Value::Array(vec![]);
+    truncated = true;
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 2. Drop verification_expectations
+    verification_expectations = serde_json::Value::Array(vec![]);
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 3. Drop required_capabilities
+    required_capabilities = serde_json::Value::Array(vec![]);
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 4. Drop behavior_goal
+    behavior_goal = None;
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // Even the smallest envelope is over cap — return null (better than an
+    // attacker-controlled un-bounded payload).
+    serde_json::Value::Null
 }
 
 fn verifier_diagnostic_messages(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     active_request: &str,
+    behavior_projection: Option<&super::required_behavior::BehaviorContractProjection>,
 ) -> Vec<ConversationMessage> {
     let excerpts = verifier_diagnostic_file_excerpts(work_root, context)
         .into_iter()
@@ -1946,6 +2113,11 @@ fn verifier_diagnostic_messages(
             })
         })
         .collect::<Vec<_>>();
+    // Issue #665 (S5-005 / S7-003): behavior_contract は user JSON payload の
+    // 1 data key としてのみ注入。system note (上方) には raw label / excerpt
+    // を載せない。helper 内で MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES cap +
+    // truncated metadata を適用。
+    let behavior_contract = behavior_contract_payload_value(behavior_projection);
     let payload = serde_json::json!({
         "task_summary": compact_verifier_failure_text(active_request, 500),
         "command": context.command,
@@ -1959,6 +2131,7 @@ fn verifier_diagnostic_messages(
         "failure_location": failure_location,
         "changed_candidates": changed_candidates,
         "safe_file_excerpts": excerpts,
+        "behavior_contract": behavior_contract,
     });
     let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     vec![
@@ -2072,6 +2245,7 @@ fn verifier_repair_pass_messages(
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
     active_request: &str,
+    behavior_projection: Option<&super::required_behavior::BehaviorContractProjection>,
 ) -> Result<Vec<ConversationMessage>, String> {
     let target_line = verifier_repair_context_line_for_path(context, &target_hint.path);
     let target_excerpt =
@@ -2145,6 +2319,8 @@ fn verifier_repair_pass_messages(
             },
         })
     });
+    // Issue #665 (S5-005 / S7-003): behavior_contract data payload.
+    let behavior_contract = behavior_contract_payload_value(behavior_projection);
     let payload = serde_json::json!({
         "task_summary": compact_verifier_failure_text(active_request, 500),
         "command": context.command,
@@ -2160,6 +2336,7 @@ fn verifier_repair_pass_messages(
         },
         "target_excerpt": target_excerpt,
         "related_excerpts": related,
+        "behavior_contract": behavior_contract,
     });
     let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     Ok(vec![
@@ -3809,6 +3986,12 @@ impl Agent {
         // restarts together at turn boundary (locality, CLAUDE.md per-turn
         // rule). NOT serialized.
         self.job_report_dedup_keys.clear();
+        // Issue #665 (Phase 6 / S5-006 / S7-002): per-turn diff-based dedup
+        // state for `agent.behavior_contract.projected` event. Reset adjacent
+        // to `last_active_job_selection = None` so all per-turn dedup state
+        // restarts together at turn boundary. Forces the first consumed
+        // projection in the new turn to emit.
+        self.last_behavior_contract_projection_event = None;
         // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
         // the reminder cap above; reset so a fresh user turn can fire the
         // Tester once even if the previous turn already did.
@@ -9973,6 +10156,50 @@ impl Agent {
         true
     }
 
+    /// Issue #665 (Phase 6 / S5-006 / S7-002): emit the
+    /// `agent.behavior_contract.projected` event with per-turn diff-based
+    /// dedup. Only emits when:
+    /// - `projection` is `Some(...)` (i.e. consumed by a prompt site), AND
+    /// - the payload-shaped key differs from
+    ///   `self.last_behavior_contract_projection_event`.
+    ///
+    /// **Per-turn rule** (DR1-007): `last_behavior_contract_projection_event`
+    /// is reset to `None` at the head of every `handle_user_message`, so the
+    /// first consumed projection in a new turn always emits.
+    ///
+    /// **Security**: payload contains only `schema_version`, `session_id`,
+    /// `turn_index`, `consumer`, `confidence`, `fields_used`. Raw `label` /
+    /// `excerpt` are NEVER included (S5-006). `log_llm_event` →
+    /// `mask_payload_inplace` is the final defense.
+    ///
+    /// Returns `true` when the event was emitted, `false` when dedup skipped
+    /// it or no projection was supplied.
+    pub(super) fn emit_behavior_contract_projected_if_changed(
+        &mut self,
+        projection: Option<&super::required_behavior::BehaviorContractProjection>,
+        consumer: &'static str,
+    ) -> bool {
+        let Some(proj) = projection else {
+            return false;
+        };
+        let key =
+            super::required_behavior::BehaviorProjectionEventKey::from_projection(proj, consumer);
+        if self.last_behavior_contract_projection_event.as_ref() == Some(&key) {
+            return false;
+        }
+        let session_id = self.session_store.session_id().to_string();
+        let turn_index = self.current_turn_index as u64;
+        let payload = super::required_behavior::behavior_contract_projected_payload(
+            &key,
+            proj.confidence,
+            &session_id,
+            turn_index,
+        );
+        log_llm_event("agent.behavior_contract.projected", payload);
+        self.last_behavior_contract_projection_event = Some(key);
+        true
+    }
+
     /// Issue #660 (Phase C): compute the current `ActiveJobSelection`
     /// using the same `build_arbiter_candidates` + `select_active_job`
     /// pipeline as `effective_tool_policy()`. Pure on `self` — no log
@@ -10309,7 +10536,19 @@ impl Agent {
         match self.verifier_repair_decision_for_policy() {
             VerifierRepairDecision::NeedDiagnostic => {
                 if let Some(context) = self.repair_job.as_ref() {
-                    self.push_system_note(verifier_repair_diagnostic_pending_note(context));
+                    // Issue #665 Phase 5: caller-side projection (S5-005 では
+                    // raw label/excerpt は system note に出さないため helper
+                    // 内部で metadata のみに縮退する)。
+                    let active_request = self.active_request_text().unwrap_or_default();
+                    let task_contract =
+                        super::task_contract::TaskContract::from_request(&active_request);
+                    let behavior_projection =
+                        super::required_behavior::project_behavior_contract(&task_contract);
+                    let note = verifier_repair_diagnostic_pending_note(
+                        context,
+                        behavior_projection.as_ref(),
+                    );
+                    self.push_system_note(note);
                     true
                 } else {
                     false
@@ -10423,7 +10662,26 @@ impl Agent {
         }
 
         let active_request = self.active_request_text().unwrap_or_default();
-        let messages = verifier_diagnostic_messages(&self.work_root, &context, &active_request);
+        // Issue #665 Phase 5: caller-side projection build (sidecar accessor
+        // pattern). `TaskContract::from_request` is pure-fn / pure data, no
+        // side effect. Per design policy §7 #6 we deliberately do NOT cache
+        // (YAGNI).
+        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+        let behavior_projection =
+            super::required_behavior::project_behavior_contract(&task_contract);
+        let messages = verifier_diagnostic_messages(
+            &self.work_root,
+            &context,
+            &active_request,
+            behavior_projection.as_ref(),
+        );
+        // Issue #665 Phase 6 (S5-006): emit `agent.behavior_contract.projected`
+        // event once per turn per (consumer + key) — only when projection is
+        // actually consumed by this prompt site.
+        self.emit_behavior_contract_projected_if_changed(
+            behavior_projection.as_ref(),
+            super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_DIAGNOSTIC,
+        );
         let diagnostic_client = match self
             .client
             .clone_with_overrides(attempt_spec.timeout_secs, VERIFIER_DIAGNOSTIC_MAX_PREDICT)
@@ -11091,11 +11349,22 @@ impl Agent {
             };
         };
         let active_request = self.active_request_text().unwrap_or_default();
+        // Issue #665 Phase 5: caller-side projection (sidecar accessor).
+        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+        let behavior_projection =
+            super::required_behavior::project_behavior_contract(&task_contract);
+        // Issue #665 Phase 6 (S5-006): emit `agent.behavior_contract.projected`
+        // event once per turn per (consumer + key).
+        self.emit_behavior_contract_projected_if_changed(
+            behavior_projection.as_ref(),
+            super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_REPAIR,
+        );
         let mut messages = match verifier_repair_pass_messages(
             &self.work_root,
             &context,
             &target_hint,
             &active_request,
+            behavior_projection.as_ref(),
         ) {
             Ok(messages) => messages,
             Err(err) => {
@@ -11506,13 +11775,25 @@ impl Agent {
                 })
                 .unwrap_or_else(|| " Failure signature: <unknown>.".to_string());
             match decision {
-                VerifierRepairDecision::NeedDiagnostic => self
-                    .repair_job
-                    .as_ref()
-                    .map(verifier_repair_diagnostic_pending_note)
-                    .unwrap_or_else(|| {
-                        "[Verifier Repair Policy] A verifier failure is pending. Output a compact diagnosis JSON object only; do not call tools.".to_string()
-                    }),
+                VerifierRepairDecision::NeedDiagnostic => {
+                    // Issue #665 Phase 5: caller-side projection (sidecar).
+                    let active_request = self.active_request_text().unwrap_or_default();
+                    let task_contract =
+                        super::task_contract::TaskContract::from_request(&active_request);
+                    let behavior_projection =
+                        super::required_behavior::project_behavior_contract(&task_contract);
+                    self.repair_job
+                        .as_ref()
+                        .map(|context| {
+                            verifier_repair_diagnostic_pending_note(
+                                context,
+                                behavior_projection.as_ref(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "[Verifier Repair Policy] A verifier failure is pending. Output a compact diagnosis JSON object only; do not call tools.".to_string()
+                        })
+                }
                 VerifierRepairDecision::NeedFreshRead(target) => {
                     let target_display = verifier_repair_target_display(&target, &self.work_root);
                     format!(
@@ -24516,7 +24797,7 @@ mod progress_tests {
             .unwrap()
             .clone();
         let messages =
-            verifier_repair_pass_messages(work_root, &context, &target, "fix app").unwrap();
+            verifier_repair_pass_messages(work_root, &context, &target, "fix app", None).unwrap();
         let payload = messages
             .iter()
             .map(|message| message.content.as_str())
@@ -25988,7 +26269,7 @@ mod progress_tests {
             None,
         );
 
-        let messages = verifier_diagnostic_messages(&work_root, &context, "build an API");
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build an API", None);
         let prompt = messages
             .iter()
             .map(|message| message.content.as_str())
@@ -27012,8 +27293,9 @@ E   assert [{'id': 1}] == []\n";
             semantic_plan: Some(plan),
             ..RepairJob::new_for_test()
         };
-        let messages = super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task")
-            .expect("messages built");
+        let messages =
+            super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task", None)
+                .expect("messages built");
         assert_eq!(messages.len(), 2);
 
         // The system message must NOT contain semantic-plan fields — those
@@ -27068,8 +27350,9 @@ E   assert [{'id': 1}] == []\n";
             semantic_plan: None,
             ..RepairJob::new_for_test()
         };
-        let messages = super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task")
-            .expect("messages built");
+        let messages =
+            super::verifier_repair_pass_messages(&work_root, &job, &target_hint, "task", None)
+                .expect("messages built");
         let user_text = format!("{:?}", messages[1]);
         assert!(
             user_text.contains("\\\"semantic_plan\\\":null"),
@@ -27095,7 +27378,7 @@ E   assert [{'id': 1}] == []\n";
         std::fs::write(&app, "def f():\n    return 1\n").unwrap();
         let context = verifier_context_for("app/main.py");
 
-        let messages = verifier_diagnostic_messages(&work_root, &context, "build api");
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build api", None);
         let prompt = messages
             .iter()
             .map(|message| message.content.as_str())
@@ -27540,7 +27823,7 @@ E   assert [{'id': 1}] == []\n";
         std::fs::write(&app, "API_KEY=supersecretvalue\napp = object()\n").unwrap();
         let context = verifier_context_for("app/main.py");
 
-        let messages = verifier_diagnostic_messages(&work_root, &context, "build api");
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build api", None);
         let user_payload = messages
             .iter()
             .find(|message| message.role == "user")
@@ -31846,7 +32129,7 @@ export default function App() {
         // serialise these fields verbatim, so the assertions above
         // transitively guarantee the prompt payload is clean — but assert
         // the diagnostic-pass payload directly here for defence in depth.
-        let messages = verifier_diagnostic_messages(work_root, &job, "build");
+        let messages = verifier_diagnostic_messages(work_root, &job, "build", None);
         let serialized: String = messages
             .iter()
             .map(|m| {
@@ -31900,7 +32183,8 @@ export default function App() {
             .as_ref()
             .unwrap()
             .clone();
-        let messages = verifier_repair_pass_messages(work_root, &job, &target, "fix app").unwrap();
+        let messages =
+            verifier_repair_pass_messages(work_root, &job, &target, "fix app", None).unwrap();
         let serialized: String = messages
             .iter()
             .map(|m| {
@@ -32351,7 +32635,7 @@ export default function App() {
             repair_attempt: 1,
             ..super::super::repair_job::RepairJob::new_for_test()
         };
-        let messages = verifier_diagnostic_messages(&work_root, &context, "fix bug");
+        let messages = verifier_diagnostic_messages(&work_root, &context, "fix bug", None);
         let payload = messages
             .iter()
             .map(|m| m.content.as_str())
