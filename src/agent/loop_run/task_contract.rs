@@ -82,7 +82,17 @@ enum EvaluateMode<'a> {
     Legacy,
     /// New entry — `evaluate_with_owned_test_artifacts` callers pass
     /// the SSOT bound slice and accept the SafeStop gate.
-    OwnedTestArtifacts(&'a [String]),
+    ///
+    /// Issue #661 (iteration-3 Task 4.2): `weak_metadata` carries the
+    /// caller's `OwnedTestVerifierPlan::Weak { owned_test_artifacts_count }`
+    /// signal. `Some(n)` (where `n > 0`) lets the Done-gate refuse a
+    /// legacy `bound_test_artifacts_count == None` verifier with the
+    /// `VerifierWeak` reason instead of the stricter `VerifierMissing`
+    /// fallback. `None` is the back-compat sentinel.
+    OwnedTestArtifacts {
+        owned: &'a [String],
+        weak_metadata: Option<usize>,
+    },
 }
 
 /// Issue #651: deterministic reason for `CompletionDecision::SafeStop`.
@@ -550,9 +560,42 @@ impl TaskContract {
         evidence: &EvidenceSet,
         owned_test_artifacts: &[String],
     ) -> CompletionDecision {
+        self.evaluate_with_owned_test_artifacts_and_weak_metadata(
+            evidence,
+            owned_test_artifacts,
+            None,
+        )
+    }
+
+    /// Issue #661 (iteration-3 Task 4.2): variant of
+    /// [`Self::evaluate_with_owned_test_artifacts`] that accepts the caller's
+    /// `OwnedTestVerifierPlan::Weak { owned_test_artifacts_count }`
+    /// metadata.
+    ///
+    /// Mapping table (design policy section 4 judgement #4):
+    /// 1. `owned_test_artifacts.is_empty()` → `SafeStopReason::VerifierMissing`
+    /// 2. any `Some(0)` evidence + no `Some(n>0)` → `SafeStopReason::VerifierWeak`
+    /// 3. only `None` evidence + `weak_metadata == Some(n)` → `SafeStopReason::VerifierWeak`
+    /// 4. only `None` evidence + `weak_metadata == None` → `SafeStopReason::VerifierMissing`
+    /// 5. any `Some(n>0)` evidence → `Done`
+    ///
+    /// `weak_metadata == Some(0)` is treated as absence of Weak metadata
+    /// (the design constrains the source to `owned_test_artifacts_count > 0`);
+    /// `None` is the back-compat sentinel for callers that have no
+    /// `OwnedTestVerifierPlan` view yet (iteration-3 production caller
+    /// in `turn.rs::run_actor_loop`).
+    pub(super) fn evaluate_with_owned_test_artifacts_and_weak_metadata(
+        &self,
+        evidence: &EvidenceSet,
+        owned_test_artifacts: &[String],
+        weak_metadata: Option<usize>,
+    ) -> CompletionDecision {
         self.evaluate_inner(
             evidence,
-            EvaluateMode::OwnedTestArtifacts(owned_test_artifacts),
+            EvaluateMode::OwnedTestArtifacts {
+                owned: owned_test_artifacts,
+                weak_metadata,
+            },
         )
     }
 
@@ -578,7 +621,10 @@ impl TaskContract {
         // is the back-compat path and intentionally skips the gate so
         // existing unit / integration tests (and any caller that has
         // no ownership view yet) keep pre-#651 completion semantics.
-        if let EvaluateMode::OwnedTestArtifacts(owned_test_artifacts) = mode
+        if let EvaluateMode::OwnedTestArtifacts {
+            owned: owned_test_artifacts,
+            weak_metadata,
+        } = mode
             && self.required_behavior.test_execution_required
         {
             // Sub-gate 1: empty owned slice → nothing for the verifier to
@@ -588,21 +634,28 @@ impl TaskContract {
                     reason: SafeStopReason::VerifierMissing,
                 };
             }
-            // Sub-gate 2 (PR-001): even when the owned slice is non-empty,
-            // the only verifier success we accept as "Done" is one that
-            // came through the structured `AutoTestRunner::run_structured`
-            // path, which records
-            // `VerifierExitZero { class: BuildTest, bound_test_artifacts_count: Some(_), .. }`.
-            // A manual / legacy unbound `VerifierExitZero` (e.g. a Bash
-            // `cargo test` outcome with `bound_test_artifacts_count: None`)
-            // is NOT proof that the runner argv contained the owned test
-            // paths — it could be a stale workspace test suite that
-            // happens to pass while the new tests/test_x.py is ignored.
-            // Refuse to mark Done in that case.
+            // Sub-gate 2 (PR-001 + Issue #661 iteration-3 Task 4.1/4.2):
+            // even when the owned slice is non-empty, the only verifier
+            // success we accept as "Done" is one that came through the
+            // structured `AutoTestRunner::run_structured` path AND bound
+            // at least one owned test artifact: `VerifierExitZero {
+            // class: BuildTest, bound_test_artifacts_count: Some(n>0) }`.
+            //
+            // `has_bound_build_test_verifier` rejects both `None`
+            // (legacy unbound) and `Some(0)` (structured but bound to
+            // zero arguments — see Issue #661 Task 4.1). When the gate
+            // refuses, the SafeStopReason is dispatched per the design
+            // policy mapping (section 4 judgement #4):
+            //
+            //   * any `Some(0)` evidence + no `Some(n>0)`
+            //                                  → VerifierWeak
+            //   * only `None` evidence + Weak metadata
+            //                                  → VerifierWeak
+            //   * only `None` evidence + no Weak metadata
+            //                                  → VerifierMissing
             if !has_bound_build_test_verifier(evidence) {
-                return CompletionDecision::SafeStop {
-                    reason: SafeStopReason::VerifierMissing,
-                };
+                let reason = done_gate_safe_stop_reason(evidence, weak_metadata);
+                return CompletionDecision::SafeStop { reason };
             }
         }
         CompletionDecision::Done
@@ -912,27 +965,71 @@ fn has_build_test_verifier(evidence: &EvidenceSet) -> bool {
     })
 }
 
-/// Issue #651 PR-001: stricter sibling of `has_build_test_verifier`. True
-/// only when at least one BuildTest verifier evidence carries a
-/// `bound_test_artifacts_count: Some(_)`, i.e. came through the
-/// `AutoTestRunner::run_structured` path that re-validates owned test
-/// artifacts before spawning `Command::new(runner).args(args)`.
+/// Issue #651 PR-001 + Issue #661 (iteration-3 Task 4.1): stricter sibling
+/// of `has_build_test_verifier`. True only when at least one BuildTest
+/// verifier evidence carries a `bound_test_artifacts_count: Some(n)` with
+/// `n > 0`, i.e. came through the `AutoTestRunner::run_structured` path
+/// AND bound at least one owned test artifact to `Command::new(runner).args(args)`.
 ///
 /// Manual `cargo test` / shell `AutoTestRunner::run` legacy paths record
 /// `bound_test_artifacts_count: None` and are not accepted as proof that
 /// the verifier input was structurally tied to the current task's owned
 /// test artifacts.
+///
+/// Issue #661 Task 4.1 also rejects `Some(0)`: a structured verifier that
+/// ran with zero bound arguments has no type-level evidence the runner
+/// argv carried any owned test path. The Done gate must refuse such
+/// evidence (mapped to `SafeStopReason::VerifierWeak` in
+/// `done_gate_safe_stop_reason`).
 fn has_bound_build_test_verifier(evidence: &EvidenceSet) -> bool {
     evidence.iter().any(|item| {
         matches!(
             item,
             CompletionEvidence::VerifierExitZero {
                 class: BashCommandClass::BuildTest,
-                bound_test_artifacts_count: Some(_),
+                bound_test_artifacts_count: Some(n),
+                ..
+            } if *n > 0
+        )
+    })
+}
+
+/// Issue #661 (iteration-3 Task 4.2): dispatch the `SafeStopReason` when
+/// the Done gate refuses to promote a structured-evidence-bearing turn.
+///
+/// Invariant: this helper is only called when `has_bound_build_test_verifier`
+/// already returned `false` and `owned_test_artifacts` is non-empty — the
+/// `is_empty()` branch returns `VerifierMissing` before reaching here.
+///
+/// Mapping (design policy section 4 judgement #4):
+/// - any `Some(0)` BuildTest evidence → `VerifierWeak`
+/// - else (only `None` evidence): caller `weak_metadata == Some(n)` →
+///   `VerifierWeak`, otherwise `VerifierMissing`.
+fn done_gate_safe_stop_reason(
+    evidence: &EvidenceSet,
+    weak_metadata: Option<usize>,
+) -> SafeStopReason {
+    let has_bound_zero = evidence.iter().any(|item| {
+        matches!(
+            item,
+            CompletionEvidence::VerifierExitZero {
+                class: BashCommandClass::BuildTest,
+                bound_test_artifacts_count: Some(0),
                 ..
             }
         )
-    })
+    });
+    if has_bound_zero {
+        return SafeStopReason::VerifierWeak;
+    }
+    // No bound evidence at all — caller may still carry Weak metadata
+    // from `OwnedTestVerifierPlan::Weak { owned_test_artifacts_count > 0 }`,
+    // which back-ports the Weak reason. `Some(0)` is treated as absence
+    // (the design pins the source to `count > 0`).
+    if matches!(weak_metadata, Some(n) if n > 0) {
+        return SafeStopReason::VerifierWeak;
+    }
+    SafeStopReason::VerifierMissing
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1918,5 +2015,194 @@ mod tests {
             base_excerpt,
             "Phase 7 invariant: excerpt_satisfies_behavior must be invariant under new-field mutations"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #661 (iteration-3 Task 4.1 / 4.2): Done gate strengthening.
+    //
+    // - `has_bound_build_test_verifier` must reject `Some(0)` so a
+    //   bound verifier with zero owned-test arguments cannot satisfy
+    //   the Done gate.
+    // - `evaluate_with_owned_test_artifacts` must surface 5 mapping
+    //   patterns (Section 4 judgement #4 of the design policy):
+    //     * `owned_test_artifacts.is_empty()` → VerifierMissing
+    //     * any `Some(0)` evidence + no `Some(n>0)`  → VerifierWeak
+    //     * only `None` evidence + caller weak metadata → VerifierWeak
+    //     * only `None` evidence + no weak metadata → VerifierMissing
+    //     * any `Some(n > 0)` evidence → Done
+    //
+    // `EvaluateMode::Legacy` is intentionally unchanged: the bare
+    // `evaluate(...)` entry must keep its pre-#651 Done semantics
+    // (see `evaluate_back_compat_entry_bypasses_safe_stop_gate`).
+    // -----------------------------------------------------------------
+
+    fn build_test_bound_zero() -> CompletionEvidence {
+        CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "pytest tests/test_x.py".to_string(),
+            bound_test_artifacts_count: Some(0),
+        }
+    }
+
+    #[test]
+    fn has_bound_build_test_verifier_rejects_some_zero() {
+        // Task 4.1: structured evidence with zero bound arguments is
+        // not proof the runner argv carried any owned test path. The
+        // Done gate must refuse it.
+        let mut evidence = EvidenceSet::new();
+        evidence.push(build_test_bound_zero());
+        assert!(
+            !has_bound_build_test_verifier(&evidence),
+            "Some(0) evidence must NOT count as a bound BuildTest verifier"
+        );
+    }
+
+    #[test]
+    fn has_bound_build_test_verifier_accepts_some_n_positive() {
+        // Regression complement: any Some(n>0) entry keeps the gate
+        // happy even when accompanied by Some(0) / None entries.
+        let mut evidence = EvidenceSet::new();
+        evidence.push(build_test_bound_zero());
+        evidence.push(build_test());
+        evidence.push(build_test_bound(2));
+        assert!(has_bound_build_test_verifier(&evidence));
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_some_zero_emits_safe_stop_weak() {
+        // Task 4.2 mapping #2: any Some(0) evidence + no Some(n>0)
+        // collapses to VerifierWeak (the verifier ran but its argv was
+        // not structurally bound to any owned test artifact).
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test_bound_zero());
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierWeak,
+            },
+            "Some(0) evidence must collapse to VerifierWeak, not Done / VerifierMissing"
+        );
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_some_zero_mixed_with_none_emits_weak() {
+        // Task 4.2 mapping #2 (mixed evidence variant): when both
+        // legacy None evidence and Some(0) bound evidence coexist (no
+        // Some(n>0)), the bound-but-empty evidence wins the SafeStop
+        // reason — Some(0) is structurally stronger evidence than
+        // None.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test()); // None
+        evidence.push(build_test_bound_zero()); // Some(0)
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierWeak,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_none_only_with_weak_metadata_emits_weak() {
+        // Task 4.2 mapping #3: legacy None evidence with caller
+        // `OwnedTestVerifierPlan::Weak { owned_test_artifacts_count > 0 }`
+        // metadata propagates the Weak reason instead of Missing.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test()); // None only
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts_and_weak_metadata(
+            &evidence,
+            &owned,
+            Some(1),
+        );
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierWeak,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_none_only_without_weak_metadata_emits_missing() {
+        // Task 4.2 mapping #4: legacy None evidence, no caller weak
+        // metadata → VerifierMissing.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test());
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision =
+            contract.evaluate_with_owned_test_artifacts_and_weak_metadata(&evidence, &owned, None);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierMissing,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_some_positive_returns_done_even_with_some_zero() {
+        // Task 4.2 mapping #5: any Some(n>0) wins over Some(0) /
+        // None. Regression complement of
+        // `evaluate_required_test_with_mixed_evidence_accepts_bound`.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test_bound_zero()); // Some(0)
+        evidence.push(build_test_bound(3)); // Some(3) — must win
+        let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    #[test]
+    fn evaluate_with_owned_artifacts_empty_owned_returns_missing_even_with_bound_zero() {
+        // Task 4.2: empty owned slice always wins as VerifierMissing
+        // regardless of bound count shape — the verifier could not
+        // have bound to any owned path because the SSOT had none.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test_bound_zero());
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
+        assert_eq!(
+            decision,
+            CompletionDecision::SafeStop {
+                reason: SafeStopReason::VerifierMissing,
+            }
+        );
+    }
+
+    #[test]
+    fn evaluate_back_compat_entry_keeps_done_under_some_zero() {
+        // Task 4.3: `EvaluateMode::Legacy` must remain unchanged. A
+        // Some(0) BuildTest evidence on the legacy entry still yields
+        // Done — the gate strengthening lives exclusively under the
+        // OwnedTestArtifacts mode.
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(build_test_bound_zero());
+        assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
     }
 }

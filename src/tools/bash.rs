@@ -72,6 +72,25 @@ where
         .collect()
 }
 
+/// Issue #661 iteration-5 (DR1-009 SSOT bridge): promote a runtime-known
+/// allowlist key (typically obtained from `filter_env_for_tester` output)
+/// back to its `'static str` representation from `TESTER_ENV_ALLOWLIST_EXACT`.
+/// Returns `None` when the key is not on the allowlist — this is a safety
+/// fall-through, not a normal path (callers MUST first run keys through
+/// `filter_env_for_tester`).
+///
+/// This is the **only** sanctioned bridge between `String`-shaped allow
+/// entries and the `&'static str` representation `HermeticEnvSummary` /
+/// `agent.verifier.invoked` payload schema requires. The auto_test path
+/// MUST go through this helper rather than reference the const slice
+/// directly so the SSOT stays in `bash.rs` (DR1-009).
+pub fn tester_allowlist_static_key(key: &str) -> Option<&'static str> {
+    TESTER_ENV_ALLOWLIST_EXACT
+        .iter()
+        .find(|allowed| **allowed == key)
+        .copied()
+}
+
 /// Internal Bash outcome bag exposed for FeedbackFrame generation in
 /// the agent layer (Issue #450). Not part of `ToolRegistry::execute`'s
 /// `Result<String, String>` contract; turn.rs invokes

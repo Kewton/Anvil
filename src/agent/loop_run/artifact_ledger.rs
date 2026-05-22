@@ -64,7 +64,7 @@ use super::artifact_ownership::{
 };
 use super::task_contract::{ArtifactRole, TaskContract};
 use super::task_workspace_scope::TaskWorkspaceScope;
-use crate::logging::log_llm_event;
+use crate::logging::{log_llm_event, stable_path_hash};
 use crate::session::feedback::mask_secrets;
 use crate::util::file_classify::{is_setup_file, is_test_file};
 
@@ -295,6 +295,9 @@ impl ArtifactLedger {
     /// iteration. Idempotent on `(Existing, role, path)`: repeated baseline
     /// seeds during a single turn do NOT append duplicate rows (returns the
     /// already-stored event).
+    ///
+    /// Issue #661 (iteration-3 Task 3.2): non-verifier admission route —
+    /// stays on `NestedTestAdmission::default()` (= `disabled()`).
     pub(super) fn record_existing_event(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
@@ -303,6 +306,7 @@ impl ArtifactLedger {
     ) -> Option<&ArtifactLedgerEvent> {
         self.record_internal(
             ctx,
+            super::artifact_ownership::NestedTestAdmission::default(),
             path,
             expected_role,
             ArtifactOrigin::Existing,
@@ -314,6 +318,9 @@ impl ArtifactLedger {
     /// on `(Scaffold, role, path)`; `post_scaffold_delta` is recomputed by
     /// the caller before the seed and a duplicate baseline does not produce
     /// multiple rows.
+    ///
+    /// Issue #661 (iteration-3 Task 3.2): non-verifier admission route —
+    /// stays on `NestedTestAdmission::default()` (= `disabled()`).
     pub(super) fn record_scaffold_event(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
@@ -323,6 +330,7 @@ impl ArtifactLedger {
     ) -> Option<&ArtifactLedgerEvent> {
         self.record_internal(
             ctx,
+            super::artifact_ownership::NestedTestAdmission::default(),
             path,
             expected_role,
             ArtifactOrigin::Scaffold,
@@ -334,6 +342,17 @@ impl ArtifactLedger {
 
     /// `RepoEdit` origin — non-no-op Write/Edit tool call. Multiple real
     /// edits append multiple events; projections dedupe by `(role, path)`.
+    ///
+    /// Issue #661 (iteration-3 Task 3.4 / DR2-003 / 判断 #1): verifier-path
+    /// SSOT — passes `NestedTestAdmission::enabled()` so the underlying
+    /// `classify_ownership` SSOT can promote nested test subdirs (e.g.
+    /// `app/tests/foo.py`) to `Owned`. Production callers always pass
+    /// `edited_this_turn=true` which independently satisfies
+    /// `has_promotion_signal`, so the admission flip is observationally a
+    /// no-op for typical edit paths and acts purely as a SSOT-consistency
+    /// guard for the 4 propagation routes. Workspace-relative / symlink
+    /// containment (CB-001) / ignored_top_dir / role-confirm checks remain
+    /// authoritative and unaffected by the flag.
     pub(super) fn record_repo_edit_event(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
@@ -343,6 +362,7 @@ impl ArtifactLedger {
     ) -> Option<&ArtifactLedgerEvent> {
         self.record_internal(
             ctx,
+            super::artifact_ownership::NestedTestAdmission::enabled(),
             path,
             expected_role,
             ArtifactOrigin::RepoEdit,
@@ -361,13 +381,25 @@ impl ArtifactLedger {
     /// ledger increments `dropped_count` and raises `overflowed` so the
     /// projection layer treats completion as untrusted (CB-002 fail-closed
     /// semantics).
+    ///
+    /// Issue #661 (iteration-3 Task 3.4 / DR2-003 / 判断 #1): verifier-path
+    /// SSOT — passes `NestedTestAdmission::enabled()` so a nested test path
+    /// observed by the structured verifier (e.g. `app/tests/foo.py` argv
+    /// element) is admitted into the secondary index for downstream
+    /// projection (`owned_test_artifacts` / verifier-binding callsites).
+    /// Workspace-relative / symlink containment / ignored_top_dir checks
+    /// remain authoritative (see `admit_path_only`).
     pub(super) fn record_verifier_observation(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
         path: &str,
         observation: VerifierObservation,
     ) -> bool {
-        let Ok(accepted) = admit_path_only(ctx, path) else {
+        let Ok(accepted) = admit_path_only(
+            ctx,
+            super::artifact_ownership::NestedTestAdmission::enabled(),
+            path,
+        ) else {
             return false;
         };
         if !self.verifier_observations.contains_key(&accepted)
@@ -384,12 +416,19 @@ impl ArtifactLedger {
     fn record_internal(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
+        nested_test_admission: super::artifact_ownership::NestedTestAdmission,
         path: String,
         expected_role: ArtifactRole,
         origin: ArtifactOrigin,
         origin_specific: AdmissionOriginInputs,
     ) -> Option<&ArtifactLedgerEvent> {
-        let admission = match admit_event(ctx, &path, expected_role, origin_specific) {
+        let admission = match admit_event(
+            ctx,
+            nested_test_admission,
+            &path,
+            expected_role,
+            origin_specific,
+        ) {
             Ok(accepted) => accepted,
             Err(_) => return None,
         };
@@ -583,8 +622,20 @@ enum AdmissionOriginInputs {
 /// nearest_existing_ancestor_within_work_root` — PR-002 SSOT) so missing-
 /// leaf rows go through exactly the same workspace confinement gate as the
 /// `artifact_completion_job` write target.
+///
+/// Issue #661 (iteration-3 Task 3.2 / 3.4 / DR2-003): `nested_test_admission`
+/// is threaded through to `classify_ownership` so the 4 verifier-path SSOT
+/// callers (`record_repo_edit_event` / `record_verifier_observation` /
+/// `validate_bound_test_artifacts_for_execution` /
+/// `seed_artifact_ledger_verifier_observation`) can opt into recognising
+/// nested test subdirs (e.g. `app/tests/foo.py`) as `Owned`. Every other
+/// caller passes `NestedTestAdmission::default()` (= `disabled()`),
+/// preserving the legacy reject behaviour exactly. The flag never bypasses
+/// the workspace-relative / symlink containment / ignored_top_dir /
+/// role-confirm checks — those gates remain authoritative.
 fn admit_event(
     ctx: &LedgerAdmissionContext<'_>,
+    nested_test_admission: super::artifact_ownership::NestedTestAdmission,
     path: &str,
     expected_role: ArtifactRole,
     origin_specific: AdmissionOriginInputs,
@@ -612,6 +663,7 @@ fn admit_event(
             }
         ),
         verifier_passed_in_scope: false,
+        nested_test_admission,
     };
     let ownership = classify_ownership(inputs);
     if matches!(ownership, ArtifactOwnership::OutOfScope) {
@@ -643,8 +695,13 @@ fn admit_event(
 /// Path-only admission (no role / origin). Used by
 /// `record_verifier_observation` to share the workspace / scope / path
 /// validation pipeline without producing an `ArtifactLedgerEvent`.
+///
+/// Issue #661 (iteration-3 Task 3.2 / DR2-003): the same
+/// `nested_test_admission` SSOT propagation rule as `admit_event` applies;
+/// see its doc comment for the per-caller contract.
 fn admit_path_only(
     ctx: &LedgerAdmissionContext<'_>,
+    nested_test_admission: super::artifact_ownership::NestedTestAdmission,
     path: &str,
 ) -> Result<String, AdmissionRejection> {
     if path.is_empty() {
@@ -660,6 +717,7 @@ fn admit_path_only(
         edited_this_session: false,
         scaffold_changed: false,
         verifier_passed_in_scope: false,
+        nested_test_admission,
     };
     if matches!(classify_ownership(inputs), ArtifactOwnership::OutOfScope) {
         return Err(AdmissionRejection::OutOfScope);
@@ -737,20 +795,17 @@ fn emit_event_recorded(
     );
 }
 
-/// Stable 16-hex hash of a `mask_secrets`-redacted path.
-///
-/// SSOT for path correlator hashing across `loop_run/*`. Promoted from
-/// private to `pub(super)` for Issue #666 so `job_report.rs` and
-/// `active_job_arbiter.rs` tests use one implementation. Production callers
-/// outside `loop_run` are forbidden by DR3-001; do NOT re-export from
-/// `loop_run.rs`.
-pub(super) fn stable_path_hash(masked_path: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    masked_path.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
+// Issue #661 DR1-002 / DR2-005: `stable_path_hash` was previously a private
+// duplicate in this module; it has been promoted to `crate::logging::
+// stable_path_hash` so all three former duplicate sites (this module +
+// `turn.rs::stable_path_hash_for_active_job` + `active_job_arbiter.rs`
+// `#[cfg(test)]` helper) share one SSOT and `agent.artifact_ledger.*`
+// event `path_hash` values remain a stable correlator with `agent.
+// active_job.selected` / `agent.verifier.invoked` payloads. Imported via
+// `use crate::logging::stable_path_hash;` at the top of this module so
+// in-module call sites (e.g. `emit_event_recorded`, `bounded_masked_path_hashes`)
+// resolve to the SSOT directly. Issue #666 `job_report.rs` consumers also
+// route through the same `crate::logging::stable_path_hash` SSOT.
 
 /// Issue #659 PR-001: bounded, masked path-hash projection helper. Each
 /// path is passed through `mask_secrets` and then `stable_path_hash` so the
@@ -958,6 +1013,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "/etc/passwd",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::Existing,
@@ -972,6 +1028,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "../sibling/x.py",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::Existing,
@@ -986,6 +1043,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/bad\u{0007}.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::Existing,
@@ -1000,6 +1058,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "node_modules/foo/index.js",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::RepoEdit {
@@ -1017,6 +1076,7 @@ mod tests {
         let big = "a/".repeat(MAX_ARTIFACT_LEDGER_PATH_BYTES) + "x.py";
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             &big,
             ArtifactRole::Implementation,
             AdmissionOriginInputs::Existing,
@@ -1032,6 +1092,7 @@ mod tests {
         // `expected_role = Test` but path is clearly not a test file.
         let acc = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "src/lib.rs",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1061,6 +1122,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "alias.py",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::RepoEdit {
@@ -1441,6 +1503,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1494,6 +1557,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/new.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1518,6 +1582,7 @@ mod tests {
         let scope = single_root_scope();
         let acc = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/new_test.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1547,6 +1612,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/test_a.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {

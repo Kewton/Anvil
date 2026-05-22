@@ -913,6 +913,34 @@ pub struct Agent {
     /// `last_active_job_selection`. `SessionSnapshot` / `CaseRecord` /
     /// `EvalTurnRecord` persistence schemas remain unchanged by Issue #666.
     pub(in crate::agent::loop_run) job_report_dedup_keys: std::collections::HashSet<String>,
+    /// Issue #661 Task 2.6 (DR1-004): per-turn dedup state for the
+    /// `agent.verifier.invoked` structured log event. Holds the 8-byte digest
+    /// of the most recent emit's canonical-JSON payload (`mask_payload_inplace`
+    /// applied first — same masking as the value the log consumer sees).
+    /// Reset to `None` at the head of every `handle_user_message`, alongside
+    /// `last_active_job_selection` / `safe_stop_report_emitted` (per-turn
+    /// reset group locality, DR1-010).
+    ///
+    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
+    /// persistence schemas are unchanged by Issue #661 (in-memory only).
+    /// Iteration-3 wires the producer (see design 5-2 DR1-005):
+    /// `turn.rs::run_task_contract_verifier_once` and
+    /// `verifier_skill.rs::execute_with_invocation_observer`.
+    #[allow(dead_code)]
+    // Iteration-3 wires production update sites; until then only the per-turn reset semantics are exercised.
+    pub(in crate::agent::loop_run) last_verifier_invoked_payload_digest: Option<[u8; 8]>,
+    /// Issue #661 Task 2.6 (DR1-010): per-turn cap for the
+    /// `agent.verifier.external_import_rejected` structured log event.
+    /// Set to `true` after the first emit so duplicate detections inside
+    /// the same turn do not amplify event cardinality. Reset to `false`
+    /// at the head of every `handle_user_message`, mirroring
+    /// `last_verifier_invoked_payload_digest`.
+    ///
+    /// NOT serialized (same rationale as
+    /// `last_verifier_invoked_payload_digest`).
+    #[allow(dead_code)]
+    // Iteration-3 wires the production producer (external_import detection in run_structured); until then only the per-turn reset semantics are exercised.
+    pub(in crate::agent::loop_run) external_import_rejected_emitted_this_turn: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1148,6 +1176,11 @@ impl Agent {
             last_behavior_contract_projection_event: None,
             artifact_ledger: artifact_ledger::ArtifactLedger::new(),
             job_report_dedup_keys: std::collections::HashSet::new(),
+            // Issue #661 Task 2.6: per-turn dedup state for
+            // `agent.verifier.invoked` + `agent.verifier.external_import_rejected`.
+            // Reset at handle_user_message head; producers land in iteration-3.
+            last_verifier_invoked_payload_digest: None,
+            external_import_rejected_emitted_this_turn: false,
         }
     }
 

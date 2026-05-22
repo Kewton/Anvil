@@ -455,6 +455,353 @@ impl AgentSkill for VerifierSkill {
     }
 }
 
+impl VerifierSkill {
+    /// Issue #661 iteration-4 Task 5.3 (DR1-005 / DR2-001 regression guard):
+    /// pre-spawn observer-aware variant of the structured verifier path.
+    ///
+    /// Order of operations (DR1-005 emit ownership):
+    ///   1. Detect the `OwnedTestVerifierPlan` via
+    ///      `AutoTestRunner::detect_with_owned_test_artifacts`.
+    ///   2. For `Runnable`: build the pre-spawn `VerifierInvokedSnapshot`
+    ///      and call `on_pre_spawn(snapshot)` BEFORE `run_structured`
+    ///      spawns the verifier process. The callback owns the emit +
+    ///      dedup (`turn.rs::emit_agent_verifier_invoked_if_new`).
+    ///   3. Spawn via `AutoTestRunner::run_structured` and map the result
+    ///      into `VerifierOutcome`.
+    ///
+    /// `AgentSkill::execute` keeps its existing signature unchanged
+    /// (DR2-001). The trait method bypasses this observer hook entirely
+    /// so the skills framework callers (skills mod) preserve their
+    /// pre-#661 behavior.
+    ///
+    /// Preconditions: caller must have validated `should_dispatch_success_verifier`
+    /// and ensured `inputs.test_execution_required && inputs.protocol_demands_verifier`
+    /// hold. The legacy path (`test_execution_required = false`) MUST go
+    /// through `AgentSkill::execute` so this method does not need to fall
+    /// back to it.
+    #[allow(dead_code)] // wired by `turn.rs::run_post_loop_success_verifier` callers in iteration-4 Task 5.4 if structured post-loop emit is enabled
+    pub(super) fn execute_with_invocation_observer(
+        &mut self,
+        inputs: VerifierInputs<'_>,
+        on_pre_spawn: &mut dyn FnMut(&super::auto_test::VerifierInvokedSnapshot),
+    ) -> VerifierOutcome {
+        debug_assert!(
+            inputs.test_execution_required && inputs.protocol_demands_verifier,
+            "execute_with_invocation_observer must only be entered on the structured path"
+        );
+        // CB-005 runtime gate (release build でも有効): facade dispatch を
+        // bypass されても、AgentSkill::execute と同じ早期 return 条件を
+        // 必ず強制する。これにより `should_dispatch_success_verifier=false`
+        // / `auto_test_disabled` / `test_execution_required=false` のいずれ
+        // でも `Skipped` を返し、observer callback を発火させない。
+        let bypass_score =
+            || compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+        if !inputs.test_execution_required || !inputs.protocol_demands_verifier {
+            return VerifierOutcome::Skipped {
+                score: bypass_score(),
+            };
+        }
+        if !inputs.should_dispatch_success_verifier {
+            return VerifierOutcome::Skipped {
+                score: bypass_score(),
+            };
+        }
+        if auto_test_disabled(|k| std::env::var(k)) {
+            return VerifierOutcome::Skipped {
+                score: bypass_score(),
+            };
+        }
+        let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            inputs.workspace_root,
+            inputs.changed_files,
+            inputs.recent_successful_bash_commands,
+            inputs.owned_test_artifacts,
+        );
+        match owned_plan {
+            OwnedTestVerifierPlan::Runnable { plan, command } => {
+                let display_command = command.to_display_string();
+                // DR1-005: pre-spawn snapshot + callback BEFORE
+                // `run_structured`. The callback owns the dedup-aware
+                // `agent.verifier.invoked` emit; this method never calls
+                // `log_llm_event` directly so the emit ownership stays in
+                // `turn.rs` (Agent-side dedup state).
+                //
+                // Issue #661 iteration-5 Task 6.2: pass runner-specific
+                // extras (VERIFIER_ENV_PYTHON_EXTRA for python3) so the
+                // pre-spawn snapshot mirrors the execution-time env plan
+                // built inside `run_structured`.
+                let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
+                    "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
+                    _ => &[],
+                };
+                let env_plan = super::auto_test::build_hermetic_env_plan(
+                    inputs.workspace_root,
+                    extras_for_emit,
+                );
+                if let Some(snapshot) =
+                    super::auto_test::VerifierInvokedSnapshot::from_command_and_env(
+                        &command, &env_plan,
+                    )
+                {
+                    on_pre_spawn(&snapshot);
+                }
+                match AutoTestRunner::run_structured(
+                    inputs.workspace_root,
+                    inputs.workspace_scope,
+                    &command,
+                    &display_command,
+                ) {
+                    Ok(result) => {
+                        let summary = build_anvil_test_summary_for_skill(&plan, &result);
+                        let score = compute_anvil_score(
+                            &inputs.score_inputs,
+                            inputs.repo_verification,
+                            Some(&summary),
+                        );
+                        let combined_output = combined_output_for_classify(&result);
+                        let feedback = Some(super::turn::build_feedback_for_auto_test(
+                            &plan,
+                            &result,
+                            inputs.workspace_root,
+                            inputs.changed_files,
+                        ));
+                        VerifierOutcome::AutoTestRan {
+                            score,
+                            auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),
+                            auto_test_passed: result.passed,
+                            auto_test_command: result.command.clone(),
+                            auto_test_output: result.output.clone(),
+                            auto_test_reason: plan.reason.clone(),
+                            anvil_test_summary: summary,
+                            feedback,
+                            auto_test_combined_output: combined_output,
+                        }
+                    }
+                    Err(error) => {
+                        let score = compute_anvil_score(
+                            &inputs.score_inputs,
+                            inputs.repo_verification,
+                            None,
+                        );
+                        VerifierOutcome::AutoTestTransportError { score, error }
+                    }
+                }
+            }
+            OwnedTestVerifierPlan::Weak {
+                detected_source, ..
+            } => {
+                let score =
+                    compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+                VerifierOutcome::Weak {
+                    score,
+                    owned_test_artifacts_count: inputs.owned_test_artifacts.len(),
+                    command_runner: detected_source,
+                }
+            }
+            OwnedTestVerifierPlan::Missing => {
+                let score =
+                    compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+                VerifierOutcome::Missing {
+                    score,
+                    owned_test_artifacts_count: inputs.owned_test_artifacts.len(),
+                }
+            }
+        }
+    }
+}
+
+/// CB-012 (Codex iteration-5 medium): observation carried to the external-
+/// import callback by the post-loop structured verifier path. Each variant
+/// matches one of the `agent.verifier.external_import_rejected` emit
+/// reasons used by `turn.rs::run_task_contract_verifier_once`. The
+/// callback contract is "raw paths never leak past the SSOT
+/// `mask_secrets` + `stable_path_hash` boundary"; the variants therefore
+/// already carry pre-hashed `path_hash` strings rather than raw paths.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired by `execute_with_full_observers` callers
+pub(super) enum ExternalImportObservation {
+    /// Pre-execution PYTHONPATH check found at least one work_root-external
+    /// component. `path_hash` is the SSOT-hashed raw substring.
+    PythonpathRejected { path_hash: String },
+    /// Post-execution stdout/stderr scan found one-or-more external
+    /// workspace imports. `path_hashes` are SSOT-hashed (mask_secrets +
+    /// stable_path_hash) raw substrings, capped at
+    /// `EXTERNAL_IMPORT_DETECTED_CAP`. `total_count` and `truncated`
+    /// reflect the pre-cap full count (CB-009 contract).
+    StdoutStderrDetected {
+        path_hashes: Vec<String>,
+        total_count: usize,
+        truncated: bool,
+    },
+}
+
+impl VerifierSkill {
+    /// CB-012 (Codex iteration-5 medium): observer-aware variant of
+    /// `execute_with_invocation_observer` that ALSO fires an external-
+    /// import callback for the same two signals `turn.rs` emits inline
+    /// (`external_pythonpath_rejected` + `external_import_detected`).
+    /// `execute_with_invocation_observer` continues to exist with its
+    /// existing signature for backward compatibility, but it delegates
+    /// here with a no-op external-import observer.
+    ///
+    /// Order of operations (mirrors `execute_with_invocation_observer`):
+    ///   1. Bypass gates (test_execution_required / dispatch / disabled).
+    ///   2. Detect `OwnedTestVerifierPlan`.
+    ///   3. For Runnable: build env_plan, fire pre-spawn callback, fire
+    ///      external-import callback for any PYTHONPATH rejection, spawn
+    ///      `run_structured`, then fire external-import callback for any
+    ///      stdout/stderr detection. The callback owns the
+    ///      `Agent::emit_agent_verifier_external_import_rejected_if_first`
+    ///      per-turn cap on the receiving side.
+    #[allow(dead_code)] // wired by post-loop callers that need external-import emit parity
+    pub(super) fn execute_with_full_observers(
+        &mut self,
+        inputs: VerifierInputs<'_>,
+        on_pre_spawn: &mut dyn FnMut(&super::auto_test::VerifierInvokedSnapshot),
+        on_external_import: &mut dyn FnMut(&str, &ExternalImportObservation),
+    ) -> VerifierOutcome {
+        debug_assert!(
+            inputs.test_execution_required && inputs.protocol_demands_verifier,
+            "execute_with_full_observers must only be entered on the structured path"
+        );
+        let bypass_score =
+            || compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+        if !inputs.test_execution_required || !inputs.protocol_demands_verifier {
+            return VerifierOutcome::Skipped {
+                score: bypass_score(),
+            };
+        }
+        if !inputs.should_dispatch_success_verifier {
+            return VerifierOutcome::Skipped {
+                score: bypass_score(),
+            };
+        }
+        if auto_test_disabled(|k| std::env::var(k)) {
+            return VerifierOutcome::Skipped {
+                score: bypass_score(),
+            };
+        }
+        let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            inputs.workspace_root,
+            inputs.changed_files,
+            inputs.recent_successful_bash_commands,
+            inputs.owned_test_artifacts,
+        );
+        match owned_plan {
+            OwnedTestVerifierPlan::Runnable { plan, command } => {
+                let display_command = command.to_display_string();
+                let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
+                    "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
+                    _ => &[],
+                };
+                let env_plan = super::auto_test::build_hermetic_env_plan(
+                    inputs.workspace_root,
+                    extras_for_emit,
+                );
+                if let Some(snapshot) =
+                    super::auto_test::VerifierInvokedSnapshot::from_command_and_env(
+                        &command, &env_plan,
+                    )
+                {
+                    on_pre_spawn(&snapshot);
+                }
+                // CB-012 step (3a): pre-execution PYTHONPATH rejection.
+                if let Some(hash) = env_plan.rejected_pythonpath_hash() {
+                    on_external_import(
+                        command.runner(),
+                        &ExternalImportObservation::PythonpathRejected { path_hash: hash },
+                    );
+                }
+                match AutoTestRunner::run_structured(
+                    inputs.workspace_root,
+                    inputs.workspace_scope,
+                    &command,
+                    &display_command,
+                ) {
+                    Ok(result) => {
+                        // CB-012 step (3b): post-execution stdout/stderr scan.
+                        let detected = super::auto_test::detect_external_imports_in_output(
+                            inputs.workspace_root,
+                            &result.stdout,
+                            &result.stderr,
+                        );
+                        if !detected.entries.is_empty() {
+                            let path_hashes: Vec<String> = detected
+                                .entries
+                                .iter()
+                                .map(|raw| {
+                                    crate::logging::stable_path_hash(
+                                        &crate::session::feedback::mask_secrets(raw),
+                                    )
+                                })
+                                .collect();
+                            on_external_import(
+                                command.runner(),
+                                &ExternalImportObservation::StdoutStderrDetected {
+                                    path_hashes,
+                                    total_count: detected.total_count,
+                                    truncated: detected.truncated,
+                                },
+                            );
+                        }
+                        let summary = build_anvil_test_summary_for_skill(&plan, &result);
+                        let score = compute_anvil_score(
+                            &inputs.score_inputs,
+                            inputs.repo_verification,
+                            Some(&summary),
+                        );
+                        let combined_output = combined_output_for_classify(&result);
+                        let feedback = Some(super::turn::build_feedback_for_auto_test(
+                            &plan,
+                            &result,
+                            inputs.workspace_root,
+                            inputs.changed_files,
+                        ));
+                        VerifierOutcome::AutoTestRan {
+                            score,
+                            auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),
+                            auto_test_passed: result.passed,
+                            auto_test_command: result.command.clone(),
+                            auto_test_output: result.output.clone(),
+                            auto_test_reason: plan.reason.clone(),
+                            anvil_test_summary: summary,
+                            feedback,
+                            auto_test_combined_output: combined_output,
+                        }
+                    }
+                    Err(error) => {
+                        let score = compute_anvil_score(
+                            &inputs.score_inputs,
+                            inputs.repo_verification,
+                            None,
+                        );
+                        VerifierOutcome::AutoTestTransportError { score, error }
+                    }
+                }
+            }
+            OwnedTestVerifierPlan::Weak {
+                detected_source, ..
+            } => {
+                let score =
+                    compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+                VerifierOutcome::Weak {
+                    score,
+                    owned_test_artifacts_count: inputs.owned_test_artifacts.len(),
+                    command_runner: detected_source,
+                }
+            }
+            OwnedTestVerifierPlan::Missing => {
+                let score =
+                    compute_anvil_score(&inputs.score_inputs, inputs.repo_verification, None);
+                VerifierOutcome::Missing {
+                    score,
+                    owned_test_artifacts_count: inputs.owned_test_artifacts.len(),
+                }
+            }
+        }
+    }
+}
+
 /// turn.rs の private fn `build_anvil_test_summary` を VerifierSkill 側でも参照するため
 /// 内部で同じロジックを再現する (本 Issue では turn.rs 側を pub(super) に昇格しない方針、
 /// 設計方針書 §11 で将来 Issue に申し送り)。
