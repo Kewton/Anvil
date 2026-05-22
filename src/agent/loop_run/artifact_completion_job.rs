@@ -233,20 +233,43 @@ impl ArtifactAttemptOutcome {
 }
 
 /// Lifecycle state of an `ArtifactCompletionJob`.
+///
+/// Issue #663 (AD1 / NG4a): parent enum intentionally does NOT carry
+/// `#[non_exhaustive]` — exhaustive match across in-crate callers is the
+/// SSOT for variant-coverage compile-time enforcement (DR1-004 平行ポリシー).
+/// Variant additions in the future must update every in-crate match site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ArtifactCompletionStatus {
-    /// Budget not yet exhausted. `remaining_budget()` is computed from
-    /// `total_budget - attempts.len()` — there is no separate counter
-    /// field (DR1-008 / DR2-005).
-    InFlight,
-    /// Completion observed (admitted by `role_from_repo_edit` /
-    /// `task_contract_evidence_set_this_turn` SSOT in turn.rs). The
-    /// `record_completion` accessor is part of the state-machine surface
-    /// pinned by unit tests; #654 will wire it explicitly once the
-    /// persisted report contract lands.
+    /// `RecoveryTargetHint` absent — target not yet confirmed.
+    /// `remaining_budget()` is the full budget; `record_attempt` is a no-op
+    /// so PendingTarget → Exhausted is type-level impossible (R5 / DR1-005).
+    ///
+    /// Issue #663 (Phase A): variant reachable via the future
+    /// `new_pending_target()` constructor (added by Phase A.4 in the next
+    /// PR slice). Today the variant exists for state-machine completeness
+    /// and is pinned by `test_artifact_completion_status_five_variants_*`.
     #[allow(dead_code)]
-    // constructed only in tests today; #654 lands the production constructor.
-    Completed,
+    PendingTarget,
+    /// Target confirmed, no matching RepoEdit observed in the ledger yet.
+    /// `record_attempt` decrements the budget here (and only here / from
+    /// `EvidenceObserved`).
+    ///
+    /// Compatibility alias for the legacy `InFlight` variant — the
+    /// state-machine surface widens to 5 states in Issue #663 while keeping
+    /// the same default starting state for jobs constructed with a target.
+    AwaitingEdit,
+    /// Ledger has at least one matching RepoEdit event for `role`; the
+    /// `RequiredArtifactsProjection`-driven Satisfied check is the next
+    /// transition target. Budget still decrements on further attempts.
+    EvidenceObserved,
+    /// `ArtifactLedger::required_artifacts_completed_projection` has
+    /// reported the role `true`. This is the SSOT terminal state for
+    /// "completion observed" (Issue #663 AD2).
+    ///
+    /// `record_completion` is retained as a `#[deprecated]` adapter for the
+    /// implicit observation path that #654 inherited; production wiring
+    /// must now route through `record_satisfied_from_ledger`.
+    Satisfied,
     Exhausted {
         reason: ExhaustedReason,
     },
@@ -254,11 +277,15 @@ pub(super) enum ArtifactCompletionStatus {
 
 /// Reason an `ArtifactCompletionJob` exhausted its budget.
 ///
-/// Issue #652 ships exactly one variant (design judgement #9 / YAGNI). New
-/// variants must come with a designed detection condition; today's only
-/// detector is "budget consumed without completion".
+/// Issue #663 (AD1 / DR1-003): `#[non_exhaustive]` is intentionally
+/// applied so future reasons (e.g. ledger overflow, pending-target
+/// timeout) can be added additively without breaking in-crate match
+/// arms — OCP (Open-Closed Principle).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExhaustedReason {
+    /// Budget (`ARTIFACT_COMPLETION_ATTEMPT_LIMIT`) consumed without
+    /// completion. Today the only detector.
     BudgetExceeded,
 }
 
@@ -384,7 +411,10 @@ impl ArtifactCompletionJob {
             allowed_read_scope: AllowedReadScope::TargetOnly,
             attempts: Vec::new(),
             total_budget: ARTIFACT_COMPLETION_ATTEMPT_LIMIT,
-            status: ArtifactCompletionStatus::InFlight,
+            // Issue #663 (Phase A): a job built with a confirmed target starts
+            // in `AwaitingEdit` (the renamed `InFlight`). Jobs without a target
+            // are built via constructor variants in later Issues.
+            status: ArtifactCompletionStatus::AwaitingEdit,
         })
     }
 
@@ -424,28 +454,40 @@ impl ArtifactCompletionJob {
     }
 
     /// Remaining attempts before exhaustion. Returns `0` once the job has
-    /// reached `Completed` or `Exhausted` regardless of `attempts.len()`.
+    /// reached `Satisfied` / `Exhausted` regardless of `attempts.len()`.
+    ///
+    /// Issue #663 (AD1 / R5): `PendingTarget` returns the full budget —
+    /// `record_attempt` is a no-op in PendingTarget so the budget is never
+    /// consumed before a target is confirmed (type-level prevention of
+    /// PendingTarget → Exhausted direct transition).
     #[allow(dead_code)] // pinned by unit tests; turn.rs reads `status()` directly.
     pub(super) fn remaining_budget(&self) -> usize {
         match self.status {
-            ArtifactCompletionStatus::InFlight => {
+            ArtifactCompletionStatus::PendingTarget => self.total_budget,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved => {
                 self.total_budget.saturating_sub(self.attempts.len())
             }
-            _ => 0,
+            ArtifactCompletionStatus::Satisfied | ArtifactCompletionStatus::Exhausted { .. } => 0,
         }
     }
 
     /// Append `outcome` to the attempt history and possibly transition the
-    /// status. Returns the new status (`InFlight` or
-    /// `Exhausted { BudgetExceeded }`).
+    /// status. Returns the new status (`AwaitingEdit` /
+    /// `EvidenceObserved` / `Exhausted { BudgetExceeded }`).
     ///
-    /// A no-op on `Completed` / `Exhausted` jobs (returns the current
-    /// status). This keeps the state machine total / monotonic.
+    /// Issue #663 (AD1 / R5 / DR1-005): no-op when the status is NOT one of
+    /// `AwaitingEdit` / `EvidenceObserved`. Specifically PendingTarget is
+    /// rejected here so the budget never decrements before a target is
+    /// confirmed (type-level prevention of `PendingTarget → Exhausted` direct
+    /// transition). Also no-op for terminal states (Satisfied / Exhausted).
     pub(super) fn record_attempt(
         &mut self,
         outcome: ArtifactAttemptOutcome,
     ) -> ArtifactCompletionStatus {
-        if !matches!(self.status, ArtifactCompletionStatus::InFlight) {
+        if !matches!(
+            self.status,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved
+        ) {
             return self.status.clone();
         }
         self.attempts.push(outcome);
@@ -457,17 +499,80 @@ impl ArtifactCompletionJob {
         self.status.clone()
     }
 
-    /// Mark the job `Completed`. No-op on `Completed` / `Exhausted`.
+    /// Legacy adapter for the implicit-observation Satisfied transition.
     ///
-    /// Today `turn.rs` does not call this directly — completion is observed
-    /// implicitly via the existing `task_contract_evidence_set_this_turn`
-    /// SSOT (`role_from_repo_edit` admission). The method is part of the
-    /// state-machine API so #654 can move to an explicit "ack completion"
-    /// signal once the persisted report contract lands.
-    #[allow(dead_code)] // pinned by unit tests; #654 will consume this entry.
+    /// Issue #663 (AD2): the production Satisfied transition now flows
+    /// through `record_satisfied_from_ledger(&RequiredArtifactsProjection)`
+    /// — the ledger projection is the single source of truth (SSOT 1 本).
+    /// This method is retained as a legacy adapter for the existing unit
+    /// tests that pre-date #659 ledger projection wiring; new callers must
+    /// not use it. Removal is tracked in the legacy
+    /// `contract_completion_role_retries` follow-up Issue.
+    ///
+    /// Issue #663 (Codex CB-005 fix): `#[deprecated]` is applied so any
+    /// new production caller fails the
+    /// `cargo clippy --all-targets -- -D warnings` quality gate. The
+    /// `#[cfg(test)]` gate further confines the function to the test
+    /// build — production binaries will not link this code path. The
+    /// only sanctioned Satisfied-transition entry point is
+    /// `record_satisfied_from_ledger`.
+    #[cfg(test)]
+    #[deprecated(
+        since = "0.6.0",
+        note = "Use `record_satisfied_from_ledger(&RequiredArtifactsProjection)` instead. \
+                This adapter bypasses the ledger projection SSOT and is kept only \
+                for legacy unit-test fixtures (Issue #663 / CB-005)."
+    )]
     pub(super) fn record_completion(&mut self) {
-        if matches!(self.status, ArtifactCompletionStatus::InFlight) {
-            self.status = ArtifactCompletionStatus::Completed;
+        if matches!(
+            self.status,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved
+        ) {
+            self.status = ArtifactCompletionStatus::Satisfied;
+        }
+    }
+
+    /// AwaitingEdit → EvidenceObserved transition. Called by `turn.rs` when
+    /// the ledger records a RepoEdit event for this role. No-op for
+    /// non-progressive states (PendingTarget / EvidenceObserved /
+    /// Satisfied / Exhausted).
+    ///
+    /// Issue #663 (AD1): this is the intermediate evidence stage between
+    /// "target confirmed" and "ledger projection confirms role complete".
+    #[allow(dead_code)] // wired by turn.rs::observe_evidence_from_repo_edit in future caller.
+    pub(super) fn record_repo_edit_observed(&mut self) {
+        if matches!(self.status, ArtifactCompletionStatus::AwaitingEdit) {
+            self.status = ArtifactCompletionStatus::EvidenceObserved;
+        }
+    }
+
+    /// Issue #663 (AD2 / DR1-001): Satisfied transition SSOT.
+    ///
+    /// Accepts a `RequiredArtifactsProjection` borrowed from the
+    /// `ArtifactLedger`. status guard集約: this method is the single site
+    /// that pre-filters by status, so caller chokepoints (e.g.
+    /// `refresh_artifact_completion_satisfied`) do NOT replicate the
+    /// guard. Fail-closed on `projection.overflowed() == true`.
+    #[allow(dead_code)] // wired by turn.rs::refresh_artifact_completion_satisfied chokepoint.
+    pub(super) fn record_satisfied_from_ledger(
+        &mut self,
+        projection: &super::artifact_ledger::RequiredArtifactsProjection,
+    ) {
+        // status guard — record_satisfied_from_ledger is the SSOT for the
+        // 1-line `if !matches!(...) { return; }` filter (DR1-001 SSOT集約).
+        if !matches!(
+            self.status,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved
+        ) {
+            return;
+        }
+        // fail-closed: when the ledger has overflowed, no role is
+        // considered satisfied (R1 / DR3-002).
+        if projection.overflowed() {
+            return;
+        }
+        if projection.is_satisfied(self.role) {
+            self.status = ArtifactCompletionStatus::Satisfied;
         }
     }
 
@@ -670,7 +775,12 @@ mod tests {
         .expect("valid target must be accepted");
         assert_eq!(job.role(), ArtifactRole::Test);
         assert_eq!(job.target_path(), "tests/test_foo.py");
-        assert!(matches!(job.status(), ArtifactCompletionStatus::InFlight));
+        // Issue #663 (Phase A): job with confirmed target starts in
+        // `AwaitingEdit` (renamed from `InFlight`).
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
         assert_eq!(job.remaining_budget(), ARTIFACT_COMPLETION_ATTEMPT_LIMIT);
     }
 
@@ -852,7 +962,11 @@ mod tests {
     }
 
     #[test]
-    fn test_record_completion_moves_to_completed_state() {
+    fn test_record_completion_moves_to_satisfied_state() {
+        // Issue #663 (Phase A): `Completed` is renamed to `Satisfied`.
+        // The legacy `record_completion()` adapter still operates on the
+        // new 5-state machine, transitioning `AwaitingEdit` →
+        // `Satisfied` for legacy test fixtures.
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -863,9 +977,191 @@ mod tests {
             false,
         )
         .unwrap();
+        // CB-005: deliberate use of the legacy adapter for pre-#659
+        // regression coverage. Production callers must use
+        // `record_satisfied_from_ledger`.
+        #[allow(deprecated)]
         job.record_completion();
-        assert!(matches!(job.status(), ArtifactCompletionStatus::Completed));
+        assert!(matches!(job.status(), ArtifactCompletionStatus::Satisfied));
         assert_eq!(job.remaining_budget(), 0);
+    }
+
+    /// Issue #663 (Phase A / Task A.1): regression — `ExhaustedReason` is
+    /// `#[non_exhaustive]` so future additive variants do not break in-crate
+    /// match arms (DR1-003 / OCP). The check is structural — adding a new
+    /// reason variant must not break this assertion.
+    ///
+    /// We intentionally include a wildcard arm to document that callers
+    /// outside the defining module would need one. Clippy's
+    /// `unreachable_patterns` lint is suppressed because today there is
+    /// exactly one variant, but the suppression is the regression anchor
+    /// for the `#[non_exhaustive]` policy.
+    #[test]
+    #[allow(unreachable_patterns)]
+    fn test_exhausted_reason_non_exhaustive_marker() {
+        let reason = ExhaustedReason::BudgetExceeded;
+        // Must compile against `_` arm because `#[non_exhaustive]` is in
+        // effect (parent enum still exhaustive — DR1-004 平行ポリシー).
+        let label = match reason {
+            ExhaustedReason::BudgetExceeded => "budget_exceeded",
+            _ => "future_variant",
+        };
+        assert_eq!(label, "budget_exceeded");
+    }
+
+    /// Issue #663 (Phase A / Task A.2): 5 variants are reachable
+    /// — `PendingTarget`, `AwaitingEdit`, `EvidenceObserved`, `Satisfied`,
+    /// `Exhausted`. Parent enum is exhaustive (DR1-004 平行ポリシー).
+    #[test]
+    fn test_artifact_completion_status_five_variants_exhaustive_match() {
+        for status in [
+            ArtifactCompletionStatus::PendingTarget,
+            ArtifactCompletionStatus::AwaitingEdit,
+            ArtifactCompletionStatus::EvidenceObserved,
+            ArtifactCompletionStatus::Satisfied,
+            ArtifactCompletionStatus::Exhausted {
+                reason: ExhaustedReason::BudgetExceeded,
+            },
+        ] {
+            let label: &'static str = match &status {
+                ArtifactCompletionStatus::PendingTarget => "pending_target",
+                ArtifactCompletionStatus::AwaitingEdit => "awaiting_edit",
+                ArtifactCompletionStatus::EvidenceObserved => "evidence_observed",
+                ArtifactCompletionStatus::Satisfied => "satisfied",
+                ArtifactCompletionStatus::Exhausted { .. } => "exhausted",
+            };
+            assert!(!label.is_empty());
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #663 Phase B: record_satisfied_from_ledger SSOT (AD2 / DR1-001)
+    // ----------------------------------------------------------------
+
+    /// Build a tiny `RequiredArtifactsProjection` via the public ledger
+    /// API. The `RequiredArtifactsProjection` constructor is private to
+    /// `artifact_ledger.rs` (DR4-001) — tests therefore route through the
+    /// real ledger to get a forge-safe projection.
+    fn projection_for(
+        role: ArtifactRole,
+        completed: bool,
+    ) -> crate::agent::loop_run::artifact_ledger::RequiredArtifactsProjection {
+        use crate::agent::loop_run::artifact_ledger::ArtifactLedger;
+        use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
+        use crate::agent::loop_run::task_workspace_scope::{ScopeMode, TaskWorkspaceScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("tests/test_a.py"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        let scope = TaskWorkspaceScope {
+            mode: ScopeMode::SingleProjectRoot,
+        };
+        let mut ledger = ArtifactLedger::new();
+        if completed {
+            let path = match role {
+                ArtifactRole::Test => "tests/test_a.py",
+                ArtifactRole::Implementation => "src/lib.rs",
+                _ => "src/lib.rs",
+            };
+            ledger.record_repo_edit_event(
+                &LedgerAdmissionContext::new(dir.path(), &scope),
+                path.to_string(),
+                role,
+                true,
+            );
+        }
+        let contract = super::super::task_contract::TaskContract {
+            intent: super::super::task_contract::TaskIntent::Build,
+            required_artifacts: vec![role],
+            optional_artifacts: vec![],
+            verification_required: true,
+            required_behavior:
+                crate::agent::loop_run::required_behavior::RequiredBehaviorContract {
+                    operations: None,
+                    domain_terms: None,
+                    interface_hints: None,
+                    required_artifacts: None,
+                    verification: None,
+                    confidence: 0.0,
+                    test_execution_required: false,
+                    behavior_goal: None,
+                    required_capabilities: None,
+                    verification_expectations: None,
+                    non_goals: None,
+                },
+        };
+        ledger.required_artifacts_completed_projection(&contract)
+    }
+
+    #[test]
+    fn test_record_satisfied_from_ledger_transitions_to_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
+        let p = projection_for(ArtifactRole::Test, true);
+        job.record_satisfied_from_ledger(&p);
+        assert!(matches!(job.status(), ArtifactCompletionStatus::Satisfied));
+    }
+
+    #[test]
+    fn test_record_satisfied_from_ledger_role_not_satisfied_remains_awaiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        let p = projection_for(ArtifactRole::Test, false);
+        job.record_satisfied_from_ledger(&p);
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
+    }
+
+    /// Issue #663 (Phase A / Task A.4 / R5): `record_repo_edit_observed`
+    /// transitions `AwaitingEdit` → `EvidenceObserved`. Non-progressive
+    /// states are no-ops.
+    #[test]
+    fn test_record_repo_edit_observed_advances_awaiting_to_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        job.record_repo_edit_observed();
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::EvidenceObserved
+        ));
+        // Re-calling is a no-op (already EvidenceObserved).
+        job.record_repo_edit_observed();
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::EvidenceObserved
+        ));
     }
 
     #[test]

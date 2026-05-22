@@ -326,3 +326,61 @@ fn repair_exhausted_linkage_propagates_to_three_reports() {
         );
     }
 }
+
+/// Issue #663 (Codex CB-003 regression guard): when multiple `StopReason`
+/// variants land in `safe_stop_report_emitted` during the same turn, the
+/// `SafeStopLinkage.reason` carried by the end-of-turn finalizer must be
+/// deterministic across runs. The previous implementation used
+/// `HashSet::iter().next()` which surfaced a non-deterministic reason; the
+/// fix uses a fixed priority order anchored against the variant declaration
+/// order in `repair_job.rs::StopReason`.
+///
+/// This test drives the *snapshot* code path (no linkage override) so the
+/// priority selector inside `snapshot_safe_stop_linkage` is what produces
+/// the linkage reason — not the synthetic test-seam override.
+#[test]
+fn snapshot_safe_stop_linkage_is_deterministic_for_multiple_reasons() {
+    use crate::agent::loop_run::repair_job::StopReason;
+
+    let session_id = unique_session_id("cb003");
+    let _ = shared_log_path();
+    let (mut agent, _td) = build_live_agent(&session_id);
+
+    // Inject TWO reasons via the agent dedup set. The HashSet iteration
+    // order is non-deterministic, so the linkage selector MUST pick the
+    // higher-priority reason (ArtifactCompletionFailed comes before
+    // RepairExhausted in the priority list).
+    agent
+        .safe_stop_report_emitted
+        .insert(StopReason::RepairExhausted);
+    agent
+        .safe_stop_report_emitted
+        .insert(StopReason::ArtifactCompletionFailed);
+
+    // Drive the snapshot path directly (NOT via the test-seam override)
+    // so `snapshot_safe_stop_linkage` is the selector that picks `reason`.
+    agent.maybe_emit_job_reports_with_linkage(None);
+
+    // ArtifactCompletionReport is observable here because
+    // `safe_stop.report_emitted` is true once the snapshot reads the
+    // non-empty `safe_stop_report_emitted` set.
+    let recs = events_by_name(&session_id, EVENT_AC);
+    assert!(
+        !recs.is_empty(),
+        "ArtifactCompletionReport must be emitted when safe_stop is observable"
+    );
+    let envelope = recs[0].get("payload").unwrap();
+    let report = envelope
+        .get("payload")
+        .expect("artifact completion envelope must carry inner payload");
+    let safe_stop = report
+        .get("safe_stop")
+        .expect("artifact completion report must carry safe_stop linkage");
+    let reason = safe_stop.get("reason").and_then(|v| v.as_str());
+    assert_eq!(
+        reason,
+        Some("artifact_completion_failed"),
+        "CB-003: linkage reason MUST be deterministic — \
+         artifact_completion_failed has higher priority than repair_exhausted"
+    );
+}

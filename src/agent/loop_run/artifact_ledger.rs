@@ -246,6 +246,41 @@ pub(super) struct TurnSummary {
     pub overflowed: bool,
 }
 
+/// Issue #663 (AD2 / DR1-002 / DR1-009 / DR4-001): forgeability-safe
+/// projection of `required_artifacts_completed` plus the ledger's
+/// `overflowed` flag.
+///
+/// Construction is restricted to
+/// [`ArtifactLedger::required_artifacts_completed_projection`] — fields are
+/// `pub(super)` strictly for in-module test helpers, never written from
+/// outside this module. External callers (e.g. `artifact_completion_job`)
+/// read via `is_satisfied(role)` / `overflowed()` accessors only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RequiredArtifactsProjection {
+    values: BTreeMap<ArtifactRole, bool>,
+    overflowed: bool,
+}
+
+impl RequiredArtifactsProjection {
+    /// Whether the given role has at least one Owned ledger event
+    /// recorded for it during the current turn.
+    ///
+    /// Fail-closed: returns `false` for every role when the ledger has
+    /// overflowed (mirrors the ledger projection's CB-002 contract).
+    pub(super) fn is_satisfied(&self, role: ArtifactRole) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        self.values.get(&role).copied().unwrap_or(false)
+    }
+
+    /// Whether the underlying ledger was in `overflowed=true` state when
+    /// this projection was built.
+    pub(super) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
 impl ArtifactLedger {
     pub(super) fn new() -> Self {
         Self::default()
@@ -588,6 +623,25 @@ impl ArtifactLedger {
         contract: &TaskContract,
     ) -> BTreeMap<ArtifactRole, bool> {
         projection::required_artifacts_completed(self, contract)
+    }
+
+    /// Issue #663 (AD2 / DR1-002 / DR1-009 / DR4-001): forgeability-safe
+    /// projection wrapping the per-role completion view + the ledger's
+    /// `overflowed` flag. The constructor lives in this module only —
+    /// external callers cannot forge a `RequiredArtifactsProjection` and
+    /// must use this accessor.
+    ///
+    /// Fail-closed contract: when the ledger has overflowed, `is_satisfied`
+    /// returns `false` for every role and `overflowed()` returns `true`.
+    pub(super) fn required_artifacts_completed_projection(
+        &self,
+        contract: &TaskContract,
+    ) -> RequiredArtifactsProjection {
+        let values = projection::required_artifacts_completed(self, contract);
+        RequiredArtifactsProjection {
+            values,
+            overflowed: self.overflowed,
+        }
     }
 
     /// Active job candidate roles. Anchor stub returning declaration order
@@ -1888,5 +1942,91 @@ mod tests {
         let expected = stable_path_hash(&mask_secrets(path));
         let hashes = bounded_masked_path_hashes([path].iter().copied());
         assert_eq!(hashes, vec![expected]);
+    }
+
+    // ---- Issue #663 Phase B: RequiredArtifactsProjection -----------------
+
+    #[test]
+    fn required_artifacts_projection_empty_ledger_reports_all_false() {
+        let ledger = ArtifactLedger::new();
+        let contract = TaskContract {
+            intent: super::super::task_contract::TaskIntent::Build,
+            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
+            optional_artifacts: vec![],
+            verification_required: true,
+            required_behavior: test_required_behavior(),
+        };
+        let p = ledger.required_artifacts_completed_projection(&contract);
+        assert!(!p.overflowed());
+        assert!(!p.is_satisfied(ArtifactRole::Implementation));
+        assert!(!p.is_satisfied(ArtifactRole::Test));
+    }
+
+    #[test]
+    fn required_artifacts_projection_marks_role_with_owned_event() {
+        // Issue #663 Phase B Task B.5 — when a role has at least one Owned
+        // RepoEdit event in the ledger, the projection's `is_satisfied`
+        // for that role MUST be `true`.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope();
+        let mut ledger = ArtifactLedger::new();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/test_a.py".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        let contract = TaskContract {
+            intent: super::super::task_contract::TaskIntent::Build,
+            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
+            optional_artifacts: vec![],
+            verification_required: true,
+            required_behavior: test_required_behavior(),
+        };
+        let p = ledger.required_artifacts_completed_projection(&contract);
+        assert!(p.is_satisfied(ArtifactRole::Test));
+        assert!(!p.is_satisfied(ArtifactRole::Implementation));
+        assert!(!p.overflowed());
+    }
+
+    #[test]
+    fn required_artifacts_projection_fail_closed_on_overflow() {
+        // Issue #663 Phase B Task B.5 — when the ledger is overflowed,
+        // `is_satisfied` returns `false` for every role (fail-closed)
+        // regardless of any recorded events. DR1-002 / DR3-002 / R1.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope();
+        let mut ledger = ArtifactLedger::new();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/test_a.py".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        // Force overflowed state directly via append loop until the cap
+        // is exceeded.
+        for i in 0..(MAX_ARTIFACT_LEDGER_EVENTS + 2) {
+            let path = format!("tests/test_overflow_{i}.py");
+            std::fs::write(dir.path().join(&path), "").ok();
+            ledger.record_repo_edit_event(&ctx(dir.path(), &scope), path, ArtifactRole::Test, true);
+        }
+        assert!(ledger.overflowed(), "fixture: ledger must overflow");
+        let contract = TaskContract {
+            intent: super::super::task_contract::TaskIntent::Build,
+            required_artifacts: vec![ArtifactRole::Test],
+            optional_artifacts: vec![],
+            verification_required: true,
+            required_behavior: test_required_behavior(),
+        };
+        let p = ledger.required_artifacts_completed_projection(&contract);
+        assert!(p.overflowed());
+        assert!(
+            !p.is_satisfied(ArtifactRole::Test),
+            "overflowed projection MUST be fail-closed for every role"
+        );
     }
 }
