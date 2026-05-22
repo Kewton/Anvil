@@ -54,6 +54,35 @@ const MAX_ARRAY: usize = 8;
 /// Maximum number of bytes kept per `domain_terms` string.
 const MAX_STR: usize = 64;
 
+/// Issue #665: Maximum bytes for `BoundedLabelWithExcerpt::label`. Re-uses the
+/// existing `MAX_STR` cap to keep all bounded-label fields under the same
+/// limit (design policy §3-5 SSOT).
+pub(super) const LABEL_MAX_LEN: usize = MAX_STR;
+
+/// Issue #665: Maximum bytes for `BoundedLabelWithExcerpt::excerpt`. Set to
+/// `LABEL_MAX_LEN * 4` to allow longer raw user-request fragments while
+/// keeping `behavior_contract` JSON payload bounded.
+pub(super) const EXCERPT_MAX_LEN: usize = LABEL_MAX_LEN * 4;
+
+/// Issue #665: Confidence threshold below which
+/// `project_behavior_contract` returns `None` (the projection is dropped
+/// rather than fed to diagnostic / repair prompts). SSOT for the
+/// "low confidence skip" invariant.
+///
+/// `#[allow(dead_code)]` is intentional until Phase 4 lands the
+/// `project_behavior_contract` accessor that consumes this threshold.
+#[allow(dead_code)]
+pub(super) const LOW_CONFIDENCE_THRESHOLD: f32 = 0.5;
+
+/// Issue #665: Serialized payload size cap for `behavior_contract` JSON
+/// injected into diagnostic / repair prompts. Cap super-set: low-priority
+/// field drop + `truncated=true` metadata when exceeded.
+///
+/// `#[allow(dead_code)]` is intentional until Phase 5 lands the
+/// `verifier_diagnostic_messages` signature extension that enforces this cap.
+#[allow(dead_code)]
+pub(super) const MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES: usize = 1200;
+
 /// Redaction sentinels emitted by [`mask_secrets`] / related helpers. Any
 /// candidate term containing one of these is dropped from `domain_terms`.
 const REDACTION_SENTINELS: &[&str] = &["***", "<REDACTED>"];
@@ -86,10 +115,143 @@ pub(super) struct RequiredBehaviorContract {
     /// `spec` / `テストも実装` (design judgement #1).
     ///
     /// `Default` is intentionally NOT implemented for this struct;
-    /// every literal construction site (7 in this module + 0 elsewhere)
-    /// is updated explicitly so adding a new boolean field stays
-    /// compile-time visible (design policy DR2-006 / DR2-008).
+    /// every literal construction site (now 10 across this module + 1 in
+    /// `artifact_ledger.rs`) is updated explicitly so adding a new field
+    /// stays compile-time visible (design policy DR2-006 / DR2-008).
     pub(super) test_execution_required: bool,
+    /// Issue #665: 1-line summary of the user-stated goal (label + raw
+    /// excerpt). `None` when extraction does not find a deterministic
+    /// match. `behavior_goal` is the only singular-Option field of the
+    /// 4 new fields; the other 3 are `Vec<...>`.
+    pub(super) behavior_goal: Option<BoundedLabelWithExcerpt>,
+    /// Issue #665: Bounded labels for required capabilities. Derived from
+    /// `operations` + `domain_terms` (post-filter source). `excerpt` is
+    /// `None` by policy (S5-003): only `behavior_goal` / `non_goals` carry
+    /// raw excerpts.
+    pub(super) required_capabilities: Option<Vec<BoundedLabelWithExcerpt>>,
+    /// Issue #665: Bounded labels for verification expectations. Derived
+    /// from `verification` (post-filter source). `excerpt` is `None` by
+    /// policy (S5-003).
+    pub(super) verification_expectations: Option<Vec<BoundedLabelWithExcerpt>>,
+    /// Issue #665: Bounded labels + raw excerpts for non-goals (e.g.
+    /// "do not", "X はしない"). Like `behavior_goal`, this field carries
+    /// raw excerpts.
+    pub(super) non_goals: Option<Vec<BoundedLabelWithExcerpt>>,
+}
+
+/// Issue #665: Bounded label + optional raw excerpt value object. Common
+/// shape for the 4 new fields on [`RequiredBehaviorContract`].
+///
+/// - `label`: bounded string (≤ [`LABEL_MAX_LEN`] bytes) derived from a
+///   closed enum or keyword scan.
+/// - `excerpt`: optional raw user-request fragment (≤ [`EXCERPT_MAX_LEN`]
+///   bytes), already passed through [`mask_secrets`] / [`mask_header_family`]
+///   via [`bounded_masked_request`] at the extraction site. `None` for
+///   derived fields (`required_capabilities` / `verification_expectations`)
+///   per design policy S5-003.
+///
+/// `Default` is intentionally NOT implemented (DR2-006 / DR2-008) — every
+/// literal construction site must spell out the value explicitly so adding
+/// a new field stays compile-time visible.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct BoundedLabelWithExcerpt {
+    pub(super) label: String,
+    pub(super) excerpt: Option<String>,
+}
+
+/// Issue #665 — Phase 4: `RequiredBehaviorContract` の diagnostic / repair
+/// 向け縮退表現（sidecar projection）。
+///
+/// `RepairJob` / `VerifierRepairAssessment` に field として保持しない
+/// turn-local computed value（prompt 組立点で都度 build）。命名は
+/// consumer-neutral (`BehaviorContract` prefix) — 同一 projection を
+/// `verifier_diagnostic_messages` / `verifier_repair_pass_messages` /
+/// 将来の `artifact_completion` 等の複数 consumer が読み得る (DR1-010)。
+///
+/// `Eq` は派生しない (`confidence: f32` を含む可能性)。
+/// `Serialize` は本 Issue 範囲外。
+///
+/// **field 設計の非対称性 (設計判断 #7)**: `behavior_goal` のみ singular
+/// `Option<...>`、他 3 フィールドは `Vec<...>`。
+///
+/// `#[allow(dead_code)]` は Phase 5 (turn.rs caller wiring) で
+/// consumer が landing するまで dead_code 警告を抑制。
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct BehaviorContractProjection {
+    pub(super) confidence: f32,
+    /// 走査順は `FIELDS_USED_ORDER` 由来で deterministic (DR1-005)。
+    pub(super) fields_used: Vec<&'static str>,
+    pub(super) behavior_goal: Option<BoundedLabelWithExcerpt>,
+    pub(super) required_capabilities: Vec<BoundedLabelWithExcerpt>,
+    pub(super) verification_expectations: Vec<BoundedLabelWithExcerpt>,
+    pub(super) non_goals: Vec<BoundedLabelWithExcerpt>,
+}
+
+/// Issue #665: deterministic ordering of `fields_used` strings emitted by
+/// [`project_behavior_contract`]. Keeping this in a `const` slice provides
+/// SSOT for both the projection helper and any future observability
+/// assertion tests (DR1-005).
+#[allow(dead_code)]
+pub(super) const FIELDS_USED_ORDER: &[&str] = &[
+    "behavior_goal",
+    "required_capabilities",
+    "verification_expectations",
+    "non_goals",
+];
+
+/// Issue #665 — Phase 4 / S5-001: Build a [`BehaviorContractProjection`] from
+/// a [`super::task_contract::TaskContract`].
+///
+/// Returns `None` when:
+/// - `contract.required_behavior.confidence < LOW_CONFIDENCE_THRESHOLD`,
+/// - or all 4 new fields are unset (no consumable data).
+///
+/// Pure fn / no I/O / no Agent state. Safe to call in deeply nested prompt
+/// build sites.
+///
+/// `#[allow(dead_code)]` は Phase 5 で `turn.rs` caller が landing するまで
+/// dead_code 警告を抑制。
+#[allow(dead_code)]
+pub(super) fn project_behavior_contract(
+    contract: &super::task_contract::TaskContract,
+) -> Option<BehaviorContractProjection> {
+    let rb = &contract.required_behavior;
+    if !rb.confidence.is_finite() || rb.confidence < LOW_CONFIDENCE_THRESHOLD {
+        return None;
+    }
+    let mut fields_used: Vec<&'static str> = Vec::with_capacity(FIELDS_USED_ORDER.len());
+    if rb.behavior_goal.is_some() {
+        fields_used.push("behavior_goal");
+    }
+    if rb
+        .required_capabilities
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+    {
+        fields_used.push("required_capabilities");
+    }
+    if rb
+        .verification_expectations
+        .as_ref()
+        .is_some_and(|v| !v.is_empty())
+    {
+        fields_used.push("verification_expectations");
+    }
+    if rb.non_goals.as_ref().is_some_and(|v| !v.is_empty()) {
+        fields_used.push("non_goals");
+    }
+    if fields_used.is_empty() {
+        return None;
+    }
+    Some(BehaviorContractProjection {
+        confidence: rb.confidence,
+        fields_used,
+        behavior_goal: rb.behavior_goal.clone(),
+        required_capabilities: rb.required_capabilities.clone().unwrap_or_default(),
+        verification_expectations: rb.verification_expectations.clone().unwrap_or_default(),
+        non_goals: rb.non_goals.clone().unwrap_or_default(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +315,15 @@ pub(super) enum SchemaError {
     DomainTermTooLong { len: usize },
     /// `confidence` was non-finite or outside `[0.0, 1.0]`.
     ConfidenceInvalid { value: f32 },
+    /// Issue #665: A [`BoundedLabelWithExcerpt::label`] entry on one of the
+    /// new fields exceeded [`LABEL_MAX_LEN`] bytes. `field` SSOT values:
+    /// `"behavior_goal"` / `"required_capabilities"` /
+    /// `"verification_expectations"` / `"non_goals"`.
+    LabelTooLong { field: &'static str, len: usize },
+    /// Issue #665: A [`BoundedLabelWithExcerpt::excerpt`] entry exceeded
+    /// [`EXCERPT_MAX_LEN`] bytes. `field` uses the same SSOT values as
+    /// [`SchemaError::LabelTooLong`].
+    ExcerptTooLong { field: &'static str, len: usize },
 }
 
 impl std::fmt::Display for SchemaError {
@@ -170,6 +341,15 @@ impl std::fmt::Display for SchemaError {
                     "confidence invalid (must be finite in [0.0, 1.0]): {value}"
                 )
             }
+            SchemaError::LabelTooLong { field, len } => {
+                write!(f, "{field} label too long: {len} > {LABEL_MAX_LEN} bytes")
+            }
+            SchemaError::ExcerptTooLong { field, len } => {
+                write!(
+                    f,
+                    "{field} excerpt too long: {len} > {EXCERPT_MAX_LEN} bytes"
+                )
+            }
         }
     }
 }
@@ -185,6 +365,45 @@ fn check_array_len<T>(field: &'static str, items: Option<&[T]>) -> Result<(), Sc
             field,
             len: items.len(),
         });
+    }
+    Ok(())
+}
+
+/// Issue #665: Validate a single [`BoundedLabelWithExcerpt`]'s `label` and
+/// optional `excerpt` lengths. `field` becomes the SSOT-aligned source name
+/// surfaced by [`SchemaError::LabelTooLong`] / [`SchemaError::ExcerptTooLong`].
+fn validate_label_with_excerpt(
+    field: &'static str,
+    item: &BoundedLabelWithExcerpt,
+) -> Result<(), SchemaError> {
+    if item.label.len() > LABEL_MAX_LEN {
+        return Err(SchemaError::LabelTooLong {
+            field,
+            len: item.label.len(),
+        });
+    }
+    if let Some(excerpt) = item.excerpt.as_ref()
+        && excerpt.len() > EXCERPT_MAX_LEN
+    {
+        return Err(SchemaError::ExcerptTooLong {
+            field,
+            len: excerpt.len(),
+        });
+    }
+    Ok(())
+}
+
+/// Issue #665: Validate an `Option<Vec<BoundedLabelWithExcerpt>>` field
+/// (array length + per-entry label / excerpt).
+fn validate_bounded_label_vec(
+    field: &'static str,
+    items: Option<&[BoundedLabelWithExcerpt]>,
+) -> Result<(), SchemaError> {
+    check_array_len(field, items)?;
+    if let Some(items) = items {
+        for item in items {
+            validate_label_with_excerpt(field, item)?;
+        }
     }
     Ok(())
 }
@@ -217,6 +436,21 @@ impl RequiredBehaviorContract {
         check_array_len("interface_hints", self.interface_hints.as_deref())?;
         check_array_len("required_artifacts", self.required_artifacts.as_deref())?;
         check_array_len("verification", self.verification.as_deref())?;
+        // Issue #665: validate the 4 new fields. `behavior_goal` is singular
+        // so it goes through the per-entry helper directly; the other three
+        // pass through `check_array_len` first.
+        if let Some(goal) = self.behavior_goal.as_ref() {
+            validate_label_with_excerpt("behavior_goal", goal)?;
+        }
+        validate_bounded_label_vec(
+            "required_capabilities",
+            self.required_capabilities.as_deref(),
+        )?;
+        validate_bounded_label_vec(
+            "verification_expectations",
+            self.verification_expectations.as_deref(),
+        )?;
+        validate_bounded_label_vec("non_goals", self.non_goals.as_deref())?;
         Ok(())
     }
 
@@ -335,6 +569,16 @@ pub(super) fn extract(request: &str) -> RequiredBehaviorContract {
         required_artifacts.as_ref(),
         verification.as_ref(),
     );
+    // Issue #665 — Phase 3: 4 new fields.
+    // - behavior_goal / non_goals: 専用 helper で raw excerpt と共に抽出。
+    // - required_capabilities / verification_expectations: 既存 fields の
+    //   projection として derive（excerpt: None 原則 / S5-003）。
+    let behavior_goal = extract_behavior_goal(scan);
+    let non_goals = extract_non_goals(scan);
+    let required_capabilities =
+        derive_required_capabilities(operations.as_deref(), domain_terms.as_deref());
+    let verification_expectations =
+        derive_verification_expectations(verification.as_deref());
     let candidate = RequiredBehaviorContract {
         operations,
         domain_terms,
@@ -343,6 +587,10 @@ pub(super) fn extract(request: &str) -> RequiredBehaviorContract {
         verification,
         confidence,
         test_execution_required: asks_for_tests,
+        behavior_goal,
+        required_capabilities,
+        verification_expectations,
+        non_goals,
     };
     debug_assert!(
         candidate.validate().is_ok(),
@@ -859,6 +1107,20 @@ pub(super) fn filter_against_request(
     let test_execution_required =
         super::task_contract::request_asks_for_test_artifact(scan, &lower);
 
+    // Issue #665 — Phase 3 / S5-002 canonicality:
+    // - behavior_goal / non_goals: candidate を信頼せず、raw request から
+    //   再抽出（masked scan の出力に対して helper を再実行）。
+    // - required_capabilities / verification_expectations: post-filter 後の
+    //   source fields (`operations` / `domain_terms` / `verification`) から
+    //   必ず derive（candidate の derived value はドリフト源になるので捨てる）。
+    let scan_text = bounded_masked_request(request);
+    let scan = scan_text.as_str();
+    let behavior_goal = extract_behavior_goal(scan);
+    let non_goals = extract_non_goals(scan);
+    let required_capabilities =
+        derive_required_capabilities(operations.as_deref(), domain_terms.as_deref());
+    let verification_expectations =
+        derive_verification_expectations(verification.as_deref());
     let filtered = RequiredBehaviorContract {
         operations,
         domain_terms,
@@ -867,12 +1129,331 @@ pub(super) fn filter_against_request(
         verification,
         confidence,
         test_execution_required,
+        behavior_goal,
+        required_capabilities,
+        verification_expectations,
+        non_goals,
     };
     debug_assert!(
         filtered.validate().is_ok(),
         "filter_against_request produced invalid schema"
     );
     filtered
+}
+
+// ---------------------------------------------------------------------------
+// Issue #665 Phase 3: behavior_goal / non_goals 抽出 helper
+// ---------------------------------------------------------------------------
+
+/// Issue #665 — Task 3.1: 1 行サマリ（user 要求の imperative 主文）を抽出する。
+///
+/// `scan` は既に [`bounded_masked_request`] (`mask_secrets` +
+/// `mask_header_family`) を通過しているため、ここでの追加処理は:
+/// 1. 改行 / 制御文字を空白に正規化
+/// 2. 否定文 (do not / don't / disable / skip / never / は対象外 / しない) を
+///    除外
+/// 3. 最大 `LABEL_MAX_LEN` byte の bounded label と最大 `EXCERPT_MAX_LEN`
+///    byte の excerpt を切り出し
+///
+/// Pure fn / no I/O.
+fn extract_behavior_goal(scan: &str) -> Option<BoundedLabelWithExcerpt> {
+    let normalized = normalize_control_chars(scan);
+    for sentence in split_into_sentences(&normalized) {
+        let trimmed = sentence.trim();
+        if trimmed.is_empty() || looks_like_negation(trimmed) {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        // 最低 1 つの imperative verb / operation keyword を含む文だけを採用。
+        if !contains_imperative_verb(&lower) {
+            continue;
+        }
+        if contains_redaction_sentinel(trimmed) {
+            continue;
+        }
+        let label = truncate_to_label(trimmed);
+        if label.is_empty() {
+            continue;
+        }
+        let excerpt = truncate_excerpt(trimmed);
+        return Some(BoundedLabelWithExcerpt {
+            label,
+            excerpt: Some(excerpt),
+        });
+    }
+    None
+}
+
+/// Issue #665 — Task 3.2: non-goal 文（do not / don't / は対象外 / しない / 不要 /
+/// 禁止）から bounded label + excerpt のリストを抽出する。
+///
+/// 最大 `MAX_ARRAY` 件、各要素は `LABEL_MAX_LEN` / `EXCERPT_MAX_LEN` で cap。
+/// Pure fn / no I/O.
+fn extract_non_goals(scan: &str) -> Option<Vec<BoundedLabelWithExcerpt>> {
+    let normalized = normalize_control_chars(scan);
+    let mut out: Vec<BoundedLabelWithExcerpt> = Vec::new();
+    for sentence in split_into_sentences(&normalized) {
+        let trimmed = sentence.trim();
+        if trimmed.is_empty() || !looks_like_negation(trimmed) {
+            continue;
+        }
+        if contains_redaction_sentinel(trimmed) {
+            continue;
+        }
+        let label = truncate_to_label(trimmed);
+        if label.is_empty() {
+            continue;
+        }
+        let excerpt = truncate_excerpt(trimmed);
+        let item = BoundedLabelWithExcerpt {
+            label,
+            excerpt: Some(excerpt),
+        };
+        if !out.iter().any(|existing| existing == &item) {
+            out.push(item);
+        }
+        if out.len() >= MAX_ARRAY {
+            break;
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Issue #665 — Task 3.3 / S5-003: post-filter `operations` + `domain_terms`
+/// から bounded label のリストを derive する。`excerpt` は `None` 固定
+/// (S5-003: derived field は raw excerpt を保持しない)。
+fn derive_required_capabilities(
+    operations: Option<&[Operation]>,
+    domain_terms: Option<&[String]>,
+) -> Option<Vec<BoundedLabelWithExcerpt>> {
+    let mut out: Vec<BoundedLabelWithExcerpt> = Vec::new();
+    if let Some(ops) = operations {
+        for op in ops {
+            let label = operation_label(*op);
+            let item = BoundedLabelWithExcerpt {
+                label: label.to_string(),
+                excerpt: None,
+            };
+            if !out.iter().any(|e| e == &item) {
+                out.push(item);
+            }
+            if out.len() >= MAX_ARRAY {
+                break;
+            }
+        }
+    }
+    if let Some(terms) = domain_terms {
+        for term in terms {
+            if out.len() >= MAX_ARRAY {
+                break;
+            }
+            let truncated = truncate_to_label(term);
+            if truncated.is_empty() {
+                continue;
+            }
+            let item = BoundedLabelWithExcerpt {
+                label: truncated,
+                excerpt: None,
+            };
+            if !out.iter().any(|e| e == &item) {
+                out.push(item);
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Issue #665 — Task 3.3 / S5-003: post-filter `verification` から bounded
+/// label のリストを derive する。`excerpt` は `None` 固定。
+fn derive_verification_expectations(
+    verification: Option<&[VerificationKind]>,
+) -> Option<Vec<BoundedLabelWithExcerpt>> {
+    let verification = verification?;
+    if verification.is_empty() {
+        return None;
+    }
+    let mut out: Vec<BoundedLabelWithExcerpt> = Vec::new();
+    for kind in verification {
+        let label = verification_label(*kind);
+        let item = BoundedLabelWithExcerpt {
+            label: label.to_string(),
+            excerpt: None,
+        };
+        if !out.iter().any(|e| e == &item) {
+            out.push(item);
+        }
+        if out.len() >= MAX_ARRAY {
+            break;
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// SSOT for projecting `Operation` enum → bounded label string.
+fn operation_label(op: Operation) -> &'static str {
+    match op {
+        Operation::Create => "create",
+        Operation::Read => "read",
+        Operation::Update => "update",
+        Operation::Delete => "delete",
+        Operation::Run => "run",
+        Operation::Validate => "validate",
+    }
+}
+
+/// SSOT for projecting `VerificationKind` enum → bounded label string.
+fn verification_label(kind: VerificationKind) -> &'static str {
+    match kind {
+        VerificationKind::Test => "test",
+        VerificationKind::Build => "build",
+        VerificationKind::Run => "run",
+        VerificationKind::Smoke => "smoke",
+    }
+}
+
+/// 制御文字 (\n / \t / \r 等) を空白に正規化。bounded_masked_request 通過後の
+/// 文字列に対して呼ぶ。
+fn normalize_control_chars(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != ' ' { ' ' } else { c }
+        })
+        .collect()
+}
+
+/// 文を ASCII 句読点 (`.`, `!`, `?`) と日本語句点 (`。`) で分割する単純な分割。
+/// 完璧な構文解析ではなく bounded heuristic。
+fn split_into_sentences(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'.' || c == b'!' || c == b'?' || c == b'\n' {
+            // unsafe-free: ASCII boundary so safe
+            if let Some(sub) = s.get(start..i) {
+                out.push(sub);
+            }
+            start = i + 1;
+            i += 1;
+            continue;
+        }
+        // 日本語句点 (U+3002 = 0xE3 0x80 0x82) を検出
+        if i + 3 <= bytes.len() && bytes[i] == 0xE3 && bytes[i + 1] == 0x80 && bytes[i + 2] == 0x82
+        {
+            if let Some(sub) = s.get(start..i) {
+                out.push(sub);
+            }
+            start = i + 3;
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    if start < s.len()
+        && let Some(sub) = s.get(start..)
+    {
+        out.push(sub);
+    }
+    out
+}
+
+/// 文が否定 / non-goal を表すかの heuristic。
+fn looks_like_negation(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    const ENGLISH_NEGATIONS: &[&str] = &[
+        "do not ",
+        "don't ",
+        "doesn't ",
+        "should not ",
+        "shouldn't ",
+        "must not ",
+        "mustn't ",
+        "won't ",
+        "no need ",
+        "without ",
+        "skip ",
+        "disable ",
+        "avoid ",
+        "never ",
+        "not allowed ",
+        "out of scope",
+    ];
+    for n in ENGLISH_NEGATIONS {
+        if lower.contains(n) {
+            return true;
+        }
+    }
+    // 日本語パターン（小文字化は ASCII のみ影響、日本語はそのまま）
+    const JP_NEGATIONS: &[&str] = &[
+        "しない",
+        "は対象外",
+        "対象外",
+        "不要",
+        "禁止",
+        "は行わない",
+        "は除外",
+    ];
+    for n in JP_NEGATIONS {
+        if s.contains(n) {
+            return true;
+        }
+    }
+    false
+}
+
+/// imperative / 動作 keyword を含むか（behavior_goal の minimum filter）。
+fn contains_imperative_verb(lower: &str) -> bool {
+    // operation keywords + 一般的な build / implement / add 系
+    for (needle, _, mode) in OPERATION_KEYWORDS {
+        if keyword_hit(lower, needle, *mode) {
+            return true;
+        }
+    }
+    const EXTRA_VERBS: &[&str] = &[
+        "build ",
+        "implement ",
+        "add ",
+        "introduce ",
+        "extend ",
+        "support ",
+        "expose ",
+        "make ",
+        "fix ",
+    ];
+    for v in EXTRA_VERBS {
+        if lower.contains(v) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `LABEL_MAX_LEN` byte で UTF-8 char boundary を維持しつつ切り詰める。
+fn truncate_to_label(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.len() <= LABEL_MAX_LEN {
+        return trimmed.to_string();
+    }
+    let mut end = LABEL_MAX_LEN;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
+}
+
+/// `EXCERPT_MAX_LEN` byte で UTF-8 char boundary を維持しつつ切り詰める。
+fn truncate_excerpt(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.len() <= EXCERPT_MAX_LEN {
+        return trimmed.to_string();
+    }
+    let mut end = EXCERPT_MAX_LEN;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
 }
 
 fn operation_in_request(op: Operation, lower: &str) -> bool {
@@ -947,6 +1528,11 @@ mod tests {
             // Issue #651: explicit default at every literal site so
             // adding a new boolean stays compile-time visible.
             test_execution_required: false,
+            // Issue #665: same compile-time-visible policy (DR2-006).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
         }
     }
 
@@ -1018,6 +1604,460 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Group F (Issue #665): SSOT 定数 + BoundedLabelWithExcerpt + SchemaError 拡張
+    // -----------------------------------------------------------------
+
+    /// Issue #665 — Task 1.2: SSOT 定数の値 invariant をテスト。
+    #[test]
+    fn issue665_ssot_constants_have_expected_values() {
+        assert_eq!(LABEL_MAX_LEN, MAX_STR);
+        assert_eq!(EXCERPT_MAX_LEN, LABEL_MAX_LEN * 4);
+        assert!((LOW_CONFIDENCE_THRESHOLD - 0.5_f32).abs() < f32::EPSILON);
+        assert_eq!(MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES, 1200);
+    }
+
+    /// Issue #665 — Task 1.1: `BoundedLabelWithExcerpt` の literal 構築と
+    /// `PartialEq` 比較が成立する。
+    #[test]
+    fn issue665_bounded_label_with_excerpt_literal_construction() {
+        let a = BoundedLabelWithExcerpt {
+            label: "create".to_string(),
+            excerpt: Some("create a Task".to_string()),
+        };
+        let b = BoundedLabelWithExcerpt {
+            label: "create".to_string(),
+            excerpt: Some("create a Task".to_string()),
+        };
+        assert_eq!(a, b);
+        let c = BoundedLabelWithExcerpt {
+            label: "create".to_string(),
+            excerpt: None,
+        };
+        assert_ne!(a, c);
+    }
+
+    /// Issue #665 — Task 1.3: `SchemaError::LabelTooLong` の `Display` 出力
+    /// が新フィールド名と長さを含む。
+    #[test]
+    fn issue665_schema_error_label_too_long_display() {
+        let err = SchemaError::LabelTooLong {
+            field: "behavior_goal",
+            len: 100,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("behavior_goal"), "got: {s}");
+        assert!(s.contains("100"), "got: {s}");
+        assert!(s.contains(&LABEL_MAX_LEN.to_string()), "got: {s}");
+    }
+
+    /// Issue #665 — Task 1.3: `SchemaError::ExcerptTooLong` の `Display`
+    /// 出力が field 名 / 長さ / cap 値を含む。
+    #[test]
+    fn issue665_schema_error_excerpt_too_long_display() {
+        let err = SchemaError::ExcerptTooLong {
+            field: "non_goals",
+            len: 500,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("non_goals"), "got: {s}");
+        assert!(s.contains("500"), "got: {s}");
+        assert!(s.contains(&EXCERPT_MAX_LEN.to_string()), "got: {s}");
+    }
+
+    /// Issue #665 — Task 2.2: `validate()` が新フィールド `behavior_goal` の
+    /// label 超過を検出する。
+    #[test]
+    fn issue665_validate_rejects_oversize_behavior_goal_label() {
+        let mut c = empty_contract();
+        c.behavior_goal = Some(BoundedLabelWithExcerpt {
+            label: "a".repeat(LABEL_MAX_LEN + 1),
+            excerpt: None,
+        });
+        assert!(matches!(
+            c.validate(),
+            Err(SchemaError::LabelTooLong {
+                field: "behavior_goal",
+                ..
+            })
+        ));
+    }
+
+    /// Issue #665 — Task 2.2: `validate()` が `behavior_goal` の excerpt
+    /// 超過を検出する。
+    #[test]
+    fn issue665_validate_rejects_oversize_behavior_goal_excerpt() {
+        let mut c = empty_contract();
+        c.behavior_goal = Some(BoundedLabelWithExcerpt {
+            label: "build".to_string(),
+            excerpt: Some("x".repeat(EXCERPT_MAX_LEN + 1)),
+        });
+        assert!(matches!(
+            c.validate(),
+            Err(SchemaError::ExcerptTooLong {
+                field: "behavior_goal",
+                ..
+            })
+        ));
+    }
+
+    /// Issue #665 — Task 2.2: `validate()` が `required_capabilities` の
+    /// 配列長超過を検出する（既存 `MAX_ARRAY` ルールが新フィールドにも適用）。
+    #[test]
+    fn issue665_validate_rejects_too_many_required_capabilities() {
+        let mut c = empty_contract();
+        c.required_capabilities = Some(
+            (0..(MAX_ARRAY + 1))
+                .map(|i| BoundedLabelWithExcerpt {
+                    label: format!("cap{i}"),
+                    excerpt: None,
+                })
+                .collect(),
+        );
+        assert!(matches!(
+            c.validate(),
+            Err(SchemaError::ArrayTooLong {
+                field: "required_capabilities",
+                ..
+            })
+        ));
+    }
+
+    /// Issue #665 — Task 2.2: `validate()` が `verification_expectations` の
+    /// 個別 label 超過を検出する（`field` SSOT 名前空間の検証）。
+    #[test]
+    fn issue665_validate_rejects_oversize_verification_expectation_label() {
+        let mut c = empty_contract();
+        c.verification_expectations = Some(vec![BoundedLabelWithExcerpt {
+            label: "x".repeat(LABEL_MAX_LEN + 1),
+            excerpt: None,
+        }]);
+        assert!(matches!(
+            c.validate(),
+            Err(SchemaError::LabelTooLong {
+                field: "verification_expectations",
+                ..
+            })
+        ));
+    }
+
+    /// Issue #665 — Task 2.2: `validate()` は valid な新フィールド構成を
+    /// 受け入れる（境界値: label = `LABEL_MAX_LEN` ぴったり、excerpt =
+    /// `EXCERPT_MAX_LEN` ぴったり）。
+    #[test]
+    fn issue665_validate_accepts_boundary_lengths_for_new_fields() {
+        let mut c = empty_contract();
+        c.behavior_goal = Some(BoundedLabelWithExcerpt {
+            label: "a".repeat(LABEL_MAX_LEN),
+            excerpt: Some("b".repeat(EXCERPT_MAX_LEN)),
+        });
+        c.required_capabilities = Some(vec![BoundedLabelWithExcerpt {
+            label: "c".repeat(LABEL_MAX_LEN),
+            excerpt: None,
+        }]);
+        c.verification_expectations = Some(vec![BoundedLabelWithExcerpt {
+            label: "d".repeat(LABEL_MAX_LEN),
+            excerpt: None,
+        }]);
+        c.non_goals = Some(vec![BoundedLabelWithExcerpt {
+            label: "e".repeat(LABEL_MAX_LEN),
+            excerpt: Some("f".repeat(EXCERPT_MAX_LEN)),
+        }]);
+        assert!(c.validate().is_ok(), "validate failed: {:?}", c.validate());
+    }
+
+    /// Issue #665 — Task 2.1 / 2.2: 既存 extract が新フィールド追加後も
+    /// 破壊されない（既存 `operations` が抽出され、`validate()` が通る）。
+    /// Phase 3 で 4 新フィールドも populated されるようになったが、本テストは
+    /// **既存 extract 経路の不変** を主な確認対象とする。
+    #[test]
+    fn issue665_extract_keeps_existing_extraction_intact_after_new_fields() {
+        let c = extract("Create a Task API");
+        // 既存フィールドの抽出は不変であることを確認。
+        assert!(
+            c.operations.is_some(),
+            "existing extract for `create` broken"
+        );
+        // validate() が新フィールド追加後も pass する。
+        assert!(c.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Group G (Issue #665 Phase 3): extract_behavior_goal /
+    // extract_non_goals / derive_required_capabilities /
+    // derive_verification_expectations
+    // -----------------------------------------------------------------
+
+    /// Phase 3 / Task 3.1: imperative 文があれば behavior_goal として抽出。
+    #[test]
+    fn issue665_extract_behavior_goal_finds_imperative_sentence() {
+        let c = extract("Build a Task API");
+        let goal = c.behavior_goal.expect("behavior_goal should be Some");
+        assert!(
+            goal.label.to_ascii_lowercase().contains("build"),
+            "label = {}",
+            goal.label
+        );
+        assert!(goal.excerpt.is_some());
+    }
+
+    /// Phase 3 / Task 3.1: 否定文だけの request では behavior_goal は抽出しない。
+    #[test]
+    fn issue665_extract_behavior_goal_skips_negation_only_request() {
+        // 否定文のみ。imperative verb は含まれていない。
+        let c = extract("do not break existing tests");
+        assert!(c.behavior_goal.is_none(), "got: {:?}", c.behavior_goal);
+    }
+
+    /// Phase 3 / Task 3.2: 否定文から non_goals を抽出。
+    #[test]
+    fn issue665_extract_non_goals_finds_english_negation() {
+        let c = extract("Build a Task API. Do not break existing tests.");
+        let non_goals = c.non_goals.expect("non_goals should be Some");
+        assert!(!non_goals.is_empty());
+        assert!(
+            non_goals.iter().any(|g| g.label.to_ascii_lowercase().contains("do not")
+                || g.label.to_ascii_lowercase().contains("break")),
+            "got: {non_goals:?}"
+        );
+    }
+
+    /// Phase 3 / Task 3.2: 日本語の否定パターンも non_goals に取れる。
+    #[test]
+    fn issue665_extract_non_goals_finds_japanese_negation() {
+        let c = extract("Build a Task API。 既存テストは対象外。");
+        let non_goals = c.non_goals.expect("non_goals should be Some");
+        assert!(
+            non_goals.iter().any(|g| g.label.contains("対象外")
+                || g.label.contains("テスト")),
+            "got: {non_goals:?}"
+        );
+    }
+
+    /// Phase 3 / Task 3.3 / S5-003: required_capabilities は operations と
+    /// domain_terms から derive され、`excerpt` は `None`。
+    #[test]
+    fn issue665_required_capabilities_are_derived_with_no_excerpt() {
+        let c = extract("Create a Task API");
+        let caps = c
+            .required_capabilities
+            .expect("required_capabilities should be Some");
+        assert!(!caps.is_empty());
+        // すべての derived field の excerpt は None
+        for cap in &caps {
+            assert!(
+                cap.excerpt.is_none(),
+                "derived field must have excerpt: None (S5-003), got: {cap:?}"
+            );
+        }
+        // operation `create` の label が含まれる
+        assert!(
+            caps.iter().any(|c| c.label == "create"),
+            "got: {caps:?}"
+        );
+    }
+
+    /// Phase 3 / Task 3.3 / S5-003: verification_expectations も derived で
+    /// excerpt: None。
+    #[test]
+    fn issue665_verification_expectations_are_derived_with_no_excerpt() {
+        let c = extract("Build a Task API and run the tests");
+        let ve = c
+            .verification_expectations
+            .expect("verification_expectations should be Some");
+        assert!(!ve.is_empty());
+        for v in &ve {
+            assert!(
+                v.excerpt.is_none(),
+                "derived field must have excerpt: None (S5-003), got: {v:?}"
+            );
+        }
+        // verification keywords `test` または `run` のいずれかの label が含まれる
+        assert!(
+            ve.iter().any(|v| v.label == "test" || v.label == "run"),
+            "got: {ve:?}"
+        );
+    }
+
+    /// Phase 3 / Task 3.4 / S5-002: filter_against_request は candidate の
+    /// derived field を信頼せず、post-filter source fields から再生成する。
+    #[test]
+    fn issue665_filter_recomputes_derived_fields_from_post_filter_source() {
+        // candidate が `required_capabilities=Some([fake_cap])` を持つが
+        // `operations=None` という mismatched 状態。
+        let candidate = RequiredBehaviorContract {
+            operations: None,
+            domain_terms: None,
+            interface_hints: None,
+            required_artifacts: None,
+            verification: None,
+            confidence: 1.0,
+            test_execution_required: false,
+            behavior_goal: None,
+            required_capabilities: Some(vec![BoundedLabelWithExcerpt {
+                label: "fake_cap_drifted".to_string(),
+                excerpt: Some("attacker controlled".to_string()),
+            }]),
+            verification_expectations: Some(vec![BoundedLabelWithExcerpt {
+                label: "fake_verification_drifted".to_string(),
+                excerpt: Some("attacker controlled".to_string()),
+            }]),
+            non_goals: None,
+        };
+        // request 自体には operation も verification も無いので、再生成した
+        // derived field は None に縮退するはず。
+        let filtered = filter_against_request(&candidate, "explain something");
+        assert!(
+            filtered.required_capabilities.is_none()
+                || filtered
+                    .required_capabilities
+                    .as_ref()
+                    .is_none_or(|v| !v
+                        .iter()
+                        .any(|e| e.label == "fake_cap_drifted")),
+            "candidate-side fake_cap_drifted must NOT survive: got {:?}",
+            filtered.required_capabilities
+        );
+        assert!(
+            filtered.verification_expectations.is_none()
+                || filtered
+                    .verification_expectations
+                    .as_ref()
+                    .is_none_or(|v| !v
+                        .iter()
+                        .any(|e| e.label == "fake_verification_drifted")),
+            "candidate-side fake_verification_drifted must NOT survive: got {:?}",
+            filtered.verification_expectations
+        );
+    }
+
+    /// Phase 3 / Task 3.1: secret-like content (REDACTION_SENTINELS) を
+    /// 含む sentence は behavior_goal に採用されない。
+    #[test]
+    fn issue665_extract_behavior_goal_drops_redaction_sentinel() {
+        // ***（マスク後の sentinel）が含まれる sentence は drop。
+        let c = extract("Build *** something secret");
+        // 後続の sentence が無いので behavior_goal は None になる。
+        assert!(c.behavior_goal.is_none(), "got: {:?}", c.behavior_goal);
+    }
+
+    /// Phase 3 / Task 3.2: non_goals は MAX_ARRAY 件で cap される。
+    #[test]
+    fn issue665_extract_non_goals_caps_at_max_array() {
+        // 否定文を 10 個含む request を作る。
+        let mut request = String::new();
+        for i in 0..10 {
+            request.push_str(&format!("do not break feature_{i}. "));
+        }
+        let c = extract(&request);
+        let non_goals = c.non_goals.expect("non_goals should be Some");
+        assert!(non_goals.len() <= MAX_ARRAY);
+    }
+
+    // -----------------------------------------------------------------
+    // Group H (Issue #665 Phase 4): BehaviorContractProjection +
+    // project_behavior_contract accessor
+    // -----------------------------------------------------------------
+
+    /// Phase 4 / Task 4.1: `BehaviorContractProjection` の literal 構築と
+    /// `PartialEq` 比較が成立する。`Eq` は派生されない。
+    #[test]
+    fn issue665_behavior_contract_projection_literal_and_partial_eq() {
+        let a = BehaviorContractProjection {
+            confidence: 0.8,
+            fields_used: vec!["behavior_goal"],
+            behavior_goal: None,
+            required_capabilities: vec![],
+            verification_expectations: vec![],
+            non_goals: vec![],
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    /// Phase 4 / Task 4.2: high confidence + fields_used 非空 で
+    /// projection は Some を返す。
+    #[test]
+    fn issue665_project_behavior_contract_returns_some_for_high_confidence_request() {
+        use super::super::task_contract::TaskContract;
+        let tc = TaskContract::from_request("Create a Task API and run the tests");
+        let proj = project_behavior_contract(&tc);
+        assert!(proj.is_some(), "expected Some, got: {proj:?}");
+        let proj = proj.unwrap();
+        assert!(proj.confidence >= LOW_CONFIDENCE_THRESHOLD);
+        assert!(!proj.fields_used.is_empty());
+    }
+
+    /// Phase 4 / Task 4.2 / Task 4.3: confidence < threshold (0.5) で None。
+    #[test]
+    fn issue665_project_behavior_contract_returns_none_for_low_confidence() {
+        use super::super::task_contract::TaskContract;
+        // 日本語のみ short request: 既存 extractor は keyword hit が 0 で
+        // confidence = 0.0 になる。
+        let tc = TaskContract::from_request("こんにちは");
+        let proj = project_behavior_contract(&tc);
+        assert!(
+            proj.is_none(),
+            "expected None for low-confidence request, got: {proj:?}"
+        );
+    }
+
+    /// Phase 4 / Task 4.3: threshold 跨ぎの境界値テスト (0.499 → None,
+    /// 0.5 → projection 試行 (fields_used 次第))。
+    #[test]
+    fn issue665_project_behavior_contract_threshold_boundary() {
+        use super::super::task_contract::TaskContract;
+        let mut tc = TaskContract::from_request("Create a Task API");
+        // 強制的に閾値直下に
+        tc.required_behavior.confidence = LOW_CONFIDENCE_THRESHOLD - 0.01;
+        let proj = project_behavior_contract(&tc);
+        assert!(proj.is_none(), "below threshold should be None");
+        // 閾値ぴったり：threshold 以上は OK
+        tc.required_behavior.confidence = LOW_CONFIDENCE_THRESHOLD;
+        let proj = project_behavior_contract(&tc);
+        // fields_used に何か入っていれば Some。
+        // Create a Task API は operations / required_capabilities が入る。
+        assert!(proj.is_some(), "at threshold should be Some when fields exist");
+    }
+
+    /// Phase 4 / Task 4.2: confidence が NaN や inf の場合は None。
+    #[test]
+    fn issue665_project_behavior_contract_returns_none_for_non_finite_confidence() {
+        use super::super::task_contract::TaskContract;
+        let mut tc = TaskContract::from_request("Create a Task API");
+        tc.required_behavior.confidence = f32::NAN;
+        assert!(project_behavior_contract(&tc).is_none());
+        tc.required_behavior.confidence = f32::INFINITY;
+        assert!(project_behavior_contract(&tc).is_none());
+    }
+
+    /// Phase 4 / Task 4.2: `fields_used` は `FIELDS_USED_ORDER` 順に
+    /// deterministic に並ぶ。
+    #[test]
+    fn issue665_project_behavior_contract_fields_used_is_deterministic_order() {
+        use super::super::task_contract::TaskContract;
+        let tc = TaskContract::from_request(
+            "Create a Task API and run the tests. Do not break existing builds.",
+        );
+        let proj = project_behavior_contract(&tc).expect("Some");
+        // すべて fields_used に含まれている前提で、順序が
+        // FIELDS_USED_ORDER の subsequence であることを確認。
+        let mut prev_idx: i32 = -1;
+        for f in &proj.fields_used {
+            let cur = FIELDS_USED_ORDER
+                .iter()
+                .position(|x| x == f)
+                .unwrap_or_else(|| panic!("unknown field name: {f}"));
+            assert!(
+                (cur as i32) > prev_idx,
+                "fields_used not in canonical order: {:?} (expect subsequence of {:?})",
+                proj.fields_used,
+                FIELDS_USED_ORDER
+            );
+            prev_idx = cur as i32;
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Group B: extract + filter (8 tests)
     // -----------------------------------------------------------------
 
@@ -1075,6 +2115,11 @@ mod tests {
             verification: None,
             confidence: 1.0,
             test_execution_required: false,
+            // Issue #665: explicit None per DR2-006 (literal site policy).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
         };
         // Request mentions create + Foo only; Delete / Bar are unbacked.
         let filtered = filter_against_request(&candidate, "create a Foo");
@@ -1093,6 +2138,11 @@ mod tests {
             verification: None,
             confidence: 1.0,
             test_execution_required: false,
+            // Issue #665: explicit None per DR2-006 (literal site policy).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
         };
         let request = format!("use {oversized}");
         let filtered = filter_against_request(&candidate, &request);
@@ -1114,6 +2164,11 @@ mod tests {
             verification: None,
             confidence: 1.0,
             test_execution_required: false,
+            // Issue #665: explicit None per DR2-006 (literal site policy).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
         };
         let filtered = filter_against_request(&candidate, &format!("use token {token}"));
         assert!(
@@ -1368,6 +2423,11 @@ mod tests {
             verification: None,
             confidence: 1.0,
             test_execution_required: false,
+            // Issue #665: explicit None per DR2-006 (literal site policy).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
         };
         // The request is an explain-only / read-only ask. It backs
         // neither Test nor Implementation, so both must be filtered out.
