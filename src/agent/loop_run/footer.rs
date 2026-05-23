@@ -1228,6 +1228,8 @@ mod tests {
             footer: enabled,
             photon_enabled: false,
             photon_url: "http://127.0.0.1:3030".to_string(),
+            // Issue #667: PAM advisory pipeline gate (production default true).
+            pam_advisory_enabled: true,
             photon_shadow_mode: true,
             photon_canary: 0,
             photon_timeout_ms: 200,

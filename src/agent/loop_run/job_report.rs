@@ -413,16 +413,31 @@ impl super::Agent {
         }
 
         // MemoryReport — PAM / context-pack state observable this turn?
+        //
+        // Issue #667 (DR1-004 / C.1): the PAM advisory carrier
+        // `last_pam_decision_this_turn` participates in the OR so a shadow
+        // turn (no injected items) still produces a MemoryReport whenever
+        // the adapter has emitted a decision.
         let mr_observable = !self.last_injected_summary_ids.is_empty()
             || self.photon_user_feedback_called_this_turn
             || !matches!(
                 self.last_photon_context_pack_status,
                 PhotonContextPackStatus::NoTurn
-            );
+            )
+            || self.last_pam_decision_this_turn.is_some();
         if mr_observable {
+            // Issue #667 (C.1): project the per-turn decision into the
+            // `pam_decision` field. The envelope traverses
+            // `record_job_report` → `log_llm_event` →
+            // `mask_payload_inplace` as the final defence (Security
+            // Invariants), so the adapter does NOT re-sanitize here.
+            let pam_decision = self
+                .last_pam_decision_this_turn
+                .as_ref()
+                .map(|d| d.to_json_value());
             let mr = MemoryReport {
                 turn_index,
-                pam_decision: None,
+                pam_decision,
                 context_pack_binding: None,
                 adopted_item_count: self.last_injected_summary_ids.len() as u32,
                 injection_skipped_reason: None,
