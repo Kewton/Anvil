@@ -241,6 +241,14 @@ pub struct Config {
     pub footer: bool,
     pub photon_enabled: bool,
     pub photon_url: String,
+    /// Issue #667 (S3-004 / S7-004 / DR2-007): toggle for the PAM
+    /// (photon-action-memory) advisory pipeline. Default: `true` via
+    /// `Config::load`'s `unwrap_or(true)` (the struct's derived `Default`
+    /// is `false`; production callers always go through `Config::load`).
+    /// Setting this to `false` is the immediate rollback (§10.1) — the
+    /// adapter chokepoint (`Agent::record_pam_advisory_decision`) early-
+    /// returns and `MemoryReport.pam_decision` stays `None`.
+    pub pam_advisory_enabled: bool,
     pub photon_shadow_mode: bool,
     pub photon_canary: u16,
     pub photon_timeout_ms: u64,
@@ -329,6 +337,9 @@ pub struct PartialConfig {
     pub footer: Option<bool>,
     pub photon_enabled: Option<bool>,
     pub photon_url: Option<String>,
+    /// Issue #667: optional override for the PAM advisory pipeline gate
+    /// (None = production default `true` via `Config::load`).
+    pub pam_advisory_enabled: Option<bool>,
     pub photon_shadow_mode: Option<bool>,
     pub photon_canary: Option<u16>,
     pub photon_timeout_ms: Option<u64>,
@@ -411,6 +422,8 @@ impl Config {
             // photon settings are not configurable via CLI flags in A1
             photon_enabled: None,
             photon_url: None,
+            // Issue #667: PAM advisory CLI flag not introduced — env + file only.
+            pam_advisory_enabled: None,
             photon_shadow_mode: None,
             photon_canary: None,
             photon_timeout_ms: None,
@@ -467,6 +480,10 @@ impl Config {
             footer: merged.footer.unwrap_or(true),
             photon_enabled,
             photon_url,
+            // Issue #667 (S3-004 / DR3-005): production default is `true`
+            // — `Config::default()` (derive) yields `false`, which fixtures
+            // must override explicitly (see T22 in the in-crate test mod).
+            pam_advisory_enabled: merged.pam_advisory_enabled.unwrap_or(true),
             photon_shadow_mode: merged.photon_shadow_mode.unwrap_or(true),
             photon_canary: merged.photon_canary.unwrap_or(0),
             photon_timeout_ms: merged.photon_timeout_ms.unwrap_or(200),
@@ -563,6 +580,11 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.photon_url.is_some() {
             merged.photon_url = config.photon_url.clone();
         }
+        // Issue #667 (DR2-007): merged adjacent to photon_shadow_mode
+        // (alphabetical `pam_*` < `photon_*` + functional adjacency).
+        if config.pam_advisory_enabled.is_some() {
+            merged.pam_advisory_enabled = config.pam_advisory_enabled;
+        }
         if config.photon_shadow_mode.is_some() {
             merged.photon_shadow_mode = config.photon_shadow_mode;
         }
@@ -652,6 +674,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         photon_enabled: map.get("photon_enabled").and_then(|v| parse_bool(v)),
         // photon_url empty string is skipped by parse_key_value_config, so None means unset
         photon_url: map.get("photon_url").cloned(),
+        // Issue #667: `.anvil/config` key `pam_advisory_enabled` (DR2-007
+        // adjacent to `photon_shadow_mode`).
+        pam_advisory_enabled: map.get("pam_advisory_enabled").and_then(|v| parse_bool(v)),
         photon_shadow_mode: map.get("photon_shadow_mode").and_then(|v| parse_bool(v)),
         photon_canary: map
             .get("photon_canary")
@@ -741,6 +766,10 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
             .ok()
             .and_then(|v| parse_bool(&v)),
         photon_url: env::var("ANVIL_PHOTON_URL").ok(),
+        // Issue #667: env override `ANVIL_PAM_ADVISORY_ENABLED` (DR2-007).
+        pam_advisory_enabled: env::var("ANVIL_PAM_ADVISORY_ENABLED")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
         photon_shadow_mode: env::var("ANVIL_PHOTON_SHADOW_MODE")
             .ok()
             .and_then(|v| parse_bool(&v)),

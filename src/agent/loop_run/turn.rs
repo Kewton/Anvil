@@ -4160,6 +4160,10 @@ impl Agent {
         // restarts together at turn boundary. Forces the first consumed
         // projection in the new turn to emit.
         self.last_behavior_contract_projection_event = None;
+        // Issue #667 (DR1-004 / per-turn rule): clear the PAM advisory
+        // decision carrier. `is_some()` is the "decided this turn" predicate;
+        // the 2 production chokepoints set this exactly once (DR1-005).
+        self.last_pam_decision_this_turn = None;
         // Issue #661 Task 2.6 (DR1-004 / DR1-010): per-turn dedup state for
         // `agent.verifier.invoked` (digest of canonical-JSON payload) and
         // per-turn cap for `agent.verifier.external_import_rejected`. Reset
@@ -5249,17 +5253,46 @@ impl Agent {
             // Issue #594: drive the filter pipeline through the provenance-aware
             // enumeration SSOT so the rendered prompt and the per-item lineage
             // come from the same pass (invariant: views.len() == items_adopted).
-            let (admitted_views, render_stats) =
+            let (admitted_views, mut render_stats) =
                 crate::photon::prompt::enumerate_admitted_items_with_provenance(
                     &resp,
                     &blocked_ids,
                 );
             items_blocked = render_stats.items_blocked;
 
-            // Pass 2a — build the rendered section from view text. We discard
-            // build_section_with_stats's adopted / dropped / ids because the
-            // authoritative values live on `render_stats` already (populated
-            // by enumerate_admitted_items_with_provenance per #591/#594 SSOT).
+            // Issue #667 (DR1-005 / DR3-001 / chokepoint A): drive the PAM
+            // advisory adapter BEFORE cache writes. On non-shadow live paths
+            // the adapter returns `live_admitted_views` — only those flow
+            // into the prompt injection cache below. Shadow turns short-
+            // circuit earlier (L5106) so this site is only reached with
+            // `shadow=false`. When the adapter is disabled or already
+            // decided (per-turn dedup), the original admitted set is used.
+            let advisory_outcome = self.record_pam_advisory_decision(&resp, &blocked_ids, false);
+            let admitted_views = match advisory_outcome.as_ref() {
+                Some(outcome) => {
+                    // Codex CB-002 fix: keep `items_adopted` aligned with the
+                    // filtered view count for the seed-provenance invariant,
+                    // but defer `adopted_summary_ids` SSOT to
+                    // `build_section_with_stats` below so the stable dedupe
+                    // (`HashSet`-backed, first-occurrence-wins) is the single
+                    // source of truth for both the rendered section and the
+                    // downstream injection cache (`last_injected_summary_ids` /
+                    // `last_adopted_summary_ids`). This prevents duplicate
+                    // summary_ids (same id on multiple bullets) from leaking
+                    // into the photon evaluate signal / feedback attribution.
+                    let filtered = outcome.live_admitted_views.clone();
+                    render_stats.items_adopted = filtered.len();
+                    filtered
+                }
+                None => admitted_views,
+            };
+
+            // Pass 2a — build the rendered section from view text. After
+            // CB-002 fix, the `adopted_ids` returned by build_section_with_stats
+            // becomes the SSOT for adopted ids (stable-deduped). We still source
+            // `items_adopted` count from `render_stats` (populated by
+            // enumerate_admitted_items_with_provenance per #591/#594 SSOT) and
+            // adjusted above when PAM advisory filters.
             let render_candidates: Vec<crate::photon::prompt::RenderCandidate> = admitted_views
                 .iter()
                 .map(|v| crate::photon::prompt::RenderCandidate {
@@ -5267,8 +5300,16 @@ impl Agent {
                     summary_id: v.provenance.summary_id.clone(),
                 })
                 .collect();
-            let (rendered_opt, _, _, _) =
+            let (rendered_opt, _, _, dedup_adopted_ids) =
                 crate::photon::prompt::build_section_with_stats(&render_candidates);
+            // Codex CB-002 fix: override render_stats.adopted_summary_ids with
+            // the stable-deduped list from the renderer SSOT so duplicate IDs
+            // (same summary_id across multiple bullets) cannot leak into
+            // last_injected_summary_ids / last_adopted_summary_ids and on into
+            // photon evaluate / feedback attribution. Note this also applies
+            // when the PAM adapter is disabled (None branch above), preserving
+            // the renderer's dedup invariant on every code path.
+            render_stats.adopted_summary_ids = dedup_adopted_ids;
 
             // Pass 2b — collect per-item SeedProvenanceSummary (PV-01
             // invariant). CB-001: the provenance summary is already sanitized
@@ -10226,29 +10267,61 @@ impl Agent {
                     turn_idx: self.current_turn_index,
                 };
                 if crate::photon::mapper::should_send_context_pack(&gate) {
-                    if let Some(photon) = &self.photon {
-                        let working_memory_text = self.session.working_memory.format_for_prompt();
-                        let inputs = crate::photon::mapper::ContextPackInputs {
-                            task: self.session.working_memory.active_task.as_deref(),
-                            repo_path: &self.work_root,
-                            branch: None,
-                            commit: None,
-                            working_memory_text: working_memory_text.as_deref(),
-                            touched_files: &self.session.working_memory.touched_files,
-                            recent_tool_summary: &recent_tool_summary,
-                            selected_case_ids: &selected_case_ids,
-                            selected_anti_pattern_ids: &selected_anti_ids,
-                            selected_precaution_ids: &selected_precaution_ids,
-                        };
-                        let req = crate::photon::mapper::build_context_pack_request(&inputs);
-                        // Capture request_id for evaluate tracking (shadow mode path).
-                        let rid = req.0["request_id"].as_str().map(|s| s.to_string());
-                        let _ = photon.context_pack(&req);
-                        // Set last_context_pack_id only if not already set by
-                        // invoke_photon_context_pack (non-shadow path takes priority).
-                        if self.last_context_pack_id.is_none() {
-                            self.last_context_pack_id = rid;
+                    // Issue #667 (DR1-001 / DR1-005 / chokepoint B): receive
+                    // the response via `let resp_opt = ...` (no longer
+                    // discarded) so the PAM advisory adapter can observe
+                    // shadow-mode + active-job-axis (3) without altering the
+                    // existing renderer cache. Shadow turn must NOT write to
+                    // `photon_context_pack_response` here — that field is
+                    // owned by `invoke_photon_context_pack` and exists
+                    // strictly for live prompt injection (§5.2 contract).
+                    let resp_opt = match &self.photon {
+                        Some(photon) => {
+                            let working_memory_text =
+                                self.session.working_memory.format_for_prompt();
+                            let inputs = crate::photon::mapper::ContextPackInputs {
+                                task: self.session.working_memory.active_task.as_deref(),
+                                repo_path: &self.work_root,
+                                branch: None,
+                                commit: None,
+                                working_memory_text: working_memory_text.as_deref(),
+                                touched_files: &self.session.working_memory.touched_files,
+                                recent_tool_summary: &recent_tool_summary,
+                                selected_case_ids: &selected_case_ids,
+                                selected_anti_pattern_ids: &selected_anti_ids,
+                                selected_precaution_ids: &selected_precaution_ids,
+                            };
+                            let req = crate::photon::mapper::build_context_pack_request(&inputs);
+                            // Capture request_id for evaluate tracking (shadow mode path).
+                            let rid = req.0["request_id"].as_str().map(|s| s.to_string());
+                            let resp = photon.context_pack(&req);
+                            // Set last_context_pack_id only if not already set
+                            // by invoke_photon_context_pack (non-shadow path
+                            // takes priority).
+                            if self.last_context_pack_id.is_none() {
+                                self.last_context_pack_id = rid;
+                            }
+                            resp
                         }
+                        None => None,
+                    };
+                    if let Some(resp) = resp_opt.as_ref() {
+                        // DR4-001: parity blocked_ids — same SSOT input as the
+                        // path-a side. `photon_respect_warnings=false` yields
+                        // the empty set so warning-blocked items cannot leak
+                        // back through advisory. `warning_blocked` event is
+                        // intentionally NOT emitted here (path-b never has
+                        // historically — event semantic invariant).
+                        let blocked_ids: std::collections::HashSet<String> =
+                            if self.config.photon_respect_warnings {
+                                let (ids, _stats) =
+                                    crate::photon::prompt::extract_blocked_summary_ids(resp);
+                                ids
+                            } else {
+                                std::collections::HashSet::new()
+                            };
+                        let shadow_input = self.config.photon_shadow_mode;
+                        let _ = self.record_pam_advisory_decision(resp, &blocked_ids, shadow_input);
                     }
                     self.session.context_pack_sent_this_turn = true;
                 }

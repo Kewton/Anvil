@@ -568,6 +568,20 @@ const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
     ("ANVIL_PHOTON_RESPECT_WARNINGS", None),
 ];
 
+/// Issue #667 T19: complete photon-adjacent env-clear set that also masks
+/// `ANVIL_PAM_ADVISORY_ENABLED`. Kept separate from `PHOTON_ENV_VARS` so the
+/// existing index-based overrides (e.g. `vars[0] = (...)`) remain stable.
+const PAM_AND_PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
+    ("ANVIL_PAM_ADVISORY_ENABLED", None),
+    ("ANVIL_PHOTON_ENABLED", None),
+    ("ANVIL_PHOTON_URL", None),
+    ("ANVIL_PHOTON_SHADOW_MODE", None),
+    ("ANVIL_PHOTON_CANARY", None),
+    ("ANVIL_PHOTON_TIMEOUT_MS", None),
+    ("ANVIL_OFFLINE", None),
+    ("ANVIL_PHOTON_RESPECT_WARNINGS", None),
+];
+
 #[test]
 fn photon_disabled_by_default() {
     let tmp = tempfile::tempdir().unwrap();
@@ -587,6 +601,128 @@ fn photon_shadow_mode_default_true() {
         let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
         assert!(cfg.photon_shadow_mode);
     });
+}
+
+// --- Issue #667 T19: pam_advisory_enabled precedence regression ---
+
+/// Default value of `pam_advisory_enabled` (no file, no env override) is `true`.
+/// SSOT lives in `Config::load` (`merged.pam_advisory_enabled.unwrap_or(true)`).
+#[test]
+fn pam_advisory_enabled_default_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PAM_AND_PHOTON_ENV_VARS, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            cfg.pam_advisory_enabled,
+            "default must be true (Issue #667 / Config::load unwrap_or(true))"
+        );
+    });
+}
+
+/// `.anvil/config` file with `pam_advisory_enabled = false` overrides the
+/// hard-coded default.
+#[test]
+fn file_pam_advisory_enabled_false_overrides_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let anvil_dir = tmp.path().join(".anvil");
+    std::fs::create_dir_all(&anvil_dir).unwrap();
+    std::fs::write(anvil_dir.join("config"), "pam_advisory_enabled = false\n").unwrap();
+    with_env(PAM_AND_PHOTON_ENV_VARS, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.pam_advisory_enabled,
+            "file `pam_advisory_enabled = false` must override default `true`"
+        );
+    });
+}
+
+/// `ANVIL_PAM_ADVISORY_ENABLED=true` env var overrides a `false` file value
+/// (env > file precedence — same ordering as `photon_shadow_mode`).
+#[test]
+fn env_pam_advisory_enabled_overrides_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let anvil_dir = tmp.path().join(".anvil");
+    std::fs::create_dir_all(&anvil_dir).unwrap();
+    std::fs::write(anvil_dir.join("config"), "pam_advisory_enabled = false\n").unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PAM_AND_PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PAM_ADVISORY_ENABLED", Some("true"));
+    with_env(&vars, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            cfg.pam_advisory_enabled,
+            "env true must beat file false (env > file precedence)"
+        );
+    });
+}
+
+/// `ANVIL_PAM_ADVISORY_ENABLED=false` env var overrides a `true` (default-implied)
+/// file value when no file key is set.
+#[test]
+fn env_pam_advisory_enabled_false_overrides_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PAM_AND_PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PAM_ADVISORY_ENABLED", Some("false"));
+    with_env(&vars, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.pam_advisory_enabled,
+            "env false must override implicit default true"
+        );
+    });
+}
+
+/// `load_env_config` reads `ANVIL_PAM_ADVISORY_ENABLED` into a
+/// `PartialConfig.pam_advisory_enabled = Some(true)` (env layer, no merge).
+#[test]
+fn env_config_reads_pam_advisory_enabled() {
+    with_env(&[("ANVIL_PAM_ADVISORY_ENABLED", Some("true"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.pam_advisory_enabled, Some(true));
+        assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
+    });
+}
+
+/// `merge_partial_configs` prefers the last source — same precedence as
+/// `photon_shadow_mode` / other bool flags (file → env → cli).
+#[test]
+fn merge_pam_advisory_enabled_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            pam_advisory_enabled: Some(true),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            pam_advisory_enabled: Some(false),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.pam_advisory_enabled, Some(false));
+
+    let merged_rev = merge_partial_configs(&[
+        PartialConfig {
+            pam_advisory_enabled: Some(false),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            pam_advisory_enabled: Some(true),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged_rev.pam_advisory_enabled, Some(true));
+}
+
+/// `load_config_file` reads the file key `pam_advisory_enabled = false` into
+/// `PartialConfig.pam_advisory_enabled = Some(false)`.
+#[test]
+fn file_config_reads_pam_advisory_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config");
+    std::fs::write(&config_path, "pam_advisory_enabled = false\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&config_path, &mut warnings).unwrap();
+    assert_eq!(cfg.pam_advisory_enabled, Some(false));
+    assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
 }
 
 #[test]

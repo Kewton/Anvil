@@ -144,6 +144,232 @@ mod job_report_e2e_tests;
 // precedent). Production binary does not include this module (DR3-001).
 #[cfg(test)]
 mod bash_policy_e2e_tests;
+// Issue #667: PAM advisory adapter SSOT (pure functions + decision types).
+// Module is intentionally *not* re-exported (DR3-001) — `turn.rs` is the
+// only behavioral in-crate consumer via the `record_pam_advisory_decision`
+// thin shell on `impl Agent`.
+mod pam_advisory;
+
+/// Issue #667 (DR2-004 Tier-2 / CB-001 precedent): drive
+/// `Agent::record_pam_advisory_decision` from `pam_advisory_e2e_tests`
+/// without widening the production API. `#[cfg(test)]` keeps the seam out
+/// of release builds entirely (matches the precedent set by
+/// `emit_safe_stop_report_*_for_test` and `maybe_emit_job_reports_for_test`).
+#[cfg(test)]
+pub(in crate::agent::loop_run) fn record_pam_advisory_decision_for_test(
+    agent: &mut Agent,
+    resp: &crate::photon::schema::ContextPackResponse,
+    blocked_ids: &std::collections::HashSet<String>,
+    shadow: bool,
+) {
+    let _ = agent.record_pam_advisory_decision(resp, blocked_ids, shadow);
+}
+
+#[cfg(test)]
+impl Agent {
+    /// Issue #667 test-only accessor: snapshot of the PAM decision carrier.
+    pub(in crate::agent::loop_run) fn last_pam_decision_this_turn(
+        &self,
+    ) -> Option<&pam_advisory::PamAdvisoryDecision> {
+        self.last_pam_decision_this_turn.as_ref()
+    }
+
+    /// Issue #667 test-only accessor: deep clone of the active job selection
+    /// so a test can assert "adapter did not mutate selection state".
+    pub(in crate::agent::loop_run) fn last_active_job_selection_clone(
+        &self,
+    ) -> Option<active_job_arbiter::ActiveJobSelection> {
+        self.last_active_job_selection.clone()
+    }
+
+    /// Issue #667 iteration-2 test-only seam: simulate the turn-boundary
+    /// reset that production `handle_user_message` performs at the top of
+    /// each turn. Lets the T5 boundary test drive multiple turns without
+    /// constructing a full request lifecycle. `#[cfg(test)]` keeps this out
+    /// of release binaries.
+    pub(in crate::agent::loop_run) fn reset_last_pam_decision_for_test(&mut self) {
+        self.last_pam_decision_this_turn = None;
+    }
+}
+
+/// Issue #667 (CB-001): in-crate test helpers exposed via a thin shim
+/// module so the e2e tests can reference schema-pin sample payloads and
+/// constants without exporting them across the crate boundary.
+#[cfg(test)]
+pub(in crate::agent::loop_run) mod tests_export {
+    use crate::agent::loop_run::pam_advisory::{
+        MAX_PAM_DECISION_LIST_LEN, PamAdvisoryDecision, PamAdvisoryDecisionPayload,
+        PamAdvisoryMode, ShadowVsLiveDiff, SuppressedSummary, SuppressionReason,
+    };
+
+    /// Re-export of `MemoryReport::PAYLOAD_SCHEMA_VERSION` for the
+    /// regression test (T17 schema-pin sibling). Issue #667 must remain 1.
+    pub const MEMORY_REPORT_SCHEMA_VERSION: u32 = {
+        use super::job_report::JobReport;
+        <super::job_report::MemoryReport as JobReport>::PAYLOAD_SCHEMA_VERSION
+    };
+
+    /// Schema-pin shape: build a sample `PamAdvisoryDecisionPayload`
+    /// matching the documented JSON wire format for the "live" mode.
+    pub struct PamAdvisoryDecisionPayloadShape;
+
+    impl PamAdvisoryDecisionPayloadShape {
+        pub fn sample_live() -> serde_json::Value {
+            let decision = PamAdvisoryDecision {
+                mode: PamAdvisoryMode::Live,
+                injected_summary_ids: vec!["s1".to_string()],
+                injected_summary_ids_truncated: false,
+                suppressed_summary_ids: vec![SuppressedSummary {
+                    summary_id: "s2".to_string(),
+                    reason: SuppressionReason::RoleMismatch,
+                }],
+                suppressed_summary_ids_truncated: false,
+                shadow_vs_live_diff: None,
+                active_job_role: "ArtifactRecovery:test".to_string(),
+            };
+            decision.to_json_value()
+        }
+
+        pub fn sample_shadow() -> serde_json::Value {
+            let decision = PamAdvisoryDecision {
+                mode: PamAdvisoryMode::Shadow,
+                injected_summary_ids: Vec::new(),
+                injected_summary_ids_truncated: false,
+                suppressed_summary_ids: Vec::new(),
+                suppressed_summary_ids_truncated: false,
+                shadow_vs_live_diff: Some(ShadowVsLiveDiff {
+                    would_inject_in_live: vec!["sX".to_string()],
+                    would_inject_in_live_truncated: false,
+                }),
+                active_job_role: ":".to_string(),
+            };
+            decision.to_json_value()
+        }
+    }
+
+    /// Schema-pin sample for the per-list cap (T7): build a payload with
+    /// 16 injected ids and the truncated flag set so the cap is observable
+    /// in the wire format without spinning up a full adapter call.
+    pub fn sample_truncated_decision_payload() -> serde_json::Value {
+        let ids: Vec<String> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| format!("s{i:02}"))
+            .collect();
+        let decision = PamAdvisoryDecision {
+            mode: PamAdvisoryMode::Live,
+            injected_summary_ids: ids,
+            injected_summary_ids_truncated: true,
+            suppressed_summary_ids: Vec::new(),
+            suppressed_summary_ids_truncated: false,
+            shadow_vs_live_diff: None,
+            active_job_role: ":".to_string(),
+        };
+        decision.to_json_value()
+    }
+
+    // Type-export so the wire wrapper struct stays reachable for
+    // PamAdvisoryDecisionPayload-direct serde verification, if needed.
+    #[allow(dead_code)]
+    pub(in crate::agent::loop_run) type Payload = PamAdvisoryDecisionPayload;
+
+    /// Issue #667 T24 boundary regression: expose the per-list cap constant
+    /// so the e2e test can pin the documented value (16) without piercing
+    /// `pam_advisory.rs::pub(super)` visibility.
+    pub const MAX_PAM_DECISION_LIST_LEN_FOR_TEST: usize = MAX_PAM_DECISION_LIST_LEN;
+
+    /// Issue #667 iteration-3 BND-002 boundary regression: expose the
+    /// envelope cap so the e2e proof can pin the documented value (8 KiB)
+    /// without piercing `job_report.rs::pub(super)` visibility.
+    pub const MAX_REPORT_PAYLOAD_BYTES_FOR_TEST: usize =
+        super::job_report::MAX_REPORT_PAYLOAD_BYTES;
+
+    /// Issue #667 iteration-3 BND-002: build the design's section 6 decision-3
+    /// worst-case `PamAdvisoryDecision` — all three per-list caps fully
+    /// saturated at `MAX_PAM_DECISION_LIST_LEN = 16` entries, every
+    /// `summary_id` synthesised at exactly the renderer SSOT cap
+    /// (`MAX_BLOCKED_SUMMARY_ID_BYTES = 256` bytes) — and return the
+    /// `PamAdvisoryDecisionPayload::to_json_value()` projection that flows
+    /// into `MemoryReport.pam_decision`. The caller pairs this with
+    /// `enforce_envelope_bounds_with_pam_decision_for_test` to verify the
+    /// envelope cap proof (`section 6 decision 3`).
+    pub fn build_worst_case_pam_decision_payload_for_test() -> serde_json::Value {
+        // Each id is exactly 256 bytes of ASCII `a` — the exact SSOT cap.
+        let max_id: String = "a".repeat(crate::photon::prompt::MAX_BLOCKED_SUMMARY_ID_BYTES);
+        let injected: Vec<String> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| {
+                // Vary one suffix char so ids are distinct but stay at the
+                // 256-byte cap exactly.
+                let mut id = max_id.clone();
+                let prefix_len = format!("{i:02}").len();
+                id.replace_range(0..prefix_len, &format!("{i:02}"));
+                id
+            })
+            .collect();
+        let suppressed: Vec<SuppressedSummary> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| {
+                let mut id = max_id.clone();
+                let prefix = format!("s{i:02}");
+                id.replace_range(0..prefix.len(), &prefix);
+                SuppressedSummary {
+                    summary_id: id,
+                    reason: SuppressionReason::RoleMismatch,
+                }
+            })
+            .collect();
+        let would_inject: Vec<String> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| {
+                let mut id = max_id.clone();
+                let prefix = format!("w{i:02}");
+                id.replace_range(0..prefix.len(), &prefix);
+                id
+            })
+            .collect();
+        let decision = PamAdvisoryDecision {
+            mode: PamAdvisoryMode::Shadow,
+            injected_summary_ids: injected,
+            injected_summary_ids_truncated: true,
+            suppressed_summary_ids: suppressed,
+            suppressed_summary_ids_truncated: true,
+            shadow_vs_live_diff: Some(ShadowVsLiveDiff {
+                would_inject_in_live: would_inject,
+                would_inject_in_live_truncated: true,
+            }),
+            active_job_role: "ArtifactRecovery:test".to_string(),
+        };
+        decision.to_json_value()
+    }
+
+    /// Issue #667 iteration-3 BND-002 envelope-cap proof helper. Wraps the
+    /// given `PamAdvisoryDecision` JSON into a `MemoryReport`, builds the
+    /// envelope via the production `build_envelope::<MemoryReport>` chokepoint
+    /// and runs `enforce_bounds`. Returns
+    /// `(serialized_len_after_enforce, overflowed, truncated)` so the e2e
+    /// proof can assert `serialized_len <= MAX_REPORT_PAYLOAD_BYTES` and the
+    /// payload was NOT replaced with `"<dropped:overflow>"`.
+    pub fn enforce_envelope_bounds_with_pam_decision_for_test(
+        pam_decision: serde_json::Value,
+    ) -> (usize, bool, bool) {
+        use super::job_report::{MemoryReport, build_envelope, enforce_bounds};
+        let report = MemoryReport {
+            turn_index: 1,
+            pam_decision: Some(pam_decision),
+            context_pack_binding: None,
+            adopted_item_count: 0,
+            injection_skipped_reason: None,
+        };
+        let mut envelope = build_envelope(&report);
+        let (overflowed, truncated) = enforce_bounds(&mut envelope);
+        let serialized_len = serde_json::to_string(&envelope)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        (serialized_len, overflowed, truncated)
+    }
+}
+// Issue #667: in-crate `#[cfg(test)]` E2E suite for the PAM advisory
+// pipeline (CB-001 fix pattern, `safe_stop_e2e_tests.rs` /
+// `job_report_e2e_tests.rs` precedent). Production binary does not include
+// this module (DR3-001).
+#[cfg(test)]
+mod pam_advisory_e2e_tests;
 
 /// Test seam (#[cfg(test)] only): drive
 /// `Agent::maybe_emit_job_reports_with_linkage` from
@@ -1407,6 +1633,17 @@ pub struct Agent {
     /// is the authority for any persisted ownership / completion data).
     pub(in crate::agent::loop_run) owned_test_verifier_missing_observed_carryover:
         Option<task_contract::RequestCarryoverKey>,
+    /// Issue #667 (DR1-004): per-turn PAM advisory decision carrier. `is_some()`
+    /// is synonymous with "adapter has produced a decision this turn"; the
+    /// old design's separate `pam_advisory_decided_this_turn: bool` flag is
+    /// intentionally absent (SRP violation + double-write footgun).
+    ///
+    /// Reset to `None` at the head of every `handle_user_message` adjacent
+    /// to `last_active_job_selection = None`. NOT serialized — in-memory
+    /// only (same per-turn pattern as `last_active_job_selection` and
+    /// `last_behavior_contract_projection_event`).
+    pub(in crate::agent::loop_run) last_pam_decision_this_turn:
+        Option<pam_advisory::PamAdvisoryDecision>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1657,6 +1894,8 @@ impl Agent {
             owned_test_verifier_missing_observed_this_turn: false,
             // Issue #664 iteration-4 (CB3-001): request-bound carryover.
             owned_test_verifier_missing_observed_carryover: None,
+            // Issue #667: PAM advisory per-turn carrier.
+            last_pam_decision_this_turn: None,
         }
     }
 
@@ -1668,6 +1907,88 @@ impl Agent {
     #[allow(dead_code)] // forward-facing helper; call sites migrate off the legacy bool in a follow-up.
     pub(super) fn is_verifier_repair_pending(&self) -> bool {
         self.repair_job.is_some()
+    }
+
+    /// Issue #667 (DR1-008): SSOT helper that resolves the adapter's
+    /// per-turn inputs (S3-008 ordering priorities (1)(2)(3) + `#665`
+    /// behavior projection). Called once per turn by
+    /// `record_pam_advisory_decision` so the 2 chokepoints never inline
+    /// the resolution logic (DR1-005).
+    pub(in crate::agent::loop_run) fn pam_advisory_inputs(
+        &self,
+    ) -> pam_advisory::PamAdvisoryInputs {
+        // Priority (1): active-job arbiter selected kind.
+        let role_hint_from_active = self
+            .last_active_job_selection
+            .as_ref()
+            .and_then(|sel| sel.selected.as_ref())
+            .and_then(|c| pam_advisory::job_kind_to_artifact_role(c.kind));
+
+        // Priority (2): artifact_completion_job's role (SSOT for
+        // role-specific completion targets).
+        let role_hint_from_completion = self.artifact_completion_job.as_ref().map(|job| job.role());
+
+        // Priority (3): TaskContract derived from active request text.
+        // `first_missing_required_role` is evidence-aware and not available
+        // here, so we fall back to the first required role hint
+        // (DR3-004 — same pattern as `refresh_artifact_completion_satisfied`).
+        let task_contract = self
+            .active_request_text()
+            .map(|text| task_contract::TaskContract::from_request(&text));
+        let role_hint_from_contract = task_contract
+            .as_ref()
+            .and_then(|tc| tc.required_artifacts.first().copied());
+
+        let role_hint = role_hint_from_active
+            .or(role_hint_from_completion)
+            .or(role_hint_from_contract);
+
+        let behavior = task_contract
+            .as_ref()
+            .and_then(required_behavior::project_behavior_contract);
+
+        pam_advisory::PamAdvisoryInputs {
+            role_hint,
+            behavior,
+        }
+    }
+
+    /// Issue #667 (DR1-005): adapter SSOT entry point. The 2 production
+    /// chokepoints (`turn.rs::invoke_photon_context_pack` and the path-b
+    /// branch in `build_request_messages`) call this shell instead of
+    /// touching the adapter directly. Performs:
+    ///
+    /// 1. `config.pam_advisory_enabled` gate (early `None`).
+    /// 2. Per-turn dedup via `last_pam_decision_this_turn.is_some()`.
+    /// 3. Builds `PamAdvisoryInputs` once.
+    /// 4. Invokes `evaluate_pam_advisory` (pure fn).
+    /// 5. Writes `last_pam_decision_this_turn = Some(decision)` exactly once.
+    pub(in crate::agent::loop_run) fn record_pam_advisory_decision(
+        &mut self,
+        resp: &crate::photon::schema::ContextPackResponse,
+        blocked_ids: &std::collections::HashSet<String>,
+        shadow_input: bool,
+    ) -> Option<pam_advisory::PamAdvisoryOutcome> {
+        if !self.config.pam_advisory_enabled {
+            return None;
+        }
+        if self.last_pam_decision_this_turn.is_some() {
+            return None;
+        }
+        let inputs = self.pam_advisory_inputs();
+        let active_ref = self.last_active_job_selection.as_ref();
+        let outcome = pam_advisory::evaluate_pam_advisory(
+            resp,
+            blocked_ids,
+            active_ref,
+            inputs.role_hint,
+            inputs.behavior.as_ref(),
+            pam_advisory::PamAdvisoryModeInput {
+                shadow: shadow_input,
+            },
+        );
+        self.last_pam_decision_this_turn = Some(outcome.decision.clone());
+        Some(outcome)
     }
 }
 
