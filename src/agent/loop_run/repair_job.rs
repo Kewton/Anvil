@@ -17,10 +17,11 @@
 use std::path::{Path, PathBuf};
 
 use super::repair_attempt_outcome::{
-    MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, should_promote_to_exhausted_after_push,
+    MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, RepairAttemptOutcomeKind,
+    RepairRejectionKind, should_promote_to_exhausted_after_push,
 };
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
-use super::spec_authority::{RepairRole, SpecAuthority};
+use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::RecoveryTargetHint;
 use super::{
     VerifierDiagnosticFailureKind, VerifierFailureType, VerifierRepairAssessment,
@@ -31,6 +32,77 @@ use crate::session::store::ConversationMessage;
 /// Maximum byte length retained for sanitized snapshot text fields. Consumed
 /// by `truncate_for_snapshot` and the `failure_snapshot` production path (Issue #638).
 pub(super) const SNAPSHOT_FIELD_BYTE_CAP: usize = 4096;
+
+/// v0.4.10: bounded target-path lifecycle ledger cap. This ledger is
+/// turn-local / in-memory like `repair_attempt_outcomes`; it stores only
+/// closed enum buckets and admitted relative paths, never raw patch text.
+const MAX_REPAIR_TARGET_ATTEMPTS: usize = 24;
+const APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD: usize = 3;
+
+/// v0.4.10: target-local bucket used to decide when a selected repair target
+/// should be skipped for the active cluster. This is deliberately separate
+/// from `RepairAttemptOutcomeKind`: target exhaustion needs the exact unsafe
+/// weakening pattern, while the cluster-level promotion path only needs the
+/// coarse outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RepairTargetAttemptBucket {
+    Unsafe {
+        rejection: RepairRejectionKind,
+        pattern: WeakeningPattern,
+    },
+    Malformed,
+    Noop,
+    Duplicate,
+    ImprovedStillFailing,
+    NoProgress,
+    Worsened,
+}
+
+impl RepairTargetAttemptBucket {
+    fn from_outcome_kind(kind: &RepairAttemptOutcomeKind) -> Option<Self> {
+        match kind {
+            RepairAttemptOutcomeKind::RejectedUnsafe { rejection, pattern } => Some(Self::Unsafe {
+                rejection: *rejection,
+                pattern: *pattern,
+            }),
+            RepairAttemptOutcomeKind::RejectedMalformed => Some(Self::Malformed),
+            RepairAttemptOutcomeKind::RejectedNoop => Some(Self::Noop),
+            RepairAttemptOutcomeKind::RejectedDuplicate => Some(Self::Duplicate),
+            RepairAttemptOutcomeKind::AppliedNoProgress => Some(Self::NoProgress),
+            RepairAttemptOutcomeKind::AppliedWorsened => Some(Self::Worsened),
+            RepairAttemptOutcomeKind::AppliedImproved => Some(Self::ImprovedStillFailing),
+            RepairAttemptOutcomeKind::RejectedNoCandidate => None,
+        }
+    }
+
+    fn exhaustion_threshold(self) -> usize {
+        match self {
+            Self::ImprovedStillFailing => APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD,
+            Self::Unsafe { .. }
+            | Self::Malformed
+            | Self::Noop
+            | Self::Duplicate
+            | Self::NoProgress
+            | Self::Worsened => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepairTargetAttemptOutcome {
+    pub(super) cluster: FailureClusterKey,
+    pub(super) role: RepairRole,
+    pub(super) path: String,
+    pub(super) bucket: RepairTargetAttemptBucket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExhaustedRepairTarget {
+    pub(super) cluster: FailureClusterKey,
+    pub(super) role: RepairRole,
+    pub(super) path: String,
+    pub(super) bucket: RepairTargetAttemptBucket,
+}
 
 /// Issue #647 (Phase B / DR1-003): 1 cluster 攻略 plan を束ねる sub-struct。
 /// `slot reuse` (設計判断 #5) 時はこの struct 単位で `RepairJob.semantic_plan`
@@ -169,6 +241,16 @@ pub(super) struct RepairJob {
     /// 同一 `(cluster, role, RejectedUnsafe { rejection })` が 2 回検出された
     /// 時点で `exhausted_attempts` にも昇格 push する (S1-006(a))。
     pub(super) repair_attempt_outcomes: Vec<RepairAttemptOutcome>,
+    /// v0.4.10: target-path lifecycle ledger. Cluster-level
+    /// `exhausted_attempts` is intentionally coarse; this ledger lets the
+    /// controller stop retrying the same weakening / malformed / no-progress
+    /// target while another admitted target for the same cluster may still
+    /// be repairable.
+    pub(super) repair_target_attempt_outcomes: Vec<RepairTargetAttemptOutcome>,
+    /// v0.4.10: target paths that should no longer be selected for the
+    /// corresponding `(cluster, role)`. This is in-memory only and carries
+    /// bounded relative paths plus closed enum buckets.
+    pub(super) exhausted_repair_targets: Vec<ExhaustedRepairTarget>,
 }
 
 /// Controller-internal decision used by `run_turn` to pick the next action
@@ -413,6 +495,8 @@ impl RepairJob {
             assessment_generation: 0,
             assessment_bound_cluster_id: None,
             repair_attempt_outcomes: Vec::new(),
+            repair_target_attempt_outcomes: Vec::new(),
+            exhausted_repair_targets: Vec::new(),
         }
     }
 
@@ -492,6 +576,208 @@ impl RepairJob {
             promoted,
             all_clusters_exhausted,
         }
+    }
+
+    /// v0.4.10: record the same repair attempt at target-path granularity.
+    ///
+    /// This wraps the existing cluster-level ledger so old safe-stop behavior
+    /// stays intact, then adds a second signal: if the same `(cluster, role,
+    /// target path, bucket)` fails twice, that target path is marked
+    /// exhausted. If every admitted target for the active cluster is now
+    /// exhausted, the cluster-level `(cluster, role)` entry is promoted too.
+    pub(super) fn record_repair_attempt_outcome_for_target(
+        &mut self,
+        outcome: RepairAttemptOutcome,
+        target_hint: &RecoveryTargetHint,
+    ) -> PromotionResult {
+        let mut result = self.record_repair_attempt_outcome(outcome.clone());
+        // The legacy cluster-level ledger promotes on repeated
+        // `(cluster, role, bucket)` regardless of target path. In the
+        // target-aware path that is too coarse: a second weakening proposal for
+        // tests/a.py should not exhaust tests/b.py. If this call just caused
+        // a cluster-level promotion but not every current target is exhausted
+        // yet, downgrade the promotion and let the target-level rule below
+        // re-promote only when all admitted targets are exhausted.
+        let cluster_entry = (outcome.cluster.clone(), outcome.role);
+        if result.promoted
+            && !self.current_cluster_role_targets_all_exhausted(&outcome.cluster, outcome.role)
+        {
+            if let Some(pos) = self
+                .exhausted_attempts
+                .iter()
+                .position(|entry| entry == &cluster_entry)
+            {
+                self.exhausted_attempts.remove(pos);
+            }
+            result.promoted = false;
+        }
+        let Some(bucket) = RepairTargetAttemptBucket::from_outcome_kind(&outcome.kind) else {
+            result.all_clusters_exhausted = self.all_clusters_exhausted_for_active_plan();
+            return result;
+        };
+        let target_path = target_hint.path.clone();
+        self.push_repair_target_attempt(RepairTargetAttemptOutcome {
+            cluster: outcome.cluster.clone(),
+            role: outcome.role,
+            path: target_path.clone(),
+            bucket,
+        });
+        let repeated_same_target_bucket = self
+            .repair_target_attempt_outcomes
+            .iter()
+            .filter(|candidate| {
+                candidate.cluster == outcome.cluster
+                    && candidate.role == outcome.role
+                    && candidate.path == target_path
+                    && candidate.bucket == bucket
+            })
+            .count()
+            >= bucket.exhaustion_threshold();
+        if repeated_same_target_bucket
+            && !self.is_repair_target_exhausted(&outcome.cluster, outcome.role, &target_path)
+        {
+            self.exhausted_repair_targets.push(ExhaustedRepairTarget {
+                cluster: outcome.cluster.clone(),
+                role: outcome.role,
+                path: target_path,
+                bucket,
+            });
+            if self.promote_cluster_if_current_targets_exhausted(&outcome.cluster, outcome.role) {
+                result.promoted = true;
+            }
+        }
+        result.all_clusters_exhausted = self.all_clusters_exhausted_for_active_plan();
+        result
+    }
+
+    fn push_repair_target_attempt(&mut self, attempt: RepairTargetAttemptOutcome) {
+        if self.repair_target_attempt_outcomes.len() >= MAX_REPAIR_TARGET_ATTEMPTS {
+            self.repair_target_attempt_outcomes.remove(0);
+            tracing::warn!(
+                event = "agent.repair_target_attempt_outcomes.fifo_drop",
+                count = MAX_REPAIR_TARGET_ATTEMPTS,
+                "repair_target_attempt_outcomes FIFO drop: oldest entry evicted"
+            );
+        }
+        self.repair_target_attempt_outcomes.push(attempt);
+    }
+
+    pub(super) fn has_exhausted_repair_targets(&self) -> bool {
+        !self.exhausted_repair_targets.is_empty()
+    }
+
+    pub(super) fn is_repair_target_exhausted(
+        &self,
+        cluster: &FailureClusterKey,
+        role: RepairRole,
+        path: &str,
+    ) -> bool {
+        self.exhausted_repair_targets
+            .iter()
+            .any(|target| &target.cluster == cluster && target.role == role && target.path == path)
+    }
+
+    pub(super) fn is_repair_hint_exhausted(&self, hint: &RecoveryTargetHint) -> bool {
+        let Some(plan) = self.semantic_plan.as_ref() else {
+            return false;
+        };
+        self.is_repair_target_exhausted(&plan.failure_cluster_id, hint.role, &hint.path)
+    }
+
+    /// Return the first admitted target for the active semantic cluster that
+    /// has not been target-exhausted. This helper is intentionally only about
+    /// semantic plans; legacy `assessment` fallback stays in `turn.rs`.
+    pub(super) fn current_unexhausted_semantic_target(&self) -> Option<&RecoveryTargetHint> {
+        let plan = self.semantic_plan.as_ref()?;
+        plan.current_cluster_targets().iter().find(|target| {
+            target.role == plan.preferred_repair_role
+                && !self.is_repair_target_exhausted(
+                    &plan.failure_cluster_id,
+                    plan.preferred_repair_role,
+                    &target.path,
+                )
+        })
+    }
+
+    /// True only when the active semantic cluster has at least one admitted
+    /// target for its role and all such targets are exhausted.
+    pub(super) fn current_semantic_targets_all_exhausted(&self) -> bool {
+        let Some(plan) = self.semantic_plan.as_ref() else {
+            return false;
+        };
+        self.current_cluster_role_targets_all_exhausted(
+            &plan.failure_cluster_id,
+            plan.preferred_repair_role,
+        )
+    }
+
+    pub(super) fn needs_diagnostic_after_target_exhaustion(&self) -> bool {
+        if !self.has_exhausted_repair_targets() {
+            return false;
+        }
+        if self.current_semantic_targets_all_exhausted() {
+            return true;
+        }
+        let Some(assessment) = self.assessment.as_ref() else {
+            return false;
+        };
+        let current_hint = assessment
+            .repair_plan
+            .get(self.applied_repair_intents.len())
+            .or(assessment.repair_target_hint.as_ref());
+        current_hint.is_some_and(|hint| self.is_repair_hint_exhausted(hint))
+    }
+
+    fn promote_cluster_if_current_targets_exhausted(
+        &mut self,
+        cluster: &FailureClusterKey,
+        role: RepairRole,
+    ) -> bool {
+        if !self.current_cluster_role_targets_all_exhausted(cluster, role) {
+            return false;
+        }
+        let entry = (cluster.clone(), role);
+        if self.exhausted_attempts.contains(&entry) {
+            return false;
+        }
+        self.exhausted_attempts.push(entry);
+        true
+    }
+
+    fn current_cluster_role_targets_all_exhausted(
+        &self,
+        cluster: &FailureClusterKey,
+        role: RepairRole,
+    ) -> bool {
+        let Some(plan) = self.semantic_plan.as_ref() else {
+            return false;
+        };
+        if &plan.failure_cluster_id != cluster || plan.preferred_repair_role != role {
+            return false;
+        }
+        let mut saw_target = false;
+        for target in plan
+            .current_cluster_targets()
+            .iter()
+            .filter(|target| target.role == role)
+        {
+            saw_target = true;
+            if !self.is_repair_target_exhausted(cluster, role, &target.path) {
+                return false;
+            }
+        }
+        saw_target
+    }
+
+    fn all_clusters_exhausted_for_active_plan(&self) -> bool {
+        self.semantic_plan.as_ref().is_some_and(|plan| {
+            next_repairable_cluster(
+                &plan.semantic_report,
+                plan.preferred_repair_role,
+                &self.exhausted_attempts,
+            )
+            .is_none()
+        })
     }
 
     /// Issue #653 (S1-007, DR1-006 命名統一): #654 (bounded stop report) が消費する
@@ -682,6 +968,15 @@ pub(super) fn verifier_repair_decision(
     // could never start because the same exhausted_attempts-based predicate
     // kept routing back to `NeedDiagnostic`.
     if job.is_some_and(semantic_plan_is_stale) {
+        if job.is_some_and(|job| {
+            job.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+        }) {
+            return VerifierRepairDecision::NeedDiagnostic;
+        }
+        return VerifierRepairDecision::DiagnosticUnavailable;
+    }
+    if job.is_some_and(|job| job.needs_diagnostic_after_target_exhaustion()) {
         if job.is_some_and(|job| {
             job.assessment_attempts
                 < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
@@ -4881,6 +5176,14 @@ mod tests {
         )
     }
 
+    fn outcome_applied_improved(cluster_label: &str, role: ArtifactRole) -> RepairAttemptOutcome {
+        RepairAttemptOutcome::for_test(
+            cluster_key_for_test(cluster_label),
+            role,
+            RepairAttemptOutcomeKind::AppliedImproved,
+        )
+    }
+
     /// Issue #662: build a `RepairJob` with `semantic_plan = Some(...)` so the
     /// `record_repair_attempt_outcome` precondition (`debug_assert!`) is
     /// satisfied. `cluster_label` becomes the active plan's
@@ -4910,6 +5213,52 @@ mod tests {
             semantic_plan: Some(plan),
             ..RepairJob::new_for_test()
         }
+    }
+
+    #[cfg(test)]
+    fn semantic_repair_job_with_targets_for_test(
+        cluster_label: &str,
+        role: ArtifactRole,
+        paths: &[&str],
+    ) -> (
+        RepairJob,
+        Vec<super::super::task_contract::RecoveryTargetHint>,
+    ) {
+        let mut report = semantic_report_fixture_with_cluster(
+            cluster_label,
+            VerifierDiagnosticFailureKind::AssertionMismatch,
+            0.7,
+        );
+        report.preferred_repair_role = role;
+        let targets = paths
+            .iter()
+            .map(|path| super::super::task_contract::RecoveryTargetHint {
+                role,
+                path: (*path).to_string(),
+                reason: "target exhaustion fixture".to_string(),
+            })
+            .collect::<Vec<_>>();
+        if let Some(cluster) = report.failure_clusters.get_mut(0) {
+            cluster.admitted_cluster_targets = targets.clone();
+        }
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: role,
+            repair_hypothesis: "h".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        (
+            RepairJob {
+                semantic_plan: Some(plan),
+                ..RepairJob::new_for_test()
+            },
+            targets,
+        )
     }
 
     /// Issue #662: like `semantic_report_fixture` but with caller-supplied
@@ -4972,6 +5321,175 @@ mod tests {
         let _ = job.record_repair_attempt_outcome(outcome.clone());
         assert_eq!(job.repair_attempt_outcomes.len(), 1);
         assert_eq!(job.repair_attempt_outcomes[0], outcome);
+    }
+
+    #[test]
+    fn target_path_exhaustion_skips_only_repeated_bad_target() {
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Test,
+            &["tests/a.py", "tests/b.py"],
+        );
+        let outcome = outcome_rejected_unsafe(
+            "A",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        );
+
+        let first = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        assert!(!first.promoted);
+        assert!(!first.all_clusters_exhausted);
+        assert!(!job.is_repair_target_exhausted(
+            &cluster_key_for_test("A"),
+            ArtifactRole::Test,
+            "tests/a.py",
+        ));
+
+        let second = job.record_repair_attempt_outcome_for_target(outcome, &targets[0]);
+        assert!(!second.promoted);
+        assert!(!second.all_clusters_exhausted);
+        assert!(job.is_repair_target_exhausted(
+            &cluster_key_for_test("A"),
+            ArtifactRole::Test,
+            "tests/a.py",
+        ));
+        assert_eq!(
+            job.current_unexhausted_semantic_target()
+                .expect("tests/b.py remains repairable")
+                .path,
+            "tests/b.py"
+        );
+        assert!(
+            !job.exhausted_attempts
+                .contains(&(cluster_key_for_test("A"), ArtifactRole::Test)),
+            "cluster-level exhaustion must wait until all admitted targets are exhausted"
+        );
+    }
+
+    #[test]
+    fn target_path_exhaustion_is_scoped_to_active_cluster() {
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Test,
+            &["tests/shared.py"],
+        );
+        let outcome = outcome_rejected_unsafe(
+            "A",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        );
+
+        let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        let _ = job.record_repair_attempt_outcome_for_target(outcome, &targets[0]);
+        assert!(job.is_repair_hint_exhausted(&targets[0]));
+
+        let report = semantic_report_fixture_with_cluster(
+            "B",
+            VerifierDiagnosticFailureKind::AssertionMismatch,
+            0.8,
+        );
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        job.semantic_plan = Some(SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::BehaviorContract,
+            preferred_repair_role: ArtifactRole::Test,
+            repair_hypothesis: "new cluster should not inherit target exhaustion".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        });
+
+        assert!(
+            !job.is_repair_hint_exhausted(&targets[0]),
+            "target exhaustion from cluster A must not suppress the same file for cluster B"
+        );
+    }
+
+    #[test]
+    fn target_path_exhaustion_promotes_cluster_after_all_targets_exhausted() {
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Test,
+            &["tests/a.py", "tests/b.py"],
+        );
+        let outcome = outcome_rejected_unsafe(
+            "A",
+            ArtifactRole::Test,
+            RepairRejectionKind::TestWeakening,
+            WeakeningPattern::AssertionDeleted,
+        );
+
+        let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[1]);
+        let fourth = job.record_repair_attempt_outcome_for_target(outcome, &targets[1]);
+
+        assert!(fourth.promoted);
+        assert!(fourth.all_clusters_exhausted);
+        assert!(job.current_semantic_targets_all_exhausted());
+        assert!(job.current_unexhausted_semantic_target().is_none());
+        assert!(
+            job.exhausted_attempts
+                .contains(&(cluster_key_for_test("A"), ArtifactRole::Test))
+        );
+    }
+
+    #[test]
+    fn target_path_exhaustion_counts_repeated_improvements_that_still_fail() {
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["app/main.py"],
+        );
+        let outcome = outcome_applied_improved("A", ArtifactRole::Implementation);
+
+        let first = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        let second = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        assert!(!first.promoted);
+        assert!(!second.promoted);
+        assert!(!job.current_semantic_targets_all_exhausted());
+
+        let third = job.record_repair_attempt_outcome_for_target(outcome, &targets[0]);
+        assert!(third.promoted);
+        assert!(job.current_semantic_targets_all_exhausted());
+        assert!(job.needs_diagnostic_after_target_exhaustion());
+    }
+
+    #[test]
+    fn exhausted_target_routes_to_diagnostic_before_safe_stop() {
+        use tempfile::tempdir;
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["app/main.py"],
+        );
+        let outcome = outcome_applied_improved("A", ArtifactRole::Implementation);
+        let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        let _ = job.record_repair_attempt_outcome_for_target(outcome, &targets[0]);
+        job.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+        job.assessment_attempts = 0;
+
+        let decision = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(0), 0);
+        assert_eq!(decision, VerifierRepairDecision::NeedDiagnostic);
+
+        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        let exhausted = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(0), 0);
+        assert_eq!(exhausted, VerifierRepairDecision::DiagnosticUnavailable);
     }
 
     #[test]
