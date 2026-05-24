@@ -325,10 +325,11 @@ fn extract_affected_cases(output: &str) -> Vec<String> {
             && let Some((name, _)) = rest.split_once("' panicked")
         {
             push_case(&mut cases, Some(name));
-        } else if trimmed.starts_with('_') && trimmed.contains(" ERROR collecting ") {
-            if let Some((_, path)) = trimmed.split_once(" ERROR collecting ") {
-                push_case(&mut cases, Some(path.trim_matches('_').trim()));
-            }
+        } else if trimmed.starts_with('_')
+            && trimmed.contains(" ERROR collecting ")
+            && let Some((_, path)) = trimmed.split_once(" ERROR collecting ")
+        {
+            push_case(&mut cases, Some(path.trim_matches('_').trim()));
         }
         if cases.len() >= MAX_CASES {
             break;

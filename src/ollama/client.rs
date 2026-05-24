@@ -334,6 +334,7 @@ impl OllamaClient {
         self.chat_impl_with_options(model, messages, tools, stream, 0.3, None, &mut on_chunk)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn chat_impl_with_options<F>(
         &self,
         model: &str,

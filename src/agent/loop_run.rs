@@ -107,6 +107,12 @@ pub(crate) mod reminder;
 // v0.4.13 Phase 4: controller-owned action projected from a validated
 // RepairBrief. Private module; consumed by the repair pipeline as it is wired.
 mod repair_action;
+// v0.4.15 MVP: provenance/authority boundary for verifier repair proposals.
+// Private module; `turn.rs` is the only production consumer.
+mod repair_authority;
+// v0.4.16: accepted repair-plan boundary. Diagnostic output remains a proposal
+// until this module validates it against FailurePacket + authority evidence.
+mod repair_plan;
 // v0.4.13 Phase 2: small diagnostic schema returned by the short-lived
 // diagnostic LLM. Private module; no direct provider abstraction.
 mod repair_brief;
@@ -121,6 +127,9 @@ mod repair_attempt_outcome;
 mod required_behavior;
 // v0.4.13 Phase 5: bounded patch proposal schema for the patch shaper LLM.
 mod patch_proposal;
+// v0.4.16: patch-provider admission boundary. Providers propose concrete
+// edits only after the controller has accepted a repair plan.
+mod patch_provider;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 // Issue #647 (Phase A.1): semantic repair planning — bounded failure-report

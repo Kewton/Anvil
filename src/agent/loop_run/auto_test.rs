@@ -1510,7 +1510,6 @@ impl AutoTestRunner {
         };
         let display_command = candidate.plan.command.clone();
         let source = candidate.source;
-        let evidence = candidate.evidence.clone();
         let plan = candidate.into_plan();
         match source {
             VerifierCandidateSource::CargoManifest => {
@@ -1533,14 +1532,16 @@ impl AutoTestRunner {
                 }
             }
             VerifierCandidateSource::PythonTests => {
-                // Only the stdlib toolchain has a structured constructor
-                // today. uv/poetry/hatch/pip-install paths fall through
-                // to Weak so an LLM-edited shell string can never become
-                // a structured execution path.
-                let is_stdlib = evidence.iter().any(|e| e == "python-toolchain:stdlib");
-                if is_stdlib
-                    && let Some(command) =
-                        VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
+                // For task-contract verification, binding the current task's
+                // owned test artifact is stronger than replaying a detected
+                // shell-shaped setup command. Even when pyproject.toml would
+                // make the generic detector prefer a `pip install && pytest`
+                // string, run the allowlisted stdlib pytest constructor with
+                // explicit owned test paths. Missing dependencies then surface
+                // as normal verifier failures instead of collapsing the task
+                // into VerifierWeak.
+                if let Some(command) =
+                    VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
                 {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }
@@ -1653,6 +1654,24 @@ impl AutoTestRunner {
                 )
             })?;
 
+        let dependency_site =
+            match structured_python_pytest_dependency_setup_packages(work_root, command) {
+                Some(packages) => {
+                    let dependency_site = structured_python_dependency_site_dir(work_root);
+                    if let Some(result) = run_structured_python_dependency_setup(
+                        &runner_program,
+                        &env_plan,
+                        &dependency_site,
+                        &packages,
+                        display_command,
+                    )? {
+                        return Ok(result);
+                    }
+                    Some(dependency_site)
+                }
+                None => None,
+            };
+
         let mut child_cmd = Command::new(runner_program);
         child_cmd
             .args(command.args())
@@ -1663,6 +1682,13 @@ impl AutoTestRunner {
         // and env overrides land in a single SSOT (env_clear + allowlist
         // re-inject + extras + PYTHONPATH + cwd).
         env_plan.apply_to(&mut child_cmd);
+        if let Some(dependency_site) = dependency_site.as_deref() {
+            apply_structured_python_dependency_site_pythonpath(
+                &mut child_cmd,
+                work_root,
+                dependency_site,
+            )?;
+        }
         // PR-003: put the verifier in its own process group on Unix so
         // `wait_with_auto_test_timeout` can SIGKILL the whole descendant
         // tree on timeout. On non-Unix this is a no-op. SSOT lives in
@@ -1694,6 +1720,121 @@ impl AutoTestRunner {
             stderr,
         })
     }
+}
+
+fn structured_python_pytest_dependency_setup_packages(
+    work_root: &Path,
+    command: &VerifierCommand,
+) -> Option<Vec<String>> {
+    if command.runner() != "python3" || !command_invokes_python_pytest_module(command) {
+        return None;
+    }
+    let pyproject_path = work_root.join("pyproject.toml");
+    if !pyproject_path.is_file() {
+        return None;
+    }
+    let packages = python_pyproject_test_packages(&PythonProjectEvidence::from_file(work_root));
+    if packages.is_empty() {
+        None
+    } else {
+        Some(packages)
+    }
+}
+
+fn command_invokes_python_pytest_module(command: &VerifierCommand) -> bool {
+    command
+        .args()
+        .windows(2)
+        .any(|window| window[0] == "-m" && window[1] == "pytest")
+}
+
+fn structured_python_dependency_site_dir(work_root: &Path) -> PathBuf {
+    work_root
+        .join(".anvil-state")
+        .join("verifier-python")
+        .join("site")
+}
+
+fn run_structured_python_dependency_setup(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    dependency_site: &Path,
+    packages: &[String],
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    std::fs::create_dir_all(dependency_site).map_err(|err| {
+        format!(
+            "failed to create structured Python verifier dependency directory {}: {err}",
+            dependency_site.display()
+        )
+    })?;
+
+    let mut setup_cmd = Command::new(runner_program);
+    setup_cmd
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--upgrade",
+            "--target",
+        ])
+        .arg(dependency_site)
+        .args(packages)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_plan.apply_to(&mut setup_cmd);
+    crate::tools::bash::apply_unix_pgroup(&mut setup_cmd);
+
+    let output = wait_with_auto_test_timeout(
+        &mut setup_cmd,
+        Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+    )?;
+    if output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut combined = String::new();
+    combined.push_str(&stdout);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+    let setup_display = format!(
+        "python3 -m pip install --target <workspace>/.anvil-state/verifier-python/site {} + {}",
+        packages.join(" "),
+        display_command
+    );
+    let redacted = crate::session::feedback::redact_verifier_command_for_storage(&setup_display);
+    Ok(Some(AutoTestResult {
+        command: redacted,
+        passed: false,
+        output: truncate(&formatted, MAX_OUTPUT_BYTES),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    }))
+}
+
+fn apply_structured_python_dependency_site_pythonpath(
+    command: &mut Command,
+    work_root: &Path,
+    dependency_site: &Path,
+) -> Result<(), String> {
+    let pythonpath = std::env::join_paths([work_root, dependency_site]).map_err(|err| {
+        format!(
+            "failed to build structured Python verifier PYTHONPATH for {}: {err}",
+            dependency_site.display()
+        )
+    })?;
+    command.env("PYTHONPATH", pythonpath);
+    Ok(())
 }
 
 /// Issue #651 Task 2.3: upper bound on a structured verifier process.
@@ -3949,6 +4090,84 @@ dev = [
             }
             other => panic!("expected Runnable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_owned_for_pyproject_python_project_prefers_bound_stdlib_pytest() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = ['fastapi', 'pytest']\n",
+        )
+        .expect("pyproject");
+        let owned = vec!["tests/test_main.py".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["main.py".to_string()],
+            &[],
+            &owned,
+        );
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert!(command.args().contains(&"pytest".to_string()));
+                assert!(
+                    command.args().contains(&"tests/test_main.py".to_string()),
+                    "pyproject verifier must still bind owned test artifacts, got {:?}",
+                    command.args()
+                );
+                assert!(
+                    !command.to_display_string().contains("pip install"),
+                    "structured task-contract verifier must not rely on shell setup"
+                );
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_python_pytest_dependency_setup_packages_reads_pyproject() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = ['fastapi', 'httpx']\n",
+        )
+        .expect("pyproject");
+        let owned = vec!["tests/test_main.py".to_string()];
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
+
+        assert_eq!(
+            structured_python_pytest_dependency_setup_packages(dir.path(), &command),
+            Some(vec![
+                "fastapi".to_string(),
+                "httpx".to_string(),
+                "pytest".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn structured_python_pytest_dependency_setup_packages_ignores_non_pytest_or_no_pyproject() {
+        let dir = tempdir().expect("tempdir");
+        let owned = vec!["tests/test_main.py".to_string()];
+        let pytest_command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
+        assert_eq!(
+            structured_python_pytest_dependency_setup_packages(dir.path(), &pytest_command),
+            None
+        );
+
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = 'x'\n")
+            .expect("pyproject");
+        let cargo_command =
+            VerifierCommand::from_cargo_test(Vec::new(), &["tests/test_main.rs".to_string()])
+                .expect("cargo command");
+        assert_eq!(
+            structured_python_pytest_dependency_setup_packages(dir.path(), &cargo_command),
+            None
+        );
     }
 
     #[test]

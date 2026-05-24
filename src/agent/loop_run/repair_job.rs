@@ -20,9 +20,10 @@ use super::repair_attempt_outcome::{
     MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, RepairAttemptOutcomeKind,
     RepairRejectionKind, should_promote_to_exhausted_after_push,
 };
+use super::repair_brief::AllowedChangeKind;
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
-use super::task_contract::RecoveryTargetHint;
+use super::task_contract::{ArtifactRole, RecoveryTargetHint};
 use super::{
     VerifierDiagnosticFailureKind, VerifierFailureType, VerifierRepairAssessment,
     VerifierRepairRerunOutcome,
@@ -38,6 +39,10 @@ pub(super) const SNAPSHOT_FIELD_BYTE_CAP: usize = 4096;
 /// closed enum buckets and admitted relative paths, never raw patch text.
 const MAX_REPAIR_TARGET_ATTEMPTS: usize = 24;
 const APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD: usize = 3;
+const MAX_REPAIR_LIFECYCLE_EVENTS: usize = 32;
+const MAX_REJECTED_ATTEMPTS: usize = 16;
+#[allow(dead_code)] // used by the v0.4.16 next_action migration surface.
+const REPEATED_REJECTED_ATTEMPT_THRESHOLD: usize = 2;
 
 /// v0.4.10: target-local bucket used to decide when a selected repair target
 /// should be skipped for the active cluster. This is deliberately separate
@@ -251,6 +256,12 @@ pub(super) struct RepairJob {
     /// corresponding `(cluster, role)`. This is in-memory only and carries
     /// bounded relative paths plus closed enum buckets.
     pub(super) exhausted_repair_targets: Vec<ExhaustedRepairTarget>,
+    /// v0.4.16: bounded event history for the repair lifecycle. This is
+    /// controller state only; it is not serialized into sessions.
+    pub(super) lifecycle_events: Vec<RepairJobEvent>,
+    /// v0.4.16: normalized reject ledger used by `next_action()` to avoid
+    /// repeating the same invalid patch family.
+    pub(super) rejected_attempts: Vec<RejectedAttempt>,
 }
 
 /// Controller-internal decision used by `run_turn` to pick the next action
@@ -362,6 +373,165 @@ pub(super) struct VerifierFailureSnapshot {
     pub(super) repair_error: Option<String>,
     pub(super) rerun_outcome: Option<VerifierRepairRerunOutcome>,
     pub(super) applied_repair_intent_count: u32,
+}
+
+/// v0.4.16: closed terminal reasons for the repair lifecycle. These are
+/// controller state, not user-facing prose; callers can project them into a
+/// safe-stop report without parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // v0.4.16 migration surface; production wiring is incremental.
+pub(super) enum RepairTerminalReason {
+    VerifiedDone,
+    AmbiguousSpecSafeStop,
+    NoSafeRepairTarget,
+    RepairBudgetExhausted,
+    DiagnosticUnavailable,
+    PatchRejectedRepeatedly,
+    VerifierUnavailable,
+}
+
+impl RepairTerminalReason {
+    #[allow(dead_code)] // telemetry/report projection hook for the v0.4.16 migration.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedDone => "verified_done",
+            Self::AmbiguousSpecSafeStop => "ambiguous_spec_safe_stop",
+            Self::NoSafeRepairTarget => "no_safe_repair_target",
+            Self::RepairBudgetExhausted => "repair_budget_exhausted",
+            Self::DiagnosticUnavailable => "diagnostic_unavailable",
+            Self::PatchRejectedRepeatedly => "patch_rejected_repeatedly",
+            Self::VerifierUnavailable => "verifier_unavailable",
+        }
+    }
+
+    #[allow(dead_code)] // v0.4.16 migration surface; used when next_action owns terminal dispatch.
+    pub(super) fn safe_stop_reason(self) -> Option<StopReason> {
+        match self {
+            Self::VerifiedDone => None,
+            Self::AmbiguousSpecSafeStop => Some(StopReason::VerifierWeak),
+            Self::NoSafeRepairTarget => Some(StopReason::DiagnosticTargetMissing),
+            Self::RepairBudgetExhausted | Self::PatchRejectedRepeatedly => {
+                Some(StopReason::RepairExhausted)
+            }
+            Self::DiagnosticUnavailable => Some(StopReason::VerifierFailedSafeStop),
+            Self::VerifierUnavailable => Some(StopReason::VerifierMissing),
+        }
+    }
+}
+
+/// v0.4.16: verifier rerun delta normalized for `RepairJob::next_action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // v0.4.16 migration surface; tests exercise the active subset.
+pub(super) enum VerifierDelta {
+    Passed,
+    Improved,
+    Unchanged,
+    Worsened,
+    DifferentFailure,
+    VerifierUnavailable,
+}
+
+impl From<VerifierRepairRerunOutcome> for VerifierDelta {
+    fn from(value: VerifierRepairRerunOutcome) -> Self {
+        match value {
+            VerifierRepairRerunOutcome::Improved => Self::Improved,
+            VerifierRepairRerunOutcome::SameFailureRemaining => Self::Unchanged,
+            VerifierRepairRerunOutcome::NewFailure => Self::DifferentFailure,
+            VerifierRepairRerunOutcome::Worsened => Self::Worsened,
+        }
+    }
+}
+
+/// v0.4.16: stable key for an attempted repair. It deliberately stores no raw
+/// LLM prose. The intent dimension is represented by role/path/change-kind,
+/// which is enough to detect same-target repeated rejects without retaining
+/// untrusted patch text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepairAttemptKey {
+    pub(super) role: ArtifactRole,
+    pub(super) path: String,
+    pub(super) allowed_change_kind: Option<AllowedChangeKind>,
+}
+
+impl RepairAttemptKey {
+    pub(super) fn from_target(
+        target: &RecoveryTargetHint,
+        allowed_change_kind: Option<AllowedChangeKind>,
+    ) -> Self {
+        Self {
+            role: target.role,
+            path: sanitize_repair_job_text_with_char_cap(&target.path, 240),
+            allowed_change_kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // closed future-proof reject taxonomy for the migration.
+pub(super) enum RejectedAttemptReason {
+    MalformedPatch,
+    AmbiguousAuthority,
+    UnsafePatch,
+    NoopPatch,
+    DuplicatePatch,
+    NoSafeCandidate,
+}
+
+impl RejectedAttemptReason {
+    #[allow(dead_code)] // report projection hook.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedPatch => "malformed_patch",
+            Self::AmbiguousAuthority => "ambiguous_authority",
+            Self::UnsafePatch => "unsafe_patch",
+            Self::NoopPatch => "noop_patch",
+            Self::DuplicatePatch => "duplicate_patch",
+            Self::NoSafeCandidate => "no_safe_candidate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RejectedAttempt {
+    pub(super) key: RepairAttemptKey,
+    pub(super) reason: RejectedAttemptReason,
+}
+
+/// v0.4.16: structured events consumed by the repair lifecycle. They are
+/// intentionally compact and closed over enum values so verifier/LLM text does
+/// not become controller state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // closed future-proof event taxonomy for the migration.
+pub(super) enum RepairJobEvent {
+    DiagnosticMalformed,
+    DiagnosticUnavailable,
+    PlanAccepted,
+    AmbiguousAuthority,
+    NoSafeTarget,
+    PatchRejected {
+        key: RepairAttemptKey,
+        reason: RejectedAttemptReason,
+    },
+    PatchApplied {
+        key: RepairAttemptKey,
+    },
+    VerifierObserved {
+        delta: VerifierDelta,
+    },
+}
+
+/// v0.4.16: first-class next action. This is the small state-machine surface
+/// that future `turn.rs` orchestration should call instead of rediscovering
+/// the same branch conditions in several places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // v0.4.16 migration surface; production callers are added incrementally.
+pub(super) enum RepairNextAction {
+    RequestDiagnostic,
+    RequestPatch { target_hint: RecoveryTargetHint },
+    RerunVerifier,
+    Replan,
+    SafeStop { reason: RepairTerminalReason },
+    VerifiedDone,
 }
 
 /// Issue #662: structured return type for `record_repair_attempt_outcome`.
@@ -497,7 +667,214 @@ impl RepairJob {
             repair_attempt_outcomes: Vec::new(),
             repair_target_attempt_outcomes: Vec::new(),
             exhausted_repair_targets: Vec::new(),
+            lifecycle_events: Vec::new(),
+            rejected_attempts: Vec::new(),
         }
+    }
+
+    /// v0.4.16: record a closed lifecycle event and update normalized ledgers.
+    ///
+    /// This is intentionally small. The existing verifier repair flow still
+    /// owns execution; this event layer gives the next migration step a single
+    /// source of truth for repeated rejects and terminal decisions.
+    pub(super) fn apply_event(&mut self, event: RepairJobEvent) {
+        match &event {
+            RepairJobEvent::DiagnosticMalformed => {
+                self.assessment_attempts = self.assessment_attempts.saturating_add(1);
+                self.assessment = None;
+            }
+            RepairJobEvent::DiagnosticUnavailable => {
+                self.diagnostic_unavailable = true;
+            }
+            RepairJobEvent::PlanAccepted => {
+                self.diagnostic_unavailable = false;
+            }
+            RepairJobEvent::AmbiguousAuthority => {
+                if let Some(key) = self.current_repair_attempt_key(None) {
+                    self.push_rejected_attempt(RejectedAttempt {
+                        key,
+                        reason: RejectedAttemptReason::AmbiguousAuthority,
+                    });
+                }
+            }
+            RepairJobEvent::NoSafeTarget => {
+                if let Some(key) = self.current_repair_attempt_key(None) {
+                    self.push_rejected_attempt(RejectedAttempt {
+                        key,
+                        reason: RejectedAttemptReason::NoSafeCandidate,
+                    });
+                }
+            }
+            RepairJobEvent::PatchRejected { key, reason } => {
+                self.push_rejected_attempt(RejectedAttempt {
+                    key: key.clone(),
+                    reason: *reason,
+                });
+            }
+            RepairJobEvent::PatchApplied { .. } | RepairJobEvent::VerifierObserved { .. } => {}
+        }
+        self.push_lifecycle_event(event);
+    }
+
+    /// v0.4.16: controller-facing state-machine projection.
+    ///
+    /// This does not yet replace `verifier_repair_decision`; it is the small,
+    /// testable kernel that future `turn.rs` orchestration should call.
+    #[allow(dead_code)] // v0.4.16 migration surface; covered by unit tests before production switch-over.
+    pub(super) fn next_action(&self) -> RepairNextAction {
+        if let Some(action) = self.next_action_from_latest_event() {
+            return action;
+        }
+        if self.diagnostic_unavailable {
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::DiagnosticUnavailable,
+            };
+        }
+        if self.repeated_rejected_attempt().is_some() {
+            if self.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+            {
+                return RepairNextAction::Replan;
+            }
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::PatchRejectedRepeatedly,
+            };
+        }
+        if self.assessment.is_none() {
+            if self.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+            {
+                return RepairNextAction::RequestDiagnostic;
+            }
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::DiagnosticUnavailable,
+            };
+        }
+        if self.current_semantic_targets_all_exhausted() {
+            if self.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+            {
+                return RepairNextAction::Replan;
+            }
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::NoSafeRepairTarget,
+            };
+        }
+        let Some(target_hint) = self.current_repair_target_hint_for_next_action() else {
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::NoSafeRepairTarget,
+            };
+        };
+        RepairNextAction::RequestPatch { target_hint }
+    }
+
+    fn push_lifecycle_event(&mut self, event: RepairJobEvent) {
+        if self.lifecycle_events.len() >= MAX_REPAIR_LIFECYCLE_EVENTS {
+            self.lifecycle_events.remove(0);
+            tracing::warn!(
+                event = "agent.repair_job_lifecycle_events.fifo_drop",
+                count = MAX_REPAIR_LIFECYCLE_EVENTS,
+                "repair job lifecycle events FIFO drop: oldest entry evicted"
+            );
+        }
+        self.lifecycle_events.push(event);
+    }
+
+    fn push_rejected_attempt(&mut self, attempt: RejectedAttempt) {
+        if self.rejected_attempts.len() >= MAX_REJECTED_ATTEMPTS {
+            self.rejected_attempts.remove(0);
+            tracing::warn!(
+                event = "agent.repair_job_rejected_attempts.fifo_drop",
+                count = MAX_REJECTED_ATTEMPTS,
+                "repair job rejected attempts FIFO drop: oldest entry evicted"
+            );
+        }
+        self.rejected_attempts.push(attempt);
+    }
+
+    #[allow(dead_code)] // helper for the next_action migration surface.
+    fn next_action_from_latest_event(&self) -> Option<RepairNextAction> {
+        match self.lifecycle_events.last()? {
+            RepairJobEvent::DiagnosticMalformed => {
+                if self.assessment_attempts
+                    < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                {
+                    Some(RepairNextAction::RequestDiagnostic)
+                } else {
+                    Some(RepairNextAction::SafeStop {
+                        reason: RepairTerminalReason::DiagnosticUnavailable,
+                    })
+                }
+            }
+            RepairJobEvent::DiagnosticUnavailable => Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::DiagnosticUnavailable,
+            }),
+            RepairJobEvent::AmbiguousAuthority => Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::AmbiguousSpecSafeStop,
+            }),
+            RepairJobEvent::NoSafeTarget => Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::NoSafeRepairTarget,
+            }),
+            RepairJobEvent::PatchApplied { .. } => Some(RepairNextAction::RerunVerifier),
+            RepairJobEvent::VerifierObserved { delta } => Some(match delta {
+                VerifierDelta::Passed => RepairNextAction::VerifiedDone,
+                VerifierDelta::Improved => {
+                    let target_hint = self.current_repair_target_hint_for_next_action()?;
+                    RepairNextAction::RequestPatch { target_hint }
+                }
+                VerifierDelta::Unchanged
+                | VerifierDelta::Worsened
+                | VerifierDelta::DifferentFailure => {
+                    if self.assessment_attempts
+                        < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                    {
+                        RepairNextAction::Replan
+                    } else {
+                        RepairNextAction::SafeStop {
+                            reason: RepairTerminalReason::RepairBudgetExhausted,
+                        }
+                    }
+                }
+                VerifierDelta::VerifierUnavailable => RepairNextAction::SafeStop {
+                    reason: RepairTerminalReason::VerifierUnavailable,
+                },
+            }),
+            RepairJobEvent::PatchRejected { .. } | RepairJobEvent::PlanAccepted => None,
+        }
+    }
+
+    #[allow(dead_code)] // helper for the next_action migration surface.
+    fn repeated_rejected_attempt(&self) -> Option<&RejectedAttempt> {
+        self.rejected_attempts.iter().rev().find(|attempt| {
+            self.rejected_attempts
+                .iter()
+                .filter(|candidate| *candidate == *attempt)
+                .count()
+                >= REPEATED_REJECTED_ATTEMPT_THRESHOLD
+        })
+    }
+
+    fn current_repair_attempt_key(
+        &self,
+        allowed_change_kind: Option<AllowedChangeKind>,
+    ) -> Option<RepairAttemptKey> {
+        self.current_repair_target_hint_for_next_action()
+            .as_ref()
+            .map(|hint| RepairAttemptKey::from_target(hint, allowed_change_kind))
+    }
+
+    fn current_repair_target_hint_for_next_action(&self) -> Option<RecoveryTargetHint> {
+        self.assessment
+            .as_ref()
+            .and_then(|assessment| {
+                assessment
+                    .repair_plan
+                    .get(self.applied_repair_intents.len())
+                    .cloned()
+                    .or_else(|| assessment.repair_target_hint.clone())
+            })
+            .or_else(|| self.repair_target_hint.clone())
+            .or_else(|| self.target_hint.clone())
     }
 
     /// Issue #653 (S7-003) / #662 (S5-003): ledger mutation SSOT (orchestration only)。
@@ -1618,8 +1995,6 @@ pub(super) fn rerun_outcome_with_cluster(
 // no nested `Option<VerifierFailureSnapshot>` shape and the FromMissingVerifier
 // branch can default these fields explicitly (DR2-008).
 
-use super::task_contract::ArtifactRole;
-
 /// Hard upper bound on a single `safe_relative_path_string` projection (chars).
 /// `expected_target` / `owned_test_artifacts[]` are first projected through
 /// `safe_relative_path_string` and then re-sanitized through
@@ -2076,6 +2451,179 @@ mod tests {
     fn missing_verifier_job_allowed_tool_names_match_first_class_state() {
         let job = MissingVerifierJob::new(3, 0);
         assert_eq!(job.allowed_tool_names(), &["Write", "Edit", "Bash"]);
+    }
+
+    #[test]
+    fn repair_job_next_action_requests_diagnostic_without_assessment() {
+        let job = RepairJob::new_for_test();
+
+        assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
+    }
+
+    #[test]
+    fn repair_job_next_action_requests_patch_with_accepted_target() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target.clone())),
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: target
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_patch_applied_requires_verifier_rerun() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let key = RepairAttemptKey::from_target(
+            &target,
+            Some(AllowedChangeKind::FixImplementationBehavior),
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target)),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchApplied { key });
+
+        assert_eq!(job.next_action(), RepairNextAction::RerunVerifier);
+    }
+
+    #[test]
+    fn repair_job_verifier_passed_becomes_verified_done() {
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Implementation,
+                "app/main.py",
+            ))),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Passed,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::VerifiedDone);
+    }
+
+    #[test]
+    fn repair_job_repeated_patch_reject_replans_before_budget_exhaustion() {
+        let target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let key =
+            RepairAttemptKey::from_target(&target, Some(AllowedChangeKind::FixTestImportOrSetup));
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target)),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::NoopPatch,
+        });
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key,
+            reason: RejectedAttemptReason::NoopPatch,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn repair_job_repeated_patch_reject_safe_stops_after_budget_exhaustion() {
+        let target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let key =
+            RepairAttemptKey::from_target(&target, Some(AllowedChangeKind::FixTestImportOrSetup));
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target)),
+            assessment_attempts: crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::DuplicatePatch,
+        });
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key,
+            reason: RejectedAttemptReason::DuplicatePatch,
+        });
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::PatchRejectedRepeatedly
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_ambiguous_authority_safe_stops_without_patch() {
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Test,
+                "tests/test_main.py",
+            ))),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::AmbiguousAuthority);
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::AmbiguousSpecSafeStop
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_diagnostic_malformed_retries_until_budget() {
+        let mut job = RepairJob::new_for_test();
+
+        job.apply_event(RepairJobEvent::DiagnosticMalformed);
+        assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
+
+        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.apply_event(RepairJobEvent::DiagnosticMalformed);
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::DiagnosticUnavailable
+            }
+        );
+    }
+
+    #[test]
+    fn repair_terminal_reason_projects_to_existing_safe_stop_reason() {
+        assert_eq!(RepairTerminalReason::VerifiedDone.safe_stop_reason(), None);
+        assert_eq!(
+            RepairTerminalReason::AmbiguousSpecSafeStop.safe_stop_reason(),
+            Some(StopReason::VerifierWeak)
+        );
+        assert_eq!(
+            RepairTerminalReason::NoSafeRepairTarget.safe_stop_reason(),
+            Some(StopReason::DiagnosticTargetMissing)
+        );
+        assert_eq!(
+            RepairTerminalReason::RepairBudgetExhausted.safe_stop_reason(),
+            Some(StopReason::RepairExhausted)
+        );
+        assert_eq!(
+            RepairTerminalReason::PatchRejectedRepeatedly.safe_stop_reason(),
+            Some(StopReason::RepairExhausted)
+        );
+        assert_eq!(
+            RepairTerminalReason::DiagnosticUnavailable.safe_stop_reason(),
+            Some(StopReason::VerifierFailedSafeStop)
+        );
+        assert_eq!(
+            RepairTerminalReason::VerifierUnavailable.safe_stop_reason(),
+            Some(StopReason::VerifierMissing)
+        );
     }
 
     #[test]
@@ -6038,6 +6586,29 @@ mod tests {
         };
         let report = SafeStopReport::build_from(input, ctx);
         assert_eq!(report.owned_test_artifacts, vec!["tests/ok.rs"]);
+    }
+
+    fn recovery_target(role: ArtifactRole, path: &str) -> RecoveryTargetHint {
+        RecoveryTargetHint {
+            role,
+            path: path.to_string(),
+            reason: "test target".to_string(),
+        }
+    }
+
+    fn verifier_assessment_for_target(
+        target: RecoveryTargetHint,
+    ) -> super::super::VerifierRepairAssessment {
+        super::super::VerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: super::super::VerifierFailureType::AssertionFailure,
+            probable_cause_role: Some(target.role),
+            needed_reads: vec![target.clone()],
+            repair_target_hint: Some(target.clone()),
+            repair_plan: vec![target],
+            summary: Some("test assessment".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        }
     }
 
     /// Construct a `FailureClusterKey` for tests via the public parse path.
