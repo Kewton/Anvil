@@ -283,11 +283,12 @@ pub(super) fn owned_test_artifacts(
             edited_this_session: edited_this_session_for(path),
             scaffold_changed: scaffold_changed_for(path),
             verifier_passed_in_scope: false,
-            // Issue #661 (Task 3.1 / 判断 #1 path #2): projection trusts the
-            // admission decision already encoded by `record_repo_edit_event`
-            // / `record_verifier_observation`; do NOT re-evaluate the flag
-            // here. Iteration-3 leaves this `disabled()` and the 4 verifier
-            // entry points switch to `enabled()` instead (Task 3.4).
+            // Keep legacy no-signal classification safe: pre-existing nested
+            // tests without an edit/scaffold/verifier signal must not become
+            // owned only because they look like tests. v0.4.8 production
+            // verifier binding now returns the ledger projection, where
+            // current-task repo edits are admitted with enabled nested-test
+            // semantics at the event boundary.
             nested_test_admission: NestedTestAdmission::default(),
         });
         if !matches!(ownership, ArtifactOwnership::Owned) {

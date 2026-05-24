@@ -441,7 +441,7 @@ fn recovery_target_hint_for_missing(
     missing: &[ArtifactRole],
 ) -> Option<RecoveryTargetHint> {
     let role = missing.first().copied()?;
-    artifacts
+    if let Some(scaffold_hint) = artifacts
         .iter()
         .find(|artifact| {
             artifact.role == role && artifact.kind == ArtifactStateKind::ScaffoldUnchanged
@@ -454,6 +454,70 @@ fn recovery_target_hint_for_missing(
                     .to_string(),
             })
         })
+    {
+        return Some(scaffold_hint);
+    }
+    synthesized_missing_role_target_hint(artifacts, role)
+}
+
+fn synthesized_missing_role_target_hint(
+    artifacts: &[ArtifactState],
+    role: ArtifactRole,
+) -> Option<RecoveryTargetHint> {
+    let path = match role {
+        ArtifactRole::Test => synthesized_test_target_path(artifacts)?,
+        ArtifactRole::UsageDocs => "README.md".to_string(),
+        ArtifactRole::Implementation | ArtifactRole::Setup => return None,
+    };
+    Some(RecoveryTargetHint {
+        role,
+        path,
+        reason: "no existing artifact for the missing role; create a conventional artifact path"
+            .to_string(),
+    })
+}
+
+fn synthesized_test_target_path(artifacts: &[ArtifactState]) -> Option<String> {
+    let impl_path = artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.role == ArtifactRole::Implementation
+                && matches!(
+                    artifact.kind,
+                    ArtifactStateKind::ExistsButUnverified
+                        | ArtifactStateKind::ChangedThisTurn
+                        | ArtifactStateKind::Verified
+                )
+        })
+        .and_then(|artifact| artifact.path.as_deref());
+    let Some(path) = impl_path else {
+        return Some("tests/test_main.py".to_string());
+    };
+    let stem = sanitized_file_stem(path).unwrap_or("main");
+    if path.ends_with(".rs") {
+        Some(format!("tests/{stem}.rs"))
+    } else if path.ends_with(".ts") || path.ends_with(".tsx") {
+        Some(format!("tests/{stem}.test.ts"))
+    } else if path.ends_with(".js") || path.ends_with(".jsx") {
+        Some(format!("tests/{stem}.test.js"))
+    } else {
+        Some(format!("tests/test_{stem}.py"))
+    }
+}
+
+fn sanitized_file_stem(path: &str) -> Option<&str> {
+    let file_name = path.rsplit('/').next()?.rsplit('\\').next()?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(stem)
 }
 
 impl From<CompletionDecision> for ArtifactRecoveryAction {
@@ -665,26 +729,19 @@ impl TaskContract {
     /// task-contract Continue loop. **Not** the role-specific
     /// `ArtifactCompletionJob` budget — that one is owned by
     /// `super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT`
-    /// and is the authoritative source of truth for the Test-role
-    /// completion job (consumed by `record_artifact_completion_attempt`
-    /// in `turn.rs::run_actor_loop`).
+    /// and is the authoritative source of truth for completion jobs
+    /// (consumed by `record_artifact_completion_attempt` in
+    /// `turn.rs::run_actor_loop`).
     ///
-    /// The legacy value is intentionally **higher** than the job's 3 so
+    /// The legacy value is intentionally **higher** than the job budget so
     /// the job's exhaustion path (which emits the
     /// `artifact_completion_failed` diagnostic + system note + eval log
-    /// trio) always fires first when a Test job is in flight. For
-    /// non-Test roles (Implementation / UsageDocs / Setup), no job is
-    /// installed today; this counter keeps the legacy "X attempts and
-    /// still no edit" exit working for them so the actor loop still
-    /// terminates cleanly. Read-only — no mutator on `TaskContract`.
+    /// trio) always fires first when a job is in flight. This counter keeps
+    /// the legacy "X attempts and still no edit" exit working when no job
+    /// is installed, so the actor loop still terminates cleanly. Read-only
+    /// — no mutator on `TaskContract`.
     pub(super) fn artifact_completion_attempt_limit(&self) -> usize {
-        // SSOT redirect: keep `>= ARTIFACT_COMPLETION_ATTEMPT_LIMIT + 1`
-        // so the job's role-specific budget (3) always exhausts before
-        // the legacy counter (4). If the SSOT constant ever changes,
-        // this fallback must be re-tuned to preserve the invariant.
-        const _: () =
-            assert!(super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT < 4);
-        4
+        super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT + 1
     }
 }
 
@@ -1813,6 +1870,81 @@ mod tests {
             }
             other => panic!("expected Continue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn planner_synthesizes_test_target_after_implementation_exists() {
+        let contract = TaskContract::from_request(
+            "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        let artifacts = vec![ArtifactState::exists(
+            ArtifactRole::Implementation,
+            "app/main.py",
+        )];
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Test, ArtifactRole::UsageDocs],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/test_main.py".to_string(),
+                    reason: "no existing artifact for the missing role; create a conventional artifact path"
+                        .to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn planner_synthesizes_usage_docs_target_after_code_and_tests_exist() {
+        let contract = TaskContract::from_request(
+            "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Implementation, "app/main.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_main.py"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::UsageDocs],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::UsageDocs,
+                    path: "README.md".to_string(),
+                    reason: "no existing artifact for the missing role; create a conventional artifact path"
+                        .to_string(),
+                }),
+            }
+        );
     }
 
     #[test]

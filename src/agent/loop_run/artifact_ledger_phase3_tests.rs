@@ -7,8 +7,8 @@
 //! - Task 3.1: the legacy field signature (`HashSet<String>`) and access
 //!   pattern are unchanged — compile-time contract test.
 //! - Task 3.2: `task_contract_artifact_states` keeps producing the same
-//!   `Vec<ArtifactState>` shape (legacy authority) and the new ledger
-//!   projection is computed in parallel without breaking the legacy result.
+//!   `Vec<ArtifactState>` shape and returns the ledger projection after the
+//!   legacy derivation seeds baseline evidence.
 //! - Task 3.3: `owned_test_artifacts_for_verifier` keeps returning
 //!   Issue #651-equivalent results and the caller signature
 //!   (`&mut self`, `&TaskContract`, `Vec<String>`) is preserved.
@@ -214,8 +214,8 @@ fn task_contract_artifact_states_returns_same_shape_as_before_empty() {
 /// ledger-projection helper (the internal switch consumer). The legacy
 /// derivation also produces the same row because the write-through
 /// adapter (Task 2.5) inserts into both sources; the test asserts the
-/// caller-facing helper returns the legacy row (authority) and that the
-/// ledger helper agrees with it.
+/// caller-facing helper returns the ledger row and that the legacy helper
+/// agrees with it in the no-divergence case.
 #[test]
 fn task_contract_artifact_states_uses_ledger_projection() {
     let session_id = unique_session_id("states-ledger");
@@ -265,8 +265,8 @@ fn task_contract_artifact_states_uses_ledger_projection() {
 /// Issue #659 (Task 3.3): `owned_test_artifacts_for_verifier` keeps the
 /// Issue #651 behavior — seeded RepoEdit test paths surface in the
 /// returned slice. The legacy and ledger derivations agree under
-/// write-through, so the function returns the legacy slice without
-/// emitting the divergence event.
+/// write-through, so the function returns the ledger slice without emitting
+/// the divergence event.
 #[test]
 fn owned_test_artifacts_for_verifier_matches_issue651_behavior() {
     let session_id = unique_session_id("verifier-match");

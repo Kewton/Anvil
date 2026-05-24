@@ -51,6 +51,8 @@ struct ChatRequest<'a> {
     keep_alive: i32,
     options: RequestOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ChatToolDefinition>>,
 }
 
@@ -105,13 +107,14 @@ impl<'a> GenerateTransport<'a> {
         }
     }
 
-    pub(crate) fn send_chat_request(
+    pub(crate) fn send_chat_request_with_format(
         &self,
         model: &str,
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
         stream: bool,
         temperature: f32,
+        response_format: Option<&str>,
     ) -> Result<Response, reqwest::Error> {
         let request = ChatRequest {
             model,
@@ -120,6 +123,7 @@ impl<'a> GenerateTransport<'a> {
             think: false,
             keep_alive: -1,
             options: self.request_options(temperature),
+            format: response_format,
             tools: (!tools.is_empty()).then(|| to_chat_tool_definitions(tools)),
         };
         self.http

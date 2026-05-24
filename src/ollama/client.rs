@@ -169,6 +169,14 @@ impl OllamaClient {
         self.chat_impl(model, messages, &[], false, |_| Ok(()))
     }
 
+    pub fn chat_text_json_control(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        self.chat_impl_with_options(model, messages, &[], false, 0.0, Some("json"), |_| Ok(()))
+    }
+
     pub fn summarize_conversation(
         &self,
         model: &str,
@@ -323,7 +331,22 @@ impl OllamaClient {
     where
         F: FnMut(&str) -> Result<(), String>,
     {
-        let temperature = 0.3;
+        self.chat_impl_with_options(model, messages, tools, stream, 0.3, None, &mut on_chunk)
+    }
+
+    fn chat_impl_with_options<F>(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        stream: bool,
+        temperature: f32,
+        response_format: Option<&str>,
+        mut on_chunk: F,
+    ) -> Result<AssistantReply, String>
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
         let tool_names_vec = tool_names(tools);
 
         logging::log_llm_event(
@@ -335,6 +358,7 @@ impl OllamaClient {
                 "temperature": temperature,
                 "num_ctx": self.context_window,
                 "num_predict": self.max_predict,
+                "format": response_format,
                 "tools": tool_names_vec,
                 "messages": messages,
             }),
@@ -347,7 +371,14 @@ impl OllamaClient {
             self.max_predict,
         );
         let response = transport
-            .send_chat_request(model, messages, tools, stream, temperature)
+            .send_chat_request_with_format(
+                model,
+                messages,
+                tools,
+                stream,
+                temperature,
+                response_format,
+            )
             .map_err(|err| {
                 logging::log_llm_event(
                     "ollama.chat.error",

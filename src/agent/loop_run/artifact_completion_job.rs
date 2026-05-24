@@ -55,7 +55,7 @@ use crate::session::feedback::mask_secrets;
 /// Role-specific retry budget. Externally immutable; the constructor pins
 /// this on every new `ArtifactCompletionJob` so user / LLM input can never
 /// inflate it (DR4-003).
-pub(super) const ARTIFACT_COMPLETION_ATTEMPT_LIMIT: usize = 3;
+pub(super) const ARTIFACT_COMPLETION_ATTEMPT_LIMIT: usize = 4;
 
 /// Upper bound on the number of `actual_actions` retained per recorded
 /// attempt. Extra elements are dropped at `ArtifactAttemptOutcome::new()`
@@ -520,9 +520,10 @@ impl ArtifactCompletionJob {
             edited_this_session,
             scaffold_changed,
             verifier_passed_in_scope: false,
-            // Issue #661 (Task 3.1): ArtifactCompletionJob is not one of
-            // the 4 verifier-path SSOT sites — keep `disabled()` so this
-            // caller's nested-test-subdir semantics stay unchanged.
+            // Keep generic artifact-target admission conservative. Current
+            // task repo edits are promoted by the artifact ledger/verifier
+            // projection, while pre-existing nested tests without evidence
+            // must not become owned just because they look like tests.
             nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
         });
         // CB-001: accept only `Owned` for an existing target, or treat
@@ -1037,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_three_wrong_targets_exhausts_with_budget_exceeded() {
+    fn test_record_attempt_wrong_targets_exhausts_with_budget_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -1063,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_three_no_tools_exhausts_with_budget_exceeded() {
+    fn test_record_attempt_no_tools_exhausts_with_budget_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -1082,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_three_prose_only_exhausts_with_budget_exceeded() {
+    fn test_record_attempt_prose_only_exhausts_with_budget_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(

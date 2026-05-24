@@ -345,13 +345,18 @@ impl HermeticEnvPlan {
 /// Issue #661 iteration-5 Task 6.2 (DR1-006 Phase B): Python verifier path
 /// extras. `PYTHONDONTWRITEBYTECODE=1` disables `.pyc` file generation
 /// (avoid `__pycache__` pollution under work_root), `PYTHONNOUSERSITE=1`
-/// blocks `~/.local/lib/python*/site-packages` from polluting `sys.path`.
+/// blocks `~/.local/lib/python*/site-packages` from polluting `sys.path`,
+/// and `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` prevents unrelated third-party
+/// pytest plugins from mutating collection/import behavior.
 ///
 /// Cargo path uses `&[]` (empty extras). The slice is a private const so
 /// no LLM/recent-shell input can flow into the extras list (DR4-002).
 #[allow(dead_code)] // wired by `from_python3_pytest_stdlib` adapter (iteration-5 Task 6.2)
-pub(super) const VERIFIER_ENV_PYTHON_EXTRA: &[(&str, &str)] =
-    &[("PYTHONDONTWRITEBYTECODE", "1"), ("PYTHONNOUSERSITE", "1")];
+pub(super) const VERIFIER_ENV_PYTHON_EXTRA: &[(&str, &str)] = &[
+    ("PYTHONDONTWRITEBYTECODE", "1"),
+    ("PYTHONNOUSERSITE", "1"),
+    ("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1"),
+];
 
 /// Issue #661 iteration-5 Task 6.1 (Phase B hermetic env 本実装):
 /// 純粋に hermetic env plan を構築する。
@@ -360,8 +365,9 @@ pub(super) const VERIFIER_ENV_PYTHON_EXTRA: &[(&str, &str)] =
 /// - `allow_entries` を `filter_env_for_tester(std::env::vars())` で構築
 /// - `extras` を caller-provided closed slice からコピー (Phase B では Python
 ///   adapter が `VERIFIER_ENV_PYTHON_EXTRA` を渡し、Cargo adapter は `&[]`)
-/// - `pythonpath_root` は parent PYTHONPATH を解析した結果に応じて Some/None。
-///   - PYTHONPATH 未設定 or 空 → `None` (PYTHONPATH を child から remove)
+/// - `pythonpath_root` は parent PYTHONPATH と runner extras から Some/None。
+///   - PYTHONPATH 未設定 or 空かつ non-Python runner → `None` (child から remove)
+///   - Python verifier extras がある → `Some(work_root)` に固定
 ///   - PYTHONPATH に external (work_root 外) component を発見 → `Some(work_root)`
 ///     に上書きしつつ、`rejected_pythonpath` に raw substring を保持
 ///   - PYTHONPATH 全要素が work_root 配下 → `Some(work_root)`
@@ -375,10 +381,17 @@ pub(super) fn build_hermetic_env_plan(
     let extras_vec: Vec<(&'static str, &'static str)> = extras.to_vec();
     // Phase B Task 7.1: pre-execution PYTHONPATH 検査。parent process env から
     // PYTHONPATH を読み取り、各要素が work_root 配下かを判定。
-    let (pythonpath_root, rejected_pythonpath) = evaluate_pythonpath_for_hermetic_env(
+    let (mut pythonpath_root, rejected_pythonpath) = evaluate_pythonpath_for_hermetic_env(
         work_root,
         std::env::var("PYTHONPATH").ok().as_deref(),
     );
+    if pythonpath_root.is_none()
+        && extras
+            .iter()
+            .any(|(key, _)| *key == "PYTHONNOUSERSITE" || *key == "PYTEST_DISABLE_PLUGIN_AUTOLOAD")
+    {
+        pythonpath_root = Some(work_root.to_path_buf());
+    }
     HermeticEnvPlan {
         allow_entries,
         extras: extras_vec,
@@ -662,7 +675,16 @@ pub(super) fn detect_external_imports_in_output(
         // split on whitespace, single-quote, double-quote and inspect tokens
         // that look like absolute filesystem paths).
         for raw in line
-            .split(|c: char| c.is_whitespace() || c == '\'' || c == '"' || c == ',')
+            .split(|c: char| {
+                c.is_whitespace()
+                    || c == '\''
+                    || c == '"'
+                    || c == ','
+                    || c == '('
+                    || c == ')'
+                    || c == '['
+                    || c == ']'
+            })
             .filter(|s| s.starts_with('/'))
         {
             let candidate = Path::new(raw);
@@ -696,6 +718,179 @@ pub(super) fn detect_external_imports_in_output(
         total_count,
         truncated,
     }
+}
+
+pub(super) fn python_package_marker_candidates_for_external_import(
+    work_root: &Path,
+    stdout: &str,
+    stderr: &str,
+) -> Vec<String> {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let mut candidates = BTreeSet::new();
+    let combined = format!("{stdout}\n{stderr}");
+    for line in combined.lines() {
+        if !line.contains("ImportError") && !line.contains("ModuleNotFoundError") {
+            continue;
+        }
+        for module in quoted_module_tokens(line) {
+            let Some(top) = module.split('.').next() else {
+                continue;
+            };
+            if !is_safe_python_module_segment(top) || matches!(top, "test" | "tests") {
+                continue;
+            }
+            let package_dir = work_root.join(top);
+            if !package_dir.is_dir() || package_dir.join("__init__.py").exists() {
+                continue;
+            }
+            let package_canon =
+                std::fs::canonicalize(&package_dir).unwrap_or_else(|_| package_dir.clone());
+            if !package_canon.starts_with(&work_canon) {
+                continue;
+            }
+            let has_direct_python_file = std::fs::read_dir(&package_dir)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "py"));
+            if has_direct_python_file {
+                candidates.insert(format!("{top}/__init__.py"));
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+pub(super) fn python_package_marker_candidates_for_owned_test_imports(
+    work_root: &Path,
+    owned_test_artifacts: &[String],
+) -> Vec<String> {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let mut candidates = BTreeSet::new();
+    for relative_path in owned_test_artifacts {
+        if !safe_relative_workspace_path(relative_path) {
+            continue;
+        }
+        let test_path = work_root.join(relative_path);
+        let Ok(test_canon) = std::fs::canonicalize(&test_path) else {
+            continue;
+        };
+        if !test_canon.starts_with(&work_canon) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&test_canon) else {
+            continue;
+        };
+        for module in imported_python_modules(&contents) {
+            for candidate in python_package_marker_candidates_for_module(work_root, &module) {
+                candidates.insert(candidate);
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn safe_relative_workspace_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.chars().any(|ch| ch.is_control())
+        && !Path::new(path).is_absolute()
+        && !Path::new(path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn imported_python_modules(contents: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("from ") {
+            let module = rest.split_whitespace().next().unwrap_or_default();
+            if !module.starts_with('.') {
+                modules.push(module.trim_end_matches(',').to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let module = part.split_whitespace().next().unwrap_or_default();
+                if !module.starts_with('.') {
+                    modules.push(module.to_string());
+                }
+            }
+        }
+    }
+    modules
+}
+
+fn python_package_marker_candidates_for_module(work_root: &Path, module: &str) -> Vec<String> {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let components: Vec<&str> = module
+        .split('.')
+        .filter(|part| is_safe_python_module_segment(part))
+        .collect();
+    if components.is_empty() || matches!(components[0], "test" | "tests") {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    let mut prefix = PathBuf::new();
+    for component in components {
+        prefix.push(component);
+        let package_dir = work_root.join(&prefix);
+        if !package_dir.is_dir() {
+            break;
+        }
+        if package_dir.join("__init__.py").exists() {
+            continue;
+        }
+        let package_canon =
+            std::fs::canonicalize(&package_dir).unwrap_or_else(|_| package_dir.clone());
+        if !package_canon.starts_with(&work_canon) {
+            break;
+        }
+        if python_dir_has_source_signal(&package_dir) {
+            candidates.push(format!(
+                "{}/__init__.py",
+                prefix.to_string_lossy().replace('\\', "/")
+            ));
+        }
+    }
+    candidates
+}
+
+fn python_dir_has_source_signal(package_dir: &Path) -> bool {
+    std::fs::read_dir(package_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            let path = entry.path();
+            path.extension().is_some_and(|ext| ext == "py") || path.is_dir()
+        })
+}
+
+fn quoted_module_tokens(line: &str) -> Vec<&str> {
+    line.split(['\'', '"'])
+        .enumerate()
+        .filter_map(|(idx, token)| {
+            if idx % 2 == 1 && token.contains('.') {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_safe_python_module_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// Issue #661 iteration-5 Task 7.2: cap on `detected_modules` carried in
@@ -4596,6 +4791,17 @@ dev = [
         );
     }
 
+    #[test]
+    fn build_hermetic_env_plan_python_extras_pin_pythonpath_to_work_root() {
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), VERIFIER_ENV_PYTHON_EXTRA);
+        let summary = plan.summary();
+        assert!(
+            summary.pythonpath_root,
+            "Python verifier extras must pin PYTHONPATH to work_root even when parent PYTHONPATH is absent"
+        );
+    }
+
     /// Phase B Task 6.1: `apply_to` MUST `env_clear()` + re-inject allowlist
     /// keys. We spawn `printenv` (Unix) and check that a non-allowlist key
     /// (`API_KEY_FAKE`) is dropped while PATH is preserved.
@@ -4727,13 +4933,21 @@ dev = [
         );
     }
 
-    /// Phase B Task 6.2: `VERIFIER_ENV_PYTHON_EXTRA` must contain the two
-    /// Python-specific cache-suppression keys and nothing else.
+    /// Phase B Task 6.2 + v0.4.8 verifier sandbox: Python verifier extras
+    /// must contain cache suppression, user-site suppression, and pytest
+    /// third-party plugin autoload suppression.
     #[test]
     fn verifier_env_python_extra_contains_expected_keys() {
         let mut keys: Vec<&str> = VERIFIER_ENV_PYTHON_EXTRA.iter().map(|(k, _)| *k).collect();
         keys.sort();
-        assert_eq!(keys, vec!["PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE"]);
+        assert_eq!(
+            keys,
+            vec![
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+                "PYTHONDONTWRITEBYTECODE",
+                "PYTHONNOUSERSITE"
+            ]
+        );
         for (_, v) in VERIFIER_ENV_PYTHON_EXTRA {
             assert_eq!(*v, "1");
         }
@@ -5016,6 +5230,84 @@ dev = [
         assert!(
             !detected.entries.is_empty(),
             "external /external/repo/.. path must be detected; got {detected:?}"
+        );
+    }
+
+    #[test]
+    fn detect_external_imports_picks_up_import_error_parenthesized_path() {
+        let work = tempdir().expect("work");
+        let stderr =
+            "E   ImportError: cannot import name 'X' from 'app.main' (/external/repo/app/main.py)";
+        let detected = detect_external_imports_in_output(work.path(), "", stderr);
+        assert!(
+            !detected.entries.is_empty(),
+            "parenthesized ImportError path must be detected; got {detected:?}"
+        );
+    }
+
+    #[test]
+    fn python_package_marker_candidates_detects_local_namespace_package() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("app")).expect("app dir");
+        std::fs::write(work.path().join("app/main.py"), "x = 1\n").expect("main");
+        let stderr =
+            "E   ImportError: cannot import name 'X' from 'app.main' (/external/repo/app/main.py)";
+        let candidates =
+            python_package_marker_candidates_for_external_import(work.path(), "", stderr);
+        assert_eq!(candidates, vec!["app/__init__.py"]);
+    }
+
+    #[test]
+    fn python_package_marker_candidates_for_owned_test_imports_detects_app_import() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("app")).expect("app dir");
+        std::fs::write(work.path().join("app/main.py"), "x = 1\n").expect("main");
+        std::fs::create_dir_all(work.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            work.path().join("tests/test_main.py"),
+            "from app.main import app\n",
+        )
+        .expect("test");
+        let candidates = python_package_marker_candidates_for_owned_test_imports(
+            work.path(),
+            &["tests/test_main.py".to_string()],
+        );
+        assert_eq!(candidates, vec!["app/__init__.py"]);
+    }
+
+    #[test]
+    fn python_package_marker_candidates_for_owned_test_imports_detects_nested_packages() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("src/app")).expect("src app dir");
+        std::fs::write(work.path().join("src/app/main.py"), "x = 1\n").expect("main");
+        std::fs::create_dir_all(work.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            work.path().join("tests/test_main.py"),
+            "import src.app.main as subject\n",
+        )
+        .expect("test");
+        let candidates = python_package_marker_candidates_for_owned_test_imports(
+            work.path(),
+            &["tests/test_main.py".to_string()],
+        );
+        assert_eq!(candidates, vec!["src/__init__.py", "src/app/__init__.py"]);
+    }
+
+    #[test]
+    fn python_package_marker_candidates_skip_tests_and_existing_init() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("tests")).expect("tests dir");
+        std::fs::write(work.path().join("tests/test_main.py"), "x = 1\n").expect("test");
+        std::fs::create_dir_all(work.path().join("app")).expect("app dir");
+        std::fs::write(work.path().join("app/main.py"), "x = 1\n").expect("main");
+        std::fs::write(work.path().join("app/__init__.py"), "").expect("init");
+        let stderr = "ImportError: cannot import name 'X' from 'tests.test_main' (/external/tests/test_main.py)\n\
+             ImportError: cannot import name 'Y' from 'app.main' (/external/app/main.py)";
+        let candidates =
+            python_package_marker_candidates_for_external_import(work.path(), "", stderr);
+        assert!(
+            candidates.is_empty(),
+            "tests package and already-initialized app package must be skipped"
         );
     }
 

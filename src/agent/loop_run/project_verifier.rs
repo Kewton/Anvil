@@ -36,6 +36,7 @@
 //!   re-applies `mask_secrets` to every string leaf (see
 //!   `src/logging.rs::mask_payload_inplace`).
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -158,7 +159,10 @@ fn check_python_syntax(relative_path: &str, contents: &str) -> ProjectVerifierOu
     })();
     let _ = std::fs::remove_dir_all(&temp_root);
     match result {
-        Ok(()) => ProjectVerifierOutcome::Ok,
+        Ok(()) => match detect_missing_python_global_bindings(contents) {
+            Some(message) => ProjectVerifierOutcome::Failed(mask_and_truncate(&message)),
+            None => ProjectVerifierOutcome::Ok,
+        },
         Err(message) => ProjectVerifierOutcome::Failed(message),
     }
 }
@@ -218,6 +222,133 @@ fn mask_and_truncate(input: &str) -> String {
     let masked = crate::session::feedback::mask_secrets(input);
     let collapsed = masked.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate(&collapsed, FAILURE_TEXT_MAX_CHARS)
+}
+
+fn detect_missing_python_global_bindings(contents: &str) -> Option<String> {
+    let declared_globals = python_declared_globals(contents);
+    if declared_globals.is_empty() {
+        return None;
+    }
+    let module_bindings = python_module_level_bindings(contents);
+    let missing = declared_globals
+        .difference(&module_bindings)
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "python global declaration references missing module-level binding(s): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn python_declared_globals(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = strip_python_inline_comment(line.trim_start());
+        let Some(rest) = trimmed.strip_prefix("global ") else {
+            continue;
+        };
+        for raw_name in rest.split(',') {
+            let name = raw_name.trim();
+            if python_identifier_is_safe(name) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn python_module_level_bindings(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let trimmed = strip_python_inline_comment(line.trim());
+        if trimmed.is_empty() || trimmed.starts_with('@') {
+            continue;
+        }
+        if let Some(name) = trimmed
+            .strip_prefix("def ")
+            .and_then(|rest| rest.split_once('(').map(|(name, _)| name.trim()))
+            .filter(|name| python_identifier_is_safe(name))
+        {
+            names.insert(name.to_string());
+            continue;
+        }
+        if let Some(name) = trimmed.strip_prefix("class ").and_then(|rest| {
+            rest.split(['(', ':'])
+                .next()
+                .map(str::trim)
+                .filter(|name| python_identifier_is_safe(name))
+        }) {
+            names.insert(name.to_string());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let name = part
+                    .split(" as ")
+                    .nth(1)
+                    .or_else(|| part.split('.').next())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if python_identifier_is_safe(name) {
+                    names.insert(name.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("from ")
+            && let Some((_, imports)) = rest.split_once(" import ")
+        {
+            for part in imports.split(',') {
+                let name = part
+                    .split(" as ")
+                    .nth(1)
+                    .or_else(|| part.trim().split('.').next_back())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if python_identifier_is_safe(name) && name != "*" {
+                    names.insert(name.to_string());
+                }
+            }
+            continue;
+        }
+        let assignment_head = trimmed
+            .split_once('=')
+            .map(|(head, _)| head)
+            .unwrap_or(trimmed);
+        let binding_head = assignment_head
+            .split_once(':')
+            .map(|(head, _)| head)
+            .unwrap_or(assignment_head)
+            .trim();
+        if python_identifier_is_safe(binding_head) {
+            names.insert(binding_head.to_string());
+        }
+    }
+    names
+}
+
+fn strip_python_inline_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map(|(head, _)| head)
+        .unwrap_or(line)
+        .trim()
+}
+
+fn python_identifier_is_safe(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -355,6 +486,87 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_python_syntax_rejects_missing_global_module_binding() {
+        if which_python3().is_none() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let contents = r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+app.items_db = {}
+app.next_id = 1
+
+def create_item():
+    global next_id, items_db
+    item = {"id": next_id}
+    items_db[next_id] = item
+    next_id += 1
+    return item
+"#;
+        let outcome = ProjectVerifier::PythonSyntax.check("app/main.py", contents);
+
+        match outcome {
+            ProjectVerifierOutcome::Failed(message) => {
+                assert!(
+                    message.contains("missing module-level binding"),
+                    "got: {message}"
+                );
+                assert!(message.contains("items_db"), "got: {message}");
+                assert!(message.contains("next_id"), "got: {message}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_python_syntax_accepts_declared_globals_with_module_bindings() {
+        if which_python3().is_none() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let contents = r#"
+items_db = {}
+next_id = 1
+
+def create_item():
+    global next_id, items_db
+    item = {"id": next_id}
+    items_db[next_id] = item
+    next_id += 1
+    return item
+"#;
+
+        let outcome = ProjectVerifier::PythonSyntax.check("app/main.py", contents);
+
+        assert_eq!(outcome, ProjectVerifierOutcome::Ok);
+    }
+
+    #[test]
+    fn check_python_syntax_accepts_annotated_declared_globals_with_module_bindings() {
+        if which_python3().is_none() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let contents = r#"
+items_db: dict = {}
+next_id: int = 1
+
+def create_item():
+    global next_id, items_db
+    item = {"id": next_id}
+    items_db[next_id] = item
+    next_id += 1
+    return item
+"#;
+
+        let outcome = ProjectVerifier::PythonSyntax.check("app/main.py", contents);
+
+        assert_eq!(outcome, ProjectVerifierOutcome::Ok);
     }
 
     #[test]

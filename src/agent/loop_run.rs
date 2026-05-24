@@ -89,6 +89,10 @@ pub(crate) mod completion_evidence;
 mod deterministic;
 pub(crate) mod feedback_kind_confirm;
 mod footer;
+// v0.4.13 Phase 1: bounded verifier-failure packet used as the shared
+// controller/LLM input for the new repair pipeline. Private module; no facade
+// re-export (DR3-001 pattern).
+mod failure_packet;
 mod interrupt;
 mod lifecycle;
 pub mod photon_user_feedback;
@@ -100,6 +104,12 @@ mod protocol;
 mod quality;
 pub(crate) mod quality_confirm;
 pub(crate) mod reminder;
+// v0.4.13 Phase 4: controller-owned action projected from a validated
+// RepairBrief. Private module; consumed by the repair pipeline as it is wired.
+mod repair_action;
+// v0.4.13 Phase 2: small diagnostic schema returned by the short-lived
+// diagnostic LLM. Private module; no direct provider abstraction.
+mod repair_brief;
 mod repair_job;
 // Issue #653: `RepairAttemptOutcome` lifecycle ledger. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
@@ -109,6 +119,10 @@ mod repair_attempt_outcome;
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
 mod required_behavior;
+// v0.4.13 Phase 5: bounded patch proposal schema for the patch shaper LLM.
+mod patch_proposal;
+// v0.4.13 Phase 6: verifier rerun progress classifier.
+mod repair_progress;
 // Issue #647 (Phase A.1): semantic repair planning — bounded failure-report
 // schema and deterministic cluster-key generation. Module is intentionally
 // *not* re-exported (DR3-001) — future consumers (`turn.rs`, `repair_job.rs`)
