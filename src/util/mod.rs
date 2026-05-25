@@ -6,3 +6,4 @@
 
 pub mod file_classify;
 pub mod git_hardened;
+pub mod workspace_paths;

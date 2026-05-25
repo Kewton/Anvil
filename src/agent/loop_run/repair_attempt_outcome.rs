@@ -64,6 +64,7 @@ pub(super) enum RepairAttemptOutcomeKind {
     /// active `SemanticRepairPlan` がある (= semantic 経路に乗っている) のに
     /// `verifier_repair_effective_target_hint(&job)` が `None` を返した、
     /// すなわち「safe な repair target が一つも残っていない」状態 (S7-002, no payload)。
+    #[allow(dead_code)] // legacy telemetry bucket; v0.4.21 routes no-target through SafeStop.
     RejectedNoCandidate,
     /// Issue #662: parse 段階での malformed reject。
     /// `parse_verifier_repair_intents_reply` / `parse_verifier_repair_intent_object`

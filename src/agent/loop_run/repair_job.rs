@@ -471,6 +471,7 @@ impl RepairAttemptKey {
 pub(super) enum RejectedAttemptReason {
     MalformedPatch,
     AmbiguousAuthority,
+    WrongTarget,
     UnsafePatch,
     NoopPatch,
     DuplicatePatch,
@@ -483,6 +484,7 @@ impl RejectedAttemptReason {
         match self {
             Self::MalformedPatch => "malformed_patch",
             Self::AmbiguousAuthority => "ambiguous_authority",
+            Self::WrongTarget => "wrong_target",
             Self::UnsafePatch => "unsafe_patch",
             Self::NoopPatch => "noop_patch",
             Self::DuplicatePatch => "duplicate_patch",
@@ -532,6 +534,25 @@ pub(super) enum RepairNextAction {
     Replan,
     SafeStop { reason: RepairTerminalReason },
     VerifiedDone,
+}
+
+/// Committed verifier-repair step consumed by `turn.rs`.
+///
+/// `RepairNextAction` remains a read-only compatibility projection. This
+/// driver surface is the production boundary for actions that must mutate
+/// job state before a runner is invoked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // migration surface; production initially uses the diagnostic path.
+pub(super) enum RepairStep {
+    RunDiagnostic,
+    RunPatchProvider { target_hint: RecoveryTargetHint },
+    RunVerifier,
+    SafeStop { reason: RepairTerminalReason },
+    Done,
+}
+
+pub(super) struct RepairJobDriver<'a> {
+    job: &'a mut RepairJob,
 }
 
 /// Issue #662: structured return type for `record_repair_attempt_outcome`.
@@ -680,7 +701,6 @@ impl RepairJob {
     pub(super) fn apply_event(&mut self, event: RepairJobEvent) {
         match &event {
             RepairJobEvent::DiagnosticMalformed => {
-                self.assessment_attempts = self.assessment_attempts.saturating_add(1);
                 self.assessment = None;
             }
             RepairJobEvent::DiagnosticUnavailable => {
@@ -716,11 +736,8 @@ impl RepairJob {
         self.push_lifecycle_event(event);
     }
 
-    /// v0.4.16: controller-facing state-machine projection.
-    ///
-    /// This does not yet replace `verifier_repair_decision`; it is the small,
-    /// testable kernel that future `turn.rs` orchestration should call.
-    #[allow(dead_code)] // v0.4.16 migration surface; covered by unit tests before production switch-over.
+    /// Controller-facing state-machine projection used by production
+    /// verifier-repair dispatch.
     pub(super) fn next_action(&self) -> RepairNextAction {
         if let Some(action) = self.next_action_from_latest_event() {
             return action;
@@ -750,6 +767,16 @@ impl RepairJob {
                 reason: RepairTerminalReason::DiagnosticUnavailable,
             };
         }
+        if semantic_plan_is_stale(self) || self.needs_diagnostic_after_target_exhaustion() {
+            if self.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+            {
+                return RepairNextAction::RequestDiagnostic;
+            }
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::DiagnosticUnavailable,
+            };
+        }
         if self.current_semantic_targets_all_exhausted() {
             if self.assessment_attempts
                 < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
@@ -766,6 +793,17 @@ impl RepairJob {
             };
         };
         RepairNextAction::RequestPatch { target_hint }
+    }
+
+    pub(super) fn driver(&mut self) -> RepairJobDriver<'_> {
+        RepairJobDriver { job: self }
+    }
+
+    fn prepare_for_diagnostic_step(&mut self) {
+        self.assessment = None;
+        self.repair_target_hint = None;
+        self.diagnostic_attempted = false;
+        self.assessment_bound_cluster_id = None;
     }
 
     fn push_lifecycle_event(&mut self, event: RepairJobEvent) {
@@ -792,7 +830,6 @@ impl RepairJob {
         self.rejected_attempts.push(attempt);
     }
 
-    #[allow(dead_code)] // helper for the next_action migration surface.
     fn next_action_from_latest_event(&self) -> Option<RepairNextAction> {
         match self.lifecycle_events.last()? {
             RepairJobEvent::DiagnosticMalformed => {
@@ -875,6 +912,10 @@ impl RepairJob {
             })
             .or_else(|| self.repair_target_hint.clone())
             .or_else(|| self.target_hint.clone())
+    }
+
+    pub(super) fn begin_next_repair_step(&mut self) -> RepairStep {
+        self.driver().begin_next_step()
     }
 
     /// Issue #653 (S7-003) / #662 (S5-003): ledger mutation SSOT (orchestration only)。
@@ -1168,6 +1209,23 @@ impl RepairJob {
     }
 }
 
+impl RepairJobDriver<'_> {
+    pub(super) fn begin_next_step(&mut self) -> RepairStep {
+        match self.job.next_action() {
+            RepairNextAction::RequestDiagnostic | RepairNextAction::Replan => {
+                self.job.prepare_for_diagnostic_step();
+                RepairStep::RunDiagnostic
+            }
+            RepairNextAction::RequestPatch { target_hint } => {
+                RepairStep::RunPatchProvider { target_hint }
+            }
+            RepairNextAction::RerunVerifier => RepairStep::RunVerifier,
+            RepairNextAction::SafeStop { reason } => RepairStep::SafeStop { reason },
+            RepairNextAction::VerifiedDone => RepairStep::Done,
+        }
+    }
+}
+
 /// SSOT text sanitizer for `RepairJob` long-lived fields and snapshot output.
 ///
 /// - token / kv / URL-userinfo: `session::feedback::mask_secrets`
@@ -1280,16 +1338,9 @@ pub(super) fn semantic_plan_is_stale(job: &RepairJob) -> bool {
     plan.assessment_generation_at_creation >= job.assessment_generation
 }
 
-/// Pure function moved from `turn.rs`. Drives the verifier-repair state
-/// machine using `messages` (for fresh-read detection) and `work_root`
-/// (for target-path resolution). Behaviour and ordering are identical to
-/// the legacy implementation; we keep the two-argument shape `(pending,
-/// job)` because the controller can sit in a transitional state where a
-/// repair is pending but no `RepairJob` has been built yet (e.g. before
-/// `verifier_repair_context_from_failure`). Treating `job=None` as
-/// `NoRepair` would break the existing
-/// `verifier_repair_unknown_target_uses_discovery_then_latest_read_target`
-/// regression test.
+/// Production bridge from the `RepairJob::next_action()` state machine to
+/// the legacy `VerifierRepairDecision` shape still consumed by turn-local
+/// tool-policy code.
 pub(super) fn verifier_repair_decision(
     pending: bool,
     job: Option<&RepairJob>,
@@ -1301,67 +1352,20 @@ pub(super) fn verifier_repair_decision(
     if !pending {
         return VerifierRepairDecision::NoRepair;
     }
-    if job.is_some_and(|job| job.diagnostic_unavailable) {
-        return VerifierRepairDecision::DiagnosticUnavailable;
-    }
     if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
         return VerifierRepairDecision::ReadyToVerify;
     }
-    if job.is_some_and(|job| {
-        job.assessment.is_none()
-            && job.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-    }) {
-        return VerifierRepairDecision::NeedDiagnostic;
+
+    if let Some(job) = job {
+        // A model-performed edit during verifier repair is equivalent to a
+        // PatchApplied event for dispatch purposes. The edit producer lives
+        // outside this pure function, so keep this as the only external
+        // bridge until all model edits are recorded as `RepairJobEvent`s.
+        return verifier_repair_decision_from_next_action(job.next_action(), messages, work_root);
     }
-    if job.is_some_and(|job| job.assessment.is_none()) {
-        return VerifierRepairDecision::DiagnosticUnavailable;
-    }
-    // Issue #647 (CB-012 / CB-014 / CB-015): When semantic_plan is active
-    // but the assessment was constructed before the plan advanced to its
-    // current cluster (= `semantic_plan_is_stale` returns `true`), the
-    // assessment is stale and the repair-target hint guard in
-    // `verifier_repair_context_target_path` returns `None`. Two branches:
-    //
-    //   * **CB-012** (attempts remain): force a fresh diagnostic so
-    //     the next assessment reflects the advanced cluster. Without
-    //     this branch we would fall through to
-    //     `latest_successful_read_existing_path` and route the repair
-    //     pass to an unrelated turn-local read target.
-    //   * **CB-014** (attempts exhausted): fail closed with
-    //     `DiagnosticUnavailable`. Without this branch the same
-    //     stale-target fallback path reopens at the diagnostic budget
-    //     boundary because `assessment.is_some()` keeps the earlier
-    //     `assessment.is_none() -> DiagnosticUnavailable` arm from
-    //     firing.
-    //
-    // **CB-015** (architectural refactor): the stale-state predicate now
-    // uses `semantic_plan_is_stale` which compares
-    // `plan.assessment_generation_at_creation` against
-    // `RepairJob.assessment_generation`. After a re-diagnostic bumps the
-    // job's generation, the predicate flips to `false` (fresh state) and
-    // the controller can advance to `NeedFreshRead` / `NeedEdit` on the
-    // current cluster — closing the liveness gap where cluster B repair
-    // could never start because the same exhausted_attempts-based predicate
-    // kept routing back to `NeedDiagnostic`.
-    if job.is_some_and(semantic_plan_is_stale) {
-        if job.is_some_and(|job| {
-            job.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-        }) {
-            return VerifierRepairDecision::NeedDiagnostic;
-        }
-        return VerifierRepairDecision::DiagnosticUnavailable;
-    }
-    if job.is_some_and(|job| job.needs_diagnostic_after_target_exhaustion()) {
-        if job.is_some_and(|job| {
-            job.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-        }) {
-            return VerifierRepairDecision::NeedDiagnostic;
-        }
-        return VerifierRepairDecision::DiagnosticUnavailable;
-    }
+
+    // Transitional missing-job state, used by MissingVerifierJob and legacy
+    // target discovery before a concrete verifier failure packet exists.
     let target = job
         .and_then(|job| super::turn::verifier_repair_context_target_path(work_root, job))
         .or_else(|| {
@@ -1374,6 +1378,37 @@ pub(super) fn verifier_repair_decision(
     let Some(target) = target else {
         return VerifierRepairDecision::NeedTargetDiscovery;
     };
+    verifier_repair_decision_for_target(target, messages, work_root)
+}
+
+fn verifier_repair_decision_from_next_action(
+    action: RepairNextAction,
+    messages: &[ConversationMessage],
+    work_root: &Path,
+) -> VerifierRepairDecision {
+    match action {
+        RepairNextAction::RequestDiagnostic | RepairNextAction::Replan => {
+            VerifierRepairDecision::NeedDiagnostic
+        }
+        RepairNextAction::RerunVerifier | RepairNextAction::VerifiedDone => {
+            VerifierRepairDecision::ReadyToVerify
+        }
+        RepairNextAction::SafeStop { .. } => VerifierRepairDecision::DiagnosticUnavailable,
+        RepairNextAction::RequestPatch { target_hint } => {
+            let Some(relative) = safe_relative_path_string(&target_hint.path) else {
+                return VerifierRepairDecision::DiagnosticUnavailable;
+            };
+            verifier_repair_decision_for_target(work_root.join(relative), messages, work_root)
+        }
+    }
+}
+
+fn verifier_repair_decision_for_target(
+    target: PathBuf,
+    messages: &[ConversationMessage],
+    work_root: &Path,
+) -> VerifierRepairDecision {
+    let target = std::fs::canonicalize(&target).unwrap_or(target);
     if !target.is_file() {
         return VerifierRepairDecision::NeedWrite(target);
     }
@@ -2530,6 +2565,38 @@ mod tests {
         });
 
         assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn repair_job_driver_commits_replan_before_diagnostic_runner() {
+        let target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let key =
+            RepairAttemptKey::from_target(&target, Some(AllowedChangeKind::FixTestImportOrSetup));
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target)),
+            repair_target_hint: Some(recovery_target(ArtifactRole::Test, "tests/test_main.py")),
+            diagnostic_attempted: true,
+            assessment_bound_cluster_id: Some(
+                super::super::semantic_failure::cluster_key_for_test("cluster-a"),
+            ),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::WrongTarget,
+        });
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key,
+            reason: RejectedAttemptReason::WrongTarget,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+        assert_eq!(job.begin_next_repair_step(), RepairStep::RunDiagnostic);
+        assert!(job.assessment.is_none());
+        assert!(job.repair_target_hint.is_none());
+        assert!(!job.diagnostic_attempted);
+        assert!(job.assessment_bound_cluster_id.is_none());
     }
 
     #[test]

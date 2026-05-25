@@ -236,6 +236,29 @@ mod tests {
     }
 
     #[test]
+    fn patch_proposal_extracts_json_with_braces_inside_strings() {
+        let reply = r#"{
+  "target_path": "tests/test_main.py",
+  "edits": [
+    {
+      "old_string": "response = client.delete(f\"/items/{item_id}\")\nassert response.status_code == 200",
+      "new_string": "response = client.delete(f\"/items/{item_id}\")\nassert response.status_code == 204",
+      "replace_all": false,
+      "reason": "align DELETE /items/{id} expectation"
+    }
+  ],
+  "explanation": "fix generated expectation",
+  "risk": "low"
+}"#;
+
+        let proposal = parse_patch_proposal_reply(reply).unwrap();
+
+        assert_eq!(proposal.target_path, "tests/test_main.py");
+        assert!(proposal.edits[0].old_string.contains("{item_id}"));
+        assert!(proposal.edits[0].reason.contains("{id}"));
+    }
+
+    #[test]
     fn patch_proposal_rejects_tool_markup() {
         let reply = r#"<anvil_tool_call>{"target_path":"app/main.py"}</anvil_tool_call>"#;
 

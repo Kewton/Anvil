@@ -1118,7 +1118,7 @@ pub(super) struct VerifierCommand {
 /// in this module. Any new entry must come with a `from_*` constructor
 /// below and (where required) a Phase 2.3 execution-time path validator.
 const VERIFIER_RUNNER_ALLOWLIST: &[&str] = &[
-    "cargo", "python3", "python", "pytest", "uv", "poetry", "hatch", "npm", "pnpm", "yarn",
+    "cargo", "python3", "python", "pytest", "uv", "poetry", "hatch", "node", "npm", "pnpm", "yarn",
 ];
 
 impl VerifierCommand {
@@ -1295,6 +1295,29 @@ impl VerifierCommand {
         Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
     }
 
+    /// `node --test <owned_test_artifacts>` structured constructor.
+    ///
+    /// Node's built-in test runner accepts file paths as positional args after
+    /// `--test`, so this preserves the bound-test invariant without parsing or
+    /// trusting package.json script bodies. TypeScript/Jest/Vitest shapes return
+    /// `None` and remain Weak until a dedicated structured adapter exists.
+    #[allow(dead_code)]
+    pub(super) fn from_node_test(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        if owned_test_artifacts
+            .iter()
+            .any(|path| !node_test_artifact_path_is_directly_runnable(path))
+        {
+            return None;
+        }
+        let mut args = Vec::with_capacity(1 + owned_test_artifacts.len());
+        args.push("--test".to_string());
+        args.extend(owned_test_artifacts.iter().cloned());
+        Self::new_allowlisted("node", args, owned_test_artifacts.to_vec())
+    }
+
     /// Returns the runner program name (allowlist member).
     #[allow(dead_code)]
     pub(super) fn runner(&self) -> &str {
@@ -1368,6 +1391,17 @@ fn cargo_integration_test_name(path: &str) -> Option<String> {
         return None;
     }
     Some(stem)
+}
+
+fn node_test_artifact_path_is_directly_runnable(path: &str) -> bool {
+    let p = Path::new(path);
+    if !crate::util::file_classify::is_test_file(p) {
+        return false;
+    }
+    matches!(
+        p.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "mjs" | "cjs")
+    )
 }
 
 /// Issue #651 Task 2.2: structured outcome of "given owned test
@@ -1551,9 +1585,18 @@ impl AutoTestRunner {
                     display_command: Some(display_command),
                 }
             }
+            VerifierCandidateSource::PackageJsonScripts => {
+                if let Some(command) = VerifierCommand::from_node_test(owned_test_artifacts) {
+                    return OwnedTestVerifierPlan::Runnable { plan, command };
+                }
+                OwnedTestVerifierPlan::Weak {
+                    reason: "package.json test script cannot be structurally bound to owned test artifacts",
+                    detected_source: source.as_str(),
+                    display_command: Some(display_command),
+                }
+            }
             VerifierCandidateSource::ProjectInstruction
             | VerifierCandidateSource::RecentSuccessfulBash
-            | VerifierCandidateSource::PackageJsonScripts
             | VerifierCandidateSource::NativeNodeFramework
             | VerifierCandidateSource::PythonCompileFallback => OwnedTestVerifierPlan::Weak {
                 reason: "verifier source has no allowlisted structured constructor",
@@ -1730,10 +1773,11 @@ fn structured_python_pytest_dependency_setup_packages(
         return None;
     }
     let pyproject_path = work_root.join("pyproject.toml");
-    if !pyproject_path.is_file() {
-        return None;
-    }
-    let packages = python_pyproject_test_packages(&PythonProjectEvidence::from_file(work_root));
+    let packages = if pyproject_path.is_file() {
+        python_pyproject_test_packages(&PythonProjectEvidence::from_file(work_root))
+    } else {
+        python_inferred_test_packages_from_sources(work_root)
+    };
     if packages.is_empty() {
         None
     } else {
@@ -2828,6 +2872,224 @@ fn python_pyproject_test_packages(pyproject: &PythonProjectEvidence) -> Vec<Stri
     packages.into_iter().collect()
 }
 
+fn python_inferred_test_packages_from_sources(work_root: &Path) -> Vec<String> {
+    const MAX_PYTHON_SOURCE_FILES: usize = 64;
+    const MAX_PYTHON_SOURCE_BYTES: u64 = 256 * 1024;
+    const MAX_INFERRED_PACKAGES: usize = 24;
+
+    let mut local_modules = python_local_top_level_modules(work_root);
+    local_modules.insert("tests".to_string());
+
+    let mut packages = BTreeSet::new();
+    packages.insert("pytest".to_string());
+    let mut stack = vec![work_root.to_path_buf()];
+    let mut visited_files = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if python_dependency_scan_ignored_name(&name) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("py") {
+                continue;
+            }
+            if visited_files >= MAX_PYTHON_SOURCE_FILES {
+                break;
+            }
+            visited_files = visited_files.saturating_add(1);
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > MAX_PYTHON_SOURCE_BYTES {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for import in python_imported_top_level_names(&contents) {
+                if local_modules.contains(&import) || python_stdlib_top_level_name(&import) {
+                    continue;
+                }
+                let package = normalize_dependency_name(&import);
+                if is_safe_python_package_name(&package) {
+                    packages.insert(package);
+                }
+            }
+            if contents.contains("fastapi.testclient") {
+                packages.insert("httpx".to_string());
+            }
+        }
+    }
+
+    packages.into_iter().take(MAX_INFERRED_PACKAGES).collect()
+}
+
+fn python_local_top_level_modules(work_root: &Path) -> BTreeSet<String> {
+    let mut modules = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(work_root) else {
+        return modules;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if python_dependency_scan_ignored_name(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("py")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                modules.insert(stem.to_string());
+            }
+            continue;
+        }
+        if file_type.is_dir() && python_dir_contains_python_source(&path) {
+            modules.insert(name);
+        }
+    }
+    modules
+}
+
+fn python_dir_contains_python_source(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|ext| ext.to_str()) == Some("py")
+    })
+}
+
+fn python_dependency_scan_ignored_name(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "__pycache__"
+                | ".anvil-state"
+                | ".git"
+                | ".hg"
+                | ".mypy_cache"
+                | ".pytest_cache"
+                | ".ruff_cache"
+                | ".tox"
+                | ".venv"
+                | "dist"
+                | "node_modules"
+                | "target"
+                | "venv"
+        )
+}
+
+fn python_imported_top_level_names(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with("from .") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let candidate = part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("");
+                if python_import_name_is_safe(candidate) {
+                    names.insert(candidate.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("from ") {
+            let candidate = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .split('.')
+                .next()
+                .unwrap_or("");
+            if python_import_name_is_safe(candidate) {
+                names.insert(candidate.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn python_import_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+}
+
+fn python_stdlib_top_level_name(name: &str) -> bool {
+    matches!(
+        name,
+        "__future__"
+            | "abc"
+            | "argparse"
+            | "asyncio"
+            | "base64"
+            | "collections"
+            | "contextlib"
+            | "csv"
+            | "dataclasses"
+            | "datetime"
+            | "decimal"
+            | "enum"
+            | "functools"
+            | "glob"
+            | "hashlib"
+            | "http"
+            | "importlib"
+            | "inspect"
+            | "io"
+            | "itertools"
+            | "json"
+            | "logging"
+            | "math"
+            | "os"
+            | "pathlib"
+            | "random"
+            | "re"
+            | "shutil"
+            | "sqlite3"
+            | "statistics"
+            | "string"
+            | "subprocess"
+            | "sys"
+            | "tempfile"
+            | "time"
+            | "traceback"
+            | "typing"
+            | "unittest"
+            | "uuid"
+    )
+}
+
 fn is_safe_python_package_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 80
@@ -3766,6 +4028,35 @@ dev = [
     }
 
     #[test]
+    fn python_pytest_without_pyproject_infers_safe_import_packages_for_structured_setup() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("main.py"),
+            "from fastapi import FastAPI\nfrom pydantic import BaseModel\nfrom uuid import uuid4\n",
+        )
+        .expect("main");
+        std::fs::write(
+            dir.path().join("tests/test_main.py"),
+            "from fastapi.testclient import TestClient\nfrom main import app\n",
+        )
+        .expect("test");
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&["tests/test_main.py".to_string()])
+                .expect("pytest command");
+
+        let packages =
+            structured_python_pytest_dependency_setup_packages(dir.path(), &command).unwrap();
+
+        assert!(packages.contains(&"fastapi".to_string()));
+        assert!(packages.contains(&"httpx".to_string()));
+        assert!(packages.contains(&"pydantic".to_string()));
+        assert!(packages.contains(&"pytest".to_string()));
+        assert!(!packages.contains(&"main".to_string()));
+        assert!(!packages.contains(&"uuid".to_string()));
+    }
+
+    #[test]
     fn pyproject_description_keyword_does_not_count_as_pytest_dependency() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(
@@ -4149,14 +4440,14 @@ dev = [
     }
 
     #[test]
-    fn structured_python_pytest_dependency_setup_packages_ignores_non_pytest_or_no_pyproject() {
+    fn structured_python_pytest_dependency_setup_packages_bootstraps_pytest_without_pyproject() {
         let dir = tempdir().expect("tempdir");
         let owned = vec!["tests/test_main.py".to_string()];
         let pytest_command =
             VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
         assert_eq!(
             structured_python_pytest_dependency_setup_packages(dir.path(), &pytest_command),
-            None
+            Some(vec!["pytest".to_string()])
         );
 
         std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = 'x'\n")
@@ -4531,6 +4822,45 @@ dev = [
         let owned = vec!["tests/test_a.py".to_string()];
         let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
         assert!(command.is_none(), "non-.rs path must not be convertible");
+    }
+
+    #[test]
+    fn verifier_command_from_node_test_binds_direct_js_test_paths() {
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_node_test(&owned).expect("node");
+        assert_eq!(
+            command.args(),
+            vec!["--test".to_string(), "tests/index.test.js".to_string()].as_slice()
+        );
+        assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+    }
+
+    #[test]
+    fn verifier_command_from_node_test_rejects_typescript_paths() {
+        let owned = vec!["tests/index.test.ts".to_string()];
+        assert!(
+            VerifierCommand::from_node_test(&owned).is_none(),
+            "plain node --test must not claim TypeScript test artifacts"
+        );
+    }
+
+    #[test]
+    fn detect_owned_for_package_json_script_with_js_test_returns_runnable() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node --test tests/*.test.js"}}"#,
+        )
+        .expect("package");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "node");
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
     }
 
     #[test]

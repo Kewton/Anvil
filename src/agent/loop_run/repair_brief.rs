@@ -319,14 +319,12 @@ pub(super) fn repair_brief_from_legacy_diagnostic(
 }
 
 pub(super) fn extract_last_json_object(reply: &str) -> Option<&str> {
-    let end = reply.rfind('}')?;
-    let bytes = reply.as_bytes();
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    let mut start = None;
-    for idx in (0..=end).rev() {
-        let ch = bytes[idx] as char;
+    let mut start: Option<usize> = None;
+    let mut last: Option<&str> = None;
+    for (idx, ch) in reply.char_indices() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -339,18 +337,27 @@ pub(super) fn extract_last_json_object(reply: &str) -> Option<&str> {
         }
         match ch {
             '"' => in_string = true,
-            '}' => depth = depth.saturating_add(1),
             '{' => {
-                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     start = Some(idx);
-                    break;
+                }
+                depth = depth.saturating_add(1);
+            }
+            '}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0
+                    && let Some(start_idx) = start.take()
+                {
+                    last = Some(&reply[start_idx..idx + ch.len_utf8()]);
                 }
             }
             _ => {}
         }
     }
-    start.map(|start| &reply[start..=end])
+    last
 }
 
 fn parse_target(
@@ -415,7 +422,7 @@ fn artifact_role_from_str(value: &str) -> Option<ArtifactRole> {
     }
 }
 
-fn legacy_kind_to_allowed_change_kind(value: &str) -> AllowedChangeKind {
+pub(super) fn legacy_kind_to_allowed_change_kind(value: &str) -> AllowedChangeKind {
     match normalize_enum(value).as_str() {
         "dependency_missing" | "config_or_verifier_error" | "missing_verifier" => {
             AllowedChangeKind::FixDependencyOrConfig

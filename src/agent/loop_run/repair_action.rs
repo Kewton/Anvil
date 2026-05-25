@@ -70,6 +70,9 @@ pub(super) fn build_repair_action(
     if packet_role != target.role {
         return Err(RepairActionRejection::RoleMismatch);
     }
+    if !allowed_change_kind_allows_target_role(brief.allowed_change_kind, target.role) {
+        return Err(RepairActionRejection::RoleMismatch);
+    }
     if brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation
         && brief.source_of_truth == SourceOfTruth::UserRequest
     {
@@ -92,6 +95,29 @@ pub(super) fn build_repair_action(
         budget: DEFAULT_ACTION_BUDGET,
         brief_confidence: brief.confidence,
     })
+}
+
+pub(super) fn allowed_change_kind_allows_target_role(
+    kind: AllowedChangeKind,
+    role: ArtifactRole,
+) -> bool {
+    match kind {
+        AllowedChangeKind::FixImplementationBehavior => role == ArtifactRole::Implementation,
+        AllowedChangeKind::FixGeneratedTestExpectation | AllowedChangeKind::FixTestIsolation => {
+            role == ArtifactRole::Test
+        }
+        AllowedChangeKind::FixTestImportOrSetup => {
+            matches!(role, ArtifactRole::Test | ArtifactRole::Setup)
+        }
+        AllowedChangeKind::ConnectExistingTestSetupToSut => matches!(
+            role,
+            ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup
+        ),
+        AllowedChangeKind::FixDependencyOrConfig | AllowedChangeKind::FixVerifierCommand => {
+            role == ArtifactRole::Setup
+        }
+        AllowedChangeKind::InsufficientEvidence => false,
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +181,34 @@ mod tests {
         assert_eq!(
             build_repair_action(&brief, &packet()),
             Err(RepairActionRejection::PathNotCandidate)
+        );
+    }
+
+    #[test]
+    fn repair_action_rejects_change_kind_target_role_mismatch() {
+        let test_packet = FailurePacket::new(
+            "pytest",
+            "assertion_failure",
+            "failed",
+            Vec::new(),
+            Vec::new(),
+            vec![CandidateArtifact::new(
+                ArtifactRole::Test,
+                "tests/test_main.py",
+                "changed test",
+            )],
+            Vec::new(),
+        );
+        let mut brief = brief();
+        brief.repair_target = Some(RepairBriefTarget {
+            role: ArtifactRole::Test,
+            path: "tests/test_main.py".to_string(),
+        });
+        brief.allowed_change_kind = AllowedChangeKind::FixImplementationBehavior;
+
+        assert_eq!(
+            build_repair_action(&brief, &test_packet),
+            Err(RepairActionRejection::RoleMismatch)
         );
     }
 

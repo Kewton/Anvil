@@ -100,6 +100,10 @@ pub mod photon_user_feedback;
 // re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
 // `super::project_verifier::*`.
 mod project_verifier;
+// v0.4.22: generic completion probe. Private helper that can advance to
+// verifier execution when current-turn artifacts are physically present even
+// if the legacy artifact projection is still asking for another edit.
+mod project_probe;
 mod protocol;
 mod quality;
 pub(crate) mod quality_confirm;
