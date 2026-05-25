@@ -498,6 +498,146 @@ mod loop_control_action_tests {
         assert!(owner.allows_focused_edit_recovery());
         assert!(owner.allows_deterministic_fallback());
     }
+
+    #[test]
+    fn transition_table_covers_all_controller_owned_states() {
+        let target_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "synthetic transition target".to_string(),
+        };
+        let cases = vec![
+            (
+                "repair diagnostic",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(
+                        super::super::repair_job::RepairNextAction::RequestDiagnostic,
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "repair patch",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(
+                        super::super::repair_job::RepairNextAction::RequestPatch {
+                            target_hint: target_hint.clone(),
+                        },
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "repair rerun",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(super::super::repair_job::RepairNextAction::RerunVerifier),
+                    ..inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "repair safe stop",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(super::super::repair_job::RepairNextAction::SafeStop {
+                        reason: super::super::repair_job::RepairTerminalReason::RepairBudgetExhausted,
+                    }),
+                    ..inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "missing verifier setup",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    missing_verifier_next_action: Some(
+                        super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::MissingVerifierJob,
+            ),
+            (
+                "missing verifier rerun",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    missing_verifier_next_action: Some(
+                        super::super::repair_job::VerifierBootstrapNextAction::RerunVerifier,
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::MissingVerifierJob,
+            ),
+            (
+                "missing verifier safe stop",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    missing_verifier_next_action: Some(
+                        super::super::repair_job::VerifierBootstrapNextAction::SafeStop {
+                            reason: "synthetic missing-verifier exhaustion",
+                        },
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::MissingVerifierJob,
+            ),
+            (
+                "verifier run",
+                LoopControlInputs {
+                    task_contract_action: Some(
+                        super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::None,
+            ),
+            (
+                "artifact completion",
+                LoopControlInputs {
+                    task_contract_action: Some(
+                        super::super::task_contract::ArtifactRecoveryAction::Continue {
+                            missing: vec![
+                                super::super::task_contract::ArtifactRole::Implementation,
+                            ],
+                            target_hint: Some(target_hint),
+                        },
+                    ),
+                    ..inputs()
+                },
+                RecoveryOwner::ArtifactCompletion,
+            ),
+        ];
+
+        for (label, input, expected_owner) in cases {
+            let task_contract_action = input.task_contract_action.clone();
+            let action = determine_loop_control_action(input);
+            let owner = RecoveryOwner::from_control_action(&action, task_contract_action.as_ref());
+
+            assert_eq!(owner, expected_owner, "{label}");
+            match owner {
+                RecoveryOwner::RepairJob | RecoveryOwner::MissingVerifierJob => {
+                    assert!(!owner.allows_generic_repo_change_recovery(), "{label}");
+                    assert!(!owner.allows_focused_edit_recovery(), "{label}");
+                    assert!(!owner.allows_deterministic_fallback(), "{label}");
+                }
+                RecoveryOwner::ArtifactCompletion => {
+                    assert!(!owner.allows_generic_repo_change_recovery(), "{label}");
+                    assert!(owner.allows_focused_edit_recovery(), "{label}");
+                    assert!(!owner.allows_deterministic_fallback(), "{label}");
+                }
+                RecoveryOwner::None => {
+                    assert!(owner.allows_generic_repo_change_recovery(), "{label}");
+                    assert!(owner.allows_focused_edit_recovery(), "{label}");
+                    assert!(owner.allows_deterministic_fallback(), "{label}");
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -872,17 +1012,23 @@ mod repair_lifecycle_event_tests {
 
 #[cfg(test)]
 mod v0421_repair_runner_contract_tests {
+    fn function_body<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
+        let start = src.rfind(start_marker).expect("start marker must exist");
+        let end = src[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .expect("end marker must exist after start marker");
+        &src[start..end]
+    }
+
     #[test]
     fn repair_job_run_verifier_dispatch_uses_job_preserving_path() {
         let src = include_str!("turn.rs");
-        let dispatch_start = src
-            .find("\n    fn dispatch_repair_job_step(")
-            .expect("dispatch_repair_job_step must exist");
-        let dispatch_end = src[dispatch_start..]
-            .find("\n    fn drive_repair_job_verifier(")
-            .map(|offset| dispatch_start + offset)
-            .expect("drive_repair_job_verifier must follow dispatch");
-        let dispatch = &src[dispatch_start..dispatch_end];
+        let dispatch = function_body(
+            src,
+            "\n    fn dispatch_repair_job_step(",
+            "\n    fn drive_repair_job_verifier(",
+        );
 
         assert!(dispatch.contains("RepairStep::RunVerifier"));
         assert!(dispatch.contains("self.drive_repair_job_verifier(args)"));
@@ -895,14 +1041,11 @@ mod v0421_repair_runner_contract_tests {
     #[test]
     fn repair_patch_provider_requires_committed_target_hint() {
         let src = include_str!("turn.rs");
-        let fn_start = src
-            .find("\n    fn run_verifier_repair_pass_and_apply(")
-            .expect("run_verifier_repair_pass_and_apply must exist");
-        let fn_end = src[fn_start..]
-            .find("\n    fn record_controller_verifier_repair_edit(")
-            .map(|offset| fn_start + offset)
-            .expect("record_controller_verifier_repair_edit must follow repair pass");
-        let body = &src[fn_start..fn_end];
+        let body = function_body(
+            src,
+            "\n    fn run_verifier_repair_pass_and_apply(",
+            "\n    fn record_controller_verifier_repair_edit(",
+        );
 
         assert!(body.contains("target_hint:"));
         assert!(body.contains("&super::task_contract::RecoveryTargetHint"));
@@ -929,6 +1072,35 @@ mod v0421_repair_runner_contract_tests {
             job.next_action(),
             super::super::repair_job::RepairNextAction::RequestDiagnostic
         );
+    }
+
+    #[test]
+    fn production_repair_dispatch_does_not_call_legacy_decision_bridge() {
+        let src = include_str!("turn.rs");
+        let run_actor_loop = function_body(
+            src,
+            "\n    fn run_actor_loop(",
+            "\n    pub(super) fn push_system_note(",
+        );
+        let arbiter_candidates = function_body(
+            src,
+            "\n    fn build_arbiter_candidates(",
+            "\n    pub(super) fn current_workspace_scope(",
+        );
+
+        for (label, body) in [
+            ("run_actor_loop", run_actor_loop),
+            ("build_arbiter_candidates", arbiter_candidates),
+        ] {
+            assert!(
+                !body.contains("VerifierRepairDecision"),
+                "{label} must not project production repair dispatch through VerifierRepairDecision"
+            );
+            assert!(
+                !body.contains("verifier_repair_decision("),
+                "{label} must not call the legacy verifier_repair_decision bridge"
+            );
+        }
     }
 }
 
@@ -13173,7 +13345,7 @@ impl Agent {
         let mut candidates: Vec<JobCandidate> = Vec::new();
 
         // Priority 1: VerifierRepair / MissingVerifier. The arbiter no longer
-        // derives verifier progress from the legacy `VerifierRepairDecision`;
+        // derives verifier progress from the legacy decision bridge;
         // it projects the same `LoopControlAction` used by the top-level
         // controller into a least-privilege policy.
         match determine_loop_control_action(LoopControlInputs {

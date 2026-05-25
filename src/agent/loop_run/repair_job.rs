@@ -2730,6 +2730,160 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SyntheticVerifierTerminal {
+        Done,
+        SafeStop(RepairTerminalReason),
+    }
+
+    fn terminal_from_action(action: RepairNextAction) -> Option<SyntheticVerifierTerminal> {
+        match action {
+            RepairNextAction::VerifiedDone => Some(SyntheticVerifierTerminal::Done),
+            RepairNextAction::SafeStop { reason } => {
+                Some(SyntheticVerifierTerminal::SafeStop(reason))
+            }
+            RepairNextAction::RequestDiagnostic
+            | RepairNextAction::RequestPatch { .. }
+            | RepairNextAction::RerunVerifier
+            | RepairNextAction::Replan => None,
+        }
+    }
+
+    #[test]
+    fn synthetic_verifier_e2e_success_walks_diagnostic_patch_rerun_done() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let key = RepairAttemptKey::from_target(
+            &target,
+            Some(AllowedChangeKind::FixImplementationBehavior),
+        );
+        let mut job = RepairJob::new_for_test();
+
+        assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
+        job.assessment = Some(verifier_assessment_for_target(target.clone()));
+        job.apply_event(RepairJobEvent::PlanAccepted);
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: target
+            }
+        );
+
+        job.apply_event(RepairJobEvent::PatchApplied { key });
+        assert_eq!(job.next_action(), RepairNextAction::RerunVerifier);
+
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Passed,
+        });
+        assert_eq!(
+            terminal_from_action(job.next_action()),
+            Some(SyntheticVerifierTerminal::Done)
+        );
+    }
+
+    #[test]
+    fn synthetic_verifier_e2e_malformed_diagnostics_end_in_safe_stop() {
+        let mut job = RepairJob::new_for_test();
+        for attempt in 0..crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT {
+            job.assessment_attempts = attempt;
+            job.apply_event(RepairJobEvent::DiagnosticMalformed);
+            if attempt + 1 < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT {
+                assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
+            }
+        }
+        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.apply_event(RepairJobEvent::DiagnosticMalformed);
+
+        assert_eq!(
+            terminal_from_action(job.next_action()),
+            Some(SyntheticVerifierTerminal::SafeStop(
+                RepairTerminalReason::DiagnosticUnavailable
+            ))
+        );
+    }
+
+    #[test]
+    fn synthetic_verifier_e2e_invalid_patch_replans_then_safe_stops() {
+        let target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let key =
+            RepairAttemptKey::from_target(&target, Some(AllowedChangeKind::FixTestImportOrSetup));
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target)),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+
+        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key,
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+        assert_eq!(
+            terminal_from_action(job.next_action()),
+            Some(SyntheticVerifierTerminal::SafeStop(
+                RepairTerminalReason::PatchRejectedRepeatedly
+            ))
+        );
+    }
+
+    #[test]
+    fn synthetic_verifier_e2e_ambiguous_authority_safe_stops_without_test_weakening() {
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Test,
+                "tests/test_main.py",
+            ))),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::AmbiguousAuthority);
+
+        assert_eq!(
+            terminal_from_action(job.next_action()),
+            Some(SyntheticVerifierTerminal::SafeStop(
+                RepairTerminalReason::AmbiguousSpecSafeStop
+            ))
+        );
+        assert!(job.applied_repair_intents.is_empty());
+    }
+
+    #[test]
+    fn synthetic_missing_verifier_e2e_setup_edit_then_rerun() {
+        let mut job = MissingVerifierJob::new(3, 0);
+
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::RequestSetupEdit
+        );
+        job.record_in_scope_edit();
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::RerunVerifier
+        );
+    }
+
+    #[test]
+    fn synthetic_missing_verifier_e2e_invalid_setup_safe_stops() {
+        let mut job = MissingVerifierJob::new(2, 0);
+
+        assert!(!job.record_invalid_setup_attempt());
+        assert!(job.record_invalid_setup_attempt());
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::SafeStop {
+                reason: "missing verifier retry budget exhausted"
+            }
+        );
+    }
+
     #[test]
     fn repair_terminal_reason_projects_to_existing_safe_stop_reason() {
         assert_eq!(RepairTerminalReason::VerifiedDone.safe_stop_reason(), None);
