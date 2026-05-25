@@ -2551,6 +2551,30 @@ enum TaskContractVerifierOutcome {
     },
 }
 
+fn task_contract_verifier_transport_error_to_outcome(
+    command: String,
+    error: String,
+) -> TaskContractVerifierOutcome {
+    if let Some(output) = verifier_timeout_failure_output(&error) {
+        TaskContractVerifierOutcome::Failed { command, output }
+    } else {
+        TaskContractVerifierOutcome::TransportError { error }
+    }
+}
+
+fn verifier_timeout_failure_output(error: &str) -> Option<String> {
+    if !error.contains("auto test command timed out after") {
+        return None;
+    }
+    let masked = crate::session::feedback::mask_secrets(error);
+    Some(format!(
+        "Verifier execution timed out before producing a pass/fail result. \
+This is a bounded verifier timeout, not an LLM transport failure. \
+Treat it as verifier evidence: repair the verifier command, reduce the test scope, \
+or safe stop if the command cannot be made bounded.\n{masked}"
+    ))
+}
+
 enum TaskContractVerifierFlowOutcome {
     Continue,
     Done {
@@ -10734,15 +10758,28 @@ impl Agent {
                             }
                         }
                         Err(error) => {
+                            let command =
+                                crate::session::feedback::redact_verifier_command_for_storage(
+                                    &display_command,
+                                );
+                            let outcome =
+                                task_contract_verifier_transport_error_to_outcome(command, error);
+                            let outcome_label = match &outcome {
+                                TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
+                                TaskContractVerifierOutcome::TransportError { .. } => {
+                                    "transport_error"
+                                }
+                                _ => "transport_error",
+                            };
                             log_llm_event(
                                 "agent.task_contract.verifier.completed",
                                 serde_json::json!({
                                     "session_id": self.session_store.session_id(),
-                                    "outcome": "transport_error",
+                                    "outcome": outcome_label,
                                     "command": crate::session::feedback::redact_verifier_command_for_storage(&display_command),
                                 }),
                             );
-                            TaskContractVerifierOutcome::TransportError { error }
+                            outcome
                         }
                     };
                 }
@@ -10890,15 +10927,24 @@ impl Agent {
                 }
             }
             Err(error) => {
+                let outcome = task_contract_verifier_transport_error_to_outcome(
+                    command_for_log.clone(),
+                    error,
+                );
+                let outcome_label = match &outcome {
+                    TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
+                    TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
+                    _ => "transport_error",
+                };
                 log_llm_event(
                     "agent.task_contract.verifier.completed",
                     serde_json::json!({
                         "session_id": self.session_store.session_id(),
-                        "outcome": "transport_error",
+                        "outcome": outcome_label,
                         "command": command_for_log,
                     }),
                 );
-                TaskContractVerifierOutcome::TransportError { error }
+                outcome
             }
         }
     }
@@ -18627,6 +18673,7 @@ mod tests {
         should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_verifier_safe_stop_mapping,
+        task_contract_verifier_transport_error_to_outcome,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
     use crate::agent::loop_run::task_contract::SafeStopReason;
@@ -19961,6 +20008,39 @@ mod tests {
                 "safe_stop_verifier_missing",
             ),
         );
+    }
+
+    #[test]
+    fn verifier_timeout_transport_error_becomes_verifier_failure_evidence() {
+        let outcome = task_contract_verifier_transport_error_to_outcome(
+            "cargo test --test generated".to_string(),
+            "auto test command timed out after 300s".to_string(),
+        );
+
+        match outcome {
+            TaskContractVerifierOutcome::Failed { command, output } => {
+                assert_eq!(command, "cargo test --test generated");
+                assert!(output.contains("Verifier execution timed out"));
+                assert!(output.contains("not an LLM transport failure"));
+                assert!(output.contains("300s"));
+            }
+            other => panic!("expected timeout to become verifier failure evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_timeout_transport_error_stays_transport_error() {
+        let outcome = task_contract_verifier_transport_error_to_outcome(
+            "cargo test".to_string(),
+            "failed to run auto test command: No such file or directory".to_string(),
+        );
+
+        match outcome {
+            TaskContractVerifierOutcome::TransportError { error } => {
+                assert!(error.contains("failed to run auto test command"));
+            }
+            other => panic!("expected non-timeout error to stay transport error, got {other:?}"),
+        }
     }
 
     // ----------------------------------------------------------------

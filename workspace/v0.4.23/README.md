@@ -9,6 +9,7 @@ The immediate target is verifier repair. When a verifier failure has created a `
 The full unification plan is maintained in `full-unification-work-plan.md`.
 The remaining completion work is tracked in `completion-work-plan.md`.
 The execution plan for reaching the final completion criteria is maintained in `complete-achievement-execution-plan.md`.
+The latest remaining work breakdown is maintained in `remaining-completion-work-plan.md`.
 
 ## Current Dispatch Sources
 
@@ -195,3 +196,47 @@ New regression tests cover:
 - stale pending flag without an owner not creating legacy repair dispatch
 
 Test-only compatibility remains for `verifier_weak` safe-stop emission because the existing safe-stop E2E tests still use the seam.
+
+## 2026-05-25 Follow-Up Execution
+
+This follow-up implements the first narrow slice of the final achievement plan.
+
+### Implemented
+
+- Structured Python verifier dependency state remains under
+  `.anvil-state/verifier-python/site`, but it is asserted to be controller-owned
+  ignored workspace state.
+- Structured Python verifier `PYTHONPATH` is explicitly built as:
+
+```text
+<workspace-root>:<.anvil-state/verifier-python/site>
+```
+
+  This keeps task code ahead of verifier helper dependencies while avoiding
+  parent-process `PYTHONPATH` leakage.
+- Verifier timeout errors from `AutoTestRunner` are now converted into verifier
+  failure evidence instead of raw transport errors.
+- Timeout evidence is masked and routed into the existing verifier repair flow,
+  so `RepairJob` can replan, retry, or safe stop through its normal budgeted
+  path.
+- The legacy shell verifier path is now bounded by the same auto-test timeout
+  helper as the structured verifier path, so unstructured verifier execution
+  cannot hang indefinitely.
+
+### Verification
+
+- `cargo fmt --check`: pass
+- `cargo test auto_test --lib`: pass, 148 tests after bounding the legacy shell verifier path
+- `cargo test loop_control_action_tests --lib`: pass, 17 tests
+- `cargo test repair_job --lib`: pass, 133 tests
+- `cargo test task_contract --lib`: pass, 80 tests
+- `cargo test --lib`: pass, 2929 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+
+### Remaining Gap
+
+This does not yet implement a full `ProjectUnit` model. It closes the immediate
+timeout-routing bug and locks down the verifier dependency path invariant, but
+project-wide verifier selection still needs the broader Phase 2 work before the
+generality smoke set can be expected to stabilize.

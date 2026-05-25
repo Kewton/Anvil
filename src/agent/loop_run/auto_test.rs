@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1607,13 +1608,28 @@ impl AutoTestRunner {
     }
 
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
-        let output = Command::new("sh")
+        Self::run_with_timeout(
+            work_root,
+            plan,
+            Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+        )
+    }
+
+    fn run_with_timeout(
+        work_root: &Path,
+        plan: &AutoTestPlan,
+        timeout: Duration,
+    ) -> Result<AutoTestResult, String> {
+        let mut command = Command::new("sh");
+        command
             .arg("-lc")
             .arg(&plan.command)
             .current_dir(work_root)
             .stdin(Stdio::null())
-            .output()
-            .map_err(|err| format!("failed to run auto test command: {err}"))?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::tools::bash::apply_unix_pgroup(&mut command);
+        let output = wait_with_auto_test_timeout(&mut command, timeout)?;
         // Always lossy-decode: invalid UTF-8 must not panic FeedbackFrame
         // creation downstream (Issue #450 / R5).
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1676,12 +1692,12 @@ impl AutoTestRunner {
         // (b) any absolute component under work_root is removed before the
         //     search runs.
         // CB-008 hardens the resolver to fail-closed: if no absolute
-        // resolution survives the sanitization filter, propagate a
-        // TransportError-shaped `Err(...)` rather than letting the child
+        // resolution survives the sanitization filter, return an explicit
+        // `Err(...)` rather than letting the child
         // process inherit the bare runner name and re-resolve through
         // the parent process PATH (which the previous best-effort
-        // fallback exposed). The caller maps this Err into
-        // `TaskContractVerifierOutcome::TransportError`.
+        // fallback exposed). The caller classifies this Err as either a
+        // verifier timeout failure or a transport error.
         let extras: &[(&'static str, &'static str)] = match command.runner() {
             "python3" => VERIFIER_ENV_PYTHON_EXTRA,
             _ => &[],
@@ -1871,14 +1887,21 @@ fn apply_structured_python_dependency_site_pythonpath(
     work_root: &Path,
     dependency_site: &Path,
 ) -> Result<(), String> {
-    let pythonpath = std::env::join_paths([work_root, dependency_site]).map_err(|err| {
+    let pythonpath = structured_python_dependency_site_pythonpath(work_root, dependency_site)?;
+    command.env("PYTHONPATH", pythonpath);
+    Ok(())
+}
+
+fn structured_python_dependency_site_pythonpath(
+    work_root: &Path,
+    dependency_site: &Path,
+) -> Result<OsString, String> {
+    std::env::join_paths([work_root, dependency_site]).map_err(|err| {
         format!(
             "failed to build structured Python verifier PYTHONPATH for {}: {err}",
             dependency_site.display()
         )
-    })?;
-    command.env("PYTHONPATH", pythonpath);
-    Ok(())
+    })
 }
 
 /// Issue #651 Task 2.3: upper bound on a structured verifier process.
@@ -4616,6 +4639,24 @@ dev = [
 
     #[cfg(unix)]
     #[test]
+    fn legacy_shell_auto_test_is_bounded_by_timeout() {
+        let dir = tempdir().expect("tempdir");
+        let plan = AutoTestPlan {
+            command: "sleep 60".to_string(),
+            reason: "timeout regression".to_string(),
+        };
+
+        let result = AutoTestRunner::run_with_timeout(dir.path(), &plan, Duration::from_millis(50));
+
+        let err = result.expect_err("legacy shell verifier must be bounded");
+        assert!(
+            err.contains("auto test command timed out after"),
+            "expected timeout error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_structured_kills_child_on_timeout() {
         // Spawn /bin/sleep 60 and force a 50ms timeout to exercise the
         // kill path. We cannot easily build a VerifierCommand for sleep
@@ -5348,6 +5389,31 @@ dev = [
         assert!(
             summary.pythonpath_root,
             "Python verifier extras must pin PYTHONPATH to work_root even when parent PYTHONPATH is absent"
+        );
+    }
+
+    #[test]
+    fn structured_python_dependency_site_is_controller_state_and_second_on_pythonpath() {
+        let work = tempdir().expect("work");
+        let dependency_site = structured_python_dependency_site_dir(work.path());
+        let relative_site = dependency_site
+            .strip_prefix(work.path())
+            .expect("site under work root");
+        assert!(
+            crate::util::workspace_paths::is_ignored_workspace_relative_path(relative_site),
+            "structured dependency site must remain controller-owned ignored state"
+        );
+
+        let pythonpath =
+            structured_python_dependency_site_pythonpath(work.path(), &dependency_site)
+                .expect("pythonpath");
+        let entries: Vec<PathBuf> = std::env::split_paths(&pythonpath).collect();
+        assert_eq!(entries.first().map(PathBuf::as_path), Some(work.path()));
+        assert_eq!(entries.get(1), Some(&dependency_site));
+        assert_eq!(
+            entries.len(),
+            2,
+            "user workspace must be searched before verifier dependency site, with no extra parent PYTHONPATH"
         );
     }
 

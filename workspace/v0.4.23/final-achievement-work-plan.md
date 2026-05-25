@@ -39,6 +39,21 @@ Empirical smoke baseline:
 - Python data script: safe stop `patch_rejected_repeatedly`.
 - Node utility: safe stop `patch_rejected_repeatedly`.
 
+Follow-up implementation status:
+
+- Phase 1 has a narrow invariant in place: `.anvil-state/verifier-python/site`
+  is controller-owned ignored state, and structured Python verifier `PYTHONPATH`
+  is limited to workspace root first, dependency site second.
+- Phase 2 has a partial fix: verifier timeout from `AutoTestRunner` is now
+  classified as verifier failure evidence and routed through verifier repair
+  instead of surfacing as raw `transport_error`.
+- The legacy shell verifier runner is now bounded by the same timeout helper as
+  the structured verifier runner, so both verifier paths produce bounded timeout
+  evidence.
+- Phase 3 uses the existing `RepairJob` repeated rejection / re-diagnostic /
+  safe-stop path for timeout evidence. No separate patch-convergence state
+  machine was added in this slice.
+
 ## Remaining Root Problems
 
 1. Verifier environment isolation is incomplete.
@@ -89,6 +104,19 @@ Acceptance:
 - Regression tests fail if `.anvil-state` re-enters artifact or verifier
   target selection.
 
+Implemented slice:
+
+- Added a regression test that treats `.anvil-state/verifier-python/site` as
+  ignored controller state.
+- Added a regression test for structured Python verifier `PYTHONPATH` ordering:
+  workspace root first, dependency site second, no inherited parent extras.
+
+Not implemented yet:
+
+- A full traceback-level assertion that verifier helper dependencies are never
+  selected as application artifacts.
+- A full project-unit verifier environment model.
+
 ## Phase 2: Project-Unit Verifier Selection
 
 Goal: choose and run a verifier as a bounded project-unit operation, not as a
@@ -119,6 +147,21 @@ Acceptance:
 - Timeout outcomes are classified and actionable.
 - Verifier command selection is described by project facts, not framework
   literals.
+
+Implemented slice:
+
+- Timeout errors containing `auto test command timed out after` are converted
+  into verifier failure evidence.
+- Non-timeout execution errors still remain transport errors.
+- Both structured and legacy shell verifier execution paths now share bounded
+  timeout behavior.
+
+Not implemented yet:
+
+- `ProjectUnit` itself.
+- Timeout subtype classification beyond the first actionable verifier-timeout
+  bucket.
+- Rust CLI smoke re-run for empirical confirmation.
 
 ## Phase 3: Repair Patch Convergence
 
@@ -245,4 +288,3 @@ Final quality bar:
    Deleting old paths before parity evidence risks losing fallback diagnostics.
 
 6. Run Phase 6 full gate and commit.
-
