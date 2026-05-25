@@ -10651,11 +10651,26 @@ impl Agent {
         let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
             self.task_contract_verifier_test_binding();
         if test_execution_required && let Some(workspace_scope) = workspace_scope_opt.as_ref() {
-            let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            let project_unit = super::project_probe::probe_project_unit(
+                &self.work_root,
+                workspace_scope,
+                &self.turn_edited_relative_paths,
+            );
+            if let Some(project_unit) = project_unit.as_ref() {
+                log_llm_event(
+                    "agent.project_unit.verifier_selection",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "summary": project_unit.summary(),
+                    }),
+                );
+            }
+            let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
                 &self.work_root,
                 changed_files,
                 &recent_successful_bash_commands,
                 &owned_test_artifacts,
+                project_unit.as_ref(),
             );
             match owned_plan {
                 super::auto_test::OwnedTestVerifierPlan::Runnable { plan, command } => {

@@ -8,6 +8,7 @@ use crate::agent::prompting::load_project_instructions;
 use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
 
+use super::project_probe::ProjectUnit;
 use super::task_workspace_scope::TaskWorkspaceScope;
 
 /// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
@@ -75,7 +76,7 @@ pub(super) enum VerifierCandidateSource {
 }
 
 impl VerifierCandidateSource {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::ProjectInstruction => "project_instruction",
             Self::RecentSuccessfulBash => "recent_successful_bash",
@@ -1485,6 +1486,20 @@ impl AutoTestRunner {
         selected
     }
 
+    pub(super) fn detect_candidate_with_project_unit(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        project_unit: Option<&ProjectUnit>,
+    ) -> Option<VerifierCandidate> {
+        let candidates =
+            detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands);
+        let candidates = filter_candidates_for_project_unit(candidates, project_unit);
+        let selected = select_verifier_candidate(candidates.clone());
+        emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
+        selected
+    }
+
     #[cfg(test)]
     pub(super) fn detect_candidates(
         work_root: &Path,
@@ -1527,6 +1542,22 @@ impl AutoTestRunner {
         recent_successful_bash_commands: &[String],
         owned_test_artifacts: &[String],
     ) -> OwnedTestVerifierPlan {
+        Self::detect_with_owned_test_artifacts_and_project_unit(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+            owned_test_artifacts,
+            None,
+        )
+    }
+
+    pub(super) fn detect_with_owned_test_artifacts_and_project_unit(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        owned_test_artifacts: &[String],
+        project_unit: Option<&ProjectUnit>,
+    ) -> OwnedTestVerifierPlan {
         // CB-001 (high): Without any owned test artifact, there is
         // nothing for the verifier to bind to. Issue #651 design treats
         // this as `Missing` rather than `Weak` — the semantic problem is
@@ -1536,10 +1567,11 @@ impl AutoTestRunner {
         if owned_test_artifacts.is_empty() {
             return OwnedTestVerifierPlan::Missing;
         }
-        let Some(candidate) = Self::detect_candidate_with_recent_successes(
+        let Some(candidate) = Self::detect_candidate_with_project_unit(
             work_root,
             changed_files,
             recent_successful_bash_commands,
+            project_unit,
         ) else {
             return OwnedTestVerifierPlan::Missing;
         };
@@ -2243,6 +2275,22 @@ fn select_verifier_candidate(candidates: Vec<VerifierCandidate>) -> Option<Verif
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| source_priority(a.source).cmp(&source_priority(b.source)))
     })
+}
+
+fn filter_candidates_for_project_unit(
+    candidates: Vec<VerifierCandidate>,
+    project_unit: Option<&ProjectUnit>,
+) -> Vec<VerifierCandidate> {
+    let Some(project_unit) = project_unit else {
+        return candidates;
+    };
+    if project_unit.verifier_candidates.is_empty() {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| project_unit.allows_verifier_source(candidate.source.as_str()))
+        .collect()
 }
 
 fn emit_verifier_candidate_telemetry(
@@ -4438,6 +4486,63 @@ dev = [
                 );
             }
             other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_unit_filters_owned_verifier_to_current_task_stack() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='outer'\nversion='0.0.0'\n",
+        )
+        .expect("cargo manifest");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+
+        let owned = vec!["tests/test_main.py".to_string()];
+        let unfiltered = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["app/main.py".to_string(), "tests/test_main.py".to_string()],
+            &[],
+            &owned,
+        );
+        match unfiltered {
+            OwnedTestVerifierPlan::Weak {
+                detected_source, ..
+            } => {
+                assert_eq!(detected_source, "cargo_manifest");
+            }
+            other => panic!("expected unfiltered cargo weak verifier, got {other:?}"),
+        }
+
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: vec![super::super::project_probe::ProjectUnitVerifierCandidate {
+                command_preview: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+                source: "python_tests",
+                timeout_class: super::super::project_probe::ProjectUnitTimeoutClass::ShortUnitTest,
+            }],
+            observed_stacks: vec!["python"],
+        };
+
+        let filtered = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["app/main.py".to_string(), "tests/test_main.py".to_string()],
+            &[],
+            &owned,
+            Some(&project_unit),
+        );
+        match filtered {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected project-unit filtered python verifier, got {other:?}"),
         }
     }
 

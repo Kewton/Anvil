@@ -100,6 +100,12 @@ impl ProjectUnit {
             verifiers
         )
     }
+
+    pub(super) fn allows_verifier_source(&self, source: &str) -> bool {
+        self.verifier_candidates
+            .iter()
+            .any(|candidate| candidate.source == source)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -159,6 +165,22 @@ pub(super) fn probe_completion(
         ),
         project_unit,
     }
+}
+
+pub(super) fn probe_project_unit(
+    work_root: &Path,
+    scope: &TaskWorkspaceScope,
+    edited_files: &HashSet<String>,
+) -> Option<ProjectUnit> {
+    let facts = WorkspaceFacts {
+        files: collect_scoped_files(work_root, scope),
+        edited_files: edited_files.clone(),
+        observed_stacks: observed_stacks(work_root, edited_files),
+    };
+    if facts.files.is_empty() {
+        return None;
+    }
+    build_project_unit(work_root, &facts)
 }
 
 fn collect_scoped_files(work_root: &Path, scope: &TaskWorkspaceScope) -> Vec<String> {

@@ -284,3 +284,43 @@ This pass implements the next planning slice from
 selection. It is now observable and tested at the completion-probe boundary,
 which is the next safe step toward moving verifier command selection behind the
 same model.
+
+## 2026-05-26 Follow-Up Execution: ProjectUnit-Aware Selection
+
+This pass connects the minimal `ProjectUnit` model to task-contract verifier
+selection without adding a new dispatch source.
+
+### Implemented
+
+- Added `project_probe::probe_project_unit()` so verifier execution can rebuild
+  the current task unit from scoped, edited workspace facts.
+- Added `ProjectUnit::allows_verifier_source()` and an
+  `AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit()` entry
+  point.
+- Task-contract verifier execution now filters AutoTest candidates to verifier
+  sources admitted by the current `ProjectUnit` when one is available.
+- Added a regression test for a mixed workspace where root `Cargo.toml` exists
+  but the current owned test artifact is Python. The filtered path selects the
+  Python structured verifier instead of the unrelated Cargo candidate.
+
+### Remaining Gap
+
+`ProjectUnit` is still an optional verifier-selection filter. The next broader
+slice is to make verifier discovery itself produce project units directly and
+remove duplicated source-specific ranking outside that model.
+
+### Verification
+
+- `cargo fmt --check`: pass
+- `cargo test project_unit --lib`: pass, 4 tests
+- `cargo test project_probe --lib`: pass, 8 tests
+- `cargo test auto_test --lib`: pass, 149 tests
+- `cargo test task_contract --lib`: pass, 80 tests
+  - Sandboxed run hit the known mockito local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo test --lib`: pass, 2934 tests
+  - Sandboxed run hit the same local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `git diff --check`: pass

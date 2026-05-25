@@ -38,8 +38,8 @@ Already covered:
 
 Remaining gaps:
 
-- `ProjectUnit` is still only wired into completion probing/logging. Verifier
-  command selection itself is not fully driven by `ProjectUnit` yet.
+- `ProjectUnit` now filters task-contract verifier selection when available,
+  but broader verifier discovery still needs to move behind the same model.
 - Timeout evidence is classified, but the classification is not yet attached to
   `FailurePacket` / `RepairJob` as a typed field.
 - Repair patch convergence still depends on several old helper paths.
@@ -83,10 +83,16 @@ Implemented slice:
 - Completion probe logs include a bounded project-unit summary.
 - Unit tests cover Rust, Node, explicit multi-directory Python, ignored
   `.anvil-state` inputs, and stable timeout-class labels.
+- Task-contract verifier selection now passes the current `ProjectUnit` into
+  `AutoTestRunner`, and candidate selection is filtered to verifier sources
+  admitted by that project unit.
+- Unit coverage verifies that a parent/root Cargo manifest cannot steal
+  verifier selection from a current Python task unit.
 
 Not implemented yet:
 
-- Move `AutoTestRunner` verifier selection behind `ProjectUnit`.
+- Make `ProjectUnit` the only verifier discovery model rather than an optional
+  task-contract filter.
 - Add docs-only/no-code project-unit behavior.
 - Add confidence scoring beyond candidate source and evidence summary.
 
