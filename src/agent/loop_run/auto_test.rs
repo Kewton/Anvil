@@ -87,6 +87,15 @@ impl VerifierCandidateSource {
             Self::PythonCompileFallback => "python_compile_fallback",
         }
     }
+
+    fn from_project_unit_source(source: &str) -> Option<Self> {
+        match source {
+            "cargo_manifest" => Some(Self::CargoManifest),
+            "package_json_scripts" => Some(Self::PackageJsonScripts),
+            "python_tests" => Some(Self::PythonTests),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1492,9 +1501,11 @@ impl AutoTestRunner {
         recent_successful_bash_commands: &[String],
         project_unit: Option<&ProjectUnit>,
     ) -> Option<VerifierCandidate> {
-        let candidates =
-            detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands);
-        let candidates = filter_candidates_for_project_unit(candidates, project_unit);
+        let candidates = if let Some(project_unit) = project_unit {
+            verifier_candidates_from_project_unit(project_unit)
+        } else {
+            detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands)
+        };
         let selected = select_verifier_candidate(candidates.clone());
         emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
         selected
@@ -2277,19 +2288,29 @@ fn select_verifier_candidate(candidates: Vec<VerifierCandidate>) -> Option<Verif
     })
 }
 
-fn filter_candidates_for_project_unit(
-    candidates: Vec<VerifierCandidate>,
-    project_unit: Option<&ProjectUnit>,
-) -> Vec<VerifierCandidate> {
-    let Some(project_unit) = project_unit else {
-        return candidates;
-    };
-    if project_unit.verifier_candidates.is_empty() {
-        return candidates;
-    }
-    candidates
-        .into_iter()
-        .filter(|candidate| project_unit.allows_verifier_source(candidate.source.as_str()))
+fn verifier_candidates_from_project_unit(project_unit: &ProjectUnit) -> Vec<VerifierCandidate> {
+    project_unit
+        .verifier_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let source = VerifierCandidateSource::from_project_unit_source(candidate.source)?;
+            Some(VerifierCandidate {
+                plan: AutoTestPlan {
+                    command: candidate.command_preview.clone(),
+                    reason: format!(
+                        "ProjectUnit verifier candidate selected from {}",
+                        candidate.source
+                    ),
+                },
+                source,
+                confidence: 0.9,
+                evidence: vec![
+                    format!("project-unit-root:{}", project_unit.root),
+                    format!("project-unit-source:{}", candidate.source),
+                    format!("project-unit-timeout:{}", candidate.timeout_class.as_str()),
+                ],
+            })
+        })
         .collect()
 }
 
@@ -4544,6 +4565,34 @@ dev = [
             }
             other => panic!("expected project-unit filtered python verifier, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_unit_without_verifier_candidates_does_not_fall_back_to_root_guess() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='outer'\nversion='0.0.0'\n",
+        )
+        .expect("cargo manifest");
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::UsageDocs);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: Vec::new(),
+            observed_stacks: Vec::new(),
+        };
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["README.md".to_string()],
+            &[],
+            &["tests/test_main.py".to_string()],
+            Some(&project_unit),
+        );
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
     }
 
     #[test]

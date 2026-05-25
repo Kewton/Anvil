@@ -27,11 +27,47 @@ pub(super) struct FailurePacket {
     pub(super) verifier_command: String,
     pub(super) failure_signature: String,
     pub(super) failure_kind: String,
+    pub(super) timeout_kind: Option<FailurePacketTimeoutKind>,
     pub(super) bounded_output_excerpt: String,
     pub(super) affected_cases: Vec<String>,
     pub(super) observed_expected_pairs: Vec<ObservedExpectedPair>,
     pub(super) candidate_artifacts: Vec<CandidateArtifact>,
     pub(super) prior_attempts: Vec<PriorRepairAttempt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailurePacketTimeoutKind {
+    LongRunningVerifier,
+    GeneratedTestHang,
+    DependencySetupTimeout,
+    EnvironmentStall,
+    BuildCommand,
+    Unknown,
+}
+
+impl FailurePacketTimeoutKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::LongRunningVerifier => "long_running_verifier",
+            Self::GeneratedTestHang => "generated_test_hang",
+            Self::DependencySetupTimeout => "dependency_setup_timeout",
+            Self::EnvironmentStall => "environment_stall_timeout",
+            Self::BuildCommand => "build_command_timeout",
+            Self::Unknown => "unknown_timeout",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "long_running_verifier" => Some(Self::LongRunningVerifier),
+            "generated_test_hang" => Some(Self::GeneratedTestHang),
+            "dependency_setup_timeout" => Some(Self::DependencySetupTimeout),
+            "environment_stall_timeout" => Some(Self::EnvironmentStall),
+            "build_command_timeout" => Some(Self::BuildCommand),
+            "unknown_timeout" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +147,7 @@ impl FailurePacket {
     ) -> Self {
         let bounded_output_excerpt =
             sanitize_repair_job_text_with_char_cap(verifier_output, MAX_OUTPUT_EXCERPT_CHARS);
+        let timeout_kind = extract_timeout_kind(&bounded_output_excerpt);
         let failure_kind = sanitize_short(failure_kind);
         let affected_cases = affected_cases
             .into_iter()
@@ -149,6 +186,7 @@ impl FailurePacket {
             ),
             failure_signature,
             failure_kind,
+            timeout_kind,
             bounded_output_excerpt,
             affected_cases,
             observed_expected_pairs,
@@ -175,6 +213,7 @@ impl FailurePacket {
             "verifier_command": &self.verifier_command,
             "failure_signature": &self.failure_signature,
             "failure_kind": &self.failure_kind,
+            "timeout_kind": self.timeout_kind.map(FailurePacketTimeoutKind::as_str),
             "bounded_output_excerpt": &self.bounded_output_excerpt,
             "affected_cases": &self.affected_cases,
             "observed_expected_pairs": self.observed_expected_pairs.iter().map(|pair| {
@@ -294,6 +333,18 @@ fn build_failure_signature(
 fn dedup_candidate_artifacts(candidates: &mut Vec<CandidateArtifact>) {
     let mut seen = std::collections::HashSet::new();
     candidates.retain(|candidate| seen.insert(candidate.path.clone()));
+}
+
+fn extract_timeout_kind(output: &str) -> Option<FailurePacketTimeoutKind> {
+    output
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("timeout_kind="))
+        .and_then(|label| {
+            let label = label.trim_matches(|ch: char| {
+                matches!(ch, ',' | ';' | '.' | ')' | ']' | '}' | '"' | '\'')
+            });
+            FailurePacketTimeoutKind::from_label(label)
+        })
 }
 
 fn extract_affected_cases(output: &str) -> Vec<String> {
@@ -481,7 +532,31 @@ assertion `left == right` failed
         assert!(packet.affected_cases.is_empty());
         assert!(packet.observed_expected_pairs.is_empty());
         assert!(!packet.bounded_output_excerpt.is_empty());
+        assert_eq!(packet.timeout_kind, None);
     }
+
+    #[test]
+    fn failure_packet_extracts_typed_timeout_kind() {
+        let packet = FailurePacket::new(
+            "python3 -B -m pytest",
+            "timeout",
+            "Verifier execution timed out. timeout_kind=generated_test_hang command=python3",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            packet.timeout_kind,
+            Some(FailurePacketTimeoutKind::GeneratedTestHang)
+        );
+        assert_eq!(
+            packet.to_json_value()["timeout_kind"],
+            serde_json::json!("generated_test_hang")
+        );
+    }
+
     #[test]
     fn failure_packet_masks_and_bounds_untrusted_text() {
         let packet = FailurePacket::new(

@@ -38,10 +38,11 @@ Already covered:
 
 Remaining gaps:
 
-- `ProjectUnit` now filters task-contract verifier selection when available,
-  but broader verifier discovery still needs to move behind the same model.
-- Timeout evidence is classified, but the classification is not yet attached to
-  `FailurePacket` / `RepairJob` as a typed field.
+- `ProjectUnit` now drives task-contract verifier selection when available,
+  but broader non-task-contract verifier discovery still needs to move behind
+  the same model.
+- Timeout evidence is now attached to `FailurePacket` as typed evidence, but
+  `RepairJob::next_action()` does not yet branch directly on that typed field.
 - Repair patch convergence still depends on several old helper paths.
 - Legacy deterministic repair is not fully deleted or telemetry-only.
 - Generality across non-FastAPI tasks is not proven by a stable smoke gate.
@@ -84,15 +85,18 @@ Implemented slice:
 - Unit tests cover Rust, Node, explicit multi-directory Python, ignored
   `.anvil-state` inputs, and stable timeout-class labels.
 - Task-contract verifier selection now passes the current `ProjectUnit` into
-  `AutoTestRunner`, and candidate selection is filtered to verifier sources
-  admitted by that project unit.
+  `AutoTestRunner`, and candidate selection is built from verifier sources
+  admitted by that project unit instead of falling back to root-level stack
+  guesses.
 - Unit coverage verifies that a parent/root Cargo manifest cannot steal
   verifier selection from a current Python task unit.
+- Unit coverage verifies that a `ProjectUnit` with no verifier candidates does
+  not fall back to unrelated root-level verifier guesses.
 
 Not implemented yet:
 
-- Make `ProjectUnit` the only verifier discovery model rather than an optional
-  task-contract filter.
+- Make `ProjectUnit` the only verifier discovery model for every verifier
+  entrypoint, not only task-contract verifier execution.
 - Add docs-only/no-code project-unit behavior.
 - Add confidence scoring beyond candidate source and evidence summary.
 
@@ -129,10 +133,13 @@ Implemented slice:
   a next-action hint.
 - Structured Python dependency setup timeout is wrapped with dependency setup
   context before classification.
+- `FailurePacket` now extracts `timeout_kind` into a typed
+  `FailurePacketTimeoutKind` field and serializes it as structured diagnostic
+  input.
 
 Not implemented yet:
 
-- Attach timeout kind as a typed field on `FailurePacket` / `RepairJob`.
+- Route `RepairJob::next_action()` directly from the typed timeout evidence.
 - Re-run Rust CLI smoke to confirm timeout no longer exits as raw
   `transport_error`.
 

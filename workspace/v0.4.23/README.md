@@ -324,3 +324,76 @@ remove duplicated source-specific ranking outside that model.
 - `cargo clippy --all-targets -- -D warnings`: pass
 - `cargo build --release`: pass
 - `git diff --check`: pass
+
+## 2026-05-26 Follow-Up Execution: ProjectUnit Authority And Typed Timeout Evidence
+
+This pass tightens the previous ProjectUnit-aware verifier selection and adds
+typed timeout evidence to the diagnostic packet.
+
+### Implemented
+
+- When task-contract verifier execution has a `ProjectUnit`, AutoTest selection
+  is now built from that unit's verifier candidates instead of first running
+  root-level stack detection and filtering afterward.
+- A `ProjectUnit` with no verifier candidates now yields verifier missing for
+  that task path instead of falling back to an unrelated root-level verifier.
+- `FailurePacket` now carries `timeout_kind` as a typed
+  `FailurePacketTimeoutKind` field and includes it in the diagnostic JSON.
+
+### Remaining Gap
+
+`RepairJob::next_action()` still does not branch directly on typed timeout
+evidence. The next slice should move timeout routing from string evidence into
+the repair-state transition layer.
+
+### Verification
+
+- `cargo test project_unit --lib`: pass, 5 tests
+- `cargo test failure_packet --lib`: pass, 5 tests
+- `cargo fmt --check`: pass
+- `cargo test auto_test --lib`: pass, 150 tests
+- `cargo test repair_job --lib`: pass, 133 tests
+- `cargo test task_contract --lib`: pass, 80 tests
+  - Sandboxed run hit the known mockito local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo test --lib`: pass, 2936 tests
+  - Sandboxed run hit the same local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `git diff --check`: pass
+
+### Genericity Evaluation: 20 Case Smoke
+
+Run root:
+`/Users/maenokota/share/work/localwork/anvilv0.4/anvilwork/generic-eval-20260526-004603`
+
+Command:
+`anvildev -m qwen3.6:27b-coding-nvfp4 --sidecar-model qwen3.5:9b -y --fresh-session --no-footer --deterministic-fallback full --max-iterations 50`
+
+Summary:
+
+- Total: 20
+- Done: 5
+- Actionable safe stop / verifier safe stop: 9
+- Failure without safe stop: 2
+- External harness timeout at 420s: 4
+
+Successful cases:
+
+- FastAPI CRUD
+- FastAPI ToDo backend
+- Python sales CSV analysis
+- Rust stack library
+- Rust line filter CLI
+
+Observed remaining failure modes:
+
+- Verifier repair often reaches a safe stop after repeated rejected patches.
+  This is safer than forcing a weak patch, but it is not completion.
+- Some non-FastAPI Python and Node cases exceed the 420s external harness
+  timeout, which means repair convergence remains too slow or cyclic.
+- A small number of cases still fail before editing all required artifact roles,
+  especially when the model creates only setup or implementation artifacts.
+- The repaired flow is no longer limited to FastAPI, but generic completion is
+  not yet stable enough to call the original goal fully achieved.

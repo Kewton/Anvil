@@ -100,12 +100,6 @@ impl ProjectUnit {
             verifiers
         )
     }
-
-    pub(super) fn allows_verifier_source(&self, source: &str) -> bool {
-        self.verifier_candidates
-            .iter()
-            .any(|candidate| candidate.source == source)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
