@@ -29,12 +29,19 @@ Already covered:
   transport error.
 - `.anvil-state/verifier-python/site` is asserted as controller-owned ignored
   state and no longer inherits arbitrary parent `PYTHONPATH` entries.
+- `project_probe` now produces a minimal `ProjectUnit` fact object for
+  completion probing. It records root, manifest evidence, current artifact
+  roles, verifier candidates, observed stacks, and verifier timeout class.
+- Verifier timeout evidence now carries a bounded `timeout_kind` bucket:
+  generated test hang, dependency setup timeout, environment stall timeout,
+  build command timeout, long-running verifier, or unknown timeout.
 
 Remaining gaps:
 
-- Project/verifier selection is still not modeled as a first-class project
-  unit.
-- Timeout evidence has only a broad verifier-timeout bucket.
+- `ProjectUnit` is still only wired into completion probing/logging. Verifier
+  command selection itself is not fully driven by `ProjectUnit` yet.
+- Timeout evidence is classified, but the classification is not yet attached to
+  `FailurePacket` / `RepairJob` as a typed field.
 - Repair patch convergence still depends on several old helper paths.
 - Legacy deterministic repair is not fully deleted or telemetry-only.
 - Generality across non-FastAPI tasks is not proven by a stable smoke gate.
@@ -67,6 +74,22 @@ Acceptance:
 - Verifier selection logs explain the selected project unit and candidate
   evidence.
 
+Implemented slice:
+
+- Added `ProjectUnit`, `ProjectUnitVerifierCandidate`, and
+  `ProjectUnitTimeoutClass` in `project_probe`.
+- `CompletionProbeDecision::RunVerifier` now carries the selected
+  `ProjectUnit`.
+- Completion probe logs include a bounded project-unit summary.
+- Unit tests cover Rust, Node, explicit multi-directory Python, ignored
+  `.anvil-state` inputs, and stable timeout-class labels.
+
+Not implemented yet:
+
+- Move `AutoTestRunner` verifier selection behind `ProjectUnit`.
+- Add docs-only/no-code project-unit behavior.
+- Add confidence scoring beyond candidate source and evidence summary.
+
 ## Phase 2: Timeout Classification
 
 Goal: route timeout failures to the right controlled outcome.
@@ -92,6 +115,20 @@ Acceptance:
   user-action hint.
 - No timeout path re-enters generic repo-change recovery while a repair job is
   active.
+
+Implemented slice:
+
+- Added `VerifierTimeoutKind` in `turn.rs`.
+- Timeout verifier evidence now includes `timeout_kind`, redacted command, and
+  a next-action hint.
+- Structured Python dependency setup timeout is wrapped with dependency setup
+  context before classification.
+
+Not implemented yet:
+
+- Attach timeout kind as a typed field on `FailurePacket` / `RepairJob`.
+- Re-run Rust CLI smoke to confirm timeout no longer exits as raw
+  `transport_error`.
 
 ## Phase 3: Repair Patch Convergence
 

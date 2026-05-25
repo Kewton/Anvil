@@ -2551,28 +2551,113 @@ enum TaskContractVerifierOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifierTimeoutKind {
+    LongRunningVerifier,
+    GeneratedTestHang,
+    DependencySetupTimeout,
+    EnvironmentStall,
+    BuildCommand,
+    Unknown,
+}
+
+impl VerifierTimeoutKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LongRunningVerifier => "long_running_verifier",
+            Self::GeneratedTestHang => "generated_test_hang",
+            Self::DependencySetupTimeout => "dependency_setup_timeout",
+            Self::EnvironmentStall => "environment_stall_timeout",
+            Self::BuildCommand => "build_command_timeout",
+            Self::Unknown => "unknown_timeout",
+        }
+    }
+
+    fn repair_hint(self) -> &'static str {
+        match self {
+            Self::LongRunningVerifier => {
+                "inspect the verifier command and reduce it to a bounded project-unit check"
+            }
+            Self::GeneratedTestHang => {
+                "inspect generated tests and implementation loops before retrying the verifier"
+            }
+            Self::DependencySetupTimeout => {
+                "repair dependency setup or safe stop if package installation cannot complete"
+            }
+            Self::EnvironmentStall => {
+                "safe stop if the verifier environment cannot produce bounded evidence"
+            }
+            Self::BuildCommand => {
+                "switch to a bounded test command or repair the build configuration"
+            }
+            Self::Unknown => "re-diagnose with timeout evidence before choosing a repair target",
+        }
+    }
+}
+
 fn task_contract_verifier_transport_error_to_outcome(
     command: String,
     error: String,
 ) -> TaskContractVerifierOutcome {
-    if let Some(output) = verifier_timeout_failure_output(&error) {
+    if let Some(output) = verifier_timeout_failure_output(&command, &error) {
         TaskContractVerifierOutcome::Failed { command, output }
     } else {
         TaskContractVerifierOutcome::TransportError { error }
     }
 }
 
-fn verifier_timeout_failure_output(error: &str) -> Option<String> {
-    if !error.contains("auto test command timed out after") {
-        return None;
-    }
-    let masked = crate::session::feedback::mask_secrets(error);
+fn verifier_timeout_failure_output(command: &str, error: &str) -> Option<String> {
+    let kind = classify_verifier_timeout(command, error)?;
+    let masked_command = crate::session::feedback::redact_verifier_command_for_storage(command);
+    let masked_error = crate::session::feedback::mask_secrets(error);
     Some(format!(
         "Verifier execution timed out before producing a pass/fail result. \
 This is a bounded verifier timeout, not an LLM transport failure. \
-Treat it as verifier evidence: repair the verifier command, reduce the test scope, \
-or safe stop if the command cannot be made bounded.\n{masked}"
+timeout_kind={} command={} next_action_hint={}\n{}",
+        kind.as_str(),
+        masked_command,
+        kind.repair_hint(),
+        masked_error
     ))
+}
+
+fn classify_verifier_timeout(command: &str, error: &str) -> Option<VerifierTimeoutKind> {
+    if !error.contains("auto test command timed out after") {
+        return None;
+    }
+    let lower_command = command.to_ascii_lowercase();
+    let lower_error = error.to_ascii_lowercase();
+    if lower_error.contains("dependency setup") || lower_command.contains("pip install") {
+        return Some(VerifierTimeoutKind::DependencySetupTimeout);
+    }
+    if lower_error.contains("environment")
+        || lower_error.contains("external_pythonpath")
+        || lower_error.contains("stalled")
+    {
+        return Some(VerifierTimeoutKind::EnvironmentStall);
+    }
+    if lower_command.starts_with("cargo build")
+        || lower_command.starts_with("npm run build")
+        || lower_command.starts_with("pnpm build")
+        || lower_command.starts_with("yarn build")
+        || lower_command.starts_with("make build")
+        || lower_command.starts_with("cargo check")
+    {
+        return Some(VerifierTimeoutKind::BuildCommand);
+    }
+    if lower_command.contains("--test ")
+        || lower_command.contains(" tests/")
+        || lower_command.contains(" tests\\")
+        || lower_command.contains("-m pytest")
+        || lower_command.contains("npm test")
+        || lower_command.contains("node --test")
+    {
+        return Some(VerifierTimeoutKind::GeneratedTestHang);
+    }
+    if lower_command.contains("test") || lower_command.contains("pytest") {
+        return Some(VerifierTimeoutKind::LongRunningVerifier);
+    }
+    Some(VerifierTimeoutKind::Unknown)
 }
 
 enum TaskContractVerifierFlowOutcome {
@@ -16850,7 +16935,10 @@ impl Agent {
                 &self.turn_edited_relative_paths,
             );
             match probe {
-                super::project_probe::CompletionProbeDecision::RunVerifier { reason } => {
+                super::project_probe::CompletionProbeDecision::RunVerifier {
+                    reason,
+                    project_unit,
+                } => {
                     log_llm_event(
                         "agent.completion_probe.decision",
                         serde_json::json!({
@@ -16858,6 +16946,7 @@ impl Agent {
                             "turn_index": self.current_turn_index,
                             "decision": "run_verifier",
                             "reason": reason,
+                            "project_unit": project_unit.summary(),
                         }),
                     );
                     return super::task_contract::ArtifactRecoveryAction::RunVerifier;
@@ -18662,15 +18751,16 @@ fn build_task_contract_verifier_exit_zero_evidence_bound(
 mod tests {
     use super::ExitReason;
     use super::{
-        PlanExplorationKey, TaskContractVerifierOutcome, answer_only_reply_is_inadequate,
-        answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
-        assistant_model_for_mode, build_task_contract_verifier_exit_zero_evidence,
+        PlanExplorationKey, TaskContractVerifierOutcome, VerifierTimeoutKind,
+        answer_only_reply_is_inadequate, answer_only_script_command_allowed,
+        answer_only_script_execution_fallback_response, assistant_model_for_mode,
+        build_task_contract_verifier_exit_zero_evidence,
         build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
-        deterministic_timeout_fallback_plan, effective_non_streaming_timeout_secs,
-        latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
-        normalize_exploration_path, normalize_plan_exploration_key,
-        request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
-        should_materialize_plan_after_timeout,
+        classify_verifier_timeout, deterministic_timeout_fallback_plan,
+        effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
+        non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
+        normalize_plan_exploration_key, request_explicitly_requests_script_execution,
+        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_verifier_safe_stop_mapping,
         task_contract_verifier_transport_error_to_outcome,
@@ -20022,10 +20112,38 @@ mod tests {
                 assert_eq!(command, "cargo test --test generated");
                 assert!(output.contains("Verifier execution timed out"));
                 assert!(output.contains("not an LLM transport failure"));
+                assert!(output.contains("timeout_kind=generated_test_hang"));
                 assert!(output.contains("300s"));
             }
             other => panic!("expected timeout to become verifier failure evidence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verifier_timeout_classifier_distinguishes_dependency_setup_and_build() {
+        assert_eq!(
+            classify_verifier_timeout(
+                "python3 -B -m pytest tests/test_main.py",
+                "structured Python dependency setup auto test command timed out after 300s",
+            ),
+            Some(VerifierTimeoutKind::DependencySetupTimeout)
+        );
+        assert_eq!(
+            classify_verifier_timeout("cargo build", "auto test command timed out after 300s"),
+            Some(VerifierTimeoutKind::BuildCommand)
+        );
+        assert_eq!(
+            classify_verifier_timeout("custom verify", "auto test command timed out after 300s"),
+            Some(VerifierTimeoutKind::Unknown)
+        );
+        assert_eq!(
+            VerifierTimeoutKind::EnvironmentStall.as_str(),
+            "environment_stall_timeout"
+        );
+        assert_eq!(
+            classify_verifier_timeout("cargo test", "failed to spawn verifier"),
+            None
+        );
     }
 
     #[test]

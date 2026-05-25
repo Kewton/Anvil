@@ -240,3 +240,47 @@ This does not yet implement a full `ProjectUnit` model. It closes the immediate
 timeout-routing bug and locks down the verifier dependency path invariant, but
 project-wide verifier selection still needs the broader Phase 2 work before the
 generality smoke set can be expected to stabilize.
+
+## 2026-05-26 Follow-Up Execution
+
+This pass implements the next planning slice from
+`remaining-completion-work-plan.md`.
+
+### Implemented
+
+- Added a minimal `ProjectUnit` fact model to `project_probe`.
+- `CompletionProbeDecision::RunVerifier` now carries:
+  - project root
+  - manifest evidence
+  - current artifact roles
+  - verifier candidates
+  - observed stacks
+  - verifier timeout class
+- Completion-probe logs now include a bounded project-unit summary.
+- Added `VerifierTimeoutKind` to classify bounded verifier timeout evidence:
+  - generated test hang
+  - dependency setup timeout
+  - environment stall timeout
+  - build command timeout
+  - long-running verifier
+  - unknown timeout
+
+### Verification
+
+- `cargo test project_probe --lib`: pass, 8 tests
+- `cargo test verifier_timeout --lib`: pass, 2 tests
+- `cargo test auto_test --lib`: pass, 148 tests
+- `cargo test task_contract --lib`: pass, 80 tests
+- `cargo test repair_job --lib`: pass, 133 tests
+- `cargo test loop_control_action_tests --lib`: pass, 17 tests
+- `cargo test --lib`: pass, 2933 tests
+- `cargo fmt --check`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+
+### Remaining Gap
+
+`ProjectUnit` is not yet the source of truth for `AutoTestRunner` verifier
+selection. It is now observable and tested at the completion-probe boundary,
+which is the next safe step toward moving verifier command selection behind the
+same model.

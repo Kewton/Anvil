@@ -1850,7 +1850,8 @@ fn run_structured_python_dependency_setup(
     let output = wait_with_auto_test_timeout(
         &mut setup_cmd,
         Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
-    )?;
+    )
+    .map_err(|err| format!("structured Python dependency setup {err}"))?;
     if output.status.success() {
         return Ok(None);
     }

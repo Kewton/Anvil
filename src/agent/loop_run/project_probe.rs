@@ -18,9 +18,88 @@ const MAX_PROBE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CompletionProbeDecision {
-    RunVerifier { reason: String },
-    RejectStackMismatch { reason: String },
+    RunVerifier {
+        reason: String,
+        project_unit: ProjectUnit,
+    },
+    RejectStackMismatch {
+        reason: String,
+    },
     KeepArtifactFlow,
+}
+
+#[allow(dead_code)]
+// ProjectUnit Phase 1 emits ShortUnitTest today; later verifier selection slices construct the remaining bounded classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectUnitTimeoutClass {
+    ShortUnitTest,
+    BuildCommand,
+    DependencySetup,
+    Unknown,
+}
+
+impl ProjectUnitTimeoutClass {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::ShortUnitTest => "short_unit_test",
+            Self::BuildCommand => "build_command",
+            Self::DependencySetup => "dependency_setup",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectUnitVerifierCandidate {
+    pub(super) command_preview: String,
+    pub(super) source: &'static str,
+    pub(super) timeout_class: ProjectUnitTimeoutClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectUnit {
+    pub(super) root: String,
+    pub(super) manifests: Vec<String>,
+    pub(super) artifact_roles: BTreeSet<ArtifactRole>,
+    pub(super) verifier_candidates: Vec<ProjectUnitVerifierCandidate>,
+    pub(super) observed_stacks: Vec<&'static str>,
+}
+
+impl ProjectUnit {
+    pub(super) fn summary(&self) -> String {
+        let roles = self
+            .artifact_roles
+            .iter()
+            .map(|role| role.label())
+            .collect::<Vec<_>>()
+            .join(",");
+        let manifests = if self.manifests.is_empty() {
+            "none".to_string()
+        } else {
+            self.manifests.join(",")
+        };
+        let verifiers = self
+            .verifier_candidates
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{}:{}:{}",
+                    candidate.source,
+                    candidate.timeout_class.as_str(),
+                    candidate.command_preview
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        format!(
+            "project_unit root={} stacks={} roles={} manifests={} verifiers={}",
+            self.root,
+            self.observed_stacks.join(","),
+            roles,
+            manifests,
+            verifiers
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,12 +144,20 @@ pub(super) fn probe_completion(
         }
     }
 
-    if !has_verifier_candidate(work_root, &facts) {
+    let Some(project_unit) = build_project_unit(work_root, &facts) else {
+        return CompletionProbeDecision::KeepArtifactFlow;
+    };
+
+    if project_unit.verifier_candidates.is_empty() {
         return CompletionProbeDecision::KeepArtifactFlow;
     }
 
     CompletionProbeDecision::RunVerifier {
-        reason: "current-turn implementation, test, docs/setup artifacts and a safe verifier candidate are present".to_string(),
+        reason: format!(
+            "current-turn implementation, test, docs/setup artifacts and a safe verifier candidate are present; {}",
+            project_unit.summary()
+        ),
+        project_unit,
     }
 }
 
@@ -172,12 +259,6 @@ fn is_usage_doc_path(path: &Path) -> bool {
         )
 }
 
-fn has_verifier_candidate(work_root: &Path, facts: &WorkspaceFacts) -> bool {
-    has_rust_verifier(work_root, facts)
-        || has_python_verifier(facts)
-        || has_node_verifier(work_root, facts)
-}
-
 fn has_rust_verifier(work_root: &Path, facts: &WorkspaceFacts) -> bool {
     work_root.join("Cargo.toml").is_file()
         && facts.files.iter().any(|path| {
@@ -203,6 +284,84 @@ fn has_node_verifier(work_root: &Path, facts: &WorkspaceFacts) -> bool {
                     Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
                 )
         })
+}
+
+fn build_project_unit(work_root: &Path, facts: &WorkspaceFacts) -> Option<ProjectUnit> {
+    let mut artifact_roles = BTreeSet::new();
+    for role in [
+        ArtifactRole::Implementation,
+        ArtifactRole::Test,
+        ArtifactRole::UsageDocs,
+        ArtifactRole::Setup,
+    ] {
+        if role_has_current_artifact(work_root, facts, role) {
+            artifact_roles.insert(role);
+        }
+    }
+    if artifact_roles.is_empty() {
+        return None;
+    }
+    Some(ProjectUnit {
+        root: ".".to_string(),
+        manifests: project_manifests(work_root, facts),
+        artifact_roles,
+        verifier_candidates: verifier_candidates(work_root, facts),
+        observed_stacks: facts
+            .observed_stacks
+            .iter()
+            .copied()
+            .filter(|stack| *stack != StackKind::Unknown)
+            .map(stack_label)
+            .collect(),
+    })
+}
+
+fn project_manifests(work_root: &Path, facts: &WorkspaceFacts) -> Vec<String> {
+    let known = [
+        "Cargo.toml",
+        "pyproject.toml",
+        "requirements.txt",
+        "package.json",
+        "tsconfig.json",
+        "go.mod",
+        "pom.xml",
+        "Gemfile",
+        "composer.json",
+    ];
+    known
+        .into_iter()
+        .filter(|path| work_root.join(path).is_file() || facts.files.iter().any(|p| p == path))
+        .map(str::to_string)
+        .collect()
+}
+
+fn verifier_candidates(
+    work_root: &Path,
+    facts: &WorkspaceFacts,
+) -> Vec<ProjectUnitVerifierCandidate> {
+    let mut out = Vec::new();
+    if has_rust_verifier(work_root, facts) {
+        out.push(ProjectUnitVerifierCandidate {
+            command_preview: "cargo test".to_string(),
+            source: "cargo_manifest",
+            timeout_class: ProjectUnitTimeoutClass::ShortUnitTest,
+        });
+    }
+    if has_python_verifier(facts) {
+        out.push(ProjectUnitVerifierCandidate {
+            command_preview: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+            source: "python_tests",
+            timeout_class: ProjectUnitTimeoutClass::ShortUnitTest,
+        });
+    }
+    if has_node_verifier(work_root, facts) {
+        out.push(ProjectUnitVerifierCandidate {
+            command_preview: "npm test".to_string(),
+            source: "package_json_scripts",
+            timeout_class: ProjectUnitTimeoutClass::ShortUnitTest,
+        });
+    }
+    out
 }
 
 fn package_json_has_test_script(work_root: &Path) -> bool {
@@ -287,6 +446,16 @@ fn observed_stacks(work_root: &Path, edited_files: &HashSet<String>) -> BTreeSet
     out
 }
 
+fn stack_label(stack: StackKind) -> &'static str {
+    match stack {
+        StackKind::Python => "python",
+        StackKind::Rust => "rust",
+        StackKind::Node => "node",
+        StackKind::TypeScript => "typescript",
+        StackKind::Unknown => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,10 +498,33 @@ mod tests {
             &scope(dir.path(), request),
             &edited(&["src/lib.rs", "tests/add.rs", "README.md"]),
         );
-        assert!(matches!(
-            decision,
-            CompletionProbeDecision::RunVerifier { .. }
-        ));
+        let CompletionProbeDecision::RunVerifier {
+            project_unit,
+            reason,
+        } = decision
+        else {
+            panic!("expected RunVerifier");
+        };
+        assert!(reason.contains("project_unit"));
+        assert_eq!(project_unit.root, ".");
+        assert_eq!(project_unit.manifests, vec!["Cargo.toml"]);
+        assert!(
+            project_unit
+                .artifact_roles
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(project_unit.artifact_roles.contains(&ArtifactRole::Test));
+        assert!(
+            project_unit
+                .artifact_roles
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert_eq!(project_unit.verifier_candidates.len(), 1);
+        assert_eq!(project_unit.verifier_candidates[0].source, "cargo_manifest");
+        assert_eq!(
+            project_unit.verifier_candidates[0].timeout_class,
+            ProjectUnitTimeoutClass::ShortUnitTest
+        );
     }
 
     #[test]
@@ -388,6 +580,58 @@ mod tests {
     }
 
     #[test]
+    fn multi_directory_python_project_unit_preserves_artifact_roles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("backend/app")).expect("app");
+        std::fs::create_dir_all(dir.path().join("backend/tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname='x'\nversion='0.0.0'\n",
+        )
+        .expect("pyproject");
+        std::fs::write(
+            dir.path().join("backend/app/main.py"),
+            "def run(): return 1",
+        )
+        .expect("impl");
+        std::fs::write(
+            dir.path().join("backend/tests/test_main.py"),
+            "def test_run(): pass",
+        )
+        .expect("test");
+        std::fs::write(dir.path().join("backend/README.md"), "pytest").expect("readme");
+
+        let request =
+            "backend ディレクトリで Python のツールを実装し、READMEとテストを書いてください";
+        let decision = probe_completion(
+            dir.path(),
+            request,
+            &contract(request),
+            &scope(dir.path(), request),
+            &edited(&[
+                "backend/app/main.py",
+                "backend/tests/test_main.py",
+                "backend/README.md",
+            ]),
+        );
+
+        let CompletionProbeDecision::RunVerifier { project_unit, .. } = decision else {
+            panic!("expected RunVerifier");
+        };
+        assert_eq!(project_unit.root, ".");
+        assert_eq!(project_unit.manifests, vec!["pyproject.toml"]);
+        assert!(project_unit.observed_stacks.contains(&"python"));
+        assert!(
+            project_unit
+                .artifact_roles
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(project_unit.artifact_roles.contains(&ArtifactRole::Test));
+        assert_eq!(project_unit.verifier_candidates.len(), 1);
+        assert_eq!(project_unit.verifier_candidates[0].source, "python_tests");
+    }
+
+    #[test]
     fn requested_stack_mismatch_is_rejected() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
@@ -430,5 +674,53 @@ mod tests {
             &edited(&["main.py", ".anvil-state/tests/test_main.py", "README.md"]),
         );
         assert_eq!(decision, CompletionProbeDecision::KeepArtifactFlow);
+    }
+
+    #[test]
+    fn controller_state_manifest_does_not_create_project_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".anvil-state/tests")).expect("ignored");
+        std::fs::write(
+            dir.path().join(".anvil-state/Cargo.toml"),
+            "[package]\nname='ignored'\nversion='0.0.0'\n",
+        )
+        .expect("ignored manifest");
+        std::fs::write(
+            dir.path().join(".anvil-state/tests/generated.rs"),
+            "#[test] fn generated(){}",
+        )
+        .expect("ignored test");
+        std::fs::write(dir.path().join("README.md"), "docs").expect("readme");
+
+        let request = "Rustで実装し、READMEとテストを書いてください";
+        let decision = probe_completion(
+            dir.path(),
+            request,
+            &contract(request),
+            &scope(dir.path(), request),
+            &edited(&[
+                ".anvil-state/Cargo.toml",
+                ".anvil-state/tests/generated.rs",
+                "README.md",
+            ]),
+        );
+        assert_eq!(decision, CompletionProbeDecision::KeepArtifactFlow);
+    }
+
+    #[test]
+    fn project_unit_timeout_class_labels_are_stable() {
+        assert_eq!(
+            ProjectUnitTimeoutClass::ShortUnitTest.as_str(),
+            "short_unit_test"
+        );
+        assert_eq!(
+            ProjectUnitTimeoutClass::BuildCommand.as_str(),
+            "build_command"
+        );
+        assert_eq!(
+            ProjectUnitTimeoutClass::DependencySetup.as_str(),
+            "dependency_setup"
+        );
+        assert_eq!(ProjectUnitTimeoutClass::Unknown.as_str(), "unknown");
     }
 }
