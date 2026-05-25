@@ -28,6 +28,7 @@ use super::{
     VerifierDiagnosticFailureKind, VerifierFailureType, VerifierRepairAssessment,
     VerifierRepairRerunOutcome,
 };
+#[cfg(test)]
 use crate::session::store::ConversationMessage;
 
 /// Maximum byte length retained for sanitized snapshot text fields. Consumed
@@ -264,9 +265,10 @@ pub(super) struct RepairJob {
     pub(super) rejected_attempts: Vec<RejectedAttempt>,
 }
 
-/// Controller-internal decision used by `run_turn` to pick the next action
-/// for a verifier-repair cycle. Variants and order match the legacy
-/// `VerifierRepairDecision` enum in `turn.rs`.
+/// Legacy verifier-repair projection retained for tests that pin the old
+/// migration behavior. Production dispatch must use [`RepairNextAction`]
+/// instead.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum VerifierRepairDecision {
     NoRepair,
@@ -312,9 +314,19 @@ pub(super) struct MissingVerifierJob {
     /// the job entered the `pending` state. Until then, the planner
     /// MUST suppress `RunVerifier` to avoid an infinite retry loop.
     pub(super) in_scope_edit_observed: bool,
+    /// Invalid setup turns (prose-only, no-tool, or policy-invalid tool calls)
+    /// observed while this job owns the verifier-bootstrap phase.
+    pub(super) setup_attempts_used: u8,
     /// Snapshot of `repo_edit_calls_made_this_turn` when the job entered
     /// `pending`. Retained for diagnostics / future log-event emission.
     pub(super) repo_edit_count_at_pending: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum VerifierBootstrapNextAction {
+    RequestSetupEdit,
+    RerunVerifier,
+    SafeStop { reason: &'static str },
 }
 
 impl MissingVerifierJob {
@@ -323,6 +335,7 @@ impl MissingVerifierJob {
             retry_budget,
             retries_used: 0,
             in_scope_edit_observed: false,
+            setup_attempts_used: 0,
             repo_edit_count_at_pending,
         }
     }
@@ -332,6 +345,18 @@ impl MissingVerifierJob {
     /// `MissingVerifierJob` was raised.
     pub(super) fn should_suppress_verifier_retry(&self) -> bool {
         !self.in_scope_edit_observed
+    }
+
+    pub(super) fn next_action(&self) -> VerifierBootstrapNextAction {
+        if self.retries_used >= self.retry_budget || self.setup_attempts_used >= self.retry_budget {
+            return VerifierBootstrapNextAction::SafeStop {
+                reason: "missing verifier retry budget exhausted",
+            };
+        }
+        if self.in_scope_edit_observed {
+            return VerifierBootstrapNextAction::RerunVerifier;
+        }
+        VerifierBootstrapNextAction::RequestSetupEdit
     }
 
     /// Mark that an in-scope edit has been observed. After this fires,
@@ -348,6 +373,16 @@ impl MissingVerifierJob {
         }
         self.retries_used = self.retries_used.saturating_add(1);
         true
+    }
+
+    /// Record an invalid model turn while verifier-bootstrap owns the loop.
+    /// Returns true when the job-level setup budget is exhausted.
+    pub(super) fn record_invalid_setup_attempt(&mut self) -> bool {
+        if self.setup_attempts_used >= self.retry_budget {
+            return true;
+        }
+        self.setup_attempts_used = self.setup_attempts_used.saturating_add(1);
+        self.setup_attempts_used >= self.retry_budget
     }
 
     /// Allowed-tool whitelist surfaced to the effective tool policy when
@@ -1338,9 +1373,9 @@ pub(super) fn semantic_plan_is_stale(job: &RepairJob) -> bool {
     plan.assessment_generation_at_creation >= job.assessment_generation
 }
 
-/// Production bridge from the `RepairJob::next_action()` state machine to
-/// the legacy `VerifierRepairDecision` shape still consumed by turn-local
-/// tool-policy code.
+/// Test-only bridge from the `RepairJob::next_action()` state machine to the
+/// legacy `VerifierRepairDecision` shape.
+#[cfg(test)]
 pub(super) fn verifier_repair_decision(
     pending: bool,
     job: Option<&RepairJob>,
@@ -1381,6 +1416,7 @@ pub(super) fn verifier_repair_decision(
     verifier_repair_decision_for_target(target, messages, work_root)
 }
 
+#[cfg(test)]
 fn verifier_repair_decision_from_next_action(
     action: RepairNextAction,
     messages: &[ConversationMessage],
@@ -1403,6 +1439,7 @@ fn verifier_repair_decision_from_next_action(
     }
 }
 
+#[cfg(test)]
 fn verifier_repair_decision_for_target(
     target: PathBuf,
     messages: &[ConversationMessage],
@@ -1449,12 +1486,10 @@ pub(super) fn has_stale_assessment_after_cluster_advance(
     job.assessment.is_some() && semantic_plan_is_stale(job)
 }
 
-/// Adapter moved from `turn.rs::Agent::task_contract_repair_state()`. Pure
-/// projection from `(Option<&RepairJob>, &VerifierRepairDecision)` to the
-/// two-variant projection consumed by `task_contract::plan_artifact_recovery`.
-/// The active hint preference order (assessment plan slot →
-/// repair_target_hint → target_hint) mirrors the legacy behaviour.
-#[allow(dead_code)] // forward-facing pure adapter; turn.rs still holds the live method during the migration.
+/// Test-only legacy adapter moved from `turn.rs::Agent::task_contract_repair_state()`.
+/// The live production path now projects [`RepairNextAction`] directly.
+#[cfg(test)]
+#[allow(dead_code)] // forward-facing pure adapter; retained for migration tests.
 pub(super) fn task_contract_repair_state(
     job: Option<&RepairJob>,
     decision: &VerifierRepairDecision,
@@ -2468,8 +2503,16 @@ mod tests {
         // recording an in-scope edit flips the gate.
         let mut job = MissingVerifierJob::new(3, 0);
         assert!(job.should_suppress_verifier_retry());
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::RequestSetupEdit
+        );
         job.record_in_scope_edit();
         assert!(!job.should_suppress_verifier_retry());
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::RerunVerifier
+        );
     }
 
     #[test]
@@ -2480,6 +2523,29 @@ mod tests {
         // Third call should report budget exhausted.
         assert!(!job.record_retry());
         assert_eq!(job.retries_used, 2);
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::SafeStop {
+                reason: "missing verifier retry budget exhausted"
+            }
+        );
+    }
+
+    #[test]
+    fn missing_verifier_job_invalid_setup_attempts_are_bounded() {
+        let mut job = MissingVerifierJob::new(2, 0);
+        assert!(!job.record_invalid_setup_attempt());
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::RequestSetupEdit
+        );
+        assert!(job.record_invalid_setup_attempt());
+        assert_eq!(
+            job.next_action(),
+            VerifierBootstrapNextAction::SafeStop {
+                reason: "missing verifier retry budget exhausted"
+            }
+        );
     }
 
     #[test]

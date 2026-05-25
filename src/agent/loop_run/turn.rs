@@ -11,7 +11,10 @@ use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
-use super::repair_job::{self, VerifierRepairDecision};
+#[cfg(test)]
+use super::repair_job;
+#[cfg(test)]
+use super::repair_job::VerifierRepairDecision;
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
@@ -131,6 +134,370 @@ enum JobInstallOutcome {
     /// the projection cannot survive without a backing job (PR-001 SSOT
     /// invariant).
     ValidationFailed,
+}
+
+/// v0.4.23: controller-facing next action for the pre-model part of the
+/// actor loop. This is deliberately small: it does not execute tools, mutate
+/// state, or infer semantic progress from model prose. It only projects
+/// already-structured state into one dispatch source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoopControlAction {
+    ContinueRepairJob {
+        next_action: super::repair_job::RepairNextAction,
+    },
+    ContinueMissingVerifierJob {
+        next_action: super::repair_job::VerifierBootstrapNextAction,
+    },
+    RunVerifier,
+    RequestModelTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopControlInputs {
+    mode: ExecutionMode,
+    task_contract_verifier_repair_pending: bool,
+    repair_next_action: Option<super::repair_job::RepairNextAction>,
+    missing_verifier_next_action: Option<super::repair_job::VerifierBootstrapNextAction>,
+    task_contract_action: Option<super::task_contract::ArtifactRecoveryAction>,
+}
+
+fn determine_loop_control_action(inputs: LoopControlInputs) -> LoopControlAction {
+    if inputs.mode == ExecutionMode::Plan {
+        return LoopControlAction::RequestModelTurn;
+    }
+
+    if inputs.task_contract_verifier_repair_pending {
+        if let Some(next_action) = inputs.repair_next_action {
+            return LoopControlAction::ContinueRepairJob { next_action };
+        }
+        if let Some(next_action) = inputs.missing_verifier_next_action {
+            return LoopControlAction::ContinueMissingVerifierJob { next_action };
+        }
+    }
+
+    if matches!(
+        inputs.task_contract_action,
+        Some(super::task_contract::ArtifactRecoveryAction::RunVerifier)
+    ) {
+        return LoopControlAction::RunVerifier;
+    }
+
+    LoopControlAction::RequestModelTurn
+}
+
+#[cfg(test)]
+fn loop_control_action_owns_recovery(action: &LoopControlAction) -> bool {
+    matches!(
+        action,
+        LoopControlAction::ContinueRepairJob { .. }
+            | LoopControlAction::ContinueMissingVerifierJob { .. }
+    )
+}
+
+fn loop_control_action_requires_missing_verifier_setup(action: &LoopControlAction) -> bool {
+    matches!(
+        action,
+        LoopControlAction::ContinueMissingVerifierJob {
+            next_action: super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
+        }
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryOwner {
+    None,
+    ArtifactCompletion,
+    RepairJob,
+    MissingVerifierJob,
+}
+
+impl RecoveryOwner {
+    fn from_control_action(
+        action: &LoopControlAction,
+        task_contract_action: Option<&super::task_contract::ArtifactRecoveryAction>,
+    ) -> Self {
+        match action {
+            LoopControlAction::ContinueRepairJob { .. } => Self::RepairJob,
+            LoopControlAction::ContinueMissingVerifierJob { .. } => Self::MissingVerifierJob,
+            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {
+                match task_contract_action {
+                    Some(
+                        super::task_contract::ArtifactRecoveryAction::Continue { .. }
+                        | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
+                    ) => Self::ArtifactCompletion,
+                    Some(
+                        super::task_contract::ArtifactRecoveryAction::RunVerifier
+                        | super::task_contract::ArtifactRecoveryAction::Done
+                        | super::task_contract::ArtifactRecoveryAction::SafeStop { .. },
+                    )
+                    | None => Self::None,
+                }
+            }
+        }
+    }
+
+    fn is_verifier_owned(self) -> bool {
+        matches!(self, Self::RepairJob | Self::MissingVerifierJob)
+    }
+
+    fn allows_generic_repo_change_recovery(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    fn allows_focused_edit_recovery(self) -> bool {
+        matches!(self, Self::None | Self::ArtifactCompletion)
+    }
+
+    fn allows_deterministic_fallback(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+#[cfg(test)]
+mod loop_control_action_tests {
+    use super::*;
+
+    fn inputs() -> LoopControlInputs {
+        LoopControlInputs {
+            mode: ExecutionMode::Act,
+            task_contract_verifier_repair_pending: false,
+            repair_next_action: None,
+            missing_verifier_next_action: None,
+            task_contract_action: None,
+        }
+    }
+
+    #[test]
+    fn plan_mode_never_dispatches_repair_or_verifier() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            mode: ExecutionMode::Plan,
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: Some(super::super::repair_job::RepairNextAction::RequestDiagnostic),
+            missing_verifier_next_action: Some(
+                super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
+            ),
+            task_contract_action: Some(
+                super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
+            ),
+        });
+
+        assert_eq!(action, LoopControlAction::RequestModelTurn);
+    }
+
+    #[test]
+    fn active_repair_job_wins_over_verifier_run() {
+        let next_action = super::super::repair_job::RepairNextAction::RequestDiagnostic;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: Some(next_action.clone()),
+            task_contract_action: Some(
+                super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
+            ),
+            ..inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::ContinueRepairJob { next_action });
+    }
+
+    #[test]
+    fn active_repair_job_blocks_artifact_and_missing_verifier_dispatch() {
+        let next_action = super::super::repair_job::RepairNextAction::RequestDiagnostic;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: Some(next_action.clone()),
+            missing_verifier_next_action: Some(
+                super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
+            ),
+            task_contract_action: Some(
+                super::super::task_contract::ArtifactRecoveryAction::Continue {
+                    missing: vec![super::super::task_contract::ArtifactRole::Test],
+                    target_hint: None,
+                },
+            ),
+            ..inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::ContinueRepairJob { next_action });
+    }
+
+    #[test]
+    fn missing_verifier_job_wins_over_generic_model_turn() {
+        let next_action = super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            missing_verifier_next_action: Some(next_action.clone()),
+            ..inputs()
+        });
+
+        assert_eq!(
+            action,
+            LoopControlAction::ContinueMissingVerifierJob { next_action }
+        );
+    }
+
+    #[test]
+    fn missing_verifier_rerun_wins_over_generic_model_turn() {
+        let next_action = super::super::repair_job::VerifierBootstrapNextAction::RerunVerifier;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            missing_verifier_next_action: Some(next_action.clone()),
+            ..inputs()
+        });
+
+        assert_eq!(
+            action,
+            LoopControlAction::ContinueMissingVerifierJob { next_action }
+        );
+    }
+
+    #[test]
+    fn missing_verifier_safe_stop_wins_over_generic_model_turn() {
+        let next_action = super::super::repair_job::VerifierBootstrapNextAction::SafeStop {
+            reason: "missing verifier retry budget exhausted",
+        };
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            missing_verifier_next_action: Some(next_action.clone()),
+            ..inputs()
+        });
+
+        assert_eq!(
+            action,
+            LoopControlAction::ContinueMissingVerifierJob { next_action }
+        );
+    }
+
+    #[test]
+    fn stale_pending_flag_without_owner_does_not_create_legacy_repair_dispatch() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: None,
+            missing_verifier_next_action: None,
+            task_contract_action: None,
+            ..inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::RequestModelTurn);
+    }
+
+    #[test]
+    fn verifier_run_is_selected_only_without_active_repair_owner() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_action: Some(
+                super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
+            ),
+            ..inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::RunVerifier);
+    }
+
+    #[test]
+    fn unresolved_artifact_flow_returns_to_model_turn() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_action: Some(
+                super::super::task_contract::ArtifactRecoveryAction::Continue {
+                    missing: vec![super::super::task_contract::ArtifactRole::Implementation],
+                    target_hint: None,
+                },
+            ),
+            ..inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::RequestModelTurn);
+    }
+
+    #[test]
+    fn active_repair_job_owns_recovery() {
+        let action = LoopControlAction::ContinueRepairJob {
+            next_action: super::super::repair_job::RepairNextAction::RequestDiagnostic,
+        };
+
+        assert!(loop_control_action_owns_recovery(&action));
+    }
+
+    #[test]
+    fn missing_verifier_job_owns_recovery() {
+        let action = LoopControlAction::ContinueMissingVerifierJob {
+            next_action: super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
+        };
+
+        assert!(loop_control_action_owns_recovery(&action));
+        assert!(loop_control_action_requires_missing_verifier_setup(&action));
+    }
+
+    #[test]
+    fn normal_model_turn_does_not_own_recovery() {
+        assert!(!loop_control_action_owns_recovery(
+            &LoopControlAction::RequestModelTurn
+        ));
+        assert!(!loop_control_action_requires_missing_verifier_setup(
+            &LoopControlAction::RequestModelTurn
+        ));
+    }
+
+    #[test]
+    fn recovery_owner_maps_repair_job_to_exclusive_owner() {
+        let owner = RecoveryOwner::from_control_action(
+            &LoopControlAction::ContinueRepairJob {
+                next_action: super::super::repair_job::RepairNextAction::RequestDiagnostic,
+            },
+            Some(&super::super::task_contract::ArtifactRecoveryAction::RunVerifier),
+        );
+
+        assert_eq!(owner, RecoveryOwner::RepairJob);
+        assert!(owner.is_verifier_owned());
+        assert!(!owner.allows_generic_repo_change_recovery());
+        assert!(!owner.allows_focused_edit_recovery());
+        assert!(!owner.allows_deterministic_fallback());
+    }
+
+    #[test]
+    fn recovery_owner_maps_missing_verifier_to_exclusive_owner() {
+        let owner = RecoveryOwner::from_control_action(
+            &LoopControlAction::ContinueMissingVerifierJob {
+                next_action:
+                    super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
+            },
+            None,
+        );
+
+        assert_eq!(owner, RecoveryOwner::MissingVerifierJob);
+        assert!(owner.is_verifier_owned());
+        assert!(!owner.allows_generic_repo_change_recovery());
+        assert!(!owner.allows_focused_edit_recovery());
+        assert!(!owner.allows_deterministic_fallback());
+    }
+
+    #[test]
+    fn recovery_owner_keeps_artifact_recovery_separate_from_verifier_repair() {
+        let owner = RecoveryOwner::from_control_action(
+            &LoopControlAction::RequestModelTurn,
+            Some(
+                &super::super::task_contract::ArtifactRecoveryAction::Continue {
+                    missing: vec![super::super::task_contract::ArtifactRole::Test],
+                    target_hint: None,
+                },
+            ),
+        );
+
+        assert_eq!(owner, RecoveryOwner::ArtifactCompletion);
+        assert!(!owner.is_verifier_owned());
+        assert!(!owner.allows_generic_repo_change_recovery());
+        assert!(owner.allows_focused_edit_recovery());
+        assert!(!owner.allows_deterministic_fallback());
+    }
+
+    #[test]
+    fn recovery_owner_allows_generic_paths_only_without_active_owner() {
+        let owner = RecoveryOwner::from_control_action(&LoopControlAction::RequestModelTurn, None);
+
+        assert_eq!(owner, RecoveryOwner::None);
+        assert!(!owner.is_verifier_owned());
+        assert!(owner.allows_generic_repo_change_recovery());
+        assert!(owner.allows_focused_edit_recovery());
+        assert!(owner.allows_deterministic_fallback());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2197,6 +2564,7 @@ fn task_contract_verifier_edit_required_note(attempt: usize, attempt_limit: usiz
     )
 }
 
+#[cfg(test)]
 fn task_contract_verifier_target_discovery_note(attempt: usize, attempt_limit: usize) -> String {
     format!(
         "[Task Contract Verification] The verifier already failed, but Anvil did not identify a safe workspace repair target yet. Do not rerun verification and do not answer in prose. Emit exactly one Read, Glob, or Grep tool call to identify the local file to repair. Do not use Bash, Write, or Edit until a target file is known. task_contract_verify_discovery_attempt={attempt}/{attempt_limit}"
@@ -7363,12 +7731,113 @@ impl Agent {
                 break 'outer;
             }
 
-            if self.session.mode_state.mode != ExecutionMode::Plan
-                && self.task_contract_verifier_repair_pending
-                && self.repair_job.is_some()
+            let pre_model_task_contract_action = if self.session.mode_state.mode
+                == ExecutionMode::Plan
+                || (self.task_contract_verifier_repair_pending && self.repair_job.is_some())
             {
-                match self.dispatch_repair_job_step(
-                    TaskContractVerifierFlowArgs {
+                None
+            } else {
+                task_contract.as_ref().map(|contract| {
+                    self.task_contract_recovery_action(
+                        contract,
+                        contract_verifier_repair_edit_count,
+                        repo_edit_calls_made_this_turn,
+                    )
+                })
+            };
+            let loop_control_action = determine_loop_control_action(LoopControlInputs {
+                mode: self.session.mode_state.mode,
+                task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
+                repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
+                missing_verifier_next_action: self
+                    .missing_verifier_job
+                    .as_ref()
+                    .map(|job| job.next_action()),
+                task_contract_action: pre_model_task_contract_action.clone(),
+            });
+            let recovery_owner = RecoveryOwner::from_control_action(
+                &loop_control_action,
+                pre_model_task_contract_action.as_ref(),
+            );
+            let missing_verifier_setup_turn =
+                loop_control_action_requires_missing_verifier_setup(&loop_control_action);
+            match loop_control_action {
+                LoopControlAction::ContinueRepairJob { next_action: _ } => {
+                    match self.dispatch_repair_job_step(
+                        TaskContractVerifierFlowArgs {
+                            before_snapshot: &before_snapshot,
+                            accumulated: &accumulated,
+                            repo_edit_calls_made_this_turn,
+                            task_contract: task_contract.as_ref(),
+                            contract_verification_retries: &mut contract_verification_retries,
+                            contract_verifier_repair_edit_count:
+                                &mut contract_verifier_repair_edit_count,
+                            repo_change_retries: &mut repo_change_retries,
+                            verifier_repair_retries: &mut verifier_repair_retries,
+                            task_contract_verify_commands_collected:
+                                &mut task_contract_verify_commands_collected,
+                            task_contract_verifier_passed_in_loop:
+                                &mut task_contract_verifier_passed_in_loop,
+                            last_iter,
+                        },
+                        &mut repo_edit_calls_made_this_turn,
+                    ) {
+                        TaskContractVerifierFlowOutcome::Continue => continue,
+                        TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
+                            final_prose = prose;
+                            exit_reason = ExitReason::Done;
+                            break 'outer;
+                        }
+                        TaskContractVerifierFlowOutcome::Exit {
+                            reason,
+                            error_text: verifier_error,
+                        } => {
+                            exit_reason = reason;
+                            error_text = verifier_error;
+                            break 'outer;
+                        }
+                    }
+                }
+                LoopControlAction::ContinueMissingVerifierJob { next_action } => {
+                    if let Some(outcome) = self.dispatch_missing_verifier_job_step(
+                        TaskContractVerifierFlowArgs {
+                            before_snapshot: &before_snapshot,
+                            accumulated: &accumulated,
+                            repo_edit_calls_made_this_turn,
+                            task_contract: task_contract.as_ref(),
+                            contract_verification_retries: &mut contract_verification_retries,
+                            contract_verifier_repair_edit_count:
+                                &mut contract_verifier_repair_edit_count,
+                            repo_change_retries: &mut repo_change_retries,
+                            verifier_repair_retries: &mut verifier_repair_retries,
+                            task_contract_verify_commands_collected:
+                                &mut task_contract_verify_commands_collected,
+                            task_contract_verifier_passed_in_loop:
+                                &mut task_contract_verifier_passed_in_loop,
+                            last_iter,
+                        },
+                        next_action,
+                    ) {
+                        match outcome {
+                            TaskContractVerifierFlowOutcome::Continue => continue,
+                            TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
+                                final_prose = prose;
+                                exit_reason = ExitReason::Done;
+                                break 'outer;
+                            }
+                            TaskContractVerifierFlowOutcome::Exit {
+                                reason,
+                                error_text: verifier_error,
+                            } => {
+                                exit_reason = reason;
+                                error_text = verifier_error;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                LoopControlAction::RunVerifier => {
+                    match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
                         before_snapshot: &before_snapshot,
                         accumulated: &accumulated,
                         repo_edit_calls_made_this_turn,
@@ -7383,333 +7852,28 @@ impl Agent {
                         task_contract_verifier_passed_in_loop:
                             &mut task_contract_verifier_passed_in_loop,
                         last_iter,
-                    },
-                    &mut repo_edit_calls_made_this_turn,
-                ) {
-                    TaskContractVerifierFlowOutcome::Continue => continue,
-                    TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                        final_prose = prose;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    TaskContractVerifierFlowOutcome::Exit {
-                        reason,
-                        error_text: verifier_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = verifier_error;
-                        break 'outer;
-                    }
-                }
-            }
-
-            if self.session.mode_state.mode != ExecutionMode::Plan
-                && self.task_contract_verifier_repair_pending
-                && self.scope_safeguarded_verifier_repair_decision(
-                    contract_verifier_repair_edit_count,
-                    repo_edit_calls_made_this_turn,
-                ) == VerifierRepairDecision::DiagnosticUnavailable
-            {
-                exit_reason = ExitReason::VerifierFailed;
-                error_text = match self.repair_job.as_ref() {
-                    Some(context) if context.needs_diagnostic_after_target_exhaustion() => {
-                        "verifier repair exhausted: no safe repair target remains".to_string()
-                    }
-                    Some(context) => context
-                        .diagnostic_error
-                        .clone()
-                        .map(|error| format!("verifier repair diagnostic_unavailable: {error}"))
-                        .unwrap_or_else(|| {
-                            "verifier repair diagnostic_unavailable: diagnostic attempts exhausted"
-                                .to_string()
-                        }),
-                    None => "verifier repair diagnostic_unavailable: diagnostic attempts exhausted"
-                        .to_string(),
-                };
-                break 'outer;
-            }
-
-            if self.session.mode_state.mode != ExecutionMode::Plan
-                && let Some(contract) = task_contract.as_ref()
-                && matches!(
-                    self.task_contract_recovery_action(
-                        contract,
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                    ),
-                    super::task_contract::ArtifactRecoveryAction::RunVerifier
-                )
-            {
-                match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
-                    before_snapshot: &before_snapshot,
-                    accumulated: &accumulated,
-                    repo_edit_calls_made_this_turn,
-                    task_contract: task_contract.as_ref(),
-                    contract_verification_retries: &mut contract_verification_retries,
-                    contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
-                    repo_change_retries: &mut repo_change_retries,
-                    verifier_repair_retries: &mut verifier_repair_retries,
-                    task_contract_verify_commands_collected:
-                        &mut task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop:
-                        &mut task_contract_verifier_passed_in_loop,
-                    last_iter,
-                }) {
-                    TaskContractVerifierFlowOutcome::Continue => continue,
-                    TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                        final_prose = prose;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    TaskContractVerifierFlowOutcome::Exit {
-                        reason,
-                        error_text: verifier_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = verifier_error;
-                        break 'outer;
-                    }
-                }
-            }
-
-            if self.session.mode_state.mode != ExecutionMode::Plan
-                && self.task_contract_verifier_repair_pending
-                && self.scope_safeguarded_verifier_repair_decision(
-                    contract_verifier_repair_edit_count,
-                    repo_edit_calls_made_this_turn,
-                ) == VerifierRepairDecision::NeedDiagnostic
-            {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Verifier diagnostic",
-                        "Running short-lived diagnostic LLM pass outside the main session.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                if let Some(step) = self
-                    .repair_job
-                    .as_mut()
-                    .map(|job| job.begin_next_repair_step())
-                {
-                    match step {
-                        super::repair_job::RepairStep::RunDiagnostic => {}
-                        super::repair_job::RepairStep::SafeStop { reason } => {
-                            self.emit_safe_stop_report_for_verifier_weak();
-                            exit_reason = ExitReason::VerifierFailed;
-                            error_text = format!("verifier repair safe stop: {}", reason.as_str());
+                    }) {
+                        TaskContractVerifierFlowOutcome::Continue => continue,
+                        TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
+                            final_prose = prose;
+                            exit_reason = ExitReason::Done;
                             break 'outer;
                         }
-                        other => {
-                            exit_reason = ExitReason::VerifierFailed;
-                            error_text = format!(
-                                "verifier repair diagnostic dispatch invariant violated: {other:?}"
-                            );
+                        TaskContractVerifierFlowOutcome::Exit {
+                            reason,
+                            error_text: verifier_error,
+                        } => {
+                            exit_reason = reason;
+                            error_text = verifier_error;
                             break 'outer;
                         }
                     }
                 }
-                match self.run_verifier_diagnostic_pass() {
-                    VerifierDiagnosticPassOutcome::Accepted => {
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Verifier diagnostic",
-                                "Accepted validated diagnostic result; continuing verifier repair.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                    }
-                    VerifierDiagnosticPassOutcome::RetryPending { error } => {
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Verifier diagnostic",
-                                &format!(
-                                    "Diagnostic pass failed ({error}); retrying with fallback model."
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                    }
-                    VerifierDiagnosticPassOutcome::Unavailable { error } => {
-                        exit_reason = ExitReason::VerifierFailed;
-                        error_text = format!("verifier repair diagnostic_unavailable: {error}");
-                        break 'outer;
-                    }
-                    VerifierDiagnosticPassOutcome::Skipped => {
-                        self.emit_safe_stop_report_for_verifier_weak();
-                        exit_reason = ExitReason::VerifierFailed;
-                        error_text = "verifier repair diagnostic skipped after committed dispatch"
-                            .to_string();
-                        break 'outer;
-                    }
-                }
-                continue;
-            }
-
-            let scoped_verifier_repair_decision = self
-                .session
-                .mode_state
-                .mode
-                .ne(&ExecutionMode::Plan)
-                .then(|| {
-                    self.scope_safeguarded_verifier_repair_decision(
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                    )
-                });
-            let scoped_verifier_repair_target_hint = self
-                .repair_job
-                .as_ref()
-                .and_then(verifier_repair_effective_target_hint)
-                .cloned();
-            if self.session.mode_state.mode != ExecutionMode::Plan
-                && self.task_contract_verifier_repair_pending
-                && scoped_verifier_repair_target_hint.is_some()
-                && matches!(
-                    scoped_verifier_repair_decision,
-                    Some(
-                        VerifierRepairDecision::NeedFreshRead(_)
-                            | VerifierRepairDecision::NeedEdit(_)
-                    )
-                )
-            {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Verifier repair",
-                        "Running controller-applied repair pass for the selected target.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                let target_hint = scoped_verifier_repair_target_hint
-                    .clone()
-                    .expect("checked is_some above");
-                match self.run_verifier_repair_pass_and_apply(&target_hint) {
-                    VerifierRepairPassOutcome::Applied { relative_path } => {
-                        repo_edit_calls_made_this_turn =
-                            repo_edit_calls_made_this_turn.saturating_add(1);
-                        repo_change_retries = 0;
-                        verifier_repair_retries = 0;
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Verifier repair",
-                                &format!(
-                                    "Applied controller repair edit to {relative_path}; verifier will rerun."
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                    }
-                    VerifierRepairPassOutcome::Invalid {
-                        error,
-                        repair_attempt_outcome,
-                    } => {
-                        let attempted_target_hint = self
-                            .repair_job
-                            .as_ref()
-                            .and_then(verifier_repair_effective_target_hint)
-                            .cloned();
-                        self.record_controller_verifier_repair_invalid(
-                            &error,
-                            repair_attempt_outcome,
-                        );
-                        let next_decision = self.scope_safeguarded_verifier_repair_decision(
-                            contract_verifier_repair_edit_count,
-                            repo_edit_calls_made_this_turn,
-                        );
-                        if verifier_repair_invalid_can_continue(
-                            &next_decision,
-                            attempted_target_hint.as_ref(),
-                            &self.work_root,
-                        ) {
-                            verifier_repair_retries = 0;
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Verifier repair",
-                                    "Rejected invalid controller repair proposal; continuing with updated repair state.",
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            continue;
-                        }
-                        if matches!(next_decision, VerifierRepairDecision::DiagnosticUnavailable) {
-                            self.emit_safe_stop_report_for_verifier_weak();
-                            exit_reason = ExitReason::VerifierFailed;
-                            error_text = error;
-                            break 'outer;
-                        }
-                        verifier_repair_retries = verifier_repair_retries.saturating_add(1);
-                        if verifier_repair_retries >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
-                            // Issue #654 (E.4): controller-applied repair pass
-                            // proposals exhausted the retry budget while every
-                            // proposal was rejected by validation (weakening
-                            // detector / candidate validator / parse failure).
-                            // Emit the structured `verifier_weak` safe stop
-                            // report through the bounded SSOT before exiting.
-                            self.emit_safe_stop_report_for_verifier_weak();
-                            exit_reason = ExitReason::VerifierFailed;
-                            error_text = error;
-                            break 'outer;
-                        }
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Verifier repair",
-                                "Rejected invalid controller repair proposal; retrying verifier repair with validation diagnostics.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                    }
-                    VerifierRepairPassOutcome::Unavailable { relative_path } => {
-                        // Issue #639: no safe project verifier was available for
-                        // this candidate path. Do not count this as a repair
-                        // attempt — defer to the next verifier rerun for a full
-                        // re-check. We keep `verifier_repair_retries` unchanged
-                        // so the natural attempt budget is preserved.
-                        // Issue #653 (S7-002): Unavailable は ledger 対象外 — None を渡す。
-                        self.record_controller_verifier_repair_invalid(
-                            &format!(
-                                "deferred to full verifier rerun (no safe cheap check available for {relative_path})"
-                            ),
-                            None,
-                        );
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Verifier repair",
-                                &format!(
-                                    "No safe cheap check available for {relative_path}; deferring to full verifier rerun."
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                    }
-                    VerifierRepairPassOutcome::Skipped => {}
-                }
-                continue;
+                LoopControlAction::RequestModelTurn => {}
             }
 
             if action_expectation == recovery::ActionExpectation::RepoChange
+                && recovery_owner.allows_deterministic_fallback()
                 && repo_edit_calls_made_this_turn == 0
                 && self.maybe_materialize_mode_deterministic_fallback(last_iter)
             {
@@ -7717,6 +7881,7 @@ impl Agent {
             }
 
             if action_expectation == recovery::ActionExpectation::RepoChange
+                && recovery_owner.allows_deterministic_fallback()
                 && repo_edit_calls_made_this_turn == 0
                 && should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
                 && self.maybe_materialize_framework_game_fallback(last_iter)
@@ -7727,6 +7892,7 @@ impl Agent {
             }
 
             if repo_edit_calls_made_this_turn == 0
+                && recovery_owner.allows_deterministic_fallback()
                 && self.current_request_needs_playable_ui_quality_gate()
                 && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
             {
@@ -7766,9 +7932,11 @@ impl Agent {
                 }
             }
 
-            let reply = match self
-                .request_assistant_reply_with_retry(stream_output, &interrupt_flag)
-            {
+            let reply = match self.request_assistant_reply_with_retry(
+                stream_output,
+                &interrupt_flag,
+                recovery_owner,
+            ) {
                 Ok(r) => r,
                 Err(err) => {
                     exit_reason = if err == USER_INTERRUPT_ERROR {
@@ -7868,6 +8036,19 @@ impl Agent {
                         let artifact_retry =
                             effective_tool_policy.artifact_directed_policy().cloned();
                         self.session.working_memory.note_error(err);
+                        if missing_verifier_setup_turn {
+                            if self.record_missing_verifier_setup_failure(
+                                last_iter,
+                                "tool policy violation",
+                            ) {
+                                exit_reason = ExitReason::MissingVerification;
+                                error_text =
+                                    "task contract requires verification, but the MissingVerifierJob setup budget is exhausted"
+                                        .to_string();
+                                break 'outer;
+                            }
+                            continue;
+                        }
                         if artifact_retry.is_some() {
                             let role = self
                                 .current_artifact_recovery_target
@@ -7943,6 +8124,19 @@ impl Agent {
                         }
                         focused_policy_retries += 1;
                         if focused_retry.is_some() && focused_policy_retries >= 3 {
+                            if !recovery_owner.allows_focused_edit_recovery() {
+                                exit_reason = if recovery_owner == RecoveryOwner::MissingVerifierJob
+                                {
+                                    ExitReason::MissingVerification
+                                } else if recovery_owner.is_verifier_owned() {
+                                    ExitReason::VerifierFailed
+                                } else {
+                                    ExitReason::ToolCallFormatError
+                                };
+                                error_text = "verifier-owned recovery rejected invalid tool calls repeatedly before an allowed repair edit"
+                                    .to_string();
+                                break 'outer;
+                            }
                             let request = self.active_request_text().unwrap_or_default();
                             let fallback =
                                 match self.maybe_apply_local_llm_small_edit_fallback(&request) {
@@ -8590,6 +8784,7 @@ impl Agent {
                 }
                 if repo_edit_calls_made_this_turn == 0
                     && tool_calls_made_this_turn > 0
+                    && recovery_owner.allows_deterministic_fallback()
                     && self.current_request_needs_playable_ui_quality_gate()
                     && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
                 {
@@ -8627,6 +8822,7 @@ impl Agent {
                 }
                 if repo_edit_calls_made_this_turn == 0
                     && tool_calls_made_this_turn > 0
+                    && recovery_owner.allows_deterministic_fallback()
                     && self.current_request_needs_playable_ui_quality_gate()
                     && let Some((request, target_path, _issue)) =
                         self.accepted_repo_change_quality_issue()
@@ -8664,6 +8860,7 @@ impl Agent {
                     }
                 }
                 if repo_edit_calls_made_this_turn > 0
+                    && recovery_owner.allows_deterministic_fallback()
                     && (should_apply_repo_change_quality_gate(
                         action_expectation,
                         self.active_task_expects_repo_change(),
@@ -8799,6 +8996,16 @@ impl Agent {
             }
 
             let final_reply = reply.content.trim().to_string();
+            if missing_verifier_setup_turn {
+                if self.record_missing_verifier_setup_failure(last_iter, "no setup edit emitted") {
+                    exit_reason = ExitReason::MissingVerification;
+                    error_text =
+                        "task contract requires verification, but the MissingVerifierJob setup budget is exhausted"
+                            .to_string();
+                    break 'outer;
+                }
+                continue;
+            }
             let task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan {
                 None
             } else {
@@ -9126,7 +9333,9 @@ impl Agent {
                 }
             }
             if final_reply.is_empty() {
-                if action_expectation == recovery::ActionExpectation::RepoChange {
+                if action_expectation == recovery::ActionExpectation::RepoChange
+                    && recovery_owner.allows_generic_repo_change_recovery()
+                {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
                         if repo_change_retries == 2
@@ -9294,7 +9503,9 @@ impl Agent {
             }
 
             if requires_action && tool_calls_made_this_turn == 0 {
-                if action_expectation == recovery::ActionExpectation::RepoChange {
+                if action_expectation == recovery::ActionExpectation::RepoChange
+                    && recovery_owner.allows_generic_repo_change_recovery()
+                {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
                         if repo_change_retries == 2
@@ -9507,6 +9718,7 @@ impl Agent {
 
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
+                && recovery_owner.allows_generic_repo_change_recovery()
             {
                 if should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
                     && self.maybe_materialize_framework_game_fallback(last_iter)
@@ -9668,7 +9880,8 @@ impl Agent {
                 repo_edit_calls_made_this_turn,
                 &final_reply,
                 task_contract_action.as_ref(),
-            ) {
+            ) && recovery_owner.allows_generic_repo_change_recovery()
+            {
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
                     exit_reason = ExitReason::MissingRepoEdits;
@@ -9696,6 +9909,7 @@ impl Agent {
                 self.active_task_expects_repo_change(),
                 self.session.mode_state.mode,
             ) || self.current_request_needs_playable_ui_quality_gate())
+                && recovery_owner.allows_deterministic_fallback()
                 && let Some((request, target_path, issue)) =
                     self.accepted_repo_change_quality_issue()
             {
@@ -11349,6 +11563,26 @@ impl Agent {
         }
     }
 
+    fn dispatch_missing_verifier_job_step(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+        next_action: super::repair_job::VerifierBootstrapNextAction,
+    ) -> Option<TaskContractVerifierFlowOutcome> {
+        match next_action {
+            super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit => None,
+            super::repair_job::VerifierBootstrapNextAction::RerunVerifier => {
+                Some(self.drive_task_contract_verifier(args))
+            }
+            super::repair_job::VerifierBootstrapNextAction::SafeStop { reason } => {
+                self.emit_safe_stop_report_for_verifier_missing();
+                Some(TaskContractVerifierFlowOutcome::Exit {
+                    reason: ExitReason::MissingVerification,
+                    error_text: reason.to_string(),
+                })
+            }
+        }
+    }
+
     fn dispatch_after_repair_patch_rejection(
         &mut self,
         last_iter: usize,
@@ -11416,6 +11650,31 @@ impl Agent {
                 }
             }
         }
+    }
+
+    fn record_missing_verifier_setup_failure(&mut self, last_iter: usize, reason: &str) -> bool {
+        let Some(job) = self.missing_verifier_job.as_mut() else {
+            return false;
+        };
+        let exhausted = job.record_invalid_setup_attempt();
+        let attempt = job.setup_attempts_used as usize;
+        let attempt_limit = job.retry_budget as usize;
+        if exhausted {
+            self.emit_safe_stop_report_for_verifier_missing();
+            return true;
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                "Verification missing",
+                &format!("Verifier setup still needs an in-scope repository edit ({reason})."),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(task_contract_no_verifier_note(attempt, attempt_limit));
+        false
     }
 
     fn emit_safe_stop_report_for_repair_terminal(
@@ -11804,6 +12063,7 @@ impl Agent {
         &mut self,
         stream_output: bool,
         interrupt_flag: &InterruptFlag,
+        recovery_owner: RecoveryOwner,
     ) -> Result<AssistantReply, String> {
         // Issue #430 Phase D: freeze the footer for the entire LLM call (the
         // thinking spinner writes to stderr, but stream chunks land on stdout
@@ -11865,12 +12125,15 @@ impl Agent {
                     //       のみで動く汎用 path (experimental flag 非依存)。
                     //       qwen3.5 ユーザーの format-error 後 finish は flag off
                     //       でも維持される。
-                    if let Some(reply) =
-                        self.maybe_apply_deterministic_edit_after_format_error(&err)?
+                    if recovery_owner.allows_deterministic_fallback()
+                        && let Some(reply) =
+                            self.maybe_apply_deterministic_edit_after_format_error(&err)?
                     {
                         return Ok(reply);
                     }
-                    if let Some(reply) = self.maybe_finish_after_edit_format_error(&err) {
+                    if recovery_owner.allows_generic_repo_change_recovery()
+                        && let Some(reply) = self.maybe_finish_after_edit_format_error(&err)
+                    {
                         return Ok(reply);
                     }
                     if lifecycle::is_tool_call_format_error(&err)
@@ -11928,6 +12191,7 @@ impl Agent {
                         }
                     }
                     if err.to_ascii_lowercase().contains("timed out")
+                        && recovery_owner.allows_deterministic_fallback()
                         && let Some(reply) =
                             self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)
                     {
@@ -11943,8 +12207,9 @@ impl Agent {
                         && let Some(policy) = timeout_focused_policy
                     {
                         let target = &policy.target;
-                        if let Some(reply) =
-                            self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)
+                        if recovery_owner.allows_deterministic_fallback()
+                            && let Some(reply) =
+                                self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)
                         {
                             // Issue #455 / D2: timeout-after quality fallback success.
                             self.session.record_feedback_if_unset(
@@ -12907,34 +13172,56 @@ impl Agent {
 
         let mut candidates: Vec<JobCandidate> = Vec::new();
 
-        // Priority 1: VerifierRepair (task_contract_verifier_repair_pending).
-        if self.task_contract_verifier_repair_pending {
-            let decision = self.verifier_repair_decision_for_policy();
-            let (policy, desired_action) = if matches!(decision, VerifierRepairDecision::NoRepair)
-                && let Some(job) = self.missing_verifier_job.as_ref()
-            {
-                (
-                    EffectiveToolPolicy::restricted(
-                        EffectiveToolPolicyReason::VerifierRepair,
-                        job.allowed_tool_names().to_vec(),
-                    ),
-                    DesiredAction::MissingVerifierCreate,
-                )
-            } else {
-                (
-                    verifier_repair_policy_for_decision(decision),
-                    DesiredAction::VerifierRepair {
+        // Priority 1: VerifierRepair / MissingVerifier. The arbiter no longer
+        // derives verifier progress from the legacy `VerifierRepairDecision`;
+        // it projects the same `LoopControlAction` used by the top-level
+        // controller into a least-privilege policy.
+        match determine_loop_control_action(LoopControlInputs {
+            mode: self.session.mode_state.mode,
+            task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
+            repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
+            missing_verifier_next_action: self
+                .missing_verifier_job
+                .as_ref()
+                .map(|job| job.next_action()),
+            task_contract_action: None,
+        }) {
+            LoopControlAction::ContinueRepairJob { next_action } => {
+                let target_hint = match &next_action {
+                    super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
+                        Some(target_hint.clone())
+                    }
+                    _ => None,
+                };
+                let policy = self.verifier_repair_policy_for_next_action(&next_action);
+                candidates.push(JobCandidate {
+                    kind: ActiveJobKind::VerifierRepair,
+                    desired_action: DesiredAction::VerifierRepair {
                         command: String::new(),
-                        target_hint: None,
+                        target_hint,
                     },
-                )
-            };
-            candidates.push(JobCandidate {
-                kind: ActiveJobKind::VerifierRepair,
-                desired_action,
-                policy,
-                budget: Budget::Unbounded,
-            });
+                    policy,
+                    budget: Budget::Unbounded,
+                });
+            }
+            LoopControlAction::ContinueMissingVerifierJob { next_action } => {
+                if matches!(
+                    next_action,
+                    super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
+                ) && let Some(job) = self.missing_verifier_job.as_ref()
+                {
+                    candidates.push(JobCandidate {
+                        kind: ActiveJobKind::VerifierRepair,
+                        desired_action: DesiredAction::MissingVerifierCreate,
+                        policy: EffectiveToolPolicy::restricted(
+                            EffectiveToolPolicyReason::VerifierRepair,
+                            job.allowed_tool_names().to_vec(),
+                        ),
+                        budget: Budget::Unbounded,
+                    });
+                }
+            }
+            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {}
         }
 
         // Priority 2: ForcedSmallEditRecovery.
@@ -13206,47 +13493,26 @@ impl Agent {
         super::active_job_arbiter::select_active_job(&candidates)
     }
 
-    fn verifier_repair_decision_for_policy(&self) -> VerifierRepairDecision {
-        // Issue #646 (A3/B1): the legacy `verifier_repair_decision` falls
-        // back to `latest_successful_read_existing_path` when no real
-        // `RepairJob` is attached. That fallback can return an out-of-scope
-        // path which then directs the tool policy / recovery note into a
-        // prior-session subtree. Route through the shared scope safeguard
-        // so all three consumers (`task_contract_repair_state`,
-        // `effective_tool_policy`, `push_verifier_repair_recovery_note`)
-        // see an identically gated decision.
-        self.scope_safeguarded_verifier_repair_decision(None, 0)
-    }
-
-    /// Issue #646 (A3/B1): single SSOT for the verifier-repair decision
-    /// after applying the active-scope safeguard. When `repair_job` is
-    /// `None` and the raw decision targets an out-of-scope path, returns
-    /// `NoRepair` instead, so downstream consumers cannot drag the model
-    /// into a prior subtree.
-    fn scope_safeguarded_verifier_repair_decision(
+    fn verifier_repair_policy_for_next_action(
         &self,
-        repair_edit_count: Option<usize>,
-        repo_edit_calls_made_this_turn: usize,
-    ) -> VerifierRepairDecision {
-        let decision = verifier_repair_decision(
-            self.task_contract_verifier_repair_pending,
-            self.repair_job.as_ref(),
-            &self.session.messages,
-            &self.work_root,
-            repair_edit_count,
-            repo_edit_calls_made_this_turn,
-        );
-        if self.repair_job.is_some() {
-            return decision;
-        }
-        let Some(target) = decision_target_path(&decision) else {
-            return decision;
-        };
-        let scope = self.current_workspace_scope();
-        if target_path_in_scope(target, &self.work_root, &scope) {
-            decision
-        } else {
-            VerifierRepairDecision::NoRepair
+        action: &super::repair_job::RepairNextAction,
+    ) -> EffectiveToolPolicy {
+        match action {
+            super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
+                verifier_repair_policy_for_target_hint(
+                    target_hint,
+                    &self.session.messages,
+                    &self.work_root,
+                )
+            }
+            super::repair_job::RepairNextAction::RequestDiagnostic
+            | super::repair_job::RepairNextAction::Replan
+            | super::repair_job::RepairNextAction::RerunVerifier
+            | super::repair_job::RepairNextAction::SafeStop { .. }
+            | super::repair_job::RepairNextAction::VerifiedDone => EffectiveToolPolicy::restricted(
+                EffectiveToolPolicyReason::VerifierRepair,
+                Vec::new(),
+            ),
         }
     }
 
@@ -13513,83 +13779,57 @@ impl Agent {
     }
 
     fn push_verifier_repair_recovery_note(&mut self, attempt: usize) -> bool {
-        match self.verifier_repair_decision_for_policy() {
-            VerifierRepairDecision::NeedDiagnostic => {
-                if let Some(context) = self.repair_job.as_ref() {
-                    // Issue #665 Phase 5: caller-side projection (S5-005 では
-                    // raw label/excerpt は system note に出さないため helper
-                    // 内部で metadata のみに縮退する)。
-                    let active_request = self.active_request_text().unwrap_or_default();
-                    let task_contract =
-                        super::task_contract::TaskContract::from_request(&active_request);
-                    let behavior_projection =
-                        super::required_behavior::project_behavior_contract(&task_contract);
-                    let note = verifier_repair_diagnostic_pending_note(
-                        context,
-                        behavior_projection.as_ref(),
-                    );
-                    self.push_system_note(note);
-                    true
-                } else {
-                    false
-                }
+        let Some(context) = self.repair_job.as_ref() else {
+            return false;
+        };
+        match context.next_action() {
+            super::repair_job::RepairNextAction::RequestDiagnostic
+            | super::repair_job::RepairNextAction::Replan => {
+                // Issue #665 Phase 5: caller-side projection (S5-005 では
+                // raw label/excerpt は system note に出さないため helper
+                // 内部で metadata のみに縮退する)。
+                let active_request = self.active_request_text().unwrap_or_default();
+                let task_contract =
+                    super::task_contract::TaskContract::from_request(&active_request);
+                let behavior_projection =
+                    super::required_behavior::project_behavior_contract(&task_contract);
+                let note =
+                    verifier_repair_diagnostic_pending_note(context, behavior_projection.as_ref());
+                self.push_system_note(note);
+                true
             }
-            VerifierRepairDecision::NeedTargetDiscovery => {
-                self.push_system_note(task_contract_verifier_target_discovery_note(
+            super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
+                let Some(relative) =
+                    super::repair_job::safe_relative_path_string(&target_hint.path)
+                else {
+                    return false;
+                };
+                let target = self.work_root.join(relative);
+                let target = std::fs::canonicalize(&target).unwrap_or(target);
+                if !target.is_file() {
+                    let target_display = verifier_repair_target_display(&target, &self.work_root);
+                    self.push_system_note(recovery::focused_edit_missing_target_recovery_note(
+                        &target_display,
+                        attempt,
+                    ));
+                    return true;
+                }
+                self.push_system_note(task_contract_verifier_targeted_edit_required_note(
+                    context,
+                    &self.work_root,
+                    focused_edit_target_already_read(
+                        &self.session.messages,
+                        &target,
+                        &self.work_root,
+                    ),
                     attempt,
                     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
                 ));
                 true
             }
-            VerifierRepairDecision::NeedFreshRead(target) => {
-                if let Some(context) = self.repair_job.as_ref() {
-                    self.push_system_note(task_contract_verifier_targeted_edit_required_note(
-                        context,
-                        &self.work_root,
-                        focused_edit_target_already_read(
-                            &self.session.messages,
-                            &target,
-                            &self.work_root,
-                        ),
-                        attempt,
-                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                    ));
-                } else {
-                    let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    self.push_system_note(format!(
-                        "[Task Contract Verification] The verifier failed and repair target discovery selected {target_display}. Emit exactly one Read on that file now. Do not run Bash, switch files, or answer in prose. task_contract_verify_read_attempt={attempt}/{TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT}"
-                    ));
-                }
-                true
-            }
-            VerifierRepairDecision::NeedEdit(target) => {
-                if let Some(context) = self.repair_job.as_ref() {
-                    self.push_system_note(task_contract_verifier_targeted_edit_required_note(
-                        context,
-                        &self.work_root,
-                        true,
-                        attempt,
-                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                    ));
-                } else {
-                    let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    self.push_system_note(format!(
-                        "[Task Contract Verification] The verifier failed and {target_display} is the discovered repair target. Emit exactly one compact Edit on that file now. Do not run Bash, switch files, or answer in prose. task_contract_verify_edit_attempt={attempt}/{TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT}"
-                    ));
-                }
-                true
-            }
-            VerifierRepairDecision::NeedWrite(target) => {
-                let target_display = verifier_repair_target_display(&target, &self.work_root);
-                self.push_system_note(recovery::focused_edit_missing_target_recovery_note(
-                    &target_display,
-                    attempt,
-                ));
-                true
-            }
-            VerifierRepairDecision::DiagnosticUnavailable
-            | VerifierRepairDecision::NoRepair
-            | VerifierRepairDecision::ReadyToVerify => false,
+            super::repair_job::RepairNextAction::RerunVerifier
+            | super::repair_job::RepairNextAction::SafeStop { .. }
+            | super::repair_job::RepairNextAction::VerifiedDone => false,
         }
     }
 
@@ -14154,6 +14394,11 @@ impl Agent {
         self.emit_repair_safe_stop_report(super::repair_job::StopReason::VerifierFailedSafeStop);
     }
 
+    #[cfg(test)]
+    pub(super) fn emit_safe_stop_report_for_verifier_weak(&mut self) {
+        self.emit_repair_safe_stop_report(super::repair_job::StopReason::VerifierWeak);
+    }
+
     /// Issue #654 (E.2) — `artifact_completion_failed` emit shell. Unlike the
     /// other shells, this path can fire BEFORE a verifier-driven `RepairJob`
     /// has been built (the role-specific retry budget exhausts during pure
@@ -14233,15 +14478,6 @@ impl Agent {
             turn_index,
         };
         self.record_safe_stop_report(input, ctx);
-    }
-
-    /// Issue #654 (E.4) — `verifier_weak` emit shell. Fires at the terminal
-    /// `VerifierRepairPassOutcome::Invalid` exit (controller-applied repair
-    /// proposals were rejected by `validate_verifier_repair_intents` for the
-    /// full retry budget), which is the closest deterministic analogue to
-    /// "verifier output was judged weak / unactionable" in the current loop.
-    pub(super) fn emit_safe_stop_report_for_verifier_weak(&mut self) {
-        self.emit_repair_safe_stop_report(super::repair_job::StopReason::VerifierWeak);
     }
 
     /// Issue #662 — `repair_exhausted` emit shell. Fires when
@@ -15042,7 +15278,6 @@ impl Agent {
     ) -> Option<String> {
         (effective_tool_policy.reason() == EffectiveToolPolicyReason::VerifierRepair).then(|| {
             let context = self.repair_job.as_ref();
-            let decision = self.verifier_repair_decision_for_policy();
             let diagnostics = context
                 .map(|context| {
                     let repeated = if context.repair_attempt > 1 {
@@ -15088,8 +15323,11 @@ impl Agent {
                     )
                 })
                 .unwrap_or_else(|| " Failure signature: <unknown>.".to_string());
-            match decision {
-                VerifierRepairDecision::NeedDiagnostic => {
+            match context.map(|context| context.next_action()) {
+                Some(
+                    super::repair_job::RepairNextAction::RequestDiagnostic
+                    | super::repair_job::RepairNextAction::Replan,
+                ) => {
                     // Issue #665 Phase 5: caller-side projection (sidecar).
                     let active_request = self.active_request_text().unwrap_or_default();
                     let task_contract =
@@ -15108,34 +15346,50 @@ impl Agent {
                             "[Verifier Repair Policy] A verifier failure is pending. Output a compact diagnosis JSON object only; do not call tools.".to_string()
                         })
                 }
-                VerifierRepairDecision::NeedFreshRead(target) => {
+                Some(super::repair_job::RepairNextAction::RequestPatch { target_hint }) => {
+                    let Some(relative) =
+                        super::repair_job::safe_relative_path_string(&target_hint.path)
+                    else {
+                        return "[Verifier Repair Policy] Verifier repair target is unsafe or unavailable. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
+                            .to_string();
+                    };
+                    let target = self.work_root.join(relative);
+                    let target = std::fs::canonicalize(&target).unwrap_or(target);
                     let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    format!(
-                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one Read on that target. Do not use Edit, Bash, switch files, or finish with prose."
-                    )
+                    if !target.is_file() {
+                        format!(
+                            "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Missing target file: {target_display}. Next required action: exactly one Write on that target. Do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the write."
+                        )
+                    } else if focused_edit_target_already_read(
+                        &self.session.messages,
+                        &target,
+                        &self.work_root,
+                    ) {
+                        format!(
+                            "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one compact Edit on that target. Do not call Read again, Bash, switch files, or finish with prose. Anvil will rerun the verifier after the edit."
+                        )
+                    } else {
+                        format!(
+                            "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one Read on that target. Do not use Edit, Bash, switch files, or finish with prose."
+                        )
+                    }
                 }
-                VerifierRepairDecision::NeedEdit(target) => {
-                    let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    format!(
-                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one compact Edit on that target. Do not call Read again, Bash, switch files, or finish with prose. Anvil will rerun the verifier after the edit."
-                    )
-                }
-                VerifierRepairDecision::NeedWrite(target) => {
-                    let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    format!(
-                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Missing target file: {target_display}. Next required action: exactly one Write on that target. Do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the write."
-                    )
-                }
-                VerifierRepairDecision::NeedTargetDiscovery => {
-                    format!(
-                        "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} No safe repair target was identified yet. Next required action: inspect with exactly one Read, Glob, or Grep. Do not use Bash, Write, Edit, or finish with prose until a target file is known."
-                    )
-                }
-                VerifierRepairDecision::DiagnosticUnavailable => {
-                    "[Verifier Repair Policy] Verifier repair diagnostic is unavailable. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
+                Some(super::repair_job::RepairNextAction::SafeStop { .. }) => {
+                    "[Verifier Repair Policy] Verifier repair cannot continue safely. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
                         .to_string()
                 }
-                VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {
+                Some(
+                    super::repair_job::RepairNextAction::RerunVerifier
+                    | super::repair_job::RepairNextAction::VerifiedDone,
+                ) => {
+                    "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step."
+                        .to_string()
+                }
+                None if self.missing_verifier_job.is_some() => {
+                    "[Verifier Setup Policy] A runnable verifier is required but missing. Emit exactly one allowed setup action for a verifier file or command. Do not switch tasks or answer in prose."
+                        .to_string()
+                }
+                None => {
                     "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step."
                         .to_string()
                 }
@@ -16291,28 +16545,34 @@ impl Agent {
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::VerifierRepairState {
-        let decision = self.scope_safeguarded_verifier_repair_decision(
-            repair_edit_count,
-            repo_edit_calls_made_this_turn,
-        );
-        match decision {
-            VerifierRepairDecision::NeedDiagnostic
-            | VerifierRepairDecision::NeedTargetDiscovery
-            | VerifierRepairDecision::NeedFreshRead(_)
-            | VerifierRepairDecision::NeedWrite(_)
-            | VerifierRepairDecision::NeedEdit(_) => {
-                return super::task_contract::VerifierRepairState::WaitingForEdit {
-                    target_hint: self.repair_job.as_ref().and_then(|context| {
-                        verifier_repair_effective_target_hint(context)
+        if !self.task_contract_verifier_repair_pending {
+            return super::task_contract::VerifierRepairState::None;
+        }
+        if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
+            return super::task_contract::VerifierRepairState::None;
+        }
+        if let Some(job) = self.repair_job.as_ref() {
+            return match job.next_action() {
+                super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
+                    super::task_contract::VerifierRepairState::WaitingForEdit {
+                        target_hint: Some(target_hint),
+                    }
+                }
+                super::repair_job::RepairNextAction::RequestDiagnostic
+                | super::repair_job::RepairNextAction::Replan => {
+                    super::task_contract::VerifierRepairState::WaitingForEdit {
+                        target_hint: verifier_repair_effective_target_hint(job)
                             .cloned()
-                            .or_else(|| context.repair_target_hint.clone())
-                            .or_else(|| context.target_hint.clone())
-                    }),
-                };
-            }
-            VerifierRepairDecision::NoRepair
-            | VerifierRepairDecision::DiagnosticUnavailable
-            | VerifierRepairDecision::ReadyToVerify => {}
+                            .or_else(|| job.repair_target_hint.clone())
+                            .or_else(|| job.target_hint.clone()),
+                    }
+                }
+                super::repair_job::RepairNextAction::RerunVerifier
+                | super::repair_job::RepairNextAction::SafeStop { .. }
+                | super::repair_job::RepairNextAction::VerifiedDone => {
+                    super::task_contract::VerifierRepairState::None
+                }
+            };
         }
         super::task_contract::VerifierRepairState::None
     }
@@ -16323,12 +16583,17 @@ impl Agent {
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::ArtifactRecoveryAction {
-        if self.task_contract_verifier_repair_pending
-            && self.scope_safeguarded_verifier_repair_decision(
-                repair_edit_count,
-                repo_edit_calls_made_this_turn,
-            ) == VerifierRepairDecision::ReadyToVerify
-        {
+        let verifier_repair_ready_to_verify = self.task_contract_verifier_repair_pending
+            && (repair_edit_count
+                .is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count)
+                || self.repair_job.as_ref().is_some_and(|job| {
+                    matches!(
+                        job.next_action(),
+                        super::repair_job::RepairNextAction::RerunVerifier
+                            | super::repair_job::RepairNextAction::VerifiedDone
+                    )
+                }));
+        if verifier_repair_ready_to_verify {
             return super::task_contract::ArtifactRecoveryAction::RunVerifier;
         }
         let artifacts = self.task_contract_artifact_states(contract);
@@ -20167,9 +20432,11 @@ mod tests {
         let first = agent.emit_active_job_selected_if_changed(0);
         assert!(first);
 
-        // Install verifier-repair pending so the next selection differs
-        // from the previous None-winner selection.
+        // Install a concrete verifier-repair job so the next selection
+        // differs from the previous None-winner selection. A stale pending
+        // flag alone is intentionally not a dispatch source anymore.
         agent.task_contract_verifier_repair_pending = true;
+        agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
         let second = agent.emit_active_job_selected_if_changed(1);
         assert!(
             second,
@@ -20860,6 +21127,7 @@ mod tests {
         // Install VerifierRepair as the active job (Priority 1 — wins over
         // every other selectable kind).
         agent.task_contract_verifier_repair_pending = true;
+        agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
 
         // (1) Arbiter must surface a VerifierRepair-derived policy.
         let policy = agent.effective_tool_policy();
@@ -21216,6 +21484,7 @@ mod tests {
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         agent.task_contract_verifier_repair_pending = true;
+        agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
 
         let policy = agent.effective_tool_policy();
         assert_eq!(
@@ -21257,6 +21526,7 @@ mod tests {
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         agent.task_contract_verifier_repair_pending = true;
+        agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
 
         // Sanity: VerifierRepair owns the turn.
         assert_eq!(
@@ -22972,6 +23242,7 @@ fn existing_workspace_candidate_for_role(
 /// [`RepairJob`] is attached. Returns `None` for decisions that do not carry
 /// a path (NoRepair / NeedDiagnostic / NeedTargetDiscovery / ReadyToVerify /
 /// DiagnosticUnavailable).
+#[cfg(test)]
 fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
     match decision {
         VerifierRepairDecision::NeedFreshRead(path)
@@ -23004,6 +23275,7 @@ fn malformed_repair_attempt_outcome_for_active_target(
 /// useful control-flow progress. Staying on the same target is still a retry
 /// against the outer terminal budget; otherwise malformed proposals can loop
 /// until `max_iterations`.
+#[cfg(test)]
 fn verifier_repair_invalid_can_continue(
     decision: &VerifierRepairDecision,
     attempted_target_hint: Option<&super::task_contract::RecoveryTargetHint>,
@@ -23023,6 +23295,7 @@ fn verifier_repair_invalid_can_continue(
     }
 }
 
+#[cfg(test)]
 fn verifier_repair_decision_targets_hint(
     decision: &VerifierRepairDecision,
     hint: &super::task_contract::RecoveryTargetHint,
@@ -23042,6 +23315,7 @@ fn verifier_repair_decision_targets_hint(
 /// resulting relative form is handed to [`TaskWorkspaceScope::contains`].
 /// Targets that fail to strip the prefix (escape via canonical/symlink) are
 /// treated as out-of-scope.
+#[cfg(test)]
 fn target_path_in_scope(
     target: &Path,
     work_root: &Path,
@@ -28013,6 +28287,7 @@ fn verifier_diagnostic_attempt_spec(
     }
 }
 
+#[cfg(test)]
 pub(super) fn verifier_repair_context_target_path(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -28085,6 +28360,7 @@ pub(super) fn verifier_repair_effective_target_hint(
 /// argument is kept so the `Agent::task_contract_verifier_repair_pending`
 /// flag and the repair-job presence remain decoupled at the call sites
 /// (Issue #637: SSOT for the decision lives in `repair_job`).
+#[cfg(test)]
 fn verifier_repair_decision(
     pending: bool,
     context: Option<&super::repair_job::RepairJob>,
@@ -28103,6 +28379,7 @@ fn verifier_repair_decision(
     )
 }
 
+#[cfg(test)]
 fn verifier_repair_policy_for_decision(decision: VerifierRepairDecision) -> EffectiveToolPolicy {
     match decision {
         VerifierRepairDecision::NeedDiagnostic => {
@@ -28136,6 +28413,45 @@ fn verifier_repair_policy_for_decision(decision: VerifierRepairDecision) -> Effe
         VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {
             EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
         }
+    }
+}
+
+fn verifier_repair_policy_for_target_hint(
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    messages: &[ConversationMessage],
+    work_root: &Path,
+) -> EffectiveToolPolicy {
+    let Some(relative) = super::repair_job::safe_relative_path_string(&target_hint.path) else {
+        return EffectiveToolPolicy::restricted(
+            EffectiveToolPolicyReason::VerifierRepair,
+            Vec::new(),
+        );
+    };
+    let target = work_root.join(relative);
+    let target = std::fs::canonicalize(&target).unwrap_or(target);
+    if !target.is_file() {
+        return EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write"],
+            target,
+            false,
+        );
+    }
+    let target_already_read = focused_edit_target_already_read(messages, &target, work_root);
+    if target_already_read {
+        EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Edit"],
+            target,
+            true,
+        )
+    } else {
+        EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read"],
+            target,
+            false,
+        )
     }
 }
 
@@ -30933,9 +31249,9 @@ mod progress_tests {
         verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
         verifier_repair_invalid_can_continue, verifier_repair_pass_messages,
         verifier_repair_pass_retry_message, verifier_repair_policy_for_decision,
-        verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
-        verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
-        workspace_appears_empty,
+        verifier_repair_policy_for_target_hint, verifier_repair_preferred_local_import_source,
+        verifier_repair_stale_assertion_test_target, verifier_repair_target_candidate_from_output,
+        verifier_repair_target_hint_from_output, workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -37234,6 +37550,77 @@ E   assert [{'id': 1}] == []\n";
         let note = focused_edit_guidance_note_for_policy(&policy, &target, &work_root, true);
         assert!(note.contains("only available tool for this turn is Edit"));
         assert!(note.contains("Do not call Read again"));
+    }
+
+    #[test]
+    fn verifier_repair_next_action_policy_uses_target_hint_without_legacy_decision() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let target = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "def main():\n    return 1\n").unwrap();
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "repair implementation".to_string(),
+        };
+
+        let policy = verifier_repair_policy_for_target_hint(&hint, &[], &work_root);
+        assert_eq!(policy.reason(), EffectiveToolPolicyReason::VerifierRepair);
+        assert_eq!(policy.allowed_tool_names_for_prompt().unwrap(), ["Read"]);
+
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "xml-1".to_string(),
+                    name: "Read".to_string(),
+                    arguments: json!({"path":"app/main.py"}),
+                }],
+            ),
+            ConversationMessage::tool("Read".to_string(), "1: def main():".to_string()),
+        ];
+        let policy = verifier_repair_policy_for_target_hint(&hint, &messages, &work_root);
+        assert_eq!(policy.allowed_tool_names_for_prompt().unwrap(), ["Edit"]);
+    }
+
+    #[test]
+    fn active_job_verifier_repair_branch_reads_repair_job_next_action_directly() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("app")).unwrap();
+        std::fs::write(
+            agent.work_root.join("app/main.py"),
+            "def main():\n    return 1\n",
+        )
+        .unwrap();
+        agent.task_contract_verifier_repair_pending = true;
+        agent.repair_job = Some(verifier_context_for("app/main.py"));
+
+        let candidates = agent.build_arbiter_candidates_pub_for_test();
+        let selection = super::super::active_job_arbiter::select_active_job(&candidates);
+        let selected = selection.selected.expect("verifier repair candidate");
+        assert_eq!(
+            selected.kind,
+            super::super::active_job_arbiter::ActiveJobKind::VerifierRepair
+        );
+        assert_eq!(
+            selected.policy.allowed_tool_names_for_prompt().unwrap(),
+            ["Read"]
+        );
+        match selected.desired_action {
+            super::super::active_job_arbiter::DesiredAction::VerifierRepair {
+                target_hint, ..
+            } => {
+                assert_eq!(
+                    target_hint.map(|hint| hint.path),
+                    Some("app/main.py".to_string())
+                );
+            }
+            other => panic!("unexpected desired action: {other:?}"),
+        }
     }
 
     #[test]
