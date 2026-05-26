@@ -35,8 +35,9 @@ pub fn is_test_file(path: &Path) -> bool {
 
 /// Setup / configuration files that ship with the repo. The list is pinned to
 /// the same set previously hard-coded in `agent::orchestration::is_setup_file`
-/// — extending it requires updating both the helper and the AC tests that
-/// rely on the classification.
+/// plus language manifest files used by the first-class verifier selectors.
+/// Extending it requires updating both the helper and the AC tests that rely
+/// on the classification.
 pub fn is_setup_file(path: &Path) -> bool {
     let file_name = path
         .file_name()
@@ -44,7 +45,9 @@ pub fn is_setup_file(path: &Path) -> bool {
         .unwrap_or_default();
     matches!(
         file_name,
-        "package.json"
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "package.json"
             | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
@@ -130,6 +133,8 @@ mod tests {
     #[test]
     fn test_is_setup_file_known_names() {
         for name in [
+            "Cargo.toml",
+            "Cargo.lock",
             "package.json",
             "package-lock.json",
             "pnpm-lock.yaml",
@@ -161,7 +166,6 @@ mod tests {
 
     #[test]
     fn test_is_setup_file_negative() {
-        assert!(!is_setup_file(&PathBuf::from("Cargo.toml")));
         assert!(!is_setup_file(&PathBuf::from("src/main.rs")));
         assert!(!is_setup_file(&PathBuf::from("README.md")));
     }

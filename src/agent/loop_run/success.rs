@@ -134,13 +134,21 @@ impl Agent {
             return true;
         }
         let scope = self.current_workspace_scope();
-        if super::project_probe::probe_project_unit(
-            &self.work_root,
-            &scope,
-            &self.turn_edited_relative_paths,
-        )
-        .is_some_and(|unit| !unit.verifier_candidates.is_empty())
-        {
+        let project_unit = if let Some(request) = self.active_request_text() {
+            super::project_probe::probe_project_unit_for_request(
+                &self.work_root,
+                &request,
+                &scope,
+                &self.turn_edited_relative_paths,
+            )
+        } else {
+            super::project_probe::probe_project_unit(
+                &self.work_root,
+                &scope,
+                &self.turn_edited_relative_paths,
+            )
+        };
+        if project_unit.is_some_and(|unit| !unit.verifier_candidates.is_empty()) {
             return true;
         }
         self.active_request_text()
@@ -301,11 +309,20 @@ impl Agent {
         // Issue #651 Phase 5.1: structured verifier binding inputs.
         let (owned_test_artifacts, test_execution_required) = self.success_verifier_test_binding();
         let workspace_scope: TaskWorkspaceScope = self.current_workspace_scope();
-        let project_unit = super::project_probe::probe_project_unit(
-            &self.work_root,
-            &workspace_scope,
-            &self.turn_edited_relative_paths,
-        );
+        let project_unit = if let Some(request) = self.active_request_text() {
+            super::project_probe::probe_project_unit_for_request(
+                &self.work_root,
+                &request,
+                &workspace_scope,
+                &self.turn_edited_relative_paths,
+            )
+        } else {
+            super::project_probe::probe_project_unit(
+                &self.work_root,
+                &workspace_scope,
+                &self.turn_edited_relative_paths,
+            )
+        };
         let v_inputs = VerifierInputs {
             score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,

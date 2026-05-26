@@ -82,10 +82,20 @@ pub(super) fn build_repair_action_with_authority(
 fn validate_authority_consistency(
     brief: &RepairBrief,
     packet: &FailurePacket,
-    _evidence: &AuthorityEvidence,
+    evidence: &AuthorityEvidence,
 ) -> Result<(), RepairPlanRejection> {
     if matches!(brief.source_of_truth, SourceOfTruth::Ambiguous)
         || brief.allowed_change_kind == AllowedChangeKind::InsufficientEvidence
+    {
+        return Err(RepairPlanRejection::AmbiguousAuthority);
+    }
+    if brief.source_of_truth == SourceOfTruth::UserRequest
+        && !evidence.user_request_has_explicit_spec
+    {
+        return Err(RepairPlanRejection::AmbiguousAuthority);
+    }
+    if brief.source_of_truth == SourceOfTruth::BehaviorContract
+        && !evidence.behavior_contract_present
     {
         return Err(RepairPlanRejection::AmbiguousAuthority);
     }
@@ -116,6 +126,25 @@ fn validate_authority_consistency(
     if !packet.observed_expected_pairs.is_empty()
         && brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation
         && !matches!(brief.source_of_truth, SourceOfTruth::UsageDocs)
+    {
+        return Err(RepairPlanRejection::AmbiguousAuthority);
+    }
+
+    // Exact observed/expected assertion pairs come from verifier output, not
+    // from the user's specification. For implementation edits that try to
+    // satisfy such values, require an external authority signal; otherwise a
+    // generated test literal can drag implementation behavior toward a
+    // hallucinated or typo-like expectation.
+    if !packet.observed_expected_pairs.is_empty()
+        && brief.allowed_change_kind == AllowedChangeKind::FixImplementationBehavior
+        && !evidence.has_explicit_spec_authority()
+        && !matches!(
+            brief.source_of_truth,
+            SourceOfTruth::UserRequest
+                | SourceOfTruth::BehaviorContract
+                | SourceOfTruth::VerifiedPublicInterface
+                | SourceOfTruth::UsageDocs
+        )
     {
         return Err(RepairPlanRejection::AmbiguousAuthority);
     }
@@ -199,6 +228,44 @@ mod tests {
         assert_eq!(
             action.allowed_change_kind,
             AllowedChangeKind::FixImplementationBehavior
+        );
+    }
+
+    #[test]
+    fn behavior_contract_self_claim_requires_controller_evidence() {
+        let packet = packet(ArtifactRole::Implementation, "app/main.py");
+        let evidence = AuthorityEvidence {
+            user_request_has_explicit_spec: false,
+            behavior_contract_present: false,
+            observed_expected_pair_count: 1,
+            candidate_artifact_count: 1,
+        };
+
+        assert_eq!(
+            build_repair_action_with_authority(
+                &implementation_brief("app/main.py"),
+                &packet,
+                &evidence,
+            ),
+            Err(RepairPlanRejection::AmbiguousAuthority)
+        );
+    }
+
+    #[test]
+    fn generated_assertion_literal_cannot_drive_unknown_implementation_repair() {
+        let packet = packet(ArtifactRole::Implementation, "app/main.py");
+        let evidence = AuthorityEvidence {
+            user_request_has_explicit_spec: false,
+            behavior_contract_present: false,
+            observed_expected_pair_count: 1,
+            candidate_artifact_count: 1,
+        };
+        let mut brief = implementation_brief("app/main.py");
+        brief.source_of_truth = SourceOfTruth::Unknown;
+
+        assert_eq!(
+            build_repair_action_with_authority(&brief, &packet, &evidence),
+            Err(RepairPlanRejection::AmbiguousAuthority)
         );
     }
 

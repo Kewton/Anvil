@@ -196,6 +196,28 @@ pub(super) fn probe_project_unit(
     build_project_unit(work_root, &facts)
 }
 
+pub(super) fn probe_project_unit_for_request(
+    work_root: &Path,
+    request: &str,
+    scope: &TaskWorkspaceScope,
+    edited_files: &HashSet<String>,
+) -> Option<ProjectUnit> {
+    let facts = WorkspaceFacts {
+        files: collect_scoped_files(work_root, scope),
+        edited_files: edited_files.clone(),
+        observed_stacks: observed_stacks(work_root, edited_files),
+    };
+    if facts.files.is_empty() {
+        return None;
+    }
+    if stack_mismatch_reason(request, &facts).is_some() {
+        return None;
+    }
+    let mut unit = build_project_unit(work_root, &facts)?;
+    constrain_project_unit_to_request(request, &mut unit)?;
+    Some(unit)
+}
+
 fn collect_scoped_files(work_root: &Path, scope: &TaskWorkspaceScope) -> Vec<String> {
     let root_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
     let mut out = Vec::new();
@@ -418,6 +440,56 @@ fn verifier_candidates(
         });
     }
     out
+}
+
+fn constrain_project_unit_to_request(request: &str, unit: &mut ProjectUnit) -> Option<()> {
+    let Some(expected) = expected_stack(request) else {
+        return Some(());
+    };
+    let verifier_count_before = unit.verifier_candidates.len();
+    unit.verifier_candidates
+        .retain(|candidate| verifier_candidate_matches_expected_stack(candidate, expected));
+    if !unit.verifier_candidates.is_empty()
+        || project_unit_has_expected_stack_signal(unit, expected)
+        || verifier_count_before == 0
+    {
+        return Some(());
+    }
+    None
+}
+
+fn verifier_candidate_matches_expected_stack(
+    candidate: &ProjectUnitVerifierCandidate,
+    expected: StackKind,
+) -> bool {
+    matches!(
+        (candidate.source, expected),
+        ("cargo_manifest", StackKind::Rust)
+            | ("python_tests", StackKind::Python)
+            | (
+                "package_json_scripts",
+                StackKind::Node | StackKind::TypeScript
+            )
+    )
+}
+
+fn project_unit_has_expected_stack_signal(unit: &ProjectUnit, expected: StackKind) -> bool {
+    let expected_label = stack_label(expected);
+    unit.observed_stacks.contains(&expected_label)
+        || unit
+            .manifests
+            .iter()
+            .any(|manifest| manifest_matches_stack(manifest, expected))
+}
+
+fn manifest_matches_stack(manifest: &str, expected: StackKind) -> bool {
+    matches!(
+        (manifest, expected),
+        ("Cargo.toml", StackKind::Rust)
+            | ("pyproject.toml" | "requirements.txt", StackKind::Python)
+            | ("package.json", StackKind::Node | StackKind::TypeScript)
+            | ("tsconfig.json", StackKind::TypeScript)
+    )
 }
 
 fn package_json_has_test_script(work_root: &Path) -> bool {
@@ -777,6 +849,85 @@ mod tests {
         assert!(unit.verifier_candidates.is_empty());
         assert_eq!(unit.confidence, ProjectUnitConfidence::Low);
         assert!(unit.summary().contains("confidence=low"));
+    }
+
+    #[test]
+    fn rust_request_does_not_accept_python_only_project_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("tests/test_main.py"),
+            "def test_slug(): assert True\n",
+        )
+        .expect("python test");
+        std::fs::write(dir.path().join("README.md"), "# Slug\npytest\n").expect("readme");
+
+        let request = "文字列スラッグ生成用のRustライブラリを開発してください。README.mdに使用方法を書き、cargo testで動くテストコードも実装してください。";
+        let scope = scope(dir.path(), request);
+        let edited = edited(&["tests/test_main.py", "README.md"]);
+
+        let generic_unit = probe_project_unit(dir.path(), &scope, &edited).expect("generic unit");
+        assert_eq!(generic_unit.verifier_candidates[0].source, "python_tests");
+
+        let request_unit = probe_project_unit_for_request(dir.path(), request, &scope, &edited);
+        assert_eq!(request_unit, None);
+    }
+
+    #[test]
+    fn rust_request_filters_unrelated_python_verifier_when_rust_manifest_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='slug'\nversion='0.0.0'\nedition='2021'\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn slug(s:&str)->String{s.into()}",
+        )
+        .expect("lib");
+        std::fs::write(
+            dir.path().join("tests/test_main.py"),
+            "def test_slug(): assert True\n",
+        )
+        .expect("python test");
+        std::fs::write(dir.path().join("README.md"), "# Slug\ncargo test\n").expect("readme");
+
+        let request =
+            "Rustでslugライブラリを実装し、READMEとcargo testで動くテストを書いてください";
+        let scope = scope(dir.path(), request);
+        let edited = edited(&["src/lib.rs", "tests/test_main.py", "README.md"]);
+
+        let unit =
+            probe_project_unit_for_request(dir.path(), request, &scope, &edited).expect("unit");
+        assert!(unit.verifier_candidates.is_empty());
+        assert!(unit.observed_stacks.contains(&"rust"));
+    }
+
+    #[test]
+    fn typescript_request_can_use_package_json_verifier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("src");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node --test tests/*.test.ts"}}"#,
+        )
+        .expect("package");
+        std::fs::write(dir.path().join("src/index.ts"), "export const x = 1;").expect("impl");
+        std::fs::write(dir.path().join("tests/index.test.ts"), "test('x',()=>{})").expect("test");
+        std::fs::write(dir.path().join("README.md"), "npm test").expect("readme");
+
+        let request = "TypeScriptで小さなライブラリを実装し、READMEとテストを書いてください";
+        let scope = scope(dir.path(), request);
+        let edited = edited(&["src/index.ts", "tests/index.test.ts", "README.md"]);
+
+        let unit =
+            probe_project_unit_for_request(dir.path(), request, &scope, &edited).expect("unit");
+        assert_eq!(unit.verifier_candidates.len(), 1);
+        assert_eq!(unit.verifier_candidates[0].source, "package_json_scripts");
     }
 
     #[test]

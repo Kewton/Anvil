@@ -390,11 +390,11 @@ impl MissingVerifierJob {
     }
 
     /// Allowed-tool whitelist surfaced to the effective tool policy when
-    /// this state is active. Intentionally narrow: the model is expected
-    /// to either create a verifier file or run one (Bash) — Read alone
-    /// cannot make progress out of this state.
+    /// this state is active. Intentionally narrow: the model must create or
+    /// update verifier metadata before Anvil permits another verifier run.
+    /// Bash is driven by the controller after an in-scope setup edit.
     pub(super) fn allowed_tool_names(&self) -> &'static [&'static str] {
-        &["Write", "Edit", "Bash"]
+        &["Write", "Edit"]
     }
 }
 
@@ -512,6 +512,7 @@ impl RepairAttemptKey {
 #[allow(dead_code)] // closed future-proof reject taxonomy for the migration.
 pub(super) enum RejectedAttemptReason {
     MalformedPatch,
+    ProviderTimeout,
     AmbiguousAuthority,
     WrongTarget,
     UnsafePatch,
@@ -525,6 +526,7 @@ impl RejectedAttemptReason {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::MalformedPatch => "malformed_patch",
+            Self::ProviderTimeout => "provider_timeout",
             Self::AmbiguousAuthority => "ambiguous_authority",
             Self::WrongTarget => "wrong_target",
             Self::UnsafePatch => "unsafe_patch",
@@ -1339,6 +1341,28 @@ pub(super) fn sanitize_repair_job_text_with_char_cap(input: &str, max_chars: usi
 /// design judgment #4 + Codex CB-002 reflected).
 pub(super) fn mask_secrets_headers_and_neutralize(input: &str) -> String {
     mask_and_neutralize(input)
+}
+
+/// File excerpts given to the repair patch provider must remain copyable as
+/// exact source anchors. Keep line feeds and tabs so `old_string` can be
+/// copied from the excerpt, while still masking secrets and neutralizing other
+/// control characters that could corrupt logs or prompts.
+pub(super) fn mask_code_excerpt_preserving_patch_anchors(input: &str) -> String {
+    let masked = crate::session::feedback::mask_header_family(
+        &crate::session::feedback::mask_secrets(input),
+    );
+    masked
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\t' {
+                c
+            } else if (c as u32) < 0x20 || c == '\x7f' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn mask_and_neutralize(input: &str) -> String {
@@ -2547,6 +2571,19 @@ mod tests {
     }
 
     #[test]
+    fn code_excerpt_sanitizer_preserves_patch_anchors_but_neutralizes_controls() {
+        let raw =
+            "Authorization: Bearer SECRETVALUE\nfn main() {\n\tprintln!(\"ok\");\r\n}\u{0000}";
+        let out = mask_code_excerpt_preserving_patch_anchors(raw);
+
+        assert!(!out.contains("SECRETVALUE"));
+        assert!(out.contains('\n'));
+        assert!(out.contains('\t'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\u{0000}'));
+    }
+
+    #[test]
     fn missing_verifier_job_suppresses_verifier_retry_until_in_scope_edit() {
         // Issue #646 (A1/B2): a fresh job suppresses verifier retry;
         // recording an in-scope edit flips the gate.
@@ -2600,7 +2637,7 @@ mod tests {
     #[test]
     fn missing_verifier_job_allowed_tool_names_match_first_class_state() {
         let job = MissingVerifierJob::new(3, 0);
-        assert_eq!(job.allowed_tool_names(), &["Write", "Edit", "Bash"]);
+        assert_eq!(job.allowed_tool_names(), &["Write", "Edit"]);
     }
 
     #[test]
@@ -2745,6 +2782,30 @@ mod tests {
         job.apply_event(RepairJobEvent::PatchRejected {
             key,
             reason: RejectedAttemptReason::NoopPatch,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn repair_job_repeated_provider_timeout_replans_before_budget_exhaustion() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let key = RepairAttemptKey::from_target(
+            &target,
+            Some(AllowedChangeKind::FixImplementationBehavior),
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target)),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::ProviderTimeout,
+        });
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key,
+            reason: RejectedAttemptReason::ProviderTimeout,
         });
 
         assert_eq!(job.next_action(), RepairNextAction::Replan);

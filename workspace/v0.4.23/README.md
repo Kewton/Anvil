@@ -532,3 +532,71 @@ Observed remaining failure modes:
   especially when the model creates only setup or implementation artifacts.
 - The repaired flow is no longer limited to FastAPI, but generic completion is
   not yet stable enough to call the original goal fully achieved.
+
+### Follow-up Generic Smoke After Repair-Pass Budget
+
+Run root:
+`/private/tmp/anvil-v0423-postfix-generic`
+
+No-PAM, 5 mixed cases, `target/release/anvil`, `--max-iterations 50`:
+
+| Case | Result | Notes |
+|---|---:|---|
+| FastAPI CRUD | `done` | Verified, but slow: 384s and many repair cycles. |
+| Python CSV CLI | `repair_safe_stop` | Controlled stop on repair-plan role mismatch; no uncontrolled timeout. |
+| Rust word-count CLI | `missing_repo_edits` | `cargo init` scaffold was not enough to satisfy requirement-specific implementation evidence. |
+| Node JSON formatter CLI | `repair_exhausted` | Implementation/tests/docs were generated, but repair did not converge. Target path normalization still needs work. |
+| docs-only README | `done` | Correctly handled as documentation-only work. |
+
+Conclusion:
+
+- The repair-pass wall-clock budget improves control stability by preventing
+  the controller from waiting indefinitely inside one repair provider call.
+- Generic performance is still not acceptable for broad unattended use.
+  The next structural work should focus on bootstrap-artifact evidence,
+  workspace-relative path normalization in repair targets, and repair patch
+  convergence rather than adding domain-specific templates.
+
+### Expanded Generic Smoke: Additional 10 No-PAM Cases
+
+Run root:
+`/private/tmp/anvil-v0423-generic-expanded`
+
+Command shape:
+`target/release/anvil -m qwen3.6:27b-coding-nvfp4 --sidecar-model qwen3.5:9b -y --fresh-session --oneshot --no-footer --deterministic-fallback full --max-iterations 50`
+
+| Case | Terminal | Duration | Quality note |
+|---|---:|---:|---|
+| Python TOML config CLI | `repair_exhausted` | 222s | Thin initial artifacts; repair proposals were repeatedly rejected. |
+| Rust slug library | `done` | 23s | False positive: only `README.md` and `tests/test_main.py` were created; no Rust implementation or Cargo project. |
+| Node CSV-to-JSON CLI | `repair_exhausted` | 150s | Generated implementation/tests/docs, but repair did not converge. |
+| Python file-renamer CLI | `repair_exhausted` | 355s | Repeated implementation repairs; final verifier still had 3 failing tests. |
+| Rust JSONL counter CLI | `repair_exhausted` | 239s | Generated Rust project and tests, then exhausted after rejected patches. |
+| FastAPI notes API | `done` | 147s | Valid completion; verifier passed after repair. |
+| Python Markdown lint CLI | `repair_exhausted` | 416s | Near miss: 13/14 tests passed, but repair exhausted on code-block handling. |
+| Node ToDo JSON CLI | `repair_exhausted` | 283s | Generated artifacts; repeated patch rejection led to safe stop. |
+| Rust JSON config merge CLI | `done` | 147s | Valid completion; verified with `cargo test --test main`. |
+| Docs-only SRE runbook | `missing_repo_edits` | 190s | No file edit; artifact completion retry budget exhausted. |
+
+Aggregate:
+
+- Raw terminal `done`: 3/10
+- Quality-adjusted valid `done`: 2/10
+- False positive `done`: 1/10
+- Controlled repair exhaustion / safe stop: 6/10
+- Artifact completion failure before any edit: 1/10
+- Uncontrolled timeout: 0/10
+
+Interpretation:
+
+- The latest repair-pass budget change is effective for control stability:
+  none of the additional cases hung indefinitely inside repair.
+- Generic task completion remains weak. The dominant failure is no longer
+  dispatch falling into a random recovery path, but repair quality and
+  artifact-evidence correctness.
+- The Rust slug false positive is a serious correctness gap: verifier
+  selection and artifact completion accepted a Python dummy test for a Rust
+  library request. This needs priority over more repair heuristics.
+- Docs-only handling improved in one earlier smoke but still has an initial
+  edit-stability gap; documentation artifacts need the same strict-but-simple
+  target execution guarantee as implementation/test artifacts.

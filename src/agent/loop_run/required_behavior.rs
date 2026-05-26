@@ -343,6 +343,35 @@ pub(super) fn project_behavior_contract(
     })
 }
 
+/// Return true when the extracted behavior contract is strong enough to act as
+/// verifier-repair authority.
+///
+/// `project_behavior_contract()` is intentionally broader: it can expose
+/// domain terms, interface hints, setup labels, and verification labels as
+/// diagnostic context. Those labels are useful for prompting, but they are too
+/// weak to authorize exact-value implementation changes after a generated test
+/// assertion fails. This predicate is the narrower boundary used by repair
+/// authority selection.
+pub(super) fn behavior_contract_has_repair_authority(
+    contract: &super::task_contract::TaskContract,
+) -> bool {
+    let rb = &contract.required_behavior;
+    if rb.behavior_goal.is_some() {
+        return true;
+    }
+    if rb.non_goals.as_ref().is_some_and(|items| !items.is_empty()) {
+        return true;
+    }
+    rb.operations.as_ref().is_some_and(|ops| {
+        ops.iter().any(|op| {
+            matches!(
+                op,
+                Operation::Create | Operation::Read | Operation::Update | Operation::Delete
+            )
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Issue #664 (AD13 / AD18 / AD22 / Stage B fallback helpers).
 //
@@ -819,6 +848,18 @@ fn extract_operations(_scan: &str, lower: &str) -> Option<Vec<Operation>> {
     for (needle, op, mode) in OPERATION_KEYWORDS {
         if keyword_hit(lower, needle, *mode) && !hits.contains(op) {
             hits.push(*op);
+        }
+    }
+    if lower.contains("crud") {
+        for op in [
+            Operation::Create,
+            Operation::Read,
+            Operation::Update,
+            Operation::Delete,
+        ] {
+            if !hits.contains(&op) {
+                hits.push(op);
+            }
         }
     }
     if hits.is_empty() {
@@ -1601,6 +1642,14 @@ fn truncate_excerpt(s: &str) -> String {
 }
 
 fn operation_in_request(op: Operation, lower: &str) -> bool {
+    if lower.contains("crud")
+        && matches!(
+            op,
+            Operation::Create | Operation::Read | Operation::Update | Operation::Delete
+        )
+    {
+        return true;
+    }
     for (needle, candidate, mode) in OPERATION_KEYWORDS {
         if *candidate == op && keyword_hit(lower, needle, *mode) {
             return true;
@@ -2125,6 +2174,36 @@ mod tests {
         let proj = proj.unwrap();
         assert!(proj.confidence >= LOW_CONFIDENCE_THRESHOLD);
         assert!(!proj.fields_used.is_empty());
+    }
+
+    #[test]
+    fn broad_domain_terms_do_not_create_repair_authority() {
+        use super::super::task_contract::TaskContract;
+        let tc = TaskContract::from_request(
+            "文字列スラッグ生成用のRustライブラリを開発してください。README.mdとcargo testで動くテストも実装してください。",
+        );
+
+        assert!(
+            project_behavior_contract(&tc).is_some(),
+            "domain/runtime labels may still be useful diagnostic context"
+        );
+        assert!(
+            !behavior_contract_has_repair_authority(&tc),
+            "domain terms alone must not authorize exact assertion repair"
+        );
+    }
+
+    #[test]
+    fn crud_operations_create_repair_authority() {
+        use super::super::task_contract::TaskContract;
+        let tc = TaskContract::from_request(
+            "FastAPIでCRUD APIを作成してREADMEとテストも追加してください",
+        );
+
+        assert!(
+            behavior_contract_has_repair_authority(&tc),
+            "closed CRUD operation labels are strong enough repair authority"
+        );
     }
 
     /// Phase 4 / Task 4.2 / Task 4.3: confidence < threshold (0.5) で None。

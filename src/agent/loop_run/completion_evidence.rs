@@ -306,7 +306,15 @@ mod tests {
 
     #[test]
     fn repo_edit_category_classifies_setup_path() {
-        // U-02 — package.json explicitly; Cargo.toml is out of SSOT scope (DR1-002).
+        // U-02 — setup / manifest files are evidence for dependency/config work.
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("Cargo.toml")),
+            RepoEditCategory::Setup
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("Cargo.lock")),
+            RepoEditCategory::Setup
+        );
         assert_eq!(
             classify_repo_edit_path(PathBuf::from("package.json")),
             RepoEditCategory::Setup
@@ -365,10 +373,6 @@ mod tests {
         // U-05
         assert_eq!(
             classify_repo_edit_path(PathBuf::from("Makefile")),
-            RepoEditCategory::Other
-        );
-        assert_eq!(
-            classify_repo_edit_path(PathBuf::from("Cargo.toml")),
             RepoEditCategory::Other
         );
     }

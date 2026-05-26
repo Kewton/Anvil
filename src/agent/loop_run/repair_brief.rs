@@ -291,14 +291,16 @@ pub(super) fn repair_brief_from_legacy_diagnostic(
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
         return Err(RepairBriefParseError::InvalidConfidence);
     }
-    let repair_target = match (input.probable_cause_role, input.repair_target_path) {
+    let target_role = input.probable_cause_role;
+    let repair_target = match (target_role, input.repair_target_path) {
         (Some(role), Some(path)) => Some(RepairBriefTarget {
             role,
             path: sanitize_path(&path),
         }),
         _ => None,
     };
-    let allowed_change_kind = legacy_kind_to_allowed_change_kind(&input.failure_kind);
+    let allowed_change_kind =
+        legacy_kind_to_allowed_change_kind_for_role(&input.failure_kind, target_role);
     let root_cause = input
         .summary
         .as_deref()
@@ -423,7 +425,40 @@ fn artifact_role_from_str(value: &str) -> Option<ArtifactRole> {
 }
 
 pub(super) fn legacy_kind_to_allowed_change_kind(value: &str) -> AllowedChangeKind {
-    match normalize_enum(value).as_str() {
+    legacy_kind_to_allowed_change_kind_for_role(value, None)
+}
+
+pub(super) fn legacy_kind_to_allowed_change_kind_for_role(
+    value: &str,
+    target_role: Option<ArtifactRole>,
+) -> AllowedChangeKind {
+    let normalized = normalize_enum(value);
+    match target_role {
+        Some(ArtifactRole::Test) => match normalized.as_str() {
+            "compile_or_syntax_error"
+            | "runtime_error"
+            | "test_bug"
+            | "test_setup_bug"
+            | "test_import_bug" => AllowedChangeKind::FixTestImportOrSetup,
+            "local_import_contract_mismatch" => AllowedChangeKind::ConnectExistingTestSetupToSut,
+            "assertion_mismatch" => AllowedChangeKind::FixGeneratedTestExpectation,
+            _ => legacy_kind_to_allowed_change_kind_unscoped(&normalized),
+        },
+        Some(ArtifactRole::Setup) => match normalized.as_str() {
+            "missing_verifier" | "dependency_missing" | "config_or_verifier_error" => {
+                AllowedChangeKind::FixDependencyOrConfig
+            }
+            _ => AllowedChangeKind::FixDependencyOrConfig,
+        },
+        Some(ArtifactRole::UsageDocs) => AllowedChangeKind::InsufficientEvidence,
+        Some(ArtifactRole::Implementation) | None => {
+            legacy_kind_to_allowed_change_kind_unscoped(&normalized)
+        }
+    }
+}
+
+fn legacy_kind_to_allowed_change_kind_unscoped(normalized: &str) -> AllowedChangeKind {
+    match normalized {
         "dependency_missing" | "config_or_verifier_error" | "missing_verifier" => {
             AllowedChangeKind::FixDependencyOrConfig
         }
@@ -575,6 +610,35 @@ mod tests {
         assert_eq!(
             brief.allowed_change_kind,
             AllowedChangeKind::FixTestImportOrSetup
+        );
+    }
+
+    #[test]
+    fn legacy_diagnostic_adapter_uses_target_role_for_compile_errors() {
+        let test_brief = repair_brief_from_legacy_diagnostic(LegacyDiagnosticBriefInput {
+            failure_kind: "compile_or_syntax_error".to_string(),
+            probable_cause_role: Some(ArtifactRole::Test),
+            repair_target_path: Some("tests/lib.rs".to_string()),
+            repair_target_confidence: Some(0.95),
+            summary: Some("generated test calls the function with the wrong signature".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            test_brief.allowed_change_kind,
+            AllowedChangeKind::FixTestImportOrSetup
+        );
+
+        let impl_brief = repair_brief_from_legacy_diagnostic(LegacyDiagnosticBriefInput {
+            failure_kind: "compile_or_syntax_error".to_string(),
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            repair_target_path: Some("src/lib.rs".to_string()),
+            repair_target_confidence: Some(0.95),
+            summary: Some("implementation has a syntax error".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            impl_brief.allowed_change_kind,
+            AllowedChangeKind::FixImplementationBehavior
         );
     }
 }

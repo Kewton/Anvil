@@ -289,11 +289,69 @@ fn excerpt_satisfies_behavior(contract: &TaskContract, excerpt: &str) -> bool {
             .excerpt_hits_any_domain_term(excerpt)
 }
 
+fn implementation_excerpt_is_obviously_placeholder(excerpt: &str) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    let markers = [
+        "placeholder",
+        "todo",
+        "stub",
+        "not implemented",
+        "unimplemented",
+        "dummy",
+    ];
+    markers.iter().any(|marker| lower.contains(marker))
+}
+
+fn implementation_excerpt_satisfies_completion(contract: &TaskContract, excerpt: &str) -> bool {
+    if implementation_excerpt_is_obviously_placeholder(excerpt) {
+        return false;
+    }
+    // Deterministic behavior labels are useful when they match, but they
+    // are too brittle to be a hard multilingual semantic gate. The
+    // verifier/repair pipeline owns semantic correctness after artifacts
+    // exist; artifact completion only blocks obvious placeholder bodies.
+    excerpt_satisfies_behavior(contract, excerpt) || !excerpt.trim().is_empty()
+}
+
 /// `usage_docs` surface marker categories. Short tokens (`run`) use the
 /// token-boundary helper so "running" / "github.run" do not false-positive.
-const USAGE_DOCS_SETUP_MARKERS: &[(&str, bool)] = &[("install", false), ("setup", false)];
-const USAGE_DOCS_RUN_MARKERS: &[(&str, bool)] = &[("run", true), ("start", false)];
-const USAGE_DOCS_VERIFY_MARKERS: &[(&str, bool)] = &[("test", false), ("verify", false)];
+const USAGE_DOCS_SETUP_MARKERS: &[(&str, bool)] = &[
+    ("install", false),
+    ("setup", false),
+    ("dependency", false),
+    ("dependencies", false),
+    ("package", false),
+    ("requirements", false),
+    ("cargo.toml", false),
+    ("package.json", false),
+    ("pyproject.toml", false),
+    ("セットアップ", false),
+    ("依存", false),
+    ("設定", false),
+];
+const USAGE_DOCS_RUN_MARKERS: &[(&str, bool)] = &[
+    ("run", true),
+    ("start", false),
+    ("usage", false),
+    ("example", false),
+    ("build", false),
+    ("execute", false),
+    ("使用", false),
+    ("使い方", false),
+    ("実行", false),
+    ("例", false),
+    ("ビルド", false),
+];
+const USAGE_DOCS_VERIFY_MARKERS: &[(&str, bool)] = &[
+    ("test", false),
+    ("verify", false),
+    ("check", false),
+    ("pytest", false),
+    ("cargo test", false),
+    ("npm test", false),
+    ("テスト", false),
+    ("検証", false),
+];
 
 /// At least two of {setup, run, verification} surface categories must
 /// appear in the README excerpt for usage_docs to count as covered. One
@@ -369,9 +427,15 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
                 continue;
             };
             let covered = match *role {
-                ArtifactRole::Implementation | ArtifactRole::Test => {
-                    excerpt_satisfies_behavior(inputs.contract, excerpt)
+                ArtifactRole::Implementation => {
+                    implementation_excerpt_satisfies_completion(inputs.contract, excerpt)
                 }
+                // Test artifacts are behavior-validated by the structured
+                // verifier binding later in the flow. Requiring the test
+                // source excerpt itself to hit deterministic request terms is
+                // brittle for multilingual prompts and for tests that express
+                // behavior through expected values rather than domain words.
+                ArtifactRole::Test => true,
                 ArtifactRole::UsageDocs => usage_docs_surface_satisfied(excerpt),
                 ArtifactRole::Setup => true,
             };
@@ -1071,6 +1135,12 @@ pub(super) fn request_asks_for_implementation_artifact(
             "component",
             "service",
             "module",
+            "library",
+            "crate",
+            "package",
+            "tool",
+            "program",
+            "command",
         ],
     ) || contains_ascii_token(lower, "api")
         || contains_any(
@@ -1082,6 +1152,11 @@ pub(super) fn request_asks_for_implementation_artifact(
                 "フロントエンド",
                 "アプリ",
                 "機能",
+                "ライブラリ",
+                "クレート",
+                "パッケージ",
+                "ツール",
+                "コマンド",
             ],
         )
         || mentions_stack_as_build_target(request, lower)
@@ -1556,11 +1631,16 @@ fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
             "with django",
             "using django",
             "django app",
+            "rust library",
+            "rust crate",
+            "rust package",
+            "cargo project",
         ],
     ) || contains_any(
         request,
         &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
-    )
+    ) || (request.contains("Rust")
+        && contains_any(request, &["ライブラリ", "クレート", "パッケージ"]))
 }
 
 fn contains_implementation_file_hint(lower: &str) -> bool {
@@ -1697,6 +1777,30 @@ mod tests {
         evidence.push(repo_edit(RepoEditCategory::Setup));
 
         let decision = contract.evaluate(&evidence);
+        assert_eq!(
+            missing_labels(&decision),
+            vec!["implementation", "test", "usage_docs"]
+        );
+    }
+
+    #[test]
+    fn rust_library_with_docs_and_tests_requires_implementation() {
+        let contract = TaskContract::from_request(
+            "文字列スラッグ生成用のRustライブラリを開発してください。README.mdとcargo testで動くテストも実装してください。",
+        );
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+
+        let decision = contract.evaluate(&EvidenceSet::new());
         assert_eq!(
             missing_labels(&decision),
             vec!["implementation", "test", "usage_docs"]
@@ -2155,6 +2259,36 @@ mod tests {
     }
 
     #[test]
+    fn implementation_excerpt_non_placeholder_is_allowed_to_reach_verifier() {
+        let contract = TaskContract::from_request("Build a slugify Rust library. Add tests.");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        let excerpts = build_excerpts(&[
+            (
+                ArtifactRole::Implementation,
+                "pub fn slug(input: &str) -> String { input.to_lowercase() }\n",
+            ),
+            (
+                ArtifactRole::Test,
+                "assert_eq!(subject(\"Hello World\"), \"hello-world\");\n",
+            ),
+        ]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
+    }
+
+    #[test]
     fn implementation_excerpt_with_operation_satisfies_coverage() {
         let contract = TaskContract::from_request(
             "Build a Task CRUD API: create / read / update / delete a Task entity. Verify with tests.",
@@ -2223,6 +2357,43 @@ mod tests {
     }
 
     #[test]
+    fn test_excerpt_behavior_terms_are_not_required_before_verifier_binding() {
+        let contract = TaskContract::from_request(
+            "Build a Task Rust library that can create tasks. Document usage in README. Add tests.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        let excerpts = build_excerpts(&[
+            (
+                ArtifactRole::Implementation,
+                "pub struct Task { id: u64 }\npub fn create_task(id: u64) -> Task { Task { id } }\n",
+            ),
+            (
+                ArtifactRole::Test,
+                "let got = subject(\"Hello World\"); assert_eq!(got, expected);\n",
+            ),
+            (
+                ArtifactRole::UsageDocs,
+                "## Usage\nExample code is shown below.\n## Test\ncargo test\n",
+            ),
+        ]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
+    }
+
+    #[test]
     fn usage_docs_excerpt_lacking_two_surfaces_falls_to_continue() {
         let contract = TaskContract::from_request(
             "Build a Task CRUD API with create / read. Document usage in README.",
@@ -2261,6 +2432,43 @@ mod tests {
             }
             other => panic!("expected Continue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_docs_surface_accepts_japanese_usage_and_cargo_examples() {
+        let contract = TaskContract::from_request(
+            "Build a Task Rust library. Document usage in README. Add tests.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        let excerpts = build_excerpts(&[
+            (
+                ArtifactRole::Implementation,
+                "pub struct Task { id: u64 }\npub fn create_task(id: u64) -> Task { Task { id } }\n",
+            ),
+            (
+                ArtifactRole::Test,
+                "let task = create_task(1); assert_eq!(task.id, 1);\n",
+            ),
+            (
+                ArtifactRole::UsageDocs,
+                "# Task\n\n## 使用例\nCargo.toml に依存を追加します。\n\n```rust\nuse tasklib::create_task;\n```\n\n```bash\ncargo test\n```\n",
+            ),
+        ]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
 
     #[test]
@@ -2318,26 +2526,13 @@ mod tests {
             "schema={:?}",
             contract.required_behavior
         );
-        let mut evidence = EvidenceSet::new();
-        evidence.push(repo_edit(RepoEditCategory::Impl));
-        // Excerpt mentions only README — must NOT count as a `read` hit.
-        let excerpts = build_excerpts(&[(
-            ArtifactRole::Implementation,
-            "// see README for details\nfn nothing() {}\n",
-        )]);
-        let repair_state = VerifierRepairState::None;
-        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
-            contract: &contract,
-            evidence: &evidence,
-            artifacts: &[],
-            repair_state: &repair_state,
-            artifact_excerpts: &excerpts,
-            missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
-        });
         assert!(
-            matches!(action, ArtifactRecoveryAction::Continue { .. }),
-            "expected Continue (token boundary), got {action:?}"
+            !excerpt_satisfies_behavior(&contract, "// see README for details\nfn nothing() {}\n"),
+            "README must not satisfy the short read operation"
+        );
+        assert!(
+            excerpt_satisfies_behavior(&contract, "fn read_endpoint() {}\n"),
+            "read as an actual token should satisfy the operation"
         );
     }
 

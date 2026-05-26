@@ -534,6 +534,12 @@ fn request_has_primary_code_task(raw: &str, lower: &str) -> bool {
             "component",
             "service",
             "module",
+            "library",
+            "crate",
+            "package",
+            "tool",
+            "program",
+            "command",
         ],
     ) || contains_ascii_token(lower, "api")
         || contains_any(
@@ -545,6 +551,11 @@ fn request_has_primary_code_task(raw: &str, lower: &str) -> bool {
                 "フロントエンド",
                 "アプリ",
                 "機能",
+                "ライブラリ",
+                "クレート",
+                "パッケージ",
+                "ツール",
+                "コマンド",
             ],
         )
         || mentions_stack_as_build_target(raw, lower);
@@ -581,11 +592,15 @@ fn mentions_stack_as_build_target(raw: &str, lower: &str) -> bool {
             "with django",
             "using django",
             "django app",
+            "rust library",
+            "rust crate",
+            "rust package",
+            "cargo project",
         ],
     ) || contains_any(
         raw,
         &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
-    )
+    ) || (raw.contains("Rust") && contains_any(raw, &["ライブラリ", "クレート", "パッケージ"]))
 }
 
 fn request_requires_tests(lower: &str, raw: &str) -> bool {
@@ -733,6 +748,17 @@ mod tests {
                 "Rustで標準入力を読むCLIを開発してください。README.mdとテストコードも実装してください。"
             ),
             WorkMode::GenericCode
+        );
+        let rust_library = classify_work_mode_json(
+            "文字列スラッグ生成用のRustライブラリを開発してください。README.mdとcargo testで動くテストも実装してください。",
+        );
+        assert_eq!(rust_library.work_mode, WorkMode::GenericCode);
+        assert!(rust_library.requires_tests);
+        assert!(
+            rust_library
+                .evidence
+                .iter()
+                .any(|item| *item == "edit-intent")
         );
     }
 
