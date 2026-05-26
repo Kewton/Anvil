@@ -46,6 +46,14 @@ Remaining gaps:
   is not yet proven.
 - Generality across non-FastAPI tasks is partially proven by small smoke
   (`Rust CLI` passed), but Python CLI repair convergence is still unstable.
+- Latest residual slice implemented:
+  - `VerifierDelta::Improved` no longer bypasses target-exhaustion state.
+    Repeated "improved but still failing" attempts now re-diagnostic/replan
+    before another patch is requested.
+  - Diagnostic-budget exhaustion after verifier repair now surfaces as
+    `repair_exhausted` instead of raw `verifier_failed`.
+  - Unit tests pin the improved-delta target-exhaustion branch and the
+    repair-exhausted exit mapping.
 
 ## Phase 1: ProjectUnit Verifier Model
 
@@ -258,6 +266,11 @@ Implemented in the final cleanup slice:
   and validated `VerifierRepairIntent` edits.
 - Source guards continue to assert that the production patch provider cannot
   call legacy deterministic repair authority.
+- Repeated `AppliedImproved` outcomes on the same semantic target are now
+  consumed by `RepairJob::next_action()` before it can request another patch
+  for that exhausted target.
+- Repair-terminal surfacing now distinguishes controlled repair exhaustion
+  (`repair_exhausted`) from an uncontrolled raw verifier failure.
 
 ## Phase 6: Small Generality Smoke Gate
 

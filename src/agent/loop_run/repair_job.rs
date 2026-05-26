@@ -815,7 +815,7 @@ impl RepairJob {
                 reason: RepairTerminalReason::DiagnosticUnavailable,
             };
         }
-        if semantic_plan_is_stale(self) || self.needs_diagnostic_after_target_exhaustion() {
+        if semantic_plan_is_stale(self) {
             if self.assessment_attempts
                 < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
             {
@@ -823,6 +823,16 @@ impl RepairJob {
             }
             return RepairNextAction::SafeStop {
                 reason: RepairTerminalReason::DiagnosticUnavailable,
+            };
+        }
+        if self.needs_diagnostic_after_target_exhaustion() {
+            if self.assessment_attempts
+                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+            {
+                return RepairNextAction::RequestDiagnostic;
+            }
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::RepairBudgetExhausted,
             };
         }
         if self.current_semantic_targets_all_exhausted() {
@@ -920,6 +930,16 @@ impl RepairJob {
             RepairJobEvent::VerifierObserved { delta } => Some(match delta {
                 VerifierDelta::Passed => RepairNextAction::VerifiedDone,
                 VerifierDelta::Improved => {
+                    if self.needs_diagnostic_after_target_exhaustion() {
+                        if self.assessment_attempts
+                            < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                        {
+                            return Some(RepairNextAction::Replan);
+                        }
+                        return Some(RepairNextAction::SafeStop {
+                            reason: RepairTerminalReason::RepairBudgetExhausted,
+                        });
+                    }
                     let target_hint = self.current_repair_target_hint_for_next_action()?;
                     RepairNextAction::RequestPatch { target_hint }
                 }
@@ -6392,6 +6412,68 @@ mod tests {
         assert!(third.promoted);
         assert!(job.current_semantic_targets_all_exhausted());
         assert!(job.needs_diagnostic_after_target_exhaustion());
+    }
+
+    #[test]
+    fn improved_delta_respects_target_exhaustion_before_next_patch() {
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["app/main.py"],
+        );
+        let outcome = outcome_applied_improved("A", ArtifactRole::Implementation);
+        for _ in 0..APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD {
+            let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        }
+        job.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Improved,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn exhausted_improved_delta_safe_stops_when_diagnostic_budget_used() {
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["app/main.py"],
+        );
+        let outcome = outcome_applied_improved("A", ArtifactRole::Implementation);
+        for _ in 0..APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD {
+            let _ = job.record_repair_attempt_outcome_for_target(outcome.clone(), &targets[0]);
+        }
+        job.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Improved,
+        });
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::RepairBudgetExhausted
+            }
+        );
     }
 
     #[test]

@@ -2677,6 +2677,13 @@ fn task_contract_verifier_safe_stop_mapping(
     }
 }
 
+fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) -> ExitReason {
+    match reason.safe_stop_reason() {
+        Some(super::repair_job::StopReason::RepairExhausted) => ExitReason::RepairExhausted,
+        _ => ExitReason::VerifierFailed,
+    }
+}
+
 fn task_contract_needs_verification(
     mode: ExecutionMode,
     contract: Option<&super::task_contract::TaskContract>,
@@ -11188,17 +11195,25 @@ impl Agent {
                 let attempt_limit =
                     task_contract_verifier_failure_attempt_limit(previous_repair_context.as_ref());
                 if *args.contract_verification_retries >= attempt_limit {
-                    // Issue #654 (E.3): verifier failed and no safe alternative
-                    // remains — emit the bounded structured safe stop report
-                    // before exit. Stash the freshly-built repair_context onto
-                    // Agent so emit_safe_stop_report_for_verifier_failed_safe_stop
-                    // can build the report off it.
                     self.repair_job = Some(repair_context);
-                    self.emit_safe_stop_report_for_verifier_failed_safe_stop();
+                    let (reason, prefix) = if previous_repair_context.is_some() {
+                        self.emit_safe_stop_report_for_repair_exhausted();
+                        (
+                            ExitReason::RepairExhausted,
+                            "verifier repair budget exhausted",
+                        )
+                    } else {
+                        // Issue #654 (E.3): verifier failed and no safe
+                        // alternative remains before a repair job has made
+                        // progress — emit the bounded structured safe stop
+                        // report before exit.
+                        self.emit_safe_stop_report_for_verifier_failed_safe_stop();
+                        (ExitReason::VerifierFailed, "required verifier failed")
+                    };
                     return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::VerifierFailed,
+                        reason,
                         error_text: format!(
-                            "required verifier failed: {}\n{}",
+                            "{prefix}: {}\n{}",
                             crate::session::feedback::mask_secrets(&command),
                             crate::session::feedback::mask_secrets(&output)
                         ),
@@ -11602,7 +11617,7 @@ impl Agent {
             super::repair_job::RepairStep::SafeStop { reason } => {
                 self.emit_safe_stop_report_for_repair_terminal(reason);
                 TaskContractVerifierFlowOutcome::Exit {
-                    reason: ExitReason::VerifierFailed,
+                    reason: repair_terminal_exit_reason(reason),
                     error_text: format!("verifier repair safe stop: {}", reason.as_str()),
                 }
             }
@@ -11690,11 +11705,11 @@ impl Agent {
                     task_contract_verifier_failure_attempt_limit(Some(&previous_repair_context));
                 if *args.contract_verification_retries >= attempt_limit {
                     self.repair_job = Some(repair_context);
-                    self.emit_safe_stop_report_for_verifier_failed_safe_stop();
+                    self.emit_safe_stop_report_for_repair_exhausted();
                     return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::VerifierFailed,
+                        reason: ExitReason::RepairExhausted,
                         error_text: format!(
-                            "required verifier failed: {}\n{}",
+                            "verifier repair budget exhausted: {}\n{}",
                             crate::session::feedback::mask_secrets(&command),
                             crate::session::feedback::mask_secrets(&output)
                         ),
@@ -11890,7 +11905,7 @@ impl Agent {
             super::repair_job::RepairNextAction::SafeStop { reason } => {
                 self.emit_safe_stop_report_for_repair_terminal(reason);
                 TaskContractVerifierFlowOutcome::Exit {
-                    reason: ExitReason::VerifierFailed,
+                    reason: repair_terminal_exit_reason(reason),
                     error_text: format!("verifier repair safe stop after rejected patch: {error}"),
                 }
             }
@@ -18690,14 +18705,16 @@ mod tests {
         classify_verifier_timeout, deterministic_timeout_fallback_plan,
         effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
         non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
-        normalize_plan_exploration_key, request_explicitly_requests_script_execution,
-        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
+        normalize_plan_exploration_key, repair_terminal_exit_reason,
+        request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
+        should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_verifier_safe_stop_mapping,
         task_contract_verifier_transport_error_to_outcome, verifier_repair_context_from_failure,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
     use crate::agent::loop_run::failure_packet::FailurePacketTimeoutKind;
+    use crate::agent::loop_run::repair_job::RepairTerminalReason;
     use crate::agent::loop_run::task_contract::SafeStopReason;
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use crate::session::store::ConversationMessage;
@@ -20029,6 +20046,22 @@ mod tests {
                 ExitReason::SafeStopVerifierMissing,
                 "safe_stop_verifier_missing",
             ),
+        );
+    }
+
+    #[test]
+    fn repair_budget_terminal_maps_to_repair_exhausted_exit_reason() {
+        assert_eq!(
+            repair_terminal_exit_reason(RepairTerminalReason::RepairBudgetExhausted),
+            ExitReason::RepairExhausted
+        );
+        assert_eq!(
+            repair_terminal_exit_reason(RepairTerminalReason::PatchRejectedRepeatedly),
+            ExitReason::RepairExhausted
+        );
+        assert_eq!(
+            repair_terminal_exit_reason(RepairTerminalReason::DiagnosticUnavailable),
+            ExitReason::VerifierFailed
         );
     }
 

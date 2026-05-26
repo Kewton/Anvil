@@ -24,6 +24,11 @@ pub(super) enum ExitReason {
     /// detected at all, or the request literally asked for tests but
     /// no owned test artifact is staged on the verifier command line.
     SafeStopVerifierMissing,
+    /// Verifier repair reached a controlled budget/exhaustion terminal.
+    /// This is distinct from a raw verifier failure: the repair controller
+    /// has already emitted a bounded safe-stop report with the last failure
+    /// packet and exhausted repair evidence.
+    RepairExhausted,
 }
 
 impl ExitReason {
@@ -45,6 +50,7 @@ impl ExitReason {
                 | ExitReason::Interrupted
                 | ExitReason::SafeStopVerifierWeak
                 | ExitReason::SafeStopVerifierMissing
+                | ExitReason::RepairExhausted
         )
     }
 
@@ -63,6 +69,7 @@ impl ExitReason {
             ExitReason::Interrupted => "interrupted",
             ExitReason::SafeStopVerifierWeak => "safe_stop_verifier_weak",
             ExitReason::SafeStopVerifierMissing => "safe_stop_verifier_missing",
+            ExitReason::RepairExhausted => "repair_exhausted",
         }
     }
 
@@ -94,6 +101,9 @@ impl ExitReason {
             }
             ExitReason::SafeStopVerifierMissing => {
                 "assistant stopped: request asks for test execution but no owned test artifact reached the verifier"
+            }
+            ExitReason::RepairExhausted => {
+                "assistant stopped: verifier repair budget exhausted with actionable diagnostics"
             }
         }
     }
@@ -259,6 +269,7 @@ mod tests {
             ExitReason::Interrupted,
             ExitReason::SafeStopVerifierWeak,
             ExitReason::SafeStopVerifierMissing,
+            ExitReason::RepairExhausted,
         ];
         let labels: Vec<_> = reasons.iter().map(|r| r.label()).collect();
         let unique: std::collections::HashSet<_> = labels.iter().collect();
@@ -280,12 +291,14 @@ mod tests {
         assert!(!ExitReason::Interrupted.is_success());
         assert!(!ExitReason::SafeStopVerifierWeak.is_success());
         assert!(!ExitReason::SafeStopVerifierMissing.is_success());
+        assert!(!ExitReason::RepairExhausted.is_success());
     }
 
     #[test]
     fn safe_stop_variants_keep_repl_alive() {
         assert!(ExitReason::SafeStopVerifierWeak.keeps_repl_alive());
         assert!(ExitReason::SafeStopVerifierMissing.keeps_repl_alive());
+        assert!(ExitReason::RepairExhausted.keeps_repl_alive());
     }
 
     #[test]
@@ -296,9 +309,13 @@ mod tests {
         // completion.
         let weak = ExitReason::SafeStopVerifierWeak.default_error_text();
         let missing = ExitReason::SafeStopVerifierMissing.default_error_text();
+        let repair = ExitReason::RepairExhausted.default_error_text();
         assert!(!weak.is_empty());
         assert!(!missing.is_empty());
+        assert!(!repair.is_empty());
         assert_ne!(weak, missing);
+        assert_ne!(weak, repair);
+        assert_ne!(missing, repair);
     }
 
     #[test]
@@ -325,6 +342,7 @@ mod tests {
         assert!(ExitReason::PlanIncomplete.keeps_repl_alive());
         assert!(ExitReason::ToolCallFormatError.keeps_repl_alive());
         assert!(ExitReason::Interrupted.keeps_repl_alive());
+        assert!(ExitReason::RepairExhausted.keeps_repl_alive());
         assert!(!ExitReason::TransportError.keeps_repl_alive());
     }
 }
