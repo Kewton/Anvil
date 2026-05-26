@@ -12,6 +12,7 @@ use super::repair_plan::AcceptedRepairPlan;
 use super::task_contract::RecoveryTargetHint;
 use crate::safety::path_guard::resolve_user_path;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
+use sha2::{Digest, Sha256};
 
 const REPAIR_PASS_MAX_REPLACE_ALL_MATCHES: usize = 32;
 
@@ -36,6 +37,35 @@ pub(super) struct RepairIntentEdit<'a> {
 pub(super) struct RepairCandidateApplyResult {
     pub(super) updated_contents: String,
     pub(super) used_whitespace_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedVerifierRepairEdit {
+    pub(super) relative_path: String,
+    pub(super) canonical_path: PathBuf,
+    pub(super) updated_contents: String,
+    pub(super) preimage_hash: String,
+    pub(super) postimage_hash: String,
+    pub(super) fingerprint: String,
+}
+
+impl ValidatedVerifierRepairEdit {
+    pub(super) fn new(
+        relative_path: String,
+        canonical_path: PathBuf,
+        original_contents: &str,
+        updated_contents: String,
+        fingerprint: String,
+    ) -> Self {
+        Self {
+            relative_path,
+            canonical_path,
+            preimage_hash: sha256_hex(original_contents.as_bytes()),
+            postimage_hash: sha256_hex(updated_contents.as_bytes()),
+            updated_contents,
+            fingerprint,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,6 +710,10 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn duplicate_binding_names_from_verifier_context(
     context: &super::repair_job::RepairJob,
 ) -> HashSet<String> {
@@ -1102,6 +1136,24 @@ mod tests {
             err.message(),
             "repair intent rejected: test/impl weakening detected ([AssertionDeleted])"
         );
+    }
+
+    #[test]
+    fn validated_repair_edit_constructor_hashes_pre_and_post_images() {
+        let edit = ValidatedVerifierRepairEdit::new(
+            "src/lib.rs".to_string(),
+            PathBuf::from("/tmp/src/lib.rs"),
+            "before",
+            "after".to_string(),
+            "fp".to_string(),
+        );
+
+        assert_eq!(edit.relative_path, "src/lib.rs");
+        assert_eq!(edit.updated_contents, "after");
+        assert_eq!(edit.fingerprint, "fp");
+        assert_ne!(edit.preimage_hash, edit.postimage_hash);
+        assert_eq!(edit.preimage_hash.len(), 64);
+        assert_eq!(edit.postimage_hash.len(), 64);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use super::reminder::{
 use super::repair_job;
 #[cfg(test)]
 use super::repair_job::VerifierRepairDecision;
+use super::repair_patch_validation::ValidatedVerifierRepairEdit;
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
@@ -766,16 +767,6 @@ struct VerifierRepairIntent {
     new_string: String,
     reason: String,
     replace_all: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ValidatedVerifierRepairEdit {
-    relative_path: String,
-    canonical_path: PathBuf,
-    updated_contents: String,
-    preimage_hash: String,
-    postimage_hash: String,
-    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24922,14 +24913,13 @@ fn validate_verifier_repair_intents_inner(
     // **before** the in-memory apply above. The remaining branches here
     // (weakening detector / candidate content check) cannot trigger a
     // duplicate signal, so no further fingerprint comparison is needed.
-    Ok(ValidatedVerifierRepairEdit {
+    Ok(ValidatedVerifierRepairEdit::new(
         relative_path,
-        canonical_path: canonical,
-        preimage_hash: sha256_hex(original_contents.as_bytes()),
-        postimage_hash: sha256_hex(contents.as_bytes()),
-        updated_contents: contents,
+        canonical,
+        &original_contents,
+        contents,
         fingerprint,
-    })
+    ))
 }
 
 fn filter_test_weakening_for_observed_assert_update(

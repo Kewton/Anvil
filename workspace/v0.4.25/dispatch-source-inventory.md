@@ -80,6 +80,8 @@ with legacy/fallback paths unable to override it.
 - Moved weakening rejection message/metadata construction into
   `repair_patch_validation.rs`; detector dispatch remains in `turn.rs` until
   shared Python diagnostic helpers are separated.
+- Moved the validated repair edit carrier and hash construction into
+  `repair_patch_validation.rs`.
 
 ## Remaining Work
 
@@ -91,3 +93,6 @@ with legacy/fallback paths unable to override it.
 - Decide whether to move shared Python diagnostic helpers first, or leave
   weakening detector dispatch in `turn.rs` and extract only the final
   high-level validated-edit assembly wrapper.
+- Keep disk write/apply orchestration in `turn.rs` unless a separate
+  executor boundary is introduced; patch validation should not silently mutate
+  the workspace.

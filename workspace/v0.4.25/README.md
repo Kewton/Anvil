@@ -833,3 +833,32 @@ Assessment:
 - The remaining extraction should either move shared Python diagnostic helpers
   to a small helper module first, or keep detector dispatch in `turn.rs` and
   only move the final validated-edit assembly.
+
+### 2026-05-27 Slice 9
+
+Applied:
+
+- Moved `ValidatedVerifierRepairEdit` into `repair_patch_validation.rs`.
+- Added a constructor that computes preimage/postimage hashes inside the
+  patch-validation boundary.
+- `turn.rs` now imports the validated edit type instead of defining it
+  locally.
+- Added a module test that pins constructor hashing and field preservation.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 17 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2996 tests when rerun outside sandbox
+
+Assessment:
+
+- The patch-validation module now owns the validated edit carrier and its
+  hashes. `turn.rs` still applies the validated edit to disk and orchestrates
+  weakening detector dispatch.
+- The next meaningful cleanup is to decide whether the Python diagnostic
+  helpers should be extracted into a shared module before moving weakening
+  detector dispatch.
