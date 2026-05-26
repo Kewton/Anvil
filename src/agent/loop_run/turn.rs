@@ -2680,7 +2680,8 @@ fn task_contract_verifier_safe_stop_mapping(
 fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) -> ExitReason {
     match reason.safe_stop_reason() {
         Some(super::repair_job::StopReason::RepairExhausted) => ExitReason::RepairExhausted,
-        _ => ExitReason::VerifierFailed,
+        Some(_) => ExitReason::RepairSafeStop,
+        None => ExitReason::VerifierFailed,
     }
 }
 
@@ -13617,7 +13618,15 @@ impl Agent {
         //   where `verification_expectations = ["test"]` would otherwise
         //   trip step (2). Stage A live alone always passes step (2);
         //   `required_artifacts::Setup` is unaffected (step 1, no gate).
-        if let Some(request) = self.active_request_text() {
+        if matches!(
+            self.session.mode_state.work_mode,
+            WorkMode::Docs | WorkMode::AnswerOnly
+        ) {
+            // Documentation/read-only turns should not acquire the Bash-only
+            // setup bootstrap policy from words such as "install" or "test"
+            // inside requested documentation content. If a docs turn needs an
+            // artifact, ArtifactRecovery should own the README target instead.
+        } else if let Some(request) = self.active_request_text() {
             let task_contract = super::task_contract::TaskContract::from_request(&request);
             let behavior_projection =
                 super::required_behavior::project_behavior_contract(&task_contract);
@@ -20061,7 +20070,11 @@ mod tests {
         );
         assert_eq!(
             repair_terminal_exit_reason(RepairTerminalReason::DiagnosticUnavailable),
-            ExitReason::VerifierFailed
+            ExitReason::RepairSafeStop
+        );
+        assert_eq!(
+            repair_terminal_exit_reason(RepairTerminalReason::NoSafeRepairTarget),
+            ExitReason::RepairSafeStop
         );
     }
 
@@ -21660,6 +21673,34 @@ mod tests {
         assert!(
             !chose_artifact_recovery,
             "CB-001: ArtifactRecovery candidate MUST NOT be selected without a job"
+        );
+    }
+
+    #[test]
+    fn docs_work_mode_does_not_install_setup_bootstrap_for_readme_install_wording() {
+        use super::super::active_job_arbiter::ActiveJobKind;
+        use super::super::commands::test_agent_with_config;
+        use crate::config::Config;
+        use crate::modes::plan_act::WorkMode;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.session.mode_state.work_mode = WorkMode::Docs;
+        agent.session.working_memory.set_active_task(Some(
+            "このプロジェクトの使い方を説明するREADME.mdを作成してください。インストール、実行、テスト方法を含めてください。"
+                .to_string(),
+        ));
+
+        let candidates = agent.build_arbiter_candidates_pub_for_test();
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.kind == ActiveJobKind::SetupBootstrap),
+            "docs-only README work must not be captured by Bash-only setup bootstrap"
+        );
+        assert_eq!(
+            agent.effective_tool_policy().reason(),
+            super::EffectiveToolPolicyReason::Unrestricted,
+            "with no artifact job installed yet, docs-only turns should stay open for the task contract to select README.md"
         );
     }
 

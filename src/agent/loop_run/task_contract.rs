@@ -1099,16 +1099,32 @@ pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool
         lower,
         &[
             "test code",
-            "test",
+            "unit test",
+            "unit tests",
+            "integration test",
+            "integration tests",
             "tests",
             "test file",
+            "add test",
+            "write test",
+            "implement test",
+            "create test",
             "pytest",
             "unittest",
             "spec",
         ],
     ) || contains_any(
         request,
-        &["テスト", "テストコード", "テストを実装", "テストも実装"],
+        &[
+            "テストコード",
+            "テストを実装",
+            "テストも実装",
+            "テストを追加",
+            "テストも追加",
+            "テストを書く",
+            "テストを作成",
+            "テスト作成",
+        ],
     )
 }
 
@@ -1643,6 +1659,20 @@ mod tests {
 
         assert_eq!(contract.intent, TaskIntent::Modify);
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn docs_readme_test_method_wording_does_not_require_test_artifact() {
+        let contract = TaskContract::from_request(
+            "このプロジェクトの使い方を説明するREADME.mdを作成してください。インストール、実行、テスト方法を含めてください。",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+
+        assert_ne!(contract.intent, TaskIntent::Install);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert!(!contract.verification_required);
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
     }
 

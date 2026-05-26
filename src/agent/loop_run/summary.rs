@@ -29,6 +29,11 @@ pub(super) enum ExitReason {
     /// has already emitted a bounded safe-stop report with the last failure
     /// packet and exhausted repair evidence.
     RepairExhausted,
+    /// Verifier repair reached a controlled safe-stop terminal that is not
+    /// specifically a budget exhaustion. This is still distinct from raw
+    /// verifier failure because the repair controller selected the terminal
+    /// state and emitted actionable diagnostics.
+    RepairSafeStop,
 }
 
 impl ExitReason {
@@ -51,6 +56,7 @@ impl ExitReason {
                 | ExitReason::SafeStopVerifierWeak
                 | ExitReason::SafeStopVerifierMissing
                 | ExitReason::RepairExhausted
+                | ExitReason::RepairSafeStop
         )
     }
 
@@ -70,6 +76,7 @@ impl ExitReason {
             ExitReason::SafeStopVerifierWeak => "safe_stop_verifier_weak",
             ExitReason::SafeStopVerifierMissing => "safe_stop_verifier_missing",
             ExitReason::RepairExhausted => "repair_exhausted",
+            ExitReason::RepairSafeStop => "repair_safe_stop",
         }
     }
 
@@ -104,6 +111,9 @@ impl ExitReason {
             }
             ExitReason::RepairExhausted => {
                 "assistant stopped: verifier repair budget exhausted with actionable diagnostics"
+            }
+            ExitReason::RepairSafeStop => {
+                "assistant stopped: verifier repair reached a controlled safe stop with actionable diagnostics"
             }
         }
     }
@@ -270,6 +280,7 @@ mod tests {
             ExitReason::SafeStopVerifierWeak,
             ExitReason::SafeStopVerifierMissing,
             ExitReason::RepairExhausted,
+            ExitReason::RepairSafeStop,
         ];
         let labels: Vec<_> = reasons.iter().map(|r| r.label()).collect();
         let unique: std::collections::HashSet<_> = labels.iter().collect();
@@ -292,6 +303,7 @@ mod tests {
         assert!(!ExitReason::SafeStopVerifierWeak.is_success());
         assert!(!ExitReason::SafeStopVerifierMissing.is_success());
         assert!(!ExitReason::RepairExhausted.is_success());
+        assert!(!ExitReason::RepairSafeStop.is_success());
     }
 
     #[test]
@@ -299,6 +311,7 @@ mod tests {
         assert!(ExitReason::SafeStopVerifierWeak.keeps_repl_alive());
         assert!(ExitReason::SafeStopVerifierMissing.keeps_repl_alive());
         assert!(ExitReason::RepairExhausted.keeps_repl_alive());
+        assert!(ExitReason::RepairSafeStop.keeps_repl_alive());
     }
 
     #[test]
@@ -310,12 +323,17 @@ mod tests {
         let weak = ExitReason::SafeStopVerifierWeak.default_error_text();
         let missing = ExitReason::SafeStopVerifierMissing.default_error_text();
         let repair = ExitReason::RepairExhausted.default_error_text();
+        let repair_safe_stop = ExitReason::RepairSafeStop.default_error_text();
         assert!(!weak.is_empty());
         assert!(!missing.is_empty());
         assert!(!repair.is_empty());
+        assert!(!repair_safe_stop.is_empty());
         assert_ne!(weak, missing);
         assert_ne!(weak, repair);
+        assert_ne!(weak, repair_safe_stop);
         assert_ne!(missing, repair);
+        assert_ne!(missing, repair_safe_stop);
+        assert_ne!(repair, repair_safe_stop);
     }
 
     #[test]
@@ -343,6 +361,7 @@ mod tests {
         assert!(ExitReason::ToolCallFormatError.keeps_repl_alive());
         assert!(ExitReason::Interrupted.keeps_repl_alive());
         assert!(ExitReason::RepairExhausted.keeps_repl_alive());
+        assert!(ExitReason::RepairSafeStop.keeps_repl_alive());
         assert!(!ExitReason::TransportError.keeps_repl_alive());
     }
 }

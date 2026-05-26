@@ -379,8 +379,12 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             confidence += 0.03;
             evidence.push("edit-intent");
         }
-        if primary_code_task && (explicit_python_artifact || explicit_ui_framework) {
-            confidence = confidence.min(0.55);
+        if primary_code_task {
+            confidence = confidence.min(if explicit_python_artifact || explicit_ui_framework {
+                0.55
+            } else {
+                0.62
+            });
             evidence.push("secondary-docs-for-code-task");
         }
         candidates.push(WorkModeCandidate {
@@ -717,6 +721,18 @@ mod tests {
         assert_eq!(
             infer_work_mode_from_text("Next.jsアプリを作成してREADMEも追加してください"),
             WorkMode::TypeScriptUi
+        );
+        assert_eq!(
+            infer_work_mode_from_text(
+                "Node.jsでToDo管理CLIを開発してください。README.mdとテストコードも作成してください。"
+            ),
+            WorkMode::GenericCode
+        );
+        assert_eq!(
+            infer_work_mode_from_text(
+                "Rustで標準入力を読むCLIを開発してください。README.mdとテストコードも実装してください。"
+            ),
+            WorkMode::GenericCode
         );
     }
 

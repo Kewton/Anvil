@@ -271,6 +271,14 @@ Implemented in the final cleanup slice:
   for that exhausted target.
 - Repair-terminal surfacing now distinguishes controlled repair exhaustion
   (`repair_exhausted`) from an uncontrolled raw verifier failure.
+- Follow-up smoke exposed and fixed three non-FastAPI control bugs:
+  - README mentions no longer make code-building requests docs-only.
+  - Docs/answer-only turns no longer receive SetupBootstrap's Bash-only policy
+    just because README content mentions install/test instructions.
+  - `テスト方法` / bare `test` wording no longer requires a test artifact; the
+    contract now requires explicit test-code phrasing.
+- Controlled repair safe stops that are not budget exhaustion now surface as
+  `repair_safe_stop` instead of raw `verifier_failed`.
 
 ## Phase 6: Small Generality Smoke Gate
 
@@ -300,6 +308,17 @@ Acceptance:
 - No smoke task ends in verifier-owned `missing_repo_edits`.
 - No smoke task reaches green through test weakening.
 - Full 20/20 evaluation only starts after this gate is stable.
+
+Follow-up result:
+
+- The first follow-up smoke attempt was invalid because Anvil was launched from
+  the Anvil repository root instead of each case directory. It is excluded.
+- Corrected clean smoke is summarized in
+  `workspace/v0.4.23/followup-eval-20260526.md`.
+- The latest fixes improve artifact completion for Node/docs cases, but the
+  small gate is still not stable because Python CSV can stall inside a
+  controller repair pass and Node can still reach repair safe stop after
+  rejected patches.
 
 ## Phase 7: Full Evaluation Gate
 
