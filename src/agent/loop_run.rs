@@ -117,6 +117,9 @@ mod repair_authority;
 // v0.4.16: accepted repair-plan boundary. Diagnostic output remains a proposal
 // until this module validates it against FailurePacket + authority evidence.
 mod repair_plan;
+// v0.4.25: verifier-repair admission boundary. Keeps RepairPlan acceptance and
+// admission error transition mapping out of the turn dispatcher.
+mod repair_plan_admission;
 // v0.4.13 Phase 2: small diagnostic schema returned by the short-lived
 // diagnostic LLM. Private module; no direct provider abstraction.
 mod repair_brief;
@@ -134,8 +137,11 @@ mod patch_proposal;
 // v0.4.16: patch-provider admission boundary. Providers propose concrete
 // edits only after the controller has accepted a repair plan.
 mod patch_provider;
+// v0.4.25: pure patch-admission checks shared by verifier repair validation.
+mod repair_patch_validation;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
+mod safe_stop_payload;
 // Issue #647 (Phase A.1): semantic repair planning — bounded failure-report
 // schema and deterministic cluster-key generation. Module is intentionally
 // *not* re-exported (DR3-001) — future consumers (`turn.rs`, `repair_job.rs`)

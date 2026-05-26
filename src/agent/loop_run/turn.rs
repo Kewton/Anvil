@@ -1,3 +1,7 @@
+use super::active_job_arbiter::{
+    LoopControlAction, LoopControlInputs, RecoveryDispatchGate, RecoveryOwner,
+    determine_loop_control_action, loop_control_action_requires_missing_verifier_setup,
+};
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
     classify_auto_test, count_compile_errors, count_test_failures,
@@ -16,6 +20,9 @@ use super::reminder::{
 use super::repair_job;
 #[cfg(test)]
 use super::repair_job::VerifierRepairDecision;
+#[cfg(test)]
+use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
+use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
@@ -105,7 +112,6 @@ const VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES: usize = 8_192;
 const VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES: usize = 32_768;
 const VERIFIER_REPAIR_PASS_MAX_REASON_CHARS: usize = 180;
 const VERIFIER_REPAIR_PASS_MAX_EDITS: usize = 16;
-const VERIFIER_REPAIR_PASS_MAX_REPLACE_ALL_MATCHES: usize = 32;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 /// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
@@ -136,510 +142,6 @@ enum JobInstallOutcome {
     /// the projection cannot survive without a backing job (PR-001 SSOT
     /// invariant).
     ValidationFailed,
-}
-
-/// v0.4.23: controller-facing next action for the pre-model part of the
-/// actor loop. This is deliberately small: it does not execute tools, mutate
-/// state, or infer semantic progress from model prose. It only projects
-/// already-structured state into one dispatch source.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LoopControlAction {
-    ContinueRepairJob {
-        next_action: super::repair_job::RepairNextAction,
-    },
-    ContinueMissingVerifierJob {
-        next_action: super::repair_job::VerifierBootstrapNextAction,
-    },
-    RunVerifier,
-    RequestModelTurn,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LoopControlInputs {
-    mode: ExecutionMode,
-    task_contract_verifier_repair_pending: bool,
-    repair_next_action: Option<super::repair_job::RepairNextAction>,
-    missing_verifier_next_action: Option<super::repair_job::VerifierBootstrapNextAction>,
-    task_contract_action: Option<super::task_contract::ArtifactRecoveryAction>,
-}
-
-fn determine_loop_control_action(inputs: LoopControlInputs) -> LoopControlAction {
-    if inputs.mode == ExecutionMode::Plan {
-        return LoopControlAction::RequestModelTurn;
-    }
-
-    if inputs.task_contract_verifier_repair_pending {
-        if let Some(next_action) = inputs.repair_next_action {
-            return LoopControlAction::ContinueRepairJob { next_action };
-        }
-        if let Some(next_action) = inputs.missing_verifier_next_action {
-            return LoopControlAction::ContinueMissingVerifierJob { next_action };
-        }
-    }
-
-    if matches!(
-        inputs.task_contract_action,
-        Some(super::task_contract::ArtifactRecoveryAction::RunVerifier)
-    ) {
-        return LoopControlAction::RunVerifier;
-    }
-
-    LoopControlAction::RequestModelTurn
-}
-
-#[cfg(test)]
-fn loop_control_action_owns_recovery(action: &LoopControlAction) -> bool {
-    matches!(
-        action,
-        LoopControlAction::ContinueRepairJob { .. }
-            | LoopControlAction::ContinueMissingVerifierJob { .. }
-    )
-}
-
-fn loop_control_action_requires_missing_verifier_setup(action: &LoopControlAction) -> bool {
-    matches!(
-        action,
-        LoopControlAction::ContinueMissingVerifierJob {
-            next_action: super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
-        }
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryOwner {
-    None,
-    ArtifactCompletion,
-    RepairJob,
-    MissingVerifierJob,
-}
-
-impl RecoveryOwner {
-    fn from_control_action(
-        action: &LoopControlAction,
-        task_contract_action: Option<&super::task_contract::ArtifactRecoveryAction>,
-    ) -> Self {
-        match action {
-            LoopControlAction::ContinueRepairJob { .. } => Self::RepairJob,
-            LoopControlAction::ContinueMissingVerifierJob { .. } => Self::MissingVerifierJob,
-            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {
-                match task_contract_action {
-                    Some(
-                        super::task_contract::ArtifactRecoveryAction::Continue { .. }
-                        | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
-                    ) => Self::ArtifactCompletion,
-                    Some(
-                        super::task_contract::ArtifactRecoveryAction::RunVerifier
-                        | super::task_contract::ArtifactRecoveryAction::Done
-                        | super::task_contract::ArtifactRecoveryAction::SafeStop { .. },
-                    )
-                    | None => Self::None,
-                }
-            }
-        }
-    }
-
-    fn is_verifier_owned(self) -> bool {
-        matches!(self, Self::RepairJob | Self::MissingVerifierJob)
-    }
-
-    fn allows_generic_repo_change_recovery(self) -> bool {
-        matches!(self, Self::None)
-    }
-
-    fn allows_focused_edit_recovery(self) -> bool {
-        matches!(self, Self::None | Self::ArtifactCompletion)
-    }
-
-    fn allows_deterministic_fallback(self) -> bool {
-        matches!(self, Self::None)
-    }
-}
-
-#[cfg(test)]
-mod loop_control_action_tests {
-    use super::*;
-
-    fn inputs() -> LoopControlInputs {
-        LoopControlInputs {
-            mode: ExecutionMode::Act,
-            task_contract_verifier_repair_pending: false,
-            repair_next_action: None,
-            missing_verifier_next_action: None,
-            task_contract_action: None,
-        }
-    }
-
-    #[test]
-    fn plan_mode_never_dispatches_repair_or_verifier() {
-        let action = determine_loop_control_action(LoopControlInputs {
-            mode: ExecutionMode::Plan,
-            task_contract_verifier_repair_pending: true,
-            repair_next_action: Some(super::super::repair_job::RepairNextAction::RequestDiagnostic),
-            missing_verifier_next_action: Some(
-                super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
-            ),
-            task_contract_action: Some(
-                super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
-            ),
-        });
-
-        assert_eq!(action, LoopControlAction::RequestModelTurn);
-    }
-
-    #[test]
-    fn active_repair_job_wins_over_verifier_run() {
-        let next_action = super::super::repair_job::RepairNextAction::RequestDiagnostic;
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_verifier_repair_pending: true,
-            repair_next_action: Some(next_action.clone()),
-            task_contract_action: Some(
-                super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
-            ),
-            ..inputs()
-        });
-
-        assert_eq!(action, LoopControlAction::ContinueRepairJob { next_action });
-    }
-
-    #[test]
-    fn active_repair_job_blocks_artifact_and_missing_verifier_dispatch() {
-        let next_action = super::super::repair_job::RepairNextAction::RequestDiagnostic;
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_verifier_repair_pending: true,
-            repair_next_action: Some(next_action.clone()),
-            missing_verifier_next_action: Some(
-                super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
-            ),
-            task_contract_action: Some(
-                super::super::task_contract::ArtifactRecoveryAction::Continue {
-                    missing: vec![super::super::task_contract::ArtifactRole::Test],
-                    target_hint: None,
-                },
-            ),
-            ..inputs()
-        });
-
-        assert_eq!(action, LoopControlAction::ContinueRepairJob { next_action });
-    }
-
-    #[test]
-    fn missing_verifier_job_wins_over_generic_model_turn() {
-        let next_action = super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit;
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_verifier_repair_pending: true,
-            missing_verifier_next_action: Some(next_action.clone()),
-            ..inputs()
-        });
-
-        assert_eq!(
-            action,
-            LoopControlAction::ContinueMissingVerifierJob { next_action }
-        );
-    }
-
-    #[test]
-    fn missing_verifier_rerun_wins_over_generic_model_turn() {
-        let next_action = super::super::repair_job::VerifierBootstrapNextAction::RerunVerifier;
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_verifier_repair_pending: true,
-            missing_verifier_next_action: Some(next_action.clone()),
-            ..inputs()
-        });
-
-        assert_eq!(
-            action,
-            LoopControlAction::ContinueMissingVerifierJob { next_action }
-        );
-    }
-
-    #[test]
-    fn missing_verifier_safe_stop_wins_over_generic_model_turn() {
-        let next_action = super::super::repair_job::VerifierBootstrapNextAction::SafeStop {
-            reason: "missing verifier retry budget exhausted",
-        };
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_verifier_repair_pending: true,
-            missing_verifier_next_action: Some(next_action.clone()),
-            ..inputs()
-        });
-
-        assert_eq!(
-            action,
-            LoopControlAction::ContinueMissingVerifierJob { next_action }
-        );
-    }
-
-    #[test]
-    fn stale_pending_flag_without_owner_does_not_create_legacy_repair_dispatch() {
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_verifier_repair_pending: true,
-            repair_next_action: None,
-            missing_verifier_next_action: None,
-            task_contract_action: None,
-            ..inputs()
-        });
-
-        assert_eq!(action, LoopControlAction::RequestModelTurn);
-    }
-
-    #[test]
-    fn verifier_run_is_selected_only_without_active_repair_owner() {
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_action: Some(
-                super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
-            ),
-            ..inputs()
-        });
-
-        assert_eq!(action, LoopControlAction::RunVerifier);
-    }
-
-    #[test]
-    fn unresolved_artifact_flow_returns_to_model_turn() {
-        let action = determine_loop_control_action(LoopControlInputs {
-            task_contract_action: Some(
-                super::super::task_contract::ArtifactRecoveryAction::Continue {
-                    missing: vec![super::super::task_contract::ArtifactRole::Implementation],
-                    target_hint: None,
-                },
-            ),
-            ..inputs()
-        });
-
-        assert_eq!(action, LoopControlAction::RequestModelTurn);
-    }
-
-    #[test]
-    fn active_repair_job_owns_recovery() {
-        let action = LoopControlAction::ContinueRepairJob {
-            next_action: super::super::repair_job::RepairNextAction::RequestDiagnostic,
-        };
-
-        assert!(loop_control_action_owns_recovery(&action));
-    }
-
-    #[test]
-    fn missing_verifier_job_owns_recovery() {
-        let action = LoopControlAction::ContinueMissingVerifierJob {
-            next_action: super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
-        };
-
-        assert!(loop_control_action_owns_recovery(&action));
-        assert!(loop_control_action_requires_missing_verifier_setup(&action));
-    }
-
-    #[test]
-    fn normal_model_turn_does_not_own_recovery() {
-        assert!(!loop_control_action_owns_recovery(
-            &LoopControlAction::RequestModelTurn
-        ));
-        assert!(!loop_control_action_requires_missing_verifier_setup(
-            &LoopControlAction::RequestModelTurn
-        ));
-    }
-
-    #[test]
-    fn recovery_owner_maps_repair_job_to_exclusive_owner() {
-        let owner = RecoveryOwner::from_control_action(
-            &LoopControlAction::ContinueRepairJob {
-                next_action: super::super::repair_job::RepairNextAction::RequestDiagnostic,
-            },
-            Some(&super::super::task_contract::ArtifactRecoveryAction::RunVerifier),
-        );
-
-        assert_eq!(owner, RecoveryOwner::RepairJob);
-        assert!(owner.is_verifier_owned());
-        assert!(!owner.allows_generic_repo_change_recovery());
-        assert!(!owner.allows_focused_edit_recovery());
-        assert!(!owner.allows_deterministic_fallback());
-    }
-
-    #[test]
-    fn recovery_owner_maps_missing_verifier_to_exclusive_owner() {
-        let owner = RecoveryOwner::from_control_action(
-            &LoopControlAction::ContinueMissingVerifierJob {
-                next_action:
-                    super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
-            },
-            None,
-        );
-
-        assert_eq!(owner, RecoveryOwner::MissingVerifierJob);
-        assert!(owner.is_verifier_owned());
-        assert!(!owner.allows_generic_repo_change_recovery());
-        assert!(!owner.allows_focused_edit_recovery());
-        assert!(!owner.allows_deterministic_fallback());
-    }
-
-    #[test]
-    fn recovery_owner_keeps_artifact_recovery_separate_from_verifier_repair() {
-        let owner = RecoveryOwner::from_control_action(
-            &LoopControlAction::RequestModelTurn,
-            Some(
-                &super::super::task_contract::ArtifactRecoveryAction::Continue {
-                    missing: vec![super::super::task_contract::ArtifactRole::Test],
-                    target_hint: None,
-                },
-            ),
-        );
-
-        assert_eq!(owner, RecoveryOwner::ArtifactCompletion);
-        assert!(!owner.is_verifier_owned());
-        assert!(!owner.allows_generic_repo_change_recovery());
-        assert!(owner.allows_focused_edit_recovery());
-        assert!(!owner.allows_deterministic_fallback());
-    }
-
-    #[test]
-    fn recovery_owner_allows_generic_paths_only_without_active_owner() {
-        let owner = RecoveryOwner::from_control_action(&LoopControlAction::RequestModelTurn, None);
-
-        assert_eq!(owner, RecoveryOwner::None);
-        assert!(!owner.is_verifier_owned());
-        assert!(owner.allows_generic_repo_change_recovery());
-        assert!(owner.allows_focused_edit_recovery());
-        assert!(owner.allows_deterministic_fallback());
-    }
-
-    #[test]
-    fn transition_table_covers_all_controller_owned_states() {
-        let target_hint = super::super::task_contract::RecoveryTargetHint {
-            role: super::super::task_contract::ArtifactRole::Implementation,
-            path: "app/main.py".to_string(),
-            reason: "synthetic transition target".to_string(),
-        };
-        let cases = vec![
-            (
-                "repair diagnostic",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    repair_next_action: Some(
-                        super::super::repair_job::RepairNextAction::RequestDiagnostic,
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::RepairJob,
-            ),
-            (
-                "repair patch",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    repair_next_action: Some(
-                        super::super::repair_job::RepairNextAction::RequestPatch {
-                            target_hint: target_hint.clone(),
-                        },
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::RepairJob,
-            ),
-            (
-                "repair rerun",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    repair_next_action: Some(super::super::repair_job::RepairNextAction::RerunVerifier),
-                    ..inputs()
-                },
-                RecoveryOwner::RepairJob,
-            ),
-            (
-                "repair safe stop",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    repair_next_action: Some(super::super::repair_job::RepairNextAction::SafeStop {
-                        reason: super::super::repair_job::RepairTerminalReason::RepairBudgetExhausted,
-                    }),
-                    ..inputs()
-                },
-                RecoveryOwner::RepairJob,
-            ),
-            (
-                "missing verifier setup",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    missing_verifier_next_action: Some(
-                        super::super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit,
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::MissingVerifierJob,
-            ),
-            (
-                "missing verifier rerun",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    missing_verifier_next_action: Some(
-                        super::super::repair_job::VerifierBootstrapNextAction::RerunVerifier,
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::MissingVerifierJob,
-            ),
-            (
-                "missing verifier safe stop",
-                LoopControlInputs {
-                    task_contract_verifier_repair_pending: true,
-                    missing_verifier_next_action: Some(
-                        super::super::repair_job::VerifierBootstrapNextAction::SafeStop {
-                            reason: "synthetic missing-verifier exhaustion",
-                        },
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::MissingVerifierJob,
-            ),
-            (
-                "verifier run",
-                LoopControlInputs {
-                    task_contract_action: Some(
-                        super::super::task_contract::ArtifactRecoveryAction::RunVerifier,
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::None,
-            ),
-            (
-                "artifact completion",
-                LoopControlInputs {
-                    task_contract_action: Some(
-                        super::super::task_contract::ArtifactRecoveryAction::Continue {
-                            missing: vec![
-                                super::super::task_contract::ArtifactRole::Implementation,
-                            ],
-                            target_hint: Some(target_hint),
-                        },
-                    ),
-                    ..inputs()
-                },
-                RecoveryOwner::ArtifactCompletion,
-            ),
-        ];
-
-        for (label, input, expected_owner) in cases {
-            let task_contract_action = input.task_contract_action.clone();
-            let action = determine_loop_control_action(input);
-            let owner = RecoveryOwner::from_control_action(&action, task_contract_action.as_ref());
-
-            assert_eq!(owner, expected_owner, "{label}");
-            match owner {
-                RecoveryOwner::RepairJob | RecoveryOwner::MissingVerifierJob => {
-                    assert!(!owner.allows_generic_repo_change_recovery(), "{label}");
-                    assert!(!owner.allows_focused_edit_recovery(), "{label}");
-                    assert!(!owner.allows_deterministic_fallback(), "{label}");
-                }
-                RecoveryOwner::ArtifactCompletion => {
-                    assert!(!owner.allows_generic_repo_change_recovery(), "{label}");
-                    assert!(owner.allows_focused_edit_recovery(), "{label}");
-                    assert!(!owner.allows_deterministic_fallback(), "{label}");
-                }
-                RecoveryOwner::None => {
-                    assert!(owner.allows_generic_repo_change_recovery(), "{label}");
-                    assert!(owner.allows_focused_edit_recovery(), "{label}");
-                    assert!(owner.allows_deterministic_fallback(), "{label}");
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1210,8 +712,8 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn plan_admission_without_assessment_forces_re_diagnostic() {
-        let event = super::verifier_repair_plan_admission_event(
-            &super::VerifierRepairPlanAdmissionError::MissingDiagnosticAssessment,
+        let event = super::super::repair_plan_admission::admission_error_event(
+            &super::super::repair_plan_admission::RepairPlanAdmissionError::MissingDiagnosticAssessment,
         );
         assert!(matches!(
             event,
@@ -1274,12 +776,6 @@ struct ValidatedVerifierRepairEdit {
     preimage_hash: String,
     postimage_hash: String,
     fingerprint: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifierRepairIntentApplyResult {
-    updated_contents: String,
-    used_whitespace_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4957,7 +4453,7 @@ fn safe_verifier_repair_file_excerpt(
     raw_path: &str,
     target_line: Option<usize>,
 ) -> Option<String> {
-    if !verifier_repair_path_input_is_safe(raw_path) {
+    if !super::repair_patch_validation::is_repair_path_input_safe(raw_path) {
         return None;
     }
     let resolved = resolve_user_path(work_root, raw_path).ok()?;
@@ -8370,6 +7866,7 @@ impl Agent {
                 &loop_control_action,
                 pre_model_task_contract_action.as_ref(),
             );
+            let recovery_dispatch_gate = RecoveryDispatchGate::from_owner(recovery_owner);
             let missing_verifier_setup_turn =
                 loop_control_action_requires_missing_verifier_setup(&loop_control_action);
             match loop_control_action {
@@ -8484,7 +7981,7 @@ impl Agent {
             }
 
             if action_expectation == recovery::ActionExpectation::RepoChange
-                && recovery_owner.allows_deterministic_fallback()
+                && recovery_dispatch_gate.allows_deterministic_fallback()
                 && repo_edit_calls_made_this_turn == 0
                 && self.maybe_materialize_mode_deterministic_fallback(last_iter)
             {
@@ -8492,7 +7989,7 @@ impl Agent {
             }
 
             if action_expectation == recovery::ActionExpectation::RepoChange
-                && recovery_owner.allows_deterministic_fallback()
+                && recovery_dispatch_gate.allows_deterministic_fallback()
                 && repo_edit_calls_made_this_turn == 0
                 && should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
                 && self.maybe_materialize_framework_game_fallback(last_iter)
@@ -8503,7 +8000,7 @@ impl Agent {
             }
 
             if repo_edit_calls_made_this_turn == 0
-                && recovery_owner.allows_deterministic_fallback()
+                && recovery_dispatch_gate.allows_deterministic_fallback()
                 && self.current_request_needs_playable_ui_quality_gate()
                 && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
             {
@@ -8546,7 +8043,7 @@ impl Agent {
             let reply = match self.request_assistant_reply_with_retry(
                 stream_output,
                 &interrupt_flag,
-                recovery_owner,
+                recovery_dispatch_gate,
             ) {
                 Ok(r) => r,
                 Err(err) => {
@@ -8735,7 +8232,7 @@ impl Agent {
                         }
                         focused_policy_retries += 1;
                         if focused_retry.is_some() && focused_policy_retries >= 3 {
-                            if !recovery_owner.allows_focused_edit_recovery() {
+                            if !recovery_dispatch_gate.allows_focused_edit_recovery() {
                                 exit_reason = if recovery_owner == RecoveryOwner::MissingVerifierJob
                                 {
                                     ExitReason::MissingVerification
@@ -9395,7 +8892,7 @@ impl Agent {
                 }
                 if repo_edit_calls_made_this_turn == 0
                     && tool_calls_made_this_turn > 0
-                    && recovery_owner.allows_deterministic_fallback()
+                    && recovery_dispatch_gate.allows_deterministic_fallback()
                     && self.current_request_needs_playable_ui_quality_gate()
                     && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
                 {
@@ -9433,7 +8930,7 @@ impl Agent {
                 }
                 if repo_edit_calls_made_this_turn == 0
                     && tool_calls_made_this_turn > 0
-                    && recovery_owner.allows_deterministic_fallback()
+                    && recovery_dispatch_gate.allows_deterministic_fallback()
                     && self.current_request_needs_playable_ui_quality_gate()
                     && let Some((request, target_path, _issue)) =
                         self.accepted_repo_change_quality_issue()
@@ -9471,7 +8968,7 @@ impl Agent {
                     }
                 }
                 if repo_edit_calls_made_this_turn > 0
-                    && recovery_owner.allows_deterministic_fallback()
+                    && recovery_dispatch_gate.allows_deterministic_fallback()
                     && (should_apply_repo_change_quality_gate(
                         action_expectation,
                         self.active_task_expects_repo_change(),
@@ -9945,7 +9442,7 @@ impl Agent {
             }
             if final_reply.is_empty() {
                 if action_expectation == recovery::ActionExpectation::RepoChange
-                    && recovery_owner.allows_generic_repo_change_recovery()
+                    && recovery_dispatch_gate.allows_generic_repo_change_recovery()
                 {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
@@ -10115,7 +9612,7 @@ impl Agent {
 
             if requires_action && tool_calls_made_this_turn == 0 {
                 if action_expectation == recovery::ActionExpectation::RepoChange
-                    && recovery_owner.allows_generic_repo_change_recovery()
+                    && recovery_dispatch_gate.allows_generic_repo_change_recovery()
                 {
                     repo_change_retries += 1;
                     if repo_change_retries >= 2 {
@@ -10329,7 +9826,7 @@ impl Agent {
 
             if action_expectation == recovery::ActionExpectation::RepoChange
                 && repo_edit_calls_made_this_turn == 0
-                && recovery_owner.allows_generic_repo_change_recovery()
+                && recovery_dispatch_gate.allows_generic_repo_change_recovery()
             {
                 if should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
                     && self.maybe_materialize_framework_game_fallback(last_iter)
@@ -10491,7 +9988,7 @@ impl Agent {
                 repo_edit_calls_made_this_turn,
                 &final_reply,
                 task_contract_action.as_ref(),
-            ) && recovery_owner.allows_generic_repo_change_recovery()
+            ) && recovery_dispatch_gate.allows_generic_repo_change_recovery()
             {
                 repo_change_retries += 1;
                 if repo_change_retries >= 3 {
@@ -10520,7 +10017,7 @@ impl Agent {
                 self.active_task_expects_repo_change(),
                 self.session.mode_state.mode,
             ) || self.current_request_needs_playable_ui_quality_gate())
-                && recovery_owner.allows_deterministic_fallback()
+                && recovery_dispatch_gate.allows_deterministic_fallback()
                 && let Some((request, target_path, issue)) =
                     self.accepted_repo_change_quality_issue()
             {
@@ -12293,7 +11790,10 @@ impl Agent {
                 self.emit_safe_stop_report_for_repair_terminal(reason);
                 TaskContractVerifierFlowOutcome::Exit {
                     reason: repair_terminal_exit_reason(reason),
-                    error_text: format!("verifier repair safe stop after rejected patch: {error}"),
+                    error_text: format!(
+                        "verifier repair safe stop after rejected patch: {error}. next_action: {}",
+                        Self::repair_rejection_next_action(&error)
+                    ),
                 }
             }
             super::repair_job::RepairNextAction::RequestDiagnostic
@@ -12343,6 +11843,26 @@ impl Agent {
                 }
             }
         }
+    }
+
+    fn repair_rejection_next_action(error: &str) -> &'static str {
+        let normalized = error.to_ascii_lowercase();
+        if normalized.contains("role_mismatch") {
+            return "diagnostic and patch target disagreed; narrow the requested repair target or provide the authoritative file to change";
+        }
+        if normalized.contains("ambiguous")
+            || normalized.contains("authority")
+            || normalized.contains("expectation")
+        {
+            return "clarify the expected behavior or provide authoritative examples before retrying";
+        }
+        if normalized.contains("malformed") {
+            return "retry with a narrower task or simpler verifier output so the patch proposal can be structured safely";
+        }
+        if normalized.contains("duplicate") || normalized.contains("noop") {
+            return "inspect the verifier failure and retry with a different repair target";
+        }
+        "inspect the verifier diagnostics and retry with a narrower repair target"
     }
 
     fn record_missing_verifier_setup_failure(&mut self, last_iter: usize, reason: &str) -> bool {
@@ -12760,7 +12280,7 @@ impl Agent {
         &mut self,
         stream_output: bool,
         interrupt_flag: &InterruptFlag,
-        recovery_owner: RecoveryOwner,
+        recovery_dispatch_gate: RecoveryDispatchGate,
     ) -> Result<AssistantReply, String> {
         // Issue #430 Phase D: freeze the footer for the entire LLM call (the
         // thinking spinner writes to stderr, but stream chunks land on stdout
@@ -12822,13 +12342,13 @@ impl Agent {
                     //       のみで動く汎用 path (experimental flag 非依存)。
                     //       qwen3.5 ユーザーの format-error 後 finish は flag off
                     //       でも維持される。
-                    if recovery_owner.allows_deterministic_fallback()
+                    if recovery_dispatch_gate.allows_deterministic_fallback()
                         && let Some(reply) =
                             self.maybe_apply_deterministic_edit_after_format_error(&err)?
                     {
                         return Ok(reply);
                     }
-                    if recovery_owner.allows_generic_repo_change_recovery()
+                    if recovery_dispatch_gate.allows_generic_repo_change_recovery()
                         && let Some(reply) = self.maybe_finish_after_edit_format_error(&err)
                     {
                         return Ok(reply);
@@ -12888,7 +12408,7 @@ impl Agent {
                         }
                     }
                     if err.to_ascii_lowercase().contains("timed out")
-                        && recovery_owner.allows_deterministic_fallback()
+                        && recovery_dispatch_gate.allows_deterministic_fallback()
                         && let Some(reply) =
                             self.maybe_apply_deterministic_polish_fallback_after_timeout(&err)
                     {
@@ -12904,7 +12424,7 @@ impl Agent {
                         && let Some(policy) = timeout_focused_policy
                     {
                         let target = &policy.target;
-                        if recovery_owner.allows_deterministic_fallback()
+                        if recovery_dispatch_gate.allows_deterministic_fallback()
                             && let Some(reply) =
                                 self.maybe_apply_deterministic_quality_fallback_after_timeout(&err)
                         {
@@ -15359,17 +14879,24 @@ impl Agent {
         );
         let behavior_contract_has_repair_authority =
             super::required_behavior::behavior_contract_has_repair_authority(&task_contract);
-        let accepted_plan = match validate_verifier_repair_plan_admission(
-            &context,
-            &active_request,
-            behavior_contract_has_repair_authority,
+        let legacy_input = context
+            .assessment
+            .as_ref()
+            .map(|assessment| legacy_repair_brief_input_from_assessment(assessment, 0.6));
+        let accepted_plan = match super::repair_plan_admission::validate_repair_plan_admission(
+            super::repair_plan_admission::RepairPlanAdmissionInput {
+                context: &context,
+                active_request: &active_request,
+                behavior_contract_present: behavior_contract_has_repair_authority,
+                legacy_input,
+            },
         ) {
             Ok(plan) => plan,
             Err(err) => {
                 let reason = err.message();
                 let error = format!("verifier_repair_pass_invalid: {reason}");
                 if let Some(job) = self.repair_job.as_mut() {
-                    job.apply_event(verifier_repair_plan_admission_event(&err));
+                    job.apply_event(super::repair_plan_admission::admission_error_event(&err));
                 }
                 log_llm_event(
                     "agent.verifier_repair_plan.rejected",
@@ -21024,7 +20551,65 @@ mod tests {
                 payload.get("truncated").and_then(|v| v.as_bool()),
                 Some(false)
             );
+            assert!(
+                payload
+                    .get("blocker_class")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "blocker_class for {:?}",
+                reason
+            );
+            assert!(
+                payload
+                    .get("authority_status")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+                "authority_status for {:?}",
+                reason
+            );
+            assert!(
+                payload
+                    .get("next_user_action")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty()),
+                "next_user_action for {:?}",
+                reason
+            );
         }
+    }
+
+    #[test]
+    fn build_safe_stop_payload_marks_assertion_repair_as_authority_gap() {
+        let report = minimal_report(
+            StopReason::VerifierFailedSafeStop,
+            VerifierFailureType::AssertionFailure,
+        );
+        let payload = build_safe_stop_payload(&report);
+
+        assert_eq!(
+            payload.get("blocker_class").and_then(|v| v.as_str()),
+            Some("assertion_authority")
+        );
+        assert_eq!(
+            payload.get("authority_status").and_then(|v| v.as_str()),
+            Some("insufficient_external_authority_for_expected_value")
+        );
+        assert!(
+            payload
+                .get("next_user_action")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("authoritative"))
+        );
+    }
+
+    #[test]
+    fn repair_rejection_next_action_explains_role_mismatch() {
+        let action = super::Agent::repair_rejection_next_action(
+            "verifier_repair_pass_invalid: repair plan rejected: role_mismatch",
+        );
+
+        assert!(action.contains("target disagreed"));
+        assert!(action.contains("authoritative file"));
     }
 
     #[test]
@@ -24948,7 +24533,7 @@ fn patch_proposal_target_contents_for_shadow(
     work_root: &Path,
     relative_path: &str,
 ) -> Option<String> {
-    if !verifier_repair_path_input_is_safe(relative_path) {
+    if !super::repair_patch_validation::is_repair_path_input_safe(relative_path) {
         return None;
     }
     let root = std::fs::canonicalize(work_root).ok()?;
@@ -25004,48 +24589,49 @@ fn validate_accepted_repair_plan_authorizes_target(
     target_hint: &super::task_contract::RecoveryTargetHint,
     relative_path: &str,
 ) -> Result<(), ValidationFailure> {
-    let action = &accepted_plan.action;
-    if normalize_shadow_path(&action.target_path) != normalize_shadow_path(relative_path) {
-        return Err(ValidationFailure::failed_with_signal(
-            "repair intent rejected: AcceptedRepairPlan target does not match selected repair target"
-                .to_string(),
-            RepairRejectionSignal::Malformed,
-        ));
-    }
-    if action.target_role != target_hint.role {
-        return Err(ValidationFailure::failed(
-            "repair intent rejected: AcceptedRepairPlan role does not match selected repair target"
-                .to_string(),
-        ));
-    }
-    if action.allowed_change_kind == super::repair_brief::AllowedChangeKind::InsufficientEvidence {
-        return Err(ValidationFailure::failed(
-            "repair intent rejected: AcceptedRepairPlan has insufficient evidence".to_string(),
-        ));
-    }
-    if matches!(
-        action.source_of_truth,
-        super::repair_brief::SourceOfTruth::Ambiguous
-    ) || (matches!(
-        action.source_of_truth,
-        super::repair_brief::SourceOfTruth::Unknown
-    ) && repair_change_kind_requires_spec_authority(action.allowed_change_kind))
-    {
-        return Err(ValidationFailure::failed(
-            "repair intent rejected: AcceptedRepairPlan authority is ambiguous".to_string(),
-        ));
-    }
-    Ok(())
+    super::repair_patch_validation::validate_accepted_plan_authorizes_target(
+        accepted_plan,
+        target_hint,
+        relative_path,
+    )
+    .map_err(|err| match err {
+        super::repair_patch_validation::RepairPlanTargetAuthorizationError::TargetMismatch => {
+            ValidationFailure::failed_with_signal(
+                err.message().to_string(),
+                RepairRejectionSignal::Malformed,
+            )
+        }
+        super::repair_patch_validation::RepairPlanTargetAuthorizationError::RoleMismatch
+        | super::repair_patch_validation::RepairPlanTargetAuthorizationError::InsufficientEvidence
+        | super::repair_patch_validation::RepairPlanTargetAuthorizationError::AmbiguousAuthority => {
+            ValidationFailure::failed(err.message().to_string())
+        }
+    })
 }
 
-fn repair_change_kind_requires_spec_authority(
-    kind: super::repair_brief::AllowedChangeKind,
-) -> bool {
-    matches!(
-        kind,
-        super::repair_brief::AllowedChangeKind::FixImplementationBehavior
-            | super::repair_brief::AllowedChangeKind::FixGeneratedTestExpectation
-    )
+fn validation_failure_from_repair_intent_input_error(
+    err: super::repair_patch_validation::RepairIntentInputError,
+) -> ValidationFailure {
+    match err {
+        super::repair_patch_validation::RepairIntentInputError::EmptyOldString => {
+            ValidationFailure::failed_with_signal(
+                err.message().to_string(),
+                RepairRejectionSignal::Malformed,
+            )
+        }
+        super::repair_patch_validation::RepairIntentInputError::Noop => {
+            ValidationFailure::failed_with_signal(
+                err.message().to_string(),
+                RepairRejectionSignal::Noop,
+            )
+        }
+        super::repair_patch_validation::RepairIntentInputError::EditTooLarge
+        | super::repair_patch_validation::RepairIntentInputError::Markup
+        | super::repair_patch_validation::RepairIntentInputError::IntroducesSecret
+        | super::repair_patch_validation::RepairIntentInputError::SuspiciousShellPayload => {
+            ValidationFailure::failed(err.message().to_string())
+        }
+    }
 }
 
 fn validate_verifier_repair_intents_inner(
@@ -25056,10 +24642,9 @@ fn validate_verifier_repair_intents_inner(
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
     // Issue #639: every early-return path here represents a *Failed* cheap
-    // check (validation rejection). Only `validate_verifier_repair_candidate_contents`
-    // can produce `CheapCheckOutcome::Unavailable`, which propagates verbatim
-    // via the trailing `?` below. The `impl From<String> for CheapCheckOutcome`
-    // makes `.into()` on a `String` produce a `Failed` variant.
+    // check (validation rejection). Only the patch-validation cheap content
+    // check can produce `CheapCheckOutcome::Unavailable`; this wrapper maps
+    // the typed module error back into the legacy outcome carrier.
     if intents.is_empty() {
         return Err(ValidationFailure::failed(
             "repair intent list must not be empty".to_string(),
@@ -25070,45 +24655,16 @@ fn validate_verifier_repair_intents_inner(
             "repair intent list contained too many edits".to_string(),
         ));
     }
-    if !verifier_repair_path_input_is_safe(&target_hint.path) {
-        return Err(ValidationFailure::failed(
-            "selected repair target path is not safe".to_string(),
-        ));
-    }
-
-    let root = std::fs::canonicalize(work_root)
-        .map_err(|err| format!("failed to canonicalize workspace: {err}"))?;
-    let selected =
-        resolve_user_path(work_root, &target_hint.path).map_err(ValidationFailure::failed)?;
-    let canonical = std::fs::canonicalize(&selected)
-        .map_err(|err| format!("selected repair target cannot be resolved: {err}"))?;
-    if canonical.strip_prefix(&root).is_err() {
-        return Err(ValidationFailure::failed(
-            "repair intent target escapes workspace".to_string(),
-        ));
-    }
-    if !canonical.is_file() {
-        return Err(ValidationFailure::failed(
-            "repair intent target is not an existing file".to_string(),
-        ));
-    }
-    let metadata = std::fs::metadata(&canonical)
-        .map_err(|err| format!("failed to read repair target metadata: {err}"))?;
-    if metadata.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
-        return Err(ValidationFailure::failed(
-            "repair target file is too large".to_string(),
-        ));
-    }
-    let bytes =
-        std::fs::read(&canonical).map_err(|err| format!("failed to read repair target: {err}"))?;
-    let original_contents = String::from_utf8(bytes)
-        .map_err(|_| "repair target is not valid UTF-8 text".to_string())?;
+    let target_snapshot = super::repair_patch_validation::read_repair_target_snapshot(
+        work_root,
+        &target_hint.path,
+        VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+    )
+    .map_err(|err| ValidationFailure::failed(err.message()))?;
+    let canonical = target_snapshot.canonical_path;
+    let relative_path = target_snapshot.relative_path;
+    let original_contents = target_snapshot.contents;
     let mut contents = original_contents.clone();
-    let relative_path = canonical
-        .strip_prefix(&root)
-        .map_err(|_| "repair target escapes workspace".to_string())?
-        .to_string_lossy()
-        .replace('\\', "/");
     if let Some(accepted_plan) = accepted_plan {
         validate_accepted_repair_plan_authorizes_target(
             accepted_plan,
@@ -25141,64 +24697,23 @@ fn validate_verifier_repair_intents_inner(
     // ---- bytes plus the previously-resolved canonical target path.
     let mut total_edit_bytes = 0usize;
     for intent in &intents {
-        if !verifier_repair_path_input_is_safe(&intent.path) {
-            return Err(ValidationFailure::failed(
-                "repair intent path is not a safe workspace-relative path".to_string(),
-            ));
-        }
-        let candidate =
-            resolve_user_path(work_root, &intent.path).map_err(ValidationFailure::failed)?;
-        let candidate = std::fs::canonicalize(&candidate)
-            .map_err(|err| format!("repair intent target cannot be resolved: {err}"))?;
-        if candidate != canonical {
-            return Err(ValidationFailure::failed(
-                "repair intent path does not match selected repair target".to_string(),
-            ));
-        }
-        if intent.old_string.is_empty() {
-            return Err(ValidationFailure::failed_with_signal(
-                "repair intent old_string must not be empty".to_string(),
-                RepairRejectionSignal::Malformed,
-            ));
-        }
-        // Issue #662 (5-4-1 priority 2): per-intent noop detector.
-        // `old_string == new_string` means the intent is a no-op — it would
-        // not change the file contents even if applied. Stays in Phase 1
-        // so Noop (priority 2) still beats Duplicate (priority 3).
-        if intent.old_string == intent.new_string {
-            return Err(ValidationFailure::failed_with_signal(
-                "repair intent old_string and new_string are identical".to_string(),
-                RepairRejectionSignal::Noop,
-            ));
-        }
-        total_edit_bytes = total_edit_bytes
-            .saturating_add(intent.old_string.len())
-            .saturating_add(intent.new_string.len());
-        if total_edit_bytes > VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES {
-            return Err(ValidationFailure::failed(
-                "repair intent edit is too large".to_string(),
-            ));
-        }
-        if verifier_repair_contains_tool_markup(&intent.old_string)
-            || verifier_repair_contains_tool_markup(&intent.new_string)
-            || verifier_repair_contains_tool_or_markdown(&intent.reason)
-        {
-            return Err(ValidationFailure::failed(
-                "repair intent string contained markdown or tool-call markup".to_string(),
-            ));
-        }
-        if introduces_obvious_secret(&intent.old_string, &intent.new_string) {
-            return Err(ValidationFailure::failed(
-                "repair intent appears to introduce a secret".to_string(),
-            ));
-        }
-        if !verifier_repair_path_allows_shell_controls(&relative_path)
-            && verifier_repair_contains_suspicious_shell_payload(&intent.new_string)
-        {
-            return Err(ValidationFailure::failed(
-                "repair intent contains suspicious shell-control payload".to_string(),
-            ));
-        }
+        super::repair_patch_validation::validate_repair_intent_target_path(
+            work_root,
+            &intent.path,
+            &canonical,
+        )
+        .map_err(|err| ValidationFailure::failed(err.message()))?;
+        total_edit_bytes = super::repair_patch_validation::validate_repair_intent_text_payload(
+            super::repair_patch_validation::RepairIntentTextPayload {
+                old_string: &intent.old_string,
+                new_string: &intent.new_string,
+                reason: &intent.reason,
+                relative_path: &relative_path,
+                current_total_edit_bytes: total_edit_bytes,
+                max_total_edit_bytes: VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
+            },
+        )
+        .map_err(validation_failure_from_repair_intent_input_error)?;
     }
 
     // Issue #662 (5-4-1 priority 3, Codex CB-001): history-driven duplicate
@@ -25223,31 +24738,21 @@ fn validate_verifier_repair_intents_inner(
     }
 
     // Phase 2: in-memory apply. Per-intent input validation has already
-    // passed; remaining failures here surface as unsigned
-    // `apply_exact_once` / `apply_bounded_replace_all` rejections (which
-    // remain `ledger-non-target` by design — they are reported via
-    // `record_controller_verifier_repair_invalid(outcome = None)`).
-    let mut used_whitespace_fallback = false;
-    for intent in &intents {
-        contents = if intent.replace_all {
-            apply_bounded_replace_all(&contents, &intent.old_string, &intent.new_string)
-                .map_err(|err| format!("repair intent replace_all rejected: {err}"))?
-        } else {
-            let result = apply_exact_once_with_whitespace_fallback(
-                &contents,
-                &intent.old_string,
-                &intent.new_string,
-            )
-            .map_err(|err| {
-                format!(
-                    "repair intent exact edit rejected: {err}; old_string_excerpt={}",
-                    compact_verifier_failure_text(&intent.old_string, 120)
-                )
-            })?;
-            used_whitespace_fallback |= result.used_whitespace_fallback;
-            result.updated_contents
-        };
-    }
+    // passed; remaining failures here surface as unsigned exact/replace-all
+    // rejections (which remain ledger-non-target by design).
+    let edit_payloads = intents
+        .iter()
+        .map(|intent| super::repair_patch_validation::RepairIntentEdit {
+            old_string: &intent.old_string,
+            new_string: &intent.new_string,
+            replace_all: intent.replace_all,
+        })
+        .collect::<Vec<_>>();
+    let apply_result =
+        super::repair_patch_validation::apply_repair_intent_edits(&contents, &edit_payloads)
+            .map_err(ValidationFailure::failed)?;
+    contents = apply_result.updated_contents;
+    let used_whitespace_fallback = apply_result.used_whitespace_fallback;
     // Issue #662 (5-4-1 priority 2 — apply-side noop branch): all per-intent
     // edits applied cleanly but the resulting file contents are identical to
     // the pre-edit snapshot (e.g. multiple intents that cancel out). This is
@@ -25390,17 +24895,28 @@ fn validate_verifier_repair_intents_inner(
             rejection_signal: None,
         });
     }
-    validate_duplicate_binding_repair_candidate(
+    super::repair_patch_validation::validate_duplicate_binding_repair_candidate(
         &relative_path,
         context,
         &original_contents,
         &contents,
-    )?;
-    validate_verifier_repair_candidate_contents(
+    )
+    .map_err(|err| {
+        ValidationFailure::failed_with_signal(err.message(), RepairRejectionSignal::Duplicate)
+    })?;
+    super::repair_patch_validation::validate_repair_candidate_contents(
         &relative_path,
         &contents,
         used_whitespace_fallback,
-    )?;
+    )
+    .map_err(|err| match err {
+        super::repair_patch_validation::RepairCandidateContentError::CheapCheckFailed(message) => {
+            CheapCheckOutcome::Failed(message)
+        }
+        super::repair_patch_validation::RepairCandidateContentError::Unavailable => {
+            CheapCheckOutcome::Unavailable
+        }
+    })?;
 
     // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran
     // **before** the in-memory apply above. The remaining branches here
@@ -25414,187 +24930,6 @@ fn validate_verifier_repair_intents_inner(
         updated_contents: contents,
         fingerprint,
     })
-}
-
-fn validate_duplicate_binding_repair_candidate(
-    relative_path: &str,
-    context: &super::repair_job::RepairJob,
-    before: &str,
-    after: &str,
-) -> Result<(), ValidationFailure> {
-    let duplicate_names = duplicate_binding_names_from_verifier_context(context);
-    if duplicate_names.is_empty() {
-        return Ok(());
-    }
-    let before_counts = source_binding_counts_for_duplicate_guard(relative_path, before);
-    let after_counts = source_binding_counts_for_duplicate_guard(relative_path, after);
-    let mut still_duplicate = Vec::new();
-    for name in duplicate_names {
-        let before_count = before_counts.get(&name).copied().unwrap_or(0);
-        let after_count = after_counts.get(&name).copied().unwrap_or(0);
-        if after_count > 1 && after_count >= before_count {
-            still_duplicate.push(format!("{name}={after_count}"));
-        }
-    }
-    if still_duplicate.is_empty() {
-        return Ok(());
-    }
-    Err(ValidationFailure::failed_with_signal(
-        format!(
-            "repair intent rejected: duplicate binding still present after candidate edit ({})",
-            still_duplicate.join(", ")
-        ),
-        RepairRejectionSignal::Duplicate,
-    ))
-}
-
-fn duplicate_binding_names_from_verifier_context(
-    context: &super::repair_job::RepairJob,
-) -> HashSet<String> {
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    if !text_mentions_duplicate_binding_failure(&diagnostic_text) {
-        return HashSet::new();
-    }
-    quoted_safe_identifiers(&diagnostic_text)
-}
-
-fn text_mentions_duplicate_binding_failure(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("defined multiple times")
-        || lower.contains("redefined")
-        || lower.contains("duplicate definition")
-        || lower.contains("already been declared")
-        || lower.contains("already defined")
-}
-
-fn quoted_safe_identifiers(text: &str) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for quote in ['`', '\'', '"'] {
-        let mut rest = text;
-        while let Some(start) = rest.find(quote) {
-            let after_start = &rest[start + quote.len_utf8()..];
-            let Some(end) = after_start.find(quote) else {
-                break;
-            };
-            let candidate = &after_start[..end];
-            if source_identifier_is_safe(candidate) {
-                names.insert(candidate.to_string());
-            }
-            rest = &after_start[end + quote.len_utf8()..];
-        }
-    }
-    names
-}
-
-fn source_binding_counts_for_duplicate_guard(
-    relative_path: &str,
-    contents: &str,
-) -> HashMap<String, usize> {
-    let extension = Path::new(relative_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mut counts = HashMap::new();
-    for line in contents.lines() {
-        let trimmed = line.trim_start();
-        let binding = match extension.as_str() {
-            "rs" => rust_binding_name(trimmed),
-            "py" | "pyw" => python_binding_name(trimmed),
-            "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => js_like_binding_name(trimmed),
-            _ => None,
-        };
-        if let Some(name) = binding {
-            *counts.entry(name).or_insert(0) += 1;
-        }
-    }
-    counts
-}
-
-fn rust_binding_name(line: &str) -> Option<String> {
-    if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
-        return None;
-    }
-    let mut tokens = line.split_whitespace().peekable();
-    while let Some(token) = tokens.peek().copied() {
-        if token == "pub"
-            || token.starts_with("pub(")
-            || matches!(token, "async" | "unsafe" | "extern")
-        {
-            tokens.next();
-        } else {
-            break;
-        }
-    }
-    let keyword = tokens.next()?;
-    if keyword == "const" && tokens.peek().copied() == Some("fn") {
-        tokens.next();
-        return token_to_source_identifier(tokens.next()?);
-    }
-    if !matches!(
-        keyword,
-        "fn" | "struct" | "enum" | "trait" | "type" | "const" | "static" | "mod"
-    ) {
-        return None;
-    }
-    token_to_source_identifier(tokens.next()?)
-}
-
-fn python_binding_name(line: &str) -> Option<String> {
-    if line.starts_with('#') || line.starts_with('@') {
-        return None;
-    }
-    let rest = line
-        .strip_prefix("async def ")
-        .or_else(|| line.strip_prefix("def "));
-    if let Some(rest) = rest {
-        return token_to_source_identifier(rest);
-    }
-    line.strip_prefix("class ")
-        .and_then(token_to_source_identifier)
-}
-
-fn js_like_binding_name(line: &str) -> Option<String> {
-    if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
-        return None;
-    }
-    let mut tokens = line.split_whitespace().peekable();
-    while let Some(token) = tokens.peek().copied() {
-        if matches!(token, "export" | "default" | "async" | "declare") {
-            tokens.next();
-        } else {
-            break;
-        }
-    }
-    let keyword = tokens.next()?;
-    match keyword {
-        "function" | "class" => token_to_source_identifier(tokens.next()?),
-        "const" | "let" | "var" => token_to_source_identifier(tokens.next()?),
-        _ => None,
-    }
-}
-
-fn token_to_source_identifier(token: &str) -> Option<String> {
-    let ident = token
-        .trim_start_matches("r#")
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
-        .collect::<String>();
-    source_identifier_is_safe(&ident).then_some(ident)
-}
-
-fn source_identifier_is_safe(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_' || first == '$')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
 fn filter_test_weakening_for_observed_assert_update(
@@ -26014,278 +25349,6 @@ fn apply_validated_verifier_repair_edit(edit: &ValidatedVerifierRepairEdit) -> R
     std::fs::write(&edit.canonical_path, edit.updated_contents.as_bytes())
         .map_err(|err| format!("failed to write validated repair target: {err}"))?;
     Ok(())
-}
-
-fn apply_exact_once_with_whitespace_fallback(
-    contents: &str,
-    old: &str,
-    new: &str,
-) -> Result<VerifierRepairIntentApplyResult, String> {
-    match crate::tools::edit::apply_exact_once(contents, old, new) {
-        Ok(updated) => Ok(VerifierRepairIntentApplyResult {
-            updated_contents: updated,
-            used_whitespace_fallback: false,
-        }),
-        Err(err) if err == "old_string was not found" => {
-            apply_unique_whitespace_normalized_replacement(contents, old, new)
-                .map(|updated| VerifierRepairIntentApplyResult {
-                    updated_contents: updated,
-                    used_whitespace_fallback: true,
-                })
-                .map_err(|fallback_err| {
-                    format!("{err}; whitespace fallback rejected: {fallback_err}")
-                })
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn validate_verifier_repair_candidate_contents(
-    relative_path: &str,
-    candidate_contents: &str,
-    used_whitespace_fallback: bool,
-) -> Result<(), CheapCheckOutcome> {
-    use super::project_verifier::{ProjectVerifier, ProjectVerifierOutcome};
-
-    match ProjectVerifier::for_path(relative_path) {
-        None => {
-            if used_whitespace_fallback
-                && verifier_repair_path_is_whitespace_sensitive(relative_path)
-            {
-                return Err(CheapCheckOutcome::Unavailable);
-            }
-            Ok(())
-        }
-        Some(verifier) => match verifier.check(relative_path, candidate_contents) {
-            ProjectVerifierOutcome::Ok => Ok(()),
-            ProjectVerifierOutcome::Failed(err) => Err(CheapCheckOutcome::Failed(format!(
-                "repair candidate cheap check failed for {relative_path}: {err}"
-            ))),
-            ProjectVerifierOutcome::Unavailable => Err(CheapCheckOutcome::Unavailable),
-        },
-    }
-}
-
-fn verifier_repair_path_is_whitespace_sensitive(relative_path: &str) -> bool {
-    matches!(
-        Path::new(relative_path)
-            .extension()
-            .and_then(|extension| extension.to_str()),
-        Some("py") | Some("pyw") | Some("yaml") | Some("yml")
-    )
-}
-
-fn apply_unique_whitespace_normalized_replacement(
-    contents: &str,
-    old: &str,
-    new: &str,
-) -> Result<String, String> {
-    if old.trim().len() < 16 {
-        return Err("old_string is too short for whitespace-normalized matching".to_string());
-    }
-    let tokens = old.split_whitespace().collect::<Vec<_>>();
-    if tokens.len() < 2 {
-        return Err("old_string has too few non-whitespace tokens".to_string());
-    }
-
-    let include_leading_whitespace = old.chars().next().is_some_and(|ch| ch.is_whitespace());
-    let include_trailing_whitespace = old.chars().next_back().is_some_and(|ch| ch.is_whitespace());
-    let mut matches = Vec::new();
-    let first = tokens[0];
-    let mut search_from = 0usize;
-
-    while search_from <= contents.len() {
-        let Some(relative_start) = contents[search_from..].find(first) else {
-            break;
-        };
-        let token_start = search_from + relative_start;
-        let token_end = token_start + first.len();
-        search_from = token_end;
-
-        if !is_whitespace_boundary_before(contents, token_start) {
-            continue;
-        }
-
-        let mut pos = token_end;
-        let mut matched = true;
-        for token in tokens.iter().skip(1) {
-            let before_skip = pos;
-            pos = skip_whitespace(contents, pos);
-            if pos == before_skip || !contents[pos..].starts_with(token) {
-                matched = false;
-                break;
-            }
-            pos += token.len();
-        }
-        if !matched {
-            continue;
-        }
-
-        let span_end = if include_trailing_whitespace {
-            let extended = skip_whitespace(contents, pos);
-            if extended == pos {
-                continue;
-            }
-            extended
-        } else if is_whitespace_boundary_after(contents, pos) {
-            pos
-        } else {
-            continue;
-        };
-        let span_start = if include_leading_whitespace {
-            let extended = backtrack_whitespace(contents, token_start);
-            if extended == token_start {
-                continue;
-            }
-            extended
-        } else {
-            token_start
-        };
-
-        matches.push((span_start, span_end));
-        if matches.len() > 1 {
-            return Err(
-                "old_string matched more than once after whitespace normalization".to_string(),
-            );
-        }
-    }
-
-    let Some((start, end)) = matches.into_iter().next() else {
-        return Err("old_string was not found after whitespace normalization".to_string());
-    };
-    let mut updated = String::with_capacity(contents.len() + new.len().saturating_sub(end - start));
-    updated.push_str(&contents[..start]);
-    updated.push_str(new);
-    updated.push_str(&contents[end..]);
-    Ok(updated)
-}
-
-fn skip_whitespace(value: &str, mut pos: usize) -> usize {
-    while pos < value.len() {
-        let Some(ch) = value[pos..].chars().next() else {
-            break;
-        };
-        if !ch.is_whitespace() {
-            break;
-        }
-        pos += ch.len_utf8();
-    }
-    pos
-}
-
-fn backtrack_whitespace(value: &str, mut pos: usize) -> usize {
-    while pos > 0 {
-        let Some((previous_pos, ch)) = value[..pos].char_indices().next_back() else {
-            break;
-        };
-        if !ch.is_whitespace() {
-            break;
-        }
-        pos = previous_pos;
-    }
-    pos
-}
-
-fn is_whitespace_boundary_before(value: &str, pos: usize) -> bool {
-    pos == 0
-        || value[..pos]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch.is_whitespace())
-}
-
-fn is_whitespace_boundary_after(value: &str, pos: usize) -> bool {
-    pos == value.len()
-        || value[pos..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_whitespace())
-}
-
-fn apply_bounded_replace_all(contents: &str, old: &str, new: &str) -> Result<String, String> {
-    if old.trim().is_empty() || old.len() < 2 {
-        return Err("replace_all old_string is too broad".to_string());
-    }
-    let match_count = contents.matches(old).count();
-    if match_count == 0 {
-        return Err("old_string was not found".to_string());
-    }
-    if match_count > VERIFIER_REPAIR_PASS_MAX_REPLACE_ALL_MATCHES {
-        return Err("old_string matched too many locations".to_string());
-    }
-    Ok(contents.replace(old, new))
-}
-
-fn verifier_repair_path_input_is_safe(raw_path: &str) -> bool {
-    let path = raw_path.trim();
-    if path.is_empty()
-        || path.contains('\0')
-        || path.chars().any(|ch| ch.is_control())
-        || Path::new(path).is_absolute()
-        || is_ignored_workspace_display_path(path)
-    {
-        return false;
-    }
-    !Path::new(path)
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-}
-
-fn verifier_repair_contains_tool_or_markdown(value: &str) -> bool {
-    value.contains("```") || verifier_repair_contains_tool_markup(value)
-}
-
-fn verifier_repair_contains_tool_markup(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("<anvil_tool_call") || lower.contains("</anvil_tool_call>")
-}
-
-fn introduces_obvious_secret(old: &str, new: &str) -> bool {
-    let old_masked = crate::session::feedback::mask_secrets(old);
-    let new_masked = crate::session::feedback::mask_secrets(new);
-    old_masked == old && new_masked != new
-}
-
-fn verifier_repair_path_allows_shell_controls(relative_path: &str) -> bool {
-    let path = Path::new(relative_path);
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        filename.as_str(),
-        "makefile" | "justfile" | "taskfile.yml" | "taskfile.yaml"
-    ) {
-        return true;
-    }
-    matches!(
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "sh" | "bash" | "zsh" | "fish" | "ps1" | "cmd" | "bat"
-    )
-}
-
-fn verifier_repair_contains_suspicious_shell_payload(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    [
-        "rm -rf",
-        "curl ",
-        "wget ",
-        "| sh",
-        "| bash",
-        "bash -c",
-        "sh -c",
-        "powershell",
-        "chmod +x",
-        "mkfs",
-        "dd if=",
-    ]
-    .iter()
-    .any(|pattern| lower.contains(pattern))
 }
 
 #[cfg(test)]
@@ -27800,107 +26863,6 @@ fn verifier_repair_action_for_context(
     )
     .ok()?;
     super::repair_action::build_repair_action(&brief, &packet).ok()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerifierRepairPlanAdmissionError {
-    MissingDiagnosticAssessment,
-    MalformedDiagnosticBrief,
-    Rejected(super::repair_authority::RepairPlanRejection),
-}
-
-impl VerifierRepairPlanAdmissionError {
-    fn message(self) -> String {
-        match self {
-            Self::MissingDiagnosticAssessment => {
-                "repair plan rejected: missing diagnostic assessment".to_string()
-            }
-            Self::MalformedDiagnosticBrief => {
-                "repair plan rejected: malformed diagnostic brief".to_string()
-            }
-            Self::Rejected(reason) => format!("repair plan rejected: {}", reason.as_str()),
-        }
-    }
-}
-
-fn verifier_repair_plan_admission_event(
-    err: &VerifierRepairPlanAdmissionError,
-) -> super::repair_job::RepairJobEvent {
-    match err {
-        VerifierRepairPlanAdmissionError::Rejected(
-            super::repair_authority::RepairPlanRejection::AmbiguousAuthority
-            | super::repair_authority::RepairPlanRejection::TestExpectationWithoutAuthority
-            | super::repair_authority::RepairPlanRejection::TestExpectationContradictsAuthority,
-        )
-        | VerifierRepairPlanAdmissionError::Rejected(
-            super::repair_authority::RepairPlanRejection::Action(
-                super::repair_action::RepairActionRejection::AmbiguousSpec
-                | super::repair_action::RepairActionRejection::TestExpectationBlockedByUserRequest
-                | super::repair_action::RepairActionRejection::TestExpectationWithoutAuthority,
-            ),
-        ) => super::repair_job::RepairJobEvent::AmbiguousAuthority,
-        VerifierRepairPlanAdmissionError::MissingDiagnosticAssessment
-        | VerifierRepairPlanAdmissionError::MalformedDiagnosticBrief
-        | VerifierRepairPlanAdmissionError::Rejected(_) => {
-            super::repair_job::RepairJobEvent::DiagnosticMalformed
-        }
-    }
-}
-
-fn validate_verifier_repair_plan_admission(
-    context: &super::repair_job::RepairJob,
-    active_request: &str,
-    behavior_contract_present: bool,
-) -> Result<super::repair_plan::AcceptedRepairPlan, VerifierRepairPlanAdmissionError> {
-    let assessment = context
-        .assessment
-        .as_ref()
-        .ok_or(VerifierRepairPlanAdmissionError::MissingDiagnosticAssessment)?;
-    let packet = super::failure_packet::FailurePacket::from_repair_job(context);
-    let mut brief = super::repair_brief::repair_brief_from_legacy_diagnostic(
-        legacy_repair_brief_input_from_assessment(assessment, 0.6),
-    )
-    .map_err(|_| VerifierRepairPlanAdmissionError::MalformedDiagnosticBrief)?;
-    if let Some(plan) = context.semantic_plan.as_ref() {
-        brief.source_of_truth = repair_brief_source_of_truth_from_spec_authority(
-            plan.spec_authority,
-            brief.source_of_truth,
-        );
-    }
-    let evidence = super::repair_authority::AuthorityEvidence::from_packet_and_context(
-        &packet,
-        active_request,
-        behavior_contract_present,
-    );
-    let proposal = super::repair_plan::RepairPlanProposal::from_brief(brief);
-    super::repair_plan::validate_repair_plan_proposal(&proposal, &packet, &evidence).map_err(
-        |reason| match reason {
-            super::repair_plan::RepairPlanValidationError::Rejected(reason) => {
-                VerifierRepairPlanAdmissionError::Rejected(reason)
-            }
-        },
-    )
-}
-
-fn repair_brief_source_of_truth_from_spec_authority(
-    authority: super::spec_authority::SpecAuthority,
-    fallback: super::repair_brief::SourceOfTruth,
-) -> super::repair_brief::SourceOfTruth {
-    match authority {
-        super::spec_authority::SpecAuthority::UserRequest => {
-            super::repair_brief::SourceOfTruth::UserRequest
-        }
-        super::spec_authority::SpecAuthority::BehaviorContract => {
-            super::repair_brief::SourceOfTruth::BehaviorContract
-        }
-        super::spec_authority::SpecAuthority::VerifiedPublicInterface => {
-            super::repair_brief::SourceOfTruth::VerifiedPublicInterface
-        }
-        super::spec_authority::SpecAuthority::ImplementationContract => {
-            super::repair_brief::SourceOfTruth::ImplementationContract
-        }
-        super::spec_authority::SpecAuthority::LlmGeneratedTest => fallback,
-    }
 }
 
 fn push_shadow_candidate_artifact(
@@ -29454,75 +28416,6 @@ pub(super) fn latest_verifier_repair_note_index(messages: &[ConversationMessage]
     })
 }
 
-/// Issue #654 — `SAFE_STOP_REPORT_EVENT_MAX_BYTES` SSOT for the bounded
-/// `agent.safe_stop.report` payload (DR4-001). The size cap is enforced by
-/// `build_safe_stop_payload`; oversize payloads are deterministically
-/// truncated and `"truncated": true` is set on the payload.
-pub(super) const SAFE_STOP_REPORT_EVENT_MAX_BYTES: usize = 4096;
-
-/// Issue #654 — collect a compact list of recent action labels (newest-last)
-/// from the conversation message stream for use as the `actual_actions_raw`
-/// input to `SafeStopContext`.
-///
-/// Issue #663 (Codex CB-004 fix): looks at the most recent `Read` / `Write`
-/// / `Edit` / `Bash` tool calls in the last ~24 messages and produces label
-/// strings whose `detail` is a 16-hex `stable_path_hash` of the
-/// mask-sanitized argument — NOT the raw path or raw command. This prevents
-/// raw workspace paths and raw bash commands from appearing in the
-/// `agent.safe_stop.report.actual_actions` surface (or in downstream
-/// persisted JSONL), independent of the downstream `mask_secrets` +
-/// `mask_payload_inplace` defence-in-depth. The hash is non-cryptographic
-/// (`DefaultHasher`) but is the existing correlator SSOT (`stable_path_hash`)
-/// so log consumers can correlate by hash if they retain workspace context.
-fn collect_recent_action_labels(messages: &[ConversationMessage]) -> Vec<String> {
-    use crate::logging::stable_path_hash;
-    use crate::session::feedback::mask_secrets;
-    const SCAN_LIMIT: usize = 24;
-    let mut out: Vec<String> = Vec::new();
-    let scan_start = messages.len().saturating_sub(SCAN_LIMIT);
-    for msg in messages.iter().skip(scan_start) {
-        if msg.role != "assistant" {
-            continue;
-        }
-        for tool_call in msg.tool_calls.iter() {
-            let name = tool_call.name.as_str();
-            if !matches!(name, "Read" | "Write" | "Edit" | "Bash") {
-                continue;
-            }
-            // CB-004: derive a hashed correlator (never the raw value) for
-            // the argument that names the action's target. `Read` / `Write`
-            // / `Edit` use `path`; `Bash` uses `command`. Empty / missing
-            // arguments emit a name-only label.
-            let raw_detail = tool_call
-                .arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    tool_call
-                        .arguments
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or("");
-            let label = if raw_detail.is_empty() {
-                name.to_string()
-            } else {
-                // `stable_path_hash` is the existing SSOT (16-hex
-                // DefaultHasher) and is documented to be applied after
-                // `mask_secrets`. The same convention is used by
-                // `artifact_ledger`'s observability events and by
-                // `active_job_arbiter`. Bash commands are not paths but
-                // share the same correlator surface — re-using the SSOT
-                // keeps the hash space stable.
-                let hash = stable_path_hash(&mask_secrets(raw_detail));
-                format!("{name} <{hash}>")
-            };
-            out.push(label);
-        }
-    }
-    out
-}
-
 /// Issue #660 (Phase C / DD-5 / Stage 4 DR4-001/002) — pure builder that
 /// renders an `ActiveJobSelection` to the `agent.active_job.selected`
 /// payload. The payload schema (proposed to #666) is:
@@ -29744,162 +28637,6 @@ pub(super) fn build_agent_verifier_external_import_rejected_payload(
         "detected_truncated": detected_truncated,
         "detected_modules": detected_modules,
     })
-}
-
-/// Issue #654 (D.1 / DR1-007 / DR4-001) — pure builder that renders a
-/// `SafeStopReport` to a `serde_json::Value` suitable for `log_llm_event`.
-/// Bounded by `SAFE_STOP_REPORT_EVENT_MAX_BYTES` (4096 bytes); when the
-/// serialized form exceeds the cap, the helper deterministically trims
-/// optional fields (largest first) and sets `"truncated": true`.
-pub(super) fn build_safe_stop_payload(
-    report: &super::repair_job::SafeStopReport,
-) -> serde_json::Value {
-    let mut payload = render_safe_stop_payload(report, false);
-    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
-        return payload;
-    }
-    // Tier 1: drop output_excerpt + command details.
-    payload = render_safe_stop_payload_trimmed(report, TrimTier::Tier1);
-    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
-        return payload;
-    }
-    // Tier 2: drop actual_actions + owned_test_artifacts + exhausted summary.
-    payload = render_safe_stop_payload_trimmed(report, TrimTier::Tier2);
-    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
-        return payload;
-    }
-    // Tier 3: keep only mandatory fields.
-    payload = render_safe_stop_payload_trimmed(report, TrimTier::Tier3);
-    if serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES {
-        return payload;
-    }
-    // CB-002 (Codex review): the mandatory string fields (`session_id` +
-    // `stop_reason`) are unbounded above by the schema; an oversized
-    // `session_id` or a future-added mandatory field can push the Tier3
-    // payload past the 4KB invariant. The final hard fallback redacts all
-    // optional context that survived Tier3 to fixed placeholder strings so
-    // the serialized form is deterministically bounded.
-    enforce_safe_stop_payload_hard_cap(report)
-}
-
-/// Issue #654 (CB-002) — last-resort projection used when Tier3 still
-/// exceeds [`SAFE_STOP_REPORT_EVENT_MAX_BYTES`]. Drops every optional /
-/// large field, redacts mandatory string fields to fixed `"redacted"`
-/// placeholders, and re-asserts the 4KB cap. The final assertion is a
-/// defense-in-depth `debug_assert!` — in release builds the function
-/// always returns a payload that is at least bounded against the
-/// largest-known runtime inputs.
-fn enforce_safe_stop_payload_hard_cap(
-    report: &super::repair_job::SafeStopReport,
-) -> serde_json::Value {
-    let serialized_session_id = sanitize_safe_stop_mandatory_string(&report.session_id);
-    let payload = serde_json::json!({
-        "session_id": serialized_session_id,
-        "turn_index": report.turn_index,
-        "stop_reason": report.stop_reason.as_str(),
-        "failure_type": report.failure_type.as_str(),
-        "failure_signature": "",
-        "command": "",
-        "output_excerpt": "",
-        "current_role": serde_json::Value::Null,
-        "expected_target": serde_json::Value::Null,
-        "actual_actions": serde_json::json!([]),
-        "diagnostic_target_missing_reason": serde_json::Value::Null,
-        "exhausted_attempts_summary": serde_json::Value::Null,
-        "owned_test_artifacts": serde_json::json!([]),
-        "truncated": true,
-    });
-    debug_assert!(
-        serialized_byte_len(&payload) <= SAFE_STOP_REPORT_EVENT_MAX_BYTES,
-        "safe_stop hard-cap projection exceeded {SAFE_STOP_REPORT_EVENT_MAX_BYTES} bytes"
-    );
-    payload
-}
-
-/// Issue #654 (CB-002) — cap a mandatory string to `SAFE_STOP_MANDATORY_STRING_MAX_CHARS`.
-/// Used by the hard-fallback projection so the worst-case `session_id` (or
-/// any future mandatory string) cannot trip the 4KB invariant.
-fn sanitize_safe_stop_mandatory_string(raw: &str) -> String {
-    const SAFE_STOP_MANDATORY_STRING_MAX_CHARS: usize = 240;
-    if raw.chars().count() <= SAFE_STOP_MANDATORY_STRING_MAX_CHARS {
-        return raw.to_string();
-    }
-    raw.chars()
-        .take(SAFE_STOP_MANDATORY_STRING_MAX_CHARS)
-        .collect()
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TrimTier {
-    Tier1,
-    Tier2,
-    Tier3,
-}
-
-fn serialized_byte_len(payload: &serde_json::Value) -> usize {
-    serde_json::to_vec(payload).map(|v| v.len()).unwrap_or(0)
-}
-
-fn render_safe_stop_payload(
-    report: &super::repair_job::SafeStopReport,
-    truncated: bool,
-) -> serde_json::Value {
-    let exhausted = report.exhausted_attempts_summary.as_ref().map(|s| {
-        serde_json::json!({
-            "total": s.total,
-            "per_cluster": s.per_cluster.iter().map(|(k, roles)| {
-                serde_json::json!([k, roles])
-            }).collect::<Vec<_>>(),
-            "last_repair_hypothesis": s.last_repair_hypothesis,
-        })
-    });
-    serde_json::json!({
-        "session_id": report.session_id,
-        "turn_index": report.turn_index,
-        "stop_reason": report.stop_reason.as_str(),
-        "failure_type": report.failure_type.as_str(),
-        "failure_signature": report.failure_signature,
-        "command": report.command,
-        "output_excerpt": report.output_excerpt,
-        "current_role": report.current_role.map(|r| r.label()),
-        "expected_target": report.expected_target,
-        "actual_actions": report.actual_actions,
-        "diagnostic_target_missing_reason": report
-            .diagnostic_target_missing_reason
-            .map(|r| r.as_str()),
-        "exhausted_attempts_summary": exhausted,
-        "owned_test_artifacts": report.owned_test_artifacts,
-        "truncated": truncated,
-    })
-}
-
-fn render_safe_stop_payload_trimmed(
-    report: &super::repair_job::SafeStopReport,
-    tier: TrimTier,
-) -> serde_json::Value {
-    let mut payload = render_safe_stop_payload(report, true);
-    let map = payload.as_object_mut().expect("safe_stop_payload object");
-    if tier == TrimTier::Tier1 || tier == TrimTier::Tier2 || tier == TrimTier::Tier3 {
-        map.insert("output_excerpt".to_string(), serde_json::json!(""));
-        map.insert("command".to_string(), serde_json::json!(""));
-    }
-    if tier == TrimTier::Tier2 || tier == TrimTier::Tier3 {
-        map.insert("actual_actions".to_string(), serde_json::json!([]));
-        map.insert("owned_test_artifacts".to_string(), serde_json::json!([]));
-        map.insert(
-            "exhausted_attempts_summary".to_string(),
-            serde_json::Value::Null,
-        );
-    }
-    if tier == TrimTier::Tier3 {
-        map.insert("expected_target".to_string(), serde_json::Value::Null);
-        map.insert(
-            "diagnostic_target_missing_reason".to_string(),
-            serde_json::Value::Null,
-        );
-        map.insert("failure_signature".to_string(), serde_json::json!(""));
-    }
-    payload
 }
 
 fn focused_edit_tool_policy_error(

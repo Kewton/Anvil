@@ -30,15 +30,165 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
-use super::repair_job::StopReason;
+use super::repair_job::{RepairNextAction, StopReason, VerifierBootstrapNextAction};
 use super::required_behavior::{
     BehaviorContractProjection, LOW_CONFIDENCE_THRESHOLD, behavior_projection_has_setup_label,
 };
 use super::task_contract::{
-    ArtifactRole, RecoveryTargetHint, TaskContract, VerifierPrerequisiteSignal,
-    has_required_setup_artifact,
+    ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract,
+    VerifierPrerequisiteSignal, has_required_setup_artifact,
 };
 use super::turn::EffectiveToolPolicy;
+use crate::modes::plan_act::ExecutionMode;
+
+/// Controller-facing next action for the pre-model part of the actor loop.
+///
+/// This is deliberately small: it does not execute tools, mutate state, or
+/// infer semantic progress from model prose. It only projects already-typed
+/// state into one dispatch source. Keeping it in this arbiter module prevents
+/// `turn.rs` from growing another local dispatch vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LoopControlAction {
+    ContinueRepairJob {
+        next_action: RepairNextAction,
+    },
+    ContinueMissingVerifierJob {
+        next_action: VerifierBootstrapNextAction,
+    },
+    RunVerifier,
+    RequestModelTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LoopControlInputs {
+    pub(super) mode: ExecutionMode,
+    pub(super) task_contract_verifier_repair_pending: bool,
+    pub(super) repair_next_action: Option<RepairNextAction>,
+    pub(super) missing_verifier_next_action: Option<VerifierBootstrapNextAction>,
+    pub(super) task_contract_action: Option<ArtifactRecoveryAction>,
+}
+
+pub(super) fn determine_loop_control_action(inputs: LoopControlInputs) -> LoopControlAction {
+    if inputs.mode == ExecutionMode::Plan {
+        return LoopControlAction::RequestModelTurn;
+    }
+
+    if inputs.task_contract_verifier_repair_pending {
+        if let Some(next_action) = inputs.repair_next_action {
+            return LoopControlAction::ContinueRepairJob { next_action };
+        }
+        if let Some(next_action) = inputs.missing_verifier_next_action {
+            return LoopControlAction::ContinueMissingVerifierJob { next_action };
+        }
+    }
+
+    if matches!(
+        inputs.task_contract_action,
+        Some(ArtifactRecoveryAction::RunVerifier)
+    ) {
+        return LoopControlAction::RunVerifier;
+    }
+
+    LoopControlAction::RequestModelTurn
+}
+
+#[cfg(test)]
+pub(super) fn loop_control_action_owns_recovery(action: &LoopControlAction) -> bool {
+    matches!(
+        action,
+        LoopControlAction::ContinueRepairJob { .. }
+            | LoopControlAction::ContinueMissingVerifierJob { .. }
+    )
+}
+
+pub(super) fn loop_control_action_requires_missing_verifier_setup(
+    action: &LoopControlAction,
+) -> bool {
+    matches!(
+        action,
+        LoopControlAction::ContinueMissingVerifierJob {
+            next_action: VerifierBootstrapNextAction::RequestSetupEdit
+        }
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryOwner {
+    None,
+    ArtifactCompletion,
+    RepairJob,
+    MissingVerifierJob,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RecoveryDispatchGate {
+    owner: RecoveryOwner,
+}
+
+impl RecoveryOwner {
+    pub(super) fn from_control_action(
+        action: &LoopControlAction,
+        task_contract_action: Option<&ArtifactRecoveryAction>,
+    ) -> Self {
+        match action {
+            LoopControlAction::ContinueRepairJob { .. } => Self::RepairJob,
+            LoopControlAction::ContinueMissingVerifierJob { .. } => Self::MissingVerifierJob,
+            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {
+                match task_contract_action {
+                    Some(
+                        ArtifactRecoveryAction::Continue { .. }
+                        | ArtifactRecoveryAction::RepairArtifact { .. },
+                    ) => Self::ArtifactCompletion,
+                    Some(
+                        ArtifactRecoveryAction::RunVerifier
+                        | ArtifactRecoveryAction::Done
+                        | ArtifactRecoveryAction::SafeStop { .. },
+                    )
+                    | None => Self::None,
+                }
+            }
+        }
+    }
+
+    pub(super) fn is_verifier_owned(self) -> bool {
+        matches!(self, Self::RepairJob | Self::MissingVerifierJob)
+    }
+
+    pub(super) fn allows_generic_repo_change_recovery(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(super) fn allows_focused_edit_recovery(self) -> bool {
+        matches!(self, Self::None | Self::ArtifactCompletion)
+    }
+
+    pub(super) fn allows_deterministic_fallback(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+impl RecoveryDispatchGate {
+    pub(super) fn from_owner(owner: RecoveryOwner) -> Self {
+        Self { owner }
+    }
+
+    #[cfg(test)]
+    pub(super) fn owner(self) -> RecoveryOwner {
+        self.owner
+    }
+
+    pub(super) fn allows_generic_repo_change_recovery(self) -> bool {
+        self.owner.allows_generic_repo_change_recovery()
+    }
+
+    pub(super) fn allows_focused_edit_recovery(self) -> bool {
+        self.owner.allows_focused_edit_recovery()
+    }
+
+    pub(super) fn allows_deterministic_fallback(self) -> bool {
+        self.owner.allows_deterministic_fallback()
+    }
+}
 
 /// Arbitration-selectable job kinds. `AnswerOnlyMode` / `PlanModeGate`
 /// are pre-arbitration gates and do NOT appear here.
@@ -1135,5 +1285,228 @@ mod tests {
             &no_signal,
             false
         ));
+    }
+
+    fn loop_inputs() -> LoopControlInputs {
+        LoopControlInputs {
+            mode: ExecutionMode::Act,
+            task_contract_verifier_repair_pending: false,
+            repair_next_action: None,
+            missing_verifier_next_action: None,
+            task_contract_action: None,
+        }
+    }
+
+    #[test]
+    fn loop_control_repair_job_wins_over_verifier_run_inside_arbiter_module() {
+        let next_action = RepairNextAction::RequestDiagnostic;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: Some(next_action.clone()),
+            task_contract_action: Some(ArtifactRecoveryAction::RunVerifier),
+            ..loop_inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::ContinueRepairJob { next_action });
+        let owner =
+            RecoveryOwner::from_control_action(&action, Some(&ArtifactRecoveryAction::RunVerifier));
+        assert_eq!(owner, RecoveryOwner::RepairJob);
+        assert!(!owner.allows_focused_edit_recovery());
+        assert!(!owner.allows_deterministic_fallback());
+    }
+
+    #[test]
+    fn loop_control_missing_verifier_wins_over_model_turn_inside_arbiter_module() {
+        let next_action = VerifierBootstrapNextAction::RequestSetupEdit;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            missing_verifier_next_action: Some(next_action.clone()),
+            ..loop_inputs()
+        });
+
+        assert_eq!(
+            action,
+            LoopControlAction::ContinueMissingVerifierJob { next_action }
+        );
+        assert!(loop_control_action_requires_missing_verifier_setup(&action));
+        assert!(loop_control_action_owns_recovery(&action));
+    }
+
+    #[test]
+    fn loop_control_plan_mode_never_dispatches_controller_jobs() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            mode: ExecutionMode::Plan,
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: Some(RepairNextAction::RequestDiagnostic),
+            missing_verifier_next_action: Some(VerifierBootstrapNextAction::RequestSetupEdit),
+            task_contract_action: Some(ArtifactRecoveryAction::RunVerifier),
+        });
+
+        assert_eq!(action, LoopControlAction::RequestModelTurn);
+    }
+
+    #[test]
+    fn loop_control_stale_pending_flag_without_owner_requests_model_turn() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            repair_next_action: None,
+            missing_verifier_next_action: None,
+            task_contract_action: None,
+            ..loop_inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::RequestModelTurn);
+    }
+
+    #[test]
+    fn loop_control_transition_table_covers_controller_owned_states() {
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "synthetic transition target".to_string(),
+        };
+        let cases = vec![
+            (
+                "repair diagnostic",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(RepairNextAction::RequestDiagnostic),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "repair patch",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(RepairNextAction::RequestPatch {
+                        target_hint: target_hint.clone(),
+                    }),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "repair rerun",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(RepairNextAction::RerunVerifier),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "repair safe stop",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    repair_next_action: Some(RepairNextAction::SafeStop {
+                        reason:
+                            super::super::repair_job::RepairTerminalReason::RepairBudgetExhausted,
+                    }),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::RepairJob,
+            ),
+            (
+                "missing verifier setup",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    missing_verifier_next_action: Some(
+                        VerifierBootstrapNextAction::RequestSetupEdit,
+                    ),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::MissingVerifierJob,
+            ),
+            (
+                "missing verifier rerun",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    missing_verifier_next_action: Some(VerifierBootstrapNextAction::RerunVerifier),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::MissingVerifierJob,
+            ),
+            (
+                "missing verifier safe stop",
+                LoopControlInputs {
+                    task_contract_verifier_repair_pending: true,
+                    missing_verifier_next_action: Some(VerifierBootstrapNextAction::SafeStop {
+                        reason: "synthetic missing-verifier exhaustion",
+                    }),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::MissingVerifierJob,
+            ),
+            (
+                "verifier run",
+                LoopControlInputs {
+                    task_contract_action: Some(ArtifactRecoveryAction::RunVerifier),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::None,
+            ),
+            (
+                "artifact completion",
+                LoopControlInputs {
+                    task_contract_action: Some(ArtifactRecoveryAction::Continue {
+                        missing: vec![ArtifactRole::Implementation],
+                        target_hint: Some(target_hint),
+                    }),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::ArtifactCompletion,
+            ),
+        ];
+
+        for (label, input, expected_owner) in cases {
+            let task_contract_action = input.task_contract_action.clone();
+            let action = determine_loop_control_action(input);
+            let owner = RecoveryOwner::from_control_action(&action, task_contract_action.as_ref());
+            let gate = RecoveryDispatchGate::from_owner(owner);
+
+            assert_eq!(owner, expected_owner, "{label}");
+            match owner {
+                RecoveryOwner::RepairJob | RecoveryOwner::MissingVerifierJob => {
+                    assert!(!gate.allows_generic_repo_change_recovery(), "{label}");
+                    assert!(!gate.allows_focused_edit_recovery(), "{label}");
+                    assert!(!gate.allows_deterministic_fallback(), "{label}");
+                }
+                RecoveryOwner::ArtifactCompletion => {
+                    assert!(!gate.allows_generic_repo_change_recovery(), "{label}");
+                    assert!(gate.allows_focused_edit_recovery(), "{label}");
+                    assert!(!gate.allows_deterministic_fallback(), "{label}");
+                }
+                RecoveryOwner::None => {
+                    assert!(gate.allows_generic_repo_change_recovery(), "{label}");
+                    assert!(gate.allows_focused_edit_recovery(), "{label}");
+                    assert!(gate.allows_deterministic_fallback(), "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_owner_gates_lower_level_fallbacks() {
+        let repair = RecoveryDispatchGate::from_owner(RecoveryOwner::RepairJob);
+        assert_eq!(repair.owner(), RecoveryOwner::RepairJob);
+        assert!(!repair.allows_generic_repo_change_recovery());
+        assert!(!repair.allows_focused_edit_recovery());
+        assert!(!repair.allows_deterministic_fallback());
+
+        let missing_verifier = RecoveryDispatchGate::from_owner(RecoveryOwner::MissingVerifierJob);
+        assert!(!missing_verifier.allows_generic_repo_change_recovery());
+        assert!(!missing_verifier.allows_focused_edit_recovery());
+        assert!(!missing_verifier.allows_deterministic_fallback());
+
+        let artifact = RecoveryDispatchGate::from_owner(RecoveryOwner::ArtifactCompletion);
+        assert!(!artifact.allows_generic_repo_change_recovery());
+        assert!(artifact.allows_focused_edit_recovery());
+        assert!(!artifact.allows_deterministic_fallback());
+
+        let none = RecoveryDispatchGate::from_owner(RecoveryOwner::None);
+        assert!(none.allows_generic_repo_change_recovery());
+        assert!(none.allows_focused_edit_recovery());
+        assert!(none.allows_deterministic_fallback());
     }
 }

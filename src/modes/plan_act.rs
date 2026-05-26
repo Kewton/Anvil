@@ -754,12 +754,7 @@ mod tests {
         );
         assert_eq!(rust_library.work_mode, WorkMode::GenericCode);
         assert!(rust_library.requires_tests);
-        assert!(
-            rust_library
-                .evidence
-                .iter()
-                .any(|item| *item == "edit-intent")
-        );
+        assert!(rust_library.evidence.contains(&"edit-intent"));
     }
 
     #[test]

@@ -1,0 +1,805 @@
+# v0.4.25 Work Plan: Complete Remaining Repair-Control Cleanup
+
+## Purpose
+
+This plan closes the remaining structural gaps in Anvil's local-LLM control
+loop. The goal is not to add another heuristic repair branch. The goal is to
+make task completion controlled, auditable, and maintainable.
+
+The expected final behavior is:
+
+1. `done` only when request-aligned artifacts exist and the correct verifier
+   passes.
+2. actionable safe stop when the task cannot be safely completed.
+3. no false-positive `done`.
+4. no uncontrolled verifier repair retry loop.
+5. no legacy or deterministic recovery path overriding the active job owner.
+
+## Current Gaps
+
+### Functional Gaps
+
+- Safe stop is controlled but not actionable enough.
+- Repair convergence is still weak for objective verifier failures.
+- Verifier delta is not yet the central signal for target switching,
+  re-diagnostic, or safe stop.
+- Ambiguous generated assertion expectations are rejected, but the final report
+  does not explain the unresolved authority gap clearly enough.
+- Generic artifact completion can still spend iterations on invalid or
+  mis-targeted model turns.
+- Mixed project shapes need broader regression coverage beyond the current
+  smoke set.
+
+### Structural Gaps
+
+- `turn.rs` is still too large and owns too many responsibilities.
+- `RepairJob` has become the conceptual center, but its driver, state,
+  validation, admission, and reporting concerns are still partly entangled.
+- Repair validation logic still lives substantially in `turn.rs`.
+- Legacy/fallback paths remain numerous and are not all mechanically classified
+  as production, assist, telemetry, or deletion candidates.
+- Active job dispatch is improved but not yet fully enforced as a single source
+  of truth.
+- Some state is still represented by loose flags, strings, and `Option`
+  combinations rather than typed transitions.
+- Evaluation remains too manual and too expensive to use as a tight regression
+  gate.
+
+## Non-Goals
+
+- Do not add FastAPI, ToDo, CRUD, Rust slug, or other business-specific
+  templates.
+- Do not make generated tests green by weakening assertions.
+- Do not introduce provider abstraction.
+- Do not replace the local-LLM loop with a large external orchestration system.
+- Do not delete all legacy paths blindly before proving equivalent or safer
+  behavior.
+
+## Success Criteria
+
+The work is complete only when all of the following are true:
+
+- `turn.rs` no longer owns repair validation or verifier repair dispatch
+  details.
+- Verifier repair production dispatch goes through one active-job path.
+- Legacy deterministic repair cannot run as a production verifier repair path.
+- Patch validation rejects unsafe edits before apply, with typed reasons.
+- Repeated invalid patch proposals transition through `RepairJob` to
+  re-diagnostic, target switch, or actionable safe stop.
+- Safe stop reports include concrete blocker class, affected files, failing
+  assertions or diagnostics, authority status, and next user action.
+- Wrong-stack verifier false positives remain blocked.
+- Tests cover both successful repair and safe-stop paths.
+- A small generic evaluation gate passes without false-positive `done`.
+
+## Phase 0: Baseline And Guard Rails
+
+Goal: freeze the current state and make later cleanup measurable.
+
+Tasks:
+
+- Record current `git status` and keep unrelated dirty files out of commits.
+- Run and record:
+  - `cargo fmt --check`
+  - `cargo test --lib -q`
+  - `cargo build --release`
+- Add or update a short baseline note with:
+  - current known success pattern
+  - current known safe-stop pattern
+  - current known repair-convergence gap
+- Confirm `.anvil-state`, logs, and evaluation output are excluded from changed
+  file and artifact evidence.
+
+Deliverables:
+
+- `workspace/v0.4.25/baseline.md`
+
+Acceptance:
+
+- Baseline is reproducible.
+- No unrelated workspace files are staged.
+
+## Phase 1: Dispatch Source Inventory And Deletion Plan
+
+Goal: remove ambiguity about who owns the next action.
+
+Tasks:
+
+- Inventory every production call site in `turn.rs` that can:
+  - continue artifact completion
+  - continue missing verifier repair
+  - continue verifier repair
+  - invoke focused edit recovery
+  - invoke generic retry
+  - invoke deterministic fallback
+  - return `done`
+  - return `missing_repo_edits`
+  - return `verifier_failed`
+  - return `repair_exhausted`
+  - return `repair_safe_stop`
+- Classify each path as:
+  - active production path
+  - compatibility wrapper
+  - validator assist
+  - telemetry only
+  - test only
+  - deletion candidate
+- Identify all production paths that bypass the active-job owner.
+- Produce a removal order that never removes the only safe stop path before a
+  replacement is tested.
+
+Deliverables:
+
+- `workspace/v0.4.25/dispatch-source-inventory.md`
+- `workspace/v0.4.25/legacy-removal-plan.md`
+
+Acceptance:
+
+- Every verifier repair dispatch path has exactly one owner.
+- Every remaining fallback path has an explicit allowed owner and expiry plan.
+
+## Phase 2: Extract ActiveJobArbiter As Single Dispatch Source
+
+Goal: make the loop ask one component what should happen next.
+
+Design:
+
+`ActiveJobArbiter` returns a typed `LoopControlAction`.
+
+Priority:
+
+1. terminal result / interrupt
+2. active `RepairJob`
+3. active `MissingVerifierJob`
+4. active `ArtifactCompletionJob`
+5. setup/bootstrap job
+6. normal model turn
+
+Tasks:
+
+- Move active-job selection out of the middle of `turn.rs`.
+- Make focused edit recovery and deterministic fallback consult the arbiter
+  owner before they can run.
+- Add tests proving:
+  - repair job suppresses artifact completion
+  - repair job suppresses focused edit recovery
+  - repair job suppresses deterministic fallback
+  - missing verifier job suppresses generic retry
+  - stale flags without an active owner cannot dispatch repair
+- Replace direct `turn.rs` dispatch checks with arbiter results.
+
+Deliverables:
+
+- `src/agent/loop_run/active_job.rs` or equivalent
+- focused arbiter tests
+
+Acceptance:
+
+- No verifier repair production action is dispatched outside the arbiter-owned
+  repair path.
+- Generic retry cannot take over an active repair job.
+
+## Phase 3: Split RepairJob Into State, Driver, Admission, Validation, Report
+
+Goal: reduce the size and responsibility load of `RepairJob` and `turn.rs`.
+
+Proposed modules:
+
+- `repair_job/state.rs`
+  - job state
+  - event history
+  - budgets
+  - active cluster/target
+- `repair_job/driver.rs`
+  - `next_action`
+  - event application
+  - transition policy
+- `repair_job/admission.rs`
+  - accepts or rejects diagnostic repair plans
+  - authority checks at plan level
+- `repair_job/patch_validation.rs`
+  - validates patch proposal before apply
+  - detects unsafe edits, weakening, path mismatch, duplicate/noop edits
+- `repair_job/report.rs`
+  - actionable safe-stop and final repair summary
+
+Tasks:
+
+- Move `validate_verifier_repair_plan_admission` out of `turn.rs`.
+- Move `validate_verifier_repair_intents*` out of `turn.rs`.
+- Move duplicate-binding guard out of `turn.rs`.
+- Move test weakening and implementation weakening detectors out of `turn.rs`.
+- Keep `turn.rs` responsible only for calling the driver and applying validated
+  edits.
+- Add module-level tests for each extracted responsibility.
+
+Deliverables:
+
+- smaller repair modules
+- reduced `turn.rs` repair section
+- regression tests moved close to the logic they validate
+
+Acceptance:
+
+- `turn.rs` no longer contains the main patch safety validator.
+- `RepairJob` state transition tests do not need to instantiate a full agent.
+
+## Phase 4: Make VerifierDelta A First-Class Transition Input
+
+Goal: repair should be guided by what changed after each patch.
+
+Tasks:
+
+- Define `VerifierDelta`:
+  - previous failure fingerprint
+  - current failure fingerprint
+  - fixed failures
+  - new failures
+  - unchanged failures
+  - verifier command and project unit
+- Feed `VerifierDelta` into `RepairJob`.
+- Add transition rules:
+  - improvement: continue same plan or verify again
+  - unchanged failure after valid patch: reduce target confidence or replan
+  - same invalid patch pattern repeated: reject and switch target/re-diagnose
+  - new unrelated failure: re-diagnostic
+  - ambiguous assertion without authority: actionable safe stop
+- Add tests for:
+  - compile error fixed then assertion remains
+  - import error unchanged after implementation edit
+  - assertion expectation ambiguous
+  - repeated invalid patch proposal
+  - target switch after non-improving patch
+
+Deliverables:
+
+- `VerifierDelta` type
+- `RepairJob` transition tests
+
+Acceptance:
+
+- Repair loop decisions are based on verifier delta, not only retry counters.
+
+## Phase 5: Actionable Safe Stop Report
+
+Goal: safe stop should be useful, not merely safer than a wrong edit.
+
+Tasks:
+
+- Define `SafeStopReport`:
+  - blocker class
+  - verifier command
+  - project unit
+  - affected files
+  - observed failure summary
+  - authority status
+  - attempted actions
+  - reason repair was not safe
+  - next user action
+- Render concise final messages from `SafeStopReport`.
+- Include exact ambiguity examples for assertion failures without overquoting
+  entire logs.
+- Add tests for:
+  - ambiguous generated test expectation
+  - missing verifier/setup metadata
+  - repeated invalid patch
+  - unsafe test weakening
+  - wrong-stack verifier rejection
+
+Deliverables:
+
+- `safe_stop_report` module or equivalent
+- user-visible report rendering tests
+
+Acceptance:
+
+- `repair_exhausted` and `repair_safe_stop` always include actionable reason.
+
+## Phase 6: Legacy And Deterministic Path Reduction
+
+Goal: delete or demote paths that can override the new control model.
+
+Tasks:
+
+- Use the Phase 1 inventory to process each legacy/fallback path.
+- For each path, choose one:
+  - delete
+  - test-only fixture
+  - telemetry-only adapter
+  - validator assist
+  - explicit opt-in compatibility fallback
+- Remove production access to legacy deterministic verifier repair.
+- Ensure deterministic scaffold/fallback, where retained, is never completion
+  evidence by itself.
+- Add tests that legacy fallback cannot run while:
+  - `RepairJob` is active
+  - `MissingVerifierJob` is active
+  - artifact completion has a required target
+
+Deliverables:
+
+- updated legacy inventory
+- deleted or isolated fallback paths
+
+Acceptance:
+
+- No production repair patch is created by legacy deterministic repair.
+- No legacy fallback can make the task `done`.
+
+## Phase 7: Artifact Evidence And Done Gate Hardening
+
+Goal: make `done` harder than safe stop.
+
+Tasks:
+
+- Audit artifact evidence sources:
+  - implementation
+  - tests
+  - usage docs
+  - setup/config
+  - verifier
+- Require evidence to be:
+  - request-aligned
+  - project-unit aligned
+  - path-confined
+  - non-placeholder
+  - produced or modified in this task context unless explicitly accepted as
+    existing relevant artifact
+- Preserve support for multi-directory applications by using project units
+  rather than single-file assumptions.
+- Add tests for:
+  - multi-directory Python app
+  - Rust library
+  - Node package
+  - docs-only task
+  - existing files in unrelated subdirectories
+  - `.anvil-state` and evaluation files ignored
+
+Deliverables:
+
+- hardened done gate tests
+- artifact evidence tests
+
+Acceptance:
+
+- Wrong stack or wrong project-unit verifier cannot produce `done`.
+- Placeholder tests/docs cannot satisfy required roles.
+
+## Phase 8: Generic Evaluation Harness
+
+Goal: replace ad hoc manual evaluation with a repeatable smoke gate.
+
+Tasks:
+
+- Define a small case matrix:
+  - Python/FastAPI CRUD API
+  - Rust library
+  - Node CLI/package
+  - docs-only documentation task
+  - existing-project modification
+  - ambiguous assertion repair case
+  - missing verifier/setup case
+  - multi-directory app case
+- For each case record:
+  - prompt
+  - expected terminal class: `done` or actionable safe stop
+  - forbidden outcomes
+  - verifier command expectation
+  - artifact roles expected
+- Build a runner script or documented command sequence that creates isolated
+  directories and captures result summaries.
+- Keep PAM and no-PAM runs separate.
+- Add a small default gate:
+  - no-PAM 5 cases
+  - PAM 5 cases
+- Add expanded gate:
+  - no-PAM 20 cases
+  - PAM 20 cases
+
+Deliverables:
+
+- `workspace/v0.4.25/evaluation-matrix.md`
+- optional evaluation runner script if it stays simple and local
+
+Acceptance:
+
+- Evaluation result is reproducible and comparable across commits.
+- False-positive `done` is tracked as a critical failure.
+
+## Phase 9: Full Verification And Regression Evaluation
+
+Goal: prove the cleanup did not regress core behavior.
+
+Required checks:
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --lib -q`
+- `cargo build --release`
+
+Evaluation:
+
+1. Run no-PAM 5-case smoke.
+2. Run PAM 5-case smoke.
+3. If no critical failures:
+   - run no-PAM 20-case evaluation
+   - run PAM 20-case evaluation
+4. Summarize:
+   - success rate
+   - actionable safe-stop rate
+   - false-positive done count
+   - verifier mismatch count
+   - repair loop exhaustion count
+   - average iteration count
+   - top residual failure classes
+
+Deliverables:
+
+- `workspace/v0.4.25/evaluation-results.md`
+
+Acceptance:
+
+- Zero false-positive `done`.
+- Zero wrong-stack verifier success.
+- Verifier repair failures end as actionable safe stop, not generic
+  `missing_repo_edits`.
+- Any remaining non-completion has a classified reason.
+
+## Phase 10: Final Cleanup And Commit Hygiene
+
+Goal: leave the repository reviewable.
+
+Tasks:
+
+- Split commits by concern if the diff becomes too large:
+  1. arbiter / dispatch ownership
+  2. repair module extraction
+  3. verifier delta and safe stop report
+  4. legacy path deletion/demotion
+  5. evaluation docs/harness
+- Keep unrelated files out of commits:
+  - `.claude/scheduled_tasks.lock`
+  - unrelated `.agents/skills/*`
+  - unrelated scripts
+- Re-run final verification after the last commit.
+- Update this README with final status and residual risk.
+
+Acceptance:
+
+- `git status --short` contains only known unrelated files or is clean.
+- Final report states what is complete, what remains, and why.
+
+## Risk Register
+
+### Risk: Over-tightening causes too many safe stops
+
+Mitigation:
+
+- Treat safe stop as acceptable only if actionable.
+- Use verifier delta to continue objective repairs when authority is clear.
+
+### Risk: Removing legacy paths regresses currently working flows
+
+Mitigation:
+
+- Classify and test before deletion.
+- Keep compatibility wrappers only when they cannot override active jobs.
+
+### Risk: Modularization changes behavior accidentally
+
+Mitigation:
+
+- Extract with characterization tests first.
+- Keep pure functions where possible.
+
+### Risk: Evaluation becomes too expensive
+
+Mitigation:
+
+- Maintain a small 5+5 gate for development.
+- Run 20+20 only after structural changes pass unit tests.
+
+### Risk: More modules hide complexity rather than reduce it
+
+Mitigation:
+
+- Each module must have one explicit responsibility.
+- Avoid creating pass-through wrappers with no ownership.
+- Delete old code as new ownership becomes covered by tests.
+
+## Work Order
+
+Recommended sequence:
+
+1. Phase 0 baseline.
+2. Phase 1 inventory.
+3. Phase 2 active-job arbiter.
+4. Phase 3 repair extraction.
+5. Phase 4 verifier delta.
+6. Phase 5 safe-stop report.
+7. Phase 6 legacy reduction.
+8. Phase 7 done gate hardening.
+9. Phase 8 evaluation harness.
+10. Phase 9 verification and evaluation.
+11. Phase 10 cleanup and commit hygiene.
+
+Do not start expanded 20+20 evaluation until Phases 2 through 7 have targeted
+tests. Otherwise the result will be expensive but not diagnostic.
+
+## Definition Of Complete
+
+This v0.4.25 cleanup is complete when:
+
+- repair dispatch ownership is singular and tested;
+- unsafe or ambiguous repair cannot mutate the repo indefinitely;
+- objective repair can still proceed when evidence is sufficient;
+- legacy production repair paths are deleted or explicitly isolated;
+- `done` requires request/project/verifier alignment;
+- safe stop is actionable;
+- generic evaluation has no false-positive completion.
+
+## Implementation Log
+
+### 2026-05-26 Slice 1
+
+Applied:
+
+- Moved the pre-model loop-control vocabulary out of `turn.rs` and into
+  `active_job_arbiter.rs`:
+  - `LoopControlAction`
+  - `LoopControlInputs`
+  - `RecoveryOwner`
+  - `determine_loop_control_action`
+  - missing-verifier setup ownership helper
+- Extracted safe-stop payload rendering into `safe_stop_payload.rs`.
+- Added actionable safe-stop payload fields:
+  - `blocker_class`
+  - `authority_status`
+  - `next_user_action`
+- Added v0.4.25 planning artifacts:
+  - `baseline.md`
+  - `dispatch-source-inventory.md`
+  - `legacy-removal-plan.md`
+  - `evaluation-matrix.md`
+
+Verification:
+
+- `cargo test loop_control_action_tests --lib -q`: pass
+- `cargo test build_safe_stop_payload --lib -q`: pass
+- `cargo test repair_rejection_next_action --lib -q`: pass
+- `cargo test --lib -q`: pass, 2989 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+
+Evaluation:
+
+- no-PAM smoke `Python CSV CLI`: controlled `repair_safe_stop`, no
+  false-positive `done`, no generic retry takeover.
+- The smoke exposed weak console actionability for `role_mismatch`; the
+  rejection terminal message now appends a concrete `next_action`.
+
+Assessment:
+
+- This slice reduces `turn.rs` by moving dispatch vocabulary and safe-stop
+  report formatting out of the actor loop file.
+- It does not yet complete the entire v0.4.25 plan. The remaining high-value
+  work is repair validation extraction, legacy path deletion/demotion, and
+  generic evaluation.
+
+### 2026-05-26 Slice 2
+
+Applied:
+
+- Extracted verifier repair plan admission from `turn.rs` into
+  `repair_plan_admission.rs`.
+- Kept the production contract unchanged:
+  - diagnostic/legacy brief input is still only a proposal;
+  - `FailurePacket` + authority evidence must accept it;
+  - admission rejection maps back into `RepairJobEvent`.
+- Added module-level admission tests:
+  - missing assessment forces re-diagnostic;
+  - ambiguous authority maps to an authority safe-stop event;
+  - malformed action-level rejection maps to re-diagnostic.
+- Added arbiter owner-gate test proving:
+  - `RepairJob` and `MissingVerifierJob` deny generic retry, focused edit, and
+    deterministic fallback;
+  - artifact completion allows only focused edit recovery;
+  - no active owner is the only state that allows generic/deterministic
+    fallback.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_plan_admission --lib -q`: pass
+- `cargo test recovery_owner_gates_lower_level_fallbacks --lib -q`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo test --lib -q`: pass, 2993 tests when rerun outside sandbox
+- `cargo build --release`: pass
+
+Sandbox note:
+
+- A sandboxed full lib test run failed because `mockito` could not bind its
+  local test server (`Operation not permitted`). The same command passed with
+  normal permissions.
+
+Assessment:
+
+- This slice moves another repair-control responsibility out of `turn.rs`
+  without adding a new recovery branch.
+- Legacy deterministic repair remains outside the production patch provider,
+  but direct `recovery_owner.allows_*` checks are still scattered in `turn.rs`.
+  The next cleanup should consolidate those checks behind a small dispatch
+  wrapper before deleting more legacy branches.
+- A non-FastAPI no-PAM Rust library smoke reached verified `done` after
+  missing-verifier setup and one controller repair. This is a useful signal
+  that the current changes are not only tuned to the original CRUD case.
+
+### 2026-05-26 Slice 3
+
+Applied:
+
+- Added `repair_patch_validation.rs` for pure patch-admission checks.
+- Moved the accepted-plan target authorization logic out of `turn.rs`:
+  - target path match;
+  - target role match;
+  - insufficient-evidence rejection;
+  - ambiguous authority rejection for behavior-changing repairs.
+- Kept a thin `turn.rs` wrapper only to translate the typed rejection into the
+  existing `ValidationFailure` shape used by the patch-apply pipeline.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass
+- `cargo test accepted_plan --lib -q`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2996 tests when rerun outside sandbox
+
+Assessment:
+
+- This is intentionally not a full extraction of
+  `validate_verifier_repair_intents_inner`; that function still depends on
+  filesystem checks, cheap project verification, weakening detectors, duplicate
+  binding guards, and legacy test helpers.
+- The safer cleanup path is to keep extracting pure admission/validation
+  sub-decisions first, then move the filesystem-heavy validator after each
+  sub-decision has tests in its own module.
+
+### 2026-05-27 Slice 4
+
+Applied:
+
+- Added `RecoveryDispatchGate` in `active_job_arbiter.rs`.
+- Production recovery/fallback branches now consult the gate instead of calling
+  `RecoveryOwner::allows_*` directly.
+- Moved pure repair-intent input checks into `repair_patch_validation.rs`:
+  - safe workspace-relative path input;
+  - empty/no-op edit rejection;
+  - total edit byte cap;
+  - tool/markdown markup rejection;
+  - secret introduction rejection;
+  - suspicious shell payload rejection outside shell-capable files.
+- Left filesystem-bound checks in `turn.rs` for now:
+  - canonical path resolution;
+  - file size/read checks;
+  - exact edit application;
+  - cheap project verifier;
+  - weakening and duplicate-binding detectors.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test loop_control --lib -q`: pass, 5 tests
+- `cargo test recovery_owner_gates_lower_level_fallbacks --lib -q`: pass
+- `cargo test repair_patch_validation --lib -q`: pass
+- `cargo test validate_verifier_repair_intents --lib -q`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2987 tests when rerun outside sandbox
+
+Assessment:
+
+- This reduces policy drift without changing the repair flow.
+- Loop-control tests now live with the arbiter instead of `turn.rs`.
+- The remaining large extraction should focus on the filesystem-bound patch
+  validator and weakening detector dispatch. Those need characterization tests
+  before moving because they encode many safety decisions.
+
+### 2026-05-27 Slice 5
+
+Applied:
+
+- Moved the duplicate-binding repair guard out of `turn.rs` and into
+  `repair_patch_validation.rs`.
+- Kept the production rejection shape unchanged by mapping the typed
+  `DuplicateBindingRepairError` back to `RepairRejectionSignal::Duplicate` at
+  the `turn.rs` boundary.
+- Added module tests for:
+  - rejecting unresolved duplicate bindings;
+  - accepting a candidate that reduces the duplicate binding.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 8 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2987 tests when rerun outside sandbox
+
+Assessment:
+
+- This is another pure validation extraction, not a new recovery heuristic.
+- `turn.rs` still owns the filesystem-bound patch validator and the
+  test/implementation weakening detector dispatch. Those remain the next
+  cleanup targets.
+
+### 2026-05-27 Slice 6
+
+Applied:
+
+- Moved filesystem-bound patch target validation into
+  `repair_patch_validation.rs`:
+  - selected target path safety;
+  - workspace canonicalization;
+  - target file existence and size checks;
+  - UTF-8 target read;
+  - intent path to selected target matching.
+- Moved cheap candidate-content validation into `repair_patch_validation.rs`.
+  `turn.rs` now maps the typed module result back into `CheapCheckOutcome`.
+- Added module tests for:
+  - reading a safe workspace target snapshot;
+  - rejecting unsafe and oversized targets;
+  - rejecting intent paths that do not match the selected target;
+  - deferring whitespace-sensitive fallback when no safe cheap verifier exists.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 13 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2992 tests when rerun outside sandbox
+
+Assessment:
+
+- The patch validation boundary now owns pure checks, target IO admission, and
+  cheap candidate-content checking.
+- `turn.rs` still owns candidate application and weakening detector dispatch.
+  Those are the remaining major repair-validation responsibilities in the
+  actor loop.
+
+### 2026-05-27 Slice 7
+
+Applied:
+
+- Moved in-memory repair candidate application into
+  `repair_patch_validation.rs`:
+  - exact-once edit application;
+  - whitespace-normalized fallback;
+  - bounded `replace_all`;
+  - exact-edit error rendering with bounded old-string excerpt.
+- Removed the now-unused application result type and replace-all cap constant
+  from `turn.rs`.
+- Added module tests for:
+  - exact plus replace-all application;
+  - exact-edit failure reporting with old-string excerpt.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 15 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2994 tests when rerun outside sandbox
+
+Assessment:
+
+- `turn.rs` no longer owns repair target IO, cheap content checks, duplicate
+  binding guard, or candidate application internals.
+- The remaining repair-validation responsibility in `turn.rs` is mainly
+  weakening detector dispatch plus the high-level assembly of the validated
+  edit result.
