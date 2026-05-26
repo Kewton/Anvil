@@ -113,8 +113,10 @@ RunVerifier       -> drive_task_contract_verifier()
 4. `project_probe` is still conservative.
    - It detects safe verifier readiness but does not yet provide a full project-unit model for every stack.
 
-5. Legacy fallback code still exists.
-   - The main verifier repair path is narrower now, but deterministic scaffold/repair paths still need a production-path audit.
+5. Legacy deterministic repair candidate generation has been removed from the
+   verifier repair production path.
+   - Deterministic scaffold/fallback code still needs to stay outside repair
+     authority, but it no longer chooses verifier repair patches.
 
 ## Quality Plan
 
@@ -339,29 +341,162 @@ typed timeout evidence to the diagnostic packet.
   that task path instead of falling back to an unrelated root-level verifier.
 - `FailurePacket` now carries `timeout_kind` as a typed
   `FailurePacketTimeoutKind` field and includes it in the diagnostic JSON.
+- Deterministic verifier-repair candidates are no longer called by the
+  production patch-provider main path. The old candidate builder is confined
+  to test/quarantine code, and the deterministic admission bridge was removed.
+- While `RepairJob` or `MissingVerifierJob` owns verifier repair dispatch,
+  `build_arbiter_candidates()` now returns that verifier candidate set
+  immediately. Lower-priority focused edit, artifact recovery, setup bootstrap,
+  and local small-edit candidates are not built for that model turn.
+- AutoTest verifier detection now filters controller-owned changed files at
+  the entrypoint, so `.anvil-state` paths cannot create Python/Rust/Node
+  verifier candidates or surface as Python script evidence.
+- RepoEdit observation and ArtifactLedger seed helpers now reject
+  controller-owned paths before they can become edited-path evidence,
+  artifact evidence, verifier observations, or repair-target admission
+  signals.
 
 ### Remaining Gap
 
-`RepairJob::next_action()` still does not branch directly on typed timeout
-evidence. The next slice should move timeout routing from string evidence into
-the repair-state transition layer.
+`RepairJob::next_action()` now consumes typed timeout evidence for the first
+safe-stop route: environment-stall timeouts stop as verifier-timeout safe stops
+instead of entering patch repair. Other timeout classes still go through
+diagnostic planning so generated-test hangs, dependency setup, build commands,
+and long-running verifier cases can be repaired when a safe target exists.
+
+The deterministic repair candidate builder has now been deleted. Remaining
+coverage validates accepted `VerifierRepairIntent` edits and `RepairJob`
+state transitions instead of preserving legacy candidate-generation behavior.
 
 ### Verification
 
 - `cargo test project_unit --lib`: pass, 5 tests
-- `cargo test failure_packet --lib`: pass, 5 tests
+- `cargo test failure_packet --lib`: pass, 6 tests
 - `cargo fmt --check`: pass
-- `cargo test auto_test --lib`: pass, 150 tests
-- `cargo test repair_job --lib`: pass, 133 tests
+- `cargo test auto_test --lib`: pass, 151 tests
+- `cargo test repair_job --lib`: pass, 138 tests
+- `cargo test loop_control_action_tests --lib`: pass, 17 tests
+- `cargo test issue660_phase_d --lib`: pass, 8 tests
+- `cargo test active_job_arbiter --lib`: pass, 40 tests
+- `cargo test v0421_repair_runner_contract_tests --lib`: pass, 5 tests
+- `cargo test artifact_ledger_phase2 --lib`: pass, 22 tests
+  - Sandboxed run hit the known mockito local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo test repo_edit_observation_ignores_controller_owned_state --lib`: pass, 1 test
+- `cargo clippy --all-targets -- -D warnings`: pass after removing the production
+  deterministic-repair admission bridge and quarantining the legacy helper.
 - `cargo test task_contract --lib`: pass, 80 tests
   - Sandboxed run hit the known mockito local-server bind restriction.
   - Re-run outside the sandbox passed.
-- `cargo test --lib`: pass, 2936 tests
+- `cargo test --lib -q`: pass, 2949 tests
   - Sandboxed run hit the same local-server bind restriction.
   - Re-run outside the sandbox passed.
 - `cargo clippy --all-targets -- -D warnings`: pass
 - `cargo build --release`: pass
 - `git diff --check`: pass
+
+### 2026-05-26 Follow-Up Execution: RepairJob Timeout Routing
+
+This pass moves timeout evidence one step further into the repair-state
+machine.
+
+Implemented:
+
+- `RepairJob` now stores `timeout_kind` as typed controller state.
+- `verifier_repair_context_from_failure()` extracts the timeout kind when a
+  verifier failure is converted into a repair job.
+- The duplicated timeout enum in `turn.rs` was removed; timeout labels and
+  repair hints now use the shared `FailurePacketTimeoutKind` type.
+- `FailurePacket::from_repair_job()` preserves the typed timeout kind even when
+  the bounded excerpt no longer contains the original `timeout_kind=...` token.
+- `RepairJob::next_action()` safe-stops environment-stall verifier timeouts
+  before patch repair. This is intentionally narrow: repairable timeout classes
+  still go through diagnostic planning.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_job_environment_timeout_safe_stops_without_patch --lib`: pass
+- `cargo test repair_job_verifier_passed_wins_over_stale_timeout_evidence --lib`: pass
+- `cargo test failure_packet_preserves_repair_job_timeout_kind_when_excerpt_lacks_label --lib`: pass
+- `cargo test verifier_repair_context_captures_typed_timeout_kind --lib`: pass
+- `cargo test failure_packet --lib`: pass, 6 tests
+- `cargo test repair_job --lib`: pass, 138 tests
+- `cargo test verifier_timeout --lib`: pass, 2 tests
+- `cargo test auto_test --lib`: pass, 151 tests
+- `cargo test loop_control_action_tests --lib`: pass, 17 tests
+- `cargo test task_contract --lib`: pass, 80 tests
+  - Sandboxed run hit the known mockito local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo test --lib -q`: pass, 2944 tests
+  - Sandboxed run hit the same local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `git diff --check`: pass
+
+### 2026-05-26 Follow-Up Execution: Final Dispatch Cleanup
+
+This pass finishes the remaining verifier-dispatch cleanup from
+`remaining-completion-work-plan.md`.
+
+Implemented:
+
+- Post-loop verifier execution now receives the current `ProjectUnit` and uses
+  project-unit-bound verifier discovery instead of root-level fallback guesses.
+- `ProjectUnit` now carries a bounded confidence label. Docs-only/no-code units
+  are low-confidence and cannot trigger unrelated verifier selection.
+- Repairable timeout classes now have explicit state-machine coverage:
+  generated-test hang, dependency setup timeout, build-command timeout,
+  long-running verifier, and unknown timeout all continue to diagnostic repair
+  rather than safe-stopping prematurely.
+- The old deterministic verifier-repair candidate builder and its dedicated
+  candidate-generation tests were removed from `turn.rs`.
+- The production patch-provider source guard remains: verifier repair patches
+  must flow through the accepted semantic repair context and validated
+  `VerifierRepairIntent` path.
+- Python structured dependency inference now treats `types` as a Python
+  standard-library module. This fixes a smoke-discovered verifier setup bug
+  where `import types` was converted into `pip install types`.
+
+Verification:
+
+- `cargo test project_unit --lib`: pass, 6 tests
+- `cargo test verifier_skill --lib`: pass, 8 tests
+- `cargo test repair_job --lib`: pass, 139 tests
+- `cargo test auto_test --lib`: pass, 151 tests
+- `cargo test task_contract --lib`: pass, 80 tests
+  - Sandboxed run hit the known mockito local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo test loop_control_action_tests --lib`: pass, 17 tests
+- `cargo test --lib -q`: pass, 2942 tests
+  - Sandboxed run hit the same local-server bind restriction.
+  - Re-run outside the sandbox passed.
+- `cargo fmt --check`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `git diff --check`: pass
+
+Small smoke gate:
+
+| Case | Result | Notes |
+|---|---:|---|
+| FastAPI CRUD | `done` | First run exposed the `types` stdlib dependency inference bug. After the fix, rerun completed and verified with `python3 -B -m pytest -p no:cacheprovider tests/test_main.py`. |
+| Rust text counter CLI | `done` | Completed and verified with `cargo test --test main`. |
+| Python CSV sales analyzer | `verifier_failed` | Controlled verifier-repair flow, but did not converge. Final failure was one generated integration test mismatch around output totals after several implementation repairs. |
+
+Interpretation:
+
+- The controller no longer falls into generic `missing_repo_edits` in these
+  smoke runs.
+- The `types` verifier setup bug was a real generic Python verifier issue and
+  is fixed.
+- Repair convergence is still not fully solved for arbitrary Python CLI tasks.
+  The remaining problem is patch quality / convergence, not dispatch ownership.
+
+- Do not start another large PAM/no-PAM evaluation cycle until the remaining
+  Python CLI repair-convergence gap has a targeted fix or a controlled safe
+  stop acceptance criterion.
 
 ### Genericity Evaluation: 20 Case Smoke
 

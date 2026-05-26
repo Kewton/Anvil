@@ -2,6 +2,7 @@ use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
     classify_auto_test, count_compile_errors, count_test_failures,
 };
+use super::failure_packet::FailurePacketTimeoutKind;
 use super::feedback_kind_confirm::{
     self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
     FeedbackKindConfirmOutcome, build_feedback_kind_confirm_log_payload,
@@ -1056,6 +1057,33 @@ mod v0421_repair_runner_contract_tests {
     }
 
     #[test]
+    fn deterministic_repair_candidate_is_not_called_by_patch_provider_main_path() {
+        let src = include_str!("turn.rs");
+        let body = function_body(
+            src,
+            "\n    fn run_verifier_repair_pass_and_apply(",
+            "\n    fn record_controller_verifier_repair_edit(",
+        );
+
+        assert!(
+            !body.contains("controller_repair_candidate_for_job("),
+            "patch provider must not call the legacy deterministic repair helper"
+        );
+        assert!(
+            !body.contains("agent.verifier_repair_candidate.assist"),
+            "legacy deterministic repair assist must stay out of the production patch provider"
+        );
+        assert!(
+            !body.contains("agent.verifier_repair_candidate.applied"),
+            "deterministic repair candidates must not apply patches from the verifier repair main path"
+        );
+        assert!(
+            !body.contains("agent.verifier_repair_candidate.apply_failed"),
+            "deterministic repair candidates are telemetry/validator assist only"
+        );
+    }
+
+    #[test]
     fn plan_admission_without_assessment_forces_re_diagnostic() {
         let event = super::verifier_repair_plan_admission_event(
             &super::VerifierRepairPlanAdmissionError::MissingDiagnosticAssessment,
@@ -1143,21 +1171,6 @@ impl PatchProposalShadowValidation {
     fn accepted(self) -> bool {
         self.status == "accepted"
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepairCandidateKind {
-    ObservedAssertExpectedLiteralUpdate,
-    ImportedScalarProviderStateReset,
-    PythonProviderMutableStateIsolation,
-    PythonMissingPytestImport,
-    PythonBareSetupStateReset,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RepairCandidate {
-    kind: RepairCandidateKind,
-    intents: Vec<VerifierRepairIntent>,
 }
 
 /// Issue #664 (AD1 / AD6 / DC1-002): `#[non_exhaustive]` enables additive
@@ -2551,50 +2564,6 @@ enum TaskContractVerifierOutcome {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerifierTimeoutKind {
-    LongRunningVerifier,
-    GeneratedTestHang,
-    DependencySetupTimeout,
-    EnvironmentStall,
-    BuildCommand,
-    Unknown,
-}
-
-impl VerifierTimeoutKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::LongRunningVerifier => "long_running_verifier",
-            Self::GeneratedTestHang => "generated_test_hang",
-            Self::DependencySetupTimeout => "dependency_setup_timeout",
-            Self::EnvironmentStall => "environment_stall_timeout",
-            Self::BuildCommand => "build_command_timeout",
-            Self::Unknown => "unknown_timeout",
-        }
-    }
-
-    fn repair_hint(self) -> &'static str {
-        match self {
-            Self::LongRunningVerifier => {
-                "inspect the verifier command and reduce it to a bounded project-unit check"
-            }
-            Self::GeneratedTestHang => {
-                "inspect generated tests and implementation loops before retrying the verifier"
-            }
-            Self::DependencySetupTimeout => {
-                "repair dependency setup or safe stop if package installation cannot complete"
-            }
-            Self::EnvironmentStall => {
-                "safe stop if the verifier environment cannot produce bounded evidence"
-            }
-            Self::BuildCommand => {
-                "switch to a bounded test command or repair the build configuration"
-            }
-            Self::Unknown => "re-diagnose with timeout evidence before choosing a repair target",
-        }
-    }
-}
-
 fn task_contract_verifier_transport_error_to_outcome(
     command: String,
     error: String,
@@ -2621,20 +2590,20 @@ timeout_kind={} command={} next_action_hint={}\n{}",
     ))
 }
 
-fn classify_verifier_timeout(command: &str, error: &str) -> Option<VerifierTimeoutKind> {
+fn classify_verifier_timeout(command: &str, error: &str) -> Option<FailurePacketTimeoutKind> {
     if !error.contains("auto test command timed out after") {
         return None;
     }
     let lower_command = command.to_ascii_lowercase();
     let lower_error = error.to_ascii_lowercase();
     if lower_error.contains("dependency setup") || lower_command.contains("pip install") {
-        return Some(VerifierTimeoutKind::DependencySetupTimeout);
+        return Some(FailurePacketTimeoutKind::DependencySetupTimeout);
     }
     if lower_error.contains("environment")
         || lower_error.contains("external_pythonpath")
         || lower_error.contains("stalled")
     {
-        return Some(VerifierTimeoutKind::EnvironmentStall);
+        return Some(FailurePacketTimeoutKind::EnvironmentStall);
     }
     if lower_command.starts_with("cargo build")
         || lower_command.starts_with("npm run build")
@@ -2643,7 +2612,7 @@ fn classify_verifier_timeout(command: &str, error: &str) -> Option<VerifierTimeo
         || lower_command.starts_with("make build")
         || lower_command.starts_with("cargo check")
     {
-        return Some(VerifierTimeoutKind::BuildCommand);
+        return Some(FailurePacketTimeoutKind::BuildCommand);
     }
     if lower_command.contains("--test ")
         || lower_command.contains(" tests/")
@@ -2652,12 +2621,12 @@ fn classify_verifier_timeout(command: &str, error: &str) -> Option<VerifierTimeo
         || lower_command.contains("npm test")
         || lower_command.contains("node --test")
     {
-        return Some(VerifierTimeoutKind::GeneratedTestHang);
+        return Some(FailurePacketTimeoutKind::GeneratedTestHang);
     }
     if lower_command.contains("test") || lower_command.contains("pytest") {
-        return Some(VerifierTimeoutKind::LongRunningVerifier);
+        return Some(FailurePacketTimeoutKind::LongRunningVerifier);
     }
-    Some(VerifierTimeoutKind::Unknown)
+    Some(FailurePacketTimeoutKind::Unknown)
 }
 
 enum TaskContractVerifierFlowOutcome {
@@ -10643,34 +10612,37 @@ impl Agent {
         let recent_successful_bash_commands =
             super::success::recent_successful_bash_commands_since_last_user(&self.session.messages);
 
-        // Issue #651 Phase 5.2: structured verifier path. Active only
-        // when the active request literally asks for test execution
-        // (`RequiredBehaviorContract.test_execution_required`); other
-        // requests continue down the legacy `detect_with_recent_successes`
-        // path so non-test-bearing flows preserve their pre-#651 behavior.
         let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
             self.task_contract_verifier_test_binding();
-        if test_execution_required && let Some(workspace_scope) = workspace_scope_opt.as_ref() {
-            let project_unit = super::project_probe::probe_project_unit(
+        let task_contract_project_unit = workspace_scope_opt.as_ref().and_then(|scope| {
+            super::project_probe::probe_project_unit(
                 &self.work_root,
-                workspace_scope,
+                scope,
                 &self.turn_edited_relative_paths,
+            )
+        });
+        if let Some(project_unit) = task_contract_project_unit.as_ref() {
+            log_llm_event(
+                "agent.project_unit.verifier_selection",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "summary": project_unit.summary(),
+                }),
             );
-            if let Some(project_unit) = project_unit.as_ref() {
-                log_llm_event(
-                    "agent.project_unit.verifier_selection",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "summary": project_unit.summary(),
-                    }),
-                );
-            }
+        }
+
+        // Issue #651 Phase 5.2: structured verifier path. Active only
+        // when the active request literally asks for test execution
+        // (`RequiredBehaviorContract.test_execution_required`). Verifier
+        // discovery itself is still ProjectUnit-bound, so even the later
+        // non-structured branch cannot fall back to root-level stack guessing.
+        if test_execution_required && let Some(workspace_scope) = workspace_scope_opt.as_ref() {
             let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
                 &self.work_root,
                 changed_files,
                 &recent_successful_bash_commands,
                 &owned_test_artifacts,
-                project_unit.as_ref(),
+                task_contract_project_unit.as_ref(),
             );
             match owned_plan {
                 super::auto_test::OwnedTestVerifierPlan::Runnable { plan, command } => {
@@ -10977,10 +10949,11 @@ impl Agent {
             }
         }
 
-        let Some(plan) = AutoTestRunner::detect_with_recent_successes(
+        let Some(plan) = AutoTestRunner::detect_with_project_unit(
             &self.work_root,
             changed_files,
             &recent_successful_bash_commands,
+            task_contract_project_unit.as_ref(),
         ) else {
             let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
             self.session.record_feedback_if_unset(frame);
@@ -13521,6 +13494,7 @@ impl Agent {
                     policy,
                     budget: Budget::Unbounded,
                 });
+                return candidates;
             }
             LoopControlAction::ContinueMissingVerifierJob { next_action } => {
                 if matches!(
@@ -13538,6 +13512,7 @@ impl Agent {
                         budget: Budget::Unbounded,
                     });
                 }
+                return candidates;
             }
             LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {}
         }
@@ -15011,87 +14986,6 @@ impl Agent {
                 ),
             };
         }
-        if let Some(candidate) =
-            controller_repair_candidate_for_job(&self.work_root, &context, target_hint)
-        {
-            let candidate_kind = candidate.kind;
-            let candidate_admission = admit_deterministic_repair_candidate(
-                &self.work_root,
-                &accepted_plan,
-                target_hint,
-                &candidate,
-            );
-            let candidate_status = if candidate_admission.is_ok() {
-                "accepted_as_assist"
-            } else {
-                "rejected_as_assist"
-            };
-            log_llm_event(
-                "agent.verifier_repair_candidate.assist",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "target_path": target_hint.path,
-                    "kind": format!("{:?}", candidate_kind),
-                    "provider_kind": "deterministic_fallback",
-                    "status": candidate_status,
-                    "intent_count": candidate.intents.len(),
-                    "reason": candidate_admission.as_ref().err().map(|err| compact_verifier_failure_text(err, 200)),
-                }),
-            );
-            if candidate_admission.is_ok() {
-                match validate_verifier_repair_intents_with_accepted_plan(
-                    &self.work_root,
-                    &context,
-                    target_hint,
-                    &accepted_plan,
-                    candidate.intents.clone(),
-                ) {
-                    Ok(edit) => {
-                        if let Err(err) = apply_validated_verifier_repair_edit(&edit) {
-                            log_llm_event(
-                                "agent.verifier_repair_candidate.apply_failed",
-                                serde_json::json!({
-                                    "session_id": self.session_store.session_id(),
-                                    "target_path": target_hint.path,
-                                    "kind": format!("{:?}", candidate_kind),
-                                    "error": compact_verifier_failure_text(&err.to_string(), 200),
-                                }),
-                            );
-                        } else {
-                            self.record_controller_verifier_repair_edit(
-                                &edit.relative_path,
-                                &edit.fingerprint,
-                                target_hint,
-                            );
-                            log_llm_event(
-                                "agent.verifier_repair_candidate.applied",
-                                serde_json::json!({
-                                    "session_id": self.session_store.session_id(),
-                                    "target_path": edit.relative_path,
-                                    "kind": format!("{:?}", candidate_kind),
-                                    "preimage_hash": edit.preimage_hash,
-                                    "postimage_hash": edit.postimage_hash,
-                                }),
-                            );
-                            return VerifierRepairPassOutcome::Applied {
-                                relative_path: edit.relative_path,
-                            };
-                        }
-                    }
-                    Err(err) => {
-                        log_llm_event(
-                            "agent.verifier_repair_candidate.validation_rejected",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "target_path": target_hint.path,
-                                "kind": format!("{:?}", candidate_kind),
-                                "reason": validation_failure_reason_label(&err),
-                            }),
-                        );
-                    }
-                }
-            }
-        }
         let mut messages = match verifier_repair_pass_messages(
             &self.work_root,
             &context,
@@ -16088,6 +15982,17 @@ impl Agent {
         else {
             return;
         };
+        if is_ignored_workspace_display_path(&relative_path) {
+            crate::logging::log_completion_evidence_observed(
+                self.current_turn_index,
+                0,
+                "repo_edit_ignored_controller_state",
+                serde_json::json!({
+                    "path_hash": stable_path_hash(&relative_path),
+                }),
+            );
+            return;
+        }
         let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(
             &relative_path,
         ));
@@ -16249,6 +16154,9 @@ impl Agent {
         role: super::task_contract::ArtifactRole,
         scope: &super::task_workspace_scope::TaskWorkspaceScope,
     ) {
+        if is_ignored_workspace_display_path(relative_path) {
+            return;
+        }
         let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
         let _ = self
             .artifact_ledger
@@ -16269,6 +16177,9 @@ impl Agent {
         post_scaffold_delta: bool,
         scope: &super::task_workspace_scope::TaskWorkspaceScope,
     ) {
+        if is_ignored_workspace_display_path(relative_path) {
+            return;
+        }
         let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
         let _ = self.artifact_ledger.record_scaffold_event(
             &ctx,
@@ -16291,6 +16202,9 @@ impl Agent {
         role: super::task_contract::ArtifactRole,
         scope: &super::task_workspace_scope::TaskWorkspaceScope,
     ) {
+        if is_ignored_workspace_display_path(relative_path) {
+            return;
+        }
         // Write-through adapter (divergence anchor): keep the legacy set
         // in lockstep with the ledger seed. Caller-facing decisions stay
         // on the legacy authority during the adapter period (Phase 6.1).
@@ -16321,6 +16235,9 @@ impl Agent {
         }
         let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&self.work_root, scope);
         for path in bound_paths {
+            if is_ignored_workspace_display_path(path) {
+                continue;
+            }
             let _ = self.artifact_ledger.record_verifier_observation(
                 &ctx,
                 path,
@@ -18766,10 +18683,9 @@ fn build_task_contract_verifier_exit_zero_evidence_bound(
 mod tests {
     use super::ExitReason;
     use super::{
-        PlanExplorationKey, TaskContractVerifierOutcome, VerifierTimeoutKind,
-        answer_only_reply_is_inadequate, answer_only_script_command_allowed,
-        answer_only_script_execution_fallback_response, assistant_model_for_mode,
-        build_task_contract_verifier_exit_zero_evidence,
+        PlanExplorationKey, TaskContractVerifierOutcome, answer_only_reply_is_inadequate,
+        answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
+        assistant_model_for_mode, build_task_contract_verifier_exit_zero_evidence,
         build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
         classify_verifier_timeout, deterministic_timeout_fallback_plan,
         effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
@@ -18778,9 +18694,10 @@ mod tests {
         should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_verifier_safe_stop_mapping,
-        task_contract_verifier_transport_error_to_outcome,
+        task_contract_verifier_transport_error_to_outcome, verifier_repair_context_from_failure,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
+    use crate::agent::loop_run::failure_packet::FailurePacketTimeoutKind;
     use crate::agent::loop_run::task_contract::SafeStopReason;
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use crate::session::store::ConversationMessage;
@@ -20135,24 +20052,42 @@ mod tests {
     }
 
     #[test]
+    fn verifier_repair_context_captures_typed_timeout_kind() {
+        let temp = tempdir().unwrap();
+        let context = verifier_repair_context_from_failure(
+            temp.path(),
+            "cargo test --test generated",
+            "Verifier execution timed out before producing a pass/fail result. timeout_kind=generated_test_hang command=cargo",
+            &[],
+            1,
+            None,
+        );
+
+        assert_eq!(
+            context.timeout_kind,
+            Some(super::failure_packet::FailurePacketTimeoutKind::GeneratedTestHang)
+        );
+    }
+
+    #[test]
     fn verifier_timeout_classifier_distinguishes_dependency_setup_and_build() {
         assert_eq!(
             classify_verifier_timeout(
                 "python3 -B -m pytest tests/test_main.py",
                 "structured Python dependency setup auto test command timed out after 300s",
             ),
-            Some(VerifierTimeoutKind::DependencySetupTimeout)
+            Some(FailurePacketTimeoutKind::DependencySetupTimeout)
         );
         assert_eq!(
             classify_verifier_timeout("cargo build", "auto test command timed out after 300s"),
-            Some(VerifierTimeoutKind::BuildCommand)
+            Some(FailurePacketTimeoutKind::BuildCommand)
         );
         assert_eq!(
             classify_verifier_timeout("custom verify", "auto test command timed out after 300s"),
-            Some(VerifierTimeoutKind::Unknown)
+            Some(FailurePacketTimeoutKind::Unknown)
         );
         assert_eq!(
-            VerifierTimeoutKind::EnvironmentStall.as_str(),
+            FailurePacketTimeoutKind::EnvironmentStall.as_str(),
             "environment_stall_timeout"
         );
         assert_eq!(
@@ -21540,6 +21475,54 @@ mod tests {
     }
 
     #[test]
+    fn active_repair_job_prevents_lower_recovery_candidates_from_being_built() {
+        use super::super::artifact_completion_job::ArtifactCompletionJob;
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{ArtifactRole, RecoveryTarget, RecoveryTargetHint};
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+        std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
+
+        let scope = agent.current_workspace_scope();
+        let artifact_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "src/main.py".to_string(),
+            reason: "missing implementation".to_string(),
+        };
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                artifact_hint.clone(),
+                true,
+                false,
+            )
+            .expect("artifact job fixture"),
+        );
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Implementation,
+            path: artifact_hint.path.clone(),
+            reason: artifact_hint.reason.clone(),
+            attempt: 1,
+        });
+        agent.task_contract_verifier_repair_pending = true;
+        agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
+
+        let candidates = agent.build_arbiter_candidates_pub_for_test();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "VerifierRepair must be the sole candidate while an active RepairJob owns dispatch"
+        );
+        assert_eq!(
+            candidates[0].kind,
+            super::super::active_job_arbiter::ActiveJobKind::VerifierRepair
+        );
+    }
+
+    #[test]
     fn issue660_phase_d_artifact_recovery_selected_skips_generic_small_edit_fallback() {
         use super::super::artifact_completion_job::ArtifactCompletionJob;
         use super::super::commands::test_agent_with_config;
@@ -22563,6 +22546,9 @@ mod tests {
         );
         let changed_files = vec!["tests/test_a.rs".to_string()];
         let owned_test_artifacts = vec!["tests/test_a.rs".to_string()];
+        let edited: std::collections::HashSet<String> = changed_files.iter().cloned().collect();
+        let project_unit =
+            super::super::project_probe::probe_project_unit(work.path(), &scope, &edited);
         let recent: Vec<String> = vec![];
         let score_inputs = AnvilScoreInputs {
             unsafe_blocks_this_turn: 0,
@@ -22580,6 +22566,7 @@ mod tests {
             tester_candidate_some: false,
             workspace_root: work.path(),
             owned_test_artifacts: &owned_test_artifacts,
+            project_unit: project_unit.as_ref(),
             test_execution_required: true,
             workspace_scope: &scope,
         };
@@ -22622,6 +22609,9 @@ mod tests {
         );
         let changed_files: Vec<String> = vec![];
         let owned_test_artifacts: Vec<String> = vec![];
+        let edited: std::collections::HashSet<String> = changed_files.iter().cloned().collect();
+        let project_unit =
+            super::super::project_probe::probe_project_unit(work.path(), &scope, &edited);
         let recent: Vec<String> = vec![];
         let inputs = VerifierInputs {
             score_inputs: AnvilScoreInputs {
@@ -22638,6 +22628,7 @@ mod tests {
             tester_candidate_some: false,
             workspace_root: work.path(),
             owned_test_artifacts: &owned_test_artifacts,
+            project_unit: project_unit.as_ref(),
             test_execution_required: true,
             workspace_scope: &scope,
         };
@@ -22683,6 +22674,9 @@ mod tests {
         );
         let changed_files = vec!["tests/test_a.rs".to_string()];
         let owned_test_artifacts = vec!["tests/test_a.rs".to_string()];
+        let edited: std::collections::HashSet<String> = changed_files.iter().cloned().collect();
+        let project_unit =
+            super::super::project_probe::probe_project_unit(work.path(), &scope, &edited);
         let recent: Vec<String> = vec![];
         let inputs = VerifierInputs {
             score_inputs: AnvilScoreInputs {
@@ -22699,6 +22693,7 @@ mod tests {
             tester_candidate_some: false,
             workspace_root: work.path(),
             owned_test_artifacts: &owned_test_artifacts,
+            project_unit: project_unit.as_ref(),
             test_execution_required: true,
             workspace_scope: &scope,
         };
@@ -23765,6 +23760,7 @@ fn verifier_repair_context_from_failure(
     let target_hint = candidate.as_ref().map(|candidate| candidate.hint.clone());
     let target_line = candidate.as_ref().and_then(|candidate| candidate.line);
     let failure_type = classify_verifier_failure_type(output);
+    let timeout_kind = super::failure_packet::timeout_kind_from_output(output);
     let changed_file_hints = verifier_repair_changed_file_hints(work_root, changed_files);
     // Issue #637 (CB-002): sanitize derived text fields BEFORE the
     // `failure_signature` equality lookup against `previous_context` so the
@@ -23853,6 +23849,7 @@ fn verifier_repair_context_from_failure(
         command: crate::session::feedback::redact_verifier_command_for_storage(command),
         output_excerpt: super::repair_job::sanitize_repair_job_text_with_char_cap(output, 4000),
         failure_type,
+        timeout_kind,
         target_hint,
         repair_target_hint: previous_repair_target_hint,
         changed_file_hints,
@@ -24235,62 +24232,6 @@ fn patch_proposal_to_verifier_repair_intents(
             replace_all: edit.replace_all,
         })
         .collect())
-}
-
-fn repair_candidate_to_patch_proposal(
-    target_path: &str,
-    candidate: &RepairCandidate,
-) -> Result<super::patch_proposal::PatchProposal, String> {
-    if candidate.intents.is_empty() {
-        return Err("deterministic candidate contained no edits".to_string());
-    }
-    let mut edits = Vec::with_capacity(candidate.intents.len());
-    for intent in &candidate.intents {
-        if intent.path != target_path {
-            return Err("deterministic candidate target did not match accepted target".to_string());
-        }
-        edits.push(super::patch_proposal::PatchEdit {
-            old_string: intent.old_string.clone(),
-            new_string: intent.new_string.clone(),
-            reason: intent.reason.clone(),
-            replace_all: intent.replace_all,
-        });
-    }
-    Ok(super::patch_proposal::PatchProposal {
-        target_path: target_path.to_string(),
-        edits,
-        explanation: format!("{:?}", candidate.kind),
-        risk: String::new(),
-    })
-}
-
-fn admit_deterministic_repair_candidate(
-    work_root: &Path,
-    accepted_plan: &super::repair_plan::AcceptedRepairPlan,
-    target_hint: &super::task_contract::RecoveryTargetHint,
-    candidate: &RepairCandidate,
-) -> Result<(), String> {
-    let target_contents =
-        patch_proposal_target_contents_for_shadow(work_root, &target_hint.path)
-            .ok_or_else(|| "deterministic candidate target is unavailable".to_string())?;
-    let proposal = repair_candidate_to_patch_proposal(&target_hint.path, candidate)?;
-    super::patch_provider::admit_patch_provider_output(
-        super::patch_provider::PatchProviderRequest {
-            accepted_plan,
-            target_contents: &target_contents,
-        },
-        super::patch_provider::PatchProviderOutput {
-            provider_kind: super::patch_provider::PatchProviderKind::DeterministicFallback,
-            proposal: &proposal,
-        },
-    )
-    .map(|_| ())
-    .map_err(|err| {
-        format!(
-            "deterministic candidate provider admission rejected: {}",
-            err.as_str()
-        )
-    })
 }
 
 fn patch_proposal_error_to_repair_intent_error(
@@ -25201,403 +25142,6 @@ fn observed_assert_equal_pairs(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn controller_repair_candidate_for_job(
-    work_root: &Path,
-    context: &super::repair_job::RepairJob,
-    target_hint: &super::task_contract::RecoveryTargetHint,
-) -> Option<RepairCandidate> {
-    if target_hint.role != super::task_contract::ArtifactRole::Test
-        || !is_test_file(Path::new(&target_hint.path))
-    {
-        return None;
-    }
-    let contents = read_safe_verifier_repair_target(work_root, &target_hint.path)?;
-
-    if test_setup_repair_allowed_by_context(context)
-        && let Some(candidate) = controller_test_setup_repair_candidate_for_contents(
-            work_root,
-            &target_hint.path,
-            &contents,
-            context,
-        )
-    {
-        return Some(candidate);
-    }
-
-    if !test_expectation_alignment_allowed_by_authority(context) {
-        return None;
-    }
-    observed_assert_expected_literal_candidate(&target_hint.path, &contents, context)
-}
-
-fn test_setup_repair_allowed_by_context(context: &super::repair_job::RepairJob) -> bool {
-    let Some(plan) = context.semantic_plan.as_ref() else {
-        return false;
-    };
-    matches!(
-        plan.semantic_cause,
-        super::VerifierDiagnosticFailureKind::TestBug
-    ) || matches!(
-        plan.semantic_report.failure_kind,
-        super::VerifierDiagnosticFailureKind::TestBug
-    ) || test_expectation_alignment_allowed_by_authority(context)
-}
-
-fn python_missing_pytest_import_candidate(
-    path: &str,
-    contents: &str,
-    context: &super::repair_job::RepairJob,
-) -> Option<RepairCandidate> {
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    if python_name_error_name_from_output(&diagnostic_text).as_deref() != Some("pytest")
-        || python_source_imports_module_name(contents, "pytest")
-        || !contents.contains("@pytest.")
-    {
-        return None;
-    }
-
-    let old_string = python_test_import_prefix_for_candidate(contents)?;
-    if contents.matches(&old_string).count() != 1 {
-        return None;
-    }
-    let new_string = python_test_prefix_with_pytest_import(&old_string)?;
-    if old_string == new_string {
-        return None;
-    }
-    Some(RepairCandidate {
-        kind: RepairCandidateKind::PythonMissingPytestImport,
-        intents: vec![VerifierRepairIntent {
-            path: path.to_string(),
-            old_string,
-            new_string,
-            reason: "add missing pytest import required by generated pytest fixture".to_string(),
-            replace_all: false,
-        }],
-    })
-}
-
-fn python_bare_setup_state_reset_candidate(
-    work_root: &Path,
-    path: &str,
-    contents: &str,
-    context: &super::repair_job::RepairJob,
-) -> Option<RepairCandidate> {
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    let missing_name = python_name_error_name_from_output(&diagnostic_text)?;
-    if missing_name == "pytest"
-        || !python_identifier_for_diagnostic_is_safe(&missing_name)
-        || !python_test_source_has_state_isolation(contents)
-    {
-        return None;
-    }
-
-    let imported_modules = python_from_imported_name_modules(contents);
-    if imported_modules.is_empty() {
-        return None;
-    }
-    let mut modules = imported_modules.values().cloned().collect::<Vec<String>>();
-    modules.sort();
-    modules.dedup();
-
-    let mut selected: Option<(String, String, Vec<String>)> = None;
-    for module in modules {
-        let Some(module_path) = python_local_module_path_for_import_validation(work_root, &module)
-        else {
-            continue;
-        };
-        let module_source = std::fs::read_to_string(module_path).ok()?;
-        let alias = provider_module_alias_for_candidate(&module);
-        if !python_identifier_for_diagnostic_is_safe(&alias)
-            || python_identifier_appears_in_source(contents, &alias)
-        {
-            continue;
-        }
-        let reset_lines =
-            python_module_mutable_state_reset_lines_for_candidate(&module_source, &alias);
-        if reset_lines.is_empty() || reset_lines.len() > 8 {
-            continue;
-        }
-        if selected.is_some() {
-            return None;
-        }
-        selected = Some((module, alias, reset_lines));
-    }
-
-    let (module, alias, replacement_lines) = selected?;
-    let import_edit = provider_module_import_intent(path, contents, &module, &alias)?;
-    let reset_edit =
-        python_bare_name_setup_reset_intent(path, contents, &missing_name, &replacement_lines)?;
-
-    Some(RepairCandidate {
-        kind: RepairCandidateKind::PythonBareSetupStateReset,
-        intents: vec![import_edit, reset_edit],
-    })
-}
-
-fn python_test_prefix_with_pytest_import(prefix: &str) -> Option<String> {
-    if python_source_imports_module_name(prefix, "pytest") {
-        return None;
-    }
-    let mut next = prefix.trim_end_matches(['\n', '\r']).to_string();
-    next.push_str("\nimport pytest\n\n");
-    Some(next)
-}
-
-fn python_bare_name_setup_reset_intent(
-    path: &str,
-    contents: &str,
-    missing_name: &str,
-    replacement_lines: &[String],
-) -> Option<VerifierRepairIntent> {
-    if !python_identifier_for_diagnostic_is_safe(missing_name)
-        || replacement_lines.is_empty()
-        || replacement_lines.len() > 8
-        || replacement_lines
-            .iter()
-            .any(|line| verifier_repair_contains_tool_or_markdown(line))
-    {
-        return None;
-    }
-    let mut edits = Vec::<VerifierRepairIntent>::new();
-    for segment in contents.split_inclusive('\n') {
-        let line = segment.trim_end_matches('\n').trim_end_matches('\r');
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        if stripped.trim() != format!("{missing_name}.clear()") {
-            continue;
-        }
-        let indent_len = line.len().saturating_sub(line.trim_start().len());
-        let indent = &line[..indent_len];
-        let suffix = &segment[line.len()..];
-        let replacement = replacement_lines
-            .iter()
-            .map(|line| format!("{indent}{}", line.trim()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let new_string = format!("{replacement}{suffix}");
-        if new_string == segment {
-            continue;
-        }
-        edits.push(VerifierRepairIntent {
-            path: path.to_string(),
-            old_string: segment.to_string(),
-            new_string,
-            reason: "reset provider module state instead of an undefined test-local name"
-                .to_string(),
-            replace_all: false,
-        });
-    }
-    if edits.len() == 1 { edits.pop() } else { None }
-}
-
-fn python_name_error_name_from_output(output: &str) -> Option<String> {
-    for quote in ["'", "\""] {
-        let marker = format!("NameError: name {quote}");
-        let Some(start) = output.find(&marker) else {
-            continue;
-        };
-        let rest = &output[start + marker.len()..];
-        let Some(end) = rest.find(quote) else {
-            continue;
-        };
-        let name = rest[..end].trim();
-        if python_identifier_for_diagnostic_is_safe(name) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
-fn controller_test_setup_repair_candidate_for_contents(
-    work_root: &Path,
-    path: &str,
-    contents: &str,
-    context: &super::repair_job::RepairJob,
-) -> Option<RepairCandidate> {
-    python_missing_pytest_import_candidate(path, contents, context)
-        .or_else(|| python_bare_setup_state_reset_candidate(work_root, path, contents, context))
-        .or_else(|| imported_scalar_provider_state_reset_candidate(work_root, path, contents))
-        .or_else(|| {
-            python_provider_mutable_state_isolation_candidate(work_root, path, contents, context)
-        })
-}
-
-fn read_safe_verifier_repair_target(work_root: &Path, raw_path: &str) -> Option<String> {
-    if !verifier_repair_path_input_is_safe(raw_path) {
-        return None;
-    }
-    let resolved = resolve_user_path(work_root, raw_path).ok()?;
-    let root = std::fs::canonicalize(work_root).ok()?;
-    let canonical = std::fs::canonicalize(&resolved).ok()?;
-    if canonical.strip_prefix(root).is_err() || !canonical.is_file() {
-        return None;
-    }
-    let metadata = std::fs::metadata(&canonical).ok()?;
-    if metadata.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(canonical).ok()?;
-    String::from_utf8(bytes).ok()
-}
-
-fn observed_assert_expected_literal_candidate(
-    path: &str,
-    contents: &str,
-    context: &super::repair_job::RepairJob,
-) -> Option<RepairCandidate> {
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    let observed_pairs = observed_assert_equal_pairs(&diagnostic_text);
-    if observed_pairs.is_empty() {
-        return None;
-    }
-
-    let observed_mismatches = observed_assert_equal_mismatches(&diagnostic_text);
-    let mut seen = HashSet::<(String, String)>::new();
-    let mut candidates = Vec::<VerifierRepairIntent>::new();
-    for mismatch in observed_mismatches {
-        let mut mismatch_candidates = Vec::<VerifierRepairIntent>::new();
-        for segment in contents.split_inclusive('\n') {
-            let line = segment.trim_end_matches('\n').trim_end_matches('\r');
-            let Some(parts) = parse_assert_equality_candidate_line(line) else {
-                continue;
-            };
-            if !supported_expected_literal_token(&parts.expected_token)
-                || mismatch.expected != parts.expected_normalized
-                || mismatch.actual == mismatch.expected
-            {
-                continue;
-            }
-            if let Some(source_lhs) = mismatch.source_lhs.as_deref()
-                && source_lhs != parts.lhs
-            {
-                continue;
-            }
-            let replacement =
-                observed_literal_for_source_token(&mismatch.actual, &parts.expected_token)?;
-            let mut new_line = String::with_capacity(
-                line.len() + replacement.len().saturating_sub(parts.expected_token.len()),
-            );
-            new_line.push_str(&line[..parts.expected_start]);
-            new_line.push_str(&replacement);
-            new_line.push_str(&line[parts.expected_end..]);
-            let suffix = &segment[line.len()..];
-            let old_string = segment.to_string();
-            let new_string = format!("{new_line}{suffix}");
-            if old_string == new_string || contents.matches(&old_string).count() != 1 {
-                continue;
-            }
-            if seen.insert((old_string.clone(), new_string.clone())) {
-                mismatch_candidates.push(VerifierRepairIntent {
-                    path: path.to_string(),
-                    old_string,
-                    new_string,
-                    reason: "align generated test assertion expected literal with observed verifier result".to_string(),
-                    replace_all: false,
-                });
-            }
-        }
-        if mismatch_candidates.len() != 1 {
-            return None;
-        }
-        candidates.extend(mismatch_candidates);
-    }
-
-    if !candidates.is_empty() && candidates.len() <= VERIFIER_REPAIR_PASS_MAX_EDITS {
-        Some(RepairCandidate {
-            kind: RepairCandidateKind::ObservedAssertExpectedLiteralUpdate,
-            intents: candidates,
-        })
-    } else {
-        None
-    }
-}
-
-fn python_provider_mutable_state_isolation_candidate(
-    work_root: &Path,
-    path: &str,
-    contents: &str,
-    context: &super::repair_job::RepairJob,
-) -> Option<RepairCandidate> {
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    if !pytest_output_suggests_shared_state_leak(&diagnostic_text)
-        || python_test_source_has_state_isolation(contents)
-    {
-        return None;
-    }
-
-    let imported_modules = python_from_imported_name_modules(contents);
-    if imported_modules.is_empty() {
-        return None;
-    }
-    let mut modules = imported_modules.values().cloned().collect::<Vec<String>>();
-    modules.sort();
-    modules.dedup();
-
-    let mut selected: Option<(String, String, Vec<String>)> = None;
-    for module in modules {
-        let Some(module_path) = python_local_module_path_for_import_validation(work_root, &module)
-        else {
-            continue;
-        };
-        let module_source = std::fs::read_to_string(module_path).ok()?;
-        let alias = provider_module_alias_for_candidate(&module);
-        if !python_identifier_for_diagnostic_is_safe(&alias)
-            || python_identifier_appears_in_source(contents, &alias)
-        {
-            continue;
-        }
-        let reset_lines =
-            python_module_mutable_state_reset_lines_for_candidate(&module_source, &alias);
-        if reset_lines.is_empty() || reset_lines.len() > 8 {
-            continue;
-        }
-        if selected.is_some() {
-            return None;
-        }
-        selected = Some((module, alias, reset_lines));
-    }
-
-    let (module, alias, reset_lines) = selected?;
-    let old_string = python_test_import_prefix_for_candidate(contents)?;
-    if contents.matches(&old_string).count() != 1 {
-        return None;
-    }
-    let new_string =
-        python_test_prefix_with_provider_state_fixture(&old_string, &module, &alias, &reset_lines)?;
-    if old_string == new_string {
-        return None;
-    }
-    Some(RepairCandidate {
-        kind: RepairCandidateKind::PythonProviderMutableStateIsolation,
-        intents: vec![VerifierRepairIntent {
-            path: path.to_string(),
-            old_string,
-            new_string,
-            reason: "add generated test isolation for provider module mutable state".to_string(),
-            replace_all: false,
-        }],
-    })
-}
-
 fn pytest_output_suggests_shared_state_leak(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if lower.contains("left contains") || lower.contains("right contains") {
@@ -25620,471 +25164,6 @@ fn pytest_output_suggests_shared_state_leak(text: &str) -> bool {
             };
             actual > expected
         })
-}
-
-fn python_test_source_has_state_isolation(contents: &str) -> bool {
-    let lower = contents.to_ascii_lowercase();
-    lower.contains("@pytest.fixture")
-        || lower.contains("setup_function")
-        || lower.contains("setup_method")
-        || lower.contains("def setup(")
-        || lower.contains("def setup_")
-        || lower.contains("def teardown")
-}
-
-fn python_module_mutable_state_reset_lines_for_candidate(source: &str, alias: &str) -> Vec<String> {
-    let mut reset_lines = Vec::new();
-    for line in source.lines() {
-        if line.chars().next().is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let Some((name, expression)) = python_top_level_assignment_parts(&stripped) else {
-            continue;
-        };
-        if let Some(reset) = python_empty_mutable_reset_line(alias, name, expression) {
-            if python_module_source_mutates_name_after_definition(source, name) {
-                reset_lines.push(reset);
-            }
-            continue;
-        }
-        if python_expression_is_scalar_literal(expression)
-            && python_module_source_mutates_name_after_definition(source, name)
-        {
-            reset_lines.push(format!("    {alias}.{name} = {}", expression.trim()));
-        }
-    }
-    reset_lines.sort();
-    reset_lines.dedup();
-    reset_lines
-}
-
-fn python_top_level_assignment_parts(line: &str) -> Option<(&str, &str)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty()
-        || trimmed.starts_with("def ")
-        || trimmed.starts_with("async def ")
-        || trimmed.starts_with("class ")
-        || trimmed.starts_with("import ")
-        || trimmed.starts_with("from ")
-    {
-        return None;
-    }
-    let (assignment_head, expression) = trimmed.split_once('=')?;
-    if assignment_head.ends_with('!')
-        || assignment_head.ends_with('<')
-        || assignment_head.ends_with('>')
-        || assignment_head.ends_with('=')
-    {
-        return None;
-    }
-    let name = assignment_head
-        .split_once(':')
-        .map(|(head, _)| head)
-        .unwrap_or(assignment_head)
-        .trim();
-    python_identifier_for_diagnostic_is_safe(name).then_some((name, expression.trim()))
-}
-
-fn python_empty_mutable_reset_line(alias: &str, name: &str, expression: &str) -> Option<String> {
-    let expression = expression.trim().trim_end_matches(',');
-    if matches!(expression, "{}" | "[]" | "dict()" | "list()" | "set()") {
-        Some(format!("    {alias}.{name}.clear()"))
-    } else {
-        None
-    }
-}
-
-fn python_module_source_mutates_name_after_definition(source: &str, name: &str) -> bool {
-    for line in source.lines() {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if python_top_level_assignment_parts(trimmed).is_some_and(|(defined, _)| defined == name) {
-            continue;
-        }
-        if trimmed
-            .strip_prefix("global ")
-            .is_some_and(|rest| rest.split(',').any(|entry| entry.trim() == name))
-        {
-            return true;
-        }
-        if trimmed.starts_with(&format!("del {name}[")) {
-            return true;
-        }
-        if trimmed.starts_with(&format!("{name}[")) && trimmed.contains('=') {
-            return true;
-        }
-        if ["+=", "-=", "*=", "/=", "//=", "%=", "|=", "&=", "^=", "="]
-            .iter()
-            .any(|op| trimmed.starts_with(&format!("{name} {op}")))
-        {
-            return true;
-        }
-        if [
-            ".append(",
-            ".extend(",
-            ".insert(",
-            ".clear(",
-            ".pop(",
-            ".remove(",
-            ".add(",
-            ".discard(",
-            ".update(",
-            ".setdefault(",
-        ]
-        .iter()
-        .any(|method| trimmed.starts_with(&format!("{name}{method}")))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn python_test_import_prefix_for_candidate(contents: &str) -> Option<String> {
-    let mut pos = 0usize;
-    let mut seen_import = false;
-    let mut in_docstring: Option<&str> = None;
-    let mut allow_docstring = true;
-    for segment in contents.split_inclusive('\n') {
-        let line = segment.trim_end_matches('\n').trim_end_matches('\r');
-        let trimmed = line.trim();
-        if let Some(quote) = in_docstring {
-            pos += segment.len();
-            if trimmed.contains(quote) {
-                in_docstring = None;
-            }
-            continue;
-        }
-        if allow_docstring
-            && !seen_import
-            && (trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''"))
-        {
-            let quote = if trimmed.starts_with("\"\"\"") {
-                "\"\"\""
-            } else {
-                "'''"
-            };
-            pos += segment.len();
-            if trimmed[quote.len()..].contains(quote) {
-                in_docstring = None;
-            } else {
-                in_docstring = Some(quote);
-            }
-            allow_docstring = false;
-            continue;
-        }
-        if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
-            seen_import = true;
-            allow_docstring = false;
-            pos += segment.len();
-            continue;
-        }
-        if seen_import && trimmed.is_empty() {
-            pos += segment.len();
-            continue;
-        }
-        if !seen_import && (trimmed.is_empty() || trimmed.starts_with('#')) {
-            pos += segment.len();
-            continue;
-        }
-        break;
-    }
-    if seen_import && pos > 0 {
-        Some(contents[..pos].to_string())
-    } else {
-        None
-    }
-}
-
-fn python_test_prefix_with_provider_state_fixture(
-    prefix: &str,
-    module: &str,
-    alias: &str,
-    reset_lines: &[String],
-) -> Option<String> {
-    if reset_lines.is_empty()
-        || !python_module_name_for_import_validation_is_safe(module)
-        || !python_identifier_for_diagnostic_is_safe(alias)
-    {
-        return None;
-    }
-    let mut next = prefix.trim_end_matches(['\n', '\r']).to_string();
-    if !python_source_imports_module_name(prefix, "pytest") {
-        next.push_str("\nimport pytest");
-    }
-    if !python_source_imports_module_alias(prefix, module, alias) {
-        next.push_str(&format!("\nimport {module} as {alias}"));
-    }
-    next.push_str("\n\n\n@pytest.fixture(autouse=True)\ndef _anvil_reset_provider_state():\n");
-    for line in reset_lines {
-        next.push_str(line);
-        next.push('\n');
-    }
-    next.push_str("    yield\n");
-    for line in reset_lines {
-        next.push_str(line);
-        next.push('\n');
-    }
-    next.push('\n');
-    Some(next)
-}
-
-fn python_source_imports_module_name(source: &str, module_name: &str) -> bool {
-    source.lines().any(|line| {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        trimmed == format!("import {module_name}")
-            || trimmed.starts_with(&format!("import {module_name} as "))
-            || trimmed.starts_with(&format!("from {module_name} import "))
-    })
-}
-
-fn python_source_imports_module_alias(source: &str, module: &str, alias: &str) -> bool {
-    source.lines().any(|line| {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        stripped.trim() == format!("import {module} as {alias}")
-    })
-}
-
-fn imported_scalar_provider_state_reset_candidate(
-    work_root: &Path,
-    path: &str,
-    contents: &str,
-) -> Option<RepairCandidate> {
-    let lower = contents.to_ascii_lowercase();
-    if !(lower.contains("@pytest.fixture")
-        || lower.contains("setup_function")
-        || lower.contains("setup_method")
-        || lower.contains("def setup(")
-        || lower.contains("def setup_"))
-    {
-        return None;
-    }
-    let imported_modules = python_from_imported_name_modules(contents);
-    if imported_modules.is_empty() {
-        return None;
-    }
-
-    let mut import_edit: Option<VerifierRepairIntent> = None;
-    let mut reset_edits = Vec::<VerifierRepairIntent>::new();
-    let mut seen_reset_edits = HashSet::<(String, String)>::new();
-    let mut selected_module: Option<String> = None;
-    let mut selected_alias: Option<String> = None;
-    for segment in contents.split_inclusive('\n') {
-        let line = segment.trim_end_matches('\n').trim_end_matches('\r');
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let Some((lhs, rhs)) = stripped.split_once('=') else {
-            continue;
-        };
-        let lhs = lhs.trim();
-        let rhs = rhs.trim();
-        let Some((object_name, scalar_name)) = lhs.split_once('.') else {
-            continue;
-        };
-        if object_name.contains('.') || scalar_name.contains('.') {
-            continue;
-        }
-        if !python_identifier_for_diagnostic_is_safe(object_name)
-            || !python_identifier_for_diagnostic_is_safe(scalar_name)
-            || !python_expression_is_scalar_literal(rhs)
-        {
-            continue;
-        }
-        let module = imported_modules.get(object_name)?;
-        let module_path = python_local_module_path_for_import_validation(work_root, module)?;
-        let module_source = std::fs::read_to_string(module_path).ok()?;
-        if !python_module_source_definitively_binds_scalar(&module_source, scalar_name)
-            || python_module_source_mentions_attr_path(work_root, module, object_name, scalar_name)
-        {
-            continue;
-        }
-        if let Some(imported_scalar_module) = imported_modules.get(scalar_name)
-            && imported_scalar_module != module
-        {
-            continue;
-        }
-        if selected_module
-            .as_deref()
-            .is_some_and(|selected| selected != module)
-        {
-            return None;
-        }
-        let alias = selected_alias
-            .clone()
-            .unwrap_or_else(|| provider_module_alias_for_candidate(module));
-        if !python_identifier_for_diagnostic_is_safe(&alias)
-            || python_identifier_appears_in_source(contents, &alias)
-        {
-            return None;
-        }
-        selected_module = Some(module.clone());
-        selected_alias = Some(alias.clone());
-        if import_edit.is_none() {
-            import_edit = provider_module_import_intent(path, contents, module, &alias);
-        }
-        let old_string = segment.to_string();
-        let new_line = line.replacen(
-            &format!("{object_name}.{scalar_name}"),
-            &format!("{alias}.{scalar_name}"),
-            1,
-        );
-        let suffix = &segment[line.len()..];
-        let new_string = format!("{new_line}{suffix}");
-        let match_count = contents.matches(&old_string).count();
-        if old_string != new_string
-            && match_count > 0
-            && match_count <= VERIFIER_REPAIR_PASS_MAX_REPLACE_ALL_MATCHES
-            && seen_reset_edits.insert((old_string.clone(), new_string.clone()))
-        {
-            reset_edits.push(VerifierRepairIntent {
-                path: path.to_string(),
-                old_string,
-                new_string,
-                reason: "reset provider module scalar state instead of assigning an attribute on an imported object".to_string(),
-                replace_all: match_count > 1,
-            });
-        }
-    }
-
-    let import_edit = import_edit?;
-    if reset_edits.is_empty() || reset_edits.len() > VERIFIER_REPAIR_PASS_MAX_EDITS - 1 {
-        return None;
-    }
-    let mut intents = Vec::with_capacity(reset_edits.len() + 1);
-    intents.push(import_edit);
-    intents.extend(reset_edits);
-    Some(RepairCandidate {
-        kind: RepairCandidateKind::ImportedScalarProviderStateReset,
-        intents,
-    })
-}
-
-fn provider_module_alias_for_candidate(module: &str) -> String {
-    format!("{}_provider", module.replace('.', "_"))
-}
-
-fn python_identifier_appears_in_source(source: &str, identifier: &str) -> bool {
-    source
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .any(|token| token == identifier)
-}
-
-fn provider_module_import_intent(
-    path: &str,
-    contents: &str,
-    module: &str,
-    alias: &str,
-) -> Option<VerifierRepairIntent> {
-    let mut matches = Vec::new();
-    for segment in contents.split_inclusive('\n') {
-        let line = segment.trim_end_matches('\n').trim_end_matches('\r');
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        if trimmed.starts_with(&format!("from {module} import ")) {
-            matches.push(segment.to_string());
-        }
-    }
-    if matches.len() != 1 {
-        return None;
-    }
-    let old_string = matches.pop()?;
-    let line = old_string.trim_end_matches('\n').trim_end_matches('\r');
-    let suffix = &old_string[line.len()..];
-    let new_string = format!("{line}\nimport {module} as {alias}{suffix}");
-    Some(VerifierRepairIntent {
-        path: path.to_string(),
-        old_string,
-        new_string,
-        reason: "import provider module so test setup can reset module-owned scalar state"
-            .to_string(),
-        replace_all: false,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AssertEqualityCandidateLine {
-    lhs: String,
-    expected_normalized: String,
-    expected_token: String,
-    expected_start: usize,
-    expected_end: usize,
-}
-
-fn parse_assert_equality_candidate_line(line: &str) -> Option<AssertEqualityCandidateLine> {
-    let indent_len = line.len().saturating_sub(line.trim_start().len());
-    let trimmed = &line[indent_len..];
-    if !trimmed.starts_with("assert ") {
-        return None;
-    }
-    let body_start = indent_len + "assert ".len();
-    let body = &line[body_start..];
-    let equals_index = body.find("==")?;
-    let lhs = body[..equals_index].trim();
-    if lhs.is_empty() {
-        return None;
-    }
-    let rhs_start = body_start + equals_index + "==".len();
-    let rhs = &line[rhs_start..];
-    let rhs_leading = rhs.len().saturating_sub(rhs.trim_start().len());
-    let mut token_start = rhs_start + rhs_leading;
-    while token_start < line.len() && line[token_start..].starts_with('(') {
-        token_start += 1;
-    }
-    let mut token_end = token_start;
-    for (offset, ch) in line[token_start..].char_indices() {
-        if ch.is_whitespace() || matches!(ch, ',' | ')' | ']' | '}' | ':' | ';') {
-            break;
-        }
-        token_end = token_start + offset + ch.len_utf8();
-    }
-    if token_end <= token_start {
-        return None;
-    }
-    let expected_token = line[token_start..token_end].to_string();
-    let expected_normalized = normalize_assert_literal_token(&expected_token)?;
-    Some(AssertEqualityCandidateLine {
-        lhs: lhs.to_string(),
-        expected_normalized,
-        expected_token,
-        expected_start: token_start,
-        expected_end: token_end,
-    })
-}
-
-fn supported_expected_literal_token(token: &str) -> bool {
-    let trimmed = token.trim();
-    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
-    {
-        return true;
-    }
-    if matches!(
-        trimmed,
-        "True" | "False" | "None" | "true" | "false" | "null"
-    ) {
-        return true;
-    }
-    trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | '.'))
-        && trimmed.chars().any(|ch| ch.is_ascii_digit())
-}
-
-fn observed_literal_for_source_token(actual: &str, source_token: &str) -> Option<String> {
-    let trimmed = source_token.trim();
-    let quote = trimmed.chars().next().filter(|ch| matches!(ch, '\'' | '"'));
-    if let Some(quote) = quote {
-        if actual.contains(quote) || actual.contains('\\') {
-            return None;
-        }
-        Some(format!("{quote}{actual}{quote}"))
-    } else {
-        Some(actual.to_string())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31588,22 +30667,21 @@ mod progress_tests {
     };
     use super::{
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
-        RepairCandidateKind, RepairRejectionSignal, VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
+        RepairRejectionSignal, VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
         VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
         ValidationFailure, VerifierRepairDecision, VerifierRepairIntent,
         apply_validated_verifier_repair_edit, artifact_directed_tool_policy_error,
-        classify_verifier_failure_type, controller_repair_candidate_for_job,
-        deterministic_empty_framework_app_files, deterministic_empty_framework_game_files,
-        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
-        deterministic_support_target_relative, diagnostic_target_allowed_by_confidence,
-        effective_tool_batch_action, effective_tool_policy_error_for_call,
-        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
-        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_guidance_note_for_policy, focused_edit_history,
+        classify_verifier_failure_type, deterministic_empty_framework_app_files,
+        deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
+        deterministic_framework_game_files_needed, deterministic_support_target_relative,
+        diagnostic_target_allowed_by_confidence, effective_tool_batch_action,
+        effective_tool_policy_error_for_call, effective_tool_policy_error_for_call_with_scope,
+        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
@@ -33412,453 +32490,6 @@ mod progress_tests {
         assert!(
             edit.updated_contents
                 .contains("assert response.status_code")
-        );
-    }
-
-    #[test]
-    fn controller_repair_candidate_builds_observed_assert_expected_update() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        let original = "def test_create_item():\n    response = client.post('/items', json={'name': 'x'})\n    assert response.status_code == 200\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        context
-            .semantic_plan
-            .as_mut()
-            .expect("test fixture attaches semantic plan")
-            .spec_authority = super::super::spec_authority::SpecAuthority::LlmGeneratedTest;
-        context.output_excerpt =
-            "FAILED tests/test_main.py::test_create_item\nE       assert 201 == 200".to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("single observed mismatch should produce a controller candidate");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::ObservedAssertExpectedLiteralUpdate
-        );
-        assert!(candidate.intents.iter().any(|intent| {
-            intent
-                .old_string
-                .contains("assert response.status_code == 200")
-        }));
-        assert!(candidate.intents.iter().any(|intent| {
-            intent
-                .new_string
-                .contains("assert response.status_code == 201")
-        }));
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("controller candidate must pass the same validator as LLM repairs");
-        assert!(edit.updated_contents.contains("status_code == 201"));
-    }
-
-    #[test]
-    fn controller_repair_candidate_builds_multiple_source_matched_assert_updates() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        let original = "class TestApi:\n    def test_create(self):\n        assert response.status_code == 200\n\n    def test_delete(self):\n        assert delete_response.status_code == 200\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        context
-            .semantic_plan
-            .as_mut()
-            .expect("test fixture attaches semantic plan")
-            .spec_authority = super::super::spec_authority::SpecAuthority::LlmGeneratedTest;
-        context.output_excerpt = "FAILED tests/test_main.py::TestApi::test_create\n\
->       assert response.status_code == 200\n\
-E       assert 201 == 200\n\
-FAILED tests/test_main.py::TestApi::test_delete\n\
->       assert delete_response.status_code == 200\n\
-E       assert 204 == 200\n"
-            .to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("source assertion lines should disambiguate multiple observed mismatches");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::ObservedAssertExpectedLiteralUpdate
-        );
-        assert_eq!(candidate.intents.len(), 2);
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("multi assertion candidate must pass existing validation gates");
-        assert!(
-            edit.updated_contents
-                .contains("response.status_code == 201")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("delete_response.status_code == 204")
-        );
-    }
-
-    #[test]
-    fn controller_repair_candidate_builds_imported_scalar_provider_state_reset() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("app")).unwrap();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        std::fs::write(work_root.join("app/__init__.py"), "").unwrap();
-        std::fs::write(
-            work_root.join("app/main.py"),
-            "from fastapi import FastAPI\napp = FastAPI()\nitems_db = {}\nnext_id: int = 1\n",
-        )
-        .unwrap();
-        let original = "import pytest\nfrom app.main import app, items_db, next_id\n\n@pytest.fixture(autouse=True)\ndef reset_db():\n    items_db.clear()\n    app.next_id = 1\n    yield\n    items_db.clear()\n    app.next_id = 1\n\ndef test_create_item():\n    assert response.status_code == 201\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let imported_modules = super::python_from_imported_name_modules(original);
-        assert_eq!(
-            imported_modules.get("app").map(String::as_str),
-            Some("app.main")
-        );
-        assert_eq!(
-            imported_modules.get("next_id").map(String::as_str),
-            Some("app.main")
-        );
-        let provider_source = std::fs::read_to_string(work_root.join("app/main.py")).unwrap();
-        assert!(super::python_module_source_definitively_binds_scalar(
-            &provider_source,
-            "next_id"
-        ));
-        assert!(!super::python_module_source_mentions_attr_path(
-            work_root, "app.main", "app", "next_id"
-        ));
-        assert!(
-            super::provider_module_import_intent(
-                "tests/test_main.py",
-                original,
-                "app.main",
-                "app_main_provider"
-            )
-            .is_some()
-        );
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        context
-            .semantic_plan
-            .as_mut()
-            .expect("test fixture attaches semantic plan")
-            .spec_authority = super::super::spec_authority::SpecAuthority::LlmGeneratedTest;
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("disconnected provider state reset should produce a controller candidate");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::ImportedScalarProviderStateReset
-        );
-        assert_eq!(candidate.intents.len(), 2);
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("provider state reset candidate must pass existing validation gates");
-        assert!(
-            edit.updated_contents
-                .contains("import app.main as app_main_provider")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("app_main_provider.next_id = 1")
-        );
-        assert!(!edit.updated_contents.contains("app.next_id = 1"));
-    }
-
-    #[test]
-    fn controller_repair_candidate_builds_provider_state_isolation_fixture() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("app")).unwrap();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        std::fs::write(work_root.join("app/__init__.py"), "").unwrap();
-        std::fs::write(
-            work_root.join("app/main.py"),
-            "app = object()\nitems_db: dict = {}\nnext_id: int = 1\n\ndef create_item():\n    global next_id\n    items_db[next_id] = {'id': next_id}\n    next_id += 1\n",
-        )
-        .unwrap();
-        let original = "\"\"\"Generated API tests.\"\"\"\n\nfrom fastapi.testclient import TestClient\nfrom app.main import app\n\nclient = TestClient(app)\n\n\ndef test_items_empty():\n    response = client.get('/items')\n    assert response.json() == []\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        {
-            let plan = context
-                .semantic_plan
-                .as_mut()
-                .expect("test fixture attaches semantic plan");
-            plan.spec_authority = super::super::spec_authority::SpecAuthority::UserRequest;
-            plan.semantic_cause = super::super::VerifierDiagnosticFailureKind::TestBug;
-            plan.semantic_report.failure_kind =
-                super::super::VerifierDiagnosticFailureKind::TestBug;
-        }
-        context.output_excerpt = "FAILED tests/test_main.py::test_items_empty\n\
->       assert response.json() == []\n\
-E       AssertionError: assert [{'id': 1}] == []\n\
-E         Left contains one more item: {'id': 1}\n"
-            .to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("shared provider state evidence should produce an isolation candidate");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::PythonProviderMutableStateIsolation
-        );
-        assert_eq!(candidate.intents.len(), 1);
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("provider state isolation fixture must pass existing validation gates");
-        assert!(edit.updated_contents.contains("import pytest"));
-        assert!(
-            edit.updated_contents
-                .contains("import app.main as app_main_provider")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("@pytest.fixture(autouse=True)")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("app_main_provider.items_db.clear()")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("app_main_provider.next_id = 1")
-        );
-    }
-
-    #[test]
-    fn controller_repair_candidate_adds_missing_pytest_import_for_test_setup() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        let original = "from fastapi.testclient import TestClient\nfrom main import app\n\nclient = TestClient(app)\n\n@pytest.fixture(autouse=True)\ndef reset_db():\n    yield\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        {
-            let plan = context
-                .semantic_plan
-                .as_mut()
-                .expect("test fixture attaches semantic plan");
-            plan.semantic_cause = super::super::VerifierDiagnosticFailureKind::TestBug;
-            plan.semantic_report.failure_kind =
-                super::super::VerifierDiagnosticFailureKind::TestBug;
-        }
-        context.output_excerpt = "ERROR collecting tests/test_main.py\n\
-tests/test_main.py:6: in <module>\n\
-    @pytest.fixture(autouse=True)\n\
-E   NameError: name 'pytest' is not defined\n"
-            .to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("pytest NameError should produce an import candidate");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::PythonMissingPytestImport
-        );
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("missing pytest import candidate must pass validation");
-        assert!(edit.updated_contents.contains("import pytest"));
-        assert!(edit.updated_contents.contains("@pytest.fixture"));
-    }
-
-    #[test]
-    fn controller_repair_candidate_rewrites_bare_setup_state_reset_to_provider_module() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        std::fs::write(
-            work_root.join("main.py"),
-            "from fastapi import FastAPI\napp = FastAPI()\nitems_db: dict = {}\n\ndef create_item(item):\n    items_db[item['id']] = item\n",
-        )
-        .unwrap();
-        let original = "import pytest\nfrom fastapi.testclient import TestClient\nfrom main import app\n\nclient = TestClient(app)\n\n@pytest.fixture(autouse=True)\ndef reset_db():\n    items.clear()\n    yield\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        {
-            let plan = context
-                .semantic_plan
-                .as_mut()
-                .expect("test fixture attaches semantic plan");
-            plan.semantic_cause = super::super::VerifierDiagnosticFailureKind::TestBug;
-            plan.semantic_report.failure_kind =
-                super::super::VerifierDiagnosticFailureKind::TestBug;
-        }
-        context.output_excerpt = "ERROR at setup of test_create_item\n\
-tests/test_main.py:9: NameError: name 'items' is not defined\n"
-            .to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("bare setup state NameError should produce provider-state reset candidate");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::PythonBareSetupStateReset
-        );
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("provider-state reset candidate must pass validation");
-        assert!(
-            edit.updated_contents
-                .contains("import main as main_provider")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("main_provider.items_db.clear()")
-        );
-        assert!(!edit.updated_contents.contains("items.clear()"));
-    }
-
-    #[test]
-    fn controller_repair_candidate_rewrites_bare_setup_reset_to_all_provider_state() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        std::fs::write(
-            work_root.join("main.py"),
-            "from fastapi import FastAPI\napp = FastAPI()\nitems_db: dict[int, dict] = {}\nnext_id: int = 1\n\ndef create_item(item):\n    global next_id\n    items_db[next_id] = item\n    next_id += 1\n",
-        )
-        .unwrap();
-        let original = "import pytest\nfrom fastapi.testclient import TestClient\nfrom main import app\n\nclient = TestClient(app)\n\n@pytest.fixture(autouse=True)\ndef reset_db():\n    items.clear()\n    yield\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        {
-            let plan = context
-                .semantic_plan
-                .as_mut()
-                .expect("test fixture attaches semantic plan");
-            plan.semantic_cause = super::super::VerifierDiagnosticFailureKind::TestBug;
-            plan.semantic_report.failure_kind =
-                super::super::VerifierDiagnosticFailureKind::TestBug;
-        }
-        context.output_excerpt = "ERROR at setup of test_create_item\n\
-tests/test_main.py:9: NameError: name 'items' is not defined\n"
-            .to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        let candidate = controller_repair_candidate_for_job(work_root, &context, &target)
-            .expect("bare setup reset should reset every provider-owned state binding");
-        assert_eq!(
-            candidate.kind,
-            RepairCandidateKind::PythonBareSetupStateReset
-        );
-        let edit =
-            validate_verifier_repair_intents(work_root, &context, &target, candidate.intents)
-                .expect("multi-state provider reset candidate must pass validation");
-        assert!(
-            edit.updated_contents
-                .contains("import main as main_provider")
-        );
-        assert!(
-            edit.updated_contents
-                .contains("main_provider.items_db.clear()")
-        );
-        assert!(edit.updated_contents.contains("main_provider.next_id = 1"));
-        assert!(!edit.updated_contents.contains("items.clear()"));
-    }
-
-    #[test]
-    fn controller_repair_candidate_rejects_ambiguous_observed_assert_update() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        let original = "def test_create_item():\n    assert response.status_code == 200\n\ndef test_update_item():\n    assert other_response.status_code == 200\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        context
-            .semantic_plan
-            .as_mut()
-            .expect("test fixture attaches semantic plan")
-            .spec_authority = super::super::spec_authority::SpecAuthority::LlmGeneratedTest;
-        context.output_excerpt =
-            "FAILED tests/test_main.py::test_create_item\nE       assert 201 == 200".to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        assert!(
-            controller_repair_candidate_for_job(work_root, &context, &target).is_none(),
-            "controller must not guess when the observed pair matches multiple assertions"
-        );
-    }
-
-    #[test]
-    fn controller_repair_candidate_respects_user_request_authority() {
-        let temp = tempdir().unwrap();
-        let work_root = temp.path();
-        std::fs::create_dir_all(work_root.join("tests")).unwrap();
-        let original = "def test_create_item():\n    assert response.status_code == 200\n";
-        std::fs::write(work_root.join("tests/test_main.py"), original).unwrap();
-        let mut context = verifier_test_context_for("tests/test_main.py");
-        context.output_excerpt =
-            "FAILED tests/test_main.py::test_create_item\nE       assert 201 == 200".to_string();
-        let target = context
-            .assessment
-            .as_ref()
-            .unwrap()
-            .repair_target_hint
-            .as_ref()
-            .unwrap()
-            .clone();
-
-        assert!(
-            controller_repair_candidate_for_job(work_root, &context, &target).is_none(),
-            "UserRequest authority must not generate observed-only test expectation candidates"
         );
     }
 
@@ -38818,6 +37449,39 @@ E   assert [{'id': 1}] == []\n";
 
         std::fs::write(work_root.join("README.md"), "# app\n").unwrap();
         assert!(!workspace_appears_empty(work_root));
+    }
+
+    #[test]
+    fn repo_edit_observation_ignores_controller_owned_state() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        let rel = ".anvil-state/verifier-python/site/generated_test.py";
+        std::fs::create_dir_all(temp.path().join(".anvil-state/verifier-python/site")).unwrap();
+        std::fs::write(temp.path().join(rel), "def test_generated(): pass\n").unwrap();
+
+        agent.observe_evidence_from_repo_edit(rel);
+
+        assert!(
+            !agent.turn_edited_relative_paths.contains(rel),
+            "controller-owned state must not become repo edit evidence"
+        );
+        assert!(
+            agent.evidence_set_this_turn.is_empty(),
+            "controller-owned state must not satisfy completion evidence"
+        );
+        assert!(
+            agent.task_contract_evidence_set_this_turn.is_empty(),
+            "controller-owned state must not satisfy task contract evidence"
+        );
+        assert!(
+            !agent
+                .artifact_ledger
+                .repo_edit_projection_set()
+                .contains(rel),
+            "controller-owned state must not enter artifact ledger repo edit projection"
+        );
     }
 
     #[test]

@@ -263,6 +263,25 @@ fn existing_seed_is_idempotent_across_evaluations() {
     );
 }
 
+#[test]
+fn existing_seed_ignores_controller_owned_state() {
+    let session_id = unique_session_id("existing-ignore-state");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    let rel = ".anvil-state/generated/README.md";
+    std::fs::create_dir_all(work_root.join(".anvil-state/generated")).unwrap();
+    std::fs::write(work_root.join(rel), "# generated\n").unwrap();
+    let scope = single_root_scope();
+
+    agent.seed_artifact_ledger_existing(rel, ArtifactRole::UsageDocs, &scope);
+
+    assert_eq!(
+        agent.artifact_ledger.event_count(),
+        0,
+        "controller-owned existing files must not enter artifact evidence"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 2.4: Scaffold seed
 // ---------------------------------------------------------------------------
@@ -298,6 +317,25 @@ fn scaffold_unchanged_retains_baseline_with_delta_false() {
     );
 }
 
+#[test]
+fn scaffold_seed_ignores_controller_owned_state() {
+    let session_id = unique_session_id("scaffold-ignore-state");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    let rel = ".anvil-state/scaffold/app/main.py";
+    std::fs::create_dir_all(work_root.join(".anvil-state/scaffold/app")).unwrap();
+    std::fs::write(work_root.join(rel), "print('generated')\n").unwrap();
+    let scope = single_root_scope();
+
+    agent.seed_artifact_ledger_scaffold(rel, ArtifactRole::Implementation, true, &scope);
+
+    assert_eq!(
+        agent.artifact_ledger.event_count(),
+        0,
+        "controller-owned scaffold files must not enter artifact evidence"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 2.5: RepoEdit seed + write-through adapter
 // ---------------------------------------------------------------------------
@@ -322,6 +360,36 @@ fn repo_edit_seed_synchronizes_legacy_set() {
     assert!(
         agent.artifact_ledger.event_count() >= 1,
         "ledger must have at least one RepoEdit event for the seeded path"
+    );
+}
+
+#[test]
+fn repo_edit_seed_ignores_controller_owned_state() {
+    let session_id = unique_session_id("repoedit-ignore-state");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    let rel = ".anvil-state/verifier-python/site/generated_test.py";
+    std::fs::create_dir_all(work_root.join(".anvil-state/verifier-python/site")).unwrap();
+    std::fs::write(work_root.join(rel), "").unwrap();
+    let scope = single_root_scope();
+
+    agent.seed_artifact_ledger_repo_edit(rel, ArtifactRole::Test, &scope);
+
+    assert!(
+        !agent.turn_edited_relative_paths.contains(rel),
+        "controller-owned state must not be mirrored into the legacy edit set"
+    );
+    assert!(
+        !agent
+            .artifact_ledger
+            .repo_edit_projection_set()
+            .contains(rel),
+        "controller-owned state must not enter the ledger repo edit projection"
+    );
+    assert_eq!(
+        agent.artifact_ledger.event_count(),
+        0,
+        "ignored controller-owned paths should not create ledger events"
     );
 }
 
@@ -400,6 +468,36 @@ fn verifier_observation_skipped_for_legacy_path() {
             .verifier_observation_for("tests/test_bound.py")
             .is_none(),
         "no verifier_observation must be created for legacy/unbound verifier paths"
+    );
+}
+
+#[test]
+fn verifier_observation_ignores_controller_owned_state() {
+    let session_id = unique_session_id("verifier-ignore-state");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    let rel = ".anvil-state/verifier-python/site/test_generated.py";
+    std::fs::create_dir_all(work_root.join(".anvil-state/verifier-python/site")).unwrap();
+    std::fs::write(work_root.join(rel), "").unwrap();
+    let scope = single_root_scope();
+
+    agent.seed_artifact_ledger_verifier_observation(
+        &[rel.to_string()],
+        VerifierOutcome::Fail,
+        &scope,
+    );
+
+    assert!(
+        agent
+            .artifact_ledger
+            .verifier_observation_for(rel)
+            .is_none(),
+        "controller-owned verifier paths must not enter verifier observations"
+    );
+    assert_eq!(
+        agent.artifact_ledger.event_count(),
+        0,
+        "ignored controller-owned verifier observations should not create ledger events"
     );
 }
 

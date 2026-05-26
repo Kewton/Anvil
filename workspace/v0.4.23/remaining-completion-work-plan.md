@@ -35,17 +35,17 @@ Already covered:
 - Verifier timeout evidence now carries a bounded `timeout_kind` bucket:
   generated test hang, dependency setup timeout, environment stall timeout,
   build command timeout, long-running verifier, or unknown timeout.
+- `RepairJob` now stores typed timeout evidence and uses it for the first
+  state-machine route: environment-stall timeouts safe-stop without patch
+  repair.
 
 Remaining gaps:
 
-- `ProjectUnit` now drives task-contract verifier selection when available,
-  but broader non-task-contract verifier discovery still needs to move behind
-  the same model.
-- Timeout evidence is now attached to `FailurePacket` as typed evidence, but
-  `RepairJob::next_action()` does not yet branch directly on that typed field.
-- Repair patch convergence still depends on several old helper paths.
-- Legacy deterministic repair is not fully deleted or telemetry-only.
-- Generality across non-FastAPI tasks is not proven by a stable smoke gate.
+- Repair patch convergence still depends on LLM proposal quality and validator
+  outcomes; it now has tighter state-machine tests, but large smoke stability
+  is not yet proven.
+- Generality across non-FastAPI tasks is partially proven by small smoke
+  (`Rust CLI` passed), but Python CLI repair convergence is still unstable.
 
 ## Phase 1: ProjectUnit Verifier Model
 
@@ -92,13 +92,35 @@ Implemented slice:
   verifier selection from a current Python task unit.
 - Unit coverage verifies that a `ProjectUnit` with no verifier candidates does
   not fall back to unrelated root-level verifier guesses.
+- Legacy deterministic verifier-repair candidates are no longer invoked by the
+  production patch-provider main path. The deterministic admission bridge and
+  old candidate builder were removed from `turn.rs`; validator coverage now
+  lives around explicit repair-intent admission instead of candidate generation.
+- `build_arbiter_candidates()` now short-circuits after a verifier-owned
+  candidate. Lower-priority recovery candidates are not built while
+  `RepairJob` / `MissingVerifierJob` owns the turn.
+- AutoTest verifier detection filters controller-owned changed files at the
+  entrypoint, preventing `.anvil-state` paths from becoming verifier or Python
+  surface evidence.
+- RepoEdit observation and ArtifactLedger seed helpers now reject
+  controller-owned paths at the boundary, so `.anvil-state` cannot become
+  edited-path evidence, artifact evidence, verifier observations, or
+  repair-target admission input.
 
-Not implemented yet:
+Implemented in the final cleanup slice:
 
-- Make `ProjectUnit` the only verifier discovery model for every verifier
-  entrypoint, not only task-contract verifier execution.
-- Add docs-only/no-code project-unit behavior.
-- Add confidence scoring beyond candidate source and evidence summary.
+- Post-loop verifier execution now receives the current `ProjectUnit` and uses
+  the same project-unit-bound verifier discovery as task-contract verifier
+  execution.
+- `ProjectUnit` now carries a small confidence label. Docs-only/no-code units
+  are low-confidence and do not fall back to unrelated root-level verifier
+  guesses.
+- The old deterministic repair candidate builder and its candidate-generation
+  tests were deleted. Remaining verifier-repair tests validate the admitted
+  `VerifierRepairIntent` path and `RepairJob` transitions.
+- Small smoke exposed and fixed a generic Python dependency inference bug:
+  `import types` is now recognized as stdlib and is not converted into a
+  non-existent `pip install types` dependency.
 
 ## Phase 2: Timeout Classification
 
@@ -136,12 +158,21 @@ Implemented slice:
 - `FailurePacket` now extracts `timeout_kind` into a typed
   `FailurePacketTimeoutKind` field and serializes it as structured diagnostic
   input.
+- `RepairJob` now stores `timeout_kind` as typed state.
+- `verifier_repair_context_from_failure()` extracts timeout kind while building
+  the repair job.
+- The duplicated timeout-kind enum in `turn.rs` has been removed; timeout
+  classification, failure-packet payloads, and repair-state routing now share
+  `FailurePacketTimeoutKind`.
+- `RepairJob::next_action()` routes environment-stall timeout evidence to a
+  verifier-timeout safe stop instead of patch repair.
 
-Not implemented yet:
+Implemented in the final cleanup slice:
 
-- Route `RepairJob::next_action()` directly from the typed timeout evidence.
-- Re-run Rust CLI smoke to confirm timeout no longer exits as raw
-  `transport_error`.
+- Synthetic transition coverage now asserts that repairable timeout classes
+  (`generated_test_hang`, `dependency_setup_timeout`, `build_command_timeout`,
+  `long_running_verifier`, and `unknown_timeout`) continue into diagnostic
+  repair instead of being prematurely safe-stopped.
 
 ## Phase 3: Repair Patch Convergence
 
@@ -219,6 +250,15 @@ Acceptance:
 - Production source guards fail if FastAPI/ToDo/CRUD-specific repair authority
   re-enters the main path.
 
+Implemented in the final cleanup slice:
+
+- The deterministic candidate builder was removed rather than left as a
+  quarantine block.
+- Production patch repair still requires an accepted semantic repair context
+  and validated `VerifierRepairIntent` edits.
+- Source guards continue to assert that the production patch provider cannot
+  call legacy deterministic repair authority.
+
 ## Phase 6: Small Generality Smoke Gate
 
 Goal: prove the controller is not tuned only to FastAPI CRUD before running
@@ -275,12 +315,19 @@ Final quality bar:
 
 ## Recommended Work Order
 
-1. Implement `ProjectUnit` facts and tests.
-2. Route verifier timeout through structured timeout kinds.
-3. Normalize repair proposal evidence into `RepairCandidate`.
-4. Tighten `RepairJob` transitions for repeated invalid patch proposals.
-5. Integrate or clearly quarantine `MissingVerifierJob`.
-6. Delete/quarantine legacy verifier repair paths behind source guards.
-7. Run the small smoke gate.
+1. Implement `ProjectUnit` facts and tests. Done for current verifier
+   entrypoints.
+2. Route verifier timeout through structured timeout kinds. Done.
+3. Keep repair proposal evidence in the accepted semantic plan +
+   validated `VerifierRepairIntent` path; do not reintroduce deterministic
+   candidate generation.
+4. Tighten `RepairJob` transitions for repeated invalid patch proposals. Done
+   for synthetic transition coverage.
+5. Keep `MissingVerifierJob` first-class through its bootstrap next-action
+   enum and `LoopControlAction` projection.
+6. Delete/quarantine legacy verifier repair paths behind source guards. Done
+   for deterministic candidate generation.
+7. Run the small smoke gate. Partially done: FastAPI CRUD and Rust CLI passed;
+   Python CSV analyzer reached controlled verifier repair but did not converge.
 8. Run the full evaluation gate only after the small gate has no controller
    regressions.

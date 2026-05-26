@@ -189,6 +189,10 @@ pub(super) struct RepairJob {
     pub(super) command: String,
     pub(super) output_excerpt: String,
     pub(super) failure_type: VerifierFailureType,
+    /// Typed timeout evidence extracted from bounded verifier output.
+    /// Stored separately from `output_excerpt` so `next_action()` can make
+    /// transition decisions without parsing verifier text.
+    pub(super) timeout_kind: Option<super::failure_packet::FailurePacketTimeoutKind>,
     pub(super) target_hint: Option<RecoveryTargetHint>,
     pub(super) repair_target_hint: Option<RecoveryTargetHint>,
     pub(super) changed_file_hints: Vec<RecoveryTargetHint>,
@@ -423,6 +427,7 @@ pub(super) enum RepairTerminalReason {
     DiagnosticUnavailable,
     PatchRejectedRepeatedly,
     VerifierUnavailable,
+    VerifierTimeoutSafeStop,
 }
 
 impl RepairTerminalReason {
@@ -436,6 +441,7 @@ impl RepairTerminalReason {
             Self::DiagnosticUnavailable => "diagnostic_unavailable",
             Self::PatchRejectedRepeatedly => "patch_rejected_repeatedly",
             Self::VerifierUnavailable => "verifier_unavailable",
+            Self::VerifierTimeoutSafeStop => "verifier_timeout_safe_stop",
         }
     }
 
@@ -450,6 +456,7 @@ impl RepairTerminalReason {
             }
             Self::DiagnosticUnavailable => Some(StopReason::VerifierFailedSafeStop),
             Self::VerifierUnavailable => Some(StopReason::VerifierMissing),
+            Self::VerifierTimeoutSafeStop => Some(StopReason::VerifierFailedSafeStop),
         }
     }
 }
@@ -698,6 +705,7 @@ impl RepairJob {
             command: String::new(),
             output_excerpt: String::new(),
             failure_type: VerifierFailureType::Unknown,
+            timeout_kind: None,
             target_hint: None,
             repair_target_hint: None,
             changed_file_hints: Vec::new(),
@@ -774,6 +782,11 @@ impl RepairJob {
     /// Controller-facing state-machine projection used by production
     /// verifier-repair dispatch.
     pub(super) fn next_action(&self) -> RepairNextAction {
+        if self.timeout_kind_requires_safe_stop() && !self.latest_verifier_observation_passed() {
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::VerifierTimeoutSafeStop,
+            };
+        }
         if let Some(action) = self.next_action_from_latest_event() {
             return action;
         }
@@ -851,6 +864,22 @@ impl RepairJob {
             );
         }
         self.lifecycle_events.push(event);
+    }
+
+    fn timeout_kind_requires_safe_stop(&self) -> bool {
+        matches!(
+            self.timeout_kind,
+            Some(super::failure_packet::FailurePacketTimeoutKind::EnvironmentStall)
+        )
+    }
+
+    fn latest_verifier_observation_passed(&self) -> bool {
+        matches!(
+            self.lifecycle_events.last(),
+            Some(RepairJobEvent::VerifierObserved {
+                delta: VerifierDelta::Passed
+            })
+        )
     }
 
     fn push_rejected_attempt(&mut self, attempt: RejectedAttempt) {
@@ -2562,6 +2591,74 @@ mod tests {
     }
 
     #[test]
+    fn repair_job_environment_timeout_safe_stops_without_patch() {
+        let job = RepairJob {
+            timeout_kind: Some(
+                super::super::failure_packet::FailurePacketTimeoutKind::EnvironmentStall,
+            ),
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::VerifierTimeoutSafeStop
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_verifier_passed_wins_over_stale_timeout_evidence() {
+        let mut job = RepairJob {
+            timeout_kind: Some(
+                super::super::failure_packet::FailurePacketTimeoutKind::EnvironmentStall,
+            ),
+            ..RepairJob::new_for_test()
+        };
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Passed,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::VerifiedDone);
+    }
+
+    #[test]
+    fn repair_job_generated_test_timeout_still_requests_diagnostic() {
+        let job = RepairJob {
+            timeout_kind: Some(
+                super::super::failure_packet::FailurePacketTimeoutKind::GeneratedTestHang,
+            ),
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
+    }
+
+    #[test]
+    fn repair_job_repairable_timeout_classes_request_diagnostic() {
+        use super::super::failure_packet::FailurePacketTimeoutKind;
+
+        for kind in [
+            FailurePacketTimeoutKind::GeneratedTestHang,
+            FailurePacketTimeoutKind::DependencySetupTimeout,
+            FailurePacketTimeoutKind::BuildCommand,
+            FailurePacketTimeoutKind::LongRunningVerifier,
+            FailurePacketTimeoutKind::Unknown,
+        ] {
+            let job = RepairJob {
+                timeout_kind: Some(kind),
+                ..RepairJob::new_for_test()
+            };
+
+            assert_eq!(
+                job.next_action(),
+                RepairNextAction::RequestDiagnostic,
+                "{kind:?} should preserve diagnostic repair instead of safe-stopping immediately"
+            );
+        }
+    }
+
+    #[test]
     fn repair_job_next_action_requests_patch_with_accepted_target() {
         let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
         let job = RepairJob {
@@ -2910,6 +3007,10 @@ mod tests {
         assert_eq!(
             RepairTerminalReason::VerifierUnavailable.safe_stop_reason(),
             Some(StopReason::VerifierMissing)
+        );
+        assert_eq!(
+            RepairTerminalReason::VerifierTimeoutSafeStop.safe_stop_reason(),
+            Some(StopReason::VerifierFailedSafeStop)
         );
     }
 

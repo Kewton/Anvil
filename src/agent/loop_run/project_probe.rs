@@ -31,7 +31,7 @@ pub(super) enum CompletionProbeDecision {
 #[allow(dead_code)]
 // ProjectUnit Phase 1 emits ShortUnitTest today; later verifier selection slices construct the remaining bounded classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProjectUnitTimeoutClass {
+pub(crate) enum ProjectUnitTimeoutClass {
     ShortUnitTest,
     BuildCommand,
     DependencySetup,
@@ -49,20 +49,38 @@ impl ProjectUnitTimeoutClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectUnitConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl ProjectUnitConfidence {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProjectUnitVerifierCandidate {
+pub(crate) struct ProjectUnitVerifierCandidate {
     pub(super) command_preview: String,
     pub(super) source: &'static str,
     pub(super) timeout_class: ProjectUnitTimeoutClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ProjectUnit {
+pub(crate) struct ProjectUnit {
     pub(super) root: String,
     pub(super) manifests: Vec<String>,
     pub(super) artifact_roles: BTreeSet<ArtifactRole>,
     pub(super) verifier_candidates: Vec<ProjectUnitVerifierCandidate>,
     pub(super) observed_stacks: Vec<&'static str>,
+    pub(super) confidence: ProjectUnitConfidence,
 }
 
 impl ProjectUnit {
@@ -91,14 +109,15 @@ impl ProjectUnit {
             })
             .collect::<Vec<_>>()
             .join("|");
-        format!(
+        let base = format!(
             "project_unit root={} stacks={} roles={} manifests={} verifiers={}",
             self.root,
             self.observed_stacks.join(","),
             roles,
             manifests,
             verifiers
-        )
+        );
+        format!("{base} confidence={}", self.confidence.as_str())
     }
 }
 
@@ -317,11 +336,13 @@ fn build_project_unit(work_root: &Path, facts: &WorkspaceFacts) -> Option<Projec
     if artifact_roles.is_empty() {
         return None;
     }
+    let verifier_candidates = verifier_candidates(work_root, facts);
+    let confidence = project_unit_confidence(&artifact_roles, &verifier_candidates);
     Some(ProjectUnit {
         root: ".".to_string(),
         manifests: project_manifests(work_root, facts),
         artifact_roles,
-        verifier_candidates: verifier_candidates(work_root, facts),
+        verifier_candidates,
         observed_stacks: facts
             .observed_stacks
             .iter()
@@ -329,7 +350,26 @@ fn build_project_unit(work_root: &Path, facts: &WorkspaceFacts) -> Option<Projec
             .filter(|stack| *stack != StackKind::Unknown)
             .map(stack_label)
             .collect(),
+        confidence,
     })
+}
+
+fn project_unit_confidence(
+    artifact_roles: &BTreeSet<ArtifactRole>,
+    verifier_candidates: &[ProjectUnitVerifierCandidate],
+) -> ProjectUnitConfidence {
+    let has_impl = artifact_roles.contains(&ArtifactRole::Implementation);
+    let has_test = artifact_roles.contains(&ArtifactRole::Test);
+    let has_docs = artifact_roles.contains(&ArtifactRole::UsageDocs);
+    let has_setup = artifact_roles.contains(&ArtifactRole::Setup);
+    let has_verifier = !verifier_candidates.is_empty();
+    if has_impl && has_test && has_verifier {
+        ProjectUnitConfidence::High
+    } else if has_verifier || ((has_impl || has_test) && (has_docs || has_setup)) {
+        ProjectUnitConfidence::Medium
+    } else {
+        ProjectUnitConfidence::Low
+    }
 }
 
 fn project_manifests(work_root: &Path, facts: &WorkspaceFacts) -> Vec<String> {
@@ -724,6 +764,22 @@ mod tests {
     }
 
     #[test]
+    fn docs_only_project_unit_has_no_verifier_and_low_confidence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# Notes\n").expect("readme");
+        let request = "READMEだけを更新してください";
+        let scope = scope(dir.path(), request);
+        let edited = edited(&["README.md"]);
+
+        let unit = probe_project_unit(dir.path(), &scope, &edited).expect("docs unit");
+
+        assert!(unit.artifact_roles.contains(&ArtifactRole::UsageDocs));
+        assert!(unit.verifier_candidates.is_empty());
+        assert_eq!(unit.confidence, ProjectUnitConfidence::Low);
+        assert!(unit.summary().contains("confidence=low"));
+    }
+
+    #[test]
     fn project_unit_timeout_class_labels_are_stable() {
         assert_eq!(
             ProjectUnitTimeoutClass::ShortUnitTest.as_str(),
@@ -738,5 +794,8 @@ mod tests {
             "dependency_setup"
         );
         assert_eq!(ProjectUnitTimeoutClass::Unknown.as_str(), "unknown");
+        assert_eq!(ProjectUnitConfidence::High.as_str(), "high");
+        assert_eq!(ProjectUnitConfidence::Medium.as_str(), "medium");
+        assert_eq!(ProjectUnitConfidence::Low.as_str(), "low");
     }
 }

@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use super::auto_test::AutoTestRunner;
 use super::completion_evidence::{CompletionEvidence, EvidenceSet};
 use super::protocol::{
     ExecutionProtocol, ProtocolKind, ProtocolSuccessContext, RequestContext,
@@ -134,7 +133,14 @@ impl Agent {
         if !recent_successful_bash_commands_since_last_user(&self.session.messages).is_empty() {
             return true;
         }
-        if AutoTestRunner::detect(&self.work_root, &[]).is_some() {
+        let scope = self.current_workspace_scope();
+        if super::project_probe::probe_project_unit(
+            &self.work_root,
+            &scope,
+            &self.turn_edited_relative_paths,
+        )
+        .is_some_and(|unit| !unit.verifier_candidates.is_empty())
+        {
             return true;
         }
         self.active_request_text()
@@ -295,6 +301,11 @@ impl Agent {
         // Issue #651 Phase 5.1: structured verifier binding inputs.
         let (owned_test_artifacts, test_execution_required) = self.success_verifier_test_binding();
         let workspace_scope: TaskWorkspaceScope = self.current_workspace_scope();
+        let project_unit = super::project_probe::probe_project_unit(
+            &self.work_root,
+            &workspace_scope,
+            &self.turn_edited_relative_paths,
+        );
         let v_inputs = VerifierInputs {
             score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
@@ -310,6 +321,7 @@ impl Agent {
             tester_candidate_some,
             workspace_root: &self.work_root,
             owned_test_artifacts: &owned_test_artifacts,
+            project_unit: project_unit.as_ref(),
             test_execution_required,
             workspace_scope: &workspace_scope,
         };

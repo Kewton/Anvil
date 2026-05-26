@@ -21,6 +21,7 @@ use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, OwnedTestVerifierPlan,
     auto_test_disabled, combined_output_for_classify,
 };
+use super::project_probe::ProjectUnit;
 use super::task_workspace_scope::TaskWorkspaceScope;
 use crate::agent::orchestration::RepoVerification;
 use crate::session::anvil_score::{
@@ -81,6 +82,10 @@ pub struct VerifierInputs<'a> {
     /// - The slice is **never persisted**: it is a per-turn borrow into
     ///   the planner-side artifact view.
     pub owned_test_artifacts: &'a [String],
+    /// Project-unit facts selected by the controller for this turn. When
+    /// verifier execution is required, verifier discovery must use this
+    /// bounded project-unit view instead of root-level stack guessing.
+    pub(crate) project_unit: Option<&'a ProjectUnit>,
     /// Issue #651 Task 3.1 / 3.3: gate that flips the structured Weak /
     /// Missing branch on. SSOT: `RequiredBehaviorContract.test_execution_required`,
     /// itself backed by `task_contract::request_asks_for_test_artifact`.
@@ -241,12 +246,17 @@ impl AgentSkill for VerifierSkill {
         // legacy path untouched so every non-test-bearing request preserves
         // its existing behaviour (Phase 4.1 regression guard).
         if inputs.test_execution_required && inputs.protocol_demands_verifier {
-            let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
-                inputs.workspace_root,
-                inputs.changed_files,
-                inputs.recent_successful_bash_commands,
-                inputs.owned_test_artifacts,
-            );
+            let owned_plan = if let Some(project_unit) = inputs.project_unit {
+                AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+                    inputs.workspace_root,
+                    inputs.changed_files,
+                    inputs.recent_successful_bash_commands,
+                    inputs.owned_test_artifacts,
+                    Some(project_unit),
+                )
+            } else {
+                OwnedTestVerifierPlan::Missing
+            };
             match owned_plan {
                 OwnedTestVerifierPlan::Runnable { plan, command } => {
                     let display_command = command.to_display_string();
@@ -318,10 +328,11 @@ impl AgentSkill for VerifierSkill {
 
         // [3] gate true → SuccessVerifier 三値で分岐 (DR2-001/007: AutoTestRunner は
         // unit struct + associated fn で changed_files が必須引数)
-        let detected_plan = AutoTestRunner::detect_with_recent_successes(
+        let detected_plan = AutoTestRunner::detect_with_project_unit(
             inputs.workspace_root,
             inputs.changed_files,
             inputs.recent_successful_bash_commands,
+            inputs.project_unit,
         );
         let auto_test_some = detected_plan.is_some();
 
@@ -511,12 +522,17 @@ impl VerifierSkill {
                 score: bypass_score(),
             };
         }
-        let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
-            inputs.workspace_root,
-            inputs.changed_files,
-            inputs.recent_successful_bash_commands,
-            inputs.owned_test_artifacts,
-        );
+        let owned_plan = if let Some(project_unit) = inputs.project_unit {
+            AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+                inputs.workspace_root,
+                inputs.changed_files,
+                inputs.recent_successful_bash_commands,
+                inputs.owned_test_artifacts,
+                Some(project_unit),
+            )
+        } else {
+            OwnedTestVerifierPlan::Missing
+        };
         match owned_plan {
             OwnedTestVerifierPlan::Runnable { plan, command } => {
                 let display_command = command.to_display_string();
@@ -681,12 +697,17 @@ impl VerifierSkill {
                 score: bypass_score(),
             };
         }
-        let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts(
-            inputs.workspace_root,
-            inputs.changed_files,
-            inputs.recent_successful_bash_commands,
-            inputs.owned_test_artifacts,
-        );
+        let owned_plan = if let Some(project_unit) = inputs.project_unit {
+            AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+                inputs.workspace_root,
+                inputs.changed_files,
+                inputs.recent_successful_bash_commands,
+                inputs.owned_test_artifacts,
+                Some(project_unit),
+            )
+        } else {
+            OwnedTestVerifierPlan::Missing
+        };
         match owned_plan {
             OwnedTestVerifierPlan::Runnable { plan, command } => {
                 let display_command = command.to_display_string();

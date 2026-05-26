@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::agent::prompting::load_project_instructions;
 use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
+use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
 use super::project_probe::ProjectUnit;
 use super::task_workspace_scope::TaskWorkspaceScope;
@@ -1463,15 +1464,18 @@ impl AutoTestRunner {
         Self::detect_candidate(work_root, changed_files).map(VerifierCandidate::into_plan)
     }
 
-    pub(super) fn detect_with_recent_successes(
+    pub(super) fn detect_with_project_unit(
         work_root: &Path,
         changed_files: &[String],
         recent_successful_bash_commands: &[String],
+        project_unit: Option<&ProjectUnit>,
     ) -> Option<AutoTestPlan> {
-        Self::detect_candidate_with_recent_successes(
+        let project_unit = project_unit?;
+        Self::detect_candidate_with_project_unit(
             work_root,
             changed_files,
             recent_successful_bash_commands,
+            Some(project_unit),
         )
         .map(VerifierCandidate::into_plan)
     }
@@ -2255,6 +2259,8 @@ fn detect_verifier_candidates(
     changed_files: &[String],
     recent_successful_bash_commands: &[String],
 ) -> Vec<VerifierCandidate> {
+    let visible_changed_files = visible_changed_files(changed_files);
+    let changed_files = visible_changed_files.as_slice();
     let mut candidates = Vec::new();
     if let Some(candidate) = detect_project_instruction_test(work_root, changed_files) {
         candidates.push(candidate);
@@ -3177,6 +3183,7 @@ fn python_stdlib_top_level_name(name: &str) -> bool {
             | "tempfile"
             | "time"
             | "traceback"
+            | "types"
             | "typing"
             | "unittest"
             | "uuid"
@@ -3451,7 +3458,9 @@ fn command_references_existing_local_file(command: &str, work_root: &Path) -> bo
 /// to `pub(super)` for Issue #459 so Tester can reuse the same heuristic
 /// (DR1-001).
 pub(super) fn has_python_surface(work_root: &Path, changed_files: &[String]) -> bool {
-    changed_files.iter().any(|path| path.ends_with(".py"))
+    changed_files
+        .iter()
+        .any(|path| path.ends_with(".py") && !is_ignored_workspace_display_path(path))
         || work_root.join("pyproject.toml").is_file()
         || work_root.join("requirements.txt").is_file()
 }
@@ -3463,9 +3472,20 @@ pub(super) fn first_python_script(changed_files: &[String]) -> Option<PathBuf> {
     changed_files
         .iter()
         .find(|path| {
-            path.ends_with(".py") && !path.starts_with("tests/") && !path.starts_with("test_")
+            path.ends_with(".py")
+                && !path.starts_with("tests/")
+                && !path.starts_with("test_")
+                && !is_ignored_workspace_display_path(path)
         })
         .map(PathBuf::from)
+}
+
+fn visible_changed_files(changed_files: &[String]) -> Vec<String> {
+    changed_files
+        .iter()
+        .filter(|path| !is_ignored_workspace_display_path(path))
+        .cloned()
+        .collect()
 }
 
 /// Returns true when `work_root/Cargo.toml` exists and the workspace has
@@ -4126,7 +4146,7 @@ dev = [
         std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
         std::fs::write(
             dir.path().join("main.py"),
-            "from fastapi import FastAPI\nfrom pydantic import BaseModel\nfrom uuid import uuid4\n",
+            "from fastapi import FastAPI\nfrom pydantic import BaseModel\nfrom uuid import uuid4\nimport types\n",
         )
         .expect("main");
         std::fs::write(
@@ -4146,6 +4166,7 @@ dev = [
         assert!(packages.contains(&"pydantic".to_string()));
         assert!(packages.contains(&"pytest".to_string()));
         assert!(!packages.contains(&"main".to_string()));
+        assert!(!packages.contains(&"types".to_string()));
         assert!(!packages.contains(&"uuid".to_string()));
     }
 
@@ -4549,6 +4570,7 @@ dev = [
                 timeout_class: super::super::project_probe::ProjectUnitTimeoutClass::ShortUnitTest,
             }],
             observed_stacks: vec!["python"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::High,
         };
 
         let filtered = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
@@ -4583,6 +4605,7 @@ dev = [
             artifact_roles,
             verifier_candidates: Vec::new(),
             observed_stacks: Vec::new(),
+            confidence: super::super::project_probe::ProjectUnitConfidence::Low,
         };
 
         let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
@@ -4593,6 +4616,25 @@ dev = [
             Some(&project_unit),
         );
         assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    #[test]
+    fn changed_files_ignore_controller_owned_state_for_verifier_detection() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".anvil-state/generated")).expect("state dir");
+        std::fs::write(
+            dir.path().join(".anvil-state/generated/test_generated.py"),
+            "def test_generated(): pass\n",
+        )
+        .expect("state file");
+
+        let changed = vec![".anvil-state/generated/test_generated.py".to_string()];
+        assert!(!has_python_surface(dir.path(), &changed));
+        assert_eq!(first_python_script(&changed), None);
+        assert!(
+            AutoTestRunner::detect_candidates(dir.path(), &changed).is_empty(),
+            "controller-owned changed files must not create verifier candidates"
+        );
     }
 
     #[test]

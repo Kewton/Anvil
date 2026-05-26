@@ -57,6 +57,27 @@ impl FailurePacketTimeoutKind {
         }
     }
 
+    pub(super) fn repair_hint(self) -> &'static str {
+        match self {
+            Self::LongRunningVerifier => {
+                "inspect the verifier command and reduce it to a bounded project-unit check"
+            }
+            Self::GeneratedTestHang => {
+                "inspect generated tests and implementation loops before retrying the verifier"
+            }
+            Self::DependencySetupTimeout => {
+                "repair dependency setup or safe stop if package installation cannot complete"
+            }
+            Self::EnvironmentStall => {
+                "safe stop if the verifier environment cannot produce bounded evidence"
+            }
+            Self::BuildCommand => {
+                "switch to a bounded test command or repair the build configuration"
+            }
+            Self::Unknown => "re-diagnose with timeout evidence before choosing a repair target",
+        }
+    }
+
     fn from_label(label: &str) -> Option<Self> {
         match label {
             "long_running_verifier" => Some(Self::LongRunningVerifier),
@@ -123,7 +144,7 @@ impl FailurePacket {
         let affected_cases = extract_affected_cases(&job.output_excerpt);
         let observed_expected_pairs = extract_observed_expected_pairs(&job.output_excerpt);
 
-        Self::new(
+        let mut packet = Self::new(
             &job.command,
             job.error_kind
                 .as_deref()
@@ -133,7 +154,11 @@ impl FailurePacket {
             observed_expected_pairs,
             candidate_artifacts,
             prior_attempts,
-        )
+        );
+        if packet.timeout_kind.is_none() {
+            packet.timeout_kind = job.timeout_kind;
+        }
+        packet
     }
 
     pub(super) fn new(
@@ -147,7 +172,7 @@ impl FailurePacket {
     ) -> Self {
         let bounded_output_excerpt =
             sanitize_repair_job_text_with_char_cap(verifier_output, MAX_OUTPUT_EXCERPT_CHARS);
-        let timeout_kind = extract_timeout_kind(&bounded_output_excerpt);
+        let timeout_kind = timeout_kind_from_output(&bounded_output_excerpt);
         let failure_kind = sanitize_short(failure_kind);
         let affected_cases = affected_cases
             .into_iter()
@@ -335,7 +360,7 @@ fn dedup_candidate_artifacts(candidates: &mut Vec<CandidateArtifact>) {
     candidates.retain(|candidate| seen.insert(candidate.path.clone()));
 }
 
-fn extract_timeout_kind(output: &str) -> Option<FailurePacketTimeoutKind> {
+pub(super) fn timeout_kind_from_output(output: &str) -> Option<FailurePacketTimeoutKind> {
     output
         .split_whitespace()
         .find_map(|token| token.strip_prefix("timeout_kind="))
@@ -554,6 +579,22 @@ assertion `left == right` failed
         assert_eq!(
             packet.to_json_value()["timeout_kind"],
             serde_json::json!("generated_test_hang")
+        );
+    }
+
+    #[test]
+    fn failure_packet_preserves_repair_job_timeout_kind_when_excerpt_lacks_label() {
+        let job = super::super::repair_job::RepairJob {
+            output_excerpt: "verifier timed out after bounded execution".to_string(),
+            timeout_kind: Some(FailurePacketTimeoutKind::EnvironmentStall),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let packet = FailurePacket::from_repair_job(&job);
+
+        assert_eq!(
+            packet.timeout_kind,
+            Some(FailurePacketTimeoutKind::EnvironmentStall)
         );
     }
 
