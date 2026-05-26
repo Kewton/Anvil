@@ -803,3 +803,33 @@ Assessment:
 - The remaining repair-validation responsibility in `turn.rs` is mainly
   weakening detector dispatch plus the high-level assembly of the validated
   edit result.
+
+### 2026-05-27 Slice 8
+
+Applied:
+
+- Moved weakening rejection message/metadata construction into
+  `repair_patch_validation.rs`.
+- `turn.rs` still runs the detector branches, but now delegates the
+  non-empty weakening-pattern rejection shape to the patch-validation module.
+- Added a module test proving weakening rejection preserves:
+  - rejection kind;
+  - first weakening pattern;
+  - legacy-compatible message text.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 16 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2995 tests when rerun outside sandbox
+
+Assessment:
+
+- This is a conservative step toward moving weakening validation out of
+  `turn.rs` without duplicating Python diagnostic helpers.
+- The remaining extraction should either move shared Python diagnostic helpers
+  to a small helper module first, or keep detector dispatch in `turn.rs` and
+  only move the final validated-edit assembly.

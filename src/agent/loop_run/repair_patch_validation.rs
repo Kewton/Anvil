@@ -104,6 +104,22 @@ pub(super) enum RepairCandidateContentError {
     Unavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepairCandidateWeakeningError {
+    pub(super) rejection: Option<super::repair_attempt_outcome::RepairRejectionKind>,
+    pub(super) pattern: Option<super::spec_authority::WeakeningPattern>,
+    patterns: Vec<super::spec_authority::WeakeningPattern>,
+}
+
+impl RepairCandidateWeakeningError {
+    pub(super) fn message(&self) -> String {
+        format!(
+            "repair intent rejected: test/impl weakening detected ({:?})",
+            self.patterns
+        )
+    }
+}
+
 impl RepairIntentTargetPathError {
     pub(super) fn message(self) -> String {
         match self {
@@ -298,6 +314,20 @@ pub(super) fn validate_repair_candidate_contents(
             ProjectVerifierOutcome::Unavailable => Err(RepairCandidateContentError::Unavailable),
         },
     }
+}
+
+pub(super) fn validate_repair_candidate_weakening_patterns(
+    patterns: Vec<super::spec_authority::WeakeningPattern>,
+    rejection: Option<super::repair_attempt_outcome::RepairRejectionKind>,
+) -> Result<(), RepairCandidateWeakeningError> {
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    Err(RepairCandidateWeakeningError {
+        rejection,
+        pattern: patterns.first().copied(),
+        patterns,
+    })
 }
 
 pub(super) fn apply_repair_intent_edits(
@@ -1050,6 +1080,28 @@ mod tests {
 
         assert!(err.contains("repair intent exact edit rejected"));
         assert!(err.contains("old_string_excerpt=missing old string with enough context"));
+    }
+
+    #[test]
+    fn weakening_patterns_are_reported_with_structured_metadata() {
+        let err = validate_repair_candidate_weakening_patterns(
+            vec![super::super::spec_authority::WeakeningPattern::AssertionDeleted],
+            Some(super::super::repair_attempt_outcome::RepairRejectionKind::TestWeakening),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.rejection,
+            Some(super::super::repair_attempt_outcome::RepairRejectionKind::TestWeakening)
+        );
+        assert_eq!(
+            err.pattern,
+            Some(super::super::spec_authority::WeakeningPattern::AssertionDeleted)
+        );
+        assert_eq!(
+            err.message(),
+            "repair intent rejected: test/impl weakening detected ([AssertionDeleted])"
+        );
     }
 
     #[test]

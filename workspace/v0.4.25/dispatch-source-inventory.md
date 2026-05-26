@@ -77,6 +77,9 @@ with legacy/fallback paths unable to override it.
 - Moved in-memory repair candidate application into
   `repair_patch_validation.rs`; `turn.rs` now passes normalized edit payloads
   and receives the updated contents plus whitespace-fallback flag.
+- Moved weakening rejection message/metadata construction into
+  `repair_patch_validation.rs`; detector dispatch remains in `turn.rs` until
+  shared Python diagnostic helpers are separated.
 
 ## Remaining Work
 
@@ -85,6 +88,6 @@ with legacy/fallback paths unable to override it.
 - Assert in tests that every verifier repair terminal path flows through
   `RepairJob::next_action`.
 - Continue deleting legacy bypass paths after they are covered by tests.
-- Move the remaining weakening detector dispatch out of `turn.rs`.
-- Continue splitting patch validation by stable sub-decision before moving the
-  final high-level validated-edit assembly wrapper as a whole.
+- Decide whether to move shared Python diagnostic helpers first, or leave
+  weakening detector dispatch in `turn.rs` and extract only the final
+  high-level validated-edit assembly wrapper.

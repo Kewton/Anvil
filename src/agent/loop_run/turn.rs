@@ -24875,26 +24875,26 @@ fn validate_verifier_repair_intents_inner(
     } else {
         (Vec::new(), None)
     };
-    if !weakening.is_empty() {
+    super::repair_patch_validation::validate_repair_candidate_weakening_patterns(
+        weakening,
+        rejection_kind,
+    )
+    .map_err(|err| {
         // Issue #653 (DR1-001): emission **文字列** は維持 (controller / log /
         // test 既存挙動非破壊)。構造化 metadata は `ValidationFailure.weakening`
         // から call site で取り回す。
-        let message = format!(
-            "repair intent rejected: test/impl weakening detected ({:?})",
-            weakening
-        );
-        let weakening_meta = match (rejection_kind, weakening.first().copied()) {
+        let weakening_meta = match (err.rejection, err.pattern) {
             (Some(rejection), Some(pattern)) => Some(ValidationWeakening { rejection, pattern }),
             // Defensive: should never happen because weakening is non-empty and
             // rejection_kind is Some when we entered this branch.
             _ => None,
         };
-        return Err(ValidationFailure {
-            outcome: CheapCheckOutcome::Failed(message),
+        ValidationFailure {
+            outcome: CheapCheckOutcome::Failed(err.message()),
             weakening: weakening_meta,
             rejection_signal: None,
-        });
-    }
+        }
+    })?;
     super::repair_patch_validation::validate_duplicate_binding_repair_candidate(
         &relative_path,
         context,
