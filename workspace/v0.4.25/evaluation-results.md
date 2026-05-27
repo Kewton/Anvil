@@ -291,3 +291,25 @@ Assessment:
 
 - No behavior change intended. `turn.rs` now provides configured limits and
   delegates patch proposal shaping to the patch-validation module.
+
+## Structural Verification: Slice 16
+
+Scope:
+
+- Route production patch proposal shaping directly through
+  `repair_patch_validation`.
+- Leave only test compatibility wrappers in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 22 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3004 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. This removes one production indirection from
+  `turn.rs` while keeping existing tests stable.

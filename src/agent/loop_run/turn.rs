@@ -15014,7 +15014,11 @@ impl Agent {
                 // — the LLM reply could not be projected into a
                 // `Vec<VerifierRepairIntent>`. Carry the signal through to the
                 // outcome builder so the ledger learns of the malformed reply.
-                let validation = parse_verifier_repair_patch_proposal_reply(&reply.content)
+                let validation =
+                    super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
+                        &reply.content,
+                        verifier_repair_intent_limits(),
+                    )
                     .map_err(|message| {
                         ValidationFailure::failed_with_signal(
                             message,
@@ -15039,13 +15043,17 @@ impl Agent {
                                 RepairRejectionSignal::Malformed,
                             ));
                         }
-                        let intents = patch_proposal_to_verifier_repair_intents(proposal.clone())
-                            .map_err(|message| {
-                            ValidationFailure::failed_with_signal(
-                                message,
-                                RepairRejectionSignal::Malformed,
+                        let intents =
+                            super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
+                                proposal.clone(),
+                                verifier_repair_intent_limits(),
                             )
-                        })?;
+                            .map_err(|message| {
+                                ValidationFailure::failed_with_signal(
+                                    message,
+                                    RepairRejectionSignal::Malformed,
+                                )
+                            })?;
                         let validation = validate_verifier_repair_intents_with_accepted_plan(
                             &self.work_root,
                             &context,
@@ -24331,6 +24339,7 @@ fn verifier_repair_intent_limits() -> super::repair_patch_validation::VerifierRe
     }
 }
 
+#[cfg(test)]
 fn parse_verifier_repair_patch_proposal_reply(
     reply: &str,
 ) -> Result<super::patch_proposal::PatchProposal, String> {
@@ -24340,6 +24349,7 @@ fn parse_verifier_repair_patch_proposal_reply(
     )
 }
 
+#[cfg(test)]
 fn patch_proposal_to_verifier_repair_intents(
     proposal: super::patch_proposal::PatchProposal,
 ) -> Result<Vec<VerifierRepairIntent>, String> {

@@ -118,3 +118,5 @@ with legacy/fallback paths unable to override it.
 - Current status: patch proposal parsing caps, malformed-reply error mapping,
   and proposal-to-intent conversion are now validation-owned; `turn.rs` only
   supplies configured limits through thin wrappers.
+- Current status: production patch proposal shaping now calls the validation
+  module directly; the `turn.rs` wrappers are test-only compatibility helpers.

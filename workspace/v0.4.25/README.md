@@ -1033,3 +1033,29 @@ Assessment:
 - Patch proposal shaping logic is now owned by the patch-validation boundary.
 - `turn.rs` still owns the high-level validation wrapper, semantic test-edit
   gate, and weakening detector dispatch.
+
+### 2026-05-27 Slice 16
+
+Applied:
+
+- Updated the production verifier repair pass to call
+  `repair_patch_validation::{parse_verifier_repair_patch_proposal_reply,
+  patch_proposal_to_verifier_repair_intents}` directly.
+- Kept the old `turn.rs` parse wrappers as `#[cfg(test)]` compatibility
+  helpers for existing tests only.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 22 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3004 tests when rerun outside sandbox
+
+Assessment:
+
+- Production patch proposal shaping no longer flows through `turn.rs`
+  wrappers.
+- `turn.rs` still supplies configured limits and orchestrates the accepted
+  proposal through shadow validation and repair-intent validation.
