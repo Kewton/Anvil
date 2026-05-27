@@ -920,3 +920,22 @@ Assessment:
 
 - No behavior change intended. Ownership admission is now a dedicated module;
   the actor loop retains the stateful target-promotion bridge only.
+
+## Structural Verification: Slice 44
+
+Scope:
+
+- Add direct module tests for `repair_target_admission.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_target_admission --lib -q`: pass, 3 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The admission module now owns its basic
+  ownership-gate characterization tests.

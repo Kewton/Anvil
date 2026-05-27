@@ -1785,3 +1785,24 @@ Assessment:
 - No behavior change intended. The owned target admission SSOT is now outside
   the actor loop; `turn.rs` still owns when to invoke that admission gate and
   how to thread admitted hints into the legacy verifier repair assessment.
+
+### 2026-05-27 Slice 44
+
+Applied:
+
+- Added module-local tests for `repair_target_admission.rs`.
+- Covered admission of in-scope edited hints, rejection of candidate-only
+  hints, and rejection of edited hints outside ambiguous parent scope.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_target_admission --lib -q`: pass, 3 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox
+
+Assessment:
+
+- No production behavior change. The admission SSOT now has direct local tests,
+  reducing reliance on large actor-loop tests for ownership-gate invariants.
