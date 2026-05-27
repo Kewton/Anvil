@@ -1546,3 +1546,30 @@ Assessment:
 - No behavior change intended. `turn.rs` now receives a parsed diagnostic
   assessment and remains responsible for workspace admission and repair-state
   orchestration, while parser-specific schema drift handling is isolated.
+
+### 2026-05-27 Slice 35
+
+Applied:
+
+- Moved framework-finding post-parse override logic into
+  `verifier_assessment_parser.rs`.
+- Kept framework finding generation in `repair_framework_findings.rs` and
+  prompt/file-excerpt assembly in `turn.rs`.
+- Left `turn.rs` with a single call that applies bounded framework evidence
+  to the parsed diagnostic assessment before workspace admission.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test framework_finding --lib -q`: pass, 11 tests
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Parsed assessment normalization and evidence
+  override now live with the diagnostic parser, reducing another
+  non-dispatch branch from `turn.rs`.

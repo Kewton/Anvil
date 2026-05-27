@@ -712,3 +712,27 @@ Assessment:
 - No behavior change intended. The parser module owns JSON extraction,
   bounded text compaction, target-list parsing, role parsing, and failure-kind
   mapping; the dispatcher no longer owns diagnostic schema drift handling.
+
+## Structural Verification: Slice 35
+
+Scope:
+
+- Move framework-finding post-parse override logic from `turn.rs` to
+  `verifier_assessment_parser.rs`.
+- Preserve generation and admission boundaries.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test framework_finding --lib -q`: pass, 11 tests.
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Bounded framework evidence now modifies the
+  parsed diagnostic assessment inside the parser boundary; `turn.rs` only
+  sequences the diagnostic pass and later workspace admission.

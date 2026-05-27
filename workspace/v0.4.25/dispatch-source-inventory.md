@@ -171,3 +171,6 @@ with legacy/fallback paths unable to override it.
 - Current status: diagnostic LLM assessment parsing is now isolated in
   `verifier_assessment_parser.rs`; `turn.rs` still owns workspace admission,
   semantic plan construction, and RepairJob state transitions.
+- Current status: parsed-assessment framework evidence override is now
+  isolated in `verifier_assessment_parser.rs`; `turn.rs` still owns
+  diagnostic prompt/file-excerpt assembly.

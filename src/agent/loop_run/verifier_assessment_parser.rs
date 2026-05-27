@@ -1,5 +1,9 @@
 use crate::ollama::xml_fallback::strip_think_tags;
 
+use super::repair_framework_findings::{
+    VerifierDiagnosticFrameworkFinding, VerifierDiagnosticFrameworkFindingKind,
+};
+
 const VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES: usize = 16_384;
 const VERIFIER_DIAGNOSTIC_MAX_SUMMARY_CHARS: usize = 240;
 const VERIFIER_DIAGNOSTIC_MAX_REASON_CHARS: usize = 180;
@@ -132,6 +136,82 @@ pub(super) fn verifier_failure_type_for_diagnostic_kind(
         }
         super::VerifierDiagnosticFailureKind::Unknown => fallback,
     }
+}
+
+pub(super) fn apply_framework_findings_to_parsed_assessment(
+    parsed: &mut ParsedVerifierRepairAssessment,
+    findings: &[VerifierDiagnosticFrameworkFinding],
+) -> bool {
+    let Some(finding) = findings
+        .iter()
+        .find(|finding| finding.role == super::task_contract::ArtifactRole::Test)
+    else {
+        return false;
+    };
+    if !framework_finding_can_override_diagnostic_kind(finding.kind, parsed.failure_kind) {
+        return false;
+    }
+    let reason = compact_verifier_failure_text(&finding.summary, 180);
+    let target = ParsedVerifierRepairTarget {
+        path: finding.path.clone(),
+        confidence: 0.95,
+        reason: reason.clone(),
+    };
+    parsed.failure_kind = super::VerifierDiagnosticFailureKind::TestBug;
+    parsed.probable_cause_role = Some(super::task_contract::ArtifactRole::Test);
+    parsed.do_not_edit_tests_without_evidence = false;
+    parsed.summary = Some(reason.clone());
+    prepend_unique_parsed_repair_target(&mut parsed.repair_targets, target.clone());
+    prepend_unique_parsed_repair_target(&mut parsed.repair_plan, target.clone());
+    if !parsed
+        .secondary_targets
+        .iter()
+        .any(|path| path == &finding.path)
+    {
+        parsed.secondary_targets.insert(0, finding.path.clone());
+    }
+    true
+}
+
+fn framework_finding_can_override_diagnostic_kind(
+    finding_kind: VerifierDiagnosticFrameworkFindingKind,
+    kind: super::VerifierDiagnosticFailureKind,
+) -> bool {
+    match kind {
+        super::VerifierDiagnosticFailureKind::DependencyMissing
+        | super::VerifierDiagnosticFailureKind::LocalImportContractMismatch => {
+            matches!(
+                finding_kind,
+                VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingLocalModuleImport
+                    | VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingImportSymbol
+                    | VerifierDiagnosticFrameworkFindingKind::RustIntegrationTestCrateImportMismatch
+            )
+        }
+        super::VerifierDiagnosticFailureKind::CompileOrSyntaxError => false,
+        super::VerifierDiagnosticFailureKind::ConfigOrVerifierError => matches!(
+            finding_kind,
+            VerifierDiagnosticFrameworkFindingKind::SetupNameError
+                | VerifierDiagnosticFrameworkFindingKind::StatefulClientMissingIsolation
+                | VerifierDiagnosticFrameworkFindingKind::UnittestLifecycleMismatch
+                | VerifierDiagnosticFrameworkFindingKind::ImportedStateRebindMismatch
+                | VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingLocalModuleImport
+                | VerifierDiagnosticFrameworkFindingKind::DisconnectedFixtureStateAssertion
+                | VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingImportSymbol
+                | VerifierDiagnosticFrameworkFindingKind::DisconnectedSetupStateAssignment
+        ),
+        super::VerifierDiagnosticFailureKind::AssertionMismatch
+        | super::VerifierDiagnosticFailureKind::RuntimeError
+        | super::VerifierDiagnosticFailureKind::TestBug
+        | super::VerifierDiagnosticFailureKind::Unknown => true,
+    }
+}
+
+fn prepend_unique_parsed_repair_target(
+    targets: &mut Vec<ParsedVerifierRepairTarget>,
+    target: ParsedVerifierRepairTarget,
+) {
+    targets.retain(|existing| existing.path != target.path);
+    targets.insert(0, target);
 }
 
 fn verifier_assessment_field<'a>(
