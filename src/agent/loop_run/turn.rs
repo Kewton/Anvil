@@ -67,6 +67,10 @@ use super::verifier_repair_shadow::{
     build_verifier_repair_pipeline_shadow_payload, legacy_repair_brief_input_from_assessment,
     verifier_repair_action_payload_for_context,
 };
+use super::verifier_repair_targeting::{
+    diagnostic_missing_setup_path_is_controller_writable, missing_python_module_workspace_path,
+    python_missing_external_dependency_name, verifier_diagnostic_path_input_is_safe,
+};
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
     WorkModeConfirmInputs, WorkModeConfirmOutcome, build_work_mode_confirm_log_payload,
@@ -23212,10 +23216,6 @@ fn recovery_target_hint_for_missing_setup_path(
     })
 }
 
-fn diagnostic_missing_setup_path_is_controller_writable(path: &str) -> bool {
-    matches!(path, "pyproject.toml")
-}
-
 fn verifier_diagnostic_missing_setup_candidates(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -23251,57 +23251,6 @@ fn python_verifier_output_missing_external_dependency(
         return false;
     }
     python_missing_external_dependency_name(work_root, &context.output_excerpt).is_some()
-}
-
-fn python_missing_external_dependency_name(work_root: &Path, output: &str) -> Option<String> {
-    for line in output.lines() {
-        let lower = line.to_ascii_lowercase();
-        let Some(marker_index) = lower.find("no module named") else {
-            continue;
-        };
-        let candidate = line[marker_index + "no module named".len()..].trim();
-        let candidate = candidate
-            .trim_matches(|ch: char| {
-                ch == '\''
-                    || ch == '"'
-                    || ch == ':'
-                    || ch == '.'
-                    || ch == ','
-                    || ch == '`'
-                    || ch == ' '
-            })
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_matches(|ch: char| {
-                ch == '\'' || ch == '"' || ch == ':' || ch == '.' || ch == ','
-            });
-        if !python_dependency_module_name_is_safe(candidate) {
-            continue;
-        }
-        let top_level = candidate.split('.').next().unwrap_or_default();
-        if top_level.is_empty()
-            || work_root.join(format!("{top_level}.py")).is_file()
-            || work_root.join(top_level).is_dir()
-        {
-            continue;
-        }
-        return Some(candidate.to_string());
-    }
-    None
-}
-
-fn python_dependency_module_name_is_safe(module: &str) -> bool {
-    !module.is_empty()
-        && !module.starts_with('.')
-        && module.split('.').all(|part| {
-            let mut chars = part.chars();
-            let Some(first) = chars.next() else {
-                return false;
-            };
-            (first == '_' || first.is_ascii_alphabetic())
-                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        })
 }
 
 fn recovery_target_hint_for_missing_local_module_path(
@@ -23348,23 +23297,6 @@ fn recovery_target_hint_for_missing_local_module_path(
         path: path.to_string(),
         reason: reason.to_string(),
     })
-}
-
-fn missing_python_module_workspace_path(work_root: &Path, module: &str) -> Option<String> {
-    let mut parts = module.split('.');
-    let top = parts.next()?;
-    if !work_root.join(top).is_dir() {
-        return None;
-    }
-    if !work_root.join(top).join("__init__.py").is_file() {
-        return None;
-    }
-    let relative = format!("{}.py", module.replace('.', "/"));
-    let parent = Path::new(&relative).parent()?;
-    if !work_root.join(parent).is_dir() {
-        return None;
-    }
-    Some(relative)
 }
 
 fn verifier_repair_missing_local_module_provider(
@@ -23435,20 +23367,6 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
         sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
         cluster.admitted_cluster_targets = admitted;
     }
-}
-
-fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
-    let path = raw_path.trim();
-    if path.is_empty()
-        || path.contains('\0')
-        || Path::new(path).is_absolute()
-        || is_ignored_workspace_display_path(path)
-    {
-        return false;
-    }
-    !Path::new(path)
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 fn verifier_repair_preferred_local_import_source(

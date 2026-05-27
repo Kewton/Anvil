@@ -1704,3 +1704,32 @@ Assessment:
 - No behavior change intended. Diagnostic target scoring and role compatibility
   are semantic planning policy now; `turn.rs` still owns the stateful bridge
   that turns an admitted diagnostic assessment into a legacy repair assessment.
+
+### 2026-05-27 Slice 41
+
+Applied:
+
+- Added `verifier_repair_targeting.rs`.
+- Moved diagnostic path-input safety checks out of `turn.rs`.
+- Moved Python missing external dependency parsing and local module workspace
+  path projection out of `turn.rs`.
+- Kept admission execution and RecoveryTargetHint construction in `turn.rs`
+  because they still depend on workspace scope, artifact ownership, and active
+  RepairJob context.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo test cb017_security_unsafe_paths_rejected_by_enrich --lib -q`: pass, 1 test
+- `cargo test missing_local_module --lib -q`: pass, 4 tests
+- `cargo test dependency --lib -q`: pass, 25 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Target/path parsing helpers are now isolated;
+  `turn.rs` still owns the stateful admission boundary and the policy decision
+  to promote a parsed candidate into an actual repair target.

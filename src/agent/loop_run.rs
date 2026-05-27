@@ -163,6 +163,10 @@ mod verifier_assessment_parser;
 // v0.4.25: verifier-repair shadow telemetry and legacy brief projection.
 // Keeps observational payload shaping out of the actor loop dispatcher.
 mod verifier_repair_shadow;
+// v0.4.25: verifier-repair target/path helper boundary. Keeps diagnostic
+// path safety and Python module/dependency candidate parsing out of the actor
+// loop dispatcher.
+mod verifier_repair_targeting;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

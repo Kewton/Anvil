@@ -852,3 +852,27 @@ Assessment:
 - No behavior change intended. The extracted helpers are pure policy checks;
   no RepairJob state transition, workspace admission call, or dispatch source
   moved in this slice.
+
+## Structural Verification: Slice 41
+
+Scope:
+
+- Extract verifier-repair target/path helper functions from `turn.rs`.
+- Keep workspace admission and RecoveryTargetHint promotion in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests.
+- `cargo test cb017_security_unsafe_paths_rejected_by_enrich --lib -q`: pass, 1 test.
+- `cargo test missing_local_module --lib -q`: pass, 4 tests.
+- `cargo test dependency --lib -q`: pass, 25 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The extracted helpers only parse and filter
+  candidate paths/modules; active repair admission remains in the existing
+  SSOT call path.

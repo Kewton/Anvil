@@ -191,3 +191,6 @@ with legacy/fallback paths unable to override it.
   compatible target selection are now isolated in `semantic_repair_planning.rs`;
   `turn.rs` still owns the legacy assessment bridge that calls admission and
   writes RepairJob-facing decisions.
+- Current status: verifier repair target/path parsing helpers are now isolated
+  in `verifier_repair_targeting.rs`; `turn.rs` still owns workspace admission,
+  hint promotion, and stateful repair-target selection.
