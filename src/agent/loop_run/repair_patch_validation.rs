@@ -34,6 +34,15 @@ pub(super) struct RepairIntentEdit<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifierRepairIntent {
+    pub(super) path: String,
+    pub(super) old_string: String,
+    pub(super) new_string: String,
+    pub(super) reason: String,
+    pub(super) replace_all: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairCandidateApplyResult {
     pub(super) updated_contents: String,
     pub(super) used_whitespace_fallback: bool,

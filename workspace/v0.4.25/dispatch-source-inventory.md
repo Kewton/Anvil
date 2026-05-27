@@ -112,3 +112,6 @@ with legacy/fallback paths unable to override it.
 - Current status: duplicate repair-intent replay detection is now
   validation-owned; `turn.rs` passes the read-only applied-intent history and
   maps the typed duplicate error into the existing repair rejection signal.
+- Current status: parsed repair patch intent data is now owned by
+  `repair_patch_validation.rs`; `turn.rs` still parses provider replies and
+  orchestrates validation.

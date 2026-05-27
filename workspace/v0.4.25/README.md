@@ -979,3 +979,29 @@ Assessment:
 - Duplicate-intent admission is now validation-owned end to end.
 - `turn.rs` still maps the typed duplicate error into the existing
   `RepairRejectionSignal::Duplicate` carrier.
+
+### 2026-05-27 Slice 14
+
+Applied:
+
+- Moved the parsed repair patch intent carrier `VerifierRepairIntent` from
+  `turn.rs` into `repair_patch_validation.rs`.
+- Kept fields crate-internal to the loop-run module boundary so parsing,
+  validation, and existing tests can still use the same shape without exposing
+  it as a public API.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 20 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3002 tests when rerun outside sandbox
+
+Assessment:
+
+- Patch-candidate shape ownership is now closer to the patch-validation
+  boundary.
+- `turn.rs` still owns patch proposal parsing and high-level validation
+  orchestration.

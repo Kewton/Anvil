@@ -20,7 +20,7 @@ use super::reminder::{
 use super::repair_job;
 #[cfg(test)]
 use super::repair_job::VerifierRepairDecision;
-use super::repair_patch_validation::ValidatedVerifierRepairEdit;
+use super::repair_patch_validation::{ValidatedVerifierRepairEdit, VerifierRepairIntent};
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
@@ -758,15 +758,6 @@ mod v0421_repair_runner_contract_tests {
             );
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifierRepairIntent {
-    path: String,
-    old_string: String,
-    new_string: String,
-    reason: String,
-    replace_all: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
