@@ -2438,3 +2438,29 @@ Assessment:
 - No behavior change intended. Actor-loop repo-edit observation now consumes
   a completion-evidence-owned no-op predicate instead of defining another
   evidence admission rule locally.
+
+### 2026-05-27 Slice 69
+
+Applied:
+
+- Moved successful repo-edit history projections from `turn.rs` to
+  `tool_history.rs`.
+- Moved `latest_user_turn_slice`, truncated-tool-call note lookup, and
+  plan-file Write/Edit exclusion into the tool-history projection module.
+- `turn.rs` now consumes these projections when deciding recovery flow,
+  instead of owning the message-scanning logic.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test truncated_tool_call --lib -q`: pass, 4 tests
+- `cargo test successful_repo_edit --lib -q`: pass, 2 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Repo-edit and truncated-tool-call evidence
+  now flow through a shared history projection module, reducing another
+  actor-loop-owned dispatch input.

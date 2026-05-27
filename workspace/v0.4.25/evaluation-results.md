@@ -1498,3 +1498,27 @@ Assessment:
 - No behavior change intended. RepoEdit evidence category and no-op
   detection now share the same pure module, reducing actor-loop policy
   surface.
+
+## Structural Verification: Slice 69
+
+Scope:
+
+- Move successful repo-edit and truncated-tool-call history projections from
+  `turn.rs` to `tool_history.rs`.
+- Keep `turn.rs` responsible for acting on those signals, not for scanning
+  raw conversation history to derive them.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test truncated_tool_call --lib -q`: pass, 4 tests.
+- `cargo test successful_repo_edit --lib -q`: pass, 2 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Recovery branches now consume repo-edit
+  evidence projections from `tool_history.rs`, keeping message-scanning
+  details out of the actor loop.

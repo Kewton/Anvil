@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::ollama::xml_fallback::ToolCall;
 use crate::safety::path_guard::resolve_user_path;
 use crate::session::store::ConversationMessage;
+use crate::tools::registry::resolve_plan_mode_write_target;
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
 
 #[derive(Debug, Clone)]
@@ -156,6 +157,147 @@ pub(super) fn latest_verifier_repair_note_index(messages: &[ConversationMessage]
                     .content
                     .contains("task_contract_verify_read_attempt="))
     })
+}
+
+pub(super) fn latest_user_turn_slice(messages: &[ConversationMessage]) -> &[ConversationMessage] {
+    messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map(|index| &messages[index..])
+        .unwrap_or(messages)
+}
+
+pub(super) fn recent_truncated_tool_call_attempt(messages: &[ConversationMessage]) -> usize {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role != "system" {
+                return None;
+            }
+            let lower = message.content.to_ascii_lowercase();
+            if !lower.contains("truncated tool call") {
+                return None;
+            }
+            message
+                .content
+                .rsplit("tool_call_format_attempt=")
+                .next()
+                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
+                .or(Some(1))
+        })
+        .unwrap_or(0)
+}
+
+pub(super) fn latest_truncated_tool_call_note_index(
+    messages: &[ConversationMessage],
+) -> Option<usize> {
+    let slice = latest_user_turn_slice(messages);
+    let offset = messages.len().saturating_sub(slice.len());
+    slice
+        .iter()
+        .rposition(|message| {
+            message.role == "system"
+                && message
+                    .content
+                    .to_ascii_lowercase()
+                    .contains("truncated tool call")
+        })
+        .map(|index| offset + index)
+}
+
+pub(super) fn has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> bool {
+    let Some(index) = latest_truncated_tool_call_note_index(messages) else {
+        return false;
+    };
+    successful_non_plan_repo_edit_count(&messages[index + 1..], work_root, plan_path) > 0
+}
+
+#[cfg(test)]
+pub(super) fn has_successful_repo_edit(messages: &[ConversationMessage]) -> bool {
+    successful_repo_edit_count(messages) > 0
+}
+
+#[cfg(test)]
+pub(super) fn successful_repo_edit_count(messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| {
+            message.role == "tool"
+                && matches!(message.name.as_deref(), Some("Write" | "Edit"))
+                && !message.content.trim_start().starts_with("Error:")
+        })
+        .count()
+}
+
+pub(super) fn has_successful_non_plan_repo_edit(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> bool {
+    successful_non_plan_repo_edit_count(messages, work_root, plan_path) > 0
+}
+
+pub(super) fn successful_non_plan_repo_edit_count(
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> usize {
+    let mut count = 0usize;
+    let mut pending_tool_calls: std::collections::VecDeque<ToolCall> =
+        std::collections::VecDeque::new();
+
+    for message in messages {
+        match message.role.as_str() {
+            "assistant" => {
+                pending_tool_calls = message.tool_calls.iter().cloned().collect();
+            }
+            "tool" => {
+                let Some(expected_tool_call) = pending_tool_calls.pop_front() else {
+                    continue;
+                };
+                if !matches!(message.name.as_deref(), Some("Write" | "Edit"))
+                    || message.content.trim_start().starts_with("Error:")
+                {
+                    continue;
+                }
+                if is_plan_file_tool_call(
+                    &expected_tool_call.name,
+                    &expected_tool_call.arguments,
+                    work_root,
+                    plan_path,
+                ) {
+                    continue;
+                }
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    count
+}
+
+pub(super) fn is_plan_file_tool_call(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> bool {
+    if !matches!(tool_name, "Write" | "Edit") {
+        return false;
+    }
+    let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    resolve_plan_mode_write_target(work_root, raw_path, plan_path)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 pub(super) fn latest_read_exchange_for_target(

@@ -267,3 +267,7 @@ with legacy/fallback paths unable to override it.
 - Current status: no-op repository edit detection is now isolated in
   `completion_evidence.rs`; `turn.rs` owns tool-result observation timing but
   not the content-hash predicate for RepoEdit evidence admission.
+- Current status: successful repo-edit counting, latest user-turn slicing,
+  truncated-tool-call note lookup, and plan-file edit exclusion are now
+  isolated in `tool_history.rs`; `turn.rs` consumes these as dispatch inputs
+  instead of scanning raw conversation history for them locally.
