@@ -1283,3 +1283,29 @@ Assessment:
 - No behavior change intended. `turn.rs` no longer owns this repair lifecycle
   projection; it still records lifecycle events and handles string-based
   fallback error classification.
+
+### 2026-05-27 Slice 25
+
+Applied:
+
+- Moved string-only repair error to lifecycle event classification into
+  `repair_job.rs`.
+- Moved the two focused tests for unknown invalid patch errors and provider
+  timeout errors from `turn.rs` to `repair_job.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test unknown_invalid_patch_error_is_still_budgeted --lib -q`: pass, 1 test
+- `cargo test timeout_invalid_patch_error_is_budgeted_as_provider_timeout --lib -q`: pass, 1 test
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. `turn.rs` no longer owns repair lifecycle event
+  classification for invalid patch errors; it still decides when to apply the
+  returned event to the active job.

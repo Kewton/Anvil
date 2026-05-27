@@ -141,5 +141,7 @@ with legacy/fallback paths unable to override it.
 - Current status: validation-signal-to-ledger-outcome conversion is now
   validation-owned; `turn.rs` still owns when to record lifecycle events.
 - Current status: repair-attempt outcome to lifecycle rejection reason
-  projection is now `RepairJob`-owned; `turn.rs` still classifies
-  string-only fallback errors.
+  projection is now `RepairJob`-owned.
+- Current status: string-only invalid patch error to lifecycle event
+  classification is now `RepairJob`-owned; `turn.rs` still applies the event
+  to the active job.

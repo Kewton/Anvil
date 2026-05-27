@@ -486,3 +486,27 @@ Assessment:
 
 - No behavior change intended. Repair lifecycle projection now sits with
   `RepairJob` state vocabulary instead of the actor loop.
+
+## Structural Verification: Slice 25
+
+Scope:
+
+- Move string-only invalid patch error classification into `repair_job.rs`.
+- Keep `turn.rs` responsible only for applying the returned lifecycle event to
+  the active job.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test unknown_invalid_patch_error_is_still_budgeted --lib -q`: pass, 1 test.
+- `cargo test timeout_invalid_patch_error_is_budgeted_as_provider_timeout --lib -q`: pass, 1 test.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The remaining actor-loop role is lifecycle
+  event application, not classifier ownership.

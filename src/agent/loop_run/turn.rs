@@ -199,70 +199,6 @@ enum VerifierRepairPassOutcome {
     Skipped,
 }
 
-fn repair_lifecycle_rejected_reason_for_error(
-    error: &str,
-) -> Option<super::repair_job::RejectedAttemptReason> {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("verifier_repair_pass_timeout")
-        || lower.contains("provider timeout")
-        || lower.contains("provider timed out")
-        || lower.contains("request timed out")
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-    {
-        return Some(super::repair_job::RejectedAttemptReason::ProviderTimeout);
-    }
-    if lower.contains("no safe repair target") || lower.contains("no safe candidate") {
-        return Some(super::repair_job::RejectedAttemptReason::NoSafeCandidate);
-    }
-    if lower.contains("ambiguous") || lower.contains("authority") {
-        return Some(super::repair_job::RejectedAttemptReason::AmbiguousAuthority);
-    }
-    if lower.contains("target_mismatch")
-        || lower.contains("wrong target")
-        || lower.contains("does not match selected repair target")
-    {
-        return Some(super::repair_job::RejectedAttemptReason::WrongTarget);
-    }
-    if lower.contains("duplicate") {
-        return Some(super::repair_job::RejectedAttemptReason::DuplicatePatch);
-    }
-    if lower.contains("noop") || lower.contains("no-op") || lower.contains("no changes") {
-        return Some(super::repair_job::RejectedAttemptReason::NoopPatch);
-    }
-    if lower.contains("weakening") || lower.contains("unsafe") {
-        return Some(super::repair_job::RejectedAttemptReason::UnsafePatch);
-    }
-    if lower.contains("json")
-        || lower.contains("malformed")
-        || lower.contains("tool calls")
-        || lower.contains("admission rejected")
-        || lower.contains("missing string field")
-        || lower.contains("edits array")
-    {
-        return Some(super::repair_job::RejectedAttemptReason::MalformedPatch);
-    }
-    None
-}
-
-fn repair_lifecycle_event_for_error(
-    error: &str,
-    active_target_hint: Option<&super::task_contract::RecoveryTargetHint>,
-) -> Option<super::repair_job::RepairJobEvent> {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("ambiguous") || lower.contains("authority") {
-        return Some(super::repair_job::RepairJobEvent::AmbiguousAuthority);
-    }
-    if lower.contains("no safe repair target") || lower.contains("no safe candidate") {
-        return Some(super::repair_job::RepairJobEvent::NoSafeTarget);
-    }
-    let target_hint = active_target_hint?;
-    let reason = repair_lifecycle_rejected_reason_for_error(error)
-        .unwrap_or(super::repair_job::RejectedAttemptReason::MalformedPatch);
-    let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
-    Some(super::repair_job::RepairJobEvent::PatchRejected { key, reason })
-}
-
 fn verifier_repair_pass_attempt_timeout_secs(elapsed: Duration) -> Option<u64> {
     let elapsed_secs = elapsed.as_secs();
     if elapsed_secs >= VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS {
@@ -286,52 +222,6 @@ fn verifier_repair_pass_timeout_error(elapsed: Duration) -> String {
 #[cfg(test)]
 mod repair_lifecycle_event_tests {
     use super::*;
-
-    #[test]
-    fn unknown_invalid_patch_error_is_still_budgeted() {
-        let target_hint = super::super::task_contract::RecoveryTargetHint {
-            role: super::super::task_contract::ArtifactRole::Implementation,
-            path: "app/main.py".to_string(),
-            reason: "test target".to_string(),
-        };
-
-        let event = repair_lifecycle_event_for_error(
-            "repair intent exact edit rejected: old_string did not match",
-            Some(&target_hint),
-        )
-        .expect("invalid patch errors with an active target must enter the repair ledger");
-
-        assert!(matches!(
-            event,
-            super::super::repair_job::RepairJobEvent::PatchRejected {
-                reason: super::super::repair_job::RejectedAttemptReason::MalformedPatch,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn timeout_invalid_patch_error_is_budgeted_as_provider_timeout() {
-        let target_hint = super::super::task_contract::RecoveryTargetHint {
-            role: super::super::task_contract::ArtifactRole::Implementation,
-            path: "app/main.py".to_string(),
-            reason: "test target".to_string(),
-        };
-
-        let event = repair_lifecycle_event_for_error(
-            "verifier_repair_pass_timeout: patch provider exceeded repair-pass wall-clock budget",
-            Some(&target_hint),
-        )
-        .expect("provider timeout errors with an active target must enter the repair ledger");
-
-        assert!(matches!(
-            event,
-            super::super::repair_job::RepairJobEvent::PatchRejected {
-                reason: super::super::repair_job::RejectedAttemptReason::ProviderTimeout,
-                ..
-            }
-        ));
-    }
 
     #[test]
     fn repair_pass_attempt_timeout_is_capped_by_attempt_timeout() {
@@ -14984,7 +14874,8 @@ impl Agent {
         if let Some(context) = self.repair_job.as_mut() {
             context.repair_error = Some(compact.clone());
             let mut lifecycle_reject_recorded = false;
-            let explicit_error_reason = repair_lifecycle_rejected_reason_for_error(&compact);
+            let explicit_error_reason =
+                super::repair_job::rejected_reason_for_repair_error(&compact);
             // Issue #653 (S7-003): ledger mutation は helper 集約。
             // `outcome = Some(...)` の場合のみ ledger に push される。
             //
@@ -15023,8 +14914,10 @@ impl Agent {
                 });
             }
             if !lifecycle_reject_recorded
-                && let Some(event) =
-                    repair_lifecycle_event_for_error(&compact, active_target_hint.as_ref())
+                && let Some(event) = super::repair_job::lifecycle_event_for_repair_error(
+                    &compact,
+                    active_target_hint.as_ref(),
+                )
             {
                 context.apply_event(event);
             }

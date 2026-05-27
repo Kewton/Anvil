@@ -562,6 +562,68 @@ pub(super) fn rejected_reason_for_repair_attempt_outcome_kind(
     }
 }
 
+pub(super) fn rejected_reason_for_repair_error(error: &str) -> Option<RejectedAttemptReason> {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("verifier_repair_pass_timeout")
+        || lower.contains("provider timeout")
+        || lower.contains("provider timed out")
+        || lower.contains("request timed out")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return Some(RejectedAttemptReason::ProviderTimeout);
+    }
+    if lower.contains("no safe repair target") || lower.contains("no safe candidate") {
+        return Some(RejectedAttemptReason::NoSafeCandidate);
+    }
+    if lower.contains("ambiguous") || lower.contains("authority") {
+        return Some(RejectedAttemptReason::AmbiguousAuthority);
+    }
+    if lower.contains("target_mismatch")
+        || lower.contains("wrong target")
+        || lower.contains("does not match selected repair target")
+    {
+        return Some(RejectedAttemptReason::WrongTarget);
+    }
+    if lower.contains("duplicate") {
+        return Some(RejectedAttemptReason::DuplicatePatch);
+    }
+    if lower.contains("noop") || lower.contains("no-op") || lower.contains("no changes") {
+        return Some(RejectedAttemptReason::NoopPatch);
+    }
+    if lower.contains("weakening") || lower.contains("unsafe") {
+        return Some(RejectedAttemptReason::UnsafePatch);
+    }
+    if lower.contains("json")
+        || lower.contains("malformed")
+        || lower.contains("tool calls")
+        || lower.contains("admission rejected")
+        || lower.contains("missing string field")
+        || lower.contains("edits array")
+    {
+        return Some(RejectedAttemptReason::MalformedPatch);
+    }
+    None
+}
+
+pub(super) fn lifecycle_event_for_repair_error(
+    error: &str,
+    active_target_hint: Option<&RecoveryTargetHint>,
+) -> Option<RepairJobEvent> {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("ambiguous") || lower.contains("authority") {
+        return Some(RepairJobEvent::AmbiguousAuthority);
+    }
+    if lower.contains("no safe repair target") || lower.contains("no safe candidate") {
+        return Some(RepairJobEvent::NoSafeTarget);
+    }
+    let target_hint = active_target_hint?;
+    let reason =
+        rejected_reason_for_repair_error(error).unwrap_or(RejectedAttemptReason::MalformedPatch);
+    let key = RepairAttemptKey::from_target(target_hint, None);
+    Some(RepairJobEvent::PatchRejected { key, reason })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RejectedAttempt {
     pub(super) key: RepairAttemptKey,
@@ -6247,6 +6309,52 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn unknown_invalid_patch_error_is_still_budgeted() {
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "test target".to_string(),
+        };
+
+        let event = lifecycle_event_for_repair_error(
+            "repair intent exact edit rejected: old_string did not match",
+            Some(&target_hint),
+        )
+        .expect("invalid patch errors with an active target must enter the repair ledger");
+
+        assert!(matches!(
+            event,
+            RepairJobEvent::PatchRejected {
+                reason: RejectedAttemptReason::MalformedPatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn timeout_invalid_patch_error_is_budgeted_as_provider_timeout() {
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "test target".to_string(),
+        };
+
+        let event = lifecycle_event_for_repair_error(
+            "verifier_repair_pass_timeout: patch provider exceeded repair-pass wall-clock budget",
+            Some(&target_hint),
+        )
+        .expect("provider timeout errors with an active target must enter the repair ledger");
+
+        assert!(matches!(
+            event,
+            RepairJobEvent::PatchRejected {
+                reason: RejectedAttemptReason::ProviderTimeout,
+                ..
+            }
+        ));
     }
 
     fn outcome_rejected_unsafe(
