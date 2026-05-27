@@ -2986,7 +2986,7 @@ fn repo_edit_satisfies_artifact_recovery_target(
     let Some(target) = target else {
         return true;
     };
-    let Some(role) = artifact_role_from_repo_edit_category(category) else {
+    let Some(role) = super::task_contract::role_from_repo_edit(category) else {
         return false;
     };
     let target_path = target.path.replace('\\', "/");
@@ -14925,7 +14925,7 @@ impl Agent {
         for evidence in self.task_contract_evidence_set_this_turn.iter() {
             if let super::completion_evidence::CompletionEvidence::RepoEdit { category, .. } =
                 evidence
-                && let Some(role) = artifact_role_from_repo_edit_category(*category)
+                && let Some(role) = super::task_contract::role_from_repo_edit(*category)
             {
                 states.push(super::task_contract::ArtifactState::changed(role));
             }
@@ -14995,7 +14995,7 @@ impl Agent {
         for evidence in self.task_contract_evidence_set_this_turn.iter() {
             if let super::completion_evidence::CompletionEvidence::RepoEdit { category, .. } =
                 evidence
-                && let Some(role) = artifact_role_from_repo_edit_category(*category)
+                && let Some(role) = super::task_contract::role_from_repo_edit(*category)
             {
                 states.push(super::task_contract::ArtifactState::changed(role));
             }
@@ -22119,7 +22119,7 @@ fn existing_workspace_candidate_for_role(
     let mut candidates = meaningful_workspace_files(work_root, 64)?
         .into_iter()
         .filter(|path| {
-            artifact_role_from_repo_edit_category(
+            super::task_contract::role_from_repo_edit(
                 super::completion_evidence::classify_repo_edit_path(path),
             )
             .is_some_and(|candidate| candidate == role)
@@ -22241,7 +22241,7 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
     let mut candidates = meaningful_workspace_files(work_root, 64)?
         .into_iter()
         .filter(|path| {
-            artifact_role_from_repo_edit_category(
+            super::task_contract::role_from_repo_edit(
                 super::completion_evidence::classify_repo_edit_path(path),
             )
             .is_some_and(|candidate| candidate == role)
@@ -23082,7 +23082,7 @@ fn recovery_target_hint_for_existing_path(
         return None;
     }
     let category = super::completion_evidence::classify_repo_edit_path(Path::new(&path));
-    let role = artifact_role_from_repo_edit_category(category)?;
+    let role = super::task_contract::role_from_repo_edit(category)?;
     Some(super::task_contract::RecoveryTargetHint {
         role,
         path,
@@ -23654,7 +23654,7 @@ fn verifier_repair_candidate_from_path(
         return None;
     }
     let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(&path));
-    let role = artifact_role_from_repo_edit_category(category)?;
+    let role = super::task_contract::role_from_repo_edit(category)?;
     let line = from_verifier_output
         .then(|| verifier_line_number_for_path(source_line, raw_path))
         .flatten();
@@ -23923,26 +23923,6 @@ fn verifier_repair_target_display(target: &Path, work_root: &Path) -> String {
         .unwrap_or(target)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn artifact_role_from_repo_edit_category(
-    category: super::completion_evidence::RepoEditCategory,
-) -> Option<super::task_contract::ArtifactRole> {
-    match category {
-        super::completion_evidence::RepoEditCategory::Impl => {
-            Some(super::task_contract::ArtifactRole::Implementation)
-        }
-        super::completion_evidence::RepoEditCategory::Test => {
-            Some(super::task_contract::ArtifactRole::Test)
-        }
-        super::completion_evidence::RepoEditCategory::Docs => {
-            Some(super::task_contract::ArtifactRole::UsageDocs)
-        }
-        super::completion_evidence::RepoEditCategory::Setup => {
-            Some(super::task_contract::ArtifactRole::Setup)
-        }
-        super::completion_evidence::RepoEditCategory::Other => None,
-    }
 }
 
 fn synthesized_missing_implementation_target_path_for_request(

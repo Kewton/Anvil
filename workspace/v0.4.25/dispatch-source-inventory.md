@@ -203,3 +203,6 @@ with legacy/fallback paths unable to override it.
 - Current status: diagnostic LLM attempt scheduling is now isolated in
   `verifier_diagnostic_attempt.rs`; `turn.rs` still owns the provider call and
   diagnostic pass state updates.
+- Current status: repo-edit-category to artifact-role mapping is now consumed
+  through `task_contract::role_from_repo_edit`; the duplicate table in
+  `turn.rs` has been removed.

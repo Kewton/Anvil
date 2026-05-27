@@ -1878,3 +1878,28 @@ Assessment:
 - No behavior change intended. Diagnostic retry scheduling is now a dedicated
   value module; `turn.rs` still owns the actual LLM call and diagnostic pass
   state updates.
+
+### 2026-05-27 Slice 48
+
+Applied:
+
+- Removed the duplicate `artifact_role_from_repo_edit_category` helper from
+  `turn.rs`.
+- Replaced its call sites with the existing
+  `task_contract::role_from_repo_edit` SSOT.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test task_contract --lib -q`: pass, 85 tests when rerun outside
+  sandbox because two filtered tests start a local mockito server
+- `cargo test completion_evidence --lib -q`: pass, 26 tests
+- `cargo test verifier_repair_targeting --lib -q`: pass, 3 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Repo-edit-category to artifact-role mapping now
+  has one owner instead of a duplicated table in `turn.rs`.

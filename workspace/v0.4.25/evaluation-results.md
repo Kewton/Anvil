@@ -1000,3 +1000,26 @@ Assessment:
 
 - No behavior change intended. Diagnostic attempt scheduling is isolated;
   diagnostic execution remains in `turn.rs`.
+
+## Structural Verification: Slice 48
+
+Scope:
+
+- Remove duplicate repo-edit-category to artifact-role mapping from `turn.rs`.
+- Use `task_contract::role_from_repo_edit` at all former call sites.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test task_contract --lib -q`: pass, 85 tests when rerun outside
+  sandbox because two filtered tests start a local mockito server.
+- `cargo test completion_evidence --lib -q`: pass, 26 tests.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 3 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Mapping responsibility is no longer duplicated
+  between `turn.rs` and `task_contract.rs`.
