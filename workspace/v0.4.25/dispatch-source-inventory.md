@@ -209,3 +209,6 @@ with legacy/fallback paths unable to override it.
 - Current status: existing-file path to `RecoveryTargetHint` conversion is now
   isolated in `verifier_repair_targeting.rs`; `turn.rs` still owns diagnostic
   admission sequencing and RepairJob state updates.
+- Current status: diagnostic path and missing setup target promotion are now
+  isolated in `verifier_repair_targeting.rs`; `turn.rs` still owns semantic
+  repair-plan construction and RepairJob state writes after admission.

@@ -1929,3 +1929,33 @@ Assessment:
 - No behavior change intended. Existing-path to repair-target hint conversion
   is now owned by the verifier repair targeting module; `turn.rs` still owns
   when that hint is promoted through admission.
+
+### 2026-05-27 Slice 50
+
+Applied:
+
+- Moved `recovery_target_hint_for_diagnostic_path` and
+  `recovery_target_hint_for_missing_setup_path` from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Kept the same admission SSOT:
+  diagnostic paths still pass through syntactic path safety, setup-target
+  gating, and owned-target admission before entering the repair plan.
+- Added module-local tests for owned existing target admission, unowned target
+  rejection, and missing setup manifest gating.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_targeting --lib -q`: pass, 8 tests
+- `cargo test recovery_target_hint --lib -q`: pass, 5 tests
+- `cargo test diagnostic_target --lib -q`: pass, 10 tests when rerun outside
+  sandbox because two filtered tests start local mockito servers
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3038 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Diagnostic target promotion now has one module
+  boundary. `turn.rs` still owns the stateful timing of diagnostic pass output,
+  semantic plan construction, and RepairJob state updates.

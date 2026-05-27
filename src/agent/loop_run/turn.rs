@@ -81,9 +81,9 @@ use super::verifier_repair_shadow::{
     verifier_repair_action_payload_for_context,
 };
 use super::verifier_repair_targeting::{
-    diagnostic_missing_setup_path_is_controller_writable, missing_python_module_workspace_path,
-    python_missing_external_dependency_name, recovery_target_hint_for_existing_path,
-    verifier_diagnostic_path_input_is_safe,
+    missing_python_module_workspace_path, python_missing_external_dependency_name,
+    recovery_target_hint_for_diagnostic_path, recovery_target_hint_for_existing_path,
+    recovery_target_hint_for_missing_setup_path, verifier_diagnostic_path_input_is_safe,
 };
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
@@ -23058,64 +23058,6 @@ fn verifier_repair_intents_fingerprint(
         relative_path,
         &repair_intent_edit_payloads(intents),
     )
-}
-
-fn recovery_target_hint_for_diagnostic_path(
-    work_root: &Path,
-    raw_path: &str,
-    reason: &str,
-    failure_kind: super::VerifierDiagnosticFailureKind,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    if let Some(hint) = recovery_target_hint_for_existing_path(work_root, raw_path, reason) {
-        if hint.role == super::task_contract::ArtifactRole::Setup
-            && !failure_kind.allows_setup_target()
-        {
-            return None;
-        }
-        // Issue #647 (§5.1 stage 2): Owned admission gate at the function exit.
-        // Path 1 of the 6 source categories: diagnostic LLM-proposed paths.
-        return admit_repair_target_hint(hint, admission);
-    }
-    recovery_target_hint_for_missing_setup_path(
-        work_root,
-        raw_path,
-        reason,
-        failure_kind,
-        admission,
-    )
-}
-
-fn recovery_target_hint_for_missing_setup_path(
-    work_root: &Path,
-    raw_path: &str,
-    reason: &str,
-    failure_kind: super::VerifierDiagnosticFailureKind,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    if !failure_kind.allows_setup_target() {
-        return None;
-    }
-    let path = raw_path.trim().replace('\\', "/");
-    if !verifier_diagnostic_path_input_is_safe(&path)
-        || !admission.scope.contains(&path)
-        || !diagnostic_missing_setup_path_is_controller_writable(&path)
-    {
-        return None;
-    }
-    let resolved = resolve_user_path(work_root, &path).ok()?;
-    if resolved.exists() {
-        return None;
-    }
-    if !super::artifact_ownership::nearest_existing_ancestor_within_work_root(work_root, &resolved)
-    {
-        return None;
-    }
-    Some(super::task_contract::RecoveryTargetHint {
-        role: super::task_contract::ArtifactRole::Setup,
-        path,
-        reason: reason.to_string(),
-    })
 }
 
 fn verifier_diagnostic_missing_setup_candidates(

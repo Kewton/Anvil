@@ -1048,3 +1048,30 @@ Assessment:
 - No behavior change intended. The path-to-hint conversion boundary is closer
   to verifier repair targeting; `turn.rs` only invokes it as part of the
   stateful diagnostic repair flow.
+
+## Structural Verification: Slice 50
+
+Scope:
+
+- Move diagnostic path to `RecoveryTargetHint` promotion from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Move missing setup target promotion to the same module.
+- Preserve syntactic path safety, setup-target gating, and owned-target
+  admission semantics.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 8 tests.
+- `cargo test recovery_target_hint --lib -q`: pass, 5 tests.
+- `cargo test diagnostic_target --lib -q`: pass, 10 tests when rerun outside
+  sandbox because two filtered tests start local mockito servers.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3038 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The diagnostic target-promotion SSOT is no
+  longer embedded in the actor loop; `turn.rs` retains only stateful repair
+  orchestration around the module boundary.

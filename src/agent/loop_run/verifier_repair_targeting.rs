@@ -3,6 +3,8 @@ use std::path::Path;
 use crate::safety::path_guard::resolve_user_path;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
+use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
+
 pub(super) fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
     let path = raw_path.trim();
     if path.is_empty()
@@ -47,6 +49,64 @@ pub(super) fn recovery_target_hint_for_existing_path(
     let role = super::task_contract::role_from_repo_edit(category)?;
     Some(super::task_contract::RecoveryTargetHint {
         role,
+        path,
+        reason: reason.to_string(),
+    })
+}
+
+pub(super) fn recovery_target_hint_for_diagnostic_path(
+    work_root: &Path,
+    raw_path: &str,
+    reason: &str,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    if let Some(hint) = recovery_target_hint_for_existing_path(work_root, raw_path, reason) {
+        if hint.role == super::task_contract::ArtifactRole::Setup
+            && !failure_kind.allows_setup_target()
+        {
+            return None;
+        }
+        // Issue #647 (§5.1 stage 2): Owned admission gate at the function exit.
+        // Path 1 of the 6 source categories: diagnostic LLM-proposed paths.
+        return admit_repair_target_hint(hint, admission);
+    }
+    recovery_target_hint_for_missing_setup_path(
+        work_root,
+        raw_path,
+        reason,
+        failure_kind,
+        admission,
+    )
+}
+
+pub(super) fn recovery_target_hint_for_missing_setup_path(
+    work_root: &Path,
+    raw_path: &str,
+    reason: &str,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    if !failure_kind.allows_setup_target() {
+        return None;
+    }
+    let path = raw_path.trim().replace('\\', "/");
+    if !verifier_diagnostic_path_input_is_safe(&path)
+        || !admission.scope.contains(&path)
+        || !diagnostic_missing_setup_path_is_controller_writable(&path)
+    {
+        return None;
+    }
+    let resolved = resolve_user_path(work_root, &path).ok()?;
+    if resolved.exists() {
+        return None;
+    }
+    if !super::artifact_ownership::nearest_existing_ancestor_within_work_root(work_root, &resolved)
+    {
+        return None;
+    }
+    Some(super::task_contract::RecoveryTargetHint {
+        role: super::task_contract::ArtifactRole::Setup,
         path,
         reason: reason.to_string(),
     })
@@ -187,6 +247,111 @@ mod tests {
         );
         assert!(
             recovery_target_hint_for_existing_path(work_root, "missing.py", "reason").is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_target_hint_for_diagnostic_path_admits_owned_existing_targets() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let edited = |path: &str| path == "app/main.py";
+        let unchanged = |_: &str| false;
+        let admission = RepairTargetAdmissionContext {
+            work_root,
+            scope: &scope,
+            edited_this_session_for: &edited,
+            scaffold_changed_for: &unchanged,
+        };
+
+        let hint = recovery_target_hint_for_diagnostic_path(
+            work_root,
+            "app/main.py",
+            "reason",
+            super::super::VerifierDiagnosticFailureKind::RuntimeError,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(hint.path, "app/main.py");
+        assert_eq!(
+            hint.role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+    }
+
+    #[test]
+    fn recovery_target_hint_for_diagnostic_path_rejects_unowned_existing_targets() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "x = 1\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let unchanged = |_: &str| false;
+        let admission = RepairTargetAdmissionContext {
+            work_root,
+            scope: &scope,
+            edited_this_session_for: &unchanged,
+            scaffold_changed_for: &unchanged,
+        };
+
+        assert!(
+            recovery_target_hint_for_diagnostic_path(
+                work_root,
+                "app/main.py",
+                "reason",
+                super::super::VerifierDiagnosticFailureKind::RuntimeError,
+                &admission,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_target_hint_for_missing_setup_path_requires_setup_failure_and_manifest() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let unchanged = |_: &str| false;
+        let admission = RepairTargetAdmissionContext {
+            work_root,
+            scope: &scope,
+            edited_this_session_for: &unchanged,
+            scaffold_changed_for: &unchanged,
+        };
+
+        let hint = recovery_target_hint_for_missing_setup_path(
+            work_root,
+            "pyproject.toml",
+            "reason",
+            super::super::VerifierDiagnosticFailureKind::DependencyMissing,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(hint.path, "pyproject.toml");
+        assert_eq!(hint.role, super::super::task_contract::ArtifactRole::Setup);
+        assert!(
+            recovery_target_hint_for_missing_setup_path(
+                work_root,
+                "pyproject.toml",
+                "reason",
+                super::super::VerifierDiagnosticFailureKind::RuntimeError,
+                &admission,
+            )
+            .is_none()
+        );
+        assert!(
+            recovery_target_hint_for_missing_setup_path(
+                work_root,
+                "requirements.txt",
+                "reason",
+                super::super::VerifierDiagnosticFailureKind::DependencyMissing,
+                &admission,
+            )
+            .is_none()
         );
     }
 
