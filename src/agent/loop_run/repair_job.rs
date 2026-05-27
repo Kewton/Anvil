@@ -537,6 +537,31 @@ impl RejectedAttemptReason {
     }
 }
 
+pub(super) fn rejected_reason_for_repair_attempt_outcome_kind(
+    kind: &super::repair_attempt_outcome::RepairAttemptOutcomeKind,
+) -> Option<RejectedAttemptReason> {
+    match kind {
+        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe { .. } => {
+            Some(RejectedAttemptReason::UnsafePatch)
+        }
+        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedMalformed => {
+            Some(RejectedAttemptReason::MalformedPatch)
+        }
+        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoop => {
+            Some(RejectedAttemptReason::NoopPatch)
+        }
+        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedDuplicate => {
+            Some(RejectedAttemptReason::DuplicatePatch)
+        }
+        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoCandidate => {
+            Some(RejectedAttemptReason::NoSafeCandidate)
+        }
+        super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedImproved
+        | super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress
+        | super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedWorsened => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RejectedAttempt {
     pub(super) key: RepairAttemptKey,
@@ -6168,6 +6193,61 @@ mod tests {
     use super::super::semantic_failure::cluster_key_for_test;
     use super::super::spec_authority::WeakeningPattern;
     use super::super::task_contract::ArtifactRole;
+
+    #[test]
+    fn rejected_reason_projection_matches_repair_attempt_outcomes() {
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::RejectedUnsafe {
+                    rejection: RepairRejectionKind::TestWeakening,
+                    pattern: WeakeningPattern::AssertionDeleted,
+                },
+            ),
+            Some(RejectedAttemptReason::UnsafePatch),
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::RejectedMalformed,
+            ),
+            Some(RejectedAttemptReason::MalformedPatch),
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::RejectedNoop
+            ),
+            Some(RejectedAttemptReason::NoopPatch),
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::RejectedDuplicate,
+            ),
+            Some(RejectedAttemptReason::DuplicatePatch),
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::RejectedNoCandidate,
+            ),
+            Some(RejectedAttemptReason::NoSafeCandidate),
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::AppliedImproved
+            ),
+            None,
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::AppliedNoProgress,
+            ),
+            None,
+        );
+        assert_eq!(
+            rejected_reason_for_repair_attempt_outcome_kind(
+                &RepairAttemptOutcomeKind::AppliedWorsened
+            ),
+            None,
+        );
+    }
 
     fn outcome_rejected_unsafe(
         cluster_label: &str,

@@ -1259,3 +1259,27 @@ Assessment:
 - The remaining actor-loop responsibility is narrower: orchestration, Python
   evidence gathering, semantic test weakening filter, repair lifecycle event
   recording, and final report wiring.
+
+### 2026-05-27 Slice 24
+
+Applied:
+
+- Moved repair-attempt outcome to `RejectedAttemptReason` projection into
+  `repair_job.rs`.
+- Added a focused unit test covering every current `RepairAttemptOutcomeKind`
+  branch.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test rejected_reason_projection_matches_repair_attempt_outcomes --lib -q`: pass, 1 test
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. `turn.rs` no longer owns this repair lifecycle
+  projection; it still records lifecycle events and handles string-based
+  fallback error classification.

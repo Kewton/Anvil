@@ -464,3 +464,25 @@ Assessment:
 - No behavior change intended. The actor loop records outcomes, while the
   validation module owns the mapping from validation signals to ledger outcome
   variants.
+
+## Structural Verification: Slice 24
+
+Scope:
+
+- Move repair-attempt outcome to repair lifecycle rejection reason projection
+  out of `turn.rs`.
+- Add direct unit coverage for every current outcome branch.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test rejected_reason_projection_matches_repair_attempt_outcomes --lib -q`: pass, 1 test.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Repair lifecycle projection now sits with
+  `RepairJob` state vocabulary instead of the actor loop.

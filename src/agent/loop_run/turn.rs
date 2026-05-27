@@ -199,31 +199,6 @@ enum VerifierRepairPassOutcome {
     Skipped,
 }
 
-fn repair_lifecycle_rejected_reason_for_outcome(
-    kind: &super::repair_attempt_outcome::RepairAttemptOutcomeKind,
-) -> Option<super::repair_job::RejectedAttemptReason> {
-    match kind {
-        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe { .. } => {
-            Some(super::repair_job::RejectedAttemptReason::UnsafePatch)
-        }
-        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedMalformed => {
-            Some(super::repair_job::RejectedAttemptReason::MalformedPatch)
-        }
-        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoop => {
-            Some(super::repair_job::RejectedAttemptReason::NoopPatch)
-        }
-        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedDuplicate => {
-            Some(super::repair_job::RejectedAttemptReason::DuplicatePatch)
-        }
-        super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoCandidate => {
-            Some(super::repair_job::RejectedAttemptReason::NoSafeCandidate)
-        }
-        super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedImproved
-        | super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress
-        | super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedWorsened => None,
-    }
-}
-
 fn repair_lifecycle_rejected_reason_for_error(
     error: &str,
 ) -> Option<super::repair_job::RejectedAttemptReason> {
@@ -15031,7 +15006,7 @@ impl Agent {
             if let Some(o) = effective_outcome {
                 if let (Some(target_hint), Some(reason)) = (
                     active_target_hint.as_ref(),
-                    repair_lifecycle_rejected_reason_for_outcome(&o.kind),
+                    super::repair_job::rejected_reason_for_repair_attempt_outcome_kind(&o.kind),
                 ) {
                     let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
                     context.apply_event(super::repair_job::RepairJobEvent::PatchRejected {
