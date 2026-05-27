@@ -565,6 +565,14 @@ pub fn is_completion_verifier_command_for_test(command: &str) -> bool {
     completion_evidence::is_completion_verifier_command(command)
 }
 
+#[doc(hidden)]
+pub fn acquire_footer_with_terminal_flag_for_test(
+    config: &crate::config::Config,
+    stdout_is_terminal: bool,
+) -> FooterLease {
+    footer::FooterLease::acquire_with_terminal_flag_for_test(config, stdout_is_terminal)
+}
+
 /// Issue #607: integration-test seam exposing the pure projection from a
 /// `BashExecutionOutcome` to an optional `VerifierExitZero` evidence record.
 /// Returns a tuple `(promoted, masked_command, class_label)` where:

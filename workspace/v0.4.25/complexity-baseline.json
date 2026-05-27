@@ -1,0 +1,117 @@
+{
+  "baseline_schema_version": 1,
+  "command": "python3 scripts/complexity_report.py --json --top 10 src/agent/loop_run/turn.rs src/agent/loop_run/repair_job.rs src/agent/loop_run/model_request.rs src/agent/loop_run/tool_execution.rs",
+  "file_metrics": [
+    {
+      "avg_rough_cc": 2.75,
+      "function_loc": 211,
+      "functions": 12,
+      "max_rough_cc": 8,
+      "path": "src/agent/loop_run/model_request.rs",
+      "rough_cc_ge_high_threshold": 0,
+      "rough_cc_ge_threshold": 0
+    },
+    {
+      "avg_rough_cc": 2.39,
+      "function_loc": 5872,
+      "functions": 240,
+      "max_rough_cc": 26,
+      "path": "src/agent/loop_run/repair_job.rs",
+      "rough_cc_ge_high_threshold": 0,
+      "rough_cc_ge_threshold": 3
+    },
+    {
+      "avg_rough_cc": 1.62,
+      "function_loc": 143,
+      "functions": 16,
+      "max_rough_cc": 7,
+      "path": "src/agent/loop_run/tool_execution.rs",
+      "rough_cc_ge_high_threshold": 0,
+      "rough_cc_ge_threshold": 0
+    },
+    {
+      "avg_rough_cc": 2.92,
+      "function_loc": 32941,
+      "functions": 1058,
+      "max_rough_cc": 320,
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc_ge_high_threshold": 1,
+      "rough_cc_ge_threshold": 24
+    }
+  ],
+  "high_threshold": 50,
+  "script_schema_version": 1,
+  "threshold": 15,
+  "top_functions": [
+    {
+      "line": 5696,
+      "loc": 2587,
+      "name": "run_actor_loop",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 320
+    },
+    {
+      "line": 5380,
+      "loc": 315,
+      "name": "handle_post_reply_recovery",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 47
+    },
+    {
+      "line": 10446,
+      "loc": 300,
+      "name": "build_request_messages",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 42
+    },
+    {
+      "line": 9893,
+      "loc": 197,
+      "name": "request_assistant_reply_with_retry",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 40
+    },
+    {
+      "line": 1180,
+      "loc": 42,
+      "name": "answer_only_script_command_allowed",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 28
+    },
+    {
+      "line": 578,
+      "loc": 43,
+      "name": "rejected_reason_for_repair_error",
+      "path": "src/agent/loop_run/repair_job.rs",
+      "rough_cc": 26
+    },
+    {
+      "line": 2259,
+      "loc": 68,
+      "name": "verifier_file_excerpt_for_line",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 21
+    },
+    {
+      "line": 12442,
+      "loc": 150,
+      "name": "run_verifier_repair_pass_and_apply",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 20
+    },
+    {
+      "line": 1009,
+      "loc": 59,
+      "name": "next_action_from_latest_event",
+      "path": "src/agent/loop_run/repair_job.rs",
+      "rough_cc": 20
+    },
+    {
+      "line": 4041,
+      "loc": 161,
+      "name": "maybe_extract_case_record",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 19
+    }
+  ]
+}

@@ -519,86 +519,103 @@ impl FooterLease {
 
         #[cfg(not(windows))]
         {
-            if !footer_terminal_is_compatible() {
-                tracing::warn!("anvil footer: disabled on incompatible terminal emulator");
+            Self::acquire_with_stdout_terminal_state(config, io::stdout().is_terminal())
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn acquire_with_stdout_terminal_state(config: &Config, stdout_is_terminal: bool) -> Self {
+        if !footer_terminal_is_compatible() {
+            tracing::warn!("anvil footer: disabled on incompatible terminal emulator");
+            return Self::disabled_lease();
+        }
+        // Non-TTY: fully disabled regardless of config (issue #430 / #432).
+        if !stdout_is_terminal {
+            return Self::disabled_lease();
+        }
+
+        // Determine draw vs. probe-only (issue #432 §4.4.2). On a TTY with
+        // `config.footer == false` we still spawn the daemon for cols
+        // broadcast; DECSTBM / footer line writes are suppressed.
+        let draw_enabled = config.footer;
+        // ANVIL_NO_RESIZE opt-out decided once at acquire time.
+        let resize_opt_out = std::env::var_os("ANVIL_NO_RESIZE").is_some_and(|v| !v.is_empty());
+
+        // Single-instance gate (AC15). Acquired here and held until `Drop`.
+        // We don't keep the guard alive across the whole acquire path — we
+        // only flip the bit, then drop the guard so other code that needs
+        // to inspect the bit (defensive checks, future audits) is not
+        // blocked.
+        {
+            let mut held = lock_lease_bit_or_recover();
+            if *held {
+                tracing::warn!(
+                    "anvil footer: a footer lease is already active; skipping second acquire"
+                );
                 return Self::disabled_lease();
             }
-            let is_terminal = io::stdout().is_terminal();
-            // Non-TTY: fully disabled regardless of config (issue #430 / #432).
-            if !is_terminal {
+            *held = true;
+        }
+
+        // Past this point, releasing the lease bit on any failure path is
+        // the responsibility of `release_lease_bit_on_failure`. We use an
+        // explicit guard struct rather than scattering manual cleanup so
+        // a future panic during install also releases the bit.
+        let bit_guard = LeaseBitGuard::new();
+
+        // Determine current terminal size. Failure or anomalous values
+        // (rows < 2, cols == 0) → auto-disable.
+        let rows = match crossterm::terminal::size() {
+            Ok((cols, rows)) if cols > 0 && rows >= 2 => rows,
+            Ok(_) => {
+                tracing::warn!("anvil footer: anomalous terminal size; disabling footer install");
+                drop(bit_guard);
                 return Self::disabled_lease();
             }
-
-            // Determine draw vs. probe-only (issue #432 §4.4.2). On a TTY with
-            // `config.footer == false` we still spawn the daemon for cols
-            // broadcast; DECSTBM / footer line writes are suppressed.
-            let draw_enabled = config.footer;
-            // ANVIL_NO_RESIZE opt-out decided once at acquire time.
-            let resize_opt_out = std::env::var_os("ANVIL_NO_RESIZE").is_some_and(|v| !v.is_empty());
-
-            // Single-instance gate (AC15). Acquired here and held until `Drop`.
-            // We don't keep the guard alive across the whole acquire path — we
-            // only flip the bit, then drop the guard so other code that needs
-            // to inspect the bit (defensive checks, future audits) is not
-            // blocked.
-            {
-                let mut held = lock_lease_bit_or_recover();
-                if *held {
-                    tracing::warn!(
-                        "anvil footer: a footer lease is already active; skipping second acquire"
-                    );
-                    return Self::disabled_lease();
-                }
-                *held = true;
+            Err(err) => {
+                tracing::warn!(?err, "anvil footer: terminal::size() failed; disabling");
+                drop(bit_guard);
+                return Self::disabled_lease();
             }
+        };
 
-            // Past this point, releasing the lease bit on any failure path is
-            // the responsibility of `release_lease_bit_on_failure`. We use an
-            // explicit guard struct rather than scattering manual cleanup so
-            // a future panic during install also releases the bit.
-            let bit_guard = LeaseBitGuard::new();
-
-            // Determine current terminal size. Failure or anomalous values
-            // (rows < 2, cols == 0) → auto-disable.
-            let rows = match crossterm::terminal::size() {
-                Ok((cols, rows)) if cols > 0 && rows >= 2 => rows,
-                Ok(_) => {
-                    tracing::warn!(
-                        "anvil footer: anomalous terminal size; disabling footer install"
-                    );
-                    drop(bit_guard);
-                    return Self::disabled_lease();
-                }
-                Err(err) => {
-                    tracing::warn!(?err, "anvil footer: terminal::size() failed; disabling");
-                    drop(bit_guard);
-                    return Self::disabled_lease();
-                }
-            };
-
-            let budget = config.context_budget;
-            let initial_flags = FooterFlags {
-                mode: ExecutionMode::Act,
-                log: config.log_level,
-                yes: config.yes_mode,
-            };
-            let writer: FooterWriter = Box::new(io::stdout());
-            match install_active(
-                rows,
-                budget,
-                initial_flags,
-                writer,
-                bit_guard,
-                draw_enabled,
-                resize_opt_out,
-            ) {
-                Ok(lease) => lease,
-                Err(()) => {
-                    // install_active already released the bit and logged on
-                    // failure; return a fresh disabled lease.
-                    Self::disabled_lease()
-                }
+        let budget = config.context_budget;
+        let initial_flags = FooterFlags {
+            mode: ExecutionMode::Act,
+            log: config.log_level,
+            yes: config.yes_mode,
+        };
+        let writer: FooterWriter = Box::new(io::stdout());
+        match install_active(
+            rows,
+            budget,
+            initial_flags,
+            writer,
+            bit_guard,
+            draw_enabled,
+            resize_opt_out,
+        ) {
+            Ok(lease) => lease,
+            Err(()) => {
+                // install_active already released the bit and logged on
+                // failure; return a fresh disabled lease.
+                Self::disabled_lease()
             }
+        }
+    }
+
+    pub(crate) fn acquire_with_terminal_flag_for_test(
+        config: &Config,
+        stdout_is_terminal: bool,
+    ) -> Self {
+        #[cfg(not(windows))]
+        {
+            Self::acquire_with_stdout_terminal_state(config, stdout_is_terminal)
+        }
+        #[cfg(windows)]
+        {
+            let _ = (config, stdout_is_terminal);
+            Self::disabled_lease()
         }
     }
 
@@ -878,7 +895,9 @@ impl Drop for FooterLease {
                 let _ = w.flush();
             }
             // 4. Restore the previous panic hook.
-            if let Some(prev) = active.prev_panic_hook.take() {
+            if let Some(prev) = active.prev_panic_hook.take()
+                && !std::thread::panicking()
+            {
                 std::panic::set_hook(panic_hook_from_arc(prev));
             }
         }
@@ -1255,7 +1274,7 @@ mod tests {
         let _g = PhaseCTestGuard::acquire();
         // Even on a TTY, config.footer = false short-circuits to no-op.
         let cfg = config_with_footer(false);
-        let lease = FooterLease::acquire(&cfg);
+        let lease = FooterLease::acquire_with_terminal_flag_for_test(&cfg, true);
         let h = lease.handle_clone();
         assert!(!h.is_enabled());
         // No lease bit held → Drop is a no-op release path.
@@ -1265,16 +1284,13 @@ mod tests {
     #[test]
     fn non_tty_returns_disabled_handle() {
         let _g = PhaseCTestGuard::acquire();
-        // Tests run with stdout = pipe (non-TTY) under cargo, so this path
-        // is exercised regardless of platform. config.footer = true ensures
-        // we pass the config gate and hit the TTY check.
+        // Drive the non-TTY branch deterministically instead of depending on
+        // the harness stdout mode (`cargo test -- --nocapture` can attach a
+        // TTY in some runners).
         let cfg = config_with_footer(true);
-        let lease = FooterLease::acquire(&cfg);
+        let lease = FooterLease::acquire_with_terminal_flag_for_test(&cfg, false);
         let h = lease.handle_clone();
-        assert!(
-            !h.is_enabled(),
-            "cargo test stdout is non-TTY; acquire must return disabled handle"
-        );
+        assert!(!h.is_enabled());
     }
 
     #[test]
@@ -1386,7 +1402,7 @@ mod tests {
             *g = true;
         }
         let cfg = config_with_footer(true);
-        let lease = FooterLease::acquire(&cfg);
+        let lease = FooterLease::acquire_with_terminal_flag_for_test(&cfg, true);
         assert!(!lease.handle_clone().is_enabled());
         drop(lease);
         assert!(

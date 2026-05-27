@@ -10,6 +10,7 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "complexity_report.py"
+BASELINE = REPO_ROOT / "workspace" / "v0.4.25" / "complexity-baseline.json"
 
 
 class TestComplexityReport(unittest.TestCase):
@@ -100,6 +101,18 @@ class TestComplexityReport(unittest.TestCase):
 
         self.assertEqual(payload["files_analyzed"], 0)
         self.assertEqual(payload["functions_analyzed"], 0)
+
+    def test_checked_in_baseline_fixture_is_parseable(self) -> None:
+        payload = json.loads(BASELINE.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["baseline_schema_version"], 1)
+        self.assertEqual(payload["script_schema_version"], 1)
+        self.assertEqual(payload["threshold"], 15)
+        self.assertEqual(payload["high_threshold"], 50)
+        self.assertTrue(payload["command"].startswith("python3 scripts/complexity_report.py"))
+        self.assertGreater(len(payload["file_metrics"]), 0)
+        self.assertGreater(len(payload["top_functions"]), 0)
+        self.assertEqual(payload["top_functions"][0]["name"], "run_actor_loop")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,22 @@ Ollama 直結の local-first コーディングエージェント。multi-provid
 - 読み取り専用の Plan mode 制御
 - live Ollama E2E を含む unit / integration / ignored E2E tests
 
+## 複雑性レポート
+
+大きい制御フローの退行確認には、軽量な rough complexity レポートを使う。
+
+```bash
+python3 scripts/complexity_report.py --top 10 \
+  src/agent/loop_run/turn.rs \
+  src/agent/loop_run/repair_job.rs \
+  src/agent/loop_run/model_request.rs \
+  src/agent/loop_run/tool_execution.rs
+```
+
+- JSON が必要なら `--json` を付ける
+- 現在の baseline は `workspace/v0.4.25/complexity-baseline.json`
+- CI では script / fixture / snapshot command の実行可能性だけを確認し、現行 debt 自体では fail させない
+
 ## クイックスタート
 
 ### 1. Ollama を起動

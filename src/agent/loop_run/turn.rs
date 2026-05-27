@@ -15,13 +15,12 @@ use super::feedback_kind_confirm::{
     run_feedback_kind_confirm_with_strategy,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
+use super::model_request::{build_assistant_request_plan, request_non_streaming_assistant_reply};
 #[cfg(test)]
 use super::model_request::{
-    effective_non_streaming_timeout_secs, non_streaming_assistant_reply_timeout_secs,
-};
-use super::model_request::{
-    focused_edit_max_predict_override, focused_edit_timeout_override_secs,
-    request_non_streaming_assistant_reply, should_use_streaming_transport,
+    effective_non_streaming_timeout_secs, focused_edit_max_predict_override,
+    focused_edit_timeout_override_secs, non_streaming_assistant_reply_timeout_secs,
+    should_use_streaming_transport,
 };
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
@@ -120,7 +119,8 @@ use super::verifier_assessment_parser::{
     verifier_failure_type_for_diagnostic_kind,
 };
 use super::verifier_diagnostic_attempt::{
-    VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, verifier_diagnostic_attempt_spec,
+    VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, VerifierDiagnosticAttemptSpec,
+    verifier_diagnostic_attempt_spec,
 };
 #[cfg(test)]
 use super::verifier_diagnostic_attempt::{
@@ -269,6 +269,31 @@ enum VerifierDiagnosticPassOutcome {
     RetryPending { error: String },
     Unavailable { error: String },
     Skipped,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedVerifierDiagnosticPass {
+    context: super::repair_job::RepairJob,
+    attempt_spec: VerifierDiagnosticAttemptSpec,
+    active_request: String,
+    behavior_projection: Option<super::required_behavior::BehaviorContractProjection>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedVerifierRepairPass {
+    context: super::repair_job::RepairJob,
+    accepted_plan: super::repair_plan::AcceptedRepairPlan,
+    messages: Vec<ConversationMessage>,
+    model: String,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredTaskContractVerifierRun {
+    plan: AutoTestPlan,
+    command: super::auto_test::VerifierCommand,
+    display_command: String,
+    bound_test_artifacts_count: usize,
+    bound_test_artifacts_paths: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1640,6 +1665,30 @@ enum TaskContractVerifierFlowOutcome {
         reason: ExitReason,
         error_text: String,
     },
+}
+
+enum PostReplyRecoveryOutcome {
+    Continue,
+    Finalize {
+        final_prose: String,
+        exit_reason: ExitReason,
+        error_text: String,
+    },
+}
+
+struct PostReplyRecoveryArgs<'a, 'b> {
+    last_iter: usize,
+    action_expectation: recovery::ActionExpectation,
+    requires_action: bool,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    repo_edit_calls_made_this_turn: usize,
+    final_reply: &'a str,
+    task_contract_action: Option<&'a super::task_contract::ArtifactRecoveryAction>,
+    interrupt_flag: &'a InterruptFlag,
+    repo_change_retries: &'b mut usize,
+    python_test_retries: &'b mut usize,
+    no_tool_retries: &'b mut usize,
+    framework_app_fallback_materialized: &'b mut bool,
 }
 
 struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -5328,6 +5377,322 @@ impl Agent {
         )
     }
 
+    fn handle_post_reply_recovery(
+        &mut self,
+        args: PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
+        if !args.requires_action
+            && self.answer_only_mode_active()
+            && reply_looks_like_future_work(args.final_reply)
+        {
+            *args.no_tool_retries += 1;
+            if *args.no_tool_retries >= 1 {
+                return Some(PostReplyRecoveryOutcome::Finalize {
+                    final_prose: self.answer_only_fallback_response(),
+                    exit_reason: ExitReason::Done,
+                    error_text: String::new(),
+                });
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    "The model answered with next-step prose in answer-only mode. Asked it to answer directly without more tools.",
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            self.push_system_note(
+                "[Answer-only Recovery] Answer the user's request now using only the context already inspected. Do not announce the next action, do not use tools, do not edit files, and do not ask the user to run anything."
+                    .to_string(),
+            );
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+
+        if args.action_expectation == recovery::ActionExpectation::RepoChange
+            && args.repo_edit_calls_made_this_turn == 0
+            && args
+                .recovery_dispatch_gate
+                .allows_generic_repo_change_recovery()
+        {
+            if should_try_framework_app_fallback(
+                args.last_iter,
+                *args.framework_app_fallback_materialized,
+            ) && self.maybe_materialize_framework_game_fallback(args.last_iter)
+            {
+                *args.framework_app_fallback_materialized = true;
+                self.push_system_note(framework_app_fallback_continuation_note().to_string());
+                return Some(PostReplyRecoveryOutcome::Continue);
+            }
+            match self
+                .maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag)
+            {
+                ScaffoldFallbackResult::Applied => {
+                    *args.repo_change_retries = 0;
+                    return Some(PostReplyRecoveryOutcome::Continue);
+                }
+                ScaffoldFallbackResult::Failed | ScaffoldFallbackResult::Skipped => {
+                    *args.repo_change_retries += 1;
+                    if *args.repo_change_retries >= 3 {
+                        return Some(PostReplyRecoveryOutcome::Finalize {
+                            final_prose: String::new(),
+                            exit_reason: ExitReason::MissingRepoEdits,
+                            error_text: ExitReason::MissingRepoEdits
+                                .default_error_text()
+                                .to_string(),
+                        });
+                    }
+                    self.push_system_note(recovery::repo_change_recovery_note(
+                        *args.repo_change_retries,
+                    ));
+                    return Some(PostReplyRecoveryOutcome::Continue);
+                }
+                ScaffoldFallbackResult::NotApplicable => {}
+            }
+            *args.repo_change_retries += 1;
+            if *args.repo_change_retries >= 3 {
+                let request = self.active_request_text().unwrap_or_default();
+                let fallback = match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+                    Ok(fallback) => fallback,
+                    Err(err) => {
+                        return Some(PostReplyRecoveryOutcome::Finalize {
+                            final_prose: String::new(),
+                            exit_reason: ExitReason::TransportError,
+                            error_text: err,
+                        });
+                    }
+                };
+                if let Some(relative) = fallback {
+                    return Some(PostReplyRecoveryOutcome::Finalize {
+                        final_prose: format!(
+                            "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+                        ),
+                        exit_reason: ExitReason::Done,
+                        error_text: String::new(),
+                    });
+                }
+                return Some(PostReplyRecoveryOutcome::Finalize {
+                    final_prose: String::new(),
+                    exit_reason: ExitReason::MissingRepoEdits,
+                    error_text: ExitReason::MissingRepoEdits
+                        .default_error_text()
+                        .to_string(),
+                });
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    "The turn finished without repository edits. Asked the model to continue implementing changes.",
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            if let Some(target) = self.focused_edit_recovery_target() {
+                let target_already_read = focused_edit_target_already_read(
+                    &self.session.messages,
+                    &target,
+                    &self.work_root,
+                );
+                self.push_system_note(self.focused_edit_no_tool_note_for_target(
+                    &target,
+                    target_already_read,
+                    *args.repo_change_retries,
+                ));
+            } else if !self.push_artifact_directed_recovery_note(*args.repo_change_retries) {
+                self.push_system_note(recovery::repo_change_recovery_note(
+                    *args.repo_change_retries,
+                ));
+            }
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+
+        if args.repo_edit_calls_made_this_turn > 0
+            && self.active_python_request_requires_tests()
+            && !self.python_test_artifact_exists()
+            && !self.python_verifier_available_for_requested_tests()
+        {
+            *args.python_test_retries += 1;
+            if *args.python_test_retries >= 2 {
+                let (final_prose, exit_reason, error_text) = match self
+                    .maybe_materialize_python_test_fallback()
+                {
+                    Ok(Some(path)) => (
+                        format!(
+                            "Added the requested Python test artifact with deterministic fallback: {path}."
+                        ),
+                        ExitReason::Done,
+                        String::new(),
+                    ),
+                    Ok(None) => (
+                        String::new(),
+                        ExitReason::MissingRepoEdits,
+                        "assistant did not add the requested Python test artifact".to_string(),
+                    ),
+                    Err(err) => (String::new(), ExitReason::TransportError, err),
+                };
+                return Some(PostReplyRecoveryOutcome::Finalize {
+                    final_prose,
+                    exit_reason,
+                    error_text,
+                });
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Quality gate",
+                    "Asked the model to add the requested Python test file or self-test command.",
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            self.push_system_note(
+                "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
+                    .to_string(),
+            );
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+
+        if !args.requires_action
+            && self.answer_only_mode_active()
+            && answer_only_reply_is_inadequate(args.final_reply)
+        {
+            *args.no_tool_retries += 1;
+            if *args.no_tool_retries >= 2 {
+                self.session
+                    .record_feedback_if_unset(build_feedback_for_no_tool_call(
+                        "answer_only_inadequate_reply",
+                        &self.work_root,
+                    ));
+                return Some(PostReplyRecoveryOutcome::Finalize {
+                    final_prose: self.answer_only_fallback_response(),
+                    exit_reason: ExitReason::Done,
+                    error_text: String::new(),
+                });
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    "The model gave an underspecified answer in answer-only mode. Asked it to provide a concrete response.",
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            self.push_system_note(
+                "[Answer-only Recovery] Answer the user's request now with concrete findings from the available context. Do not output a tool call, do not edit files, and do not ask the user to run anything."
+                    .to_string(),
+            );
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+
+        if should_apply_repo_change_partial_progress_recovery(
+            args.action_expectation,
+            args.repo_edit_calls_made_this_turn,
+            args.final_reply,
+            args.task_contract_action,
+        ) && args
+            .recovery_dispatch_gate
+            .allows_generic_repo_change_recovery()
+        {
+            *args.repo_change_retries += 1;
+            if *args.repo_change_retries >= 3 {
+                return Some(PostReplyRecoveryOutcome::Finalize {
+                    final_prose: String::new(),
+                    exit_reason: ExitReason::MissingRepoEdits,
+                    error_text: ExitReason::MissingRepoEdits
+                        .default_error_text()
+                        .to_string(),
+                });
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    "A small edit landed, but the model answered with next-step prose instead of a completed result. Asked it to keep implementing with tools.",
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            self.push_system_note(recovery::repo_change_partial_progress_note(
+                *args.repo_change_retries,
+            ));
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+
+        if (should_apply_repo_change_quality_gate(
+            args.action_expectation,
+            self.active_task_expects_repo_change(),
+            self.session.mode_state.mode,
+        ) || self.current_request_needs_playable_ui_quality_gate())
+            && args.recovery_dispatch_gate.allows_deterministic_fallback()
+            && let Some((request, target_path, issue)) = self.accepted_repo_change_quality_issue()
+        {
+            match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
+                Ok(true) => {
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            args.last_iter,
+                            self.config.max_iterations,
+                            "Quality fallback",
+                            &format!("Replaced scaffold placeholder output in {target_path}."),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    self.session.record_feedback_if_unset(
+                        build_feedback_for_deterministic_content_fallback(&self.work_root),
+                    );
+                    self.push_deterministic_ui_recovery_continuation_note(
+                        &target_path,
+                        (*args.repo_change_retries).saturating_add(1),
+                    );
+                    return Some(PostReplyRecoveryOutcome::Continue);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    return Some(PostReplyRecoveryOutcome::Finalize {
+                        final_prose: String::new(),
+                        exit_reason: ExitReason::TransportError,
+                        error_text: err,
+                    });
+                }
+            }
+            *args.repo_change_retries += 1;
+            if *args.repo_change_retries >= 3 {
+                return Some(PostReplyRecoveryOutcome::Finalize {
+                    final_prose: String::new(),
+                    exit_reason: ExitReason::MissingRepoEdits,
+                    error_text: issue,
+                });
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Quality gate",
+                    &format!("Asked the model to replace placeholder output in {target_path}."),
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            self.push_system_note(recovery::repo_change_quality_gate_note(
+                &request,
+                &target_path,
+                &issue,
+                *args.repo_change_retries,
+            ));
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+
+        None
+    }
+
     fn run_actor_loop(
         &mut self,
         action_expectation: recovery::ActionExpectation,
@@ -7510,282 +7875,33 @@ impl Agent {
                 continue;
             }
 
-            if !requires_action
-                && self.answer_only_mode_active()
-                && reply_looks_like_future_work(&final_reply)
-            {
-                no_tool_retries += 1;
-                if no_tool_retries >= 1 {
-                    final_prose = self.answer_only_fallback_response();
-                    exit_reason = ExitReason::Done;
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Retry requested",
-                        "The model answered with next-step prose in answer-only mode. Asked it to answer directly without more tools.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(
-                    "[Answer-only Recovery] Answer the user's request now using only the context already inspected. Do not announce the next action, do not use tools, do not edit files, and do not ask the user to run anything."
-                        .to_string(),
-                );
-                continue;
-            }
-
-            if action_expectation == recovery::ActionExpectation::RepoChange
-                && repo_edit_calls_made_this_turn == 0
-                && recovery_dispatch_gate.allows_generic_repo_change_recovery()
-            {
-                if should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
-                    && self.maybe_materialize_framework_game_fallback(last_iter)
-                {
-                    framework_app_fallback_materialized = true;
-                    self.push_system_note(framework_app_fallback_continuation_note().to_string());
-                    continue;
-                }
-                match self.maybe_apply_deterministic_nextjs_scaffold(last_iter, &interrupt_flag) {
-                    ScaffoldFallbackResult::Applied => {
-                        repo_change_retries = 0;
-                        continue;
-                    }
-                    ScaffoldFallbackResult::Failed | ScaffoldFallbackResult::Skipped => {
-                        repo_change_retries += 1;
-                        if repo_change_retries >= 3 {
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = exit_reason.default_error_text().to_string();
-                            break 'outer;
-                        }
-                        self.push_system_note(recovery::repo_change_recovery_note(
-                            repo_change_retries,
-                        ));
-                        continue;
-                    }
-                    ScaffoldFallbackResult::NotApplicable => {}
-                }
-                repo_change_retries += 1;
-                if repo_change_retries >= 3 {
-                    let request = self.active_request_text().unwrap_or_default();
-                    let fallback = match self.maybe_apply_local_llm_small_edit_fallback(&request) {
-                        Ok(fallback) => fallback,
-                        Err(err) => {
-                            exit_reason = ExitReason::TransportError;
-                            error_text = err;
-                            break 'outer;
-                        }
-                    };
-                    if let Some(relative) = fallback {
-                        final_prose = format!(
-                            "Applied a verified small edit fallback after the local model stopped before editing {relative}."
-                        );
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    exit_reason = ExitReason::MissingRepoEdits;
-                    error_text = exit_reason.default_error_text().to_string();
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Retry requested",
-                        "The turn finished without repository edits. Asked the model to continue implementing changes.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                if let Some(target) = self.focused_edit_recovery_target() {
-                    let target_already_read = focused_edit_target_already_read(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    );
-                    self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                        &target,
-                        target_already_read,
-                        repo_change_retries,
-                    ));
-                } else if !self.push_artifact_directed_recovery_note(repo_change_retries) {
-                    self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
-                }
-                continue;
-            }
-
-            if repo_edit_calls_made_this_turn > 0
-                && self.active_python_request_requires_tests()
-                && !self.python_test_artifact_exists()
-                && !self.python_verifier_available_for_requested_tests()
-            {
-                python_test_retries += 1;
-                if python_test_retries >= 2 {
-                    match self.maybe_materialize_python_test_fallback() {
-                        Ok(Some(path)) => {
-                            final_prose = format!(
-                                "Added the requested Python test artifact with deterministic fallback: {path}."
-                            );
-                            exit_reason = ExitReason::Done;
-                        }
-                        Ok(None) => {
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = "assistant did not add the requested Python test artifact"
-                                .to_string();
-                        }
-                        Err(err) => {
-                            exit_reason = ExitReason::TransportError;
-                            error_text = err;
-                        }
-                    }
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Quality gate",
-                        "Asked the model to add the requested Python test file or self-test command.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(
-                    "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
-                        .to_string(),
-                );
-                continue;
-            }
-
-            if !requires_action
-                && self.answer_only_mode_active()
-                && answer_only_reply_is_inadequate(&final_reply)
-            {
-                no_tool_retries += 1;
-                if no_tool_retries >= 2 {
-                    // Issue #455 / D1: answer-only inadequate reply exhaustion
-                    // also records NoToolCall — the model never produced a
-                    // concrete tool call. Recovery still completes via the
-                    // deterministic answer_only_fallback_response, but the
-                    // Reminder Sidecar should still see the failure pattern.
-                    self.session
-                        .record_feedback_if_unset(build_feedback_for_no_tool_call(
-                            "answer_only_inadequate_reply",
-                            &self.work_root,
-                        ));
-                    final_prose = self.answer_only_fallback_response();
-                    exit_reason = ExitReason::Done;
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Retry requested",
-                        "The model gave an underspecified answer in answer-only mode. Asked it to provide a concrete response.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(
-                    "[Answer-only Recovery] Answer the user's request now with concrete findings from the available context. Do not output a tool call, do not edit files, and do not ask the user to run anything."
-                        .to_string(),
-                );
-                continue;
-            }
-
-            if should_apply_repo_change_partial_progress_recovery(
+            if let Some(outcome) = self.handle_post_reply_recovery(PostReplyRecoveryArgs {
+                last_iter,
                 action_expectation,
+                requires_action,
+                recovery_dispatch_gate,
                 repo_edit_calls_made_this_turn,
-                &final_reply,
-                task_contract_action.as_ref(),
-            ) && recovery_dispatch_gate.allows_generic_repo_change_recovery()
-            {
-                repo_change_retries += 1;
-                if repo_change_retries >= 3 {
-                    exit_reason = ExitReason::MissingRepoEdits;
-                    error_text = exit_reason.default_error_text().to_string();
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Retry requested",
-                        "A small edit landed, but the model answered with next-step prose instead of a completed result. Asked it to keep implementing with tools.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(recovery::repo_change_partial_progress_note(
-                    repo_change_retries,
-                ));
-                continue;
-            }
-
-            if (should_apply_repo_change_quality_gate(
-                action_expectation,
-                self.active_task_expects_repo_change(),
-                self.session.mode_state.mode,
-            ) || self.current_request_needs_playable_ui_quality_gate())
-                && recovery_dispatch_gate.allows_deterministic_fallback()
-                && let Some((request, target_path, issue)) =
-                    self.accepted_repo_change_quality_issue()
-            {
-                match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
-                    Ok(true) => {
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Quality fallback",
-                                &format!("Replaced scaffold placeholder output in {target_path}."),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        // Issue #455 / D2 (deterministic content fallback).
-                        self.session.record_feedback_if_unset(
-                            build_feedback_for_deterministic_content_fallback(&self.work_root),
-                        );
-                        self.push_deterministic_ui_recovery_continuation_note(
-                            &target_path,
-                            repo_change_retries.saturating_add(1),
-                        );
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        exit_reason = ExitReason::TransportError;
-                        error_text = err;
+                final_reply: &final_reply,
+                task_contract_action: task_contract_action.as_ref(),
+                interrupt_flag: &interrupt_flag,
+                repo_change_retries: &mut repo_change_retries,
+                python_test_retries: &mut python_test_retries,
+                no_tool_retries: &mut no_tool_retries,
+                framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
+            }) {
+                match outcome {
+                    PostReplyRecoveryOutcome::Continue => continue,
+                    PostReplyRecoveryOutcome::Finalize {
+                        final_prose: next_final_prose,
+                        exit_reason: next_exit_reason,
+                        error_text: next_error_text,
+                    } => {
+                        final_prose = next_final_prose;
+                        exit_reason = next_exit_reason;
+                        error_text = next_error_text;
                         break 'outer;
                     }
                 }
-                repo_change_retries += 1;
-                if repo_change_retries >= 3 {
-                    exit_reason = ExitReason::MissingRepoEdits;
-                    error_text = issue;
-                    break 'outer;
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Quality gate",
-                        &format!("Asked the model to replace placeholder output in {target_path}."),
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(recovery::repo_change_quality_gate_note(
-                    &request,
-                    &target_path,
-                    &issue,
-                    repo_change_retries,
-                ));
-                continue;
             }
 
             // Done
@@ -8180,9 +8296,63 @@ impl Agent {
             return TaskContractVerifierOutcome::Disabled;
         }
 
+        let (verifier_selection, workspace_scope_opt) =
+            self.select_task_contract_verifier_once(changed_files);
+        match verifier_selection {
+            TaskContractVerifierSelection::StructuredRunnable {
+                plan,
+                command,
+                display_command,
+                bound_test_artifacts_count,
+                bound_test_artifacts_paths,
+            } => self.handle_structured_task_contract_verifier_selection(
+                changed_files,
+                workspace_scope_opt.as_ref(),
+                StructuredTaskContractVerifierRun {
+                    plan,
+                    command,
+                    display_command,
+                    bound_test_artifacts_count,
+                    bound_test_artifacts_paths,
+                },
+            ),
+            TaskContractVerifierSelection::StructuredWeak {
+                detected_source,
+                owned_test_artifacts_count,
+            } => self.handle_weak_task_contract_verifier_selection(
+                detected_source,
+                owned_test_artifacts_count,
+            ),
+            TaskContractVerifierSelection::StructuredMissing {
+                outcome,
+                owned_test_artifacts_count,
+            } => self.handle_missing_task_contract_verifier_selection(
+                outcome,
+                owned_test_artifacts_count,
+            ),
+            TaskContractVerifierSelection::LegacyRunnable {
+                plan,
+                command_for_log,
+            } => self.handle_legacy_task_contract_verifier_selection(
+                changed_files,
+                plan,
+                command_for_log,
+            ),
+            TaskContractVerifierSelection::Missing => {
+                self.handle_absent_task_contract_verifier_selection()
+            }
+        }
+    }
+
+    fn select_task_contract_verifier_once(
+        &mut self,
+        changed_files: &[String],
+    ) -> (
+        TaskContractVerifierSelection,
+        Option<super::task_workspace_scope::TaskWorkspaceScope>,
+    ) {
         let recent_successful_bash_commands =
             super::success::recent_successful_bash_commands_since_last_user(&self.session.messages);
-
         let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
             self.task_contract_verifier_test_binding();
         let active_request = self.active_request_text();
@@ -8201,258 +8371,263 @@ impl Agent {
                 }),
             );
         }
+        (
+            select_task_contract_verifier(
+                &self.work_root,
+                changed_files,
+                &recent_successful_bash_commands,
+                &owned_test_artifacts,
+                test_execution_required,
+                workspace_scope_opt.as_ref(),
+                task_contract_project_unit.as_ref(),
+            ),
+            workspace_scope_opt,
+        )
+    }
 
-        let verifier_selection = select_task_contract_verifier(
-            &self.work_root,
-            changed_files,
-            &recent_successful_bash_commands,
-            &owned_test_artifacts,
-            test_execution_required,
-            workspace_scope_opt.as_ref(),
-            task_contract_project_unit.as_ref(),
-        );
-        match verifier_selection {
-            TaskContractVerifierSelection::StructuredRunnable {
-                plan,
-                command,
-                display_command,
-                bound_test_artifacts_count,
-                bound_test_artifacts_paths,
-            } => {
-                let Some(workspace_scope) = workspace_scope_opt.as_ref() else {
-                    return TaskContractVerifierOutcome::NoVerifier;
-                };
-                if command.runner() == "python3" {
-                    self.materialize_python_package_markers_for_owned_test_imports(
-                        &bound_test_artifacts_paths,
-                    );
-                }
-                let invocation_report =
-                    structured_verifier_invocation_report(&self.work_root, &command);
-                if let Some(snapshot) = invocation_report.snapshot.as_ref() {
-                    self.emit_agent_verifier_invoked_if_new(snapshot);
-                }
-                if let Some(hash) = invocation_report.rejected_pythonpath_hash.as_deref() {
-                    self.emit_agent_verifier_external_import_rejected_if_first(
-                        command.runner(),
-                        "external_pythonpath_rejected",
-                        &[(hash, "pythonpath")],
-                        1,
-                        false,
-                    );
-                }
-                let result = {
-                    let _sp = Spinner::start("running verifier...".to_string());
-                    run_structured_task_contract_verifier(
-                        &self.work_root,
-                        workspace_scope,
-                        &command,
-                        &display_command,
-                    )
-                };
-                match result {
-                    Ok(result) => {
-                        log_llm_event(
-                            "agent.autotest.completed",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "command": &result.command,
-                                "passed": result.passed,
-                                "reason": &plan.reason,
-                            }),
-                        );
-                        if let Some(contamination) =
-                            detect_verifier_external_import_contamination(&self.work_root, &result)
-                        {
-                            let created_markers = self
-                                .materialize_python_package_markers_for_external_import(
-                                    &result.stdout,
-                                    &result.stderr,
-                                );
-                            let borrowed = contamination.borrowed_hashes();
-                            self.emit_agent_verifier_external_import_rejected_if_first(
-                                command.runner(),
-                                "external_import_detected",
-                                &borrowed,
-                                contamination.detected_count,
-                                contamination.truncated,
-                            );
-                            return contamination.to_failure_outcome(result, &created_markers);
-                        }
-                        let frame = build_feedback_for_auto_test(
-                            &plan,
-                            &result,
-                            &self.work_root,
-                            changed_files,
-                        );
-                        self.session.record_feedback_if_unset(frame);
-                        self.record_task_contract_verifier_invocation(
-                            &result.command,
-                            result.exit_code,
-                        );
-                        // Issue #659 (Task 2.6): seed the bound test
-                        // path verifier_observations once the result
-                        // is known.
-                        let last_outcome = if result.passed {
-                            super::artifact_ledger::VerifierOutcome::Pass
-                        } else {
-                            super::artifact_ledger::VerifierOutcome::Fail
-                        };
-                        let scope_for_seed = workspace_scope.clone();
-                        self.seed_artifact_ledger_verifier_observation(
-                            &bound_test_artifacts_paths,
-                            last_outcome,
-                            &scope_for_seed,
-                        );
-                        if result.passed {
-                            // PR-001: structured (bound) evidence —
-                            // proof that the verifier argv contained
-                            // the owned test artifact paths.
-                            self.observe_task_contract_verifier_exit_zero_bound(
-                                &result.command,
-                                bound_test_artifacts_count,
-                            );
-                        }
-                        task_contract_auto_test_result_to_outcome(result)
-                    }
-                    Err(error) => {
-                        let command = crate::session::feedback::redact_verifier_command_for_storage(
-                            &display_command,
-                        );
-                        let outcome =
-                            task_contract_verifier_transport_error_to_outcome(command, error);
-                        let outcome_label = task_contract_verifier_outcome_label(&outcome);
-                        log_llm_event(
-                            "agent.task_contract.verifier.completed",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "outcome": outcome_label,
-                                "command": crate::session::feedback::redact_verifier_command_for_storage(&display_command),
-                            }),
-                        );
-                        outcome
-                    }
-                }
-            }
-            TaskContractVerifierSelection::StructuredWeak {
-                detected_source,
-                owned_test_artifacts_count,
-            } => {
-                if !self.session.verifier_safe_stop_emitted_this_turn {
-                    self.session.verifier_safe_stop_emitted_this_turn = true;
-                    log_llm_event(
-                        "agent.verifier.weak",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "turn_index": self.current_turn_index,
-                            "iter_index": self.session.iter_count_this_turn,
-                            "owned_test_artifacts_count": owned_test_artifacts_count,
-                            "command_runner": detected_source,
-                            "auto_test_detected": true,
-                            "test_execution_required": true,
-                        }),
-                    );
-                }
-                let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-                self.session.record_feedback_if_unset(frame);
-                TaskContractVerifierOutcome::SafeStop {
-                    reason: super::task_contract::SafeStopReason::VerifierWeak,
-                }
-            }
-            TaskContractVerifierSelection::StructuredMissing {
-                outcome,
-                owned_test_artifacts_count,
-            } => {
-                self.owned_test_verifier_missing_observed_this_turn = true;
-                self.owned_test_verifier_missing_observed_carryover = self
-                    .active_request_text()
-                    .as_deref()
-                    .map(super::task_contract::RequestCarryoverKey::from_request);
-                let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-                self.session.record_feedback_if_unset(frame);
-                if matches!(outcome, TaskContractVerifierOutcome::NoVerifier) {
-                    log_llm_event(
-                        "agent.task_contract.verifier.completed",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "outcome": "no_structured_verifier",
-                            "owned_test_artifacts_count": owned_test_artifacts_count,
-                            "test_execution_required": true,
-                        }),
-                    );
-                    return TaskContractVerifierOutcome::NoVerifier;
-                }
-                if !self.session.verifier_safe_stop_emitted_this_turn {
-                    self.session.verifier_safe_stop_emitted_this_turn = true;
-                    log_llm_event(
-                        "agent.verifier.missing",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "turn_index": self.current_turn_index,
-                            "iter_index": self.session.iter_count_this_turn,
-                            "owned_test_artifacts_count": owned_test_artifacts_count,
-                            "auto_test_detected": false,
-                            "test_execution_required": true,
-                        }),
-                    );
-                }
-                outcome
-            }
-            TaskContractVerifierSelection::LegacyRunnable {
-                plan,
-                command_for_log,
-            } => {
-                let result = {
-                    let _sp = Spinner::start("running verifier...".to_string());
-                    run_legacy_task_contract_verifier(&self.work_root, &plan)
-                };
-                let Ok(result) = result else {
-                    let outcome = task_contract_verifier_transport_error_to_outcome(
-                        command_for_log.clone(),
-                        result.err().unwrap_or_default(),
-                    );
-                    let outcome_label = task_contract_verifier_outcome_label(&outcome);
-                    log_llm_event(
-                        "agent.task_contract.verifier.completed",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "outcome": outcome_label,
-                            "command": command_for_log,
-                        }),
-                    );
-                    return outcome;
-                };
-                log_llm_event(
-                    "agent.autotest.completed",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "command": command_for_log,
-                        "passed": result.passed,
-                        "reason": &plan.reason,
-                    }),
+    fn handle_structured_task_contract_verifier_selection(
+        &mut self,
+        changed_files: &[String],
+        workspace_scope: Option<&super::task_workspace_scope::TaskWorkspaceScope>,
+        selection: StructuredTaskContractVerifierRun,
+    ) -> TaskContractVerifierOutcome {
+        let Some(workspace_scope) = workspace_scope else {
+            return TaskContractVerifierOutcome::NoVerifier;
+        };
+        if selection.command.runner() == "python3" {
+            self.materialize_python_package_markers_for_owned_test_imports(
+                &selection.bound_test_artifacts_paths,
+            );
+        }
+        let invocation_report =
+            structured_verifier_invocation_report(&self.work_root, &selection.command);
+        if let Some(snapshot) = invocation_report.snapshot.as_ref() {
+            self.emit_agent_verifier_invoked_if_new(snapshot);
+        }
+        if let Some(hash) = invocation_report.rejected_pythonpath_hash.as_deref() {
+            self.emit_agent_verifier_external_import_rejected_if_first(
+                selection.command.runner(),
+                "external_pythonpath_rejected",
+                &[(hash, "pythonpath")],
+                1,
+                false,
+            );
+        }
+        let result = {
+            let _sp = Spinner::start("running verifier...".to_string());
+            run_structured_task_contract_verifier(
+                &self.work_root,
+                workspace_scope,
+                &selection.command,
+                &selection.display_command,
+            )
+        };
+        match result {
+            Ok(result) => self.finish_structured_task_contract_verifier_selection(
+                changed_files,
+                workspace_scope,
+                selection,
+                result,
+            ),
+            Err(error) => {
+                let command = crate::session::feedback::redact_verifier_command_for_storage(
+                    &selection.display_command,
                 );
-                let frame =
-                    build_feedback_for_auto_test(&plan, &result, &self.work_root, changed_files);
-                self.session.record_feedback_if_unset(frame);
-                self.record_task_contract_verifier_invocation(&result.command, result.exit_code);
-                if result.passed {
-                    self.observe_task_contract_verifier_exit_zero(&result.command);
-                }
-                task_contract_auto_test_result_to_outcome(result)
-            }
-            TaskContractVerifierSelection::Missing => {
-                let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-                self.session.record_feedback_if_unset(frame);
+                let outcome = task_contract_verifier_transport_error_to_outcome(command, error);
+                let outcome_label = task_contract_verifier_outcome_label(&outcome);
                 log_llm_event(
                     "agent.task_contract.verifier.completed",
                     serde_json::json!({
                         "session_id": self.session_store.session_id(),
-                        "outcome": "no_verifier",
+                        "outcome": outcome_label,
+                        "command": crate::session::feedback::redact_verifier_command_for_storage(&selection.display_command),
                     }),
                 );
-                TaskContractVerifierOutcome::NoVerifier
+                outcome
             }
         }
+    }
+
+    fn finish_structured_task_contract_verifier_selection(
+        &mut self,
+        changed_files: &[String],
+        workspace_scope: &super::task_workspace_scope::TaskWorkspaceScope,
+        selection: StructuredTaskContractVerifierRun,
+        result: AutoTestResult,
+    ) -> TaskContractVerifierOutcome {
+        log_llm_event(
+            "agent.autotest.completed",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "command": &result.command,
+                "passed": result.passed,
+                "reason": &selection.plan.reason,
+            }),
+        );
+        if let Some(contamination) =
+            detect_verifier_external_import_contamination(&self.work_root, &result)
+        {
+            let created_markers = self.materialize_python_package_markers_for_external_import(
+                &result.stdout,
+                &result.stderr,
+            );
+            let borrowed = contamination.borrowed_hashes();
+            self.emit_agent_verifier_external_import_rejected_if_first(
+                selection.command.runner(),
+                "external_import_detected",
+                &borrowed,
+                contamination.detected_count,
+                contamination.truncated,
+            );
+            return contamination.to_failure_outcome(result, &created_markers);
+        }
+        let frame =
+            build_feedback_for_auto_test(&selection.plan, &result, &self.work_root, changed_files);
+        self.session.record_feedback_if_unset(frame);
+        self.record_task_contract_verifier_invocation(&result.command, result.exit_code);
+        let last_outcome = if result.passed {
+            super::artifact_ledger::VerifierOutcome::Pass
+        } else {
+            super::artifact_ledger::VerifierOutcome::Fail
+        };
+        let scope_for_seed = workspace_scope.clone();
+        self.seed_artifact_ledger_verifier_observation(
+            &selection.bound_test_artifacts_paths,
+            last_outcome,
+            &scope_for_seed,
+        );
+        if result.passed {
+            self.observe_task_contract_verifier_exit_zero_bound(
+                &result.command,
+                selection.bound_test_artifacts_count,
+            );
+        }
+        task_contract_auto_test_result_to_outcome(result)
+    }
+
+    fn handle_weak_task_contract_verifier_selection(
+        &mut self,
+        detected_source: &'static str,
+        owned_test_artifacts_count: usize,
+    ) -> TaskContractVerifierOutcome {
+        if !self.session.verifier_safe_stop_emitted_this_turn {
+            self.session.verifier_safe_stop_emitted_this_turn = true;
+            log_llm_event(
+                "agent.verifier.weak",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "turn_index": self.current_turn_index,
+                    "iter_index": self.session.iter_count_this_turn,
+                    "owned_test_artifacts_count": owned_test_artifacts_count,
+                    "command_runner": detected_source,
+                    "auto_test_detected": true,
+                    "test_execution_required": true,
+                }),
+            );
+        }
+        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+        self.session.record_feedback_if_unset(frame);
+        TaskContractVerifierOutcome::SafeStop {
+            reason: super::task_contract::SafeStopReason::VerifierWeak,
+        }
+    }
+
+    fn handle_missing_task_contract_verifier_selection(
+        &mut self,
+        outcome: TaskContractVerifierOutcome,
+        owned_test_artifacts_count: usize,
+    ) -> TaskContractVerifierOutcome {
+        self.owned_test_verifier_missing_observed_this_turn = true;
+        self.owned_test_verifier_missing_observed_carryover = self
+            .active_request_text()
+            .as_deref()
+            .map(super::task_contract::RequestCarryoverKey::from_request);
+        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+        self.session.record_feedback_if_unset(frame);
+        if matches!(outcome, TaskContractVerifierOutcome::NoVerifier) {
+            log_llm_event(
+                "agent.task_contract.verifier.completed",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "outcome": "no_structured_verifier",
+                    "owned_test_artifacts_count": owned_test_artifacts_count,
+                    "test_execution_required": true,
+                }),
+            );
+            return TaskContractVerifierOutcome::NoVerifier;
+        }
+        if !self.session.verifier_safe_stop_emitted_this_turn {
+            self.session.verifier_safe_stop_emitted_this_turn = true;
+            log_llm_event(
+                "agent.verifier.missing",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "turn_index": self.current_turn_index,
+                    "iter_index": self.session.iter_count_this_turn,
+                    "owned_test_artifacts_count": owned_test_artifacts_count,
+                    "auto_test_detected": false,
+                    "test_execution_required": true,
+                }),
+            );
+        }
+        outcome
+    }
+
+    fn handle_legacy_task_contract_verifier_selection(
+        &mut self,
+        changed_files: &[String],
+        plan: AutoTestPlan,
+        command_for_log: String,
+    ) -> TaskContractVerifierOutcome {
+        let result = {
+            let _sp = Spinner::start("running verifier...".to_string());
+            run_legacy_task_contract_verifier(&self.work_root, &plan)
+        };
+        let Ok(result) = result else {
+            let outcome = task_contract_verifier_transport_error_to_outcome(
+                command_for_log.clone(),
+                result.err().unwrap_or_default(),
+            );
+            let outcome_label = task_contract_verifier_outcome_label(&outcome);
+            log_llm_event(
+                "agent.task_contract.verifier.completed",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "outcome": outcome_label,
+                    "command": command_for_log,
+                }),
+            );
+            return outcome;
+        };
+        log_llm_event(
+            "agent.autotest.completed",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "command": command_for_log,
+                "passed": result.passed,
+                "reason": &plan.reason,
+            }),
+        );
+        let frame = build_feedback_for_auto_test(&plan, &result, &self.work_root, changed_files);
+        self.session.record_feedback_if_unset(frame);
+        self.record_task_contract_verifier_invocation(&result.command, result.exit_code);
+        if result.passed {
+            self.observe_task_contract_verifier_exit_zero(&result.command);
+        }
+        task_contract_auto_test_result_to_outcome(result)
+    }
+
+    fn handle_absent_task_contract_verifier_selection(&mut self) -> TaskContractVerifierOutcome {
+        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+        self.session.record_feedback_if_unset(frame);
+        log_llm_event(
+            "agent.task_contract.verifier.completed",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "outcome": "no_verifier",
+            }),
+        );
+        TaskContractVerifierOutcome::NoVerifier
     }
 
     fn materialize_python_package_markers_for_external_import(
@@ -8539,6 +8714,382 @@ impl Agent {
         (owned_test_artifacts, test_execution_required, Some(scope))
     }
 
+    fn handle_task_contract_verifier_pass(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+        previous_repair_context: Option<super::repair_job::RepairJob>,
+        command: String,
+    ) -> TaskContractVerifierFlowOutcome {
+        if task_contract_needs_verification(
+            self.session.mode_state.mode,
+            args.task_contract,
+            &self.task_contract_evidence_set_this_turn,
+        ) {
+            return TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::MissingVerification,
+                error_text: "verifier passed but verifier evidence could not be recorded"
+                    .to_string(),
+            };
+        }
+        let safe_command = crate::session::feedback::mask_secrets(&command).replace('`', "\\`");
+        if let Some(sanitized) =
+            super::verifier_skill::sanitize_verify_command_for_case_record(&command)
+        {
+            args.task_contract_verify_commands_collected.push(sanitized);
+        }
+        emit_repair_progress_classified_event(
+            self.session_store.session_id(),
+            previous_repair_context.as_ref(),
+            None,
+            true,
+        );
+        self.repair_job = None;
+        self.missing_verifier_job = None;
+        *args.verifier_repair_retries = 0;
+        self.repair_job_artifact_attempts = 0;
+        *args.task_contract_verifier_passed_in_loop = true;
+        self.task_contract_verifier_passed_this_actor_loop = true;
+        TaskContractVerifierFlowOutcome::Done {
+            final_prose: format!(
+                "Completed requested repository changes and verified them with `{safe_command}`."
+            ),
+        }
+    }
+
+    fn handle_task_contract_verifier_failure(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+        previous_repair_context: Option<super::repair_job::RepairJob>,
+        changed_files: &[String],
+        command: String,
+        output: String,
+    ) -> TaskContractVerifierFlowOutcome {
+        *args.contract_verification_retries += 1;
+        let mut repair_context = verifier_repair_context_from_failure(
+            &self.work_root,
+            &command,
+            &output,
+            changed_files,
+            *args.contract_verification_retries,
+            previous_repair_context.as_ref(),
+        );
+        let attempt_limit =
+            task_contract_verifier_failure_attempt_limit(previous_repair_context.as_ref());
+        if *args.contract_verification_retries >= attempt_limit {
+            self.repair_job = Some(repair_context);
+            let (reason, prefix) = if previous_repair_context.is_some() {
+                self.emit_safe_stop_report_for_repair_exhausted();
+                (
+                    ExitReason::RepairExhausted,
+                    "verifier repair budget exhausted",
+                )
+            } else {
+                self.emit_safe_stop_report_for_verifier_failed_safe_stop();
+                (ExitReason::VerifierFailed, "required verifier failed")
+            };
+            return TaskContractVerifierFlowOutcome::Exit {
+                reason,
+                error_text: format!(
+                    "{prefix}: {}\n{}",
+                    crate::session::feedback::mask_secrets(&command),
+                    crate::session::feedback::mask_secrets(&output)
+                ),
+            };
+        }
+        let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
+            &mut repair_context,
+            previous_repair_context.as_ref(),
+        );
+        *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
+        self.task_contract_verifier_repair_pending = true;
+        if let Some(outcome) = repair_context.rerun_outcome {
+            log_llm_event(
+                "agent.verifier_repair.rerun_classified",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "outcome": outcome.as_str(),
+                    "previous_failure_signature": repair_context.previous_failure_signature.as_deref(),
+                    "current_failure_signature": repair_context.failure_signature.as_str(),
+                    "previous_failure_count": repair_context.previous_failure_count,
+                    "current_failure_count": repair_context.failure_count,
+                }),
+            );
+        }
+        emit_repair_progress_classified_event(
+            self.session_store.session_id(),
+            previous_repair_context.as_ref(),
+            Some(&repair_context),
+            false,
+        );
+        self.repair_job = Some(repair_context);
+        self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        self.repair_job_artifact_attempts = 0;
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Verification failed",
+                "Asked the model to repair the repository using verifier diagnostics.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(task_contract_verifier_repair_note(
+            &command,
+            &output,
+            *args.contract_verification_retries,
+            attempt_limit,
+            self.repair_job.as_ref(),
+        ));
+        TaskContractVerifierFlowOutcome::Continue
+    }
+
+    fn handle_task_contract_verifier_no_verifier(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+    ) -> TaskContractVerifierFlowOutcome {
+        if self.missing_verifier_job.is_none() {
+            self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
+                TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
+                args.repo_edit_calls_made_this_turn,
+            ));
+        }
+        let budget_exhausted = self
+            .missing_verifier_job
+            .as_mut()
+            .is_some_and(|job| !job.record_retry());
+        if budget_exhausted {
+            self.emit_safe_stop_report_for_verifier_missing();
+            return TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::MissingVerification,
+                error_text:
+                    "task contract requires verification, but the MissingVerifierJob retry budget is exhausted"
+                        .to_string(),
+            };
+        }
+        *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
+        self.task_contract_verifier_repair_pending = true;
+        self.repair_job = None;
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        self.repair_job_artifact_attempts = 0;
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Verification missing",
+                "Asked the model to add or fix a runnable verifier path.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        let job_attempt = self
+            .missing_verifier_job
+            .as_ref()
+            .map(|job| job.retries_used as usize)
+            .unwrap_or(0);
+        self.push_system_note(task_contract_no_verifier_note(
+            job_attempt,
+            TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            self.active_request_text().unwrap_or_default().as_str(),
+        ));
+        TaskContractVerifierFlowOutcome::Continue
+    }
+
+    fn handle_task_contract_verifier_safe_stop(
+        &mut self,
+        last_iter: usize,
+        reason: super::task_contract::SafeStopReason,
+        source: &'static str,
+    ) -> TaskContractVerifierFlowOutcome {
+        let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
+        log_llm_event(
+            "agent.task_contract.safe_stop",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "iter": last_iter,
+                "outcome": log_outcome,
+                "source": source,
+            }),
+        );
+        TaskContractVerifierFlowOutcome::Exit {
+            reason: mapped_reason,
+            error_text: mapped_reason.default_error_text().to_string(),
+        }
+    }
+
+    fn handle_repair_job_verifier_pass(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+        previous_repair_context: super::repair_job::RepairJob,
+        command: String,
+    ) -> TaskContractVerifierFlowOutcome {
+        if task_contract_needs_verification(
+            self.session.mode_state.mode,
+            args.task_contract,
+            &self.task_contract_evidence_set_this_turn,
+        ) {
+            return TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::MissingVerification,
+                error_text: "verifier passed but verifier evidence could not be recorded"
+                    .to_string(),
+            };
+        }
+        let safe_command = crate::session::feedback::mask_secrets(&command).replace('`', "\\`");
+        if let Some(sanitized) =
+            super::verifier_skill::sanitize_verify_command_for_case_record(&command)
+        {
+            args.task_contract_verify_commands_collected.push(sanitized);
+        }
+        if let Some(job) = self.repair_job.as_mut() {
+            job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
+                delta: super::repair_job::VerifierDelta::Passed,
+            });
+        }
+        emit_repair_progress_classified_event(
+            self.session_store.session_id(),
+            Some(&previous_repair_context),
+            self.repair_job.as_ref(),
+            true,
+        );
+        self.missing_verifier_job = None;
+        *args.verifier_repair_retries = 0;
+        self.repair_job_artifact_attempts = 0;
+        *args.task_contract_verifier_passed_in_loop = true;
+        self.task_contract_verifier_passed_this_actor_loop = true;
+        TaskContractVerifierFlowOutcome::Done {
+            final_prose: format!(
+                "Completed requested repository changes and verified them with `{safe_command}`."
+            ),
+        }
+    }
+
+    fn handle_repair_job_verifier_failure(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+        previous_repair_context: super::repair_job::RepairJob,
+        changed_files: &[String],
+        command: String,
+        output: String,
+    ) -> TaskContractVerifierFlowOutcome {
+        *args.contract_verification_retries += 1;
+        let mut repair_context = verifier_repair_context_from_failure(
+            &self.work_root,
+            &command,
+            &output,
+            changed_files,
+            *args.contract_verification_retries,
+            Some(&previous_repair_context),
+        );
+        let attempt_limit =
+            task_contract_verifier_failure_attempt_limit(Some(&previous_repair_context));
+        if *args.contract_verification_retries >= attempt_limit {
+            self.repair_job = Some(repair_context);
+            self.emit_safe_stop_report_for_repair_exhausted();
+            return TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::RepairExhausted,
+                error_text: format!(
+                    "verifier repair budget exhausted: {}\n{}",
+                    crate::session::feedback::mask_secrets(&command),
+                    crate::session::feedback::mask_secrets(&output)
+                ),
+            };
+        }
+
+        let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
+            &mut repair_context,
+            Some(&previous_repair_context),
+        );
+        *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
+        self.task_contract_verifier_repair_pending = true;
+        if let Some(outcome) = repair_context.rerun_outcome {
+            log_llm_event(
+                "agent.verifier_repair.rerun_classified",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "outcome": outcome.as_str(),
+                    "previous_failure_signature": repair_context.previous_failure_signature.as_deref(),
+                    "current_failure_signature": repair_context.failure_signature.as_str(),
+                    "previous_failure_count": repair_context.previous_failure_count,
+                    "current_failure_count": repair_context.failure_count,
+                    "job_preserving": true,
+                }),
+            );
+        }
+        emit_repair_progress_classified_event(
+            self.session_store.session_id(),
+            Some(&previous_repair_context),
+            Some(&repair_context),
+            false,
+        );
+        self.repair_job = Some(repair_context);
+        self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        self.repair_job_artifact_attempts = 0;
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Verification failed",
+                "Repair job observed verifier failure and updated its state.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(task_contract_verifier_repair_note(
+            &command,
+            &output,
+            *args.contract_verification_retries,
+            attempt_limit,
+            self.repair_job.as_ref(),
+        ));
+        TaskContractVerifierFlowOutcome::Continue
+    }
+
+    fn handle_repair_job_verifier_no_verifier(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+    ) -> TaskContractVerifierFlowOutcome {
+        if let Some(job) = self.repair_job.as_mut() {
+            job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
+                delta: super::repair_job::VerifierDelta::VerifierUnavailable,
+            });
+        }
+        self.task_contract_verifier_repair_pending = true;
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Verification missing",
+                "Repair job observed that no runnable verifier is available.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        TaskContractVerifierFlowOutcome::Continue
+    }
+
+    fn handle_repair_job_verifier_safe_stop(
+        &mut self,
+        last_iter: usize,
+        reason: super::task_contract::SafeStopReason,
+    ) -> TaskContractVerifierFlowOutcome {
+        let outcome =
+            self.handle_task_contract_verifier_safe_stop(last_iter, reason, "repair_job_verifier");
+        if let Some(job) = self.repair_job.as_mut() {
+            job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
+                delta: super::repair_job::VerifierDelta::VerifierUnavailable,
+            });
+        }
+        outcome
+    }
+
     fn drive_task_contract_verifier(
         &mut self,
         args: TaskContractVerifierFlowArgs<'_, '_>,
@@ -8562,217 +9113,18 @@ impl Agent {
         );
         match self.run_task_contract_verifier_once(&changed_files) {
             TaskContractVerifierOutcome::Passed { command } => {
-                if task_contract_needs_verification(
-                    self.session.mode_state.mode,
-                    args.task_contract,
-                    &self.task_contract_evidence_set_this_turn,
-                ) {
-                    return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::MissingVerification,
-                        error_text: "verifier passed but verifier evidence could not be recorded"
-                            .to_string(),
-                    };
-                }
-                let safe_command =
-                    crate::session::feedback::mask_secrets(&command).replace('`', "\\`");
-                if let Some(sanitized) =
-                    super::verifier_skill::sanitize_verify_command_for_case_record(&command)
-                {
-                    args.task_contract_verify_commands_collected.push(sanitized);
-                }
-                emit_repair_progress_classified_event(
-                    self.session_store.session_id(),
-                    previous_repair_context.as_ref(),
-                    None,
-                    true,
-                );
-                self.repair_job = None;
-                // Issue #646 (A1): verifier success retires any in-flight
-                // MissingVerifierJob — no further suppression is needed.
-                self.missing_verifier_job = None;
-                *args.verifier_repair_retries = 0;
-                // Issue #637 (CB-001): mirror the local counter reset on the
-                // Agent-field counter so the next verifier failure / repair
-                // cycle restarts at 1/3.
-                self.repair_job_artifact_attempts = 0;
-                *args.task_contract_verifier_passed_in_loop = true;
-                // Issue #647 (SF1 V3.2): mirror the local flag onto the
-                // Agent so `run_verifier_diagnostic_pass` (called later
-                // in the same actor-loop iteration on re-failure) can
-                // wire `has_verified_public_interface = true` into the
-                // SpecAuthorityInput.
-                self.task_contract_verifier_passed_this_actor_loop = true;
-                TaskContractVerifierFlowOutcome::Done {
-                    final_prose: format!(
-                        "Completed requested repository changes and verified them with `{safe_command}`."
-                    ),
-                }
+                self.handle_task_contract_verifier_pass(args, previous_repair_context, command)
             }
-            TaskContractVerifierOutcome::Failed { command, output } => {
-                *args.contract_verification_retries += 1;
-                let mut repair_context = verifier_repair_context_from_failure(
-                    &self.work_root,
-                    &command,
-                    &output,
+            TaskContractVerifierOutcome::Failed { command, output } => self
+                .handle_task_contract_verifier_failure(
+                    args,
+                    previous_repair_context,
                     &changed_files,
-                    *args.contract_verification_retries,
-                    previous_repair_context.as_ref(),
-                );
-                let attempt_limit =
-                    task_contract_verifier_failure_attempt_limit(previous_repair_context.as_ref());
-                if *args.contract_verification_retries >= attempt_limit {
-                    self.repair_job = Some(repair_context);
-                    let (reason, prefix) = if previous_repair_context.is_some() {
-                        self.emit_safe_stop_report_for_repair_exhausted();
-                        (
-                            ExitReason::RepairExhausted,
-                            "verifier repair budget exhausted",
-                        )
-                    } else {
-                        // Issue #654 (E.3): verifier failed and no safe
-                        // alternative remains before a repair job has made
-                        // progress — emit the bounded structured safe stop
-                        // report before exit.
-                        self.emit_safe_stop_report_for_verifier_failed_safe_stop();
-                        (ExitReason::VerifierFailed, "required verifier failed")
-                    };
-                    return TaskContractVerifierFlowOutcome::Exit {
-                        reason,
-                        error_text: format!(
-                            "{prefix}: {}\n{}",
-                            crate::session::feedback::mask_secrets(&command),
-                            crate::session::feedback::mask_secrets(&output)
-                        ),
-                    };
-                }
-                let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
-                    &mut repair_context,
-                    previous_repair_context.as_ref(),
-                );
-                *args.contract_verifier_repair_edit_count =
-                    Some(args.repo_edit_calls_made_this_turn);
-                self.task_contract_verifier_repair_pending = true;
-                if let Some(outcome) = repair_context.rerun_outcome {
-                    log_llm_event(
-                        "agent.verifier_repair.rerun_classified",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "outcome": outcome.as_str(),
-                            "previous_failure_signature": repair_context.previous_failure_signature.as_deref(),
-                            "current_failure_signature": repair_context.failure_signature.as_str(),
-                            "previous_failure_count": repair_context.previous_failure_count,
-                            "current_failure_count": repair_context.failure_count,
-                        }),
-                    );
-                }
-                emit_repair_progress_classified_event(
-                    self.session_store.session_id(),
-                    previous_repair_context.as_ref(),
-                    Some(&repair_context),
-                    false,
-                );
-                self.repair_job = Some(repair_context);
-                // Issue #662: emit `StopReason::RepairExhausted` once the
-                // ledger lives on `self.repair_job`. `record_safe_stop_report`
-                // dedups internally via `safe_stop_report_emitted`, so no
-                // caller-side `contains` guard is needed. The shared helper
-                // keeps this Applied caller in lockstep with the Invalid
-                // caller (`record_controller_verifier_repair_invalid`) so a
-                // CB-002 regression in either observation site is caught by
-                // the in-crate E2E suite.
-                self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
-                *args.repo_change_retries = 0;
-                *args.verifier_repair_retries = 0;
-                // Issue #637 (CB-001): a new verifier failure starts a fresh
-                // repair cycle; reset the Agent-field counter alongside the
-                // turn-local one so `RepairArtifact` re-enters at 1/3.
-                self.repair_job_artifact_attempts = 0;
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Verification failed",
-                        "Asked the model to repair the repository using verifier diagnostics.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(task_contract_verifier_repair_note(
-                    &command,
-                    &output,
-                    *args.contract_verification_retries,
-                    attempt_limit,
-                    self.repair_job.as_ref(),
-                ));
-                TaskContractVerifierFlowOutcome::Continue
-            }
+                    command,
+                    output,
+                ),
             TaskContractVerifierOutcome::NoVerifier => {
-                // Issue #646 (A1): the MissingVerifierJob is the first-class
-                // owner of the NoVerifier retry budget. Create the job on
-                // the first transition and advance it on every subsequent
-                // one. The legacy `contract_verification_retries` counter
-                // is intentionally NOT incremented for NoVerifier
-                // transitions any more — it tracks verifier *failures*, a
-                // distinct lifecycle (NoVerifier ≠ Failed). Exiting on
-                // exhausted budget happens here, before any of the
-                // pending-flag bookkeeping below.
-                if self.missing_verifier_job.is_none() {
-                    self.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
-                        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
-                        args.repo_edit_calls_made_this_turn,
-                    ));
-                }
-                let budget_exhausted = self
-                    .missing_verifier_job
-                    .as_mut()
-                    .is_some_and(|job| !job.record_retry());
-                if budget_exhausted {
-                    // Issue #654 (E.5): MissingVerifierJob budget exhausted —
-                    // emit the bounded structured safe stop report through
-                    // the FromMissingVerifier builder.
-                    self.emit_safe_stop_report_for_verifier_missing();
-                    return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::MissingVerification,
-                        error_text:
-                            "task contract requires verification, but the MissingVerifierJob retry budget is exhausted"
-                                .to_string(),
-                    };
-                }
-                *args.contract_verifier_repair_edit_count =
-                    Some(args.repo_edit_calls_made_this_turn);
-                self.task_contract_verifier_repair_pending = true;
-                self.repair_job = None;
-                *args.repo_change_retries = 0;
-                *args.verifier_repair_retries = 0;
-                // Issue #637 (CB-001): transitioning to NoVerifier resets the
-                // turn-local counter; mirror that on the Agent-field counter
-                // so subsequent verifier failures start at 1/3.
-                self.repair_job_artifact_attempts = 0;
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Verification missing",
-                        "Asked the model to add or fix a runnable verifier path.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                // Issue #646 (A1): prompt uses the MissingVerifierJob's
-                // own counter so the displayed attempt N/M reflects the
-                // first-class retry budget, not the legacy verifier-failure
-                // counter.
-                let job_attempt = self
-                    .missing_verifier_job
-                    .as_ref()
-                    .map(|job| job.retries_used as usize)
-                    .unwrap_or(0);
-                self.push_system_note(task_contract_no_verifier_note(
-                    job_attempt,
-                    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                    self.active_request_text().unwrap_or_default().as_str(),
-                ));
-                TaskContractVerifierFlowOutcome::Continue
+                self.handle_task_contract_verifier_no_verifier(args)
             }
             TaskContractVerifierOutcome::Disabled => TaskContractVerifierFlowOutcome::Exit {
                 reason: ExitReason::MissingVerification,
@@ -8785,30 +9137,12 @@ impl Agent {
                     error_text: error,
                 }
             }
-            // Issue #651 PR-002: structured-runner SafeStop. Map the
-            // type-level reason directly to ExitReason::SafeStopVerifier
-            // {Weak,Missing}, bypassing the MissingVerifierJob retry
-            // path. The mapping is delegated to the pure helper
-            // `task_contract_verifier_safe_stop_mapping` so the SafeStop
-            // dispatch can be unit tested without the surrounding agent
-            // harness.
-            TaskContractVerifierOutcome::SafeStop { reason } => {
-                let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
-                log_llm_event(
-                    "agent.task_contract.safe_stop",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "turn_index": self.current_turn_index,
-                        "iter": args.last_iter,
-                        "outcome": log_outcome,
-                        "source": "task_contract_verifier",
-                    }),
-                );
-                TaskContractVerifierFlowOutcome::Exit {
-                    reason: mapped_reason,
-                    error_text: mapped_reason.default_error_text().to_string(),
-                }
-            }
+            TaskContractVerifierOutcome::SafeStop { reason } => self
+                .handle_task_contract_verifier_safe_stop(
+                    args.last_iter,
+                    reason,
+                    "task_contract_verifier",
+                ),
         }
     }
 
@@ -9003,142 +9337,18 @@ impl Agent {
 
         match self.run_task_contract_verifier_once(&changed_files) {
             TaskContractVerifierOutcome::Passed { command } => {
-                if task_contract_needs_verification(
-                    self.session.mode_state.mode,
-                    args.task_contract,
-                    &self.task_contract_evidence_set_this_turn,
-                ) {
-                    return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::MissingVerification,
-                        error_text: "verifier passed but verifier evidence could not be recorded"
-                            .to_string(),
-                    };
-                }
-                let safe_command =
-                    crate::session::feedback::mask_secrets(&command).replace('`', "\\`");
-                if let Some(sanitized) =
-                    super::verifier_skill::sanitize_verify_command_for_case_record(&command)
-                {
-                    args.task_contract_verify_commands_collected.push(sanitized);
-                }
-                if let Some(job) = self.repair_job.as_mut() {
-                    job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
-                        delta: super::repair_job::VerifierDelta::Passed,
-                    });
-                }
-                emit_repair_progress_classified_event(
-                    self.session_store.session_id(),
-                    Some(&previous_repair_context),
-                    self.repair_job.as_ref(),
-                    true,
-                );
-                self.missing_verifier_job = None;
-                *args.verifier_repair_retries = 0;
-                self.repair_job_artifact_attempts = 0;
-                *args.task_contract_verifier_passed_in_loop = true;
-                self.task_contract_verifier_passed_this_actor_loop = true;
-                TaskContractVerifierFlowOutcome::Done {
-                    final_prose: format!(
-                        "Completed requested repository changes and verified them with `{safe_command}`."
-                    ),
-                }
+                self.handle_repair_job_verifier_pass(args, previous_repair_context, command)
             }
-            TaskContractVerifierOutcome::Failed { command, output } => {
-                *args.contract_verification_retries += 1;
-                let mut repair_context = verifier_repair_context_from_failure(
-                    &self.work_root,
-                    &command,
-                    &output,
+            TaskContractVerifierOutcome::Failed { command, output } => self
+                .handle_repair_job_verifier_failure(
+                    args,
+                    previous_repair_context,
                     &changed_files,
-                    *args.contract_verification_retries,
-                    Some(&previous_repair_context),
-                );
-                let attempt_limit =
-                    task_contract_verifier_failure_attempt_limit(Some(&previous_repair_context));
-                if *args.contract_verification_retries >= attempt_limit {
-                    self.repair_job = Some(repair_context);
-                    self.emit_safe_stop_report_for_repair_exhausted();
-                    return TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::RepairExhausted,
-                        error_text: format!(
-                            "verifier repair budget exhausted: {}\n{}",
-                            crate::session::feedback::mask_secrets(&command),
-                            crate::session::feedback::mask_secrets(&output)
-                        ),
-                    };
-                }
-
-                let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
-                    &mut repair_context,
-                    Some(&previous_repair_context),
-                );
-                *args.contract_verifier_repair_edit_count =
-                    Some(args.repo_edit_calls_made_this_turn);
-                self.task_contract_verifier_repair_pending = true;
-                if let Some(outcome) = repair_context.rerun_outcome {
-                    log_llm_event(
-                        "agent.verifier_repair.rerun_classified",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "outcome": outcome.as_str(),
-                            "previous_failure_signature": repair_context.previous_failure_signature.as_deref(),
-                            "current_failure_signature": repair_context.failure_signature.as_str(),
-                            "previous_failure_count": repair_context.previous_failure_count,
-                            "current_failure_count": repair_context.failure_count,
-                            "job_preserving": true,
-                        }),
-                    );
-                }
-                emit_repair_progress_classified_event(
-                    self.session_store.session_id(),
-                    Some(&previous_repair_context),
-                    Some(&repair_context),
-                    false,
-                );
-                self.repair_job = Some(repair_context);
-                self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
-                *args.repo_change_retries = 0;
-                *args.verifier_repair_retries = 0;
-                self.repair_job_artifact_attempts = 0;
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Verification failed",
-                        "Repair job observed verifier failure and updated its state.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.push_system_note(task_contract_verifier_repair_note(
-                    &command,
-                    &output,
-                    *args.contract_verification_retries,
-                    attempt_limit,
-                    self.repair_job.as_ref(),
-                ));
-                TaskContractVerifierFlowOutcome::Continue
-            }
+                    command,
+                    output,
+                ),
             TaskContractVerifierOutcome::NoVerifier => {
-                if let Some(job) = self.repair_job.as_mut() {
-                    job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
-                        delta: super::repair_job::VerifierDelta::VerifierUnavailable,
-                    });
-                }
-                self.task_contract_verifier_repair_pending = true;
-                *args.repo_change_retries = 0;
-                *args.verifier_repair_retries = 0;
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Verification missing",
-                        "Repair job observed that no runnable verifier is available.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                TaskContractVerifierFlowOutcome::Continue
+                self.handle_repair_job_verifier_no_verifier(args)
             }
             TaskContractVerifierOutcome::Disabled => TaskContractVerifierFlowOutcome::Exit {
                 reason: ExitReason::MissingVerification,
@@ -9152,26 +9362,7 @@ impl Agent {
                 }
             }
             TaskContractVerifierOutcome::SafeStop { reason } => {
-                let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
-                log_llm_event(
-                    "agent.task_contract.safe_stop",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "turn_index": self.current_turn_index,
-                        "iter": args.last_iter,
-                        "outcome": log_outcome,
-                        "source": "repair_job_verifier",
-                    }),
-                );
-                if let Some(job) = self.repair_job.as_mut() {
-                    job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
-                        delta: super::repair_job::VerifierDelta::VerifierUnavailable,
-                    });
-                }
-                TaskContractVerifierFlowOutcome::Exit {
-                    reason: mapped_reason,
-                    error_text: mapped_reason.default_error_text().to_string(),
-                }
+                self.handle_repair_job_verifier_safe_stop(args.last_iter, reason)
             }
         }
     }
@@ -9912,97 +10103,26 @@ impl Agent {
             .map(|policy| policy.target.as_path());
         let messages = self.build_request_messages(protocol, &effective_tool_policy);
         let assistant_model = self.current_assistant_model();
-        let focused_edit_timeout_override = focused_edit_timeout_override_secs(
+        let request_plan = build_assistant_request_plan(
             assistant_model.as_str(),
+            native_tools_enabled,
+            stream_output,
+            io::stdin().is_terminal(),
             &self.session.messages,
             focused_edit_target,
             &self.work_root,
         );
-        let focused_edit_max_predict_override = focused_edit_max_predict_override(
-            assistant_model.as_str(),
-            &self.session.messages,
-            focused_edit_target,
-            &self.work_root,
-        );
-        let force_non_streaming_for_focused_edit =
-            focused_edit_timeout_override.is_some() || focused_edit_max_predict_override.is_some();
-        let use_streaming_transport = !force_non_streaming_for_focused_edit
-            && should_use_streaming_transport(
-                assistant_model.as_str(),
-                native_tools_enabled,
-                stream_output,
-                io::stdin().is_terminal(),
-            );
-
         let tool_specs = self.tool_specs_for_policy(&effective_tool_policy);
 
-        if use_streaming_transport {
-            let mut first_chunk = true;
-            // Issue #431: resolve renderer behavior at call-site (env /
-            // is_terminal) and wire it as the terminal stage of the display
-            // pipeline. Session storage still receives `reply.content` raw.
-            let markdown_disabled = crate::tui::markdown::markdown_fully_disabled();
-            let color = crate::tui::markdown::color_enabled_for_markdown();
-            let utf8 = crate::tui::markdown::markdown_unicode_enabled();
-            tracing::debug!(
-                disabled = markdown_disabled,
-                color,
-                utf8,
-                "markdown renderer state for this stream"
-            );
-            let mut renderer = if markdown_disabled {
-                None
-            } else {
-                Some(crate::tui::markdown::MarkdownRenderer::new(color, utf8))
-            };
-            let reply = self.client.chat_streaming_with_mode(
-                assistant_model.as_str(),
+        if request_plan.use_streaming_transport {
+            self.request_streaming_assistant_reply(
                 &messages,
                 &tool_specs,
                 native_tools_enabled,
-                |chunk| {
-                    if interrupt_flag.is_set() {
-                        if let Some(sig) = &stop_signal {
-                            sig.trigger();
-                        }
-                        return Err(USER_INTERRUPT_ERROR.to_string());
-                    }
-                    if first_chunk {
-                        // First chunk: stop spinner immediately (stop flag +
-                        // Condvar notify) so no spinner residue appears before
-                        // "assistant> ". Safe when `stop_signal` is None.
-                        if stream_output && let Some(sig) = &stop_signal {
-                            sig.trigger();
-                        }
-                        if stream_output {
-                            write_stdout_rendered("assistant> ", false);
-                        }
-                        first_chunk = false;
-                    }
-                    if let Some(r) = renderer.as_mut() {
-                        let out = r.push_chunk(chunk);
-                        if !out.is_empty() && stream_output {
-                            write_stdout_rendered(&out, false);
-                        }
-                    } else {
-                        if stream_output {
-                            write_stdout_rendered(chunk, false);
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            // Drain any residual buffered content before the closing newline.
-            if let Some(r) = renderer.as_mut() {
-                let tail = r.flush();
-                if !tail.is_empty() && stream_output {
-                    write_stdout_rendered(&tail, false);
-                }
-            }
-            if stream_output && !first_chunk {
-                write_stdout_rendered("", true);
-            }
-            Ok(reply)
+                stream_output,
+                stop_signal,
+                interrupt_flag,
+            )
         } else {
             request_non_streaming_assistant_reply(
                 &self.client,
@@ -10010,10 +10130,79 @@ impl Agent {
                 &messages,
                 &tool_specs,
                 native_tools_enabled,
-                focused_edit_timeout_override,
-                focused_edit_max_predict_override,
+                request_plan.focused_edit_timeout_override,
+                request_plan.focused_edit_max_predict_override,
             )
         }
+    }
+
+    fn request_streaming_assistant_reply(
+        &self,
+        messages: &[ConversationMessage],
+        tool_specs: &[ToolSpec],
+        native_tools_enabled: bool,
+        stream_output: bool,
+        stop_signal: Option<SpinnerStopSignal>,
+        interrupt_flag: &InterruptFlag,
+    ) -> Result<AssistantReply, String> {
+        let assistant_model = self.current_assistant_model();
+        let mut first_chunk = true;
+        let markdown_disabled = crate::tui::markdown::markdown_fully_disabled();
+        let color = crate::tui::markdown::color_enabled_for_markdown();
+        let utf8 = crate::tui::markdown::markdown_unicode_enabled();
+        tracing::debug!(
+            disabled = markdown_disabled,
+            color,
+            utf8,
+            "markdown renderer state for this stream"
+        );
+        let mut renderer = if markdown_disabled {
+            None
+        } else {
+            Some(crate::tui::markdown::MarkdownRenderer::new(color, utf8))
+        };
+        let reply = self.client.chat_streaming_with_mode(
+            assistant_model.as_str(),
+            messages,
+            tool_specs,
+            native_tools_enabled,
+            |chunk| {
+                if interrupt_flag.is_set() {
+                    if let Some(sig) = &stop_signal {
+                        sig.trigger();
+                    }
+                    return Err(USER_INTERRUPT_ERROR.to_string());
+                }
+                if first_chunk {
+                    if stream_output && let Some(sig) = &stop_signal {
+                        sig.trigger();
+                    }
+                    if stream_output {
+                        write_stdout_rendered("assistant> ", false);
+                    }
+                    first_chunk = false;
+                }
+                if let Some(r) = renderer.as_mut() {
+                    let out = r.push_chunk(chunk);
+                    if !out.is_empty() && stream_output {
+                        write_stdout_rendered(&out, false);
+                    }
+                } else if stream_output {
+                    write_stdout_rendered(chunk, false);
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(r) = renderer.as_mut() {
+            let tail = r.flush();
+            if !tail.is_empty() && stream_output {
+                write_stdout_rendered(&tail, false);
+            }
+        }
+        if stream_output && !first_chunk {
+            write_stdout_rendered("", true);
+        }
+        Ok(reply)
     }
 
     fn current_assistant_model(&self) -> String {
@@ -11441,119 +11630,25 @@ impl Agent {
     }
 
     fn run_verifier_diagnostic_pass(&mut self) -> VerifierDiagnosticPassOutcome {
-        // Issue #647 (CB-013): before the Skipped short-circuit consults
-        // `context.assessment.is_some()`, detect the "advanced semantic_plan
-        // + stale assessment" state that CB-012 catches at the decision
-        // layer. If we are in that state, clear the stale assessment so the
-        // diagnostic actually runs — otherwise the Skipped short-circuit
-        // below would fire and neutralize the CB-012 fix at the production
-        // layer (the decision layer returns NeedDiagnostic, but this runner
-        // refuses to actually run because the stale assessment is still
-        // present).
-        //
-        // We deliberately do NOT touch `assessment_attempts` here — the
-        // existing diagnostic runner logic below increments it via the
-        // `current.assessment_attempts = current.assessment_attempts.saturating_add(1)`
-        // line after `verifier_diagnostic_attempt_spec` resolves. We only
-        // clear the stale assessment + flip `diagnostic_attempted` back to
-        // `false` so a fresh diagnostic pass is permitted under the same
-        // attempt budget.
-        let stale_advance = self.repair_job.as_ref().is_some_and(|job| {
-            super::repair_job::has_stale_assessment_after_cluster_advance(job, &self.work_root)
-        });
-        let target_exhausted = self
-            .repair_job
-            .as_ref()
-            .is_some_and(|job| job.needs_diagnostic_after_target_exhaustion());
-        if (stale_advance || target_exhausted)
-            && let Some(current) = self.repair_job.as_mut()
-        {
-            current.assessment = None;
-            current.diagnostic_attempted = false;
-            if target_exhausted {
-                current.repair_target_hint = None;
-                current.assessment_bound_cluster_id = None;
-            }
-        }
-        let Some(context) = self.repair_job.clone() else {
-            return VerifierDiagnosticPassOutcome::Skipped;
+        let prepared = match self.prepare_verifier_diagnostic_pass() {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
         };
-        if context.diagnostic_unavailable || context.assessment.is_some() {
-            return VerifierDiagnosticPassOutcome::Skipped;
-        }
-        let Some(attempt_spec) = verifier_diagnostic_attempt_spec(
-            &self.models.main,
-            self.models.sidecar.as_deref(),
-            context.assessment_attempts,
-        ) else {
-            let error = context
-                .diagnostic_error
-                .clone()
-                .unwrap_or_else(|| "diagnostic attempts exhausted".to_string());
-            self.record_verifier_diagnostic_unavailable(error.clone());
-            return VerifierDiagnosticPassOutcome::Unavailable { error };
+        let reply_content = match self.request_verifier_diagnostic_reply(&prepared) {
+            Ok(reply_content) => reply_content,
+            Err(outcome) => return outcome,
         };
-        if let Some(current) = self.repair_job.as_mut() {
-            current.diagnostic_attempted = true;
-            current.assessment_attempts = current.assessment_attempts.saturating_add(1);
-        }
-
-        let active_request = self.active_request_text().unwrap_or_default();
-        // Issue #665 Phase 5: caller-side projection build (sidecar accessor
-        // pattern). `TaskContract::from_request` is pure-fn / pure data, no
-        // side effect. Per design policy §7 #6 we deliberately do NOT cache
-        // (YAGNI).
-        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
-        let behavior_projection =
-            super::required_behavior::project_behavior_contract(&task_contract);
-        let messages = verifier_diagnostic_messages(
-            &self.work_root,
-            &context,
-            &active_request,
-            behavior_projection.as_ref(),
-        );
-        // Issue #665 Phase 6 (S5-006): emit `agent.behavior_contract.projected`
-        // event once per turn per (consumer + key) — only when projection is
-        // actually consumed by this prompt site.
-        self.emit_behavior_contract_projected_if_changed(
-            behavior_projection.as_ref(),
-            super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_DIAGNOSTIC,
-        );
-        let diagnostic_client = match self
-            .client
-            .clone_with_overrides(attempt_spec.timeout_secs, VERIFIER_DIAGNOSTIC_MAX_PREDICT)
-        {
-            Ok(client) => client,
-            Err(err) => {
-                return self.handle_verifier_diagnostic_failure(
-                    format!("client clone failed: {err}"),
-                    attempt_spec.role,
-                );
-            }
-        };
-        let reply = match diagnostic_client.chat_text_json_control(&attempt_spec.model, &messages) {
-            Ok(reply) => reply,
-            Err(err) => {
-                return self.handle_verifier_diagnostic_failure(err, attempt_spec.role);
-            }
-        };
-        if !reply.tool_calls.is_empty() {
-            return self.handle_verifier_diagnostic_failure(
-                "diagnostic reply contained unexpected tool calls".to_string(),
-                attempt_spec.role,
-            );
-        }
-        let Some(mut parsed) = parse_verifier_repair_assessment_reply(&reply.content) else {
+        let Some(mut parsed) = parse_verifier_repair_assessment_reply(&reply_content) else {
             return self.handle_verifier_diagnostic_failure(
                 "diagnostic reply was malformed".to_string(),
-                attempt_spec.role,
+                prepared.attempt_spec.role,
             );
         };
         let framework_findings = verifier_framework_findings_for_diagnostic(
             &self.work_root,
-            &context.command,
-            &verifier_framework_signal_for_context(&context),
-            &verifier_diagnostic_file_excerpts(&self.work_root, &context),
+            &prepared.context.command,
+            &verifier_framework_signal_for_context(&prepared.context),
+            &verifier_diagnostic_file_excerpts(&self.work_root, &prepared.context),
         );
         let framework_override =
             apply_framework_findings_to_parsed_assessment(&mut parsed, &framework_findings);
@@ -11576,10 +11671,10 @@ impl Agent {
         // `model_assessment_to_verifier_repair_assessment` for the full
         // responsibility split.
         let semantic_report = if framework_override {
-            build_semantic_failure_report_from_legacy(&parsed, &context)
+            build_semantic_failure_report_from_legacy(&parsed, &prepared.context)
         } else {
-            parse_semantic_failure_report_from_reply(&reply.content)
-                .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &context))
+            parse_semantic_failure_report_from_reply(&reply_content)
+                .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &prepared.context))
         };
         // Issue #647 (SF1 / V3): build the `SpecAuthorityInput` from the
         // four real detectors wired in V3:
@@ -11649,7 +11744,7 @@ impl Agent {
         // is the one this plan was built against — the controller can route
         // to NeedFreshRead/NeedEdit instead of looping back to
         // NeedDiagnostic on the same cluster.
-        let pre_bump_assessment_generation = context.assessment_generation;
+        let pre_bump_assessment_generation = prepared.context.assessment_generation;
         let mut semantic_plan = semantic_report.and_then(|report| {
             build_semantic_repair_plan_from_report_with_authority_input(
                 report,
@@ -11663,7 +11758,7 @@ impl Agent {
         // the `RepairJob` it never touches.
         let assessment = model_assessment_to_verifier_repair_assessment(
             &self.work_root,
-            &context,
+            &prepared.context,
             parsed.clone(),
             &admission,
         );
@@ -11671,30 +11766,32 @@ impl Agent {
         if !has_target {
             return self.handle_verifier_diagnostic_failure(
                 "diagnostic did not identify a safe repair target".to_string(),
-                attempt_spec.role,
+                prepared.attempt_spec.role,
             );
         }
         log_llm_event(
             "agent.verifier_repair_pipeline.shadow",
             build_verifier_repair_pipeline_shadow_payload(
                 self.session_store.session_id(),
-                &attempt_spec.model,
-                attempt_spec.role,
-                &context,
+                &prepared.attempt_spec.model,
+                prepared.attempt_spec.role,
+                &prepared.context,
                 &parsed,
                 &assessment,
             ),
         );
         if semantic_plan.is_none() {
-            semantic_plan =
-                build_semantic_failure_report_from_legacy_assessment(&assessment, &context)
-                    .and_then(|report| {
-                        build_semantic_repair_plan_from_report_with_authority_input(
-                            report,
-                            authority_input.clone(),
-                            pre_bump_assessment_generation,
-                        )
-                    });
+            semantic_plan = build_semantic_failure_report_from_legacy_assessment(
+                &assessment,
+                &prepared.context,
+            )
+            .and_then(|report| {
+                build_semantic_repair_plan_from_report_with_authority_input(
+                    report,
+                    authority_input.clone(),
+                    pre_bump_assessment_generation,
+                )
+            });
         }
         if let Some(current) = self.repair_job.as_mut() {
             current.failure_type = assessment.failure_type;
@@ -11764,12 +11861,115 @@ impl Agent {
             "agent.verifier_diagnostic.completed",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
-                "model": attempt_spec.model,
-                "role": attempt_spec.role,
+                "model": prepared.attempt_spec.model,
+                "role": prepared.attempt_spec.role,
                 "accepted": has_target,
             }),
         );
         VerifierDiagnosticPassOutcome::Accepted
+    }
+
+    fn prepare_verifier_diagnostic_pass(
+        &mut self,
+    ) -> Result<PreparedVerifierDiagnosticPass, VerifierDiagnosticPassOutcome> {
+        self.reset_verifier_diagnostic_state_if_needed();
+        let Some(context) = self.repair_job.clone() else {
+            return Err(VerifierDiagnosticPassOutcome::Skipped);
+        };
+        if context.diagnostic_unavailable || context.assessment.is_some() {
+            return Err(VerifierDiagnosticPassOutcome::Skipped);
+        }
+        let Some(attempt_spec) = verifier_diagnostic_attempt_spec(
+            &self.models.main,
+            self.models.sidecar.as_deref(),
+            context.assessment_attempts,
+        ) else {
+            let error = context
+                .diagnostic_error
+                .clone()
+                .unwrap_or_else(|| "diagnostic attempts exhausted".to_string());
+            self.record_verifier_diagnostic_unavailable(error.clone());
+            return Err(VerifierDiagnosticPassOutcome::Unavailable { error });
+        };
+        if let Some(current) = self.repair_job.as_mut() {
+            current.diagnostic_attempted = true;
+            current.assessment_attempts = current.assessment_attempts.saturating_add(1);
+        }
+        let active_request = self.active_request_text().unwrap_or_default();
+        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+        let behavior_projection =
+            super::required_behavior::project_behavior_contract(&task_contract);
+        self.emit_behavior_contract_projected_if_changed(
+            behavior_projection.as_ref(),
+            super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_DIAGNOSTIC,
+        );
+        Ok(PreparedVerifierDiagnosticPass {
+            context,
+            attempt_spec,
+            active_request,
+            behavior_projection,
+        })
+    }
+
+    fn reset_verifier_diagnostic_state_if_needed(&mut self) {
+        let stale_advance = self.repair_job.as_ref().is_some_and(|job| {
+            super::repair_job::has_stale_assessment_after_cluster_advance(job, &self.work_root)
+        });
+        let target_exhausted = self
+            .repair_job
+            .as_ref()
+            .is_some_and(|job| job.needs_diagnostic_after_target_exhaustion());
+        if (stale_advance || target_exhausted)
+            && let Some(current) = self.repair_job.as_mut()
+        {
+            current.assessment = None;
+            current.diagnostic_attempted = false;
+            if target_exhausted {
+                current.repair_target_hint = None;
+                current.assessment_bound_cluster_id = None;
+            }
+        }
+    }
+
+    fn request_verifier_diagnostic_reply(
+        &mut self,
+        prepared: &PreparedVerifierDiagnosticPass,
+    ) -> Result<String, VerifierDiagnosticPassOutcome> {
+        let messages = verifier_diagnostic_messages(
+            &self.work_root,
+            &prepared.context,
+            &prepared.active_request,
+            prepared.behavior_projection.as_ref(),
+        );
+        let diagnostic_client = match self.client.clone_with_overrides(
+            prepared.attempt_spec.timeout_secs,
+            VERIFIER_DIAGNOSTIC_MAX_PREDICT,
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                return Err(self.handle_verifier_diagnostic_failure(
+                    format!("client clone failed: {err}"),
+                    prepared.attempt_spec.role,
+                ));
+            }
+        };
+        let reply = match diagnostic_client
+            .chat_text_json_control(&prepared.attempt_spec.model, &messages)
+        {
+            Ok(reply) => reply,
+            Err(err) => {
+                return Err(
+                    self.handle_verifier_diagnostic_failure(err, prepared.attempt_spec.role)
+                );
+            }
+        };
+        if !reply.tool_calls.is_empty() {
+            return Err(self.handle_verifier_diagnostic_failure(
+                "diagnostic reply contained unexpected tool calls".to_string(),
+                prepared.attempt_spec.role,
+            ));
+        }
+        Ok(reply.content)
     }
 
     fn handle_verifier_diagnostic_failure(
@@ -12243,16 +12443,164 @@ impl Agent {
         &mut self,
         target_hint: &super::task_contract::RecoveryTargetHint,
     ) -> VerifierRepairPassOutcome {
+        let mut prepared = match self.prepare_verifier_repair_pass(target_hint) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
+        let pass_started = Instant::now();
+
+        let mut last_error = "repair pass did not run".to_string();
+        // Issue #653 (DR2-005): 1 pass = 最大 1 outcome push。retry loop 内では
+        // 最新の invalid outcome を上書きし、loop 終了時に Invalid に載せる。
+        // Issue #653 CB-001: 各 attempt 冒頭で `None` にリセットし、過去 attempt の
+        // ledger 対象 outcome (典型的には `RejectedUnsafe`) が ledger-non-target な
+        // 後続失敗 (parse error / duplicate / exact match 失敗 / apply 失敗 /
+        // LLM request 失敗 / 予期せぬ tool call) に紛れて伝播しないようにする。
+        // `VerifierRepairPassOutcome::Invalid` は **最後の attempt が ledger 対象
+        // だった場合のみ** `Some(...)` を載せる契約 (DR2-005)。
+        let mut last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome> =
+            None;
+        for attempt in 1..=VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
+            // Issue #653 CB-001: 各 attempt 開始時にリセット。これ以降の branch で
+            // 明示的に `Some(...)` を入れた場合のみ最終 `Invalid` outcome に伝播する。
+            last_invalid_outcome = None;
+            let Some(attempt_timeout_secs) =
+                verifier_repair_pass_attempt_timeout_secs(pass_started.elapsed())
+            else {
+                last_error = verifier_repair_pass_timeout_error(pass_started.elapsed());
+                log_llm_event(
+                    "agent.verifier_repair_pass.timeout",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "model": &prepared.model,
+                        "path": target_hint.path,
+                        "attempt": attempt,
+                        "elapsed_secs": pass_started.elapsed().as_secs(),
+                        "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
+                    }),
+                );
+                break;
+            };
+            let repair_client = match self
+                .client
+                .clone_with_overrides(attempt_timeout_secs, VERIFIER_REPAIR_PASS_MAX_PREDICT)
+            {
+                Ok(client) => client,
+                Err(err) => {
+                    last_error =
+                        format!("verifier_repair_pass_invalid: client clone failed: {err}");
+                    break;
+                }
+            };
+            let reply = match repair_client
+                .chat_text_json_control(&prepared.model, &prepared.messages)
+            {
+                Ok(reply) => reply,
+                Err(err) => {
+                    let raw_error = err.to_string();
+                    let lower_error = raw_error.to_ascii_lowercase();
+                    last_error =
+                        if lower_error.contains("timeout") || lower_error.contains("timed out") {
+                            format!(
+                                "verifier_repair_pass_timeout: patch provider request timed out \
+                             after {attempt_timeout_secs}s"
+                            )
+                        } else {
+                            format!("repair LLM request failed: {err}")
+                        };
+                    if last_error.contains("verifier_repair_pass_timeout") {
+                        log_llm_event(
+                            "agent.verifier_repair_pass.timeout",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "model": &prepared.model,
+                                "path": target_hint.path,
+                                "attempt": attempt,
+                                "elapsed_secs": pass_started.elapsed().as_secs(),
+                                "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
+                                "attempt_timeout_secs": attempt_timeout_secs,
+                            }),
+                        );
+                    }
+                    break;
+                }
+            };
+            if !reply.tool_calls.is_empty() {
+                last_error = "repair reply contained unexpected tool calls".to_string();
+            } else {
+                match self.handle_verifier_repair_pass_reply(
+                    &mut prepared,
+                    target_hint,
+                    attempt,
+                    &reply.content,
+                ) {
+                    Ok(outcome) => return outcome,
+                    Err(ValidationFailure {
+                        outcome: CheapCheckOutcome::Failed(message),
+                        weakening,
+                        rejection_signal,
+                    }) => {
+                        last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(
+                            weakening,
+                            rejection_signal,
+                            prepared.context.semantic_plan.as_ref(),
+                        );
+                        last_error = message;
+                    }
+                    Err(ValidationFailure {
+                        outcome: CheapCheckOutcome::Unavailable,
+                        ..
+                    }) => {
+                        log_llm_event(
+                            "agent.verifier_repair_pass.unavailable",
+                            serde_json::json!({
+                                "session_id": self.session_store.session_id(),
+                                "model": &prepared.model,
+                                "target_path": target_hint.path,
+                                "attempt": attempt,
+                            }),
+                        );
+                        return VerifierRepairPassOutcome::Unavailable {
+                            relative_path: target_hint.path.clone(),
+                        };
+                    }
+                }
+            }
+
+            if attempt < VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
+                prepared.messages.push(ConversationMessage::user(
+                    verifier_repair_pass_retry_message(&last_error),
+                ));
+            }
+        }
+
+        let error = format!("verifier_repair_pass_invalid: {last_error}");
+        log_llm_event(
+            "agent.verifier_repair_pass.invalid",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "model": &prepared.model,
+                "path": target_hint.path,
+                "error": compact_verifier_failure_text(&error, 240),
+            }),
+        );
+        VerifierRepairPassOutcome::Invalid {
+            error,
+            repair_attempt_outcome: last_invalid_outcome,
+        }
+    }
+
+    fn prepare_verifier_repair_pass(
+        &mut self,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+    ) -> Result<PreparedVerifierRepairPass, VerifierRepairPassOutcome> {
         let Some(context) = self.repair_job.clone() else {
-            return VerifierRepairPassOutcome::Skipped;
+            return Err(VerifierRepairPassOutcome::Skipped);
         };
         let active_request = self.active_request_text().unwrap_or_default();
-        // Issue #665 Phase 5: caller-side projection (sidecar accessor).
         let task_contract = super::task_contract::TaskContract::from_request(&active_request);
         let behavior_projection =
             super::required_behavior::project_behavior_contract(&task_contract);
-        // Issue #665 Phase 6 (S5-006): emit `agent.behavior_contract.projected`
-        // event once per turn per (consumer + key).
         self.emit_behavior_contract_projected_if_changed(
             behavior_projection.as_ref(),
             super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_REPAIR,
@@ -12286,10 +12634,10 @@ impl Agent {
                         "reason": reason,
                     }),
                 );
-                return VerifierRepairPassOutcome::Invalid {
+                return Err(VerifierRepairPassOutcome::Invalid {
                     error,
                     repair_attempt_outcome: None,
-                };
+                });
             }
         };
         if let Err(err) = validate_accepted_repair_plan_authorizes_target(
@@ -12297,16 +12645,16 @@ impl Agent {
             target_hint,
             &target_hint.path,
         ) {
-            return VerifierRepairPassOutcome::Invalid {
+            return Err(VerifierRepairPassOutcome::Invalid {
                 error: format!("verifier_repair_pass_invalid: {}", err.reason_label()),
                 repair_attempt_outcome: build_verifier_repair_pass_ledger_outcome(
                     err.weakening,
                     err.rejection_signal,
                     context.semantic_plan.as_ref(),
                 ),
-            };
+            });
         }
-        let mut messages = match verifier_repair_pass_messages(
+        let messages = match verifier_repair_pass_messages(
             &self.work_root,
             &context,
             target_hint,
@@ -12315,103 +12663,56 @@ impl Agent {
         ) {
             Ok(messages) => messages,
             Err(err) => {
-                return VerifierRepairPassOutcome::Invalid {
+                return Err(VerifierRepairPassOutcome::Invalid {
                     error: format!("verifier_repair_pass_invalid: {err}"),
                     repair_attempt_outcome: None,
-                };
+                });
             }
         };
-        let model = self.models.main.clone();
-        let pass_started = Instant::now();
+        Ok(PreparedVerifierRepairPass {
+            context,
+            accepted_plan,
+            messages,
+            model: self.models.main.clone(),
+        })
+    }
 
-        let mut last_error = "repair pass did not run".to_string();
-        // Issue #653 (DR2-005): 1 pass = 最大 1 outcome push。retry loop 内では
-        // 最新の invalid outcome を上書きし、loop 終了時に Invalid に載せる。
-        // Issue #653 CB-001: 各 attempt 冒頭で `None` にリセットし、過去 attempt の
-        // ledger 対象 outcome (典型的には `RejectedUnsafe`) が ledger-non-target な
-        // 後続失敗 (parse error / duplicate / exact match 失敗 / apply 失敗 /
-        // LLM request 失敗 / 予期せぬ tool call) に紛れて伝播しないようにする。
-        // `VerifierRepairPassOutcome::Invalid` は **最後の attempt が ledger 対象
-        // だった場合のみ** `Some(...)` を載せる契約 (DR2-005)。
-        let mut last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome> =
-            None;
-        for attempt in 1..=VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
-            // Issue #653 CB-001: 各 attempt 開始時にリセット。これ以降の branch で
-            // 明示的に `Some(...)` を入れた場合のみ最終 `Invalid` outcome に伝播する。
-            last_invalid_outcome = None;
-            let Some(attempt_timeout_secs) =
-                verifier_repair_pass_attempt_timeout_secs(pass_started.elapsed())
-            else {
-                last_error = verifier_repair_pass_timeout_error(pass_started.elapsed());
-                log_llm_event(
-                    "agent.verifier_repair_pass.timeout",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "model": model,
-                        "path": target_hint.path,
-                        "attempt": attempt,
-                        "elapsed_secs": pass_started.elapsed().as_secs(),
-                        "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-                    }),
+    fn handle_verifier_repair_pass_reply(
+        &mut self,
+        prepared: &mut PreparedVerifierRepairPass,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+        attempt: usize,
+        reply_content: &str,
+    ) -> Result<VerifierRepairPassOutcome, ValidationFailure> {
+        let validation =
+            super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
+                reply_content,
+                verifier_repair_intent_limits(),
+            )
+            .map_err(|message| {
+                ValidationFailure::failed_with_signal(message, RepairRejectionSignal::Malformed)
+            })
+            .and_then(|proposal| {
+                let shadow_validation = emit_patch_proposal_shadow_validation_event(
+                    self.session_store.session_id(),
+                    &prepared.model,
+                    attempt,
+                    &self.work_root,
+                    &prepared.accepted_plan,
+                    &proposal,
                 );
-                break;
-            };
-            let repair_client = match self
-                .client
-                .clone_with_overrides(attempt_timeout_secs, VERIFIER_REPAIR_PASS_MAX_PREDICT)
-            {
-                Ok(client) => client,
-                Err(err) => {
-                    last_error =
-                        format!("verifier_repair_pass_invalid: client clone failed: {err}");
-                    break;
+                if shadow_validation.is_decisive() && !shadow_validation.accepted() {
+                    return Err(ValidationFailure::failed_with_signal(
+                        format!(
+                            "patch provider admission rejected: {}",
+                            shadow_validation.reason
+                        ),
+                        RepairRejectionSignal::Malformed,
+                    ));
                 }
-            };
-            let reply = match repair_client.chat_text_json_control(&model, &messages) {
-                Ok(reply) => reply,
-                Err(err) => {
-                    let raw_error = err.to_string();
-                    let lower_error = raw_error.to_ascii_lowercase();
-                    last_error =
-                        if lower_error.contains("timeout") || lower_error.contains("timed out") {
-                            format!(
-                                "verifier_repair_pass_timeout: patch provider request timed out \
-                             after {attempt_timeout_secs}s"
-                            )
-                        } else {
-                            format!("repair LLM request failed: {err}")
-                        };
-                    if last_error.contains("verifier_repair_pass_timeout") {
-                        log_llm_event(
-                            "agent.verifier_repair_pass.timeout",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "model": model,
-                                "path": target_hint.path,
-                                "attempt": attempt,
-                                "elapsed_secs": pass_started.elapsed().as_secs(),
-                                "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-                                "attempt_timeout_secs": attempt_timeout_secs,
-                            }),
-                        );
-                    }
-                    break;
-                }
-            };
-            if !reply.tool_calls.is_empty() {
-                last_error = "repair reply contained unexpected tool calls".to_string();
-            } else {
-                // Issue #639 / #653: parse + validate. Parse errors and
-                // non-weakening validation failures stay ledger-non-target
-                // (`weakening: None`), only weakening detections carry
-                // `ValidationWeakening` metadata for ledger push (S5-003).
-                // Issue #662 (5-4-1 priority 1): parse-stage `RejectedMalformed`
-                // — the LLM reply could not be projected into a
-                // `Vec<VerifierRepairIntent>`. Carry the signal through to the
-                // outcome builder so the ledger learns of the malformed reply.
-                let validation =
-                    super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
-                        &reply.content,
+                let intents =
+                    super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
+                        proposal.clone(),
                         verifier_repair_intent_limits(),
                     )
                     .map_err(|message| {
@@ -12419,146 +12720,71 @@ impl Agent {
                             message,
                             RepairRejectionSignal::Malformed,
                         )
-                    })
-                    .and_then(|proposal| {
-                        let shadow_validation = emit_patch_proposal_shadow_validation_event(
-                            self.session_store.session_id(),
-                            &model,
-                            attempt,
-                            &self.work_root,
-                            &accepted_plan,
-                            &proposal,
-                        );
-                        if shadow_validation.is_decisive() && !shadow_validation.accepted() {
-                            return Err(ValidationFailure::failed_with_signal(
-                                format!(
-                                    "patch provider admission rejected: {}",
-                                    shadow_validation.reason
-                                ),
-                                RepairRejectionSignal::Malformed,
-                            ));
-                        }
-                        let intents =
-                            super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
-                                proposal.clone(),
-                                verifier_repair_intent_limits(),
-                            )
-                            .map_err(|message| {
-                                ValidationFailure::failed_with_signal(
-                                    message,
-                                    RepairRejectionSignal::Malformed,
-                                )
-                            })?;
-                        let validation = validate_verifier_repair_intents_with_accepted_plan(
-                            &self.work_root,
-                            &context,
-                            target_hint,
-                            &accepted_plan,
-                            intents,
-                        );
-                        emit_patch_proposal_legacy_validation_comparison_event(
-                            self.session_store.session_id(),
-                            &model,
-                            attempt,
-                            &proposal,
-                            shadow_validation,
-                            &validation,
-                        );
-                        validation
-                    });
-                match validation {
-                    Ok(edit) => {
-                        if context.applied_repair_intents.contains(&edit.fingerprint) {
-                            last_error =
-                                "duplicate repair edit intent for the same failure".to_string();
-                        } else if let Err(err) =
-                            super::repair_patch_executor::apply_validated_repair_edit(&edit)
-                        {
-                            last_error = format!("failed to apply {}: {err}", edit.relative_path);
-                            break;
-                        } else {
-                            self.record_controller_verifier_repair_edit(
-                                &edit.relative_path,
-                                &edit.fingerprint,
-                                target_hint,
-                            );
-                            log_llm_event(
-                                "agent.verifier_repair_pass.applied",
-                                serde_json::json!({
-                                    "session_id": self.session_store.session_id(),
-                                    "model": model,
-                                    "path": edit.relative_path,
-                                    "preimage_hash": edit.preimage_hash,
-                                    "postimage_hash": edit.postimage_hash,
-                                    "attempt": attempt,
-                                }),
-                            );
-                            return VerifierRepairPassOutcome::Applied {
-                                relative_path: edit.relative_path,
-                            };
-                        }
-                    }
-                    Err(ValidationFailure {
-                        outcome: CheapCheckOutcome::Failed(message),
-                        weakening,
-                        rejection_signal,
-                    }) => {
-                        // Issue #653 (DR1-001 / S5-003) / #662 (5-4-1):
-                        // weakening = Some(...) または rejection_signal =
-                        // Some(...) の場合に ledger 対象。active plan が無い
-                        // (semantic_plan = None) legacy path は ledger 非対象
-                        // (S5-004)。
-                        // CB-001: `last_invalid_outcome` は loop top で `None`
-                        // にリセット済 — ここで `Some(...)` を入れた場合のみ
-                        // 最終 `Invalid` outcome に伝播する。
-                        last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(
-                            weakening,
-                            rejection_signal,
-                            context.semantic_plan.as_ref(),
-                        );
-                        last_error = message;
-                    }
-                    Err(ValidationFailure {
-                        outcome: CheapCheckOutcome::Unavailable,
-                        ..
-                    }) => {
-                        log_llm_event(
-                            "agent.verifier_repair_pass.unavailable",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "model": model,
-                                "target_path": target_hint.path,
-                                "attempt": attempt,
-                            }),
-                        );
-                        return VerifierRepairPassOutcome::Unavailable {
-                            relative_path: target_hint.path.clone(),
-                        };
-                    }
-                }
-            }
-
-            if attempt < VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
-                messages.push(ConversationMessage::user(
-                    verifier_repair_pass_retry_message(&last_error),
-                ));
-            }
+                    })?;
+                let validation = validate_verifier_repair_intents_with_accepted_plan(
+                    &self.work_root,
+                    &prepared.context,
+                    target_hint,
+                    &prepared.accepted_plan,
+                    intents,
+                );
+                emit_patch_proposal_legacy_validation_comparison_event(
+                    self.session_store.session_id(),
+                    &prepared.model,
+                    attempt,
+                    &proposal,
+                    shadow_validation,
+                    &validation,
+                );
+                validation
+            });
+        match validation {
+            Ok(edit) => self.apply_verifier_repair_pass_edit(prepared, target_hint, attempt, edit),
+            Err(error) => Err(error),
         }
+    }
 
-        let error = format!("verifier_repair_pass_invalid: {last_error}");
+    fn apply_verifier_repair_pass_edit(
+        &mut self,
+        prepared: &PreparedVerifierRepairPass,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+        attempt: usize,
+        edit: ValidatedVerifierRepairEdit,
+    ) -> Result<VerifierRepairPassOutcome, ValidationFailure> {
+        if prepared
+            .context
+            .applied_repair_intents
+            .contains(&edit.fingerprint)
+        {
+            return Err(ValidationFailure::failed(
+                "duplicate repair edit intent for the same failure".to_string(),
+            ));
+        }
+        if let Err(err) = super::repair_patch_executor::apply_validated_repair_edit(&edit) {
+            return Err(ValidationFailure::failed(format!(
+                "failed to apply {}: {err}",
+                edit.relative_path
+            )));
+        }
+        self.record_controller_verifier_repair_edit(
+            &edit.relative_path,
+            &edit.fingerprint,
+            target_hint,
+        );
         log_llm_event(
-            "agent.verifier_repair_pass.invalid",
+            "agent.verifier_repair_pass.applied",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
-                "model": model,
-                "path": target_hint.path,
-                "error": compact_verifier_failure_text(&error, 240),
+                "model": &prepared.model,
+                "path": edit.relative_path,
+                "preimage_hash": edit.preimage_hash,
+                "postimage_hash": edit.postimage_hash,
+                "attempt": attempt,
             }),
         );
-        VerifierRepairPassOutcome::Invalid {
-            error,
-            repair_attempt_outcome: last_invalid_outcome,
-        }
+        Ok(VerifierRepairPassOutcome::Applied {
+            relative_path: edit.relative_path,
+        })
     }
 
     fn record_controller_verifier_repair_edit(
@@ -13039,12 +13265,36 @@ impl Agent {
         // active, hand the active workspace scope to the policy gate so
         // out-of-scope `Write`/`Edit` paths are rejected even when the
         // restricted whitelist would otherwise admit them.
-        let scope_for_policy = if self.missing_verifier_job.is_some() {
-            Some(self.current_workspace_scope())
-        } else {
-            None
-        };
-        let effective_policy_error = if let Some(policy) = effective_tool_policy {
+        if let Some(err) =
+            self.effective_tool_policy_error_for_execution(name, arguments, effective_tool_policy)
+        {
+            return self.handle_tool_execution_rejection(name, arguments, &err);
+        }
+        if cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return user_interrupt_result();
+        }
+        let context = self.tool_context(cancel_flag);
+        if name == "Bash" {
+            return self.execute_bash_tool_call(name, arguments, &context);
+        }
+
+        self.execute_non_bash_tool_call(name, arguments, &context)
+    }
+
+    fn effective_tool_policy_error_for_execution(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        effective_tool_policy: Option<&EffectiveToolPolicy>,
+    ) -> Option<String> {
+        let scope_for_policy = self
+            .missing_verifier_job
+            .as_ref()
+            .map(|_| self.current_workspace_scope());
+        if let Some(policy) = effective_tool_policy {
             effective_tool_policy_error_for_call_with_scope(
                 policy,
                 name,
@@ -13054,89 +13304,54 @@ impl Agent {
             )
         } else {
             self.effective_tool_policy_error(name, arguments)
-        };
-        if let Some(err) = effective_policy_error {
-            let _tool_outcome = rejected_outcome_for_call(name, &err);
-            self.session.working_memory.note_error(err.clone());
-            // Issue #652: classify "artifact-directed recovery rejected …"
-            // policy errors as attempts against the active
-            // `ArtifactCompletionJob`. Path-string matching is intentional
-            // — the policy gate's error format is the SSOT for this class
-            // of rejection (see `artifact_directed_tool_policy_error`).
-            // No-op when the err is from a different policy gate or when
-            // no job is installed.
-            //
-            // Issue #664 iteration-2 (CB-003): split the artifact-directed
-            // rejection into two routes:
-            //   - `name == "Bash"`: Bash policy violation → record via
-            //     `record_artifact_completion_bash_violation` so the
-            //     attempt projection emits
-            //     `category = "bash_out_of_policy"`. The raw command is
-            //     never stored — `ArtifactAttemptOutcome::new` sanitizes
-            //     and `attempt_outcome_to_json_value` hashes via
-            //     `stable_path_hash` (AD5).
-            //   - Otherwise: legacy `WrongTarget` Read/Write/Edit reject
-            //     against the active target.
-            if err.contains("artifact-directed recovery rejected") {
-                if name == "Bash" {
-                    let command_arg = arguments
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    // CB-003: actual_actions carries the (masked + hashed)
-                    // Bash command preview. ArtifactAttemptOutcome::new
-                    // applies `mask_secrets` + length cap + control-char
-                    // neutralize; the projection further hashes via
-                    // `stable_path_hash` (16-hex correlator). Raw bytes
-                    // never appear in the structured report.
-                    let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
-                } else {
-                    let actual_path = arguments
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    // CB-002: capture the exhaustion signal so the actor
-                    // loop can break with `MissingRepoEdits` instead of
-                    // continuing past a budget-exhausted WrongTarget. The
-                    // `artifact_completion_exhausted_this_turn` flag is the
-                    // SSOT and is also flipped by NoTool / ProseOnly /
-                    // RolePolicyViolation paths (those break the loop via
-                    // the returned bool directly; this WrongTarget path is
-                    // inside `execute_tool_call` and propagates via the
-                    // flag instead).
-                    let _ = self.record_artifact_completion_attempt(
-                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
-                        vec![format!("{name} on {actual_path}")],
-                    );
-                }
-            } else if err.starts_with("setup bootstrap")
-                && name == "Bash"
-                && self.artifact_completion_job.is_some()
-            {
-                // Issue #664 iteration-2 (CB-003): SetupBootstrap branch
-                // rejection of a non-EnvSetup Bash command. When an
-                // ArtifactCompletionJob happens to be installed alongside,
-                // record the violation against it for audit. SetupBootstrap
-                // and ArtifactCompletionJob are normally disjoint (different
-                // ActiveJobKind priorities), but the recording is idempotent
-                // when no job is present (returns false).
+        }
+    }
+
+    fn handle_tool_execution_rejection(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        err: &str,
+    ) -> String {
+        let _tool_outcome = rejected_outcome_for_call(name, err);
+        self.session.working_memory.note_error(err.to_string());
+        if err.contains("artifact-directed recovery rejected") {
+            if name == "Bash" {
                 let command_arg = arguments
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
                 let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+            } else {
+                let actual_path = arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let _ = self.record_artifact_completion_attempt(
+                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                    vec![format!("{name} on {actual_path}")],
+                );
             }
-            return lifecycle::format_tool_error(&err);
-        }
-        if cancel_flag
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        } else if err.starts_with("setup bootstrap")
+            && name == "Bash"
+            && self.artifact_completion_job.is_some()
         {
-            return user_interrupt_result();
+            let command_arg = arguments
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
         }
+        lifecycle::format_tool_error(err)
+    }
+
+    fn tool_context(
+        &self,
+        cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> ToolContext {
         let tmp_tests_root = Some(
             self.session_store
                 .state_root()
@@ -13144,7 +13359,7 @@ impl Agent {
                 .join(self.session_store.session_id())
                 .join("tmp-tests"),
         );
-        let context = ToolContext {
+        ToolContext {
             root: self.work_root.clone(),
             mode: self.session.mode_state.mode,
             plan_path: self.session.mode_state.active_plan_path.clone(),
@@ -13154,76 +13369,52 @@ impl Agent {
             offline: self.config.offline,
             cancel_flag,
             tmp_tests_root,
-            // Issue #459: Tester is active for the remainder of this turn once
-            // its smoke run has dispatched. The Tester orchestrator itself
-            // routes Edit/Write through the closure-DI Bash path, but any
-            // residual main-turn tool calls after Tester ran are confined to
-            // the session-scoped tmp-tests prefix (DR1-014 / DR3-002).
             tester_active: self.tester_called_this_turn,
-        };
-
-        // CB-001: Bash dispatch goes through the structured-outcome path so we
-        // can record a FeedbackFrame for timeout / unsafe-block / non-zero
-        // exit before returning the formatted text result.
-        if name == "Bash" {
-            let (result, outcome) = self
-                .tool_registry
-                .execute_bash_with_outcome(arguments, &context);
-            if let Some(outcome) = outcome.as_ref()
-                && let Some(frame) = build_feedback_for_bash(outcome, &self.work_root)
-            {
-                self.session.record_feedback(frame);
-            }
-            // Issue #606 (T-1.6): post-hoc observation of a successful
-            // build/test command as `VerifierExitZero` evidence. Gated by
-            // the T-3.1 security helper `is_completion_verifier_command`
-            // which rejects shell-control operators that could mask the
-            // real exit code (DR4-002 — `cargo test || true` is poisoned).
-            if let Some(outcome) = outcome.as_ref() {
-                self.observe_evidence_from_bash_outcome(outcome);
-            }
-            return match result {
-                Ok(text) => {
-                    self.maybe_update_work_root(name, arguments, &text);
-                    text
-                }
-                Err((err, class)) => {
-                    self.session
-                        .working_memory
-                        .note_error(format!("{name}: {err}"));
-                    // CB2-001: only the dangerous-snippet block path is
-                    // recorded as `UnsafeCommandBlocked`. Mode / scope /
-                    // approval / offline / missing-argument / runtime failures
-                    // are NOT security blocks (design 5.2 / 11.2) and must not
-                    // mislead Reminder / Verifier consumers of last_feedback.
-                    if class == BashErrorClass::DangerousBlock {
-                        let cmd = arguments
-                            .get("command")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("");
-                        // Issue #461 / DR4-004: record the typed block
-                        // reason as `primary_error` (not the raw command)
-                        // so the Reminder Sidecar prompt does not
-                        // ingest blocked-command text. The rendered
-                        // reason already starts with `"blocked dangerous
-                        // command fragment: …"` and includes the matched
-                        // pattern + category.
-                        let frame =
-                            build_feedback_for_unsafe_block_reason(cmd, &err, &self.work_root);
-                        self.session.record_feedback(frame);
-                        // Issue #456: count this unsafe block toward the
-                        // turn-local AnvilScore counter.
-                        self.session.unsafe_blocks_this_turn =
-                            self.session.unsafe_blocks_this_turn.saturating_add(1);
-                    }
-                    lifecycle::format_tool_error(&err)
-                }
-            };
         }
+    }
 
-        // Issue #646 (C2 / A4): capture pre-tool hash so
-        // `observe_evidence_from_repo_edit` can detect no-op Write/Edit
-        // calls (content unchanged → no `Owned` promotion).
+    fn execute_bash_tool_call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ToolContext,
+    ) -> String {
+        let (result, outcome) = self
+            .tool_registry
+            .execute_bash_with_outcome(arguments, context);
+        if let Some(outcome) = outcome.as_ref()
+            && let Some(frame) = build_feedback_for_bash(outcome, &self.work_root)
+        {
+            self.session.record_feedback(frame);
+        }
+        if let Some(outcome) = outcome.as_ref() {
+            self.observe_evidence_from_bash_outcome(outcome);
+        }
+        match result {
+            Ok(text) => {
+                self.maybe_update_work_root(name, arguments, &text);
+                text
+            }
+            Err((err, class)) => {
+                self.session
+                    .working_memory
+                    .note_error(format!("{name}: {err}"));
+                if class == BashErrorClass::DangerousBlock {
+                    let cmd = arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let frame = build_feedback_for_unsafe_block_reason(cmd, &err, &self.work_root);
+                    self.session.record_feedback(frame);
+                    self.session.unsafe_blocks_this_turn =
+                        self.session.unsafe_blocks_this_turn.saturating_add(1);
+                }
+                lifecycle::format_tool_error(&err)
+            }
+        }
+    }
+
+    fn capture_pre_tool_hash_if_needed(&mut self, arguments: &serde_json::Value, name: &str) {
         if matches!(name, "Write" | "Edit")
             && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
             && let Some(rel) = workspace_relative_path_for_tool_arg(&self.work_root, raw_path)
@@ -13231,24 +13422,23 @@ impl Agent {
             let pre_hash = current_file_hash_for_relative_path(&self.work_root, &rel);
             self.turn_pre_tool_file_hashes.insert(rel, pre_hash);
         }
-        match self.tool_registry.execute(name, arguments, &context) {
+    }
+
+    fn execute_non_bash_tool_call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        context: &ToolContext,
+    ) -> String {
+        self.capture_pre_tool_hash_if_needed(arguments, name);
+        match self.tool_registry.execute(name, arguments, context) {
             Ok(result) => {
                 let tool_outcome = success_outcome_for_call(name, arguments, &self.work_root);
                 if let Some(edit) = tool_outcome.repo_edit_evidence() {
                     self.session
                         .working_memory
                         .note_touched_file(normalize_memory_path(edit.raw_path(), &self.work_root));
-                    // Issue #456: a successful Write/Edit feeds
-                    // `user_visible_artifact` (combined with the post-loop
-                    // verify_repo_progress diff signal in
-                    // `compute_anvil_score`).
                     self.session.repo_edit_succeeded_this_turn = true;
-                    // Issue #606 (T-1.7): post-hoc observation of a
-                    // successful repo edit as `RepoEdit` evidence. Path
-                    // categorisation goes through
-                    // `completion_evidence::classify_repo_edit_path`
-                    // which evaluates predicates in a fixed order so
-                    // `.mdx` reliably classifies as Docs (DR1-001).
                     self.observe_evidence_from_repo_edit(edit.raw_path());
                 }
                 self.maybe_update_work_root(name, arguments, &result);
@@ -13259,7 +13449,6 @@ impl Agent {
                 self.session
                     .working_memory
                     .note_error(format!("{name}: {err}"));
-                // CB-001: Edit Err -> EditFailure FeedbackFrame.
                 if name == "Edit" {
                     let path = arguments.get("path").and_then(serde_json::Value::as_str);
                     let frame = build_feedback_for_edit_failure(path, &err, &self.work_root);

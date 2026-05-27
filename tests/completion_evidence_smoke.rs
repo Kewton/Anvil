@@ -140,11 +140,12 @@ fn edit_write_paths_classify_via_ssot_predicates() {
         classify_repo_edit_path_for_test(Path::new("tsconfig.json")),
         "setup"
     );
-    // Other — `Cargo.toml` is intentionally out of the setup SSOT (DR1-002).
+    // Setup — manifest/config files flow through the shared setup SSOT.
     assert_eq!(
         classify_repo_edit_path_for_test(Path::new("Cargo.toml")),
-        "other"
+        "setup"
     );
+    // Other
     assert_eq!(
         classify_repo_edit_path_for_test(Path::new("Makefile")),
         "other"

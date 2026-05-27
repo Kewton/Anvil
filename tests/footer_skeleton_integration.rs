@@ -16,7 +16,9 @@
 //! offline (no Ollama) and to match the existing `tests/session_cli_tests.rs`
 //! convention.
 
-use anvil::agent::loop_run::{FooterHandle, FooterLease};
+use anvil::agent::loop_run::{
+    FooterHandle, FooterLease, acquire_footer_with_terminal_flag_for_test,
+};
 use anvil::config::{Config, LogLevel};
 use anvil::modes::plan_act::ExecutionMode;
 
@@ -37,10 +39,10 @@ fn acquire_with_config_footer_false_returns_disabled() {
 
 #[test]
 fn acquire_under_cargo_non_tty_returns_disabled() {
-    // cargo test runs with stdout = pipe (non-TTY), so even with
-    // config.footer = true the acquire short-circuits.
+    // Drive the non-TTY branch deterministically instead of assuming cargo's
+    // integration-test stdout is always non-terminal in this environment.
     let cfg = config_with_footer(true);
-    let lease = FooterLease::acquire(&cfg);
+    let lease = acquire_footer_with_terminal_flag_for_test(&cfg, false);
     assert!(!lease.handle_clone().is_enabled());
 }
 

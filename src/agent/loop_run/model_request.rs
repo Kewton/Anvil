@@ -8,6 +8,13 @@ use crate::tools::registry::ToolSpec;
 
 use super::tool_history::focused_edit_target_already_read;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AssistantRequestPlan {
+    pub(super) focused_edit_timeout_override: Option<u64>,
+    pub(super) focused_edit_max_predict_override: Option<usize>,
+    pub(super) use_streaming_transport: bool,
+}
+
 pub(super) fn should_use_streaming_transport(
     model: &str,
     _native_tools_enabled: bool,
@@ -85,6 +92,35 @@ pub(super) fn focused_edit_max_predict_override(
             focused_edit.pre_read_max_predict
         },
     )
+}
+
+pub(super) fn build_assistant_request_plan(
+    model: &str,
+    native_tools_enabled: bool,
+    stream_output: bool,
+    stdin_is_terminal: bool,
+    messages: &[ConversationMessage],
+    target: Option<&Path>,
+    work_root: &Path,
+) -> AssistantRequestPlan {
+    let focused_edit_timeout_override =
+        focused_edit_timeout_override_secs(model, messages, target, work_root);
+    let focused_edit_max_predict_override =
+        focused_edit_max_predict_override(model, messages, target, work_root);
+    let force_non_streaming_for_focused_edit =
+        focused_edit_timeout_override.is_some() || focused_edit_max_predict_override.is_some();
+    let use_streaming_transport = !force_non_streaming_for_focused_edit
+        && should_use_streaming_transport(
+            model,
+            native_tools_enabled,
+            stream_output,
+            stdin_is_terminal,
+        );
+    AssistantRequestPlan {
+        focused_edit_timeout_override,
+        focused_edit_max_predict_override,
+        use_streaming_transport,
+    }
 }
 
 pub(super) fn request_non_streaming_assistant_reply(
@@ -177,5 +213,39 @@ mod tests {
             focused_edit_max_predict_override("qwen3.5:122b", &messages, None, Path::new(".")),
             None
         );
+    }
+
+    #[test]
+    fn request_plan_forces_non_streaming_for_focused_edit() {
+        let messages: Vec<ConversationMessage> = Vec::new();
+        let plan = build_assistant_request_plan(
+            "qwen3.5:122b",
+            true,
+            true,
+            true,
+            &messages,
+            Some(Path::new("src/main.rs")),
+            Path::new("."),
+        );
+
+        assert!(plan.focused_edit_timeout_override.is_some());
+        assert!(plan.focused_edit_max_predict_override.is_some());
+        assert!(!plan.use_streaming_transport);
+    }
+
+    #[test]
+    fn request_plan_uses_streaming_when_no_focused_edit_override_exists() {
+        let messages: Vec<ConversationMessage> = Vec::new();
+        let plan = build_assistant_request_plan(
+            "qwen3.6:27b-coding-nvfp4",
+            true,
+            true,
+            true,
+            &messages,
+            None,
+            Path::new("."),
+        );
+
+        assert!(plan.use_streaming_transport);
     }
 }

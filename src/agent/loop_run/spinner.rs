@@ -27,6 +27,7 @@ const TICK_MS: u64 = 80;
 
 // --- Env detection (DI-friendly, cached once per process) ------------------
 
+#[derive(Clone, Copy)]
 pub(super) struct Env {
     pub(super) enabled: bool,
     pub(super) use_color: bool,
@@ -131,14 +132,22 @@ impl Spinner {
     /// spawn failure). The label is sanitized before being rendered, so
     /// adversarial tool / model names cannot inject escapes.
     pub(super) fn start(label: impl Into<String>) -> Self {
-        let e = env();
+        let e = *env();
         if !e.enabled {
             return Self { inner: None };
         }
         Self::spawn(e, sanitize(&label.into()))
     }
 
-    fn spawn(env: &'static Env, label: String) -> Self {
+    #[cfg(test)]
+    fn start_with_env_for_test(env: Env, label: impl Into<String>) -> Self {
+        if !env.enabled {
+            return Self { inner: None };
+        }
+        Self::spawn(env, sanitize(&label.into()))
+    }
+
+    fn spawn(env: Env, label: String) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let signal = SpinnerStopSignal {
@@ -242,7 +251,7 @@ fn clear_line() {
 fn render_loop(
     start: Instant,
     label: String,
-    env: &Env,
+    env: Env,
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<()>, Condvar)>,
 ) {
@@ -459,20 +468,21 @@ mod tests {
         assert_eq!(sanitize("hello world 日本語"), "hello world 日本語");
     }
 
-    // -- Spinner lifecycle (relies on CI non-TTY) ---------------------------
+    // -- Spinner lifecycle --------------------------------------------------
 
-    // NOTE: `Spinner::start("x")` consults `env()` which is backed by a
-    // process-wide `OnceLock<Env>`. In CI / test harness runs stderr is
-    // non-TTY, so `env().enabled == false` and `Spinner::start` takes the
-    // early-return branch BEFORE `thread::Builder::spawn` is reached (see
-    // `Spinner::start` impl above). Therefore `stop_signal().is_none()` is
-    // equivalent to "no worker thread was spawned" in this environment.
     #[test]
     fn test_spinner_start_returns_noop_when_env_disabled() {
-        let sp = Spinner::start("x");
+        let sp = Spinner::start_with_env_for_test(
+            Env {
+                enabled: false,
+                use_color: false,
+                use_utf8: false,
+            },
+            "x",
+        );
         assert!(
             sp.stop_signal().is_none(),
-            "CI runs under non-TTY stderr; Spinner::start must take the early-return branch"
+            "disabled env must return a no-op spinner without spawning a worker thread"
         );
     }
 
