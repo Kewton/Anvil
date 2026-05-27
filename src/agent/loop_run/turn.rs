@@ -5410,7 +5410,33 @@ impl Agent {
 
     fn handle_post_reply_recovery(
         &mut self,
-        args: PostReplyRecoveryArgs<'_, '_>,
+        mut args: PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
+        if let Some(outcome) = self.maybe_handle_answer_only_future_work_recovery(&mut args) {
+            return Some(outcome);
+        }
+        if let Some(outcome) = self.maybe_handle_missing_repo_edit_recovery(&mut args) {
+            return Some(outcome);
+        }
+        if let Some(outcome) = self.maybe_handle_python_test_artifact_recovery(&mut args) {
+            return Some(outcome);
+        }
+        if let Some(outcome) = self.maybe_handle_answer_only_inadequate_recovery(&mut args) {
+            return Some(outcome);
+        }
+        if let Some(outcome) = self.maybe_handle_repo_change_partial_progress_recovery(&mut args) {
+            return Some(outcome);
+        }
+        if let Some(outcome) = self.maybe_handle_repo_change_quality_gate_recovery(&mut args) {
+            return Some(outcome);
+        }
+
+        None
+    }
+
+    fn maybe_handle_answer_only_future_work_recovery(
+        &mut self,
+        args: &mut PostReplyRecoveryArgs<'_, '_>,
     ) -> Option<PostReplyRecoveryOutcome> {
         if !args.requires_action
             && self.answer_only_mode_active()
@@ -5440,153 +5466,166 @@ impl Agent {
             );
             return Some(PostReplyRecoveryOutcome::Continue);
         }
+        None
+    }
 
-        if args.action_expectation == recovery::ActionExpectation::RepoChange
-            && args.repo_edit_calls_made_this_turn == 0
-            && args
+    fn maybe_handle_missing_repo_edit_recovery(
+        &mut self,
+        args: &mut PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
+        if args.action_expectation != recovery::ActionExpectation::RepoChange
+            || args.repo_edit_calls_made_this_turn != 0
+            || !args
                 .recovery_dispatch_gate
                 .allows_generic_repo_change_recovery()
         {
-            if should_try_framework_app_fallback(
-                args.last_iter,
-                *args.framework_app_fallback_materialized,
-            ) && self.maybe_materialize_framework_game_fallback(args.last_iter)
-            {
-                *args.framework_app_fallback_materialized = true;
-                self.push_system_note(framework_app_fallback_continuation_note().to_string());
+            return None;
+        }
+        if should_try_framework_app_fallback(
+            args.last_iter,
+            *args.framework_app_fallback_materialized,
+        ) && self.maybe_materialize_framework_game_fallback(args.last_iter)
+        {
+            *args.framework_app_fallback_materialized = true;
+            self.push_system_note(framework_app_fallback_continuation_note().to_string());
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+        match self.maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag) {
+            ScaffoldFallbackResult::Applied => {
+                *args.repo_change_retries = 0;
                 return Some(PostReplyRecoveryOutcome::Continue);
             }
-            match self
-                .maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag)
-            {
-                ScaffoldFallbackResult::Applied => {
-                    *args.repo_change_retries = 0;
-                    return Some(PostReplyRecoveryOutcome::Continue);
-                }
-                ScaffoldFallbackResult::Failed | ScaffoldFallbackResult::Skipped => {
-                    *args.repo_change_retries += 1;
-                    if *args.repo_change_retries >= 3 {
-                        return Some(PostReplyRecoveryOutcome::Finalize {
-                            final_prose: String::new(),
-                            exit_reason: ExitReason::MissingRepoEdits,
-                            error_text: ExitReason::MissingRepoEdits
-                                .default_error_text()
-                                .to_string(),
-                        });
-                    }
-                    self.push_system_note(recovery::repo_change_recovery_note(
-                        *args.repo_change_retries,
-                    ));
-                    return Some(PostReplyRecoveryOutcome::Continue);
-                }
-                ScaffoldFallbackResult::NotApplicable => {}
-            }
-            *args.repo_change_retries += 1;
-            if *args.repo_change_retries >= 3 {
-                let request = self.active_request_text().unwrap_or_default();
-                let fallback = match self.maybe_apply_local_llm_small_edit_fallback(&request) {
-                    Ok(fallback) => fallback,
-                    Err(err) => {
-                        return Some(PostReplyRecoveryOutcome::Finalize {
-                            final_prose: String::new(),
-                            exit_reason: ExitReason::TransportError,
-                            error_text: err,
-                        });
-                    }
-                };
-                if let Some(relative) = fallback {
+            ScaffoldFallbackResult::Failed | ScaffoldFallbackResult::Skipped => {
+                *args.repo_change_retries += 1;
+                if *args.repo_change_retries >= 3 {
                     return Some(PostReplyRecoveryOutcome::Finalize {
-                        final_prose: format!(
-                            "Applied a verified small edit fallback after the local model stopped before editing {relative}."
-                        ),
-                        exit_reason: ExitReason::Done,
-                        error_text: String::new(),
+                        final_prose: String::new(),
+                        exit_reason: ExitReason::MissingRepoEdits,
+                        error_text: ExitReason::MissingRepoEdits
+                            .default_error_text()
+                            .to_string(),
                     });
                 }
-                return Some(PostReplyRecoveryOutcome::Finalize {
-                    final_prose: String::new(),
-                    exit_reason: ExitReason::MissingRepoEdits,
-                    error_text: ExitReason::MissingRepoEdits
-                        .default_error_text()
-                        .to_string(),
-                });
-            }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Retry requested",
-                    "The turn finished without repository edits. Asked the model to continue implementing changes.",
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            if let Some(target) = self.focused_edit_recovery_target() {
-                let target_already_read = focused_edit_target_already_read(
-                    &self.session.messages,
-                    &target,
-                    &self.work_root,
-                );
-                self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                    &target,
-                    target_already_read,
-                    *args.repo_change_retries,
-                ));
-            } else if !self.push_artifact_directed_recovery_note(*args.repo_change_retries) {
                 self.push_system_note(recovery::repo_change_recovery_note(
                     *args.repo_change_retries,
                 ));
+                return Some(PostReplyRecoveryOutcome::Continue);
             }
-            return Some(PostReplyRecoveryOutcome::Continue);
+            ScaffoldFallbackResult::NotApplicable => {}
         }
-
-        if args.repo_edit_calls_made_this_turn > 0
-            && self.active_python_request_requires_tests()
-            && !self.python_test_artifact_exists()
-            && !self.python_verifier_available_for_requested_tests()
-        {
-            *args.python_test_retries += 1;
-            if *args.python_test_retries >= 2 {
-                let (final_prose, exit_reason, error_text) = match self
-                    .maybe_materialize_python_test_fallback()
-                {
-                    Ok(Some(path)) => (
-                        format!(
-                            "Added the requested Python test artifact with deterministic fallback: {path}."
-                        ),
-                        ExitReason::Done,
-                        String::new(),
-                    ),
-                    Ok(None) => (
-                        String::new(),
-                        ExitReason::MissingRepoEdits,
-                        "assistant did not add the requested Python test artifact".to_string(),
-                    ),
-                    Err(err) => (String::new(), ExitReason::TransportError, err),
-                };
+        *args.repo_change_retries += 1;
+        if *args.repo_change_retries >= 3 {
+            let request = self.active_request_text().unwrap_or_default();
+            let fallback = match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+                Ok(fallback) => fallback,
+                Err(err) => {
+                    return Some(PostReplyRecoveryOutcome::Finalize {
+                        final_prose: String::new(),
+                        exit_reason: ExitReason::TransportError,
+                        error_text: err,
+                    });
+                }
+            };
+            if let Some(relative) = fallback {
                 return Some(PostReplyRecoveryOutcome::Finalize {
-                    final_prose,
-                    exit_reason,
-                    error_text,
+                    final_prose: format!(
+                        "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+                    ),
+                    exit_reason: ExitReason::Done,
+                    error_text: String::new(),
                 });
             }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Quality gate",
-                    "Asked the model to add the requested Python test file or self-test command.",
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            self.push_system_note(
-                "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose: String::new(),
+                exit_reason: ExitReason::MissingRepoEdits,
+                error_text: ExitReason::MissingRepoEdits
+                    .default_error_text()
                     .to_string(),
-            );
-            return Some(PostReplyRecoveryOutcome::Continue);
+            });
         }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                "The turn finished without repository edits. Asked the model to continue implementing changes.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        if let Some(target) = self.focused_edit_recovery_target() {
+            let target_already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            self.push_system_note(self.focused_edit_no_tool_note_for_target(
+                &target,
+                target_already_read,
+                *args.repo_change_retries,
+            ));
+        } else if !self.push_artifact_directed_recovery_note(*args.repo_change_retries) {
+            self.push_system_note(recovery::repo_change_recovery_note(
+                *args.repo_change_retries,
+            ));
+        }
+        Some(PostReplyRecoveryOutcome::Continue)
+    }
 
+    fn maybe_handle_python_test_artifact_recovery(
+        &mut self,
+        args: &mut PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
+        if args.repo_edit_calls_made_this_turn == 0
+            || !self.active_python_request_requires_tests()
+            || self.python_test_artifact_exists()
+            || self.python_verifier_available_for_requested_tests()
+        {
+            return None;
+        }
+        *args.python_test_retries += 1;
+        if *args.python_test_retries >= 2 {
+            let (final_prose, exit_reason, error_text) = match self
+                .maybe_materialize_python_test_fallback()
+            {
+                Ok(Some(path)) => (
+                    format!(
+                        "Added the requested Python test artifact with deterministic fallback: {path}."
+                    ),
+                    ExitReason::Done,
+                    String::new(),
+                ),
+                Ok(None) => (
+                    String::new(),
+                    ExitReason::MissingRepoEdits,
+                    "assistant did not add the requested Python test artifact".to_string(),
+                ),
+                Err(err) => (String::new(), ExitReason::TransportError, err),
+            };
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose,
+                exit_reason,
+                error_text,
+            });
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Quality gate",
+                "Asked the model to add the requested Python test file or self-test command.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(
+            "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
+                .to_string(),
+        );
+        Some(PostReplyRecoveryOutcome::Continue)
+    }
+
+    fn maybe_handle_answer_only_inadequate_recovery(
+        &mut self,
+        args: &mut PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
         if !args.requires_action
             && self.answer_only_mode_active()
             && answer_only_reply_is_inadequate(args.final_reply)
@@ -5620,108 +5659,119 @@ impl Agent {
             );
             return Some(PostReplyRecoveryOutcome::Continue);
         }
+        None
+    }
 
-        if should_apply_repo_change_partial_progress_recovery(
+    fn maybe_handle_repo_change_partial_progress_recovery(
+        &mut self,
+        args: &mut PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
+        if !should_apply_repo_change_partial_progress_recovery(
             args.action_expectation,
             args.repo_edit_calls_made_this_turn,
             args.final_reply,
             args.task_contract_action,
-        ) && args
+        ) || !args
             .recovery_dispatch_gate
             .allows_generic_repo_change_recovery()
         {
-            *args.repo_change_retries += 1;
-            if *args.repo_change_retries >= 3 {
-                return Some(PostReplyRecoveryOutcome::Finalize {
-                    final_prose: String::new(),
-                    exit_reason: ExitReason::MissingRepoEdits,
-                    error_text: ExitReason::MissingRepoEdits
-                        .default_error_text()
-                        .to_string(),
-                });
-            }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Retry requested",
-                    "A small edit landed, but the model answered with next-step prose instead of a completed result. Asked it to keep implementing with tools.",
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            self.push_system_note(recovery::repo_change_partial_progress_note(
-                *args.repo_change_retries,
-            ));
-            return Some(PostReplyRecoveryOutcome::Continue);
+            return None;
         }
+        *args.repo_change_retries += 1;
+        if *args.repo_change_retries >= 3 {
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose: String::new(),
+                exit_reason: ExitReason::MissingRepoEdits,
+                error_text: ExitReason::MissingRepoEdits
+                    .default_error_text()
+                    .to_string(),
+            });
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                "A small edit landed, but the model answered with next-step prose instead of a completed result. Asked it to keep implementing with tools.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(recovery::repo_change_partial_progress_note(
+            *args.repo_change_retries,
+        ));
+        Some(PostReplyRecoveryOutcome::Continue)
+    }
 
-        if (should_apply_repo_change_quality_gate(
+    fn maybe_handle_repo_change_quality_gate_recovery(
+        &mut self,
+        args: &mut PostReplyRecoveryArgs<'_, '_>,
+    ) -> Option<PostReplyRecoveryOutcome> {
+        if !(should_apply_repo_change_quality_gate(
             args.action_expectation,
             self.active_task_expects_repo_change(),
             self.session.mode_state.mode,
         ) || self.current_request_needs_playable_ui_quality_gate())
-            && args.recovery_dispatch_gate.allows_deterministic_fallback()
-            && let Some((request, target_path, issue)) = self.accepted_repo_change_quality_issue()
+            || !args.recovery_dispatch_gate.allows_deterministic_fallback()
         {
-            match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
-                Ok(true) => {
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            args.last_iter,
-                            self.config.max_iterations,
-                            "Quality fallback",
-                            &format!("Replaced scaffold placeholder output in {target_path}."),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    self.session.record_feedback_if_unset(
-                        build_feedback_for_deterministic_content_fallback(&self.work_root),
-                    );
-                    self.push_deterministic_ui_recovery_continuation_note(
-                        &target_path,
-                        (*args.repo_change_retries).saturating_add(1),
-                    );
-                    return Some(PostReplyRecoveryOutcome::Continue);
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    return Some(PostReplyRecoveryOutcome::Finalize {
-                        final_prose: String::new(),
-                        exit_reason: ExitReason::TransportError,
-                        error_text: err,
-                    });
-                }
+            return None;
+        }
+        let (request, target_path, issue) = self.accepted_repo_change_quality_issue()?;
+        match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
+            Ok(true) => {
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        args.last_iter,
+                        self.config.max_iterations,
+                        "Quality fallback",
+                        &format!("Replaced scaffold placeholder output in {target_path}."),
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                self.session.record_feedback_if_unset(
+                    build_feedback_for_deterministic_content_fallback(&self.work_root),
+                );
+                self.push_deterministic_ui_recovery_continuation_note(
+                    &target_path,
+                    (*args.repo_change_retries).saturating_add(1),
+                );
+                return Some(PostReplyRecoveryOutcome::Continue);
             }
-            *args.repo_change_retries += 1;
-            if *args.repo_change_retries >= 3 {
+            Ok(false) => {}
+            Err(err) => {
                 return Some(PostReplyRecoveryOutcome::Finalize {
                     final_prose: String::new(),
-                    exit_reason: ExitReason::MissingRepoEdits,
-                    error_text: issue,
+                    exit_reason: ExitReason::TransportError,
+                    error_text: err,
                 });
             }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Quality gate",
-                    &format!("Asked the model to replace placeholder output in {target_path}."),
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            self.push_system_note(recovery::repo_change_quality_gate_note(
-                &request,
-                &target_path,
-                &issue,
-                *args.repo_change_retries,
-            ));
-            return Some(PostReplyRecoveryOutcome::Continue);
         }
-
-        None
+        *args.repo_change_retries += 1;
+        if *args.repo_change_retries >= 3 {
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose: String::new(),
+                exit_reason: ExitReason::MissingRepoEdits,
+                error_text: issue,
+            });
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Quality gate",
+                &format!("Asked the model to replace placeholder output in {target_path}."),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(recovery::repo_change_quality_gate_note(
+            &request,
+            &target_path,
+            &issue,
+            *args.repo_change_retries,
+        ));
+        Some(PostReplyRecoveryOutcome::Continue)
     }
 
     fn run_actor_loop(

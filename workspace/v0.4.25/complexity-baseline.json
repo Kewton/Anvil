@@ -30,9 +30,9 @@
       "rough_cc_ge_threshold": 0
     },
     {
-      "avg_rough_cc": 2.91,
-      "function_loc": 33003,
-      "functions": 1070,
+      "avg_rough_cc": 2.90,
+      "function_loc": 33047,
+      "functions": 1076,
       "max_rough_cc": 320,
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc_ge_high_threshold": 1,
@@ -44,18 +44,11 @@
   "threshold": 15,
   "top_functions": [
     {
-      "line": 5727,
+      "line": 5777,
       "loc": 2587,
       "name": "run_actor_loop",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 320
-    },
-    {
-      "line": 5411,
-      "loc": 315,
-      "name": "handle_post_reply_recovery",
-      "path": "src/agent/loop_run/turn.rs",
-      "rough_cc": 47
     },
     {
       "line": 1211,
@@ -79,7 +72,7 @@
       "rough_cc": 21
     },
     {
-      "line": 12535,
+      "line": 12585,
       "loc": 150,
       "name": "run_verifier_repair_pass_and_apply",
       "path": "src/agent/loop_run/turn.rs",
@@ -100,7 +93,7 @@
       "rough_cc": 19
     },
     {
-      "line": 22071,
+      "line": 22121,
       "loc": 30,
       "name": "synthesized_missing_test_target_path_for_request",
       "path": "src/agent/loop_run/turn.rs",
@@ -110,6 +103,13 @@
       "line": 3375,
       "loc": 142,
       "name": "maybe_invoke_work_mode_confirm",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 18
+    },
+    {
+      "line": 5472,
+      "loc": 99,
+      "name": "maybe_handle_missing_repo_edit_recovery",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 18
     }
