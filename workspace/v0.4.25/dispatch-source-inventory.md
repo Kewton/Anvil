@@ -271,3 +271,6 @@ with legacy/fallback paths unable to override it.
   truncated-tool-call note lookup, and plan-file edit exclusion are now
   isolated in `tool_history.rs`; `turn.rs` consumes these as dispatch inputs
   instead of scanning raw conversation history for them locally.
+- Current status: focused-edit policy violation feedback-note construction is
+  now isolated in `tool_policy.rs`; `turn.rs` owns only when to add the note
+  after policy rejection.

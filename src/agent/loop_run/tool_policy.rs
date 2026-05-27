@@ -189,6 +189,27 @@ impl EffectiveToolPolicy {
     }
 }
 
+pub(super) fn focused_edit_policy_violation_feedback_note(
+    unresolved_errors: &[String],
+    allowed_tools: Option<&[&str]>,
+    target_display: Option<&str>,
+) -> Option<String> {
+    let error = unresolved_errors.iter().rev().find(|error| {
+        let is_policy_error = error.starts_with("focused edit recovery rejected ")
+            || error.starts_with("focused edit recovery only allows ")
+            || error.starts_with("artifact-directed recovery rejected ")
+            || error.starts_with("tool policy rejected ");
+        is_policy_error && target_display.is_none_or(|target| error.contains(target))
+    })?;
+    let allowed = allowed_tools
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| tools.join(", "))
+        .unwrap_or_else(|| "none".to_string());
+    Some(format!(
+        "[Focused Edit Policy Violation] Previous tool call was rejected and was not executed: {error}. Allowed tools now: {allowed}. Emit exactly one allowed tool call on the required target path; do not call omitted tools."
+    ))
+}
+
 pub(super) fn focused_edit_tool_policy_error(
     name: &str,
     arguments: &serde_json::Value,

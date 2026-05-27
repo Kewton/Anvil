@@ -2464,3 +2464,29 @@ Assessment:
 - No behavior change intended. Repo-edit and truncated-tool-call evidence
   now flow through a shared history projection module, reducing another
   actor-loop-owned dispatch input.
+
+### 2026-05-27 Slice 70
+
+Applied:
+
+- Moved focused-edit policy violation feedback note construction from
+  `turn.rs` to `tool_policy.rs`.
+- `tool_policy.rs` now owns both the policy rejection strings and the
+  follow-up feedback note that explains an unresolved policy rejection.
+- `turn.rs` still decides when to append the note to the conversation.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test focused_edit_policy_violation_feedback --lib -q`: pass, 4 tests
+- `cargo test effective_tool_policy --lib -q`: pass, 8 tests when rerun
+  outside sandbox
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Policy feedback wording is now colocated with
+  policy enforcement, reducing actor-loop ownership of recovery prompt
+  mechanics.

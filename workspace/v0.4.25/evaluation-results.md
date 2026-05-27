@@ -1522,3 +1522,26 @@ Assessment:
 - No behavior change intended. Recovery branches now consume repo-edit
   evidence projections from `tool_history.rs`, keeping message-scanning
   details out of the actor loop.
+
+## Structural Verification: Slice 70
+
+Scope:
+
+- Move focused-edit policy violation feedback-note construction from
+  `turn.rs` to `tool_policy.rs`.
+- Keep `turn.rs` responsible for note injection timing only.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test focused_edit_policy_violation_feedback --lib -q`: pass, 4 tests.
+- `cargo test effective_tool_policy --lib -q`: pass, 8 tests when rerun
+  outside sandbox.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The policy module now owns both rejection
+  detection and the constrained retry note derived from it.

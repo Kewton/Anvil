@@ -81,7 +81,7 @@ use super::tool_history::{
 use super::tool_policy::{
     EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction, FocusedEditPolicy,
     effective_tool_batch_action_with_scope, effective_tool_policy_error_for_call_with_scope,
-    workspace_relative_path_for_tool_arg,
+    focused_edit_policy_violation_feedback_note, workspace_relative_path_for_tool_arg,
 };
 #[cfg(test)]
 use super::tool_policy::{
@@ -23039,27 +23039,6 @@ fn format_numbered_read_block(contents: &str) -> String {
         .map(|(index, line)| format!("{:>4}: {line}", index + 1))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn focused_edit_policy_violation_feedback_note(
-    unresolved_errors: &[String],
-    allowed_tools: Option<&[&str]>,
-    target_display: Option<&str>,
-) -> Option<String> {
-    let error = unresolved_errors.iter().rev().find(|error| {
-        let is_policy_error = error.starts_with("focused edit recovery rejected ")
-            || error.starts_with("focused edit recovery only allows ")
-            || error.starts_with("artifact-directed recovery rejected ")
-            || error.starts_with("tool policy rejected ");
-        is_policy_error && target_display.is_none_or(|target| error.contains(target))
-    })?;
-    let allowed = allowed_tools
-        .filter(|tools| !tools.is_empty())
-        .map(|tools| tools.join(", "))
-        .unwrap_or_else(|| "none".to_string());
-    Some(format!(
-        "[Focused Edit Policy Violation] Previous tool call was rejected and was not executed: {error}. Allowed tools now: {allowed}. Emit exactly one allowed tool call on the required target path; do not call omitted tools."
-    ))
 }
 
 fn focused_read_target_for_directory(resolved: &Path, target: &Path) -> bool {
