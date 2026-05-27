@@ -24748,12 +24748,16 @@ fn validate_verifier_repair_intents_inner(
     // the pre-edit snapshot (e.g. multiple intents that cancel out). This is
     // a no-op outcome that should still cost the same `count >= 2` promotion
     // budget as the per-intent noop branch above.
-    if contents == original_contents {
-        return Err(ValidationFailure::failed_with_signal(
-            "repair intent applied but produced no net change to the file".to_string(),
+    super::repair_patch_validation::validate_repair_candidate_changed(
+        &original_contents,
+        &contents,
+    )
+    .map_err(|err| {
+        ValidationFailure::failed_with_signal(
+            err.message().to_string(),
             RepairRejectionSignal::Noop,
-        ));
-    }
+        )
+    })?;
     // Issue #647 (MF3 / codex final review): SemanticRepairPlan gate for test
     // edits. Test files (`is_test_file`) may only be edited when the
     // RepairJob carries a `SemanticRepairPlan` with both a determined

@@ -106,3 +106,6 @@ with legacy/fallback paths unable to override it.
   invoke it; the executor owns the write mechanics and preimage guard.
 - Current status: duplicate-intent fingerprinting is now validation-owned;
   `turn.rs` no longer constructs the fingerprint directly in production.
+- Current status: post-apply no-op candidate validation is now
+  validation-owned; `turn.rs` maps the typed no-op error into the existing
+  repair rejection signal.

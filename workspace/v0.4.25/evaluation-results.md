@@ -205,3 +205,25 @@ Assessment:
 - Good: verifier repair stayed inside the repair-job path and completed.
 - Residual: diagnostic still produced one malformed reply before fallback, so
   diagnostic schema robustness remains a quality issue.
+
+## Structural Verification: Slice 12
+
+Scope:
+
+- Move post-apply no-op candidate validation out of `turn.rs`.
+- Keep workspace mutation out of validation code.
+
+Verification:
+
+- `cargo fmt --check`: initially reported formatting only; passed after
+  `cargo fmt`.
+- `cargo test repair_patch_validation --lib -q`: pass, 19 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3001 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The change narrows `turn.rs` responsibility by
+  moving one more pure admission rule into the validation boundary.

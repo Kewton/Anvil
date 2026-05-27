@@ -927,3 +927,29 @@ Assessment:
   alongside edit payload normalization and application.
 - `turn.rs` still owns the orchestration sequence and weakening detector
   dispatch.
+
+### 2026-05-27 Slice 12
+
+Applied:
+
+- Moved the final post-apply no-op candidate check into
+  `repair_patch_validation.rs`.
+- Added a typed `RepairCandidateNoopError` so `turn.rs` only maps the pure
+  validation result into the legacy `ValidationFailure` carrier.
+- Added a module test anchoring the no-op rejection message and accepting real
+  content changes.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting
+- `cargo test repair_patch_validation --lib -q`: pass, 19 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3001 tests when rerun outside sandbox
+
+Assessment:
+
+- Patch validation now owns another pure candidate-admission rule.
+- `turn.rs` still owns the high-level validation sequence, semantic test-edit
+  gate, and weakening detector dispatch.

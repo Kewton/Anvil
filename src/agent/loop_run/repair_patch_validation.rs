@@ -134,6 +134,15 @@ pub(super) enum RepairCandidateContentError {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RepairCandidateNoopError;
+
+impl RepairCandidateNoopError {
+    pub(super) fn message(self) -> &'static str {
+        "repair intent applied but produced no net change to the file"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairCandidateWeakeningError {
     pub(super) rejection: Option<super::repair_attempt_outcome::RepairRejectionKind>,
@@ -414,6 +423,16 @@ pub(super) fn repair_intent_edits_fingerprint(
         });
     }
     format!("{:x}", hasher.finalize())
+}
+
+pub(super) fn validate_repair_candidate_changed(
+    original_contents: &str,
+    updated_contents: &str,
+) -> Result<(), RepairCandidateNoopError> {
+    if original_contents == updated_contents {
+        return Err(RepairCandidateNoopError);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_repair_intent_text_payload(
@@ -1200,6 +1219,17 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first, different_mode);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn candidate_changed_validation_rejects_noop_candidate() {
+        let err = validate_repair_candidate_changed("same", "same").unwrap_err();
+        assert_eq!(err, RepairCandidateNoopError);
+        assert_eq!(
+            err.message(),
+            "repair intent applied but produced no net change to the file"
+        );
+        assert!(validate_repair_candidate_changed("before", "after").is_ok());
     }
 
     #[test]
