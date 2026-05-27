@@ -1293,3 +1293,25 @@ Assessment:
 
 - No behavior change intended. Target selection now sits next to the
   semantic-plan exhaustion state it depends on.
+
+## Structural Verification: Slice 60
+
+Scope:
+
+- Move task-contract-facing verifier repair state projection from the actor
+  loop into `repair_job.rs`.
+- Keep `Agent::task_contract_repair_state` as a thin adapter over
+  `task_contract_repair_state_from_job`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_job --lib -q`: pass, 143 tests.
+- `cargo test task_contract --lib -q`: pass, 85 tests when rerun outside
+  sandbox.
+
+Assessment:
+
+- No behavior change intended. The task-contract recovery planner now receives
+  verifier repair state from the RepairJob state module, not from duplicated
+  actor-loop projection logic.

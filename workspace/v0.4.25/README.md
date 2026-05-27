@@ -2207,3 +2207,27 @@ Assessment:
 
 - No behavior change intended. The active repair target is now derived in the
   same module that owns semantic-plan exhaustion and RepairJob state.
+
+### 2026-05-27 Slice 60
+
+Applied:
+
+- Moved verifier repair state projection for task-contract recovery into
+  `repair_job.rs` as `task_contract_repair_state_from_job`.
+- Reduced `Agent::task_contract_repair_state` to a thin adapter over the
+  RepairJob-owned projection.
+- Kept the task-contract-facing `VerifierRepairState` type owned by
+  `repair_job.rs` and re-exported from `task_contract.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_job --lib -q`: pass, 143 tests
+- `cargo test task_contract --lib -q`: pass, 85 tests when rerun outside
+  sandbox
+
+Assessment:
+
+- No behavior change intended. Task-contract recovery now receives verifier
+  repair state from the RepairJob module instead of duplicating projection
+  logic inside the actor loop.

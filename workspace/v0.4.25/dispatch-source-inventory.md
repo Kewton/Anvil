@@ -239,3 +239,6 @@ with legacy/fallback paths unable to override it.
 - Current status: effective verifier repair target selection is now isolated
   in `repair_job.rs`; `turn.rs` imports it as a projection and one
   `repair_job.rs` to `turn.rs` reverse dependency has been removed.
+- Current status: task-contract-facing verifier repair state projection is
+  now isolated in `repair_job.rs`; `turn.rs` keeps only a thin adapter that
+  passes the Agent-owned pending flag and per-turn edit counters.

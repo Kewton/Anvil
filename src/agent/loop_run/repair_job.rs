@@ -2214,6 +2214,39 @@ pub(super) fn verifier_repair_effective_target_hint(
     None
 }
 
+pub(super) fn task_contract_repair_state_from_job(
+    pending: bool,
+    job: Option<&RepairJob>,
+    repair_edit_count: Option<usize>,
+    repo_edit_calls_made_this_turn: usize,
+) -> VerifierRepairState {
+    if !pending {
+        return VerifierRepairState::None;
+    }
+    if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
+        return VerifierRepairState::None;
+    }
+    let Some(job) = job else {
+        return VerifierRepairState::None;
+    };
+    match job.next_action() {
+        RepairNextAction::RequestPatch { target_hint } => VerifierRepairState::WaitingForEdit {
+            target_hint: Some(target_hint),
+        },
+        RepairNextAction::RequestDiagnostic | RepairNextAction::Replan => {
+            VerifierRepairState::WaitingForEdit {
+                target_hint: verifier_repair_effective_target_hint(job)
+                    .cloned()
+                    .or_else(|| job.repair_target_hint.clone())
+                    .or_else(|| job.target_hint.clone()),
+            }
+        }
+        RepairNextAction::RerunVerifier
+        | RepairNextAction::SafeStop { .. }
+        | RepairNextAction::VerifiedDone => VerifierRepairState::None,
+    }
+}
+
 pub(super) fn verifier_repair_context_from_failure(
     work_root: &Path,
     command: &str,

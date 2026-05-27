@@ -15133,36 +15133,12 @@ impl Agent {
         repair_edit_count: Option<usize>,
         repo_edit_calls_made_this_turn: usize,
     ) -> super::task_contract::VerifierRepairState {
-        if !self.task_contract_verifier_repair_pending {
-            return super::task_contract::VerifierRepairState::None;
-        }
-        if repair_edit_count.is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count) {
-            return super::task_contract::VerifierRepairState::None;
-        }
-        if let Some(job) = self.repair_job.as_ref() {
-            return match job.next_action() {
-                super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
-                    super::task_contract::VerifierRepairState::WaitingForEdit {
-                        target_hint: Some(target_hint),
-                    }
-                }
-                super::repair_job::RepairNextAction::RequestDiagnostic
-                | super::repair_job::RepairNextAction::Replan => {
-                    super::task_contract::VerifierRepairState::WaitingForEdit {
-                        target_hint: verifier_repair_effective_target_hint(job)
-                            .cloned()
-                            .or_else(|| job.repair_target_hint.clone())
-                            .or_else(|| job.target_hint.clone()),
-                    }
-                }
-                super::repair_job::RepairNextAction::RerunVerifier
-                | super::repair_job::RepairNextAction::SafeStop { .. }
-                | super::repair_job::RepairNextAction::VerifiedDone => {
-                    super::task_contract::VerifierRepairState::None
-                }
-            };
-        }
-        super::task_contract::VerifierRepairState::None
+        super::repair_job::task_contract_repair_state_from_job(
+            self.task_contract_verifier_repair_pending,
+            self.repair_job.as_ref(),
+            repair_edit_count,
+            repo_edit_calls_made_this_turn,
+        )
     }
 
     fn task_contract_recovery_action(
