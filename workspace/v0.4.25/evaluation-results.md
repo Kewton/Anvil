@@ -1451,3 +1451,25 @@ Assessment:
 
 - No behavior change intended. The actor loop now consumes the active-job
   payload builder instead of owning that schema itself.
+
+## Structural Verification: Slice 67
+
+Scope:
+
+- Move verifier invocation and external-import rejection telemetry payload
+  builders from `turn.rs` to `auto_test.rs`.
+- Keep `turn.rs` responsible for event emission lifecycle only.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_invoked --lib -q`: pass, 17 tests.
+- `cargo test external_import_rejected --lib -q`: pass, 4 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The verifier execution module now owns the
+  sanitized payload projection for the verifier snapshot it already produces.

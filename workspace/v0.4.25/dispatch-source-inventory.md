@@ -261,3 +261,6 @@ with legacy/fallback paths unable to override it.
 - Current status: `agent.active_job.selected` payload construction is now
   isolated in `active_job_arbiter.rs`; `turn.rs` owns emission timing/dedup
   but not the active-job selected/rejected schema projection.
+- Current status: verifier invocation and external-import rejection payload
+  construction is now isolated in `auto_test.rs`; `turn.rs` owns emission
+  timing/masking/dedup but not the verifier snapshot telemetry schema.

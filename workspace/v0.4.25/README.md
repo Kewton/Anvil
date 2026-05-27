@@ -2384,3 +2384,29 @@ Assessment:
 - No behavior change intended. Active-job structured output is now colocated
   with active-job selection/projection, reducing another actor-loop schema
   responsibility.
+
+### 2026-05-27 Slice 67
+
+Applied:
+
+- Moved `agent.verifier.invoked` and
+  `agent.verifier.external_import_rejected` payload construction from
+  `turn.rs` to `auto_test.rs`.
+- `auto_test.rs` now owns the verifier invocation snapshot and the sanitized
+  telemetry schema derived from that snapshot.
+- `turn.rs` keeps only emission timing, masking, and dedup ownership.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_invoked --lib -q`: pass, 17 tests
+- `cargo test external_import_rejected --lib -q`: pass, 4 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Verifier execution telemetry is now colocated
+  with verifier execution/snapshot logic instead of remaining as actor-loop
+  schema construction.

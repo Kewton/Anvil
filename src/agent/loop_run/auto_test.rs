@@ -1114,6 +1114,73 @@ impl VerifierInvokedSnapshot {
     }
 }
 
+/// Pure builder for the `agent.verifier.invoked` event payload.
+///
+/// `cwd_inside_work_root` is intentionally root-level even though
+/// `HermeticEnvSummary` carries it. `env_summary` only carries
+/// `allowlist_keys` and `pythonpath_root`.
+pub(super) fn build_agent_verifier_invoked_payload(
+    session_id: &str,
+    turn_index: usize,
+    iteration_seq: usize,
+    snapshot: &VerifierInvokedSnapshot,
+) -> serde_json::Value {
+    let bound_artifacts: Vec<serde_json::Value> = snapshot
+        .bound_artifacts
+        .iter()
+        .map(|h| serde_json::json!({ "path_hash": h.as_str() }))
+        .collect();
+    let env_summary = serde_json::json!({
+        "allowlist_keys": snapshot.env_summary.allowlist_keys,
+        "pythonpath_root": snapshot.env_summary.pythonpath_root,
+    });
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "iteration_seq": iteration_seq,
+        "runner": snapshot.runner.as_str(),
+        "bound_artifacts": bound_artifacts,
+        "bound_test_artifacts_count": snapshot.bound_test_artifacts_count,
+        "bound_artifacts_truncated": snapshot.bound_artifacts_truncated,
+        "env_summary": env_summary,
+        "cwd_inside_work_root": snapshot.env_summary.cwd_inside_work_root,
+    })
+}
+
+/// Pure builder for the `agent.verifier.external_import_rejected` event
+/// payload. The caller passes only pre-hashed strings; raw module names,
+/// filesystem paths, and executable paths must not enter this payload.
+pub(super) fn build_agent_verifier_external_import_rejected_payload(
+    session_id: &str,
+    turn_index: usize,
+    runner: &str,
+    reason: &str,
+    detected_hashes: &[(&str, &'static str)],
+    detected_count: usize,
+    detected_truncated: bool,
+) -> serde_json::Value {
+    let detected_modules: Vec<serde_json::Value> = detected_hashes
+        .iter()
+        .take(EXTERNAL_IMPORT_DETECTED_CAP)
+        .map(|(hash, source_kind)| {
+            serde_json::json!({
+                "module_hash": *hash,
+                "path_hash": *hash,
+                "source_kind": *source_kind,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "runner": runner,
+        "reason": reason,
+        "detected_count": detected_count,
+        "detected_truncated": detected_truncated,
+        "detected_modules": detected_modules,
+    })
+}
+
 /// `bound_test_artifacts` stores the (already scope-validated) test
 /// artifact paths that were appended to `args`. Phase 2.3
 /// (`validate_bound_test_artifacts_for_execution`) re-checks them at

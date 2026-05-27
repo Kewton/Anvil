@@ -5,6 +5,7 @@ use super::active_job_arbiter::{
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
+    build_agent_verifier_external_import_rejected_payload, build_agent_verifier_invoked_payload,
     classify_auto_test, count_compile_errors, count_test_failures,
 };
 use super::failure_packet::FailurePacketTimeoutKind;
@@ -23169,108 +23170,6 @@ fn format_numbered_read_block(contents: &str) -> String {
         .map(|(index, line)| format!("{:>4}: {line}", index + 1))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Issue #661 iteration-4 Task 5.2 (DR1-005 / Section 8-1): pure builder for
-/// the `agent.verifier.invoked` event payload. Extracted as a free function
-/// so unit tests can assert the field shape without instantiating an Agent.
-///
-/// Payload schema (Section 8-1, `mask_payload_inplace` post-application form):
-///
-/// ```json
-/// {
-///   "session_id": "<SessionStore::session_id()>",
-///   "turn_index": <usize>,
-///   "iteration_seq": <usize>,
-///   "runner": "cargo" | "python3",
-///   "bound_artifacts": [{ "path_hash": "<16-hex>" }],
-///   "bound_test_artifacts_count": <usize>,
-///   "bound_artifacts_truncated": <bool>,
-///   "env_summary": {
-///     "allowlist_keys": [<&str>],
-///     "pythonpath_root": <bool>
-///   },
-///   "cwd_inside_work_root": <bool>
-/// }
-/// ```
-///
-/// `cwd_inside_work_root` is intentionally a **root-level** field even though
-/// the `HermeticEnvSummary` struct carries it. Section 8-1 specifies the
-/// flatten so log consumers can pivot on cwd containment without descending
-/// into `env_summary`. `env_summary` only carries `allowlist_keys` /
-/// `pythonpath_root`.
-///
-/// Field order matches the schema documentation so `serde_json::to_vec`
-/// (used by `compute_payload_digest`) sees a stable canonical byte sequence
-/// for identical inputs across re-emits in the same turn (DR1-004 dedup
-/// determinism).
-pub(super) fn build_agent_verifier_invoked_payload(
-    session_id: &str,
-    turn_index: usize,
-    iteration_seq: usize,
-    snapshot: &super::auto_test::VerifierInvokedSnapshot,
-) -> serde_json::Value {
-    let bound_artifacts: Vec<serde_json::Value> = snapshot
-        .bound_artifacts
-        .iter()
-        .map(|h| serde_json::json!({ "path_hash": h.as_str() }))
-        .collect();
-    let env_summary = serde_json::json!({
-        "allowlist_keys": snapshot.env_summary.allowlist_keys,
-        "pythonpath_root": snapshot.env_summary.pythonpath_root,
-    });
-    serde_json::json!({
-        "session_id": session_id,
-        "turn_index": turn_index,
-        "iteration_seq": iteration_seq,
-        "runner": snapshot.runner.as_str(),
-        "bound_artifacts": bound_artifacts,
-        "bound_test_artifacts_count": snapshot.bound_test_artifacts_count,
-        "bound_artifacts_truncated": snapshot.bound_artifacts_truncated,
-        "env_summary": env_summary,
-        // Root-level (NOT inside env_summary) per Section 8-1 schema.
-        "cwd_inside_work_root": snapshot.env_summary.cwd_inside_work_root,
-    })
-}
-
-/// Issue #661 iteration-5 Task 7.3: pure-fn builder for the
-/// `agent.verifier.external_import_rejected` event payload (Section 8-2 schema).
-///
-/// raw module name / raw filesystem path / raw executable path は payload に
-/// 出さない (DR4-005)。caller (`emit_agent_verifier_external_import_rejected_if_first`)
-/// が事前に `mask_secrets` + `stable_path_hash` 経由で hash 化した文字列のみを
-/// `detected_hashes` 経由で受け取る。`detected_modules` は最大
-/// `EXTERNAL_IMPORT_DETECTED_CAP` 件 (8) で truncate される。
-pub(super) fn build_agent_verifier_external_import_rejected_payload(
-    session_id: &str,
-    turn_index: usize,
-    runner: &str,
-    reason: &str,
-    detected_hashes: &[(&str, &'static str)],
-    detected_count: usize,
-    detected_truncated: bool,
-) -> serde_json::Value {
-    let cap = super::auto_test::EXTERNAL_IMPORT_DETECTED_CAP;
-    let detected_modules: Vec<serde_json::Value> = detected_hashes
-        .iter()
-        .take(cap)
-        .map(|(hash, source_kind)| {
-            serde_json::json!({
-                "module_hash": *hash,
-                "path_hash": *hash,
-                "source_kind": *source_kind,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "session_id": session_id,
-        "turn_index": turn_index,
-        "runner": runner,
-        "reason": reason,
-        "detected_count": detected_count,
-        "detected_truncated": detected_truncated,
-        "detected_modules": detected_modules,
-    })
 }
 
 /// Issue #646 (C2 / A4): no-op repo-edit detector. Compares the pre-tool
