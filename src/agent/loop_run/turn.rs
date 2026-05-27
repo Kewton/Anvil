@@ -123,8 +123,9 @@ use super::verifier_driver::{
     TaskContractVerifierOutcome, TaskContractVerifierSelection,
     detect_verifier_external_import_contamination, run_legacy_task_contract_verifier,
     run_structured_task_contract_verifier, select_task_contract_project_unit,
-    select_task_contract_verifier, task_contract_auto_test_result_to_outcome,
-    task_contract_verifier_outcome_label, task_contract_verifier_transport_error_to_outcome,
+    select_task_contract_verifier, structured_verifier_invocation_report,
+    task_contract_auto_test_result_to_outcome, task_contract_verifier_outcome_label,
+    task_contract_verifier_transport_error_to_outcome,
 };
 use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
@@ -8340,43 +8341,16 @@ impl Agent {
                         &bound_test_artifacts_paths,
                     );
                 }
-                // Issue #661 iteration-4 Task 5.2 (DR1-005 emit ownership):
-                // pre-spawn `agent.verifier.invoked` event emit + per-turn
-                // dedup. Build the snapshot *before* `run_structured` so
-                // the event lands even if the spawn itself fails (the
-                // event records intent, not outcome). RunnerKind::None
-                // never reaches Runnable in production (cargo / python3
-                // only), but `from_command_and_env` returns None for
-                // unknown runners as a DR4-004 security fail-closed
-                // backstop — we skip the emit in that case.
-                //
-                // iteration-5 Task 6.2: pass runner-specific extras
-                // (Python adapter receives VERIFIER_ENV_PYTHON_EXTRA) so
-                // the snapshot's env_summary mirrors execution-time env.
-                let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
-                    "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
-                    _ => &[],
-                };
-                let env_plan_for_emit =
-                    super::auto_test::build_hermetic_env_plan(&self.work_root, extras_for_emit);
-                if let Some(snapshot) =
-                    super::auto_test::VerifierInvokedSnapshot::from_command_and_env(
-                        &command,
-                        &env_plan_for_emit,
-                    )
-                {
-                    self.emit_agent_verifier_invoked_if_new(&snapshot);
+                let invocation_report =
+                    structured_verifier_invocation_report(&self.work_root, &command);
+                if let Some(snapshot) = invocation_report.snapshot.as_ref() {
+                    self.emit_agent_verifier_invoked_if_new(snapshot);
                 }
-                // Issue #661 iteration-5 Task 7.1 / 7.3: if the env plan
-                // detected an external PYTHONPATH component pre-execution,
-                // emit the `agent.verifier.external_import_rejected` event
-                // (per-turn cap'd) so the LLM / log consumer sees the
-                // boundary breach signal before run_structured.
-                if let Some(hash) = env_plan_for_emit.rejected_pythonpath_hash() {
+                if let Some(hash) = invocation_report.rejected_pythonpath_hash.as_deref() {
                     self.emit_agent_verifier_external_import_rejected_if_first(
                         command.runner(),
                         "external_pythonpath_rejected",
-                        &[(hash.as_str(), "pythonpath")],
+                        &[(hash, "pythonpath")],
                         1,
                         false,
                     );

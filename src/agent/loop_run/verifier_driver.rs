@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::auto_test::{
     AutoTestPlan, AutoTestResult, AutoTestRunner, OwnedTestVerifierPlan, VerifierCommand,
+    VerifierInvokedSnapshot,
 };
 use super::failure_packet::FailurePacketTimeoutKind;
 use super::project_probe::ProjectUnit;
@@ -58,6 +59,12 @@ pub(super) enum TaskContractVerifierSelection {
         command_for_log: String,
     },
     Missing,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct StructuredVerifierInvocationReport {
+    pub(super) snapshot: Option<VerifierInvokedSnapshot>,
+    pub(super) rejected_pythonpath_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +147,21 @@ pub(super) fn detect_verifier_external_import_contamination(
         truncated: detected.truncated,
         hashed_entries,
     })
+}
+
+pub(super) fn structured_verifier_invocation_report(
+    work_root: &Path,
+    command: &VerifierCommand,
+) -> StructuredVerifierInvocationReport {
+    let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
+        "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
+        _ => &[],
+    };
+    let env_plan_for_emit = super::auto_test::build_hermetic_env_plan(work_root, extras_for_emit);
+    StructuredVerifierInvocationReport {
+        snapshot: VerifierInvokedSnapshot::from_command_and_env(command, &env_plan_for_emit),
+        rejected_pythonpath_hash: env_plan_for_emit.rejected_pythonpath_hash(),
+    }
 }
 
 pub(super) fn select_task_contract_verifier(
@@ -446,6 +468,21 @@ mod tests {
             contamination.hashed_entries[0].0,
             "/external/repo/app/main.py"
         );
+    }
+
+    #[test]
+    fn structured_invocation_report_builds_snapshot_for_python_verifier() {
+        let dir = tempdir().unwrap();
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&["tests/test_main.py".to_string()])
+                .unwrap();
+
+        let report = structured_verifier_invocation_report(dir.path(), &command);
+
+        let snapshot = report.snapshot.expect("python verifier snapshot");
+        assert_eq!(snapshot.bound_test_artifacts_count, 1);
+        assert!(snapshot.env_summary.pythonpath_root);
+        assert!(snapshot.env_summary.cwd_inside_work_root);
     }
 
     #[test]
