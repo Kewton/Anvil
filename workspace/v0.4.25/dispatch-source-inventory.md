@@ -109,3 +109,6 @@ with legacy/fallback paths unable to override it.
 - Current status: post-apply no-op candidate validation is now
   validation-owned; `turn.rs` maps the typed no-op error into the existing
   repair rejection signal.
+- Current status: duplicate repair-intent replay detection is now
+  validation-owned; `turn.rs` passes the read-only applied-intent history and
+  maps the typed duplicate error into the existing repair rejection signal.

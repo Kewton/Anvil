@@ -227,3 +227,24 @@ Assessment:
 
 - No behavior change intended. The change narrows `turn.rs` responsibility by
   moving one more pure admission rule into the validation boundary.
+
+## Structural Verification: Slice 13
+
+Scope:
+
+- Move duplicate repair-intent replay detection out of `turn.rs`.
+- Preserve the existing duplicate rejection signal and ledger behavior.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 20 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3002 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Replay detection is now a typed validation rule
+  rather than an inline `turn.rs` branch.

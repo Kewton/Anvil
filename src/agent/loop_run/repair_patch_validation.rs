@@ -143,6 +143,15 @@ impl RepairCandidateNoopError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RepairCandidateDuplicateIntentError;
+
+impl RepairCandidateDuplicateIntentError {
+    pub(super) fn message(self) -> &'static str {
+        "duplicate repair edit intent for the same failure"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairCandidateWeakeningError {
     pub(super) rejection: Option<super::repair_attempt_outcome::RepairRejectionKind>,
@@ -431,6 +440,19 @@ pub(super) fn validate_repair_candidate_changed(
 ) -> Result<(), RepairCandidateNoopError> {
     if original_contents == updated_contents {
         return Err(RepairCandidateNoopError);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_repair_intent_not_replayed(
+    applied_repair_intents: &[String],
+    fingerprint: &str,
+) -> Result<(), RepairCandidateDuplicateIntentError> {
+    if applied_repair_intents
+        .iter()
+        .any(|applied| applied == fingerprint)
+    {
+        return Err(RepairCandidateDuplicateIntentError);
     }
     Ok(())
 }
@@ -1230,6 +1252,19 @@ mod tests {
             "repair intent applied but produced no net change to the file"
         );
         assert!(validate_repair_candidate_changed("before", "after").is_ok());
+    }
+
+    #[test]
+    fn duplicate_intent_validation_rejects_replayed_fingerprint() {
+        let applied = vec!["abc123".to_string()];
+
+        let err = validate_repair_intent_not_replayed(&applied, "abc123").unwrap_err();
+        assert_eq!(err, RepairCandidateDuplicateIntentError);
+        assert_eq!(
+            err.message(),
+            "duplicate repair edit intent for the same failure"
+        );
+        assert!(validate_repair_intent_not_replayed(&applied, "other").is_ok());
     }
 
     #[test]

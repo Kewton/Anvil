@@ -24728,12 +24728,16 @@ fn validate_verifier_repair_intents_inner(
         &relative_path,
         &edit_payloads,
     );
-    if context.applied_repair_intents.contains(&fingerprint) {
-        return Err(ValidationFailure::failed_with_signal(
-            "duplicate repair edit intent for the same failure".to_string(),
+    super::repair_patch_validation::validate_repair_intent_not_replayed(
+        &context.applied_repair_intents,
+        &fingerprint,
+    )
+    .map_err(|err| {
+        ValidationFailure::failed_with_signal(
+            err.message().to_string(),
             RepairRejectionSignal::Duplicate,
-        ));
-    }
+        )
+    })?;
 
     // Phase 2: in-memory apply. Per-intent input validation has already
     // passed; remaining failures here surface as unsigned exact/replace-all

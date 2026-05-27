@@ -953,3 +953,29 @@ Assessment:
 - Patch validation now owns another pure candidate-admission rule.
 - `turn.rs` still owns the high-level validation sequence, semantic test-edit
   gate, and weakening detector dispatch.
+
+### 2026-05-27 Slice 13
+
+Applied:
+
+- Moved duplicate repair-intent replay detection into
+  `repair_patch_validation.rs`.
+- Kept fingerprint construction in the validation boundary and changed the
+  replay check to accept the existing applied-intent history as a read-only
+  slice rather than requiring a specific collection type.
+- Added a module test for replay rejection and non-replayed acceptance.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 20 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3002 tests when rerun outside sandbox
+
+Assessment:
+
+- Duplicate-intent admission is now validation-owned end to end.
+- `turn.rs` still maps the typed duplicate error into the existing
+  `RepairRejectionSignal::Duplicate` carrier.
