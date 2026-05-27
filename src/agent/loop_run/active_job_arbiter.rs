@@ -38,7 +38,7 @@ use super::task_contract::{
     ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract,
     VerifierPrerequisiteSignal, has_required_setup_artifact,
 };
-use super::turn::EffectiveToolPolicy;
+use super::tool_policy::EffectiveToolPolicy;
 use crate::modes::plan_act::ExecutionMode;
 
 /// Controller-facing next action for the pre-model part of the actor loop.
@@ -630,7 +630,7 @@ pub(super) fn project_policy(selection: &ActiveJobSelection) -> EffectiveToolPol
 
 #[cfg(test)]
 mod tests {
-    use super::super::turn::EffectiveToolPolicyReason;
+    use super::super::tool_policy::EffectiveToolPolicyReason;
     use super::*;
     use std::path::PathBuf;
 

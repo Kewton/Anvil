@@ -1335,3 +1335,25 @@ Assessment:
 
 - No behavior change intended. The normalized changed-file list now lives next
   to the code that consumes changed files for verifier target hints.
+
+## Structural Verification: Slice 62
+
+Scope:
+
+- Move effective tool policy data types and constructors from `turn.rs` to
+  `tool_policy.rs`.
+- Remove the production `active_job_arbiter.rs -> turn.rs` dependency for
+  `EffectiveToolPolicy`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test active_job_arbiter --lib -q`: pass, 46 tests.
+- `cargo test effective_tool_policy --lib -q`: pass, 8 tests when rerun
+  outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Tool policy projection is now independent of
+  the actor loop, reducing coupling between active-job arbitration and
+  turn-level orchestration.

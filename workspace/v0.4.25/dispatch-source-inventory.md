@@ -245,3 +245,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier changed-file aggregation is now isolated in
   `verifier_repair_targeting.rs`; `turn.rs` only decides when to capture repo
   snapshots and passes the normalized list into verifier repair state.
+- Current status: effective tool policy types are now isolated in
+  `tool_policy.rs`; `active_job_arbiter.rs` no longer depends on `turn.rs`
+  for the selected-job policy projection.

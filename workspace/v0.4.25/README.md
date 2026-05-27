@@ -2251,3 +2251,27 @@ Assessment:
 
 - No behavior change intended. Changed-file normalization is now colocated
   with verifier repair target parsing and hint generation.
+
+### 2026-05-27 Slice 62
+
+Applied:
+
+- Added `tool_policy.rs` and moved `EffectiveToolPolicy`,
+  `EffectiveToolPolicyReason`, `FocusedEditPolicy`, and
+  `ArtifactDirectedPolicy` out of `turn.rs`.
+- Updated `active_job_arbiter.rs` to depend on the standalone policy module
+  instead of importing policy types from the actor loop.
+- Updated policy-focused tests and PAM advisory tests to import from
+  `tool_policy.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test active_job_arbiter --lib -q`: pass, 46 tests
+- `cargo test effective_tool_policy --lib -q`: pass, 8 tests when rerun
+  outside sandbox
+
+Assessment:
+
+- No behavior change intended. Tool policy is now a neutral projection module;
+  active-job arbitration no longer depends on `turn.rs` for policy types.

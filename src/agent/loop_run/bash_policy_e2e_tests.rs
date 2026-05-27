@@ -21,8 +21,8 @@
 //! - `super::active_job_arbiter::should_install_setup_bootstrap`
 //! - `super::artifact_completion_job::attempt_outcome_to_json_value`
 //! - `super::artifact_completion_job::ArtifactAttemptOutcomeKind::as_str`
-//! - `super::turn::EffectiveToolPolicy::setup_bootstrap`
-//! - `super::turn::EffectiveToolPolicyReason::SetupBootstrap`
+//! - `super::tool_policy::EffectiveToolPolicy::setup_bootstrap`
+//! - `super::tool_policy::EffectiveToolPolicyReason::SetupBootstrap`
 
 #![cfg(test)]
 
@@ -50,7 +50,7 @@ use super::task_contract::{
     ArtifactRole, TaskContract, VerifierPrerequisiteSignal,
     has_optional_setup_or_verifier_prerequisite, has_required_setup_artifact,
 };
-use super::turn::{EffectiveToolPolicy, EffectiveToolPolicyReason};
+use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::{
     build_arbiter_candidates_for_test, consume_carryover_at_actor_loop_head_for_test,
     drive_artifact_directed_policy_error_for_test, effective_tool_policy_for_test,

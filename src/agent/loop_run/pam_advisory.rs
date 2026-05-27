@@ -606,7 +606,7 @@ pub(super) fn pam_advisory_decide_for_test(
 pub(super) fn build_active_job_selection_artifact_recovery_for_test() -> ActiveJobSelection {
     use super::active_job_arbiter::{Budget, DesiredAction, JobCandidate};
     use super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
-    use super::turn::{EffectiveToolPolicy, EffectiveToolPolicyReason};
+    use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
     let candidate = JobCandidate {
         kind: ActiveJobKind::ArtifactRecovery,
         desired_action: DesiredAction::ArtifactDirected {

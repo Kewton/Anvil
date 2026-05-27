@@ -478,6 +478,7 @@ mod task_contract;
 // via `super::task_workspace_scope::*`.
 mod task_workspace_scope;
 mod tester;
+mod tool_policy;
 mod turn;
 pub(crate) mod verifier_skill;
 pub(crate) mod work_mode_confirm;
