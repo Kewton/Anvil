@@ -2590,3 +2590,28 @@ Assessment:
 
 - No behavior change intended. Unicode capability detection now lives with
   progress display text/styling, and `turn.rs` no longer owns locale parsing.
+
+### 2026-05-27 Slice 75
+
+Applied:
+
+- Moved `NO_COLOR` environment detection from `turn.rs` to
+  `progress_text.rs`.
+- Updated the loop-run re-export so TUI markdown and banner tests continue to
+  consume `loop_run::no_color_requested`.
+- Adjusted banner tests to compare against the public loop-run helper instead
+  of the private `turn` module.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test no_color_requested --lib -q`: pass, 4 tests
+- `cargo test progress_text --lib -q`: pass, 10 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3054 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Color/Unicode display capability detection is
+  now fully outside the actor loop, with the public re-export preserved.

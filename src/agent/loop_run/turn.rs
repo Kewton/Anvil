@@ -160,7 +160,8 @@ use super::deterministic::empty_framework_game_files as deterministic_empty_fram
 #[cfg(test)]
 use super::progress_text::is_utf8_locale;
 use super::progress_text::{
-    paint, sanitize_for_progress, tool_color, tool_emoji, truncate, unicode_supported,
+    no_color_requested, paint, sanitize_for_progress, tool_color, tool_emoji, truncate,
+    unicode_supported,
 };
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
@@ -16470,12 +16471,6 @@ if __name__ == "__main__":
             .messages
             .push(ConversationMessage::user(content));
     }
-}
-
-/// Returns true when the environment requests that color output be suppressed
-/// (https://no-color.org/): `NO_COLOR` is set to any non-empty value.
-pub(crate) fn no_color_requested() -> bool {
-    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
 }
 
 /// Issue #606 T-1.6 / Issue #607: pure projection from a Bash outcome to an

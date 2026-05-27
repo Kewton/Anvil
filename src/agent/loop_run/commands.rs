@@ -2604,7 +2604,7 @@ mod tests {
         assert_eq!(state_suffix(true, true), "fresh");
     }
 
-    // --- banner_no_color_requested vs turn::no_color_requested -------------
+    // --- banner_no_color_requested vs loop_run::no_color_requested ---------
 
     #[test]
     fn banner_no_color_requested_unset_is_false() {
@@ -2612,7 +2612,7 @@ mod tests {
         let guard = NoColorGuard::capture();
         guard.unset();
         assert!(!banner_no_color_requested());
-        assert!(!super::super::turn::no_color_requested());
+        assert!(!crate::agent::loop_run::no_color_requested());
     }
 
     #[test]
@@ -2621,7 +2621,7 @@ mod tests {
         let guard = NoColorGuard::capture();
         guard.set("");
         assert!(!banner_no_color_requested());
-        assert!(!super::super::turn::no_color_requested());
+        assert!(!crate::agent::loop_run::no_color_requested());
     }
 
     #[test]
@@ -2630,7 +2630,7 @@ mod tests {
         let guard = NoColorGuard::capture();
         guard.set("1");
         assert!(banner_no_color_requested());
-        assert!(super::super::turn::no_color_requested());
+        assert!(crate::agent::loop_run::no_color_requested());
     }
 
     #[test]
@@ -2641,14 +2641,14 @@ mod tests {
             guard.set(value);
             assert_eq!(
                 banner_no_color_requested(),
-                super::super::turn::no_color_requested(),
+                crate::agent::loop_run::no_color_requested(),
                 "drift detected for NO_COLOR={value:?}"
             );
         }
         guard.unset();
         assert_eq!(
             banner_no_color_requested(),
-            super::super::turn::no_color_requested()
+            crate::agent::loop_run::no_color_requested()
         );
     }
 

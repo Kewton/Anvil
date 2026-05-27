@@ -1639,3 +1639,26 @@ Assessment:
 
 - No behavior change intended. Display capability detection is now colocated
   with progress display helpers instead of the actor loop.
+
+## Structural Verification: Slice 75
+
+Scope:
+
+- Move `NO_COLOR` detection from `turn.rs` to `progress_text.rs`.
+- Preserve the public `loop_run::no_color_requested` helper used by TUI
+  markdown and banner consistency tests.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test no_color_requested --lib -q`: pass, 4 tests.
+- `cargo test progress_text --lib -q`: pass, 10 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3054 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. NO_COLOR and UTF-8 display capability
+  detection now share the progress display helper module and a stable
+  loop-run re-export.

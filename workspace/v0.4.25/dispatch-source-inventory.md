@@ -286,3 +286,6 @@ with legacy/fallback paths unable to override it.
 - Current status: UTF-8 locale detection and `unicode_supported` are now
   isolated in `progress_text.rs`; the crate-level re-export remains available
   for TUI markdown while `turn.rs` consumes it as a display helper.
+- Current status: `NO_COLOR` detection is now isolated in `progress_text.rs`;
+  the crate-level `loop_run::no_color_requested` re-export is preserved while
+  `turn.rs` no longer owns the environment helper.

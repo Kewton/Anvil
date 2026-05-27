@@ -85,6 +85,12 @@ pub(crate) fn unicode_supported() -> bool {
     false
 }
 
+/// Returns true when the environment requests that color output be suppressed
+/// (https://no-color.org/): `NO_COLOR` is set to any non-empty value.
+pub(crate) fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
