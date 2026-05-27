@@ -32,8 +32,9 @@ Approximate module-level results:
 
 | File | Functions | Avg Rough CC | Max Rough CC | Rough CC >= 15 | Rough CC >= 30 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `src/agent/loop_run/turn.rs` | 1042 | 3.0 | 362 | 30 | 6 |
+| `src/agent/loop_run/turn.rs` | 1036 | 3.03 | 362 | 30 | 1 |
 | `src/agent/loop_run/repair_job.rs` | 236 | 2.4 | 26 | 3 | 0 |
+| `src/agent/loop_run/model_request.rs` | 9 | 3.11 | 8 | 0 | 0 |
 | `src/agent/loop_run/active_job_arbiter.rs` | 79 | 2.0 | 11 | 0 | 0 |
 | `src/agent/loop_run/repair_patch_validation.rs` | 118 | 3.1 | 15 | 1 | 0 |
 | `src/agent/loop_run/tool_policy.rs` | 26 | 3.5 | 14 | 0 | 0 |
@@ -169,6 +170,278 @@ Remaining work:
 - make the report non-blocking at first.
 - later fail CI only on regressions over a baseline, not on the current debt.
 
+## Resolution Approach By Issue
+
+### 1. Resolve `run_actor_loop` By Introducing A Small Turn Driver
+
+Target design:
+
+- keep one public entry point for the existing caller.
+- introduce a small `TurnDriver` or `TurnPhaseDriver` that owns phase
+  sequencing.
+- represent each phase result with a typed enum instead of scattered booleans
+  and early returns.
+- keep phase implementations small and side-effect bounded.
+
+Proposed phase boundary:
+
+1. `prepare_turn`
+   - load session state
+   - snapshot active jobs
+   - compute display context
+2. `select_next_action`
+   - ask `ActiveJobArbiter` for the next owner/action
+   - no model call, verifier call, or tool call here
+3. `execute_next_action`
+   - call exactly one narrow executor based on the selected typed action
+4. `record_observation`
+   - update transcript, job state, ledger, and progress text
+5. `decide_terminal_state`
+   - return `done`, actionable safe stop, or continue
+
+Migration method:
+
+- first add the phase functions while leaving behavior unchanged.
+- move one block at a time from `run_actor_loop` into a phase.
+- after each move, add focused tests for the phase outcome.
+- keep `run_actor_loop` as a thin shell until it is safe to rename or delete
+  the old body.
+
+Tests:
+
+- active repair job suppresses artifact recovery.
+- missing verifier job suppresses generic retry.
+- terminal safe stop exits before any new model/tool action.
+- normal implementation turn still reaches tool execution.
+
+Done criteria:
+
+- `run_actor_loop` no longer contains verifier, repair, request, or tool
+  implementation details.
+- rough CC for `run_actor_loop` drops below 50.
+- branch-heavy logic is covered by phase-level tests.
+
+### 2. Resolve Verifier And Repair Leakage With A Dedicated Job Driver API
+
+Target design:
+
+- `turn.rs` should not know the internals of verifier repair.
+- verifier repair should be driven through a narrow API:
+  `drive_repair_job_once(context) -> RepairDriveOutcome`.
+- the driver owns diagnostic pass, repair pass, patch validation,
+  verifier-delta interpretation, re-diagnostic, target switching, and safe
+  stop transition.
+
+Proposed modules:
+
+- `verifier_driver`
+  - command selection
+  - verifier execution
+  - stdout/stderr normalization
+  - failure packet construction
+- `repair_driver`
+  - consumes `RepairJob::next_action`
+  - runs diagnostic or patch-generation steps
+  - applies only validated patch proposals
+  - feeds verifier delta back into the job
+- `repair_report`
+  - formats actionable safe stop and final failure reports
+
+Migration method:
+
+- move `run_task_contract_verifier_once` first because it is a boundary with
+  clear inputs and outputs.
+- move `run_verifier_diagnostic_pass` next.
+- move `run_verifier_repair_pass_and_apply` last because it touches patch
+  validation, filesystem edits, and job state.
+- keep old function names as temporary wrappers only if tests need smaller
+  diffs; remove wrappers after call sites are updated.
+
+Tests:
+
+- compile/import failure selects implementation target.
+- assertion mismatch produces an authority-aware repair plan.
+- malformed diagnostic result consumes job-level budget and then re-diagnoses
+  or safe-stops.
+- unsafe test weakening is rejected before apply.
+- verifier delta can switch target or stop without falling into generic retry.
+
+Done criteria:
+
+- production verifier repair is dispatched only by the repair driver.
+- `turn.rs` cannot directly choose a verifier repair target.
+- invalid repair proposal handling is job-level, not loop-level.
+
+### 3. Resolve Model Request Complexity With Message Composer And Request Client
+
+Target design:
+
+- message construction is pure and testable.
+- model transport/retry behavior is separate from loop decisions.
+- request failures become typed outcomes, not ad hoc control-flow branches.
+
+Proposed modules:
+
+- `message_composer`
+  - builds system/developer/user/tool context
+  - owns context-budget trimming
+  - never performs network calls
+- `model_request`
+  - sends request to Ollama client
+  - handles retry/fallback model selection
+  - normalizes timeout, malformed tool call, prose-only response, and transport
+    errors into typed results
+
+Migration method:
+
+- extract `build_request_messages` into pure functions first.
+- snapshot current prompt/message behavior with tests.
+- extract `request_assistant_reply_with_retry` after message composition is
+  stable.
+- keep loop-level policy as a consumer of typed outcomes only.
+
+Tests:
+
+- artifact completion prompt includes required artifact target.
+- verifier repair prompt includes accepted repair plan and target.
+- PAM context is included as assistive context but not authority.
+- malformed response outcome does not directly mutate repair state.
+
+Done criteria:
+
+- `build_request_messages`, `request_assistant_reply_with_retry`, and
+  `request_assistant_reply` are no longer high-complexity functions in
+  `turn.rs`.
+- prompt construction regressions are caught by unit tests.
+- retry policy is visible in one place.
+
+### 4. Resolve Tool Execution Centralization With Typed Tool Outcomes
+
+Target design:
+
+- tool execution remains generic.
+- path/security validation remains inside the tool layer.
+- actor loop receives a normalized `ToolExecutionOutcome` and does not inspect
+  low-level tool details unless required for job evidence.
+
+Proposed shape:
+
+```rust
+enum ToolExecutionOutcome {
+    RepoEdit(RepoEditEvidence),
+    Read(ReadEvidence),
+    Command(CommandEvidence),
+    Noop(NoopReason),
+    Rejected(ToolRejection),
+    Failed(ToolFailure),
+}
+```
+
+Migration method:
+
+- extract preflight validation from `execute_tool_call`.
+- extract per-tool result conversion.
+- keep existing built-in tool implementations unchanged at first.
+- replace loop-side conditionals with outcome matching.
+
+Tests:
+
+- repo edit evidence excludes `.anvil-state` and other internal files.
+- command output does not become artifact evidence by itself.
+- rejected unsafe path does not mutate job state.
+- read-only tool calls cannot satisfy required artifact edit evidence.
+
+Done criteria:
+
+- `execute_tool_call` is mostly dispatch plus outcome conversion.
+- security-sensitive checks are closer to tool implementation.
+- actor loop branches on typed outcomes, not string/tool-name patterns.
+
+### 5. Resolve `repair_job.rs` Conceptual Size Through Controlled Splitting
+
+Target design:
+
+- keep `RepairJob` as the public state-machine boundary.
+- split internal responsibilities only when the extracted module has a stable
+  domain concept and test surface.
+- avoid scattering transition logic across many files.
+
+Safe split order:
+
+1. `repair_job::state`
+   - job fields, budgets, cluster state, active target
+2. `repair_job::transition`
+   - `next_action`
+   - event application
+   - retry/re-diagnostic/safe-stop transitions
+3. `repair_job::admission`
+   - accepted repair plan validation
+   - authority consistency checks
+4. `repair_job::report`
+   - actionable safe-stop report construction
+
+Keep together for now:
+
+- transition policy and budget consumption, until tests prove the boundary is
+  stable.
+- authority decisions and plan admission, unless duplication appears.
+
+Tests:
+
+- every transition consumes or preserves budget intentionally.
+- repeated invalid patch proposals cannot loop indefinitely.
+- target change requires accepted plan or explicit diagnostic reason.
+- safe stop report includes blocker, target, evidence, and next action.
+
+Done criteria:
+
+- `repair_job.rs` can be understood by reading state, transition, admission,
+  and report modules independently.
+- public API remains small.
+- no new path bypasses `RepairJob::next_action`.
+
+### 6. Resolve Missing Complexity Regression Gate With A Baseline Report
+
+Target design:
+
+- complexity reporting starts as a non-blocking developer command.
+- CI should initially fail only on measurement script failure, not on current
+  complexity debt.
+- once the baseline is stable, CI can block new regressions above threshold.
+
+Proposed implementation:
+
+- add a small script under `scripts/` or `dev-tools/` that reports:
+  - largest functions by approximate LOC
+  - rough branch score
+  - functions above threshold
+  - module totals
+- store current baseline in `workspace/v0.4.25` or a dedicated
+  `dev-reports/complexity-baseline.json`.
+- add a documented command:
+  `cargo xtask complexity` only if an `xtask` already exists or is justified;
+  otherwise keep a simple script.
+
+Threshold policy:
+
+- warn when any changed production function exceeds rough CC 15.
+- require explicit exception when any production function exceeds rough CC 50.
+- fail CI only when a touched function increases above the stored baseline.
+- do not fail CI merely because existing `turn.rs` debt still exists.
+
+Tests/checks:
+
+- script handles Rust comments, strings, macros, and nested functions well
+  enough for stable trend reporting.
+- script exits non-zero only on parser/runtime failure in the first phase.
+- baseline update is manual and reviewable.
+
+Done criteria:
+
+- complexity report can be reproduced locally.
+- new hotspots are visible before review.
+- current debt is tracked without blocking unrelated work.
+
 ## Recommended Priority Order
 
 1. Extract `run_actor_loop` phases into a typed turn driver.
@@ -198,4 +471,3 @@ The cyclomatic-complexity cleanup is complete when:
 - Do not split modules purely to lower numbers while keeping hidden coupling.
 - Do not replace typed state transitions with prompt-only control.
 - Do not remove safety validation in order to simplify flow.
-

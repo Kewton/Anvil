@@ -9,13 +9,20 @@ use super::auto_test::{
     classify_auto_test, count_compile_errors, count_test_failures,
 };
 use super::completion_evidence::is_repo_edit_no_op;
-use super::failure_packet::FailurePacketTimeoutKind;
 use super::feedback_kind_confirm::{
     self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
     FeedbackKindConfirmOutcome, build_feedback_kind_confirm_log_payload,
     run_feedback_kind_confirm_with_strategy,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
+#[cfg(test)]
+use super::model_request::{
+    effective_non_streaming_timeout_secs, non_streaming_assistant_reply_timeout_secs,
+};
+use super::model_request::{
+    focused_edit_max_predict_override, focused_edit_timeout_override_secs,
+    request_non_streaming_assistant_reply, should_use_streaming_transport,
+};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
@@ -67,6 +74,9 @@ use super::semantic_repair_planning::{
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
+use super::tool_execution::{
+    failed_outcome_for_call, rejected_outcome_for_call, success_outcome_for_call,
+};
 use super::tool_history::{
     build_recent_tool_summary, focused_edit_target_already_read, focused_read_target_for_directory,
     has_successful_non_plan_repo_edit,
@@ -104,6 +114,15 @@ use super::verifier_diagnostic_attempt::{
 #[cfg(test)]
 use super::verifier_diagnostic_attempt::{
     VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
+};
+#[cfg(test)]
+use super::verifier_driver::classify_verifier_timeout;
+#[cfg(test)]
+use super::verifier_driver::task_contract_structured_missing_outcome;
+use super::verifier_driver::{
+    TaskContractVerifierOutcome, TaskContractVerifierSelection, select_task_contract_project_unit,
+    select_task_contract_verifier, task_contract_auto_test_result_to_outcome,
+    task_contract_verifier_transport_error_to_outcome,
 };
 use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
@@ -1651,103 +1670,6 @@ fn reply_looks_like_future_work(reply: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TaskContractVerifierOutcome {
-    Passed {
-        command: String,
-    },
-    Failed {
-        command: String,
-        output: String,
-    },
-    NoVerifier,
-    Disabled,
-    TransportError {
-        error: String,
-    },
-    /// Issue #651 PR-002: structured-runner SafeStop. Emitted by
-    /// `run_task_contract_verifier_once` when `OwnedTestVerifierPlan`
-    /// resolves to `Weak` / `Missing`. The mapping to
-    /// `ExitReason::SafeStopVerifier{Weak,Missing}` is performed by
-    /// `drive_task_contract_verifier` directly — the MissingVerifierJob
-    /// retry path is NOT entered, because Weak / Missing are not
-    /// "no verifier detected yet, retry after edit" — they are
-    /// "verifier cannot be structurally bound to the owned test
-    /// artifacts, stop without claiming Done".
-    ///
-    /// The `_ =>` fallback at every match site is intentionally banned
-    /// (CLAUDE.md design judgement #2) so a future `SafeStopReason`
-    /// variant lights up compile errors at every dispatch.
-    SafeStop {
-        reason: super::task_contract::SafeStopReason,
-    },
-}
-
-fn task_contract_verifier_transport_error_to_outcome(
-    command: String,
-    error: String,
-) -> TaskContractVerifierOutcome {
-    if let Some(output) = verifier_timeout_failure_output(&command, &error) {
-        TaskContractVerifierOutcome::Failed { command, output }
-    } else {
-        TaskContractVerifierOutcome::TransportError { error }
-    }
-}
-
-fn verifier_timeout_failure_output(command: &str, error: &str) -> Option<String> {
-    let kind = classify_verifier_timeout(command, error)?;
-    let masked_command = crate::session::feedback::redact_verifier_command_for_storage(command);
-    let masked_error = crate::session::feedback::mask_secrets(error);
-    Some(format!(
-        "Verifier execution timed out before producing a pass/fail result. \
-This is a bounded verifier timeout, not an LLM transport failure. \
-timeout_kind={} command={} next_action_hint={}\n{}",
-        kind.as_str(),
-        masked_command,
-        kind.repair_hint(),
-        masked_error
-    ))
-}
-
-fn classify_verifier_timeout(command: &str, error: &str) -> Option<FailurePacketTimeoutKind> {
-    if !error.contains("auto test command timed out after") {
-        return None;
-    }
-    let lower_command = command.to_ascii_lowercase();
-    let lower_error = error.to_ascii_lowercase();
-    if lower_error.contains("dependency setup") || lower_command.contains("pip install") {
-        return Some(FailurePacketTimeoutKind::DependencySetupTimeout);
-    }
-    if lower_error.contains("environment")
-        || lower_error.contains("external_pythonpath")
-        || lower_error.contains("stalled")
-    {
-        return Some(FailurePacketTimeoutKind::EnvironmentStall);
-    }
-    if lower_command.starts_with("cargo build")
-        || lower_command.starts_with("npm run build")
-        || lower_command.starts_with("pnpm build")
-        || lower_command.starts_with("yarn build")
-        || lower_command.starts_with("make build")
-        || lower_command.starts_with("cargo check")
-    {
-        return Some(FailurePacketTimeoutKind::BuildCommand);
-    }
-    if lower_command.contains("--test ")
-        || lower_command.contains(" tests/")
-        || lower_command.contains(" tests\\")
-        || lower_command.contains("-m pytest")
-        || lower_command.contains("npm test")
-        || lower_command.contains("node --test")
-    {
-        return Some(FailurePacketTimeoutKind::GeneratedTestHang);
-    }
-    if lower_command.contains("test") || lower_command.contains("pytest") {
-        return Some(FailurePacketTimeoutKind::LongRunningVerifier);
-    }
-    Some(FailurePacketTimeoutKind::Unknown)
-}
-
 enum TaskContractVerifierFlowOutcome {
     Continue,
     Done {
@@ -1793,18 +1715,6 @@ fn task_contract_verifier_safe_stop_mapping(
             ExitReason::SafeStopVerifierMissing,
             "safe_stop_verifier_missing",
         ),
-    }
-}
-
-fn task_contract_structured_missing_outcome(
-    owned_test_artifacts_count: usize,
-) -> TaskContractVerifierOutcome {
-    if owned_test_artifacts_count == 0 {
-        TaskContractVerifierOutcome::SafeStop {
-            reason: super::task_contract::SafeStopReason::VerifierMissing,
-        }
-    } else {
-        TaskContractVerifierOutcome::NoVerifier
     }
 }
 
@@ -8387,22 +8297,12 @@ impl Agent {
         let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
             self.task_contract_verifier_test_binding();
         let active_request = self.active_request_text();
-        let task_contract_project_unit = workspace_scope_opt.as_ref().and_then(|scope| {
-            if let Some(request) = active_request.as_deref() {
-                super::project_probe::probe_project_unit_for_request(
-                    &self.work_root,
-                    request,
-                    scope,
-                    &self.turn_edited_relative_paths,
-                )
-            } else {
-                super::project_probe::probe_project_unit(
-                    &self.work_root,
-                    scope,
-                    &self.turn_edited_relative_paths,
-                )
-            }
-        });
+        let task_contract_project_unit = select_task_contract_project_unit(
+            &self.work_root,
+            active_request.as_deref(),
+            workspace_scope_opt.as_ref(),
+            &self.turn_edited_relative_paths,
+        );
         if let Some(project_unit) = task_contract_project_unit.as_ref() {
             log_llm_event(
                 "agent.project_unit.verifier_selection",
@@ -8413,371 +8313,302 @@ impl Agent {
             );
         }
 
-        // Issue #651 Phase 5.2: structured verifier path. Active only
-        // when the active request literally asks for test execution
-        // (`RequiredBehaviorContract.test_execution_required`). Verifier
-        // discovery itself is still ProjectUnit-bound, so even the later
-        // non-structured branch cannot fall back to root-level stack guessing.
-        if test_execution_required && let Some(workspace_scope) = workspace_scope_opt.as_ref() {
-            let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
-                &self.work_root,
-                changed_files,
-                &recent_successful_bash_commands,
-                &owned_test_artifacts,
-                task_contract_project_unit.as_ref(),
-            );
-            match owned_plan {
-                super::auto_test::OwnedTestVerifierPlan::Runnable { plan, command } => {
-                    let display_command = command.to_display_string();
-                    // PR-001: snapshot the structurally-bound owned-test
-                    // count before consuming `command`. The structured
-                    // runner re-validates each path against the
-                    // TaskWorkspaceScope before spawning, so the count
-                    // here is what actually appeared in argv.
-                    let bound_test_artifacts_count = command.bound_test_artifacts().len();
-                    // Issue #659 (Task 2.6): capture the bound paths
-                    // BEFORE `command` is borrowed by `run_structured` so
-                    // the verifier_observation seed can record each
-                    // structurally-bound path with the resulting outcome
-                    // (Pass/Fail). Legacy / unbound paths skip this seed
-                    // entirely so the absence-as-NotRun rule stays intact.
-                    let bound_test_artifacts_paths: Vec<String> =
-                        command.bound_test_artifacts().to_vec();
-                    if command.runner() == "python3" {
-                        self.materialize_python_package_markers_for_owned_test_imports(
-                            &bound_test_artifacts_paths,
-                        );
-                    }
-                    // Issue #661 iteration-4 Task 5.2 (DR1-005 emit ownership):
-                    // pre-spawn `agent.verifier.invoked` event emit + per-turn
-                    // dedup. Build the snapshot *before* `run_structured` so
-                    // the event lands even if the spawn itself fails (the
-                    // event records intent, not outcome). RunnerKind::None
-                    // never reaches Runnable in production (cargo / python3
-                    // only), but `from_command_and_env` returns None for
-                    // unknown runners as a DR4-004 security fail-closed
-                    // backstop — we skip the emit in that case.
-                    //
-                    // iteration-5 Task 6.2: pass runner-specific extras
-                    // (Python adapter receives VERIFIER_ENV_PYTHON_EXTRA) so
-                    // the snapshot's env_summary mirrors execution-time env.
-                    let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
-                        "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
-                        _ => &[],
-                    };
-                    let env_plan_for_emit =
-                        super::auto_test::build_hermetic_env_plan(&self.work_root, extras_for_emit);
-                    if let Some(snapshot) =
-                        super::auto_test::VerifierInvokedSnapshot::from_command_and_env(
-                            &command,
-                            &env_plan_for_emit,
-                        )
-                    {
-                        self.emit_agent_verifier_invoked_if_new(&snapshot);
-                    }
-                    // Issue #661 iteration-5 Task 7.1 / 7.3: if the env plan
-                    // detected an external PYTHONPATH component pre-execution,
-                    // emit the `agent.verifier.external_import_rejected` event
-                    // (per-turn cap'd) so the LLM / log consumer sees the
-                    // boundary breach signal before run_structured.
-                    if let Some(hash) = env_plan_for_emit.rejected_pythonpath_hash() {
-                        self.emit_agent_verifier_external_import_rejected_if_first(
-                            command.runner(),
-                            "external_pythonpath_rejected",
-                            &[(hash.as_str(), "pythonpath")],
-                            1,
-                            false,
-                        );
-                    }
-                    let result = {
-                        let _sp = Spinner::start("running verifier...".to_string());
-                        AutoTestRunner::run_structured(
-                            &self.work_root,
-                            workspace_scope,
-                            &command,
-                            &display_command,
-                        )
-                    };
-                    return match result {
-                        Ok(result) => {
-                            log_llm_event(
-                                "agent.autotest.completed",
-                                serde_json::json!({
-                                    "session_id": self.session_store.session_id(),
-                                    "command": &result.command,
-                                    "passed": result.passed,
-                                    "reason": &plan.reason,
-                                }),
-                            );
-                            // Issue #661 iteration-5 Task 7.2 / 7.3 +
-                            // CB-009 (Codex iteration-5 medium):
-                            // post-execution external import detection via
-                            // stdout/stderr pattern match. raw paths are
-                            // hashed before emit (DR4-005). `detected_count`
-                            // and `truncated` come from
-                            // `DetectedExternalImports` so the pre-cap total
-                            // is preserved even when the per-emit cap drops
-                            // excess entries.
-                            let detected = super::auto_test::detect_external_imports_in_output(
-                                &self.work_root,
-                                &result.stdout,
-                                &result.stderr,
-                            );
-                            if !detected.entries.is_empty() {
-                                let detected_count = detected.total_count;
-                                let truncated = detected.truncated;
-                                let created_markers = self
-                                    .materialize_python_package_markers_for_external_import(
-                                        &result.stdout,
-                                        &result.stderr,
-                                    );
-                                let hashes: Vec<(String, &'static str)> = detected
-                                    .entries
-                                    .iter()
-                                    .map(|raw| {
-                                        (
-                                            crate::logging::stable_path_hash(
-                                                &crate::session::feedback::mask_secrets(raw),
-                                            ),
-                                            "stdout_stderr",
-                                        )
-                                    })
-                                    .collect();
-                                let borrowed: Vec<(&str, &'static str)> =
-                                    hashes.iter().map(|(h, k)| (h.as_str(), *k)).collect();
-                                self.emit_agent_verifier_external_import_rejected_if_first(
-                                    command.runner(),
-                                    "external_import_detected",
-                                    &borrowed,
-                                    detected_count,
-                                    truncated,
-                                );
-                                let marker_note = if created_markers.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(
-                                        "\nCreated local Python package marker(s) to keep imports inside work_root: {}",
-                                        created_markers.join(", ")
-                                    )
-                                };
-                                return TaskContractVerifierOutcome::Failed {
-                                    command: result.command,
-                                    output: format!(
-                                        "Verifier environment contamination detected: {detected_count} external import path(s) outside work_root.{marker_note}\n{}",
-                                        result.output
-                                    ),
-                                };
-                            }
-                            let frame = build_feedback_for_auto_test(
-                                &plan,
-                                &result,
-                                &self.work_root,
-                                changed_files,
-                            );
-                            self.session.record_feedback_if_unset(frame);
-                            self.record_task_contract_verifier_invocation(
-                                &result.command,
-                                result.exit_code,
-                            );
-                            // Issue #659 (Task 2.6): seed the bound test
-                            // path verifier_observations once the result
-                            // is known.
-                            let last_outcome = if result.passed {
-                                super::artifact_ledger::VerifierOutcome::Pass
-                            } else {
-                                super::artifact_ledger::VerifierOutcome::Fail
-                            };
-                            let scope_for_seed = workspace_scope.clone();
-                            self.seed_artifact_ledger_verifier_observation(
-                                &bound_test_artifacts_paths,
-                                last_outcome,
-                                &scope_for_seed,
-                            );
-                            if result.passed {
-                                // PR-001: structured (bound) evidence —
-                                // proof that the verifier argv contained
-                                // the owned test artifact paths.
-                                self.observe_task_contract_verifier_exit_zero_bound(
-                                    &result.command,
-                                    bound_test_artifacts_count,
-                                );
-                                TaskContractVerifierOutcome::Passed {
-                                    command: result.command,
-                                }
-                            } else {
-                                TaskContractVerifierOutcome::Failed {
-                                    command: result.command,
-                                    output: result.output,
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let command =
-                                crate::session::feedback::redact_verifier_command_for_storage(
-                                    &display_command,
-                                );
-                            let outcome =
-                                task_contract_verifier_transport_error_to_outcome(command, error);
-                            let outcome_label = match &outcome {
-                                TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
-                                TaskContractVerifierOutcome::TransportError { .. } => {
-                                    "transport_error"
-                                }
-                                _ => "transport_error",
-                            };
-                            log_llm_event(
-                                "agent.task_contract.verifier.completed",
-                                serde_json::json!({
-                                    "session_id": self.session_store.session_id(),
-                                    "outcome": outcome_label,
-                                    "command": crate::session::feedback::redact_verifier_command_for_storage(&display_command),
-                                }),
-                            );
-                            outcome
-                        }
-                    };
+        let verifier_selection = select_task_contract_verifier(
+            &self.work_root,
+            changed_files,
+            &recent_successful_bash_commands,
+            &owned_test_artifacts,
+            test_execution_required,
+            workspace_scope_opt.as_ref(),
+            task_contract_project_unit.as_ref(),
+        );
+        match verifier_selection {
+            TaskContractVerifierSelection::StructuredRunnable {
+                plan,
+                command,
+                display_command,
+                bound_test_artifacts_count,
+                bound_test_artifacts_paths,
+            } => {
+                let Some(workspace_scope) = workspace_scope_opt.as_ref() else {
+                    return TaskContractVerifierOutcome::NoVerifier;
+                };
+                if command.runner() == "python3" {
+                    self.materialize_python_package_markers_for_owned_test_imports(
+                        &bound_test_artifacts_paths,
+                    );
                 }
-                super::auto_test::OwnedTestVerifierPlan::Weak {
-                    detected_source, ..
-                } => {
-                    if !self.session.verifier_safe_stop_emitted_this_turn {
-                        self.session.verifier_safe_stop_emitted_this_turn = true;
+                // Issue #661 iteration-4 Task 5.2 (DR1-005 emit ownership):
+                // pre-spawn `agent.verifier.invoked` event emit + per-turn
+                // dedup. Build the snapshot *before* `run_structured` so
+                // the event lands even if the spawn itself fails (the
+                // event records intent, not outcome). RunnerKind::None
+                // never reaches Runnable in production (cargo / python3
+                // only), but `from_command_and_env` returns None for
+                // unknown runners as a DR4-004 security fail-closed
+                // backstop — we skip the emit in that case.
+                //
+                // iteration-5 Task 6.2: pass runner-specific extras
+                // (Python adapter receives VERIFIER_ENV_PYTHON_EXTRA) so
+                // the snapshot's env_summary mirrors execution-time env.
+                let extras_for_emit: &[(&'static str, &'static str)] = match command.runner() {
+                    "python3" => super::auto_test::VERIFIER_ENV_PYTHON_EXTRA,
+                    _ => &[],
+                };
+                let env_plan_for_emit =
+                    super::auto_test::build_hermetic_env_plan(&self.work_root, extras_for_emit);
+                if let Some(snapshot) =
+                    super::auto_test::VerifierInvokedSnapshot::from_command_and_env(
+                        &command,
+                        &env_plan_for_emit,
+                    )
+                {
+                    self.emit_agent_verifier_invoked_if_new(&snapshot);
+                }
+                // Issue #661 iteration-5 Task 7.1 / 7.3: if the env plan
+                // detected an external PYTHONPATH component pre-execution,
+                // emit the `agent.verifier.external_import_rejected` event
+                // (per-turn cap'd) so the LLM / log consumer sees the
+                // boundary breach signal before run_structured.
+                if let Some(hash) = env_plan_for_emit.rejected_pythonpath_hash() {
+                    self.emit_agent_verifier_external_import_rejected_if_first(
+                        command.runner(),
+                        "external_pythonpath_rejected",
+                        &[(hash.as_str(), "pythonpath")],
+                        1,
+                        false,
+                    );
+                }
+                let result = {
+                    let _sp = Spinner::start("running verifier...".to_string());
+                    AutoTestRunner::run_structured(
+                        &self.work_root,
+                        workspace_scope,
+                        &command,
+                        &display_command,
+                    )
+                };
+                match result {
+                    Ok(result) => {
                         log_llm_event(
-                            "agent.verifier.weak",
+                            "agent.autotest.completed",
                             serde_json::json!({
                                 "session_id": self.session_store.session_id(),
-                                "turn_index": self.current_turn_index,
-                                "iter_index": self.session.iter_count_this_turn,
-                                "owned_test_artifacts_count": owned_test_artifacts.len(),
-                                "command_runner": detected_source,
-                                "auto_test_detected": true,
-                                "test_execution_required": true,
+                                "command": &result.command,
+                                "passed": result.passed,
+                                "reason": &plan.reason,
                             }),
                         );
-                    }
-                    let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-                    self.session.record_feedback_if_unset(frame);
-                    // Issue #651 PR-002: surface Weak as SafeStop so the
-                    // dispatch maps to ExitReason::SafeStopVerifierWeak
-                    // directly, without re-entering the MissingVerifierJob
-                    // retry path (NoVerifier).
-                    return TaskContractVerifierOutcome::SafeStop {
-                        reason: super::task_contract::SafeStopReason::VerifierWeak,
-                    };
-                }
-                super::auto_test::OwnedTestVerifierPlan::Missing => {
-                    if matches!(
-                        task_contract_structured_missing_outcome(owned_test_artifacts.len()),
-                        TaskContractVerifierOutcome::NoVerifier
-                    ) {
-                        self.owned_test_verifier_missing_observed_this_turn = true;
-                        self.owned_test_verifier_missing_observed_carryover = self
-                            .active_request_text()
-                            .as_deref()
-                            .map(super::task_contract::RequestCarryoverKey::from_request);
-                        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+                        // Issue #661 iteration-5 Task 7.2 / 7.3 +
+                        // CB-009 (Codex iteration-5 medium):
+                        // post-execution external import detection via
+                        // stdout/stderr pattern match. raw paths are
+                        // hashed before emit (DR4-005). `detected_count`
+                        // and `truncated` come from
+                        // `DetectedExternalImports` so the pre-cap total
+                        // is preserved even when the per-emit cap drops
+                        // excess entries.
+                        let detected = super::auto_test::detect_external_imports_in_output(
+                            &self.work_root,
+                            &result.stdout,
+                            &result.stderr,
+                        );
+                        if !detected.entries.is_empty() {
+                            let detected_count = detected.total_count;
+                            let truncated = detected.truncated;
+                            let created_markers = self
+                                .materialize_python_package_markers_for_external_import(
+                                    &result.stdout,
+                                    &result.stderr,
+                                );
+                            let hashes: Vec<(String, &'static str)> = detected
+                                .entries
+                                .iter()
+                                .map(|raw| {
+                                    (
+                                        crate::logging::stable_path_hash(
+                                            &crate::session::feedback::mask_secrets(raw),
+                                        ),
+                                        "stdout_stderr",
+                                    )
+                                })
+                                .collect();
+                            let borrowed: Vec<(&str, &'static str)> =
+                                hashes.iter().map(|(h, k)| (h.as_str(), *k)).collect();
+                            self.emit_agent_verifier_external_import_rejected_if_first(
+                                command.runner(),
+                                "external_import_detected",
+                                &borrowed,
+                                detected_count,
+                                truncated,
+                            );
+                            let marker_note = if created_markers.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "\nCreated local Python package marker(s) to keep imports inside work_root: {}",
+                                    created_markers.join(", ")
+                                )
+                            };
+                            return TaskContractVerifierOutcome::Failed {
+                                command: result.command,
+                                output: format!(
+                                    "Verifier environment contamination detected: {detected_count} external import path(s) outside work_root.{marker_note}\n{}",
+                                    result.output
+                                ),
+                            };
+                        }
+                        let frame = build_feedback_for_auto_test(
+                            &plan,
+                            &result,
+                            &self.work_root,
+                            changed_files,
+                        );
                         self.session.record_feedback_if_unset(frame);
+                        self.record_task_contract_verifier_invocation(
+                            &result.command,
+                            result.exit_code,
+                        );
+                        // Issue #659 (Task 2.6): seed the bound test
+                        // path verifier_observations once the result
+                        // is known.
+                        let last_outcome = if result.passed {
+                            super::artifact_ledger::VerifierOutcome::Pass
+                        } else {
+                            super::artifact_ledger::VerifierOutcome::Fail
+                        };
+                        let scope_for_seed = workspace_scope.clone();
+                        self.seed_artifact_ledger_verifier_observation(
+                            &bound_test_artifacts_paths,
+                            last_outcome,
+                            &scope_for_seed,
+                        );
+                        if result.passed {
+                            // PR-001: structured (bound) evidence —
+                            // proof that the verifier argv contained
+                            // the owned test artifact paths.
+                            self.observe_task_contract_verifier_exit_zero_bound(
+                                &result.command,
+                                bound_test_artifacts_count,
+                            );
+                        }
+                        task_contract_auto_test_result_to_outcome(result)
+                    }
+                    Err(error) => {
+                        let command = crate::session::feedback::redact_verifier_command_for_storage(
+                            &display_command,
+                        );
+                        let outcome =
+                            task_contract_verifier_transport_error_to_outcome(command, error);
+                        let outcome_label = match &outcome {
+                            TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
+                            TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
+                            _ => "transport_error",
+                        };
                         log_llm_event(
                             "agent.task_contract.verifier.completed",
                             serde_json::json!({
                                 "session_id": self.session_store.session_id(),
-                                "outcome": "no_structured_verifier",
-                                "owned_test_artifacts_count": owned_test_artifacts.len(),
-                                "test_execution_required": true,
+                                "outcome": outcome_label,
+                                "command": crate::session::feedback::redact_verifier_command_for_storage(&display_command),
                             }),
                         );
-                        return TaskContractVerifierOutcome::NoVerifier;
+                        outcome
                     }
-                    // Issue #664 iteration-2 (CB-001): set the per-turn
-                    // Stage A flag so `build_arbiter_candidates` can
-                    // consult `OwnedTestVerifierPlan::Missing` via the
-                    // `VerifierPrerequisiteSignal` Stage A path. This is
-                    // the single producer site; the flag is reset at
-                    // `handle_user_message` head (per-turn rule).
-                    self.owned_test_verifier_missing_observed_this_turn = true;
-                    // Issue #664 iteration-3 (CB2-001): also set the
-                    // cross-turn carryover so the **next** turn's
-                    // `build_arbiter_candidates` can promote the
-                    // signal into `_this_turn` and install a
-                    // SetupBootstrap candidate. The current turn
-                    // immediately returns `SafeStop` below, which
-                    // ends the actor loop — without the carryover the
-                    // signal is reset before any arbiter cycle could
-                    // consume it (CB2-001 lifecycle gap).
-                    //
-                    // Issue #664 iteration-4 (CB3-001): bind the
-                    // carryover to a 16-hex digest of the originating
-                    // request text via `mask_secrets` +
-                    // `stable_path_hash`. The next-turn consumer
-                    // compares the stored key with the current
-                    // turn's request key; a topic switch clears the
-                    // carryover without promotion, closing the
-                    // false-positive grant of `setup_bootstrap`
-                    // policy to unrelated high-confidence requests.
-                    //
-                    // When the active request text is absent (rare —
-                    // verifier ran with no driving message), skip
-                    // the carryover entirely: an unbound carryover
-                    // would degrade into the iteration-3 boolean
-                    // semantics CB3-001 explicitly rejects.
-                    self.owned_test_verifier_missing_observed_carryover = self
-                        .active_request_text()
-                        .as_deref()
-                        .map(super::task_contract::RequestCarryoverKey::from_request);
-                    if !self.session.verifier_safe_stop_emitted_this_turn {
-                        self.session.verifier_safe_stop_emitted_this_turn = true;
-                        log_llm_event(
-                            "agent.verifier.missing",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "turn_index": self.current_turn_index,
-                                "iter_index": self.session.iter_count_this_turn,
-                                "owned_test_artifacts_count": owned_test_artifacts.len(),
-                                "auto_test_detected": false,
-                                "test_execution_required": true,
-                            }),
-                        );
-                    }
-                    let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-                    self.session.record_feedback_if_unset(frame);
-                    // Issue #651 PR-002: structured Missing → SafeStop
-                    // (mapped to ExitReason::SafeStopVerifierMissing) so
-                    // the MissingVerifierJob retry budget is NOT consumed.
-                    // Missing means "no allowlisted structured runner",
-                    // which is unrecoverable via more retries in the same
-                    // workspace shape — stopping is the safe contract.
-                    return TaskContractVerifierOutcome::SafeStop {
-                        reason: super::task_contract::SafeStopReason::VerifierMissing,
-                    };
                 }
             }
-        }
-
-        let Some(plan) = AutoTestRunner::detect_with_project_unit(
-            &self.work_root,
-            changed_files,
-            &recent_successful_bash_commands,
-            task_contract_project_unit.as_ref(),
-        ) else {
-            let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-            self.session.record_feedback_if_unset(frame);
-            log_llm_event(
-                "agent.task_contract.verifier.completed",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "outcome": "no_verifier",
-                }),
-            );
-            return TaskContractVerifierOutcome::NoVerifier;
-        };
-
-        let command_for_log = crate::session::feedback::mask_secrets(&plan.command);
-        let result = {
-            let _sp = Spinner::start("running verifier...".to_string());
-            AutoTestRunner::run(&self.work_root, &plan)
-        };
-        match result {
-            Ok(result) => {
+            TaskContractVerifierSelection::StructuredWeak {
+                detected_source,
+                owned_test_artifacts_count,
+            } => {
+                if !self.session.verifier_safe_stop_emitted_this_turn {
+                    self.session.verifier_safe_stop_emitted_this_turn = true;
+                    log_llm_event(
+                        "agent.verifier.weak",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "turn_index": self.current_turn_index,
+                            "iter_index": self.session.iter_count_this_turn,
+                            "owned_test_artifacts_count": owned_test_artifacts_count,
+                            "command_runner": detected_source,
+                            "auto_test_detected": true,
+                            "test_execution_required": true,
+                        }),
+                    );
+                }
+                let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+                self.session.record_feedback_if_unset(frame);
+                TaskContractVerifierOutcome::SafeStop {
+                    reason: super::task_contract::SafeStopReason::VerifierWeak,
+                }
+            }
+            TaskContractVerifierSelection::StructuredMissing {
+                outcome,
+                owned_test_artifacts_count,
+            } => {
+                self.owned_test_verifier_missing_observed_this_turn = true;
+                self.owned_test_verifier_missing_observed_carryover = self
+                    .active_request_text()
+                    .as_deref()
+                    .map(super::task_contract::RequestCarryoverKey::from_request);
+                let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+                self.session.record_feedback_if_unset(frame);
+                if matches!(outcome, TaskContractVerifierOutcome::NoVerifier) {
+                    log_llm_event(
+                        "agent.task_contract.verifier.completed",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "outcome": "no_structured_verifier",
+                            "owned_test_artifacts_count": owned_test_artifacts_count,
+                            "test_execution_required": true,
+                        }),
+                    );
+                    return TaskContractVerifierOutcome::NoVerifier;
+                }
+                if !self.session.verifier_safe_stop_emitted_this_turn {
+                    self.session.verifier_safe_stop_emitted_this_turn = true;
+                    log_llm_event(
+                        "agent.verifier.missing",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "turn_index": self.current_turn_index,
+                            "iter_index": self.session.iter_count_this_turn,
+                            "owned_test_artifacts_count": owned_test_artifacts_count,
+                            "auto_test_detected": false,
+                            "test_execution_required": true,
+                        }),
+                    );
+                }
+                outcome
+            }
+            TaskContractVerifierSelection::LegacyRunnable {
+                plan,
+                command_for_log,
+            } => {
+                let result = {
+                    let _sp = Spinner::start("running verifier...".to_string());
+                    AutoTestRunner::run(&self.work_root, &plan)
+                };
+                let Ok(result) = result else {
+                    let outcome = task_contract_verifier_transport_error_to_outcome(
+                        command_for_log.clone(),
+                        result.err().unwrap_or_default(),
+                    );
+                    let outcome_label = match &outcome {
+                        TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
+                        TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
+                        _ => "transport_error",
+                    };
+                    log_llm_event(
+                        "agent.task_contract.verifier.completed",
+                        serde_json::json!({
+                            "session_id": self.session_store.session_id(),
+                            "outcome": outcome_label,
+                            "command": command_for_log,
+                        }),
+                    );
+                    return outcome;
+                };
                 log_llm_event(
                     "agent.autotest.completed",
                     serde_json::json!({
@@ -8793,35 +8624,20 @@ impl Agent {
                 self.record_task_contract_verifier_invocation(&result.command, result.exit_code);
                 if result.passed {
                     self.observe_task_contract_verifier_exit_zero(&result.command);
-                    TaskContractVerifierOutcome::Passed {
-                        command: result.command,
-                    }
-                } else {
-                    TaskContractVerifierOutcome::Failed {
-                        command: result.command,
-                        output: result.output,
-                    }
                 }
+                task_contract_auto_test_result_to_outcome(result)
             }
-            Err(error) => {
-                let outcome = task_contract_verifier_transport_error_to_outcome(
-                    command_for_log.clone(),
-                    error,
-                );
-                let outcome_label = match &outcome {
-                    TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
-                    TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
-                    _ => "transport_error",
-                };
+            TaskContractVerifierSelection::Missing => {
+                let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
+                self.session.record_feedback_if_unset(frame);
                 log_llm_event(
                     "agent.task_contract.verifier.completed",
                     serde_json::json!({
                         "session_id": self.session_store.session_id(),
-                        "outcome": outcome_label,
-                        "command": command_for_log,
+                        "outcome": "no_verifier",
                     }),
                 );
-                outcome
+                TaskContractVerifierOutcome::NoVerifier
             }
         }
     }
@@ -10495,7 +10311,8 @@ impl Agent {
             }
             Ok(reply)
         } else {
-            self.request_assistant_reply_non_streaming(
+            request_non_streaming_assistant_reply(
+                &self.client,
                 assistant_model.as_str(),
                 &messages,
                 &tool_specs,
@@ -10503,50 +10320,6 @@ impl Agent {
                 focused_edit_timeout_override,
                 focused_edit_max_predict_override,
             )
-        }
-    }
-
-    fn request_assistant_reply_non_streaming(
-        &self,
-        model: &str,
-        messages: &[ConversationMessage],
-        tool_specs: &[ToolSpec],
-        native_tools_enabled: bool,
-        timeout_override_secs: Option<u64>,
-        max_predict_override: Option<usize>,
-    ) -> Result<AssistantReply, String> {
-        let client = if let Some(max_predict) = max_predict_override {
-            self.client
-                .clone_with_overrides(self.client.timeout_secs(), max_predict)?
-        } else {
-            self.client.clone()
-        };
-        let model = model.to_string();
-        let tool_specs = tool_specs.to_vec();
-        let owned_messages = messages.to_vec();
-        let timeout = Duration::from_secs(effective_non_streaming_timeout_secs(
-            &model,
-            native_tools_enabled,
-            client.timeout_secs(),
-            timeout_override_secs,
-        ));
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-
-        std::thread::spawn(move || {
-            let result =
-                client.chat_with_mode(&model, &owned_messages, &tool_specs, native_tools_enabled);
-            let _ = tx.send(result);
-        });
-
-        match rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-                "assistant reply timed out after {}s",
-                timeout.as_secs()
-            )),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err("assistant reply worker disconnected".to_string())
-            }
         }
     }
 
@@ -13590,6 +13363,7 @@ impl Agent {
             self.effective_tool_policy_error(name, arguments)
         };
         if let Some(err) = effective_policy_error {
+            let _tool_outcome = rejected_outcome_for_call(name, &err);
             self.session.working_memory.note_error(err.clone());
             // Issue #652: classify "artifact-directed recovery rejected …"
             // policy errors as attempts against the active
@@ -13766,15 +13540,11 @@ impl Agent {
         }
         match self.tool_registry.execute(name, arguments, &context) {
             Ok(result) => {
-                if matches!(name, "Write" | "Edit")
-                    && let Some(raw_path) =
-                        arguments.get("path").and_then(serde_json::Value::as_str)
-                {
+                let tool_outcome = success_outcome_for_call(name, arguments, &self.work_root);
+                if let Some(edit) = tool_outcome.repo_edit_evidence() {
                     self.session
                         .working_memory
-                        .note_touched_file(normalize_memory_path(raw_path, &self.work_root));
-                }
-                if matches!(name, "Write" | "Edit") {
+                        .note_touched_file(normalize_memory_path(edit.raw_path(), &self.work_root));
                     // Issue #456: a successful Write/Edit feeds
                     // `user_visible_artifact` (combined with the post-loop
                     // verify_repo_progress diff signal in
@@ -13786,16 +13556,13 @@ impl Agent {
                     // `completion_evidence::classify_repo_edit_path`
                     // which evaluates predicates in a fixed order so
                     // `.mdx` reliably classifies as Docs (DR1-001).
-                    if let Some(raw_path) =
-                        arguments.get("path").and_then(serde_json::Value::as_str)
-                    {
-                        self.observe_evidence_from_repo_edit(raw_path);
-                    }
+                    self.observe_evidence_from_repo_edit(edit.raw_path());
                 }
                 self.maybe_update_work_root(name, arguments, &result);
                 result
             }
             Err(err) => {
+                let _tool_outcome = failed_outcome_for_call(name, &err);
                 self.session
                     .working_memory
                     .note_error(format!("{name}: {err}"));
@@ -20829,85 +20596,6 @@ fn join_sections_for_progress(sections: &[&str]) -> String {
             parts.join(", ")
         }
     }
-}
-
-fn should_use_streaming_transport(
-    model: &str,
-    _native_tools_enabled: bool,
-    stream_output: bool,
-    stdin_is_terminal: bool,
-) -> bool {
-    let wants_streaming = stream_output || stdin_is_terminal;
-    if !wants_streaming {
-        return false;
-    }
-
-    if !model_capabilities(model).streaming_tool_calls {
-        return false;
-    }
-
-    true
-}
-
-fn non_streaming_assistant_reply_timeout_secs(
-    model: &str,
-    _native_tools_enabled: bool,
-    default_timeout_secs: u64,
-) -> u64 {
-    model_capabilities(model)
-        .non_streaming_hard_timeout_secs
-        .unwrap_or(default_timeout_secs)
-}
-
-fn effective_non_streaming_timeout_secs(
-    model: &str,
-    native_tools_enabled: bool,
-    default_timeout_secs: u64,
-    timeout_override_secs: Option<u64>,
-) -> u64 {
-    let model_timeout = non_streaming_assistant_reply_timeout_secs(
-        model,
-        native_tools_enabled,
-        default_timeout_secs,
-    );
-    match timeout_override_secs {
-        Some(override_secs) => override_secs,
-        None => model_timeout,
-    }
-}
-
-fn focused_edit_timeout_override_secs(
-    model: &str,
-    messages: &[ConversationMessage],
-    target: Option<&Path>,
-    work_root: &Path,
-) -> Option<u64> {
-    let target = target?;
-    let focused_edit = model_capabilities(model).focused_edit?;
-    Some(
-        if focused_edit_target_already_read(messages, target, work_root) {
-            focused_edit.post_read_timeout_secs
-        } else {
-            focused_edit.pre_read_timeout_secs
-        },
-    )
-}
-
-fn focused_edit_max_predict_override(
-    model: &str,
-    messages: &[ConversationMessage],
-    target: Option<&Path>,
-    work_root: &Path,
-) -> Option<usize> {
-    let target = target?;
-    let focused_edit = model_capabilities(model).focused_edit?;
-    Some(
-        if focused_edit_target_already_read(messages, target, work_root) {
-            focused_edit.post_read_max_predict
-        } else {
-            focused_edit.pre_read_max_predict
-        },
-    )
 }
 
 fn should_materialize_plan_after_timeout(

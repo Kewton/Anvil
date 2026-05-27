@@ -4,6 +4,9 @@ Latest executable checklist:
 
 - `workspace/v0.4.25/complete-remaining-work-plan.md`
 - `workspace/v0.4.25/cyclomatic-complexity-remaining-issues.md`
+- `workspace/v0.4.25/cyclomatic-complexity-work-plan.md`
+- `workspace/v0.4.25/complexity-baseline.md`
+- `workspace/v0.4.25/cyclomatic-complexity-implementation-log.md`
 
 ## Purpose
 

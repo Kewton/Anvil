@@ -95,6 +95,10 @@ mod footer;
 mod failure_packet;
 mod interrupt;
 mod lifecycle;
+// v0.4.25: model request policy helpers. Keeps transport and focused-edit
+// request sizing decisions out of the actor-loop dispatcher as they are
+// extracted toward a dedicated request boundary.
+mod model_request;
 pub mod photon_user_feedback;
 // Issue #639: ProjectVerifier capability. Module is intentionally *not*
 // re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
@@ -164,6 +168,10 @@ mod repair_framework_findings;
 // v0.4.25: diagnostic LLM assessment JSON boundary. Keeps schema-shape
 // tolerance and enum mapping out of the actor loop dispatcher.
 mod verifier_assessment_parser;
+// v0.4.26: task-contract verifier outcome normalization boundary. Keeps
+// pass/fail/transport classification separate from the actor-loop dispatcher
+// while command execution and state transitions remain in turn.rs.
+mod verifier_driver;
 // v0.4.25: diagnostic LLM attempt schedule and timeout constants.
 mod verifier_diagnostic_attempt;
 // v0.4.25: verifier failure fingerprint/signature helpers. Keeps log
@@ -199,6 +207,10 @@ mod success;
 // v0.4.25: tool-call history projection helpers. Keeps conversation evidence
 // lookup out of both the actor loop dispatcher and RepairJob state machine.
 mod tool_history;
+// v0.4.26: typed tool execution outcome boundary. Keeps artifact evidence
+// interpretation separate from low-level tool dispatch as turn.rs is reduced
+// toward a coordinator.
+mod tool_execution;
 // Issue #654 (CB-001): in-crate `#[cfg(test)]` E2E suite for the bounded
 // safe-stop-report pipeline. The seam set above is `#[cfg(test)]`-only, so
 // the cross-crate `tests/bounded_safe_stop_report_e2e.rs` integration file
