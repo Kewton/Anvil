@@ -103,6 +103,12 @@ pub(super) enum RepairIntentInputError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RepairIntentPayloadValidationError {
+    TargetPath(RepairIntentTargetPathError),
+    Input(RepairIntentInputError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairTargetSnapshot {
     pub(super) relative_path: String,
     pub(super) canonical_path: PathBuf,
@@ -541,6 +547,36 @@ pub(super) fn validate_repair_intent_not_replayed(
         return Err(RepairCandidateDuplicateIntentError);
     }
     Ok(())
+}
+
+pub(super) fn validate_repair_intents_and_build_edit_payloads<'a>(
+    work_root: &Path,
+    selected_canonical_path: &Path,
+    relative_path: &str,
+    intents: &'a [VerifierRepairIntent],
+    max_total_edit_bytes: usize,
+) -> Result<Vec<RepairIntentEdit<'a>>, RepairIntentPayloadValidationError> {
+    let mut total_edit_bytes = 0usize;
+    let mut edit_payloads = Vec::with_capacity(intents.len());
+    for intent in intents {
+        validate_repair_intent_target_path(work_root, &intent.path, selected_canonical_path)
+            .map_err(RepairIntentPayloadValidationError::TargetPath)?;
+        total_edit_bytes = validate_repair_intent_text_payload(RepairIntentTextPayload {
+            old_string: &intent.old_string,
+            new_string: &intent.new_string,
+            reason: &intent.reason,
+            relative_path,
+            current_total_edit_bytes: total_edit_bytes,
+            max_total_edit_bytes,
+        })
+        .map_err(RepairIntentPayloadValidationError::Input)?;
+        edit_payloads.push(RepairIntentEdit {
+            old_string: &intent.old_string,
+            new_string: &intent.new_string,
+            replace_all: intent.replace_all,
+        });
+    }
+    Ok(edit_payloads)
 }
 
 pub(super) fn validate_test_edit_semantic_plan(
@@ -1529,6 +1565,70 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, "repair reply exceeded output cap");
+    }
+
+    #[test]
+    fn repair_intent_payload_validation_builds_normalized_edit_payloads() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let selected = dir.path().join("src/lib.rs");
+        std::fs::write(&selected, "fn value() -> i32 { 1 }\n").unwrap();
+        let selected = std::fs::canonicalize(selected).unwrap();
+        let intents = vec![VerifierRepairIntent {
+            path: "src/lib.rs".to_string(),
+            old_string: "1".to_string(),
+            new_string: "2".to_string(),
+            reason: "fix value".to_string(),
+            replace_all: false,
+        }];
+
+        let payloads = validate_repair_intents_and_build_edit_payloads(
+            dir.path(),
+            &selected,
+            "src/lib.rs",
+            &intents,
+            128,
+        )
+        .unwrap();
+
+        assert_eq!(
+            payloads,
+            vec![RepairIntentEdit {
+                old_string: "1",
+                new_string: "2",
+                replace_all: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn repair_intent_payload_validation_preserves_input_error_kind() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let selected = dir.path().join("src/lib.rs");
+        std::fs::write(&selected, "fn value() -> i32 { 1 }\n").unwrap();
+        let selected = std::fs::canonicalize(selected).unwrap();
+        let intents = vec![VerifierRepairIntent {
+            path: "src/lib.rs".to_string(),
+            old_string: "same".to_string(),
+            new_string: "same".to_string(),
+            reason: "noop".to_string(),
+            replace_all: false,
+        }];
+
+        let err = validate_repair_intents_and_build_edit_payloads(
+            dir.path(),
+            &selected,
+            "src/lib.rs",
+            &intents,
+            128,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RepairIntentPayloadValidationError::Input(RepairIntentInputError::Noop)
+        );
     }
 
     #[test]

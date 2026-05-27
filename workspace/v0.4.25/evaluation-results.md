@@ -355,3 +355,25 @@ Assessment:
 
 - No behavior change intended. Python evidence gathering remains in `turn.rs`,
   but reject authority and message construction now live in validation.
+
+## Structural Verification: Slice 19
+
+Scope:
+
+- Move per-intent path/text validation and edit-payload construction out of
+  `turn.rs`.
+- Preserve existing malformed/no-op signal mapping at the actor-loop boundary.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 28 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3010 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. `turn.rs` now asks validation for normalized
+  edit payloads instead of constructing them inline.

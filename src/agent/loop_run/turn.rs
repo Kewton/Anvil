@@ -24578,6 +24578,19 @@ fn validation_failure_from_repair_intent_input_error(
     }
 }
 
+fn validation_failure_from_repair_intent_payload_validation_error(
+    err: super::repair_patch_validation::RepairIntentPayloadValidationError,
+) -> ValidationFailure {
+    match err {
+        super::repair_patch_validation::RepairIntentPayloadValidationError::TargetPath(err) => {
+            ValidationFailure::failed(err.message())
+        }
+        super::repair_patch_validation::RepairIntentPayloadValidationError::Input(err) => {
+            validation_failure_from_repair_intent_input_error(err)
+        }
+    }
+}
+
 fn validate_verifier_repair_intents_inner(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -24639,26 +24652,15 @@ fn validate_verifier_repair_intents_inner(
     // ---- Phase 1: per-intent input-only validation (no file read /
     // ---- no on-disk apply). Each check inspects only the intent's own
     // ---- bytes plus the previously-resolved canonical target path.
-    let mut total_edit_bytes = 0usize;
-    for intent in &intents {
-        super::repair_patch_validation::validate_repair_intent_target_path(
+    let edit_payloads =
+        super::repair_patch_validation::validate_repair_intents_and_build_edit_payloads(
             work_root,
-            &intent.path,
             &canonical,
+            &relative_path,
+            &intents,
+            VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
         )
-        .map_err(|err| ValidationFailure::failed(err.message()))?;
-        total_edit_bytes = super::repair_patch_validation::validate_repair_intent_text_payload(
-            super::repair_patch_validation::RepairIntentTextPayload {
-                old_string: &intent.old_string,
-                new_string: &intent.new_string,
-                reason: &intent.reason,
-                relative_path: &relative_path,
-                current_total_edit_bytes: total_edit_bytes,
-                max_total_edit_bytes: VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
-            },
-        )
-        .map_err(validation_failure_from_repair_intent_input_error)?;
-    }
+        .map_err(validation_failure_from_repair_intent_payload_validation_error)?;
 
     // Issue #662 (5-4-1 priority 3, Codex CB-001): history-driven duplicate
     // detector. Runs **before** the in-memory apply so a replay of an
@@ -24673,7 +24675,6 @@ fn validate_verifier_repair_intents_inner(
     // The fingerprint deliberately excludes raw `old_string` / `new_string`
     // from outcome payloads downstream (see
     // `RepairAttemptOutcomeKind::RejectedDuplicate`).
-    let edit_payloads = repair_intent_edit_payloads(&intents);
     let fingerprint = super::repair_patch_validation::repair_intent_edits_fingerprint(
         &context.failure_signature,
         &relative_path,
@@ -24846,6 +24847,7 @@ fn validate_verifier_repair_intents_inner(
     ))
 }
 
+#[cfg(test)]
 fn repair_intent_edit_payloads(
     intents: &[VerifierRepairIntent],
 ) -> Vec<super::repair_patch_validation::RepairIntentEdit<'_>> {

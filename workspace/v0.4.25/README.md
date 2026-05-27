@@ -1121,3 +1121,32 @@ Assessment:
 - Another test-edit admission rule is validation-owned.
 - Python evidence collection remains in `turn.rs` until the Python diagnostic
   helpers are moved to a dedicated module.
+
+### 2026-05-27 Slice 19
+
+Applied:
+
+- Moved per-intent target-path validation, text-payload validation, edit-byte
+  accounting, and edit-payload construction into
+  `repair_patch_validation.rs`.
+- Added `RepairIntentPayloadValidationError` so `turn.rs` can preserve the
+  existing malformed/no-op signal mapping without owning the loop.
+- Marked the old `turn.rs` payload builder as test-only compatibility for
+  fingerprint helper tests.
+- Added module tests for successful payload construction and preservation of
+  input error kind.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 28 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3010 tests when rerun outside sandbox
+
+Assessment:
+
+- Phase-1 repair-intent validation is now validation-owned.
+- `turn.rs` still owns the high-level sequence, Python evidence gathering,
+  and weakening detector dispatch.

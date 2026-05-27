@@ -125,3 +125,6 @@ with legacy/fallback paths unable to override it.
   accepted-plan presence, and optional repair hypothesis.
 - Current status: test import-contract evidence admission is now
   validation-owned; `turn.rs` still gathers Python-specific evidence.
+- Current status: per-intent path/text validation and edit-payload construction
+  are now validation-owned; `turn.rs` only maps typed validation errors back
+  into legacy repair rejection carriers.
