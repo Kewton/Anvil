@@ -3,7 +3,10 @@ use std::path::Path;
 use crate::safety::path_guard::resolve_user_path;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
-use super::repair_framework_findings::output_or_command_looks_like_pytest;
+use super::repair_framework_findings::{
+    missing_python_module_name_from_output, output_or_command_looks_like_pytest,
+    workspace_implementation_imports_python_module,
+};
 use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
 
 pub(super) fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
@@ -148,6 +151,73 @@ pub(super) fn python_verifier_output_missing_external_dependency(
         return false;
     }
     python_missing_external_dependency_name(work_root, &context.output_excerpt).is_some()
+}
+
+pub(super) fn recovery_target_hint_for_missing_local_module_path(
+    work_root: &Path,
+    raw_path: &str,
+    reason: &str,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    let path = raw_path.trim();
+    if !verifier_diagnostic_path_input_is_safe(path) {
+        return None;
+    }
+    if Path::new(path)
+        .components()
+        .any(|component| match component {
+            std::path::Component::Normal(name) => {
+                super::task_workspace_scope::is_workspace_ignored_dir(&name.to_string_lossy())
+            }
+            _ => false,
+        })
+    {
+        return None;
+    }
+    if Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case("py"))
+    {
+        return None;
+    }
+    if !admission.scope.contains(path) {
+        return None;
+    }
+    let resolved = resolve_user_path(work_root, path).ok()?;
+    if resolved.exists() {
+        return recovery_target_hint_for_existing_path(work_root, path, reason);
+    }
+    if !super::artifact_ownership::nearest_existing_ancestor_within_work_root(work_root, &resolved)
+    {
+        return None;
+    }
+    Some(super::task_contract::RecoveryTargetHint {
+        role: super::task_contract::ArtifactRole::Implementation,
+        path: path.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+pub(super) fn verifier_repair_missing_local_module_provider(
+    context: &super::repair_job::RepairJob,
+    derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    if derived_failure_type != super::VerifierFailureType::ImportOrDependency {
+        return None;
+    }
+    let module = missing_python_module_name_from_output(&context.output_excerpt)?;
+    if !workspace_implementation_imports_python_module(admission.work_root, &module) {
+        return None;
+    }
+    let path = missing_python_module_workspace_path(admission.work_root, &module)?;
+    recovery_target_hint_for_missing_local_module_path(
+        admission.work_root,
+        &path,
+        "verifier output names a missing local module provider",
+        admission,
+    )
 }
 
 pub(super) fn python_missing_external_dependency_name(
@@ -434,6 +504,72 @@ mod tests {
         );
         assert!(
             verifier_diagnostic_missing_setup_candidates(work_root, &local_module, "").is_empty()
+        );
+    }
+
+    #[test]
+    fn verifier_repair_missing_local_module_provider_targets_prospective_impl_file() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/__init__.py"), "").unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "from app.database import db\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let context = super::super::repair_job::RepairJob {
+            output_excerpt: "ModuleNotFoundError: No module named 'app.database'".to_string(),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let hint = verifier_repair_missing_local_module_provider(
+            &context,
+            super::super::VerifierFailureType::ImportOrDependency,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(hint.path, "app/database.py");
+        assert_eq!(
+            hint.role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+    }
+
+    #[test]
+    fn verifier_repair_missing_local_module_provider_ignores_test_only_imports() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(work_root.join("app/__init__.py"), "").unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "from fastapi import FastAPI\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work_root.join("tests/test_main.py"),
+            "from app.database import SessionLocal\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let context = super::super::repair_job::RepairJob {
+            output_excerpt: "ModuleNotFoundError: No module named 'app.database'".to_string(),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        assert!(
+            verifier_repair_missing_local_module_provider(
+                &context,
+                super::super::VerifierFailureType::ImportOrDependency,
+                &admission,
+            )
+            .is_none()
         );
     }
 

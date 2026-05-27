@@ -215,3 +215,6 @@ with legacy/fallback paths unable to override it.
 - Current status: pytest missing-dependency to missing setup candidate
   generation is now isolated in `verifier_repair_targeting.rs`; `turn.rs`
   consumes the generated hints only for diagnostic prompt context assembly.
+- Current status: missing local Python module provider target selection is now
+  isolated in `verifier_repair_targeting.rs`; `turn.rs` still owns the
+  legacy/semantic assessment bridge that applies the selected target.

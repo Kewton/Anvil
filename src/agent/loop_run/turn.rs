@@ -19,7 +19,6 @@ use super::reminder::{
 use super::repair_framework_findings::{
     VerifierDiagnosticFileExcerpt,
     findings_for_diagnostic as verifier_framework_findings_for_diagnostic,
-    missing_python_module_name_from_output, workspace_implementation_imports_python_module,
 };
 #[cfg(test)]
 use super::repair_framework_findings::{
@@ -79,9 +78,8 @@ use super::verifier_repair_shadow::{
     verifier_repair_action_payload_for_context,
 };
 use super::verifier_repair_targeting::{
-    missing_python_module_workspace_path, recovery_target_hint_for_diagnostic_path,
-    recovery_target_hint_for_existing_path, verifier_diagnostic_missing_setup_candidates,
-    verifier_diagnostic_path_input_is_safe,
+    recovery_target_hint_for_diagnostic_path, verifier_diagnostic_missing_setup_candidates,
+    verifier_diagnostic_path_input_is_safe, verifier_repair_missing_local_module_provider,
 };
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
@@ -23055,73 +23053,6 @@ fn verifier_repair_intents_fingerprint(
         &context.failure_signature,
         relative_path,
         &repair_intent_edit_payloads(intents),
-    )
-}
-
-fn recovery_target_hint_for_missing_local_module_path(
-    work_root: &Path,
-    raw_path: &str,
-    reason: &str,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    let path = raw_path.trim();
-    if !verifier_diagnostic_path_input_is_safe(path) {
-        return None;
-    }
-    if Path::new(path)
-        .components()
-        .any(|component| match component {
-            std::path::Component::Normal(name) => {
-                super::task_workspace_scope::is_workspace_ignored_dir(&name.to_string_lossy())
-            }
-            _ => false,
-        })
-    {
-        return None;
-    }
-    if Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_none_or(|ext| !ext.eq_ignore_ascii_case("py"))
-    {
-        return None;
-    }
-    if !admission.scope.contains(path) {
-        return None;
-    }
-    let resolved = resolve_user_path(work_root, path).ok()?;
-    if resolved.exists() {
-        return recovery_target_hint_for_existing_path(work_root, path, reason);
-    }
-    if !super::artifact_ownership::nearest_existing_ancestor_within_work_root(work_root, &resolved)
-    {
-        return None;
-    }
-    Some(super::task_contract::RecoveryTargetHint {
-        role: super::task_contract::ArtifactRole::Implementation,
-        path: path.to_string(),
-        reason: reason.to_string(),
-    })
-}
-
-fn verifier_repair_missing_local_module_provider(
-    context: &super::repair_job::RepairJob,
-    derived_failure_type: super::VerifierFailureType,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    if derived_failure_type != super::VerifierFailureType::ImportOrDependency {
-        return None;
-    }
-    let module = missing_python_module_name_from_output(&context.output_excerpt)?;
-    if !workspace_implementation_imports_python_module(admission.work_root, &module) {
-        return None;
-    }
-    let path = missing_python_module_workspace_path(admission.work_root, &module)?;
-    recovery_target_hint_for_missing_local_module_path(
-        admission.work_root,
-        &path,
-        "verifier output names a missing local module provider",
-        admission,
     )
 }
 

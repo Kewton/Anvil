@@ -1988,3 +1988,32 @@ Assessment:
 - No behavior change intended. Missing setup candidate generation is now a
   read-only verifier-targeting responsibility; `turn.rs` only consumes the
   generated hints while assembling the diagnostic prompt context.
+
+### 2026-05-27 Slice 52
+
+Applied:
+
+- Moved missing local Python module provider targeting from `turn.rs` to
+  `verifier_repair_targeting.rs`:
+  - `recovery_target_hint_for_missing_local_module_path`
+  - `verifier_repair_missing_local_module_provider`
+- Kept behavior unchanged: prospective provider files are only synthesized
+  when implementation code imports the missing local module.
+- Added module-local tests for prospective provider targeting and test-only
+  import rejection.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_targeting --lib -q`: pass, 12 tests
+- `cargo test missing_local_module --lib -q`: pass, 6 tests
+- `cargo test verifier_repair_missing_local_module --lib -q`: pass, 4 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3042 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Local-module provider target selection is now a
+  verifier-targeting responsibility; `turn.rs` only uses the selected hint
+  while building the legacy/semantic repair assessment bridge.

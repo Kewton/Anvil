@@ -1100,3 +1100,29 @@ Assessment:
 - No behavior change intended. The actor loop no longer owns the Python
   missing-setup candidate generator; the targeting module owns the read-only
   evidence-to-hint conversion.
+
+## Structural Verification: Slice 52
+
+Scope:
+
+- Move missing local Python module provider target selection from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Preserve the guard that only implementation imports can synthesize missing
+  provider files.
+- Keep semantic/legacy assessment bridge sequencing in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 12 tests.
+- `cargo test missing_local_module --lib -q`: pass, 6 tests.
+- `cargo test verifier_repair_missing_local_module --lib -q`: pass, 4 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3042 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The local-module provider targeting policy is
+  now isolated with the rest of verifier repair targeting; `turn.rs` retains
+  only bridge orchestration and state updates.
