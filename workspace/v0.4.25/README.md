@@ -1175,3 +1175,30 @@ Assessment:
 - The remaining `validate_verifier_repair_intents_inner` validation logic in
   `turn.rs` is mostly orchestration, Python evidence gathering, and weakening
   detector dispatch.
+
+### 2026-05-27 Slice 21
+
+Applied:
+
+- Moved test/implementation weakening detector dispatch into
+  `repair_patch_validation.rs`.
+- `turn.rs` still applies the test-specific observed-assert-update filter
+  because that filter depends on `RepairJob` semantic context and Python
+  helper functions.
+- Added module tests for test-path dispatch and non-code path no-op behavior.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3013 tests when rerun outside sandbox
+
+Assessment:
+
+- File-kind dispatch for weakening detection is now validation-owned.
+- The remaining actor-loop responsibility is the semantic test weakening
+  filter and mapping typed weakening metadata into the legacy
+  `ValidationFailure` carrier.

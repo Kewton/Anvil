@@ -130,3 +130,6 @@ with legacy/fallback paths unable to override it.
   into legacy repair rejection carriers.
 - Current status: repair-intent list bounds are now validation-owned; the
   actor loop no longer owns empty/too-many intent branches.
+- Current status: test/implementation weakening detector dispatch is now
+  validation-owned; `turn.rs` still applies the semantic test weakening
+  filter before mapping typed metadata into `ValidationFailure`.

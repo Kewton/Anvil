@@ -24755,40 +24755,28 @@ fn validate_verifier_repair_intents_inner(
     // separately at hint admission via `diagnostic_target_allowed_by_confidence`):
     // any weakening detected here is rejected unconditionally, while the
     // evidence-required gate remains the independent first line of defence.
-    let weakening_path = Path::new(&relative_path);
     // Issue #653 (DR1-001 / DR3-002): record which detector branch produced the
     // weakening so the call site can build a `RepairAttemptOutcome::RejectedUnsafe`
     // with the right `RepairRejectionKind` without re-parsing message text.
-    let (weakening, rejection_kind) = if is_test_file(weakening_path) {
-        let detected = super::spec_authority::detect_test_weakening(
+    let weakening_detection =
+        super::repair_patch_validation::detect_repair_candidate_weakening_patterns(
             &relative_path,
             &original_contents,
             &contents,
         );
-        (
-            filter_test_weakening_for_observed_assert_update(
-                detected,
-                context,
-                &original_contents,
-                &contents,
-            ),
-            Some(super::repair_attempt_outcome::RepairRejectionKind::TestWeakening),
-        )
-    } else if is_implementation_file(weakening_path) {
-        (
-            super::spec_authority::detect_impl_weakening(
-                &relative_path,
-                &original_contents,
-                &contents,
-            ),
-            Some(super::repair_attempt_outcome::RepairRejectionKind::ImplWeakening),
+    let weakening = if weakening_detection.target_is_test_file {
+        filter_test_weakening_for_observed_assert_update(
+            weakening_detection.patterns,
+            context,
+            &original_contents,
+            &contents,
         )
     } else {
-        (Vec::new(), None)
+        weakening_detection.patterns
     };
     super::repair_patch_validation::validate_repair_candidate_weakening_patterns(
         weakening,
-        rejection_kind,
+        weakening_detection.rejection_kind,
     )
     .map_err(|err| {
         // Issue #653 (DR1-001): emission **文字列** は維持 (controller / log /

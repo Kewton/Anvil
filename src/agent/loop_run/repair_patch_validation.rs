@@ -12,6 +12,7 @@ use super::repair_plan::AcceptedRepairPlan;
 use super::task_contract::RecoveryTargetHint;
 use crate::safety::path_guard::resolve_user_path;
 use crate::session::feedback::mask_secrets;
+use crate::util::file_classify::{is_implementation_file, is_test_file};
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use sha2::{Digest, Sha256};
 
@@ -266,6 +267,13 @@ pub(super) struct RepairCandidateWeakeningError {
     patterns: Vec<super::spec_authority::WeakeningPattern>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepairCandidateWeakeningDetection {
+    pub(super) patterns: Vec<super::spec_authority::WeakeningPattern>,
+    pub(super) rejection_kind: Option<super::repair_attempt_outcome::RepairRejectionKind>,
+    pub(super) target_is_test_file: bool,
+}
+
 impl RepairCandidateWeakeningError {
     pub(super) fn message(&self) -> String {
         format!(
@@ -483,6 +491,41 @@ pub(super) fn validate_repair_candidate_weakening_patterns(
         pattern: patterns.first().copied(),
         patterns,
     })
+}
+
+pub(super) fn detect_repair_candidate_weakening_patterns(
+    relative_path: &str,
+    original_contents: &str,
+    candidate_contents: &str,
+) -> RepairCandidateWeakeningDetection {
+    let path = Path::new(relative_path);
+    if is_test_file(path) {
+        return RepairCandidateWeakeningDetection {
+            patterns: super::spec_authority::detect_test_weakening(
+                relative_path,
+                original_contents,
+                candidate_contents,
+            ),
+            rejection_kind: Some(super::repair_attempt_outcome::RepairRejectionKind::TestWeakening),
+            target_is_test_file: true,
+        };
+    }
+    if is_implementation_file(path) {
+        return RepairCandidateWeakeningDetection {
+            patterns: super::spec_authority::detect_impl_weakening(
+                relative_path,
+                original_contents,
+                candidate_contents,
+            ),
+            rejection_kind: Some(super::repair_attempt_outcome::RepairRejectionKind::ImplWeakening),
+            target_is_test_file: false,
+        };
+    }
+    RepairCandidateWeakeningDetection {
+        patterns: Vec::new(),
+        rejection_kind: None,
+        target_is_test_file: false,
+    }
 }
 
 pub(super) fn apply_repair_intent_edits(
@@ -1486,6 +1529,35 @@ mod tests {
             err.message(),
             "repair intent rejected: test/impl weakening detected ([AssertionDeleted])"
         );
+    }
+
+    #[test]
+    fn weakening_detection_dispatches_test_paths() {
+        let detection = detect_repair_candidate_weakening_patterns(
+            "tests/test_main.py",
+            "def test_x():\n    assert foo() == 1\n",
+            "def test_x():\n    assert True\n",
+        );
+
+        assert!(detection.target_is_test_file);
+        assert_eq!(
+            detection.rejection_kind,
+            Some(super::super::repair_attempt_outcome::RepairRejectionKind::TestWeakening)
+        );
+        assert!(
+            detection
+                .patterns
+                .contains(&super::super::spec_authority::WeakeningPattern::AssertTrueWeakening)
+        );
+    }
+
+    #[test]
+    fn weakening_detection_ignores_non_code_paths() {
+        let detection = detect_repair_candidate_weakening_patterns("README.md", "before", "after");
+
+        assert!(!detection.target_is_test_file);
+        assert_eq!(detection.rejection_kind, None);
+        assert!(detection.patterns.is_empty());
     }
 
     #[test]

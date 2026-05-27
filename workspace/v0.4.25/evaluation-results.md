@@ -398,3 +398,24 @@ Assessment:
 
 - No behavior change intended. This removes another inline validation branch
   from the actor loop.
+
+## Structural Verification: Slice 21
+
+Scope:
+
+- Move test/implementation weakening detector dispatch out of `turn.rs`.
+- Preserve the semantic test-filter in `turn.rs` for now.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting.
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3013 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. File-kind dispatch is validation-owned while
+  context-sensitive test filtering remains local to the actor-loop boundary.
