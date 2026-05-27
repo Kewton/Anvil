@@ -1202,3 +1202,33 @@ Assessment:
 - The remaining actor-loop responsibility is the semantic test weakening
   filter and mapping typed weakening metadata into the legacy
   `ValidationFailure` carrier.
+
+### 2026-05-27 Slice 22
+
+Applied:
+
+- Moved verifier repair validation error carriers into
+  `repair_patch_validation.rs`:
+  - `CheapCheckOutcome`
+  - `ValidationWeakening`
+  - `RepairRejectionSignal`
+  - `ValidationFailure`
+- `turn.rs` now imports those typed carriers and keeps only the ledger/report
+  conversion logic.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3013 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Patch validation now owns the validation result
+  shape as well as most typed admission checks.
+- The remaining actor-loop responsibility is still the high-level orchestration,
+  Python evidence gathering, semantic test weakening filter, and conversion
+  from validation result to repair attempt ledger/reporting.

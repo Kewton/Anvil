@@ -135,3 +135,6 @@ with legacy/fallback paths unable to override it.
 - Current status: test/implementation weakening detector dispatch is now
   validation-owned; `turn.rs` still applies the semantic test weakening
   filter before mapping typed metadata into `ValidationFailure`.
+- Current status: verifier repair validation result carriers are now
+  validation-owned; `turn.rs` imports them and still owns ledger/report
+  conversion.

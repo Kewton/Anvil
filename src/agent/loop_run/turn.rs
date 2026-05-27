@@ -20,7 +20,10 @@ use super::reminder::{
 use super::repair_job;
 #[cfg(test)]
 use super::repair_job::VerifierRepairDecision;
-use super::repair_patch_validation::{ValidatedVerifierRepairEdit, VerifierRepairIntent};
+use super::repair_patch_validation::{
+    CheapCheckOutcome, RepairRejectionSignal, ValidatedVerifierRepairEdit, ValidationFailure,
+    ValidationWeakening, VerifierRepairIntent,
+};
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
@@ -194,160 +197,6 @@ enum VerifierRepairPassOutcome {
         relative_path: String,
     },
     Skipped,
-}
-
-/// Issue #639: control-flow vocabulary for `validate_verifier_repair_*` to
-/// distinguish a cheap-check failure (which feeds the existing retry-message
-/// pipeline) from "no safe verifier exists" (which short-circuits to a full
-/// verifier rerun). `impl From<String>` lets `?` automatically convert
-/// existing `Err(String)` paths into `CheapCheckOutcome::Failed`.
-///
-/// Issue #653 (DR3-001): `Clone, PartialEq, Eq` 拡張 — `ValidationFailure` の
-/// derive 連鎖を成立させるための変更。`Hash` は付与しない (HashMap key と
-/// しては未使用)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CheapCheckOutcome {
-    Failed(String),
-    Unavailable,
-}
-
-impl From<String> for CheapCheckOutcome {
-    fn from(message: String) -> Self {
-        CheapCheckOutcome::Failed(message)
-    }
-}
-
-impl std::fmt::Display for CheapCheckOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheapCheckOutcome::Failed(message) => f.write_str(message),
-            CheapCheckOutcome::Unavailable => f.write_str("<cheap check unavailable>"),
-        }
-    }
-}
-
-#[cfg(test)]
-impl CheapCheckOutcome {
-    /// Test-only convenience to preserve the previous `err.contains("...")`
-    /// assertion style used throughout `turn.rs::tests`. Unavailable never
-    /// matches, so a test expecting a Failed message will fail loudly if the
-    /// validator ever short-circuits with Unavailable instead.
-    fn contains(&self, needle: &str) -> bool {
-        match self {
-            CheapCheckOutcome::Failed(message) => message.contains(needle),
-            CheapCheckOutcome::Unavailable => false,
-        }
-    }
-}
-
-/// Issue #653 (DR1-001 / DR3-002): weakening 検出時の構造化 metadata。
-/// `detect_test_weakening` branch は `TestWeakening`、`detect_impl_weakening`
-/// branch は `ImplWeakening` を入れる。message からの再 parse、および
-/// `preferred_repair_role` からの `RepairRejectionKind` 再導出は行わない
-/// (DR3-002 — `RepairRole = ArtifactRole` には `UsageDocs` / `Setup` も含む
-/// ため、coarse category は detector branch 側で確定する)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ValidationWeakening {
-    rejection: super::repair_attempt_outcome::RepairRejectionKind,
-    pattern: super::spec_authority::WeakeningPattern,
-}
-
-/// Issue #662: structured "non-unsafe" rejection signal carried inside
-/// `ValidationFailure`. `Noop` / `Duplicate` flow through
-/// `validate_verifier_repair_intents`; `Malformed` is produced when
-/// `parse_verifier_repair_intents_reply` fails. Each maps 1:1 to a
-/// `RepairAttemptOutcomeKind` variant for ledger push.
-///
-/// **Detection-order SSOT (5-4-1 priority)**:
-///   - priority 1 `Malformed`  → `RepairAttemptOutcomeKind::RejectedMalformed`
-///   - priority 2 `Noop`       → `RepairAttemptOutcomeKind::RejectedNoop`
-///   - priority 3 `Duplicate`  → `RepairAttemptOutcomeKind::RejectedDuplicate`
-///   - priority 4 (weakening, carried by `ValidationFailure.weakening`)
-///     → `RepairAttemptOutcomeKind::RejectedUnsafe { .. }`
-///   - priority 5 (Applied — no signal, fed by rerun classification)
-///     → `RepairAttemptOutcomeKind::Applied*`
-///
-/// Priorities 1-3 live in this enum; priorities 4 / 5 live elsewhere in
-/// `ValidationFailure.weakening` / the rerun classification path. The
-/// translation into `RepairAttemptOutcomeKind` happens in
-/// `build_verifier_repair_pass_ledger_outcome`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RepairRejectionSignal {
-    Noop,
-    Duplicate,
-    Malformed,
-}
-
-/// Issue #653 (DR1-001 / DR3-001): `validate_verifier_repair_intents` の
-/// 構造化 Err 型。`outcome` は既存 `CheapCheckOutcome` の文字列互換性を維持し、
-/// `weakening` は `Some(...)` の場合のみ ledger 対象 (`RejectedUnsafe`)。
-/// parse error / exact match 失敗 / cheap syntax check 失敗は `weakening = None`
-/// かつ `rejection_signal = None` (S5-003 — ledger 非対象 / 旧挙動)。
-///
-/// Issue #662: `rejection_signal` field を additive 追加。`weakening` と直交
-/// する non-unsafe rejection (Noop / Duplicate / Malformed) を carry する。
-/// 同時に両方が `Some` になることはなく、`build_verifier_repair_pass_ledger_outcome`
-/// 内で `weakening` が優先される (検出順序 SSOT priority 4 が priority 1-3 より
-/// 後段で計算されるため、実装上 weakening を後で上書きする経路は存在しない)。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ValidationFailure {
-    outcome: CheapCheckOutcome,
-    weakening: Option<ValidationWeakening>,
-    rejection_signal: Option<RepairRejectionSignal>,
-}
-
-impl ValidationFailure {
-    fn failed(message: String) -> Self {
-        Self {
-            outcome: CheapCheckOutcome::Failed(message),
-            weakening: None,
-            rejection_signal: None,
-        }
-    }
-
-    /// Issue #662: build a `Failed` ValidationFailure carrying a non-unsafe
-    /// rejection signal (Noop / Duplicate). Used inside
-    /// `validate_verifier_repair_intents` so the caller can build a
-    /// `RepairAttemptOutcomeKind::Rejected{Noop,Duplicate}` outcome.
-    fn failed_with_signal(message: String, signal: RepairRejectionSignal) -> Self {
-        Self {
-            outcome: CheapCheckOutcome::Failed(message),
-            weakening: None,
-            rejection_signal: Some(signal),
-        }
-    }
-}
-
-impl From<String> for ValidationFailure {
-    fn from(message: String) -> Self {
-        Self::failed(message)
-    }
-}
-
-impl From<CheapCheckOutcome> for ValidationFailure {
-    fn from(outcome: CheapCheckOutcome) -> Self {
-        Self {
-            outcome,
-            weakening: None,
-            rejection_signal: None,
-        }
-    }
-}
-
-impl std::fmt::Display for ValidationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.outcome.fmt(f)
-    }
-}
-
-#[cfg(test)]
-impl ValidationFailure {
-    /// Test-only convenience to preserve the previous `err.contains("...")`
-    /// assertion style used throughout `turn.rs::tests` after the signature
-    /// of `validate_verifier_repair_intents` changed (DR3-001).
-    fn contains(&self, needle: &str) -> bool {
-        self.outcome.contains(needle)
-    }
 }
 
 /// Issue #653 (CB-001) / #662 (5-4-1): pure helper that derives the

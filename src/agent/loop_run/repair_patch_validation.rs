@@ -51,6 +51,119 @@ pub(super) struct VerifierRepairIntentLimits {
     pub(super) max_reason_chars: usize,
 }
 
+/// Issue #653 (DR3-001): cheap validation can be conclusive failure or
+/// unavailable. The verifier repair caller keeps this display-compatible with
+/// earlier `Err(String)` paths by treating string errors as `Failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CheapCheckOutcome {
+    Failed(String),
+    Unavailable,
+}
+
+impl From<String> for CheapCheckOutcome {
+    fn from(message: String) -> Self {
+        CheapCheckOutcome::Failed(message)
+    }
+}
+
+impl std::fmt::Display for CheapCheckOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheapCheckOutcome::Failed(message) => f.write_str(message),
+            CheapCheckOutcome::Unavailable => f.write_str("<cheap check unavailable>"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl CheapCheckOutcome {
+    /// Test-only convenience to preserve the previous `err.contains("...")`
+    /// assertion style used throughout `turn.rs::tests`. Unavailable never
+    /// matches, so a test expecting a Failed message will fail loudly if the
+    /// validator ever short-circuits with Unavailable instead.
+    pub(super) fn contains(&self, needle: &str) -> bool {
+        match self {
+            CheapCheckOutcome::Failed(message) => message.contains(needle),
+            CheapCheckOutcome::Unavailable => false,
+        }
+    }
+}
+
+/// Issue #653 (DR1-001 / DR3-002): structured weakening metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ValidationWeakening {
+    pub(super) rejection: super::repair_attempt_outcome::RepairRejectionKind,
+    pub(super) pattern: super::spec_authority::WeakeningPattern,
+}
+
+/// Issue #662: structured "non-unsafe" rejection signal carried inside
+/// `ValidationFailure`. It maps 1:1 to repair-attempt ledger outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RepairRejectionSignal {
+    Noop,
+    Duplicate,
+    Malformed,
+}
+
+/// Issue #653 (DR1-001 / DR3-001): structured verifier repair validation
+/// error. `outcome` preserves the legacy cheap-check/string compatibility,
+/// while `weakening` and `rejection_signal` provide typed ledger signals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidationFailure {
+    pub(super) outcome: CheapCheckOutcome,
+    pub(super) weakening: Option<ValidationWeakening>,
+    pub(super) rejection_signal: Option<RepairRejectionSignal>,
+}
+
+impl ValidationFailure {
+    pub(super) fn failed(message: String) -> Self {
+        Self {
+            outcome: CheapCheckOutcome::Failed(message),
+            weakening: None,
+            rejection_signal: None,
+        }
+    }
+
+    pub(super) fn failed_with_signal(message: String, signal: RepairRejectionSignal) -> Self {
+        Self {
+            outcome: CheapCheckOutcome::Failed(message),
+            weakening: None,
+            rejection_signal: Some(signal),
+        }
+    }
+}
+
+impl From<String> for ValidationFailure {
+    fn from(message: String) -> Self {
+        Self::failed(message)
+    }
+}
+
+impl From<CheapCheckOutcome> for ValidationFailure {
+    fn from(outcome: CheapCheckOutcome) -> Self {
+        Self {
+            outcome,
+            weakening: None,
+            rejection_signal: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.outcome.fmt(f)
+    }
+}
+
+#[cfg(test)]
+impl ValidationFailure {
+    /// Test-only convenience to preserve the previous `err.contains("...")`
+    /// assertion style used throughout `turn.rs::tests`.
+    pub(super) fn contains(&self, needle: &str) -> bool {
+        self.outcome.contains(needle)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct RepairCandidateTestImportContractEvidence {
     pub(super) missing_modules: Vec<String>,

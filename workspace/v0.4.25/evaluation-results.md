@@ -419,3 +419,24 @@ Assessment:
 
 - No behavior change intended. File-kind dispatch is validation-owned while
   context-sensitive test filtering remains local to the actor-loop boundary.
+
+## Structural Verification: Slice 22
+
+Scope:
+
+- Move verifier repair validation error carriers out of `turn.rs`.
+- Preserve existing validation messages, rejection signals, and ledger mapping.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3013 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The validation module now owns both the typed
+  rejection checks and the typed validation result carrier.
