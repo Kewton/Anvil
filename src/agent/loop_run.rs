@@ -128,6 +128,9 @@ mod repair_job;
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
 // in-crate consumers via `super::repair_attempt_outcome::*`.
 mod repair_attempt_outcome;
+// v0.4.25: pure assertion/output analysis helpers shared by verifier repair
+// diagnostics and generated-test semantic weakening filters.
+mod repair_assertion_analysis;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.

@@ -1387,3 +1387,29 @@ Assessment:
 - No behavior change intended. `turn.rs` no longer owns typed validation error
   shaping; its remaining validation responsibilities are orchestration,
   Python evidence gathering, and semantic generated-test weakening filtering.
+
+### 2026-05-27 Slice 29
+
+Applied:
+
+- Added `repair_assertion_analysis.rs` for pure assertion/output parsing used
+  by verifier repair diagnostics and semantic generated-test filtering.
+- Moved assertion delta helpers, observed assert-pair parsing, and the pytest
+  shared-state-leak signal into that module.
+- Added focused unit tests for assertion delta handling and observed pytest
+  output parsing.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_assertion_analysis --lib -q`: pass, 3 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3017 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. This does not move the semantic weakening
+  decision itself yet; it removes pure assertion parsing from `turn.rs` first
+  so the eventual semantic filter extraction has a smaller dependency surface.

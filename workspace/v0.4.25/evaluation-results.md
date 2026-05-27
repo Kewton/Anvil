@@ -575,3 +575,24 @@ Assessment:
 
 - No behavior change intended. The actor loop now delegates validation error
   shaping to the validation module.
+
+## Structural Verification: Slice 29
+
+Scope:
+
+- Extract pure assertion/output analysis helpers from `turn.rs`.
+- Keep filesystem and `RepairJob` semantic decisions out of the new module.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_assertion_analysis --lib -q`: pass, 3 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3017 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The new module is deliberately pure and only
+  owns reusable assertion/output parsing.

@@ -153,3 +153,6 @@ with legacy/fallback paths unable to override it.
 - Current status: remaining typed validation errors now convert to
   validation-result carriers inside `repair_patch_validation.rs`; `turn.rs`
   still sequences the checks and gathers Python evidence.
+- Current status: pure assertion/output parsing is now isolated in
+  `repair_assertion_analysis.rs`; `turn.rs` still owns the semantic
+  generated-test weakening decision and Python evidence gathering.

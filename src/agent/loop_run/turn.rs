@@ -16,6 +16,12 @@ use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
+use super::repair_assertion_analysis::{
+    assert_line_update_has_observed_pair, changed_assert_equalities, changed_assert_lines,
+    changed_non_assert_lines, count_assert_lines, observed_assert_equal_pairs,
+    pytest_output_suggests_shared_state_leak, python_assert_line_is_obvious_weakening,
+    python_assert_line_observes_fixture_state,
+};
 #[cfg(test)]
 use super::repair_job;
 #[cfg(test)]
@@ -24557,54 +24563,6 @@ fn disconnected_fixture_assertion_update_matches(
         .all(|line| !python_assert_line_is_obvious_weakening(line))
 }
 
-fn assert_line_update_has_observed_pair(
-    deleted_line: &str,
-    added_line: &str,
-    observed_pairs: &[(String, String)],
-) -> bool {
-    let Some((old_lhs, old_expected)) = assert_equality_parts(deleted_line) else {
-        return false;
-    };
-    let Some((new_lhs, new_expected)) = assert_equality_parts(added_line) else {
-        return false;
-    };
-    old_lhs == new_lhs
-        && observed_pairs
-            .iter()
-            .any(|(actual, expected)| actual == &new_expected && expected == &old_expected)
-}
-
-fn changed_assert_lines(left: &str, right: &str) -> Vec<String> {
-    let mut right_lines = line_count_map(right);
-    let mut changed = Vec::new();
-    for line in left.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if let Some(count) = right_lines.get_mut(line)
-            && *count > 0
-        {
-            *count -= 1;
-            continue;
-        }
-        if line.starts_with("assert") {
-            changed.push(line.to_string());
-        }
-    }
-    changed
-}
-
-fn python_assert_line_observes_fixture_state(line: &str, fixture_name: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("assert ")
-        && (trimmed.contains(&format!("len({fixture_name})"))
-            || trimmed.contains(&format!("{fixture_name} =="))
-            || trimmed.contains(&format!("{fixture_name} !="))
-            || trimmed.contains(&format!("{fixture_name}[")))
-}
-
-fn python_assert_line_is_obvious_weakening(line: &str) -> bool {
-    let trimmed = line.trim().trim_end_matches(';').trim();
-    matches!(trimmed, "assert True" | "assert true" | "assert!(true)")
-}
-
 fn test_only_missing_import_symbol_update_matches(
     context: &super::repair_job::RepairJob,
     before: &str,
@@ -24642,167 +24600,6 @@ fn test_only_missing_import_symbol_update_matches(
     added_asserts
         .iter()
         .all(|line| !python_assert_line_is_obvious_weakening(line))
-}
-
-fn changed_non_assert_lines(left: &str, right: &str) -> Vec<String> {
-    let mut right_lines = line_count_map(right);
-    let mut changed = Vec::new();
-    for line in left.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if let Some(count) = right_lines.get_mut(line)
-            && *count > 0
-        {
-            *count -= 1;
-            continue;
-        }
-        if !line.starts_with("assert") {
-            changed.push(line.to_string());
-        }
-    }
-    changed
-}
-
-fn count_assert_lines(text: &str) -> usize {
-    text.lines()
-        .filter(|line| line.trim_start().starts_with("assert "))
-        .count()
-}
-
-fn changed_assert_equalities(left: &str, right: &str) -> Vec<(String, String)> {
-    let mut right_lines = line_count_map(right);
-    let mut changed = Vec::new();
-    for line in left.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if let Some(count) = right_lines.get_mut(line)
-            && *count > 0
-        {
-            *count -= 1;
-            continue;
-        }
-        if let Some(parts) = assert_equality_parts(line) {
-            changed.push(parts);
-        }
-    }
-    changed
-}
-
-fn line_count_map(text: &str) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        *counts.entry(line.to_string()).or_insert(0) += 1;
-    }
-    counts
-}
-
-fn observed_assert_equal_pairs(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|line| {
-            let (_, tail) = line.split_once("assert ")?;
-            let (actual, expected) = tail.split_once("==")?;
-            Some((
-                normalize_assert_literal_token(actual)?,
-                normalize_assert_literal_token(expected)?,
-            ))
-        })
-        .collect()
-}
-
-fn pytest_output_suggests_shared_state_leak(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("left contains") || lower.contains("right contains") {
-        return true;
-    }
-    observed_assert_equal_mismatches(text)
-        .iter()
-        .any(|mismatch| {
-            let Some(lhs) = mismatch.source_lhs.as_deref() else {
-                return false;
-            };
-            if !lhs.trim_start().starts_with("len(") {
-                return false;
-            }
-            let Ok(actual) = mismatch.actual.parse::<i64>() else {
-                return false;
-            };
-            let Ok(expected) = mismatch.expected.parse::<i64>() else {
-                return false;
-            };
-            actual > expected
-        })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ObservedAssertMismatch {
-    source_lhs: Option<String>,
-    actual: String,
-    expected: String,
-}
-
-fn observed_assert_equal_mismatches(text: &str) -> Vec<ObservedAssertMismatch> {
-    let mut last_source: Option<(String, String)> = None;
-    let mut mismatches = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('>') {
-            if let Some((_, tail)) = trimmed.split_once("assert ") {
-                let source_line = format!("assert {tail}");
-                last_source = assert_equality_parts(&source_line);
-            }
-            continue;
-        }
-        if !trimmed.starts_with('E') {
-            continue;
-        }
-        let Some((_, tail)) = trimmed.split_once("assert ") else {
-            continue;
-        };
-        let Some((actual, expected)) = observed_assert_pair_from_tail(tail) else {
-            continue;
-        };
-        let source_lhs = last_source
-            .as_ref()
-            .filter(|(_, source_expected)| source_expected == &expected)
-            .map(|(lhs, _)| lhs.clone());
-        mismatches.push(ObservedAssertMismatch {
-            source_lhs,
-            actual,
-            expected,
-        });
-    }
-    mismatches
-}
-
-fn observed_assert_pair_from_tail(tail: &str) -> Option<(String, String)> {
-    let (actual, expected) = tail.split_once("==")?;
-    Some((
-        normalize_assert_literal_token(actual)?,
-        normalize_assert_literal_token(expected)?,
-    ))
-}
-
-fn assert_equality_parts(line: &str) -> Option<(String, String)> {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with("assert ") {
-        return None;
-    }
-    let body = trimmed.strip_prefix("assert ")?;
-    let (lhs, rhs) = body.split_once("==")?;
-    Some((lhs.trim().to_string(), normalize_assert_literal_token(rhs)?))
-}
-
-fn normalize_assert_literal_token(raw: &str) -> Option<String> {
-    let token = raw
-        .trim()
-        .trim_start_matches('(')
-        .chars()
-        .take_while(|ch| !ch.is_whitespace() && !matches!(ch, ',' | ')' | ']' | '}' | ':' | ';'))
-        .collect::<String>();
-    let normalized = token.trim_matches(['\'', '"']).to_string();
-    if normalized.is_empty() {
-        return None;
-    }
-    let safe = normalized
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'));
-    safe.then_some(normalized)
 }
 
 #[cfg(test)]
