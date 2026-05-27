@@ -78,6 +78,9 @@ Implemented:
   - `select_task_contract_project_unit`
   - `TaskContractVerifierSelection`
   - `select_task_contract_verifier`
+  - `run_structured_task_contract_verifier`
+  - `run_legacy_task_contract_verifier`
+  - `task_contract_verifier_outcome_label`
 
 Wired into:
 
@@ -90,6 +93,8 @@ Wired into:
     `verifier_driver`.
   - structured vs legacy verifier command selection is delegated to
     `verifier_driver`.
+  - structured / legacy verifier execution now goes through `verifier_driver`
+    wrappers instead of direct `AutoTestRunner::run*` calls in `turn.rs`.
 
 Tests added:
 
@@ -101,12 +106,13 @@ Tests added:
 - verifier selection returns structured missing when tests are required but no
   owned test artifact exists
 - verifier selection returns missing when no runnable verifier candidate exists
+- verifier transport outcome labels are centralized for logging
 
 Current effect:
 
-- `run_task_contract_verifier_once` rough CC dropped from `38` to `34`.
+- `run_task_contract_verifier_once` rough CC dropped from `38` to `26`.
 - `verifier_driver.rs` stays below the high-complexity threshold:
-  - functions: `21`
+  - functions: `25`
   - max rough CC: `7`
   - rough CC >= 15: `0`
 
@@ -137,18 +143,18 @@ Results:
 - targeted Rust tests passed
 - Python complexity-report tests passed
 - `cargo clippy --all-targets -- -D warnings` passed
-- `cargo test --lib -q` passed: `3070 passed`
+- `cargo test --lib -q` passed: `3071 passed`
 - `cargo build --release` passed
 
 ## Current Complexity Snapshot
 
 | File | Functions | Avg Rough CC | Max Rough CC | CC >= 15 | CC >= 50 | Function LOC |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `src/agent/loop_run/turn.rs` | 1032 | 3.01 | 362 | 29 | 1 | 33115 |
+| `src/agent/loop_run/turn.rs` | 1032 | 3.01 | 362 | 29 | 1 | 33107 |
 | `src/agent/loop_run/repair_job.rs` | 236 | 2.37 | 26 | 3 | 0 | 5806 |
 | `src/agent/loop_run/model_request.rs` | 9 | 3.11 | 8 | 0 | 0 | 153 |
 | `src/agent/loop_run/tool_execution.rs` | 16 | 1.62 | 7 | 0 | 0 | 143 |
-| `src/agent/loop_run/verifier_driver.rs` | 21 | 2.24 | 7 | 0 | 0 | 288 |
+| `src/agent/loop_run/verifier_driver.rs` | 25 | 2.20 | 7 | 0 | 0 | 330 |
 
 Top remaining hotspots:
 
@@ -157,7 +163,7 @@ Top remaining hotspots:
 | 362 | `turn.rs::run_actor_loop` |
 | 42 | `turn.rs::build_request_messages` |
 | 40 | `turn.rs::request_assistant_reply_with_retry` |
-| 34 | `turn.rs::run_task_contract_verifier_once` |
+| 26 | `turn.rs::run_task_contract_verifier_once` |
 | 30 | `turn.rs::run_verifier_repair_pass_and_apply` |
 | 28 | `turn.rs::execute_tool_call` |
 

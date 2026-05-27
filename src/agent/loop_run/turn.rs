@@ -120,9 +120,10 @@ use super::verifier_driver::classify_verifier_timeout;
 #[cfg(test)]
 use super::verifier_driver::task_contract_structured_missing_outcome;
 use super::verifier_driver::{
-    TaskContractVerifierOutcome, TaskContractVerifierSelection, select_task_contract_project_unit,
+    TaskContractVerifierOutcome, TaskContractVerifierSelection, run_legacy_task_contract_verifier,
+    run_structured_task_contract_verifier, select_task_contract_project_unit,
     select_task_contract_verifier, task_contract_auto_test_result_to_outcome,
-    task_contract_verifier_transport_error_to_outcome,
+    task_contract_verifier_outcome_label, task_contract_verifier_transport_error_to_outcome,
 };
 use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
@@ -8381,7 +8382,7 @@ impl Agent {
                 }
                 let result = {
                     let _sp = Spinner::start("running verifier...".to_string());
-                    AutoTestRunner::run_structured(
+                    run_structured_task_contract_verifier(
                         &self.work_root,
                         workspace_scope,
                         &command,
@@ -8500,11 +8501,7 @@ impl Agent {
                         );
                         let outcome =
                             task_contract_verifier_transport_error_to_outcome(command, error);
-                        let outcome_label = match &outcome {
-                            TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
-                            TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
-                            _ => "transport_error",
-                        };
+                        let outcome_label = task_contract_verifier_outcome_label(&outcome);
                         log_llm_event(
                             "agent.task_contract.verifier.completed",
                             serde_json::json!({
@@ -8587,18 +8584,14 @@ impl Agent {
             } => {
                 let result = {
                     let _sp = Spinner::start("running verifier...".to_string());
-                    AutoTestRunner::run(&self.work_root, &plan)
+                    run_legacy_task_contract_verifier(&self.work_root, &plan)
                 };
                 let Ok(result) = result else {
                     let outcome = task_contract_verifier_transport_error_to_outcome(
                         command_for_log.clone(),
                         result.err().unwrap_or_default(),
                     );
-                    let outcome_label = match &outcome {
-                        TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
-                        TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
-                        _ => "transport_error",
-                    };
+                    let outcome_label = task_contract_verifier_outcome_label(&outcome);
                     log_llm_event(
                         "agent.task_contract.verifier.completed",
                         serde_json::json!({

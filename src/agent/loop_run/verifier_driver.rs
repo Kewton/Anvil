@@ -181,6 +181,32 @@ pub(super) fn select_task_contract_project_unit(
     }
 }
 
+pub(super) fn task_contract_verifier_outcome_label(
+    outcome: &TaskContractVerifierOutcome,
+) -> &'static str {
+    match outcome {
+        TaskContractVerifierOutcome::Failed { .. } => "verifier_timeout",
+        TaskContractVerifierOutcome::TransportError { .. } => "transport_error",
+        _ => "transport_error",
+    }
+}
+
+pub(super) fn run_structured_task_contract_verifier(
+    work_root: &Path,
+    workspace_scope: &TaskWorkspaceScope,
+    command: &VerifierCommand,
+    display_command: &str,
+) -> Result<AutoTestResult, String> {
+    AutoTestRunner::run_structured(work_root, workspace_scope, command, display_command)
+}
+
+pub(super) fn run_legacy_task_contract_verifier(
+    work_root: &Path,
+    plan: &AutoTestPlan,
+) -> Result<AutoTestResult, String> {
+    AutoTestRunner::run(work_root, plan)
+}
+
 fn verifier_timeout_failure_output(command: &str, error: &str) -> Option<String> {
     let kind = classify_verifier_timeout(command, error)?;
     let masked_command = crate::session::feedback::redact_verifier_command_for_storage(command);
@@ -327,6 +353,27 @@ mod tests {
             TaskContractVerifierOutcome::TransportError {
                 error: "connection refused".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn outcome_label_is_stable_for_transport_logging() {
+        assert_eq!(
+            task_contract_verifier_outcome_label(&TaskContractVerifierOutcome::Failed {
+                command: "pytest".to_string(),
+                output: "timeout".to_string(),
+            }),
+            "verifier_timeout"
+        );
+        assert_eq!(
+            task_contract_verifier_outcome_label(&TaskContractVerifierOutcome::TransportError {
+                error: "connection refused".to_string(),
+            }),
+            "transport_error"
+        );
+        assert_eq!(
+            task_contract_verifier_outcome_label(&TaskContractVerifierOutcome::NoVerifier),
+            "transport_error"
         );
     }
 
