@@ -80,6 +80,7 @@ use super::verifier_repair_shadow::{
 use super::verifier_repair_targeting::{
     recovery_target_hint_for_diagnostic_path, verifier_diagnostic_missing_setup_candidates,
     verifier_diagnostic_path_input_is_safe, verifier_repair_missing_local_module_provider,
+    verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
@@ -23103,87 +23104,6 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
         sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
         cluster.admitted_cluster_targets = admitted;
     }
-}
-
-fn verifier_repair_preferred_local_import_source(
-    context: &super::repair_job::RepairJob,
-    // Issue #638 (設計判断 #3): caller passes the assessment-derived failure type
-    // so this helper is not gated on `context.failure_type` (which is `Unknown`
-    // after the parser scope reduction in Task 1.2). Production callers MUST pass
-    // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
-    derived_failure_type: super::VerifierFailureType,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    if derived_failure_type != super::VerifierFailureType::ImportOrDependency {
-        return None;
-    }
-    let lower = context.output_excerpt.to_ascii_lowercase();
-    let local_import_mismatch = lower.contains("cannot import name")
-        || lower.contains("unresolved import")
-        || lower.contains("has no exported member")
-        || lower.contains("attempted import error")
-        || lower.contains("is not exported from");
-    if !local_import_mismatch {
-        return None;
-    }
-    let hint = context.target_hint.as_ref()?;
-    let promoted = if hint.role == super::task_contract::ArtifactRole::Implementation {
-        Some(super::task_contract::RecoveryTargetHint {
-            reason: "local import contract mismatch names this provider/source file".to_string(),
-            ..hint.clone()
-        })
-    } else {
-        None
-    }?;
-    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 4 of the
-    // 6 source categories: local-import-contract-derived hints.
-    admit_repair_target_hint(promoted, admission)
-}
-
-fn verifier_repair_stale_assertion_test_target(
-    context: &super::repair_job::RepairJob,
-    selected_path: Option<&str>,
-    // Issue #638 (設計判断 #3): caller passes the assessment-derived failure type
-    // so this helper is not gated on `context.failure_type` (which is `Unknown`
-    // after the parser scope reduction in Task 1.2). Production callers MUST pass
-    // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
-    derived_failure_type: super::VerifierFailureType,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    if derived_failure_type != super::VerifierFailureType::AssertionFailure {
-        return None;
-    }
-    let previous_non_test_repair_was_unresolved = matches!(
-        context.rerun_outcome,
-        Some(
-            super::VerifierRepairRerunOutcome::SameFailureRemaining
-                | super::VerifierRepairRerunOutcome::Worsened
-                | super::VerifierRepairRerunOutcome::Improved
-        )
-    );
-    if !previous_non_test_repair_was_unresolved {
-        return None;
-    }
-    let previous_target = context.repair_target_hint.as_ref()?;
-    if previous_target.role == super::task_contract::ArtifactRole::Test {
-        return None;
-    }
-    if selected_path.is_some_and(|path| path != previous_target.path) {
-        return None;
-    }
-    let failure_target = context.target_hint.as_ref()?;
-    if failure_target.role != super::task_contract::ArtifactRole::Test
-        || failure_target.path == previous_target.path
-    {
-        return None;
-    }
-    let promoted = super::task_contract::RecoveryTargetHint {
-        reason: "same assertion failure remained after a non-test repair; inspect generated test setup or expectations".to_string(),
-        ..failure_target.clone()
-    };
-    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
-    // 6 source categories: stale-assertion test re-target.
-    admit_repair_target_hint(promoted, admission)
 }
 
 /// Boundary helper that converts a parsed diagnostic reply into the

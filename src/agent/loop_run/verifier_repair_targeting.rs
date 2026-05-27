@@ -220,6 +220,87 @@ pub(super) fn verifier_repair_missing_local_module_provider(
     )
 }
 
+pub(super) fn verifier_repair_preferred_local_import_source(
+    context: &super::repair_job::RepairJob,
+    // Issue #638 (設計判断 #3): caller passes the assessment-derived failure type
+    // so this helper is not gated on `context.failure_type` (which is `Unknown`
+    // after the parser scope reduction in Task 1.2). Production callers MUST pass
+    // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
+    derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    if derived_failure_type != super::VerifierFailureType::ImportOrDependency {
+        return None;
+    }
+    let lower = context.output_excerpt.to_ascii_lowercase();
+    let local_import_mismatch = lower.contains("cannot import name")
+        || lower.contains("unresolved import")
+        || lower.contains("has no exported member")
+        || lower.contains("attempted import error")
+        || lower.contains("is not exported from");
+    if !local_import_mismatch {
+        return None;
+    }
+    let hint = context.target_hint.as_ref()?;
+    let promoted = if hint.role == super::task_contract::ArtifactRole::Implementation {
+        Some(super::task_contract::RecoveryTargetHint {
+            reason: "local import contract mismatch names this provider/source file".to_string(),
+            ..hint.clone()
+        })
+    } else {
+        None
+    }?;
+    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 4 of the
+    // 6 source categories: local-import-contract-derived hints.
+    admit_repair_target_hint(promoted, admission)
+}
+
+pub(super) fn verifier_repair_stale_assertion_test_target(
+    context: &super::repair_job::RepairJob,
+    selected_path: Option<&str>,
+    // Issue #638 (設計判断 #3): caller passes the assessment-derived failure type
+    // so this helper is not gated on `context.failure_type` (which is `Unknown`
+    // after the parser scope reduction in Task 1.2). Production callers MUST pass
+    // `verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type)`.
+    derived_failure_type: super::VerifierFailureType,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    if derived_failure_type != super::VerifierFailureType::AssertionFailure {
+        return None;
+    }
+    let previous_non_test_repair_was_unresolved = matches!(
+        context.rerun_outcome,
+        Some(
+            super::VerifierRepairRerunOutcome::SameFailureRemaining
+                | super::VerifierRepairRerunOutcome::Worsened
+                | super::VerifierRepairRerunOutcome::Improved
+        )
+    );
+    if !previous_non_test_repair_was_unresolved {
+        return None;
+    }
+    let previous_target = context.repair_target_hint.as_ref()?;
+    if previous_target.role == super::task_contract::ArtifactRole::Test {
+        return None;
+    }
+    if selected_path.is_some_and(|path| path != previous_target.path) {
+        return None;
+    }
+    let failure_target = context.target_hint.as_ref()?;
+    if failure_target.role != super::task_contract::ArtifactRole::Test
+        || failure_target.path == previous_target.path
+    {
+        return None;
+    }
+    let promoted = super::task_contract::RecoveryTargetHint {
+        reason: "same assertion failure remained after a non-test repair; inspect generated test setup or expectations".to_string(),
+        ..failure_target.clone()
+    };
+    // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
+    // 6 source categories: stale-assertion test re-target.
+    admit_repair_target_hint(promoted, admission)
+}
+
 pub(super) fn python_missing_external_dependency_name(
     work_root: &Path,
     output: &str,
@@ -571,6 +652,83 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn verifier_repair_preferred_local_import_source_promotes_owned_impl_target() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "from app import missing\n").unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "changed impl".to_string(),
+        };
+        let context = super::super::repair_job::RepairJob {
+            output_excerpt: "ImportError: cannot import name 'missing' from 'app'".to_string(),
+            target_hint: Some(hint),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let promoted = verifier_repair_preferred_local_import_source(
+            &context,
+            super::super::VerifierFailureType::ImportOrDependency,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(promoted.path, "app/main.py");
+        assert_eq!(
+            promoted.reason,
+            "local import contract mismatch names this provider/source file"
+        );
+    }
+
+    #[test]
+    fn verifier_repair_stale_assertion_test_target_promotes_owned_test_after_unresolved_impl_repair()
+     {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "items = []\n").unwrap();
+        std::fs::write(
+            work_root.join("tests/test_main.py"),
+            "def test_items(): pass\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let impl_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "previous target".to_string(),
+        };
+        let test_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_main.py".to_string(),
+            reason: "failure target".to_string(),
+        };
+        let context = super::super::repair_job::RepairJob {
+            repair_target_hint: Some(impl_hint.clone()),
+            target_hint: Some(test_hint),
+            rerun_outcome: Some(super::super::VerifierRepairRerunOutcome::SameFailureRemaining),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let promoted = verifier_repair_stale_assertion_test_target(
+            &context,
+            Some("app/main.py"),
+            super::super::VerifierFailureType::AssertionFailure,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(promoted.path, "tests/test_main.py");
+        assert_eq!(impl_hint.path, "app/main.py");
     }
 
     #[test]

@@ -2017,3 +2017,32 @@ Assessment:
 - No behavior change intended. Local-module provider target selection is now a
   verifier-targeting responsibility; `turn.rs` only uses the selected hint
   while building the legacy/semantic repair assessment bridge.
+
+### 2026-05-27 Slice 53
+
+Applied:
+
+- Moved two remaining read-only repair target choice helpers from `turn.rs` to
+  `verifier_repair_targeting.rs`:
+  - `verifier_repair_preferred_local_import_source`
+  - `verifier_repair_stale_assertion_test_target`
+- Preserved existing admission semantics; both helpers still require owned
+  target admission before returning a hint.
+- Added module-local tests for local import provider promotion and stale
+  assertion test retargeting.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_targeting --lib -q`: pass, 14 tests
+- `cargo test local_import_source --lib -q`: pass, 2 tests
+- `cargo test stale_assertion --lib -q`: pass, 4 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3044 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Target-choice policy for import-contract and
+  unresolved assertion repair is no longer embedded in `turn.rs`; the actor
+  loop still owns only when to apply those choices to the assessment bridge.

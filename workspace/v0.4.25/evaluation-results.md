@@ -1126,3 +1126,27 @@ Assessment:
 - No behavior change intended. The local-module provider targeting policy is
   now isolated with the rest of verifier repair targeting; `turn.rs` retains
   only bridge orchestration and state updates.
+
+## Structural Verification: Slice 53
+
+Scope:
+
+- Move local import provider preference and stale assertion test-retarget
+  selection from `turn.rs` to `verifier_repair_targeting.rs`.
+- Preserve owned-admission gating for both helper paths.
+- Keep assessment bridge sequencing in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 14 tests.
+- `cargo test local_import_source --lib -q`: pass, 2 tests.
+- `cargo test stale_assertion --lib -q`: pass, 4 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3044 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Repair target selection for these two read-only
+  cases is no longer actor-loop responsibility.
