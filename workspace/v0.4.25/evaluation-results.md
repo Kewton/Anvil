@@ -825,3 +825,30 @@ Assessment:
 - No behavior change intended. A source-layout-sensitive grep test had to be
   made robust after the adjacent `pub(super)` function was moved; production
   behavior stayed unchanged.
+
+## Structural Verification: Slice 40
+
+Scope:
+
+- Extract diagnostic target confidence gating from `turn.rs`.
+- Extract role/failure-kind compatible diagnostic target selection from
+  `turn.rs`.
+- Preserve legacy assessment construction and admission orchestration in
+  `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests.
+- `cargo test semantic_failure --lib -q`: pass, 40 tests.
+- `cargo test model_assessment --lib -q`: pass, 6 tests.
+- `cargo test validate_verifier_repair_intents_weakening_reject_compounds_evidence_gate --lib -q`: pass, 1 test.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The extracted helpers are pure policy checks;
+  no RepairJob state transition, workspace admission call, or dispatch source
+  moved in this slice.

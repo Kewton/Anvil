@@ -45,7 +45,8 @@ use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
     build_semantic_failure_report_from_legacy_assessment,
     build_semantic_repair_plan_from_report_with_authority_input,
-    build_spec_authority_input_for_active_request, merge_legacy_targets_into_clusters,
+    build_spec_authority_input_for_active_request, diagnostic_target_allowed_by_confidence,
+    first_role_kind_compatible_diagnostic_target, merge_legacy_targets_into_clusters,
     sort_admitted_by_authority_role_priority,
 };
 #[cfg(test)]
@@ -23436,25 +23437,6 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
     }
 }
 
-fn diagnostic_target_allowed_by_confidence(
-    hint: &super::task_contract::RecoveryTargetHint,
-    confidence: f64,
-    failure_kind: super::VerifierDiagnosticFailureKind,
-    probable_cause_role: Option<super::task_contract::ArtifactRole>,
-    do_not_edit_tests_without_evidence: bool,
-) -> bool {
-    if hint.role != super::task_contract::ArtifactRole::Test || !do_not_edit_tests_without_evidence
-    {
-        return true;
-    }
-    if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug)
-        || probable_cause_role == Some(super::task_contract::ArtifactRole::Test)
-    {
-        return confidence >= 0.60;
-    }
-    confidence >= 0.85
-}
-
 fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
     let path = raw_path.trim();
     if path.is_empty()
@@ -23748,33 +23730,6 @@ fn model_assessment_to_verifier_repair_assessment(
         summary: parsed.summary,
         source: super::VerifierRepairAssessmentSource::DiagnosticPass,
     }
-}
-
-fn first_role_kind_compatible_diagnostic_target(
-    repair_plan: &[super::task_contract::RecoveryTargetHint],
-    repair_candidates: &[(super::task_contract::RecoveryTargetHint, f64)],
-    secondary_repair_candidates: &[super::task_contract::RecoveryTargetHint],
-    changed_repair_candidates: &[super::task_contract::RecoveryTargetHint],
-    failure_kind: super::VerifierDiagnosticFailureKind,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    repair_plan
-        .iter()
-        .chain(repair_candidates.iter().map(|(hint, _)| hint))
-        .chain(secondary_repair_candidates.iter())
-        .chain(changed_repair_candidates.iter())
-        .find(|hint| diagnostic_target_role_matches_failure_kind(hint, failure_kind))
-        .cloned()
-}
-
-fn diagnostic_target_role_matches_failure_kind(
-    hint: &super::task_contract::RecoveryTargetHint,
-    failure_kind: super::VerifierDiagnosticFailureKind,
-) -> bool {
-    let kind = super::repair_brief::legacy_kind_to_allowed_change_kind(failure_kind.as_str());
-    if kind == super::repair_brief::AllowedChangeKind::InsufficientEvidence {
-        return true;
-    }
-    super::repair_action::allowed_change_kind_allows_target_role(kind, hint.role)
 }
 
 #[cfg(test)]

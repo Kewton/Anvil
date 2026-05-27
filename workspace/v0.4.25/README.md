@@ -1675,3 +1675,32 @@ Assessment:
 - No behavior change intended. Pure semantic planning helpers are outside the
   actor loop; the admission-enrichment function remains in `turn.rs` until
   the SSOT structure test is replaced by a less source-layout-sensitive seam.
+
+### 2026-05-27 Slice 40
+
+Applied:
+
+- Moved diagnostic target confidence gating into
+  `semantic_repair_planning.rs`.
+- Moved role/failure-kind compatibility selection for diagnostic targets into
+  `semantic_repair_planning.rs`.
+- Kept `model_assessment_to_verifier_repair_assessment` in `turn.rs` because
+  it still coordinates workspace admission, context-derived fallbacks, and
+  legacy assessment construction.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo test semantic_failure --lib -q`: pass, 40 tests
+- `cargo test model_assessment --lib -q`: pass, 6 tests
+- `cargo test validate_verifier_repair_intents_weakening_reject_compounds_evidence_gate --lib -q`: pass, 1 test
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Diagnostic target scoring and role compatibility
+  are semantic planning policy now; `turn.rs` still owns the stateful bridge
+  that turns an admitted diagnostic assessment into a legacy repair assessment.
