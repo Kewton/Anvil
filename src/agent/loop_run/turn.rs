@@ -120,7 +120,8 @@ use super::verifier_driver::classify_verifier_timeout;
 #[cfg(test)]
 use super::verifier_driver::task_contract_structured_missing_outcome;
 use super::verifier_driver::{
-    TaskContractVerifierOutcome, TaskContractVerifierSelection, run_legacy_task_contract_verifier,
+    TaskContractVerifierOutcome, TaskContractVerifierSelection,
+    detect_verifier_external_import_contamination, run_legacy_task_contract_verifier,
     run_structured_task_contract_verifier, select_task_contract_project_unit,
     select_task_contract_verifier, task_contract_auto_test_result_to_outcome,
     task_contract_verifier_outcome_label, task_contract_verifier_transport_error_to_outcome,
@@ -8400,64 +8401,23 @@ impl Agent {
                                 "reason": &plan.reason,
                             }),
                         );
-                        // Issue #661 iteration-5 Task 7.2 / 7.3 +
-                        // CB-009 (Codex iteration-5 medium):
-                        // post-execution external import detection via
-                        // stdout/stderr pattern match. raw paths are
-                        // hashed before emit (DR4-005). `detected_count`
-                        // and `truncated` come from
-                        // `DetectedExternalImports` so the pre-cap total
-                        // is preserved even when the per-emit cap drops
-                        // excess entries.
-                        let detected = super::auto_test::detect_external_imports_in_output(
-                            &self.work_root,
-                            &result.stdout,
-                            &result.stderr,
-                        );
-                        if !detected.entries.is_empty() {
-                            let detected_count = detected.total_count;
-                            let truncated = detected.truncated;
+                        if let Some(contamination) =
+                            detect_verifier_external_import_contamination(&self.work_root, &result)
+                        {
                             let created_markers = self
                                 .materialize_python_package_markers_for_external_import(
                                     &result.stdout,
                                     &result.stderr,
                                 );
-                            let hashes: Vec<(String, &'static str)> = detected
-                                .entries
-                                .iter()
-                                .map(|raw| {
-                                    (
-                                        crate::logging::stable_path_hash(
-                                            &crate::session::feedback::mask_secrets(raw),
-                                        ),
-                                        "stdout_stderr",
-                                    )
-                                })
-                                .collect();
-                            let borrowed: Vec<(&str, &'static str)> =
-                                hashes.iter().map(|(h, k)| (h.as_str(), *k)).collect();
+                            let borrowed = contamination.borrowed_hashes();
                             self.emit_agent_verifier_external_import_rejected_if_first(
                                 command.runner(),
                                 "external_import_detected",
                                 &borrowed,
-                                detected_count,
-                                truncated,
+                                contamination.detected_count,
+                                contamination.truncated,
                             );
-                            let marker_note = if created_markers.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    "\nCreated local Python package marker(s) to keep imports inside work_root: {}",
-                                    created_markers.join(", ")
-                                )
-                            };
-                            return TaskContractVerifierOutcome::Failed {
-                                command: result.command,
-                                output: format!(
-                                    "Verifier environment contamination detected: {detected_count} external import path(s) outside work_root.{marker_note}\n{}",
-                                    result.output
-                                ),
-                            };
+                            return contamination.to_failure_outcome(result, &created_markers);
                         }
                         let frame = build_feedback_for_auto_test(
                             &plan,

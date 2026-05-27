@@ -71,10 +71,12 @@ Implemented:
 
 - `src/agent/loop_run/verifier_driver.rs`
   - `TaskContractVerifierOutcome`
+  - `VerifierExternalImportContamination`
   - `task_contract_auto_test_result_to_outcome`
   - `task_contract_verifier_transport_error_to_outcome`
   - `task_contract_structured_missing_outcome`
   - `classify_verifier_timeout`
+  - `detect_verifier_external_import_contamination`
   - `select_task_contract_project_unit`
   - `TaskContractVerifierSelection`
   - `select_task_contract_verifier`
@@ -95,6 +97,9 @@ Wired into:
     `verifier_driver`.
   - structured / legacy verifier execution now goes through `verifier_driver`
     wrappers instead of direct `AutoTestRunner::run*` calls in `turn.rs`.
+  - post-verifier external import contamination detection, path hashing, and
+    failure-outcome construction are delegated to `verifier_driver`; `turn.rs`
+    still owns the side effects: marker materialization and event emission.
 
 Tests added:
 
@@ -107,12 +112,15 @@ Tests added:
   owned test artifact exists
 - verifier selection returns missing when no runnable verifier candidate exists
 - verifier transport outcome labels are centralized for logging
+- external import contamination output is normalized into a verifier failure
+  without leaking raw external paths into telemetry hashes
+- external import contamination detection preserves count/truncated metadata
 
 Current effect:
 
-- `run_task_contract_verifier_once` rough CC dropped from `38` to `26`.
+- `run_task_contract_verifier_once` rough CC dropped from `38` to `25`.
 - `verifier_driver.rs` stays below the high-complexity threshold:
-  - functions: `25`
+  - functions: `30`
   - max rough CC: `7`
   - rough CC >= 15: `0`
 
@@ -126,6 +134,7 @@ cargo test tool_execution --lib -q
 cargo test recovery_owner_gates_lower_level_fallbacks --lib -q
 cargo test model_request --lib -q
 cargo test verifier_driver --lib -q
+cargo test task_contract_verifier --lib -q
 python3 -m unittest tests/test_complexity_report.py
 cargo clippy --all-targets -- -D warnings
 cargo test --lib -q
@@ -143,18 +152,18 @@ Results:
 - targeted Rust tests passed
 - Python complexity-report tests passed
 - `cargo clippy --all-targets -- -D warnings` passed
-- `cargo test --lib -q` passed: `3071 passed`
+- `cargo test --lib -q` passed: `3073 passed`
 - `cargo build --release` passed
 
 ## Current Complexity Snapshot
 
 | File | Functions | Avg Rough CC | Max Rough CC | CC >= 15 | CC >= 50 | Function LOC |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `src/agent/loop_run/turn.rs` | 1032 | 3.01 | 362 | 29 | 1 | 33107 |
+| `src/agent/loop_run/turn.rs` | 1032 | 3.00 | 362 | 29 | 1 | 33066 |
 | `src/agent/loop_run/repair_job.rs` | 236 | 2.37 | 26 | 3 | 0 | 5806 |
 | `src/agent/loop_run/model_request.rs` | 9 | 3.11 | 8 | 0 | 0 | 153 |
 | `src/agent/loop_run/tool_execution.rs` | 16 | 1.62 | 7 | 0 | 0 | 143 |
-| `src/agent/loop_run/verifier_driver.rs` | 25 | 2.20 | 7 | 0 | 0 | 330 |
+| `src/agent/loop_run/verifier_driver.rs` | 30 | 2.17 | 7 | 0 | 0 | 435 |
 
 Top remaining hotspots:
 
@@ -163,9 +172,11 @@ Top remaining hotspots:
 | 362 | `turn.rs::run_actor_loop` |
 | 42 | `turn.rs::build_request_messages` |
 | 40 | `turn.rs::request_assistant_reply_with_retry` |
-| 26 | `turn.rs::run_task_contract_verifier_once` |
 | 30 | `turn.rs::run_verifier_repair_pass_and_apply` |
 | 28 | `turn.rs::execute_tool_call` |
+| 25 | `turn.rs::drive_task_contract_verifier` |
+| 25 | `turn.rs::run_task_contract_verifier_once` |
+| 25 | `turn.rs::drive_repair_job_verifier` |
 
 ## Remaining Work
 

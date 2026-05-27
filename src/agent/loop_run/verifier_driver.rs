@@ -60,6 +60,44 @@ pub(super) enum TaskContractVerifierSelection {
     Missing,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifierExternalImportContamination {
+    pub(super) detected_count: usize,
+    pub(super) truncated: bool,
+    pub(super) hashed_entries: Vec<(String, &'static str)>,
+}
+
+impl VerifierExternalImportContamination {
+    pub(super) fn borrowed_hashes(&self) -> Vec<(&str, &'static str)> {
+        self.hashed_entries
+            .iter()
+            .map(|(hash, source)| (hash.as_str(), *source))
+            .collect()
+    }
+
+    pub(super) fn to_failure_outcome(
+        &self,
+        result: AutoTestResult,
+        created_markers: &[String],
+    ) -> TaskContractVerifierOutcome {
+        let marker_note = if created_markers.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nCreated local Python package marker(s) to keep imports inside work_root: {}",
+                created_markers.join(", ")
+            )
+        };
+        TaskContractVerifierOutcome::Failed {
+            command: result.command,
+            output: format!(
+                "Verifier environment contamination detected: {} external import path(s) outside work_root.{}\n{}",
+                self.detected_count, marker_note, result.output
+            ),
+        }
+    }
+}
+
 pub(super) fn task_contract_auto_test_result_to_outcome(
     result: AutoTestResult,
 ) -> TaskContractVerifierOutcome {
@@ -73,6 +111,35 @@ pub(super) fn task_contract_auto_test_result_to_outcome(
             output: result.output,
         }
     }
+}
+
+pub(super) fn detect_verifier_external_import_contamination(
+    work_root: &Path,
+    result: &AutoTestResult,
+) -> Option<VerifierExternalImportContamination> {
+    let detected = super::auto_test::detect_external_imports_in_output(
+        work_root,
+        &result.stdout,
+        &result.stderr,
+    );
+    if detected.entries.is_empty() {
+        return None;
+    }
+    let hashed_entries = detected
+        .entries
+        .iter()
+        .map(|raw| {
+            (
+                crate::logging::stable_path_hash(&crate::session::feedback::mask_secrets(raw)),
+                "stdout_stderr",
+            )
+        })
+        .collect();
+    Some(VerifierExternalImportContamination {
+        detected_count: detected.total_count,
+        truncated: detected.truncated,
+        hashed_entries,
+    })
 }
 
 pub(super) fn select_task_contract_verifier(
@@ -324,6 +391,60 @@ mod tests {
                 command: "python3 -m pytest".to_string(),
                 output: "FAILED tests/test_main.py".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn external_import_contamination_builds_masked_failure_outcome() {
+        let result = auto_test_result(
+            "python3 -B -m pytest",
+            false,
+            "ImportError: cannot import name 'app' from '/external/repo/app/main.py'",
+        );
+        let contamination = VerifierExternalImportContamination {
+            detected_count: 1,
+            truncated: false,
+            hashed_entries: vec![("hash-1".to_string(), "stdout_stderr")],
+        };
+        let borrowed = contamination.borrowed_hashes();
+        assert_eq!(borrowed, vec![("hash-1", "stdout_stderr")]);
+
+        let outcome = contamination.to_failure_outcome(result, &["app/__init__.py".to_string()]);
+        match outcome {
+            TaskContractVerifierOutcome::Failed { command, output } => {
+                assert_eq!(command, "python3 -B -m pytest");
+                assert!(output.contains(
+                    "Verifier environment contamination detected: 1 external import path(s) outside work_root."
+                ));
+                assert!(output.contains(
+                    "Created local Python package marker(s) to keep imports inside work_root: app/__init__.py"
+                ));
+                assert!(output.contains("ImportError"));
+            }
+            other => panic!("expected contamination failure outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn external_import_contamination_detection_hashes_raw_paths() {
+        let dir = tempdir().unwrap();
+        let mut result = auto_test_result(
+            "python3 -B -m pytest",
+            false,
+            "ImportError: cannot import name 'app' from '/external/repo/app/main.py'",
+        );
+        result.stderr = result.output.clone();
+
+        let contamination =
+            detect_verifier_external_import_contamination(dir.path(), &result).unwrap();
+
+        assert_eq!(contamination.detected_count, 1);
+        assert!(!contamination.truncated);
+        assert_eq!(contamination.hashed_entries.len(), 1);
+        assert_eq!(contamination.hashed_entries[0].1, "stdout_stderr");
+        assert_ne!(
+            contamination.hashed_entries[0].0,
+            "/external/repo/app/main.py"
         );
     }
 
