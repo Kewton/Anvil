@@ -77,9 +77,9 @@ with legacy/fallback paths unable to override it.
 - Moved in-memory repair candidate application into
   `repair_patch_validation.rs`; `turn.rs` now passes normalized edit payloads
   and receives the updated contents plus whitespace-fallback flag.
-- Moved weakening rejection message/metadata construction into
-  `repair_patch_validation.rs`; detector dispatch remains in `turn.rs` until
-  shared Python diagnostic helpers are separated.
+- Moved weakening rejection message/metadata construction and file-kind
+  detector dispatch into `repair_patch_validation.rs`; the remaining
+  `turn.rs` responsibility is the semantic generated-test expectation filter.
 - Moved the validated repair edit carrier and hash construction into
   `repair_patch_validation.rs`.
 - Added `repair_patch_executor.rs` for the only workspace-mutating step in
@@ -96,12 +96,14 @@ with legacy/fallback paths unable to override it.
 - Assert in tests that every verifier repair terminal path flows through
   `RepairJob::next_action`.
 - Continue deleting legacy bypass paths after they are covered by tests.
-- Decide whether to move shared Python diagnostic helpers first, or leave
-  weakening detector dispatch in `turn.rs` and extract only the final
-  high-level validated-edit assembly wrapper.
-- Keep disk write/apply orchestration in `turn.rs` unless a separate
-  executor boundary is introduced; patch validation should not silently mutate
-  the workspace.
+- Move the shared Python diagnostic/test-weakening helper cluster to a
+  dedicated module before moving the remaining semantic generated-test
+  weakening filter out of `turn.rs`.
+- Consider whether extracting the final high-level validated-edit assembly
+  wrapper is worth the coupling cost. The remaining logic is now primarily
+  orchestration and legacy-carrier mapping.
+- Keep disk write/apply orchestration out of patch validation. The executor
+  boundary owns mutation mechanics; `turn.rs` decides when to invoke it.
 - Current status: an executor boundary exists. `turn.rs` still decides when to
   invoke it; the executor owns the write mechanics and preimage guard.
 - Current status: duplicate-intent fingerprinting is now validation-owned;

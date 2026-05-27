@@ -24742,19 +24742,11 @@ fn validate_verifier_repair_intents_inner(
         .map_err(|err| ValidationFailure::failed(err.message()))?;
     }
 
-    // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): apply the deterministic
-    // test/impl weakening detectors at the repair editor's admission
-    // boundary. `original_contents` is the pre-edit `before` snapshot and
-    // `contents` is the post-edit `after`. Both are simultaneously available
-    // here (DR3-002), unlike inside `apply_validated_verifier_repair_edit`
-    // which only sees pre/post hashes. Test-side and impl-side detectors are
-    // dispatched by `file_classify` so each path is judged by the relevant
-    // closed pattern list (5 test patterns / 4 impl patterns). A non-empty
-    // pattern vec rejects the intent — this implements the AND coupling with
-    // the legacy `do_not_edit_tests_without_evidence` reject (which lives
-    // separately at hint admission via `diagnostic_target_allowed_by_confidence`):
-    // any weakening detected here is rejected unconditionally, while the
-    // evidence-required gate remains the independent first line of defence.
+    // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): run weakening
+    // admission at the repair editor boundary. The validation module owns
+    // file-kind detector dispatch; this boundary still applies the
+    // context-sensitive generated-test expectation filter before mapping the
+    // typed rejection into the legacy `ValidationFailure` carrier.
     // Issue #653 (DR1-001 / DR3-002): record which detector branch produced the
     // weakening so the call site can build a `RepairAttemptOutcome::RejectedUnsafe`
     // with the right `RepairRejectionKind` without re-parsing message text.
