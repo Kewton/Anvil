@@ -10572,124 +10572,131 @@ impl Agent {
             messages.push(message);
         }
         if focused_edit_target.is_none() {
-            if self.active_task_expects_repo_change() && self.workspace_appears_empty() {
-                if let Some(framework) = self.active_task_requested_scaffold_framework() {
-                    messages.push(ConversationMessage::system(
-                        recovery::framework_scaffold_now_note(framework.label()),
-                    ));
-                }
+            self.append_general_request_context_messages(&mut messages);
+        }
+        self.append_common_request_messages(&mut messages, protocol, effective_tool_policy);
+        if let Some(target) = focused_edit_target {
+            self.append_focused_edit_request_messages(
+                &mut messages,
+                effective_tool_policy,
+                &target,
+                focused_edit_target_already_read,
+                successful_repo_edits,
+            );
+        } else {
+            messages.extend(self.session.messages.clone());
+        }
+        messages
+    }
+
+    fn append_general_request_context_messages(&mut self, messages: &mut Vec<ConversationMessage>) {
+        if self.active_task_expects_repo_change() && self.workspace_appears_empty() {
+            if let Some(framework) = self.active_task_requested_scaffold_framework() {
                 messages.push(ConversationMessage::system(
-                    recovery::empty_workspace_scaffold_note(),
+                    recovery::framework_scaffold_now_note(framework.label()),
                 ));
             }
-            if let Some(memory_message) = self.working_memory_message() {
-                messages.push(memory_message);
-            }
-            // Issue #463: inject `Relevant Local Cases:` directly after the
-            // Working Memory section. Pure-function retrieval; no Ollama call.
-            let case_injection = self.try_inject_case_retrieval_message();
-            if let Some(ref inj) = case_injection {
-                messages.push(inj.message.clone());
-            }
-            // Issue #464: inject `Avoid Patterns (from prior failures):` after
-            // the case retrieval section. Pure-function retrieval; no Ollama
-            // call.
-            let anti_injection = self.try_inject_anti_pattern_message();
-            if let Some(ref inj) = anti_injection {
-                messages.push(inj.message.clone());
-            }
-            // Issue #555: send context_pack to photon sidecar once per turn,
-            // after retrieval IDs are known (per-turn one-shot via session flag).
-            if !self.session.context_pack_sent_this_turn {
-                let selected_case_ids: Vec<String> = case_injection
-                    .as_ref()
-                    .map(|inj| inj.selected_ids.clone())
-                    .unwrap_or_default();
-                let selected_anti_ids: Vec<String> = anti_injection
-                    .as_ref()
-                    .map(|inj| inj.selected_ids.clone())
-                    .unwrap_or_default();
-                let selected_precaution_ids: Vec<String> = self
-                    .session
-                    .working_memory
-                    .active_precautions
-                    .iter()
-                    .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
-                    .map(|p| p.id.clone())
-                    .collect();
-                let recent_tool_summary = build_recent_tool_summary(&self.session.messages);
-                let gate = crate::photon::mapper::PhotonGateInputs {
-                    photon_present: self.photon.is_some(),
-                    shadow_mode: self.config.photon_shadow_mode,
-                    canary: self.config.photon_canary,
-                    session_id: self.session_store.session_id(),
-                    turn_idx: self.current_turn_index,
-                };
-                if crate::photon::mapper::should_send_context_pack(&gate) {
-                    // Issue #667 (DR1-001 / DR1-005 / chokepoint B): receive
-                    // the response via `let resp_opt = ...` (no longer
-                    // discarded) so the PAM advisory adapter can observe
-                    // shadow-mode + active-job-axis (3) without altering the
-                    // existing renderer cache. Shadow turn must NOT write to
-                    // `photon_context_pack_response` here — that field is
-                    // owned by `invoke_photon_context_pack` and exists
-                    // strictly for live prompt injection (§5.2 contract).
-                    let resp_opt = match &self.photon {
-                        Some(photon) => {
-                            let working_memory_text =
-                                self.session.working_memory.format_for_prompt();
-                            let inputs = crate::photon::mapper::ContextPackInputs {
-                                task: self.session.working_memory.active_task.as_deref(),
-                                repo_path: &self.work_root,
-                                branch: None,
-                                commit: None,
-                                working_memory_text: working_memory_text.as_deref(),
-                                touched_files: &self.session.working_memory.touched_files,
-                                recent_tool_summary: &recent_tool_summary,
-                                selected_case_ids: &selected_case_ids,
-                                selected_anti_pattern_ids: &selected_anti_ids,
-                                selected_precaution_ids: &selected_precaution_ids,
-                            };
-                            let req = crate::photon::mapper::build_context_pack_request(&inputs);
-                            // Capture request_id for evaluate tracking (shadow mode path).
-                            let rid = req.0["request_id"].as_str().map(|s| s.to_string());
-                            let resp = photon.context_pack(&req);
-                            // Set last_context_pack_id only if not already set
-                            // by invoke_photon_context_pack (non-shadow path
-                            // takes priority).
-                            if self.last_context_pack_id.is_none() {
-                                self.last_context_pack_id = rid;
-                            }
-                            resp
-                        }
-                        None => None,
-                    };
-                    if let Some(resp) = resp_opt.as_ref() {
-                        // DR4-001: parity blocked_ids — same SSOT input as the
-                        // path-a side. `photon_respect_warnings=false` yields
-                        // the empty set so warning-blocked items cannot leak
-                        // back through advisory. `warning_blocked` event is
-                        // intentionally NOT emitted here (path-b never has
-                        // historically — event semantic invariant).
-                        let blocked_ids: std::collections::HashSet<String> =
-                            if self.config.photon_respect_warnings {
-                                let (ids, _stats) =
-                                    crate::photon::prompt::extract_blocked_summary_ids(resp);
-                                ids
-                            } else {
-                                std::collections::HashSet::new()
-                            };
-                        let shadow_input = self.config.photon_shadow_mode;
-                        let _ = self.record_pam_advisory_decision(resp, &blocked_ids, shadow_input);
-                    }
-                    self.session.context_pack_sent_this_turn = true;
-                }
-            }
-            if let Some(repo_context_message) = self.repo_context_message() {
-                messages.push(repo_context_message);
-            }
+            messages.push(ConversationMessage::system(
+                recovery::empty_workspace_scaffold_note(),
+            ));
         }
-        // [Issue #556] inject context_pack response (all paths, once — DR1-001 DRY)
+        if let Some(memory_message) = self.working_memory_message() {
+            messages.push(memory_message);
+        }
+        let case_injection = self.try_inject_case_retrieval_message();
+        if let Some(ref inj) = case_injection {
+            messages.push(inj.message.clone());
+        }
+        let anti_injection = self.try_inject_anti_pattern_message();
+        if let Some(ref inj) = anti_injection {
+            messages.push(inj.message.clone());
+        }
+        self.maybe_send_request_context_pack(&case_injection, &anti_injection);
+        if let Some(repo_context_message) = self.repo_context_message() {
+            messages.push(repo_context_message);
+        }
+    }
+
+    fn maybe_send_request_context_pack(
+        &mut self,
+        case_injection: &Option<RetrievalInjection>,
+        anti_injection: &Option<RetrievalInjection>,
+    ) {
+        if self.session.context_pack_sent_this_turn {
+            return;
+        }
+        let selected_case_ids: Vec<String> = case_injection
+            .as_ref()
+            .map(|inj| inj.selected_ids.clone())
+            .unwrap_or_default();
+        let selected_anti_ids: Vec<String> = anti_injection
+            .as_ref()
+            .map(|inj| inj.selected_ids.clone())
+            .unwrap_or_default();
+        let selected_precaution_ids: Vec<String> = self
+            .session
+            .working_memory
+            .active_precautions
+            .iter()
+            .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
+            .map(|p| p.id.clone())
+            .collect();
+        let recent_tool_summary = build_recent_tool_summary(&self.session.messages);
+        let gate = crate::photon::mapper::PhotonGateInputs {
+            photon_present: self.photon.is_some(),
+            shadow_mode: self.config.photon_shadow_mode,
+            canary: self.config.photon_canary,
+            session_id: self.session_store.session_id(),
+            turn_idx: self.current_turn_index,
+        };
+        if !crate::photon::mapper::should_send_context_pack(&gate) {
+            return;
+        }
+        let resp_opt = match &self.photon {
+            Some(photon) => {
+                let working_memory_text = self.session.working_memory.format_for_prompt();
+                let inputs = crate::photon::mapper::ContextPackInputs {
+                    task: self.session.working_memory.active_task.as_deref(),
+                    repo_path: &self.work_root,
+                    branch: None,
+                    commit: None,
+                    working_memory_text: working_memory_text.as_deref(),
+                    touched_files: &self.session.working_memory.touched_files,
+                    recent_tool_summary: &recent_tool_summary,
+                    selected_case_ids: &selected_case_ids,
+                    selected_anti_pattern_ids: &selected_anti_ids,
+                    selected_precaution_ids: &selected_precaution_ids,
+                };
+                let req = crate::photon::mapper::build_context_pack_request(&inputs);
+                let rid = req.0["request_id"].as_str().map(|s| s.to_string());
+                let resp = photon.context_pack(&req);
+                if self.last_context_pack_id.is_none() {
+                    self.last_context_pack_id = rid;
+                }
+                resp
+            }
+            None => None,
+        };
+        if let Some(resp) = resp_opt.as_ref() {
+            let blocked_ids: std::collections::HashSet<String> =
+                if self.config.photon_respect_warnings {
+                    let (ids, _stats) = crate::photon::prompt::extract_blocked_summary_ids(resp);
+                    ids
+                } else {
+                    std::collections::HashSet::new()
+                };
+            let shadow_input = self.config.photon_shadow_mode;
+            let _ = self.record_pam_advisory_decision(resp, &blocked_ids, shadow_input);
+        }
+        self.session.context_pack_sent_this_turn = true;
+    }
+
+    fn append_common_request_messages(
+        &mut self,
+        messages: &mut Vec<ConversationMessage>,
+        protocol: prompting::ToolProtocol,
+        effective_tool_policy: &EffectiveToolPolicy,
+    ) {
         if let Some(ctx) = self.photon_context_pack_injection_message() {
             messages.push(ctx);
         }
@@ -10740,89 +10747,94 @@ impl Agent {
             last_suspected,
             &current_request_paths,
         ));
-        if let Some(target) = focused_edit_target {
-            let recovery_anchor = focused_edit_exact_recovery_anchor(
-                &self.session.messages,
-                &target,
+    }
+
+    fn append_focused_edit_request_messages(
+        &self,
+        messages: &mut Vec<ConversationMessage>,
+        effective_tool_policy: &EffectiveToolPolicy,
+        target: &Path,
+        focused_edit_target_already_read: bool,
+        successful_repo_edits: usize,
+    ) {
+        let recovery_anchor = focused_edit_exact_recovery_anchor(
+            &self.session.messages,
+            target,
+            &self.work_root,
+            focused_edit_target_already_read,
+            successful_repo_edits,
+        );
+        let compact_anchor = (recovery_anchor.is_none()
+            && focused_edit_target_already_read
+            && recent_truncated_tool_call_attempt(&self.session.messages) > 0)
+            .then(|| {
+                focused_edit_compact_recovery_anchor(
+                    &self.session.messages,
+                    target,
+                    &self.work_root,
+                )
+            })
+            .flatten();
+        let exact_anchor = recovery_anchor.or_else(|| compact_anchor.clone());
+        let target_display = target
+            .strip_prefix(&self.work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some(note) = focused_edit_policy_violation_feedback_note(
+            &self.session.working_memory.unresolved_errors,
+            effective_tool_policy.allowed_tool_names_for_prompt(),
+            Some(&target_display),
+        ) {
+            messages.push(ConversationMessage::system(note));
+        }
+        messages.push(ConversationMessage::system(
+            focused_edit_guidance_note_for_policy(
+                effective_tool_policy,
+                target,
                 &self.work_root,
                 focused_edit_target_already_read,
-                successful_repo_edits,
-            );
-            let compact_anchor = (recovery_anchor.is_none()
-                && focused_edit_target_already_read
-                && recent_truncated_tool_call_attempt(&self.session.messages) > 0)
-                .then(|| {
-                    focused_edit_compact_recovery_anchor(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    )
-                })
-                .flatten();
-            let exact_anchor = recovery_anchor.or_else(|| compact_anchor.clone());
-            let target_display = target
-                .strip_prefix(&self.work_root)
-                .unwrap_or(&target)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Some(note) = focused_edit_policy_violation_feedback_note(
-                &self.session.working_memory.unresolved_errors,
-                effective_tool_policy.allowed_tool_names_for_prompt(),
-                Some(&target_display),
-            ) {
-                messages.push(ConversationMessage::system(note));
-            }
+            ),
+        ));
+        if compact_anchor.is_some() {
             messages.push(ConversationMessage::system(
-                focused_edit_guidance_note_for_policy(
-                    effective_tool_policy,
-                    &target,
-                    &self.work_root,
-                    focused_edit_target_already_read,
-                ),
+                focused_edit_compact_anchor_note(target, &self.work_root),
             ));
-            if compact_anchor.is_some() {
-                messages.push(ConversationMessage::system(
-                    focused_edit_compact_anchor_note(&target, &self.work_root),
-                ));
-            }
-            if successful_repo_edits == 0
-                && let Some(note) = focused_edit_first_slice_note(
-                    &self.session.messages,
-                    &target,
-                    &self.work_root,
-                    focused_edit_target_already_read,
-                )
-            {
-                messages.push(ConversationMessage::system(note));
-            }
-            if successful_repo_edits == 1
-                && let Some(note) = focused_edit_second_slice_note(
-                    &self.session.messages,
-                    &target,
-                    &self.work_root,
-                    focused_edit_target_already_read,
-                )
-            {
-                messages.push(ConversationMessage::system(note));
-            }
-            if let Some(anchor) = exact_anchor {
-                messages.extend(focused_edit_exact_anchor_history(
-                    &self.session.messages,
-                    &target,
-                    &self.work_root,
-                    &anchor,
-                ));
-            } else {
-                messages.extend(focused_edit_history(
-                    &self.session.messages,
-                    &target,
-                    &self.work_root,
-                ));
-            }
-        } else {
-            messages.extend(self.session.messages.clone());
         }
-        messages
+        if successful_repo_edits == 0
+            && let Some(note) = focused_edit_first_slice_note(
+                &self.session.messages,
+                target,
+                &self.work_root,
+                focused_edit_target_already_read,
+            )
+        {
+            messages.push(ConversationMessage::system(note));
+        }
+        if successful_repo_edits == 1
+            && let Some(note) = focused_edit_second_slice_note(
+                &self.session.messages,
+                target,
+                &self.work_root,
+                focused_edit_target_already_read,
+            )
+        {
+            messages.push(ConversationMessage::system(note));
+        }
+        if let Some(anchor) = exact_anchor {
+            messages.extend(focused_edit_exact_anchor_history(
+                &self.session.messages,
+                target,
+                &self.work_root,
+                &anchor,
+            ));
+        } else {
+            messages.extend(focused_edit_history(
+                &self.session.messages,
+                target,
+                &self.work_root,
+            ));
+        }
     }
 
     /// Issue #664 test seam: `pub(super)` wrapper over the private

@@ -30,13 +30,13 @@
       "rough_cc_ge_threshold": 0
     },
     {
-      "avg_rough_cc": 2.92,
-      "function_loc": 32995,
-      "functions": 1066,
+      "avg_rough_cc": 2.91,
+      "function_loc": 33003,
+      "functions": 1070,
       "max_rough_cc": 320,
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc_ge_high_threshold": 1,
-      "rough_cc_ge_threshold": 23
+      "rough_cc_ge_threshold": 22
     }
   ],
   "high_threshold": 50,
@@ -56,13 +56,6 @@
       "name": "handle_post_reply_recovery",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 47
-    },
-    {
-      "line": 10527,
-      "loc": 300,
-      "name": "build_request_messages",
-      "path": "src/agent/loop_run/turn.rs",
-      "rough_cc": 42
     },
     {
       "line": 1211,
@@ -86,7 +79,7 @@
       "rough_cc": 21
     },
     {
-      "line": 12523,
+      "line": 12535,
       "loc": 150,
       "name": "run_verifier_repair_pass_and_apply",
       "path": "src/agent/loop_run/turn.rs",
@@ -107,11 +100,18 @@
       "rough_cc": 19
     },
     {
-      "line": 22059,
+      "line": 22071,
       "loc": 30,
       "name": "synthesized_missing_test_target_path_for_request",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 19
+    },
+    {
+      "line": 3375,
+      "loc": 142,
+      "name": "maybe_invoke_work_mode_confirm",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 18
     }
   ]
 }
