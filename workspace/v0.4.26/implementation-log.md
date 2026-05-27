@@ -139,6 +139,13 @@ Implemented:
   - `apply_verifier_rerun_observation`
   - `record_applied_repair_outcome_for_rerun`
   - `repair_attempt_outcome_kind_from_rerun`
+- `src/agent/loop_run/repair_driver.rs`
+  - `VerifierRepairPassOutcome`
+  - repair pass timeout / wall-clock constants
+  - repair pass bounded output / edit constants
+  - `verifier_repair_pass_attempt_timeout_secs`
+  - `verifier_repair_pass_timeout_error`
+  - `verifier_repair_pass_retry_message`
 
 Wired into:
 
@@ -146,11 +153,17 @@ Wired into:
   - both verifier-failure observation sites now delegate rerun outcome
     ledger updates, verifier-observed lifecycle events, and semantic
     post-rerun dispatch to `RepairJob`.
+  - repair pass outcome typing, retry timing, and retry advice now come from
+    `repair_driver` instead of living in the actor-loop module.
 
 Tests added:
 
 - rerun observation records a typed verifier delta even without a semantic
   plan, while avoiding promotion side effects.
+- repair pass timeout budget calculation is capped by per-attempt timeout and
+  expires at the wall-clock limit.
+- repair pass retry advice keeps existing guidance while using a data-driven
+  rule table instead of an if/else chain.
 
 Current effect:
 
@@ -158,6 +171,10 @@ Current effect:
   branches.
 - `drive_task_contract_verifier` and `drive_repair_job_verifier` dropped out
   of the top-12 complexity list.
+- `repair_driver.rs` stays deliberately small:
+  - functions: `8`
+  - max rough CC: `2`
+  - rough CC >= 15: `0`
 - this is not yet the full `RepairDriver`; patch execution and diagnostic
   execution still remain in `turn.rs`.
 
@@ -173,6 +190,8 @@ cargo test model_request --lib -q
 cargo test verifier_driver --lib -q
 cargo test task_contract_verifier --lib -q
 cargo test repair_job --lib -q
+cargo test repair_driver --lib -q
+cargo test verifier_repair_pass_retry_message --lib -q
 python3 -m unittest tests/test_complexity_report.py
 cargo clippy --all-targets -- -D warnings
 cargo test --lib -q
@@ -190,15 +209,16 @@ Results:
 - targeted Rust tests passed
 - Python complexity-report tests passed
 - `cargo clippy --all-targets -- -D warnings` passed
-- `cargo test --lib -q` passed: `3075 passed`
+- `cargo test --lib -q` passed: `3079 passed`
 - `cargo build --release` passed
 
 ## Current Complexity Snapshot
 
 | File | Functions | Avg Rough CC | Max Rough CC | CC >= 15 | CC >= 50 | Function LOC |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `src/agent/loop_run/turn.rs` | 1032 | 2.98 | 362 | 29 | 1 | 32919 |
+| `src/agent/loop_run/turn.rs` | 1029 | 2.97 | 362 | 28 | 1 | 32830 |
 | `src/agent/loop_run/repair_job.rs` | 240 | 2.39 | 26 | 3 | 0 | 5872 |
+| `src/agent/loop_run/repair_driver.rs` | 8 | 1.12 | 2 | 0 | 0 | 62 |
 | `src/agent/loop_run/model_request.rs` | 9 | 3.11 | 8 | 0 | 0 | 153 |
 | `src/agent/loop_run/tool_execution.rs` | 16 | 1.62 | 7 | 0 | 0 | 143 |
 | `src/agent/loop_run/verifier_driver.rs` | 32 | 2.19 | 7 | 0 | 0 | 462 |

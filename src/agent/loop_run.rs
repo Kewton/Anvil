@@ -133,6 +133,10 @@ mod repair_job;
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
 // in-crate consumers via `super::repair_attempt_outcome::*`.
 mod repair_attempt_outcome;
+// v0.4.26: repair-pass driver boundary. Keeps verifier-repair pass outcome
+// typing, retry timing, and retry advice out of the actor-loop dispatcher as
+// repair execution moves behind a dedicated owner.
+mod repair_driver;
 // v0.4.25: pure assertion/output analysis helpers shared by verifier repair
 // diagnostics and generated-test semantic weakening filters.
 mod repair_assertion_analysis;
