@@ -24,6 +24,12 @@ use super::repair_brief::AllowedChangeKind;
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::{ArtifactRole, RecoveryTargetHint};
+use super::verifier_failure_signature::{
+    verifier_failure_count, verifier_failure_error_kind, verifier_failure_signature,
+};
+use super::verifier_repair_targeting::{
+    verifier_repair_changed_file_hints, verifier_repair_target_candidate_from_output,
+};
 use super::{
     VerifierDiagnosticFailureKind, VerifierFailureType, VerifierRepairAssessment,
     VerifierRepairRerunOutcome,
@@ -2166,6 +2172,198 @@ pub(super) fn rebind_legacy_assessment_to_current_cluster(repair_job: &mut Repai
     }
     // CR-4 V2: rebind 後は新しい cluster_id に bind。
     repair_job.assessment_bound_cluster_id = Some(plan_cluster_id);
+}
+
+pub(super) fn verifier_repair_context_from_failure(
+    work_root: &Path,
+    command: &str,
+    output: &str,
+    changed_files: &[String],
+    _verifier_attempt: usize,
+    previous_context: Option<&RepairJob>,
+) -> RepairJob {
+    let candidate = verifier_repair_target_candidate_from_output(work_root, output, changed_files);
+    let target_hint = candidate.as_ref().map(|candidate| candidate.hint.clone());
+    let target_line = candidate.as_ref().and_then(|candidate| candidate.line);
+    let failure_type = classify_verifier_failure_type(output);
+    let timeout_kind = super::failure_packet::timeout_kind_from_output(output);
+    let changed_file_hints = verifier_repair_changed_file_hints(work_root, changed_files);
+    // Issue #637 (CB-002): sanitize derived text fields BEFORE the
+    // `failure_signature` equality lookup against `previous_context` so the
+    // comparison is between two sanitized forms. `previous_context` was
+    // stored sanitized, so we must compare against the sanitized form of
+    // the freshly-computed signature to keep the legacy "same failure"
+    // matching behaviour intact.
+    let error_kind = verifier_failure_error_kind(output)
+        .map(|s| sanitize_repair_job_text_with_char_cap(&s, 220));
+    let failure_signature = sanitize_repair_job_text_with_char_cap(
+        &verifier_failure_signature(
+            output,
+            target_hint.as_ref().map(|hint| hint.path.as_str()),
+            target_line,
+            error_kind.as_deref(),
+        ),
+        220,
+    );
+    let failure_count = verifier_failure_count(output);
+    let previous_failure_signature =
+        previous_context.map(|context| context.failure_signature.clone());
+    let previous_failure_count = previous_context.and_then(|context| context.failure_count);
+    let rerun_outcome =
+        verifier_repair_rerun_outcome(previous_context, &failure_signature, failure_count);
+    let previous_matching_context =
+        previous_context.filter(|context| context.failure_signature == failure_signature);
+    let repair_attempt = previous_matching_context
+        .map(|context| context.repair_attempt.saturating_add(1))
+        .unwrap_or(1);
+    let previous_repair_made_no_progress = previous_matching_context.is_some_and(|context| {
+        !context.applied_repair_intents.is_empty()
+            && matches!(
+                rerun_outcome,
+                Some(
+                    VerifierRepairRerunOutcome::SameFailureRemaining
+                        | VerifierRepairRerunOutcome::Worsened
+                )
+            )
+    });
+    let previous_assessment = if previous_repair_made_no_progress {
+        None
+    } else {
+        previous_matching_context.and_then(|context| context.assessment.clone())
+    };
+    let previous_repair_target_hint = previous_matching_context
+        .and_then(|context| context.repair_target_hint.clone())
+        .or_else(|| {
+            previous_assessment
+                .as_ref()
+                .and_then(|assessment| assessment.repair_target_hint.clone())
+        })
+        .or_else(|| {
+            previous_context.and_then(|context| {
+                if context.applied_repair_intents.is_empty() {
+                    None
+                } else {
+                    context.repair_target_hint.clone()
+                }
+            })
+        });
+    let diagnostic_attempted = !previous_repair_made_no_progress
+        && previous_matching_context
+            .is_some_and(|context| context.diagnostic_attempted || context.assessment.is_some());
+    let diagnostic_error = if previous_repair_made_no_progress {
+        None
+    } else {
+        previous_matching_context.and_then(|context| context.diagnostic_error.clone())
+    };
+    let applied_repair_intents = previous_matching_context
+        .map(|context| context.applied_repair_intents.clone())
+        .unwrap_or_default();
+
+    // Issue #637 (CB-002): every long-lived RepairJob text field crosses the
+    // store boundary through its SSOT redactor. `command` goes through
+    // `redact_verifier_command_for_storage` (mask_secrets + mask_header_family
+    // + control-char neutralization + 4096-byte cap); `output_excerpt` goes
+    // through `sanitize_repair_job_text_with_char_cap` so Authorization /
+    // Cookie / X-API-Key headers and raw control chars never reach the
+    // diagnostic / repair-pass prompt payloads. `error_kind` /
+    // `failure_signature` were sanitized above (before the previous-context
+    // equality lookup); `diagnostic_error` / `previous_failure_signature`
+    // come from `previous_context` and were already sanitized at store time,
+    // so we trust them here while `failure_snapshot()` re-applies the SSOT
+    // pipeline as defence in depth.
+    RepairJob {
+        command: crate::session::feedback::redact_verifier_command_for_storage(command),
+        output_excerpt: sanitize_repair_job_text_with_char_cap(output, 4000),
+        failure_type,
+        timeout_kind,
+        target_hint,
+        repair_target_hint: previous_repair_target_hint,
+        changed_file_hints,
+        assessment: previous_assessment,
+        assessment_attempts: 0,
+        diagnostic_attempted,
+        diagnostic_unavailable: false,
+        diagnostic_error,
+        repair_error: None,
+        applied_repair_intents,
+        target_line,
+        error_kind,
+        failure_signature,
+        failure_count,
+        previous_failure_signature,
+        previous_failure_count,
+        rerun_outcome,
+        repair_attempt,
+        // Issue #647 (Phase B / MF2.1): carry `semantic_plan` and
+        // `exhausted_attempts` over from the previous turn so cluster-aware
+        // sequential repair survives slot reuse. The Phase-D diagnostic
+        // populates these slots — without the carryover, every new verifier
+        // failure would discard the active cluster plan and the per-job
+        // ledger, forcing a fresh diagnostic round-trip and defeating the
+        // sequential-repair design (設計判断 #5, S3-010). The post-rerun
+        // dispatch in `drive_task_contract_verifier` (MF2.2 / MF2.3) walks
+        // these carried-over slots via the Phase-E helpers.
+        semantic_plan: previous_context.and_then(|context| context.semantic_plan.clone()),
+        exhausted_attempts: previous_context
+            .map(|context| context.exhausted_attempts.clone())
+            .unwrap_or_default(),
+        // Issue #647 (CB-015): carry `assessment_generation` over so the
+        // stale↔fresh distinction survives turn boundaries. The generation
+        // is monotonic across the job lifetime — every successful
+        // diagnostic write bumps it; cluster advances do not touch it.
+        // A new failure that builds a fresh `RepairJob` (no previous_context)
+        // resets the generation to 0, mirroring the `semantic_plan = None /
+        // exhausted_attempts = empty` defaults applied above.
+        assessment_generation: previous_context
+            .map(|context| context.assessment_generation)
+            .unwrap_or(0),
+        // Issue #647 / CB-017 A''' (CR-4 V2): carry over the cluster-key bind
+        // so `rebind_legacy_assessment_to_current_cluster` can detect cluster
+        // transitions across turn boundaries. A new failure that builds a
+        // fresh `RepairJob` (no previous_context) starts with `None` —
+        // matching the "no semantic plan yet" defaults applied above so the
+        // first rebind after a fresh diagnostic is treated as a new bind.
+        assessment_bound_cluster_id: previous_context
+            .and_then(|context| context.assessment_bound_cluster_id.clone()),
+        // Issue #653 (S3-001): turn 境界 carryover。`exhausted_attempts` と
+        // 同一規約 — previous_context = Some なら clone、None なら空 Vec
+        // (新規 verifier failure はクリーンスタート)。session 永続化対象外。
+        repair_attempt_outcomes: previous_context
+            .map(|context| context.repair_attempt_outcomes.clone())
+            .unwrap_or_default(),
+        repair_target_attempt_outcomes: previous_context
+            .map(|context| context.repair_target_attempt_outcomes.clone())
+            .unwrap_or_default(),
+        exhausted_repair_targets: previous_context
+            .map(|context| context.exhausted_repair_targets.clone())
+            .unwrap_or_default(),
+        lifecycle_events: previous_context
+            .map(|context| context.lifecycle_events.clone())
+            .unwrap_or_default(),
+        rejected_attempts: previous_context
+            .map(|context| context.rejected_attempts.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Issue #638 (Task 1.2): parser scope reduction.
+///
+/// Root-cause classification has been moved exclusively to the diagnostic JSON
+/// path (`VerifierDiagnosticFailureKind` → `verifier_failure_type_for_diagnostic_kind`).
+/// The string-pattern branches (syntax / import / assertion / runtime / config) have
+/// been removed so that parser output no longer influences `failure_type`.
+///
+/// The parser retains its two *non-classification* responsibilities:
+///   1. **Candidate extraction**: `verifier_repair_target_candidate_from_output` /
+///      `verifier_repair_changed_file_hints` continue to mine paths from output.
+///   2. **Safety boundary**: `verifier_diagnostic_path_input_is_safe` still validates
+///      any path tokens before they enter the repair flow.
+///
+/// `context.failure_type` is therefore always `Unknown` after this call.
+/// The assessment-derived value (`assessment.failure_type`) carries the real
+/// classification once a diagnostic pass succeeds.
+pub(super) fn classify_verifier_failure_type(_output: &str) -> VerifierFailureType {
+    VerifierFailureType::Unknown
 }
 
 pub(super) fn verifier_repair_rerun_outcome(

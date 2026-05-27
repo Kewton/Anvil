@@ -1243,3 +1243,32 @@ Assessment:
 
 - No behavior change intended. Rerun outcome classification is now owned by
   the RepairJob module.
+
+## Structural Verification: Slice 58
+
+Scope:
+
+- Move verifier failure to RepairJob context construction from `turn.rs` to
+  `repair_job.rs`.
+- Keep verifier observation and orchestration in `turn.rs`; move sanitized
+  state assembly, carry-over, signature/count usage, changed-file hints, and
+  rerun outcome wiring to the RepairJob state module.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_context --lib -q`: pass, 7 tests.
+- `cargo test rerun_outcome --lib -q`: pass, 3 tests.
+- `cargo test verifier_failure_count --lib -q`: pass, 2 tests.
+- `cargo test repair_job --lib -q`: pass, 143 tests.
+- `cargo test verifier_repair_target --lib -q`: pass, 20 tests.
+- `cargo test cb017 --lib -q`: pass, 40 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. RepairJob context construction now has one
+  dispatch-adjacent owner, reducing the amount of verifier repair state wiring
+  embedded in the actor loop.

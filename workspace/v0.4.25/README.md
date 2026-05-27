@@ -2153,3 +2153,34 @@ Assessment:
 - No behavior change intended. Rerun outcome classification now lives next to
   the RepairJob state vocabulary; `turn.rs` still constructs and stores the
   job.
+
+### 2026-05-27 Slice 58
+
+Applied:
+
+- Moved verifier failure to `RepairJob` context construction from `turn.rs` to
+  `repair_job.rs`.
+- Moved parser-scope failure classification stub with the context builder so
+  `failure_type` initialization is owned by the RepairJob state module.
+- `turn.rs` now only invokes `verifier_repair_context_from_failure` when the
+  verifier observes a failure; it no longer assembles carry-over state,
+  signatures, changed-file hints, rerun outcome, or sanitized excerpts inline.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_context --lib -q`: pass, 7 tests
+- `cargo test rerun_outcome --lib -q`: pass, 3 tests
+- `cargo test verifier_failure_count --lib -q`: pass, 2 tests
+- `cargo test repair_job --lib -q`: pass, 143 tests
+- `cargo test verifier_repair_target --lib -q`: pass, 20 tests
+- `cargo test cb017 --lib -q`: pass, 40 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. RepairJob lifecycle state construction now has
+  one owner in `repair_job.rs`; `turn.rs` keeps verifier observation and
+  orchestration only.
