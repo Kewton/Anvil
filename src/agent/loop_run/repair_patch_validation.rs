@@ -169,6 +169,27 @@ impl RepairCandidateDuplicateIntentError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RepairCandidateTestEditPlanError {
+    MissingPlan,
+    EmptyHypothesis,
+}
+
+impl RepairCandidateTestEditPlanError {
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::MissingPlan => {
+                "repair intent rejected: test edit requires SemanticRepairPlan \
+                 (spec_authority + repair_hypothesis); none was constructed"
+            }
+            Self::EmptyHypothesis => {
+                "repair intent rejected: test edit requires a non-empty \
+                 repair_hypothesis in the SemanticRepairPlan"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairCandidateWeakeningError {
     pub(super) rejection: Option<super::repair_attempt_outcome::RepairRejectionKind>,
@@ -470,6 +491,22 @@ pub(super) fn validate_repair_intent_not_replayed(
         .any(|applied| applied == fingerprint)
     {
         return Err(RepairCandidateDuplicateIntentError);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_test_edit_semantic_plan(
+    is_test_file: bool,
+    accepted_plan_present: bool,
+    repair_hypothesis: Option<&str>,
+) -> Result<(), RepairCandidateTestEditPlanError> {
+    if !is_test_file || accepted_plan_present {
+        return Ok(());
+    }
+    let repair_hypothesis =
+        repair_hypothesis.ok_or(RepairCandidateTestEditPlanError::MissingPlan)?;
+    if repair_hypothesis.trim().is_empty() {
+        return Err(RepairCandidateTestEditPlanError::EmptyHypothesis);
     }
     Ok(())
 }
@@ -1421,6 +1458,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, "repair reply exceeded output cap");
+    }
+
+    #[test]
+    fn test_edit_semantic_plan_validation_requires_plan_and_hypothesis() {
+        let missing = validate_test_edit_semantic_plan(true, false, None).unwrap_err();
+        assert_eq!(missing, RepairCandidateTestEditPlanError::MissingPlan);
+        assert_eq!(
+            missing.message(),
+            "repair intent rejected: test edit requires SemanticRepairPlan \
+                 (spec_authority + repair_hypothesis); none was constructed"
+        );
+
+        let empty = validate_test_edit_semantic_plan(true, false, Some("   ")).unwrap_err();
+        assert_eq!(empty, RepairCandidateTestEditPlanError::EmptyHypothesis);
+        assert_eq!(
+            empty.message(),
+            "repair intent rejected: test edit requires a non-empty \
+                 repair_hypothesis in the SemanticRepairPlan"
+        );
+
+        assert!(validate_test_edit_semantic_plan(true, false, Some("fix expectation")).is_ok());
+        assert!(validate_test_edit_semantic_plan(false, false, None).is_ok());
+        assert!(validate_test_edit_semantic_plan(true, true, None).is_ok());
     }
 
     #[test]

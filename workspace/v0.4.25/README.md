@@ -1059,3 +1059,35 @@ Assessment:
   wrappers.
 - `turn.rs` still supplies configured limits and orchestrates the accepted
   proposal through shadow validation and repair-intent validation.
+
+### 2026-05-27 Slice 17
+
+Applied:
+
+- Moved the pure test-edit `SemanticRepairPlan` gate into
+  `repair_patch_validation.rs`.
+- Kept the validation module independent of `RepairJob` internals by passing
+  only:
+  - whether the target is a test file;
+  - whether an accepted repair plan is already present;
+  - the optional repair hypothesis string.
+- Left Python import-contract checks in `turn.rs`; those still depend on
+  shared Python helper functions and should be extracted separately.
+- Added module tests for missing plan, empty hypothesis, accepted plan bypass,
+  non-test bypass, and valid hypothesis.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting
+- `cargo test repair_patch_validation --lib -q`: pass, 23 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3005 tests when rerun outside sandbox
+
+Assessment:
+
+- The semantic gate is now a typed patch-admission rule rather than inline
+  actor-loop logic.
+- `turn.rs` still owns Python import-contract checks and weakening detector
+  dispatch.

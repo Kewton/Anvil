@@ -313,3 +313,24 @@ Assessment:
 
 - No behavior change intended. This removes one production indirection from
   `turn.rs` while keeping existing tests stable.
+
+## Structural Verification: Slice 17
+
+Scope:
+
+- Move the pure test-edit `SemanticRepairPlan` gate out of `turn.rs`.
+- Preserve existing rejection messages and accepted-plan bypass behavior.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting.
+- `cargo test repair_patch_validation --lib -q`: pass, 23 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3005 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop now delegates one more
+  patch-admission decision to `repair_patch_validation`.

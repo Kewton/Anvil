@@ -120,3 +120,6 @@ with legacy/fallback paths unable to override it.
   supplies configured limits through thin wrappers.
 - Current status: production patch proposal shaping now calls the validation
   module directly; the `turn.rs` wrappers are test-only compatibility helpers.
+- Current status: the pure test-edit `SemanticRepairPlan` gate is now
+  validation-owned; `turn.rs` only supplies the test-file classification,
+  accepted-plan presence, and optional repair hypothesis.

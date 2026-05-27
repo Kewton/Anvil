@@ -24723,24 +24723,17 @@ fn validate_verifier_repair_intents_inner(
     // so that semantic_plan = None always rejects regardless of whether the
     // edit text itself appears benign. Impl edits remain unaffected (impl
     // repair has wider latitude — only test edits are gated here).
-    let relative_path_classified = Path::new(&relative_path);
-    if is_test_file(relative_path_classified) {
-        if accepted_plan.is_none() {
-            let plan = context.semantic_plan.as_ref().ok_or_else(|| {
-                ValidationFailure::failed(
-                    "repair intent rejected: test edit requires SemanticRepairPlan \
-                     (spec_authority + repair_hypothesis); none was constructed"
-                        .to_string(),
-                )
-            })?;
-            if plan.repair_hypothesis.trim().is_empty() {
-                return Err(ValidationFailure::failed(
-                    "repair intent rejected: test edit requires a non-empty \
-                     repair_hypothesis in the SemanticRepairPlan"
-                        .to_string(),
-                ));
-            }
-        }
+    let target_is_test_file = is_test_file(Path::new(&relative_path));
+    super::repair_patch_validation::validate_test_edit_semantic_plan(
+        target_is_test_file,
+        accepted_plan.is_some(),
+        context
+            .semantic_plan
+            .as_ref()
+            .map(|plan| plan.repair_hypothesis.as_str()),
+    )
+    .map_err(|err| ValidationFailure::failed(err.message().to_string()))?;
+    if target_is_test_file {
         let missing_modules = python_missing_local_import_modules(work_root, &contents);
         if !missing_modules.is_empty() {
             let summary = missing_modules
