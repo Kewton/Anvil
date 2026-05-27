@@ -1890,6 +1890,65 @@ struct ActorLoopTaskContractIncompleteArgs<'a, 'b> {
     contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
 }
 
+struct ActorLoopPlanToolFollowupArgs<'a> {
+    last_iter: usize,
+    plan_ready_after_tool: bool,
+    plan_file_edit_calls_this_turn: usize,
+    plan_exploration_calls_this_turn: usize,
+    plan_missing_before_turn: Option<usize>,
+    plan_progress_retries: &'a mut usize,
+    plan_exploration_only_turns: &'a mut usize,
+}
+
+enum ActorLoopPlanToolFollowupOutcome {
+    Proceed,
+    Done {
+        final_prose: String,
+    },
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+}
+
+struct ActorLoopPostToolFallbackArgs<'a> {
+    last_iter: usize,
+    action_expectation: recovery::ActionExpectation,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    emitted_bash_loop_note: bool,
+    bash_only_tool_turn: bool,
+    repo_edit_calls_made_this_turn: usize,
+    tool_calls_made_this_turn: usize,
+    logged_act_first_repo_edit: bool,
+    repo_change_retries: &'a mut usize,
+}
+
+enum ActorLoopPostToolFallbackOutcome {
+    Proceed,
+    Continue,
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+}
+
+struct ActorLoopPostToolCleanupArgs<'a> {
+    task_contract: Option<&'a super::task_contract::TaskContract>,
+    contract_verifier_repair_edit_count: Option<usize>,
+    repo_edit_calls_made_this_turn: usize,
+    contract_completion_retries: usize,
+    tool_calls_made_this_turn: usize,
+    interrupt_flag: &'a InterruptFlag,
+}
+
+enum ActorLoopPostToolCleanupOutcome {
+    Continue,
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+}
+
 #[derive(Clone, Copy)]
 enum ActorLoopMissingRepoChangeReplyKind {
     Empty,
@@ -6805,6 +6864,424 @@ impl Agent {
         }
     }
 
+    fn handle_actor_loop_plan_tool_followup(
+        &mut self,
+        args: ActorLoopPlanToolFollowupArgs<'_>,
+    ) -> ActorLoopPlanToolFollowupOutcome {
+        if self.session.mode_state.mode != ExecutionMode::Plan {
+            return ActorLoopPlanToolFollowupOutcome::Proceed;
+        }
+        if args.plan_ready_after_tool {
+            return ActorLoopPlanToolFollowupOutcome::Done {
+                final_prose:
+                    "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                        .to_string(),
+            };
+        }
+        if args.plan_file_edit_calls_this_turn > 0 {
+            let plan_contents = self
+                .current_plan_contents()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
+            let missing_after = lifecycle::plan_missing_sections(&plan_contents);
+            let made_section_progress = args
+                .plan_missing_before_turn
+                .is_none_or(|before| missing_after.len() < before);
+            if made_section_progress {
+                *args.plan_progress_retries = 0;
+                *args.plan_exploration_only_turns = 0;
+                return ActorLoopPlanToolFollowupOutcome::Proceed;
+            }
+            *args.plan_progress_retries += 1;
+            if *args.plan_progress_retries >= 2 {
+                return match self
+                    .materialize_deterministic_fallback_plan(
+                        "agent.plan.non_progress_edit_fallback_materialized",
+                    ) {
+                    Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
+                        final_prose:
+                            "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                                .to_string(),
+                    },
+                    Ok(false) => ActorLoopPlanToolFollowupOutcome::Exit {
+                        reason: ExitReason::PlanIncomplete,
+                        error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+                    },
+                    Err(err) => ActorLoopPlanToolFollowupOutcome::Exit {
+                        reason: ExitReason::TransportError,
+                        error_text: err,
+                    },
+                };
+            }
+            self.push_system_note(recovery::plan_progress_recovery_note(
+                self.session.mode_state.plan_stage,
+                &lifecycle::plan_next_stage_sections(&plan_contents),
+                &missing_after,
+                *args.plan_progress_retries,
+            ));
+            return ActorLoopPlanToolFollowupOutcome::Proceed;
+        }
+        if args.plan_exploration_calls_this_turn >= 2 {
+            return self
+                .handle_actor_loop_plan_exploration_only_turn(
+                    args.last_iter,
+                    "exploration_only_turn",
+                    args.plan_progress_retries,
+                )
+                .map_or(ActorLoopPlanToolFollowupOutcome::Proceed, |outcome| outcome);
+        }
+        if args.plan_exploration_calls_this_turn > 0 {
+            *args.plan_exploration_only_turns += 1;
+            if *args.plan_exploration_only_turns >= 1 {
+                let outcome = self.handle_actor_loop_plan_exploration_only_turn(
+                    args.last_iter,
+                    "repeated_exploration_only_turns",
+                    args.plan_progress_retries,
+                );
+                *args.plan_exploration_only_turns = 0;
+                return outcome.map_or(ActorLoopPlanToolFollowupOutcome::Proceed, |value| value);
+            }
+        }
+        ActorLoopPlanToolFollowupOutcome::Proceed
+    }
+
+    fn handle_actor_loop_plan_exploration_only_turn(
+        &mut self,
+        last_iter: usize,
+        stall_reason: &'static str,
+        plan_progress_retries: &mut usize,
+    ) -> Option<ActorLoopPlanToolFollowupOutcome> {
+        match self.current_plan_contents() {
+            Ok(Some(contents)) => {
+                let current_stage = lifecycle::current_plan_stage(&contents);
+                let next_sections = lifecycle::plan_next_stage_sections(&contents);
+                let missing_sections = lifecycle::plan_missing_sections(&contents);
+                if !missing_sections.is_empty() {
+                    *plan_progress_retries += 1;
+                    log_plan_stall(
+                        self.session_store.session_id(),
+                        last_iter,
+                        stall_reason,
+                        current_stage,
+                        &next_sections,
+                        &missing_sections,
+                        *plan_progress_retries,
+                    );
+                    self.push_system_note(recovery::plan_progress_recovery_note(
+                        current_stage,
+                        &next_sections,
+                        &missing_sections,
+                        *plan_progress_retries,
+                    ));
+                }
+                Some(ActorLoopPlanToolFollowupOutcome::Proceed)
+            }
+            Ok(None) => Some(ActorLoopPlanToolFollowupOutcome::Proceed),
+            Err(err) => Some(ActorLoopPlanToolFollowupOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            }),
+        }
+    }
+
+    fn handle_actor_loop_post_tool_fallbacks(
+        &mut self,
+        args: ActorLoopPostToolFallbackArgs<'_>,
+    ) -> ActorLoopPostToolFallbackOutcome {
+        self.record_actor_loop_post_tool_notes(
+            args.action_expectation,
+            args.emitted_bash_loop_note,
+            args.bash_only_tool_turn,
+            args.repo_edit_calls_made_this_turn,
+            args.logged_act_first_repo_edit,
+        );
+        match self.handle_actor_loop_post_tool_no_edit_fallbacks(
+            args.last_iter,
+            args.recovery_dispatch_gate,
+            args.repo_edit_calls_made_this_turn,
+            args.tool_calls_made_this_turn,
+            args.repo_change_retries,
+        ) {
+            ActorLoopPostToolFallbackOutcome::Proceed => {}
+            outcome => return outcome,
+        }
+        match self.handle_actor_loop_post_tool_repo_edit_quality_gate(
+            args.last_iter,
+            args.action_expectation,
+            args.recovery_dispatch_gate,
+            args.repo_edit_calls_made_this_turn,
+            args.repo_change_retries,
+        ) {
+            ActorLoopPostToolFallbackOutcome::Proceed => {}
+            outcome => return outcome,
+        }
+        ActorLoopPostToolFallbackOutcome::Proceed
+    }
+
+    fn record_actor_loop_post_tool_notes(
+        &mut self,
+        action_expectation: recovery::ActionExpectation,
+        emitted_bash_loop_note: bool,
+        bash_only_tool_turn: bool,
+        repo_edit_calls_made_this_turn: usize,
+        logged_act_first_repo_edit: bool,
+    ) {
+        if emitted_bash_loop_note {
+            self.push_system_note(recovery::install_loop_recovery_note());
+        } else if self.session.mode_state.mode == ExecutionMode::Act
+            && action_expectation == recovery::ActionExpectation::RepoChange
+            && bash_only_tool_turn
+            && repo_edit_calls_made_this_turn == 0
+            && !logged_act_first_repo_edit
+        {
+            self.push_system_note(recovery::repo_change_after_setup_note());
+        }
+    }
+
+    fn handle_actor_loop_post_tool_no_edit_fallbacks(
+        &mut self,
+        last_iter: usize,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+        repo_edit_calls_made_this_turn: usize,
+        tool_calls_made_this_turn: usize,
+        repo_change_retries: &mut usize,
+    ) -> ActorLoopPostToolFallbackOutcome {
+        if repo_edit_calls_made_this_turn != 0
+            || tool_calls_made_this_turn == 0
+            || !recovery_dispatch_gate.allows_deterministic_fallback()
+            || !self.current_request_needs_playable_ui_quality_gate()
+        {
+            return ActorLoopPostToolFallbackOutcome::Proceed;
+        }
+        if let Some((request, target_path)) = self.accepted_repo_change_polish_target() {
+            return self.handle_actor_loop_post_tool_polish_fallback(
+                last_iter,
+                &request,
+                &target_path,
+                repo_change_retries,
+            );
+        }
+        if let Some((request, target_path, _issue)) = self.accepted_repo_change_quality_issue() {
+            return self.handle_actor_loop_post_tool_quality_fallback(
+                last_iter,
+                &request,
+                &target_path,
+                repo_change_retries,
+            );
+        }
+        ActorLoopPostToolFallbackOutcome::Proceed
+    }
+
+    fn handle_actor_loop_post_tool_polish_fallback(
+        &mut self,
+        last_iter: usize,
+        request: &str,
+        target_path: &str,
+        repo_change_retries: &mut usize,
+    ) -> ActorLoopPostToolFallbackOutcome {
+        match self.maybe_apply_deterministic_polish_fallback(request, target_path) {
+            Ok(true) => {
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Polish fallback",
+                        &format!("Applied deterministic visual polish to {target_path}."),
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                self.session.record_feedback_if_unset(
+                    build_feedback_for_deterministic_content_fallback(&self.work_root),
+                );
+                self.push_deterministic_ui_recovery_continuation_note(
+                    target_path,
+                    (*repo_change_retries).saturating_add(1),
+                );
+                ActorLoopPostToolFallbackOutcome::Continue
+            }
+            Ok(false) => ActorLoopPostToolFallbackOutcome::Proceed,
+            Err(err) => ActorLoopPostToolFallbackOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            },
+        }
+    }
+
+    fn handle_actor_loop_post_tool_quality_fallback(
+        &mut self,
+        last_iter: usize,
+        request: &str,
+        target_path: &str,
+        repo_change_retries: &mut usize,
+    ) -> ActorLoopPostToolFallbackOutcome {
+        match self.maybe_apply_deterministic_quality_fallback(request, target_path) {
+            Ok(true) => {
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Quality fallback",
+                        &format!("Replaced scaffold placeholder output in {target_path}."),
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                self.session.record_feedback_if_unset(
+                    build_feedback_for_deterministic_content_fallback(&self.work_root),
+                );
+                self.push_deterministic_ui_recovery_continuation_note(
+                    target_path,
+                    (*repo_change_retries).saturating_add(1),
+                );
+                ActorLoopPostToolFallbackOutcome::Continue
+            }
+            Ok(false) => ActorLoopPostToolFallbackOutcome::Proceed,
+            Err(err) => ActorLoopPostToolFallbackOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            },
+        }
+    }
+
+    fn handle_actor_loop_post_tool_repo_edit_quality_gate(
+        &mut self,
+        last_iter: usize,
+        action_expectation: recovery::ActionExpectation,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+        repo_edit_calls_made_this_turn: usize,
+        repo_change_retries: &mut usize,
+    ) -> ActorLoopPostToolFallbackOutcome {
+        if repo_edit_calls_made_this_turn == 0
+            || !recovery_dispatch_gate.allows_deterministic_fallback()
+            || !(should_apply_repo_change_quality_gate(
+                action_expectation,
+                self.active_task_expects_repo_change(),
+                self.session.mode_state.mode,
+            ) || self.current_request_needs_playable_ui_quality_gate())
+        {
+            return ActorLoopPostToolFallbackOutcome::Proceed;
+        }
+        let Some((request, target_path, issue)) = self.accepted_repo_change_quality_issue() else {
+            return ActorLoopPostToolFallbackOutcome::Proceed;
+        };
+        match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
+            Ok(true) => {
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        last_iter,
+                        self.config.max_iterations,
+                        "Quality fallback",
+                        &format!("Replaced scaffold placeholder output in {target_path}."),
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                self.session.record_feedback_if_unset(
+                    build_feedback_for_deterministic_content_fallback(&self.work_root),
+                );
+                self.push_deterministic_ui_recovery_continuation_note(
+                    &target_path,
+                    (*repo_change_retries).saturating_add(1),
+                );
+                ActorLoopPostToolFallbackOutcome::Continue
+            }
+            Ok(false) => {
+                *repo_change_retries += 1;
+                if *repo_change_retries >= 3 {
+                    ActorLoopPostToolFallbackOutcome::Exit {
+                        reason: ExitReason::MissingRepoEdits,
+                        error_text: issue,
+                    }
+                } else {
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            last_iter,
+                            self.config.max_iterations,
+                            "Quality gate",
+                            &format!(
+                                "Asked the model to replace placeholder output in {target_path}."
+                            ),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    self.push_system_note(recovery::repo_change_quality_gate_note(
+                        &request,
+                        &target_path,
+                        &issue,
+                        *repo_change_retries,
+                    ));
+                    ActorLoopPostToolFallbackOutcome::Proceed
+                }
+            }
+            Err(err) => ActorLoopPostToolFallbackOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            },
+        }
+    }
+
+    fn handle_actor_loop_post_tool_cleanup(
+        &mut self,
+        args: ActorLoopPostToolCleanupArgs<'_>,
+    ) -> ActorLoopPostToolCleanupOutcome {
+        if self.session.mode_state.mode != ExecutionMode::Plan
+            && let Some(contract) = args.task_contract
+        {
+            let action = self.task_contract_recovery_action(
+                contract,
+                args.contract_verifier_repair_edit_count,
+                args.repo_edit_calls_made_this_turn,
+            );
+            match action {
+                super::task_contract::ArtifactRecoveryAction::Continue { .. }
+                | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
+                    self.set_artifact_recovery_target_for_action(
+                        &action,
+                        args.contract_completion_retries.saturating_add(1),
+                    );
+                }
+                super::task_contract::ArtifactRecoveryAction::RunVerifier
+                | super::task_contract::ArtifactRecoveryAction::Done => {
+                    self.clear_artifact_recovery_target("contract_artifacts_satisfied");
+                }
+                super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
+                    let tag = match reason {
+                        super::task_contract::SafeStopReason::VerifierWeak => {
+                            "task_contract_safe_stop_verifier_weak"
+                        }
+                        super::task_contract::SafeStopReason::VerifierMissing => {
+                            "task_contract_safe_stop_verifier_missing"
+                        }
+                    };
+                    self.clear_artifact_recovery_target(tag);
+                }
+            }
+        }
+        self.maybe_invoke_reminder(args.interrupt_flag);
+        let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
+            false
+        } else {
+            self.maybe_compact_late_turn_session(
+                args.tool_calls_made_this_turn,
+                args.repo_edit_calls_made_this_turn,
+            )
+        };
+        if !compacted && self.session.mode_state.mode != ExecutionMode::Plan {
+            self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+        }
+        if args.interrupt_flag.is_set() {
+            return ActorLoopPostToolCleanupOutcome::Exit {
+                reason: ExitReason::Interrupted,
+                error_text: String::new(),
+            };
+        }
+        ActorLoopPostToolCleanupOutcome::Continue
+    }
+
     fn handle_actor_loop_missing_repo_change_reply(
         &mut self,
         args: ActorLoopMissingRepoChangeReplyArgs<'_>,
@@ -7972,349 +8449,70 @@ impl Agent {
                         break;
                     }
                 }
-                if self.session.mode_state.mode == ExecutionMode::Plan {
-                    if plan_ready_after_tool {
-                        final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
+                match self.handle_actor_loop_plan_tool_followup(ActorLoopPlanToolFollowupArgs {
+                    last_iter,
+                    plan_ready_after_tool,
+                    plan_file_edit_calls_this_turn,
+                    plan_exploration_calls_this_turn,
+                    plan_missing_before_turn,
+                    plan_progress_retries: &mut plan_progress_retries,
+                    plan_exploration_only_turns: &mut plan_exploration_only_turns,
+                }) {
+                    ActorLoopPlanToolFollowupOutcome::Proceed => {}
+                    ActorLoopPlanToolFollowupOutcome::Done { final_prose: prose } => {
+                        final_prose = prose;
                         exit_reason = ExitReason::Done;
                         break 'outer;
                     }
-                    if plan_file_edit_calls_this_turn > 0 {
-                        let plan_contents = self
-                            .current_plan_contents()
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-                        self.session.mode_state.plan_stage =
-                            lifecycle::current_plan_stage(&plan_contents);
-                        let missing_after = lifecycle::plan_missing_sections(&plan_contents);
-                        let made_section_progress = plan_missing_before_turn
-                            .is_none_or(|before| missing_after.len() < before);
-                        if made_section_progress {
-                            plan_progress_retries = 0;
-                            plan_exploration_only_turns = 0;
-                        } else {
-                            plan_progress_retries += 1;
-                            if plan_progress_retries >= 2 {
-                                match self.materialize_deterministic_fallback_plan(
-                                    "agent.plan.non_progress_edit_fallback_materialized",
-                                ) {
-                                    Ok(true) => {
-                                        final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
-                                        exit_reason = ExitReason::Done;
-                                    }
-                                    Ok(false) => {
-                                        exit_reason = ExitReason::PlanIncomplete;
-                                        error_text = exit_reason.default_error_text().to_string();
-                                    }
-                                    Err(err) => {
-                                        exit_reason = ExitReason::TransportError;
-                                        error_text = err;
-                                    }
-                                }
-                                break 'outer;
-                            }
-                            self.push_system_note(recovery::plan_progress_recovery_note(
-                                self.session.mode_state.plan_stage,
-                                &lifecycle::plan_next_stage_sections(&plan_contents),
-                                &missing_after,
-                                plan_progress_retries,
-                            ));
-                        }
-                    } else if plan_exploration_calls_this_turn >= 2 {
-                        match self.current_plan_contents() {
-                            Ok(Some(contents)) => {
-                                let current_stage = lifecycle::current_plan_stage(&contents);
-                                let next_sections = lifecycle::plan_next_stage_sections(&contents);
-                                let missing_sections = lifecycle::plan_missing_sections(&contents);
-                                if !missing_sections.is_empty() {
-                                    plan_progress_retries += 1;
-                                    log_plan_stall(
-                                        self.session_store.session_id(),
-                                        last_iter,
-                                        "exploration_only_turn",
-                                        current_stage,
-                                        &next_sections,
-                                        &missing_sections,
-                                        plan_progress_retries,
-                                    );
-                                    self.push_system_note(recovery::plan_progress_recovery_note(
-                                        current_stage,
-                                        &next_sections,
-                                        &missing_sections,
-                                        plan_progress_retries,
-                                    ));
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                exit_reason = ExitReason::TransportError;
-                                error_text = err;
-                                break 'outer;
-                            }
-                        }
-                    } else if plan_exploration_calls_this_turn > 0 {
-                        plan_exploration_only_turns += 1;
-                        if plan_exploration_only_turns >= 1 {
-                            match self.current_plan_contents() {
-                                Ok(Some(contents)) => {
-                                    let current_stage = lifecycle::current_plan_stage(&contents);
-                                    let next_sections =
-                                        lifecycle::plan_next_stage_sections(&contents);
-                                    let missing_sections =
-                                        lifecycle::plan_missing_sections(&contents);
-                                    if !missing_sections.is_empty() {
-                                        plan_progress_retries += 1;
-                                        log_plan_stall(
-                                            self.session_store.session_id(),
-                                            last_iter,
-                                            "repeated_exploration_only_turns",
-                                            current_stage,
-                                            &next_sections,
-                                            &missing_sections,
-                                            plan_progress_retries,
-                                        );
-                                        self.push_system_note(
-                                            recovery::plan_progress_recovery_note(
-                                                current_stage,
-                                                &next_sections,
-                                                &missing_sections,
-                                                plan_progress_retries,
-                                            ),
-                                        );
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(err) => {
-                                    exit_reason = ExitReason::TransportError;
-                                    error_text = err;
-                                    break 'outer;
-                                }
-                            }
-                            plan_exploration_only_turns = 0;
-                        }
-                    }
-                }
-                if emitted_bash_loop_note {
-                    self.push_system_note(recovery::install_loop_recovery_note());
-                } else if self.session.mode_state.mode == ExecutionMode::Act
-                    && action_expectation == recovery::ActionExpectation::RepoChange
-                    && bash_only_tool_turn
-                    && repo_edit_calls_made_this_turn == 0
-                    && !logged_act_first_repo_edit
-                {
-                    self.push_system_note(recovery::repo_change_after_setup_note());
-                }
-                if repo_edit_calls_made_this_turn == 0
-                    && tool_calls_made_this_turn > 0
-                    && recovery_dispatch_gate.allows_deterministic_fallback()
-                    && self.current_request_needs_playable_ui_quality_gate()
-                    && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
-                {
-                    match self.maybe_apply_deterministic_polish_fallback(&request, &target_path) {
-                        Ok(true) => {
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Polish fallback",
-                                    &format!(
-                                        "Applied deterministic visual polish to {target_path}."
-                                    ),
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            // Issue #455 / D2 (deterministic content fallback).
-                            self.session.record_feedback_if_unset(
-                                build_feedback_for_deterministic_content_fallback(&self.work_root),
-                            );
-                            self.push_deterministic_ui_recovery_continuation_note(
-                                &target_path,
-                                repo_change_retries.saturating_add(1),
-                            );
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            exit_reason = ExitReason::TransportError;
-                            error_text = err;
-                            break 'outer;
-                        }
-                    }
-                }
-                if repo_edit_calls_made_this_turn == 0
-                    && tool_calls_made_this_turn > 0
-                    && recovery_dispatch_gate.allows_deterministic_fallback()
-                    && self.current_request_needs_playable_ui_quality_gate()
-                    && let Some((request, target_path, _issue)) =
-                        self.accepted_repo_change_quality_issue()
-                {
-                    match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
-                        Ok(true) => {
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Quality fallback",
-                                    &format!(
-                                        "Replaced scaffold placeholder output in {target_path}."
-                                    ),
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            // Issue #455 / D2 (deterministic content fallback).
-                            self.session.record_feedback_if_unset(
-                                build_feedback_for_deterministic_content_fallback(&self.work_root),
-                            );
-                            self.push_deterministic_ui_recovery_continuation_note(
-                                &target_path,
-                                repo_change_retries.saturating_add(1),
-                            );
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            exit_reason = ExitReason::TransportError;
-                            error_text = err;
-                            break 'outer;
-                        }
-                    }
-                }
-                if repo_edit_calls_made_this_turn > 0
-                    && recovery_dispatch_gate.allows_deterministic_fallback()
-                    && (should_apply_repo_change_quality_gate(
-                        action_expectation,
-                        self.active_task_expects_repo_change(),
-                        self.session.mode_state.mode,
-                    ) || self.current_request_needs_playable_ui_quality_gate())
-                    && let Some((request, target_path, issue)) =
-                        self.accepted_repo_change_quality_issue()
-                {
-                    match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
-                        Ok(true) => {
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Quality fallback",
-                                    &format!(
-                                        "Replaced scaffold placeholder output in {target_path}."
-                                    ),
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            // Issue #455 / D2 (deterministic content fallback).
-                            self.session.record_feedback_if_unset(
-                                build_feedback_for_deterministic_content_fallback(&self.work_root),
-                            );
-                            self.push_deterministic_ui_recovery_continuation_note(
-                                &target_path,
-                                repo_change_retries.saturating_add(1),
-                            );
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            exit_reason = ExitReason::TransportError;
-                            error_text = err;
-                            break 'outer;
-                        }
-                    }
-                    repo_change_retries += 1;
-                    if repo_change_retries >= 3 {
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = issue;
+                    ActorLoopPlanToolFollowupOutcome::Exit {
+                        reason,
+                        error_text: followup_error,
+                    } => {
+                        exit_reason = reason;
+                        error_text = followup_error;
                         break 'outer;
                     }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Quality gate",
-                            &format!(
-                                "Asked the model to replace placeholder output in {target_path}."
-                            ),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    self.push_system_note(recovery::repo_change_quality_gate_note(
-                        &request,
-                        &target_path,
-                        &issue,
-                        repo_change_retries,
-                    ));
                 }
-                // Issue #452: Reminder Sidecar (iteration-internal hook).
-                // Fires after the iteration's `record_feedback` calls have
-                // landed and before compaction so that any new precautions
-                // are visible to subsequent prompt builds. Per-turn cap means
-                // only the first eligible failure in this turn produces a
-                // sidecar call.
-                if self.session.mode_state.mode != ExecutionMode::Plan
-                    && let Some(contract) = task_contract.as_ref()
-                {
-                    let action = self.task_contract_recovery_action(
-                        contract,
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                    );
-                    match action {
-                        super::task_contract::ArtifactRecoveryAction::Continue { .. }
-                        | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-                            self.set_artifact_recovery_target_for_action(
-                                &action,
-                                contract_completion_retries.saturating_add(1),
-                            );
-                        }
-                        super::task_contract::ArtifactRecoveryAction::RunVerifier
-                        | super::task_contract::ArtifactRecoveryAction::Done => {
-                            self.clear_artifact_recovery_target("contract_artifacts_satisfied");
-                        }
-                        // Issue #651 Phase 4.2: SafeStop must not leak a
-                        // stale recovery target into the surfacing flow.
-                        // Clear the target with a reason-specific tag so
-                        // log readers can correlate the planner-side
-                        // SafeStop with the eventual ExitReason. The
-                        // actual break/exit is owned by the main match
-                        // below — this site is the Reminder Sidecar pre-
-                        // pass and only clears state.
-                        super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
-                            let tag = match reason {
-                                super::task_contract::SafeStopReason::VerifierWeak => {
-                                    "task_contract_safe_stop_verifier_weak"
-                                }
-                                super::task_contract::SafeStopReason::VerifierMissing => {
-                                    "task_contract_safe_stop_verifier_missing"
-                                }
-                            };
-                            self.clear_artifact_recovery_target(tag);
-                        }
+                match self.handle_actor_loop_post_tool_fallbacks(ActorLoopPostToolFallbackArgs {
+                    last_iter,
+                    action_expectation,
+                    recovery_dispatch_gate,
+                    emitted_bash_loop_note,
+                    bash_only_tool_turn,
+                    repo_edit_calls_made_this_turn,
+                    tool_calls_made_this_turn,
+                    logged_act_first_repo_edit,
+                    repo_change_retries: &mut repo_change_retries,
+                }) {
+                    ActorLoopPostToolFallbackOutcome::Proceed => {}
+                    ActorLoopPostToolFallbackOutcome::Continue => continue,
+                    ActorLoopPostToolFallbackOutcome::Exit {
+                        reason,
+                        error_text: followup_error,
+                    } => {
+                        exit_reason = reason;
+                        error_text = followup_error;
+                        break 'outer;
                     }
                 }
-                self.maybe_invoke_reminder(&interrupt_flag);
-                let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
-                    false
-                } else {
-                    self.maybe_compact_late_turn_session(
-                        tool_calls_made_this_turn,
-                        repo_edit_calls_made_this_turn,
-                    )
-                };
-                if !compacted && self.session.mode_state.mode != ExecutionMode::Plan {
-                    self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+                match self.handle_actor_loop_post_tool_cleanup(ActorLoopPostToolCleanupArgs {
+                    task_contract: task_contract.as_ref(),
+                    contract_verifier_repair_edit_count,
+                    repo_edit_calls_made_this_turn,
+                    contract_completion_retries,
+                    tool_calls_made_this_turn,
+                    interrupt_flag: &interrupt_flag,
+                }) {
+                    ActorLoopPostToolCleanupOutcome::Continue => continue,
+                    ActorLoopPostToolCleanupOutcome::Exit {
+                        reason,
+                        error_text: cleanup_error,
+                    } => {
+                        exit_reason = reason;
+                        error_text = cleanup_error;
+                        break 'outer;
+                    }
                 }
-                // Boundary 3: after tool messages have been pushed and the
-                // session has been compacted, so `persist_session` (called by
-                // `process_line`) can save a consistent snapshot the user can
-                // `--resume` from. `Condvar` wake on drop makes this cheap.
-                if interrupt_flag.is_set() {
-                    exit_reason = ExitReason::Interrupted;
-                    break 'outer;
-                }
-                continue;
             }
 
             let final_reply = reply_content.trim().to_string();
