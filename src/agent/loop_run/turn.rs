@@ -1797,6 +1797,80 @@ enum ActorLoopToolPreparationOutcome {
     },
 }
 
+struct ActorLoopNoToolReplyArgs<'a, 'b> {
+    last_iter: usize,
+    action_expectation: recovery::ActionExpectation,
+    requires_action: bool,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    final_reply: &'a str,
+    tool_calls_made_this_turn: usize,
+    repo_change_retries: &'b mut usize,
+    plan_progress_retries: &'b mut usize,
+    empty_retries: &'b mut usize,
+    no_tool_retries: &'b mut usize,
+    framework_app_fallback_materialized: &'b mut bool,
+}
+
+enum ActorLoopNoToolReplyOutcome {
+    NotHandled,
+    Continue,
+    Done {
+        final_prose: String,
+    },
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ActorLoopMissingRepoChangeReplyKind {
+    Empty,
+    ProseOnly,
+}
+
+struct ActorLoopMissingRepoChangeReplyArgs<'a> {
+    kind: ActorLoopMissingRepoChangeReplyKind,
+    last_iter: usize,
+    repo_change_retries: &'a mut usize,
+    framework_app_fallback_materialized: &'a mut bool,
+}
+
+struct ActorLoopMissingRepoChangeRetryPromptArgs {
+    kind: ActorLoopMissingRepoChangeReplyKind,
+    last_iter: usize,
+    repo_change_retries: usize,
+}
+
+struct ActorLoopMissingRepoChangeRetryExhaustedArgs<'a> {
+    last_iter: usize,
+    repo_change_retries: usize,
+    framework_app_fallback_materialized: &'a mut bool,
+}
+
+struct ActorLoopEmptyReplyArgs<'b> {
+    last_iter: usize,
+    action_expectation: recovery::ActionExpectation,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    requires_action: bool,
+    repo_change_retries: &'b mut usize,
+    plan_progress_retries: &'b mut usize,
+    empty_retries: &'b mut usize,
+    framework_app_fallback_materialized: &'b mut bool,
+}
+
+struct ActorLoopProseOnlyReplyArgs<'a, 'b> {
+    last_iter: usize,
+    action_expectation: recovery::ActionExpectation,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    tool_calls_made_this_turn: usize,
+    repo_change_retries: &'b mut usize,
+    plan_progress_retries: &'b mut usize,
+    no_tool_retries: &'b mut usize,
+    framework_app_fallback_materialized: &'b mut bool,
+    final_reply: &'a str,
+}
+
 struct TaskContractVerifierFlowArgs<'a, 'b> {
     before_snapshot: &'a RepoSnapshot,
     accumulated: &'a [RepoVerification],
@@ -6322,6 +6396,406 @@ impl Agent {
         }
     }
 
+    fn handle_actor_loop_missing_repo_change_reply(
+        &mut self,
+        args: ActorLoopMissingRepoChangeReplyArgs<'_>,
+    ) -> ActorLoopNoToolReplyOutcome {
+        *args.repo_change_retries += 1;
+        if *args.repo_change_retries >= 2 {
+            return self.handle_actor_loop_missing_repo_change_retry_exhausted(
+                ActorLoopMissingRepoChangeRetryExhaustedArgs {
+                    last_iter: args.last_iter,
+                    repo_change_retries: *args.repo_change_retries,
+                    framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+                },
+            );
+        }
+        self.handle_actor_loop_missing_repo_change_retry_prompt(
+            ActorLoopMissingRepoChangeRetryPromptArgs {
+                kind: args.kind,
+                last_iter: args.last_iter,
+                repo_change_retries: *args.repo_change_retries,
+            },
+        )
+    }
+
+    fn handle_actor_loop_missing_repo_change_retry_prompt(
+        &mut self,
+        args: ActorLoopMissingRepoChangeRetryPromptArgs,
+    ) -> ActorLoopNoToolReplyOutcome {
+        let status_note = match args.kind {
+            ActorLoopMissingRepoChangeReplyKind::Empty => {
+                "The model replied without edits. Asked it to make the required repository changes."
+            }
+            ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
+                "The model answered with prose only. Asked it to emit exactly one tool call now and resume concrete repo work."
+            }
+        };
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                status_note,
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+
+        match args.kind {
+            ActorLoopMissingRepoChangeReplyKind::Empty => {
+                if !self.push_artifact_directed_recovery_note(args.repo_change_retries)
+                    && !self.push_repo_change_no_edit_recovery_note(args.repo_change_retries)
+                {
+                    self.push_system_note(recovery::repo_change_recovery_note(
+                        args.repo_change_retries,
+                    ));
+                }
+                if self.record_artifact_completion_attempt(
+                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
+                    Vec::new(),
+                ) {
+                    return ActorLoopNoToolReplyOutcome::Exit {
+                        reason: ExitReason::MissingRepoEdits,
+                        error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
+                    };
+                }
+            }
+            ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
+                if let Some(target) = self.focused_edit_recovery_target() {
+                    let target_already_read = focused_edit_target_already_read(
+                        &self.session.messages,
+                        &target,
+                        &self.work_root,
+                    );
+                    self.push_system_note(self.focused_edit_no_tool_note_for_target(
+                        &target,
+                        target_already_read,
+                        args.repo_change_retries,
+                    ));
+                } else if !self.push_artifact_directed_recovery_note(args.repo_change_retries)
+                    && !self.push_repo_change_no_edit_recovery_note(args.repo_change_retries)
+                {
+                    self.push_system_note(recovery::repo_change_no_tool_recovery_note(
+                        args.repo_change_retries,
+                    ));
+                }
+                if self.record_artifact_completion_attempt(
+                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
+                    Vec::new(),
+                ) {
+                    return ActorLoopNoToolReplyOutcome::Exit {
+                        reason: ExitReason::MissingRepoEdits,
+                        error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
+                    };
+                }
+            }
+        }
+
+        ActorLoopNoToolReplyOutcome::Continue
+    }
+
+    fn handle_actor_loop_missing_repo_change_retry_exhausted(
+        &mut self,
+        args: ActorLoopMissingRepoChangeRetryExhaustedArgs<'_>,
+    ) -> ActorLoopNoToolReplyOutcome {
+        if args.repo_change_retries == 2
+            && (self.push_artifact_directed_recovery_note(args.repo_change_retries)
+                || self.push_repo_change_no_edit_recovery_note(args.repo_change_retries))
+        {
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    "Asked the model to continue with one allowed repository edit on the target artifact.",
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            return ActorLoopNoToolReplyOutcome::Continue;
+        }
+        let request = self.active_request_text().unwrap_or_default();
+        let fallback = match self.maybe_apply_local_llm_small_edit_fallback(&request) {
+            Ok(fallback) => fallback,
+            Err(err) => {
+                return ActorLoopNoToolReplyOutcome::Exit {
+                    reason: ExitReason::TransportError,
+                    error_text: err,
+                };
+            }
+        };
+        if let Some(relative) = fallback {
+            return ActorLoopNoToolReplyOutcome::Done {
+                final_prose: format!(
+                    "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+                ),
+            };
+        }
+        if should_try_framework_app_fallback(
+            args.last_iter,
+            *args.framework_app_fallback_materialized,
+        ) && self.maybe_materialize_framework_game_fallback(args.last_iter)
+        {
+            *args.framework_app_fallback_materialized = true;
+            self.push_system_note(framework_app_fallback_continuation_note().to_string());
+            return ActorLoopNoToolReplyOutcome::Continue;
+        }
+        ActorLoopNoToolReplyOutcome::Exit {
+            reason: ExitReason::MissingRepoEdits,
+            error_text: ExitReason::MissingRepoEdits
+                .default_error_text()
+                .to_string(),
+        }
+    }
+
+    fn handle_actor_loop_empty_reply(
+        &mut self,
+        args: ActorLoopEmptyReplyArgs<'_>,
+    ) -> ActorLoopNoToolReplyOutcome {
+        if args.action_expectation == recovery::ActionExpectation::RepoChange
+            && args
+                .recovery_dispatch_gate
+                .allows_generic_repo_change_recovery()
+        {
+            return self.handle_actor_loop_missing_repo_change_reply(
+                ActorLoopMissingRepoChangeReplyArgs {
+                    kind: ActorLoopMissingRepoChangeReplyKind::Empty,
+                    last_iter: args.last_iter,
+                    repo_change_retries: args.repo_change_retries,
+                    framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+                },
+            );
+        }
+        if args.action_expectation == recovery::ActionExpectation::PlanProgress {
+            let plan_contents = self
+                .current_plan_contents()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let current_stage = lifecycle::current_plan_stage(&plan_contents);
+            let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
+            *args.plan_progress_retries += 1;
+            if *args.plan_progress_retries >= 2 {
+                return match self
+                    .materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
+                {
+                    Ok(true) => ActorLoopNoToolReplyOutcome::Done {
+                        final_prose:
+                            "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                                .to_string(),
+                    },
+                    Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
+                        reason: ExitReason::PlanIncomplete,
+                        error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+                    },
+                    Err(err) => ActorLoopNoToolReplyOutcome::Exit {
+                        reason: ExitReason::TransportError,
+                        error_text: err,
+                    },
+                };
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    &format!(
+                        "The model returned an empty reply. Asked it to continue the plan by writing {}.",
+                        join_sections_for_progress(&next_sections)
+                    ),
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+            log_plan_stall(
+                self.session_store.session_id(),
+                args.last_iter,
+                "empty_reply",
+                current_stage,
+                &next_sections,
+                &missing_sections,
+                *args.plan_progress_retries,
+            );
+            self.push_system_note(recovery::plan_progress_recovery_note(
+                current_stage,
+                &next_sections,
+                &missing_sections,
+                *args.plan_progress_retries,
+            ));
+            return ActorLoopNoToolReplyOutcome::Continue;
+        }
+
+        *args.empty_retries += 1;
+        if *args.empty_retries >= 3 {
+            return ActorLoopNoToolReplyOutcome::Exit {
+                reason: ExitReason::EmptyResponses,
+                error_text: ExitReason::EmptyResponses.default_error_text().to_string(),
+            };
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                "The model returned an empty reply. Asked it to continue with concrete tool actions.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(recovery::empty_response_recovery_note(
+            *args.empty_retries,
+            args.requires_action,
+        ));
+        ActorLoopNoToolReplyOutcome::Continue
+    }
+
+    fn handle_actor_loop_prose_only_reply(
+        &mut self,
+        args: ActorLoopProseOnlyReplyArgs<'_, '_>,
+    ) -> ActorLoopNoToolReplyOutcome {
+        if args.tool_calls_made_this_turn != 0 {
+            return ActorLoopNoToolReplyOutcome::NotHandled;
+        }
+        if args.action_expectation == recovery::ActionExpectation::RepoChange
+            && args
+                .recovery_dispatch_gate
+                .allows_generic_repo_change_recovery()
+        {
+            return self.handle_actor_loop_missing_repo_change_reply(
+                ActorLoopMissingRepoChangeReplyArgs {
+                    kind: ActorLoopMissingRepoChangeReplyKind::ProseOnly,
+                    last_iter: args.last_iter,
+                    repo_change_retries: args.repo_change_retries,
+                    framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+                },
+            );
+        }
+        if args.action_expectation == recovery::ActionExpectation::PlanProgress {
+            let plan_contents = self
+                .current_plan_contents()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if self.plan_is_substantive_with_fallback(&plan_contents) {
+                return ActorLoopNoToolReplyOutcome::Done {
+                    final_prose: args.final_reply.to_string(),
+                };
+            }
+            let current_stage = lifecycle::current_plan_stage(&plan_contents);
+            let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
+            *args.plan_progress_retries += 1;
+            if *args.plan_progress_retries >= 2 {
+                return match self
+                    .materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
+                {
+                    Ok(true) => ActorLoopNoToolReplyOutcome::Done {
+                        final_prose:
+                            "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                                .to_string(),
+                    },
+                    Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
+                        reason: ExitReason::PlanIncomplete,
+                        error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+                    },
+                    Err(err) => ActorLoopNoToolReplyOutcome::Exit {
+                        reason: ExitReason::TransportError,
+                        error_text: err,
+                    },
+                };
+            }
+            write_stdout_rendered(
+                &format_iteration_status(
+                    args.last_iter,
+                    self.config.max_iterations,
+                    "Retry requested",
+                    &format!(
+                        "The model answered without tool calls. Asked it to update {} with Write or Edit.",
+                        join_sections_for_progress(&next_sections)
+                    ),
+                    self.footer.current_cols(),
+                ),
+                true,
+            );
+            let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+            log_plan_stall(
+                self.session_store.session_id(),
+                args.last_iter,
+                "no_tool_reply",
+                current_stage,
+                &next_sections,
+                &missing_sections,
+                *args.plan_progress_retries,
+            );
+            self.push_system_note(recovery::plan_no_tool_recovery_note(
+                current_stage,
+                &next_sections,
+                *args.plan_progress_retries,
+            ));
+            return ActorLoopNoToolReplyOutcome::Continue;
+        }
+
+        *args.no_tool_retries += 1;
+        if *args.no_tool_retries >= 3 {
+            self.session
+                .record_feedback_if_unset(build_feedback_for_no_tool_call(
+                    "no_tool_retries_exhausted",
+                    &self.work_root,
+                ));
+            return ActorLoopNoToolReplyOutcome::Exit {
+                reason: ExitReason::NoToolCalls,
+                error_text: ExitReason::NoToolCalls.default_error_text().to_string(),
+            };
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                "The model answered without tool calls. Asked it to continue with concrete actions.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        self.push_system_note(recovery::no_tool_recovery_note(*args.no_tool_retries));
+        ActorLoopNoToolReplyOutcome::Continue
+    }
+
+    fn handle_actor_loop_no_tool_reply(
+        &mut self,
+        args: ActorLoopNoToolReplyArgs<'_, '_>,
+    ) -> ActorLoopNoToolReplyOutcome {
+        if args.final_reply.is_empty() {
+            return self.handle_actor_loop_empty_reply(ActorLoopEmptyReplyArgs {
+                last_iter: args.last_iter,
+                action_expectation: args.action_expectation,
+                recovery_dispatch_gate: args.recovery_dispatch_gate,
+                requires_action: args.requires_action,
+                repo_change_retries: args.repo_change_retries,
+                plan_progress_retries: args.plan_progress_retries,
+                empty_retries: args.empty_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+            });
+        }
+
+        if args.requires_action && args.tool_calls_made_this_turn == 0 {
+            return self.handle_actor_loop_prose_only_reply(ActorLoopProseOnlyReplyArgs {
+                last_iter: args.last_iter,
+                action_expectation: args.action_expectation,
+                recovery_dispatch_gate: args.recovery_dispatch_gate,
+                tool_calls_made_this_turn: args.tool_calls_made_this_turn,
+                repo_change_retries: args.repo_change_retries,
+                plan_progress_retries: args.plan_progress_retries,
+                no_tool_retries: args.no_tool_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+                final_reply: args.final_reply,
+            });
+        }
+
+        ActorLoopNoToolReplyOutcome::NotHandled
+    }
+
     fn run_actor_loop(
         &mut self,
         action_expectation: recovery::ActionExpectation,
@@ -7771,361 +8245,36 @@ impl Agent {
                     }
                 }
             }
-            if final_reply.is_empty() {
-                if action_expectation == recovery::ActionExpectation::RepoChange
-                    && recovery_dispatch_gate.allows_generic_repo_change_recovery()
-                {
-                    repo_change_retries += 1;
-                    if repo_change_retries >= 2 {
-                        if repo_change_retries == 2
-                            && (self.push_artifact_directed_recovery_note(repo_change_retries)
-                                || self.push_repo_change_no_edit_recovery_note(repo_change_retries))
-                        {
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Retry requested",
-                                    "Asked the model to continue with one allowed repository edit on the target artifact.",
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            continue;
-                        }
-                        let request = self.active_request_text().unwrap_or_default();
-                        let fallback =
-                            match self.maybe_apply_local_llm_small_edit_fallback(&request) {
-                                Ok(fallback) => fallback,
-                                Err(err) => {
-                                    exit_reason = ExitReason::TransportError;
-                                    error_text = err;
-                                    break 'outer;
-                                }
-                            };
-                        if let Some(relative) = fallback {
-                            final_prose = format!(
-                                "Applied a verified small edit fallback after the local model stopped before editing {relative}."
-                            );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
-                        }
-                        if should_try_framework_app_fallback(
-                            last_iter,
-                            framework_app_fallback_materialized,
-                        ) && self.maybe_materialize_framework_game_fallback(last_iter)
-                        {
-                            framework_app_fallback_materialized = true;
-                            self.push_system_note(
-                                framework_app_fallback_continuation_note().to_string(),
-                            );
-                            continue;
-                        }
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = exit_reason.default_error_text().to_string();
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Retry requested",
-                            "The model replied without edits. Asked it to make the required repository changes.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    if !self.push_artifact_directed_recovery_note(repo_change_retries)
-                        && !self.push_repo_change_no_edit_recovery_note(repo_change_retries)
-                    {
-                        self.push_system_note(recovery::repo_change_recovery_note(
-                            repo_change_retries,
-                        ));
-                    }
-                    // Issue #652: record the empty-reply path as a
-                    // `NoTool` attempt against the active
-                    // `ArtifactCompletionJob`. (Prose-only is classified
-                    // separately at the executable-prose path below — when
-                    // `final_reply` is non-empty AND no tool calls were
-                    // produced.) Recording exhausts the role-specific
-                    // budget independently of the generic
-                    // `repo_change_retries` counter; on exhaustion we exit
-                    // with `MissingRepoEdits` so the actor loop terminates.
-                    if self.record_artifact_completion_attempt(
-                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
-                        Vec::new(),
-                    ) {
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
-                        break 'outer;
-                    }
-                } else if action_expectation == recovery::ActionExpectation::PlanProgress {
-                    let plan_contents = self
-                        .current_plan_contents()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    let current_stage = lifecycle::current_plan_stage(&plan_contents);
-                    let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
-                    plan_progress_retries += 1;
-                    if plan_progress_retries >= 2 {
-                        match self.materialize_deterministic_fallback_plan(
-                            "agent.plan.progress_fallback_materialized",
-                        ) {
-                            Ok(true) => {
-                                final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
-                                exit_reason = ExitReason::Done;
-                            }
-                            Ok(false) => {
-                                exit_reason = ExitReason::PlanIncomplete;
-                                error_text = exit_reason.default_error_text().to_string();
-                            }
-                            Err(err) => {
-                                exit_reason = ExitReason::TransportError;
-                                error_text = err;
-                            }
-                        }
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Retry requested",
-                            &format!(
-                                "The model returned an empty reply. Asked it to continue the plan by writing {}.",
-                                join_sections_for_progress(&next_sections)
-                            ),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
-                    log_plan_stall(
-                        self.session_store.session_id(),
-                        last_iter,
-                        "empty_reply",
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        plan_progress_retries,
-                    );
-                    self.push_system_note(recovery::plan_progress_recovery_note(
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        plan_progress_retries,
-                    ));
-                } else {
-                    empty_retries += 1;
-                    if empty_retries >= 3 {
-                        exit_reason = ExitReason::EmptyResponses;
-                        error_text = exit_reason.default_error_text().to_string();
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Retry requested",
-                            "The model returned an empty reply. Asked it to continue with concrete tool actions.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    self.push_system_note(recovery::empty_response_recovery_note(
-                        empty_retries,
-                        requires_action,
-                    ));
+            match self.handle_actor_loop_no_tool_reply(ActorLoopNoToolReplyArgs {
+                last_iter,
+                action_expectation,
+                requires_action,
+                recovery_dispatch_gate,
+                final_reply: &final_reply,
+                tool_calls_made_this_turn,
+                repo_change_retries: &mut repo_change_retries,
+                plan_progress_retries: &mut plan_progress_retries,
+                empty_retries: &mut empty_retries,
+                no_tool_retries: &mut no_tool_retries,
+                framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
+            }) {
+                ActorLoopNoToolReplyOutcome::NotHandled => {}
+                ActorLoopNoToolReplyOutcome::Continue => continue,
+                ActorLoopNoToolReplyOutcome::Done {
+                    final_prose: next_final_prose,
+                } => {
+                    final_prose = next_final_prose;
+                    exit_reason = ExitReason::Done;
+                    break 'outer;
                 }
-                continue;
-            }
-
-            if requires_action && tool_calls_made_this_turn == 0 {
-                if action_expectation == recovery::ActionExpectation::RepoChange
-                    && recovery_dispatch_gate.allows_generic_repo_change_recovery()
-                {
-                    repo_change_retries += 1;
-                    if repo_change_retries >= 2 {
-                        if repo_change_retries == 2
-                            && (self.push_artifact_directed_recovery_note(repo_change_retries)
-                                || self.push_repo_change_no_edit_recovery_note(repo_change_retries))
-                        {
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Retry requested",
-                                    "Asked the model to continue with one allowed repository edit on the target artifact.",
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            continue;
-                        }
-                        let request = self.active_request_text().unwrap_or_default();
-                        let fallback =
-                            match self.maybe_apply_local_llm_small_edit_fallback(&request) {
-                                Ok(fallback) => fallback,
-                                Err(err) => {
-                                    exit_reason = ExitReason::TransportError;
-                                    error_text = err;
-                                    break 'outer;
-                                }
-                            };
-                        if let Some(relative) = fallback {
-                            final_prose = format!(
-                                "Applied a verified small edit fallback after the local model stopped before editing {relative}."
-                            );
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
-                        }
-                        if should_try_framework_app_fallback(
-                            last_iter,
-                            framework_app_fallback_materialized,
-                        ) && self.maybe_materialize_framework_game_fallback(last_iter)
-                        {
-                            framework_app_fallback_materialized = true;
-                            self.push_system_note(
-                                framework_app_fallback_continuation_note().to_string(),
-                            );
-                            continue;
-                        }
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = exit_reason.default_error_text().to_string();
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Retry requested",
-                            "The model answered with prose only. Asked it to emit exactly one tool call now and resume concrete repo work.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    if let Some(target) = self.focused_edit_recovery_target() {
-                        let target_already_read = focused_edit_target_already_read(
-                            &self.session.messages,
-                            &target,
-                            &self.work_root,
-                        );
-                        self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                            &target,
-                            target_already_read,
-                            repo_change_retries,
-                        ));
-                    } else if !self.push_artifact_directed_recovery_note(repo_change_retries)
-                        && !self.push_repo_change_no_edit_recovery_note(repo_change_retries)
-                    {
-                        self.push_system_note(recovery::repo_change_no_tool_recovery_note(
-                            repo_change_retries,
-                        ));
-                    }
-                    // Issue #652: prose-only branch — the assistant produced
-                    // text but no tool call. Record against the active job
-                    // (no-op when no job exists). On exhaustion exit with
-                    // `MissingRepoEdits` to terminate the loop.
-                    if self.record_artifact_completion_attempt(
-                        super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
-                        Vec::new(),
-                    ) {
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
-                        break 'outer;
-                    }
-                } else if action_expectation == recovery::ActionExpectation::PlanProgress {
-                    let plan_contents = self
-                        .current_plan_contents()
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    if self.plan_is_substantive_with_fallback(&plan_contents) {
-                        final_prose = final_reply;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    let current_stage = lifecycle::current_plan_stage(&plan_contents);
-                    let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
-                    plan_progress_retries += 1;
-                    if plan_progress_retries >= 2 {
-                        match self.materialize_deterministic_fallback_plan(
-                            "agent.plan.progress_fallback_materialized",
-                        ) {
-                            Ok(true) => {
-                                final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
-                                exit_reason = ExitReason::Done;
-                            }
-                            Ok(false) => {
-                                exit_reason = ExitReason::PlanIncomplete;
-                                error_text = exit_reason.default_error_text().to_string();
-                            }
-                            Err(err) => {
-                                exit_reason = ExitReason::TransportError;
-                                error_text = err;
-                            }
-                        }
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Retry requested",
-                            &format!(
-                                "The model answered without tool calls. Asked it to update {} with Write or Edit.",
-                                join_sections_for_progress(&next_sections)
-                            ),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
-                    log_plan_stall(
-                        self.session_store.session_id(),
-                        last_iter,
-                        "no_tool_reply",
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        plan_progress_retries,
-                    );
-                    self.push_system_note(recovery::plan_no_tool_recovery_note(
-                        current_stage,
-                        &next_sections,
-                        plan_progress_retries,
-                    ));
-                } else {
-                    no_tool_retries += 1;
-                    if no_tool_retries >= 3 {
-                        // Issue #455 / D1: surface a NoToolCall FeedbackFrame
-                        // to the Reminder Sidecar via first-eligible-failure-wins
-                        // (D4) so the next turn carries an actionable precaution
-                        // about emitting concrete tool calls. `pre_turn_last_feedback`
-                        // is the snapshot captured at run_turn entry (DR4-002).
-                        self.session
-                            .record_feedback_if_unset(build_feedback_for_no_tool_call(
-                                "no_tool_retries_exhausted",
-                                &self.work_root,
-                            ));
-                        exit_reason = ExitReason::NoToolCalls;
-                        error_text = exit_reason.default_error_text().to_string();
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Retry requested",
-                            "The model answered without tool calls. Asked it to continue with concrete actions.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    self.push_system_note(recovery::no_tool_recovery_note(no_tool_retries));
+                ActorLoopNoToolReplyOutcome::Exit {
+                    reason,
+                    error_text: next_error_text,
+                } => {
+                    exit_reason = reason;
+                    error_text = next_error_text;
+                    break 'outer;
                 }
-                continue;
             }
 
             if let Some(outcome) = self.handle_post_reply_recovery(PostReplyRecoveryArgs {
