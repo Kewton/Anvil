@@ -194,3 +194,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier repair target/path parsing helpers are now isolated
   in `verifier_repair_targeting.rs`; `turn.rs` still owns workspace admission,
   hint promotion, and stateful repair-target selection.
+- Current status: verifier repair target ownership admission is now isolated
+  in `repair_target_admission.rs`; `turn.rs` still owns when to invoke the
+  admission gate while building diagnostic repair targets.

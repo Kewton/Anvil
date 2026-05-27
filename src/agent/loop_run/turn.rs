@@ -39,6 +39,9 @@ use super::repair_patch_validation::{
     validate_accepted_repair_plan_authorizes_target,
 };
 #[cfg(test)]
+use super::repair_target_admission::admission_always_false;
+use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
+#[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
 use super::semantic_repair_planning::{
@@ -23078,84 +23081,6 @@ fn recovery_target_hint_for_existing_path(
         path,
         reason: reason.to_string(),
     })
-}
-
-/// Issue #647 (Phase C, §4.4 / §5.1): Owned admission context for every
-/// `RecoveryTargetHint` promotion path. Path-local predicates (DR3-001) so
-/// the SSOT gate evaluates `turn_edited_relative_paths.contains(path)` /
-/// `repo_edit_has_post_scaffold_delta(path)` for *the hint's own path*, not
-/// a turn-global signal that would falsely promote unrelated files.
-///
-/// `verifier_passed_in_scope` is omitted from the context per DR1-006:
-/// every callsite in this Issue is "trying to repair a hint" — by
-/// construction the verifier has not yet passed for the active scope, so
-/// `admit_repair_target_hint` fixes that flag to `false` literally. When a
-/// future Issue introduces post-success repair paths the field can be
-/// re-introduced on this struct without touching the SSOT function shape.
-pub(super) struct RepairTargetAdmissionContext<'a> {
-    pub(super) work_root: &'a Path,
-    pub(super) scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
-    pub(super) edited_this_session_for: &'a dyn Fn(&str) -> bool,
-    pub(super) scaffold_changed_for: &'a dyn Fn(&str) -> bool,
-}
-
-#[cfg(test)]
-fn admission_always_true(_: &str) -> bool {
-    true
-}
-
-#[cfg(test)]
-fn admission_always_false(_: &str) -> bool {
-    false
-}
-
-impl<'a> RepairTargetAdmissionContext<'a> {
-    /// Test-only helper: build an admission context whose predicates always
-    /// promote the hint to `Owned` (edited_this_session=true). Lets fixtures
-    /// keep their existing repair-target assertions while still routing
-    /// through the SSOT gate (S7-004 / DR2-001).
-    #[cfg(test)]
-    pub(super) fn owned_for_test(
-        work_root: &'a Path,
-        scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
-    ) -> Self {
-        Self {
-            work_root,
-            scope,
-            edited_this_session_for: &admission_always_true,
-            scaffold_changed_for: &admission_always_false,
-        }
-    }
-}
-
-/// Issue #647 (Phase C, §5.1 SSOT): Owned admission gate for any
-/// `RecoveryTargetHint` heading downstream into the repair-job pipeline.
-/// Every hint-promotion source category (6 categories in §5.1) routes
-/// through this single function so the `OwnershipInputs` invariants stay
-/// consistent (path-local predicates evaluated against `hint.path`,
-/// `verifier_passed_in_scope` fixed to `false` per DR1-006).
-pub(super) fn admit_repair_target_hint(
-    hint: super::task_contract::RecoveryTargetHint,
-    ctx: &RepairTargetAdmissionContext<'_>,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    let path = hint.path.clone();
-    let inputs = super::artifact_ownership::OwnershipInputs {
-        work_root: ctx.work_root,
-        relative_path: &path,
-        scope: ctx.scope,
-        edited_this_session: (ctx.edited_this_session_for)(&path),
-        scaffold_changed: (ctx.scaffold_changed_for)(&path),
-        verifier_passed_in_scope: false,
-        // Issue #661 (Task 3.1): RepairJob target admission is NOT one of
-        // the 4 verifier-path SSOT sites — keep `disabled()` so repair
-        // target acceptance semantics are unchanged.
-        nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
-    };
-    match super::artifact_ownership::classify_ownership(inputs) {
-        super::artifact_ownership::ArtifactOwnership::Owned => Some(hint),
-        super::artifact_ownership::ArtifactOwnership::CandidateOnly
-        | super::artifact_ownership::ArtifactOwnership::OutOfScope => None,
-    }
 }
 
 fn recovery_target_hint_for_diagnostic_path(

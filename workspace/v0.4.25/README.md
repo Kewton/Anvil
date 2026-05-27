@@ -1756,3 +1756,32 @@ Assessment:
 - No production behavior change. The extracted targeting boundary now has
   local characterization tests, reducing dependence on large `turn.rs`
   integration-style tests for path/module parsing invariants.
+
+### 2026-05-27 Slice 43
+
+Applied:
+
+- Added `repair_target_admission.rs`.
+- Moved `RepairTargetAdmissionContext` and `admit_repair_target_hint` out of
+  `turn.rs`.
+- Kept `recovery_target_hint_for_diagnostic_path` and related hint-promotion
+  sequencing in `turn.rs` because they still combine filesystem resolution,
+  failure-kind gating, missing setup handling, and active RepairJob context.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test admission --lib -q`: pass, 26 tests when rerun outside sandbox
+  because one filtered test starts a local mockito server
+- `cargo test cb017_ --lib -q`: pass, 40 tests
+- `cargo test verifier_repair_targeting --lib -q`: pass, 3 tests
+- `cargo test model_assessment --lib -q`: pass, 6 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3030 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. The owned target admission SSOT is now outside
+  the actor loop; `turn.rs` still owns when to invoke that admission gate and
+  how to thread admitted hints into the legacy verifier repair assessment.

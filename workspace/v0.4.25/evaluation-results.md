@@ -895,3 +895,28 @@ Assessment:
 
 - No behavior change intended. The new tests make the extracted path/module
   helper boundary independently verifiable.
+
+## Structural Verification: Slice 43
+
+Scope:
+
+- Extract verifier repair target ownership admission context and SSOT gate
+  from `turn.rs`.
+- Preserve diagnostic-path hint promotion sequencing in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test admission --lib -q`: pass, 26 tests when rerun outside sandbox
+  because one filtered test starts a local mockito server.
+- `cargo test cb017_ --lib -q`: pass, 40 tests.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 3 tests.
+- `cargo test model_assessment --lib -q`: pass, 6 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3030 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Ownership admission is now a dedicated module;
+  the actor loop retains the stateful target-promotion bridge only.

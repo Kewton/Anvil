@@ -145,6 +145,9 @@ mod patch_provider;
 mod repair_patch_executor;
 // v0.4.25: pure patch-admission checks shared by verifier repair validation.
 mod repair_patch_validation;
+// v0.4.25: verifier-repair target ownership admission SSOT. Keeps the
+// path-local ownership gate out of the actor loop dispatcher.
+mod repair_target_admission;
 // v0.4.25: bounded Python local import-contract evidence for verifier repair
 // validation. Keeps filesystem probing out of the turn dispatcher.
 mod repair_python_import_evidence;
