@@ -95,6 +95,15 @@ Additional verification after patch-executor extraction:
 - `cargo build --release`: pass
 - `cargo test --lib -q`: pass, 2999 tests when run outside the sandbox
 
+Additional verification after repair-intent fingerprint extraction:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 18 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3000 tests when run outside the sandbox
+
 Note:
 
 - The first sandboxed `cargo test --lib -q` run failed because many tests use

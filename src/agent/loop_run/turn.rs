@@ -24722,7 +24722,12 @@ fn validate_verifier_repair_intents_inner(
     // The fingerprint deliberately excludes raw `old_string` / `new_string`
     // from outcome payloads downstream (see
     // `RepairAttemptOutcomeKind::RejectedDuplicate`).
-    let fingerprint = verifier_repair_intents_fingerprint(context, &relative_path, &intents);
+    let edit_payloads = repair_intent_edit_payloads(&intents);
+    let fingerprint = super::repair_patch_validation::repair_intent_edits_fingerprint(
+        &context.failure_signature,
+        &relative_path,
+        &edit_payloads,
+    );
     if context.applied_repair_intents.contains(&fingerprint) {
         return Err(ValidationFailure::failed_with_signal(
             "duplicate repair edit intent for the same failure".to_string(),
@@ -24733,14 +24738,6 @@ fn validate_verifier_repair_intents_inner(
     // Phase 2: in-memory apply. Per-intent input validation has already
     // passed; remaining failures here surface as unsigned exact/replace-all
     // rejections (which remain ledger-non-target by design).
-    let edit_payloads = intents
-        .iter()
-        .map(|intent| super::repair_patch_validation::RepairIntentEdit {
-            old_string: &intent.old_string,
-            new_string: &intent.new_string,
-            replace_all: intent.replace_all,
-        })
-        .collect::<Vec<_>>();
     let apply_result =
         super::repair_patch_validation::apply_repair_intent_edits(&contents, &edit_payloads)
             .map_err(ValidationFailure::failed)?;
@@ -24922,6 +24919,19 @@ fn validate_verifier_repair_intents_inner(
         contents,
         fingerprint,
     ))
+}
+
+fn repair_intent_edit_payloads(
+    intents: &[VerifierRepairIntent],
+) -> Vec<super::repair_patch_validation::RepairIntentEdit<'_>> {
+    intents
+        .iter()
+        .map(|intent| super::repair_patch_validation::RepairIntentEdit {
+            old_string: &intent.old_string,
+            new_string: &intent.new_string,
+            replace_all: intent.replace_all,
+        })
+        .collect()
 }
 
 fn filter_test_weakening_for_observed_assert_update(
@@ -25340,28 +25350,17 @@ fn verifier_repair_intent_fingerprint(
     verifier_repair_intents_fingerprint(context, relative_path, std::slice::from_ref(intent))
 }
 
+#[cfg(test)]
 fn verifier_repair_intents_fingerprint(
     context: &super::repair_job::RepairJob,
     relative_path: &str,
     intents: &[VerifierRepairIntent],
 ) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(context.failure_signature.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(relative_path.as_bytes());
-    for intent in intents {
-        hasher.update(b"\0");
-        hasher.update(intent.old_string.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(intent.new_string.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(if intent.replace_all {
-            b"replace_all".as_slice()
-        } else {
-            b"exact_once".as_slice()
-        });
-    }
-    format!("{:x}", hasher.finalize())
+    super::repair_patch_validation::repair_intent_edits_fingerprint(
+        &context.failure_signature,
+        relative_path,
+        &repair_intent_edit_payloads(intents),
+    )
 }
 
 fn verifier_assessment_field<'a>(

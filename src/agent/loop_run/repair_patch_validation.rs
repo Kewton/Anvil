@@ -392,6 +392,30 @@ pub(super) fn apply_repair_intent_edits(
     })
 }
 
+pub(super) fn repair_intent_edits_fingerprint(
+    failure_signature: &str,
+    relative_path: &str,
+    edits: &[RepairIntentEdit<'_>],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(failure_signature.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(relative_path.as_bytes());
+    for edit in edits {
+        hasher.update(b"\0");
+        hasher.update(edit.old_string.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(edit.new_string.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(if edit.replace_all {
+            b"replace_all".as_slice()
+        } else {
+            b"exact_once".as_slice()
+        });
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 pub(super) fn validate_repair_intent_text_payload(
     input: RepairIntentTextPayload<'_>,
 ) -> Result<usize, RepairIntentInputError> {
@@ -1154,6 +1178,28 @@ mod tests {
         assert_ne!(edit.preimage_hash, edit.postimage_hash);
         assert_eq!(edit.preimage_hash.len(), 64);
         assert_eq!(edit.postimage_hash.len(), 64);
+    }
+
+    #[test]
+    fn repair_intent_fingerprint_is_stable_and_distinguishes_replace_mode() {
+        let exact = vec![RepairIntentEdit {
+            old_string: "a",
+            new_string: "b",
+            replace_all: false,
+        }];
+        let replace_all = vec![RepairIntentEdit {
+            old_string: "a",
+            new_string: "b",
+            replace_all: true,
+        }];
+
+        let first = repair_intent_edits_fingerprint("failure", "src/lib.rs", &exact);
+        let second = repair_intent_edits_fingerprint("failure", "src/lib.rs", &exact);
+        let different_mode = repair_intent_edits_fingerprint("failure", "src/lib.rs", &replace_all);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different_mode);
+        assert_eq!(first.len(), 64);
     }
 
     #[test]

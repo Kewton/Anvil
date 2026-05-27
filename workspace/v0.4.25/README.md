@@ -897,3 +897,33 @@ Assessment:
 - The remaining `turn.rs` repair-validation responsibility is primarily the
   weakening detector dispatch and the high-level sequence inside
   `validate_verifier_repair_intents_inner`.
+
+### 2026-05-27 Slice 11
+
+Applied:
+
+- Moved repair intent fingerprint generation into
+  `repair_patch_validation.rs`.
+- Production validation now builds normalized edit payloads once and reuses
+  them for:
+  - duplicate-intent fingerprinting;
+  - in-memory candidate application.
+- Kept old `turn.rs` fingerprint helper as a test-only compatibility wrapper.
+- Added a module test proving fingerprint stability and distinction between
+  exact-once and replace-all modes.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 18 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3000 tests when rerun outside sandbox
+
+Assessment:
+
+- Duplicate-intent detection now belongs to the patch-validation boundary,
+  alongside edit payload normalization and application.
+- `turn.rs` still owns the orchestration sequence and weakening detector
+  dispatch.

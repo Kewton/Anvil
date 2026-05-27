@@ -85,6 +85,9 @@ with legacy/fallback paths unable to override it.
 - Added `repair_patch_executor.rs` for the only workspace-mutating step in
   verifier repair patch application. It applies a validated edit after
   checking the target preimage hash still matches.
+- Moved repair intent fingerprint generation into `repair_patch_validation.rs`
+  so duplicate-intent detection uses the same normalized edit payload shape as
+  candidate application.
 
 ## Remaining Work
 
@@ -101,3 +104,5 @@ with legacy/fallback paths unable to override it.
   the workspace.
 - Current status: an executor boundary exists. `turn.rs` still decides when to
   invoke it; the executor owns the write mechanics and preimage guard.
+- Current status: duplicate-intent fingerprinting is now validation-owned;
+  `turn.rs` no longer constructs the fingerprint directly in production.
