@@ -736,3 +736,25 @@ Assessment:
 - No behavior change intended. Bounded framework evidence now modifies the
   parsed diagnostic assessment inside the parser boundary; `turn.rs` only
   sequences the diagnostic pass and later workspace admission.
+
+## Structural Verification: Slice 36
+
+Scope:
+
+- Extract semantic failure report parsing from diagnostic LLM replies.
+- Leave semantic fallback and repair-plan construction in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test semantic_failure --lib -q`: pass, 40 tests.
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Diagnostic JSON extraction and both parser
+  branches now live in `verifier_assessment_parser.rs`; `turn.rs` keeps the
+  stateful planning bridge.

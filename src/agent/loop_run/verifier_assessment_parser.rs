@@ -109,6 +109,40 @@ pub(super) fn extract_diagnostic_reply_json_value(reply: &str) -> Option<serde_j
     serde_json::from_str(json_text).ok()
 }
 
+pub(super) fn parse_semantic_failure_report_from_reply(
+    reply: &str,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    let value = extract_diagnostic_reply_json_value(reply)?;
+    super::semantic_failure::parse_semantic_failure_report(&value).or_else(|| {
+        let object = value.as_object()?;
+        let nested = object
+            .get("SemanticFailureReport")
+            .or_else(|| object.get("semantic_failure_report"))?;
+        let mut nested = nested.clone();
+        let nested_object = nested.as_object_mut()?;
+        if !nested_object.contains_key("failure_kind") {
+            let failure_kind = object
+                .get("failure_kind")
+                .or_else(|| object.get("failure_type"))?;
+            nested_object.insert("failure_kind".to_string(), failure_kind.clone());
+        }
+        if !nested_object.contains_key("preferred_repair_role")
+            && let Some(role) = object
+                .get("probable_cause_role")
+                .or_else(|| object.get("root_cause_role"))
+                .or_else(|| object.get("role"))
+        {
+            nested_object.insert("preferred_repair_role".to_string(), role.clone());
+        }
+        if !nested_object.contains_key("confidence")
+            && let Some(confidence) = object.get("confidence")
+        {
+            nested_object.insert("confidence".to_string(), confidence.clone());
+        }
+        super::semantic_failure::parse_semantic_failure_report(&nested)
+    })
+}
+
 pub(super) fn verifier_failure_type_for_diagnostic_kind(
     kind: super::VerifierDiagnosticFailureKind,
     fallback: super::VerifierFailureType,

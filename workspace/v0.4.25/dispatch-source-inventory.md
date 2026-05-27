@@ -174,3 +174,6 @@ with legacy/fallback paths unable to override it.
 - Current status: parsed-assessment framework evidence override is now
   isolated in `verifier_assessment_parser.rs`; `turn.rs` still owns
   diagnostic prompt/file-excerpt assembly.
+- Current status: semantic failure report parsing is now isolated in
+  `verifier_assessment_parser.rs`; `turn.rs` still owns fallback synthesis,
+  repair-plan construction, and RepairJob state updates.

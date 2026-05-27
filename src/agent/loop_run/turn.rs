@@ -48,7 +48,7 @@ use super::tester;
 use super::verifier_assessment_parser::ParsedVerifierRepairTarget;
 use super::verifier_assessment_parser::{
     ParsedVerifierRepairAssessment, apply_framework_findings_to_parsed_assessment,
-    extract_diagnostic_reply_json_value, parse_verifier_repair_assessment_reply,
+    parse_semantic_failure_report_from_reply, parse_verifier_repair_assessment_reply,
     verifier_failure_type_for_diagnostic_kind,
 };
 use super::work_mode_confirm::{
@@ -23720,46 +23720,6 @@ fn verifier_repair_stale_assertion_test_target(
     // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
     // 6 source categories: stale-assertion test re-target.
     admit_repair_target_hint(promoted, admission)
-}
-
-/// Issue #647 (Phase D / D.1): parse a diagnostic LLM reply into an
-/// [`super::semantic_failure::SemanticFailureReport`]. Independent of the
-/// legacy `ParsedVerifierRepairAssessment` parse — a failure here returns
-/// `None` and the caller proceeds with `semantic_plan = None` (DR3-005), so
-/// the existing `VerifierRepairAssessment` / legacy repair-target selection
-/// is **not** disturbed.
-fn parse_semantic_failure_report_from_reply(
-    reply: &str,
-) -> Option<super::semantic_failure::SemanticFailureReport> {
-    let value = extract_diagnostic_reply_json_value(reply)?;
-    super::semantic_failure::parse_semantic_failure_report(&value).or_else(|| {
-        let object = value.as_object()?;
-        let nested = object
-            .get("SemanticFailureReport")
-            .or_else(|| object.get("semantic_failure_report"))?;
-        let mut nested = nested.clone();
-        let nested_object = nested.as_object_mut()?;
-        if !nested_object.contains_key("failure_kind") {
-            let failure_kind = object
-                .get("failure_kind")
-                .or_else(|| object.get("failure_type"))?;
-            nested_object.insert("failure_kind".to_string(), failure_kind.clone());
-        }
-        if !nested_object.contains_key("preferred_repair_role")
-            && let Some(role) = object
-                .get("probable_cause_role")
-                .or_else(|| object.get("root_cause_role"))
-                .or_else(|| object.get("role"))
-        {
-            nested_object.insert("preferred_repair_role".to_string(), role.clone());
-        }
-        if !nested_object.contains_key("confidence")
-            && let Some(confidence) = object.get("confidence")
-        {
-            nested_object.insert("confidence".to_string(), confidence.clone());
-        }
-        super::semantic_failure::parse_semantic_failure_report(&nested)
-    })
 }
 
 /// Issue #647 (MF1): deterministic fallback that synthesizes a

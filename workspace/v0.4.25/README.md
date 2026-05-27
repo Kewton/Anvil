@@ -1573,3 +1573,28 @@ Assessment:
 - No behavior change intended. Parsed assessment normalization and evidence
   override now live with the diagnostic parser, reducing another
   non-dispatch branch from `turn.rs`.
+
+### 2026-05-27 Slice 36
+
+Applied:
+
+- Moved semantic failure report parsing from diagnostic LLM replies into
+  `verifier_assessment_parser.rs`.
+- Kept semantic fallback synthesis and `SemanticRepairPlan` construction in
+  `turn.rs` because they still combine admitted targets, active request
+  authority, and RepairJob generation state.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test semantic_failure --lib -q`: pass, 40 tests
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Both legacy assessment parsing and semantic
+  report parsing now share the same diagnostic JSON extraction boundary
+  outside the actor loop.
