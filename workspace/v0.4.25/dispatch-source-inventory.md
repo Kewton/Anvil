@@ -165,3 +165,6 @@ with legacy/fallback paths unable to override it.
 - Current status: semantic generated-test weakening admission is now isolated
   in `repair_test_weakening_filter.rs`; `turn.rs` only invokes it after the
   generic weakening detector reports patterns.
+- Current status: verifier framework/test-runner finding generation is now
+  isolated in `repair_framework_findings.rs`; `turn.rs` still owns diagnostic
+  prompt assembly and parsed-assessment override application.

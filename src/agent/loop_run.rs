@@ -154,6 +154,9 @@ mod repair_python_test_analysis;
 // v0.4.25: semantic test weakening admission filter. Keeps verifier repair
 // authority decisions out of the actor loop.
 mod repair_test_weakening_filter;
+// v0.4.25: objective framework/test-runner findings used as bounded evidence
+// for verifier diagnostics.
+mod repair_framework_findings;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

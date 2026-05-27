@@ -1492,3 +1492,30 @@ Assessment:
 - No behavior change intended. Semantic test-repair authority checks now live
   behind a dedicated module boundary instead of being embedded in verifier
   repair validation orchestration.
+
+### 2026-05-27 Slice 33
+
+Applied:
+
+- Added `repair_framework_findings.rs` for objective verifier framework /
+  test-runner findings used by the diagnostic prompt and post-parse override.
+- Moved pytest lifecycle, pytest setup/import/state-isolation, and cargo
+  integration-test crate-import finding generation out of `turn.rs`.
+- Kept parsed assessment override application in `turn.rs` for this slice so
+  the diagnostic schema and high-level orchestration boundary remain stable.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_framework_findings --lib -q`: pass, 2 tests
+- `cargo test framework_finding --lib -q`: pass, 11 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Framework finding generation is now a bounded
+  evidence module; `turn.rs` still decides how that evidence affects the
+  parsed verifier assessment.

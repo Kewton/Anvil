@@ -666,3 +666,26 @@ Assessment:
 - No behavior change intended. The actor loop now invokes a dedicated semantic
   filter instead of owning the expected-literal and test-only repair admission
   details.
+
+## Structural Verification: Slice 33
+
+Scope:
+
+- Extract verifier framework/test-runner finding generation from `turn.rs`.
+- Preserve the diagnostic prompt payload and post-parse override behavior.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_framework_findings --lib -q`: pass, 2 tests.
+- `cargo test framework_finding --lib -q`: pass, 11 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The new module owns objective language/test
+  runner evidence; `turn.rs` still owns how that evidence is merged into the
+  parsed diagnostic assessment.
