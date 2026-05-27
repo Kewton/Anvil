@@ -31297,61 +31297,6 @@ E   assert [{'id': 1}] == []\n";
     }
 
     #[test]
-    fn verifier_failure_signature_uses_failed_test_names_not_assertion_values() {
-        let output_a = "FAILED tests/test_health.py::test_list_todos_empty - AssertionError\n\
-                        E   assert [{'id': 1, 'created_at': '2026-05-19'}] == []\n";
-        let output_b = "FAILED tests/test_health.py::test_list_todos_empty - AssertionError\n\
-                        E   assert [{'id': 4, 'created_at': '2026-05-20'}] == []\n";
-
-        let sig_a = super::verifier_failure_signature(
-            output_a,
-            Some("tests/test_health.py"),
-            None,
-            super::verifier_failure_error_kind(output_a).as_deref(),
-        );
-        let sig_b = super::verifier_failure_signature(
-            output_b,
-            Some("tests/test_health.py"),
-            None,
-            super::verifier_failure_error_kind(output_b).as_deref(),
-        );
-
-        assert_eq!(sig_a, sig_b);
-        assert!(sig_a.contains("failed_tests:1"));
-        assert!(!sig_a.contains("2026-05"));
-    }
-
-    #[test]
-    fn verifier_failure_signature_includes_exception_type_without_assertion_literals() {
-        let output_a = "FAILED tests/test_main.py::TestCreateItem::test_create_item - fastapi.exceptions.ResponseValidationError\n\
-                        E   fastapi.exceptions.ResponseValidationError: 1 validation errors:\n\
-                        E   {'type': 'float_type', 'input': None}\n";
-        let output_b = "FAILED tests/test_main.py::TestCreateItem::test_create_item - AssertionError\n\
-                        E   AssertionError: unexpected status\n\
-                        E   assert 201 == 200\n";
-
-        let sig_a = super::verifier_failure_signature(
-            output_a,
-            Some("tests/test_main.py"),
-            None,
-            super::verifier_failure_error_kind(output_a).as_deref(),
-        );
-        let sig_b = super::verifier_failure_signature(
-            output_b,
-            Some("tests/test_main.py"),
-            None,
-            super::verifier_failure_error_kind(output_b).as_deref(),
-        );
-
-        assert_ne!(sig_a, sig_b);
-        assert!(sig_a.contains("failed_tests:1"));
-        assert!(sig_a.contains("ResponseValidationError"));
-        assert!(sig_b.contains("AssertionError"));
-        assert!(!sig_a.contains("float_type"));
-        assert!(!sig_b.contains("201"));
-    }
-
-    #[test]
     fn verifier_diagnostic_rejects_setup_target_for_local_import_mismatch() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();

@@ -1831,3 +1831,25 @@ Assessment:
 - No behavior change intended. Verifier failure fingerprint text shaping is now
   isolated from the actor loop; `turn.rs` still decides when that signature is
   attached to a RepairJob.
+
+### 2026-05-27 Slice 46
+
+Applied:
+
+- Moved verifier failure signature characterization tests from `turn.rs` into
+  `verifier_failure_signature.rs`.
+- Kept the same assertions for failed-test-name stability and exception-type
+  distinction while removing actor-loop test coupling.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_failure_signature --lib -q`: pass, 2 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox
+
+Assessment:
+
+- No production behavior change. The failure-signature module now owns its
+  characterization tests directly.

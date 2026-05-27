@@ -959,3 +959,23 @@ Assessment:
 
 - No behavior change intended. Failure fingerprint text shaping is now
   independently owned; RepairJob context assembly remains in `turn.rs`.
+
+## Structural Verification: Slice 46
+
+Scope:
+
+- Move verifier failure signature characterization tests from `turn.rs` into
+  `verifier_failure_signature.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_failure_signature --lib -q`: pass, 2 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Test ownership now follows the extracted
+  failure-signature module.
