@@ -2490,3 +2490,26 @@ Assessment:
 - No behavior change intended. Policy feedback wording is now colocated with
   policy enforcement, reducing actor-loop ownership of recovery prompt
   mechanics.
+
+### 2026-05-27 Slice 71
+
+Applied:
+
+- Moved focused-read directory target matching from `turn.rs` to
+  `tool_history.rs`.
+- Directory Read handling now lives next to the other tool path / target
+  matching helpers used by focused edit and repair flow.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test focused_read_target_for_directory --lib -q`: pass, 1 test
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Focused read path matching is now part of the
+  shared tool-history/path projection layer instead of an actor-loop-local
+  helper.

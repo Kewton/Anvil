@@ -67,7 +67,8 @@ use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
 use super::tool_history::{
-    focused_edit_target_already_read, has_successful_non_plan_repo_edit,
+    focused_edit_target_already_read, focused_read_target_for_directory,
+    has_successful_non_plan_repo_edit,
     has_successful_non_plan_repo_edit_after_latest_truncated_tool_call, is_plan_file_tool_call,
     is_preferred_read_edit_target, latest_read_exchange_for_target,
     latest_successful_read_existing_path, latest_user_turn_slice,
@@ -23039,19 +23040,6 @@ fn format_numbered_read_block(contents: &str) -> String {
         .map(|(index, line)| format!("{:>4}: {line}", index + 1))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn focused_read_target_for_directory(resolved: &Path, target: &Path) -> bool {
-    if !resolved.is_dir() {
-        return false;
-    }
-    let Some(parent) = target.parent() else {
-        return false;
-    };
-    let canonical_resolved =
-        std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
-    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    canonical_resolved == canonical_parent
 }
 
 fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {

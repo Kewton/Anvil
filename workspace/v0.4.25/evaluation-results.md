@@ -1545,3 +1545,24 @@ Assessment:
 
 - No behavior change intended. The policy module now owns both rejection
   detection and the constrained retry note derived from it.
+
+## Structural Verification: Slice 71
+
+Scope:
+
+- Move focused-read directory matching from `turn.rs` to `tool_history.rs`.
+- Keep focused edit control in `turn.rs`; keep path/target matching helpers
+  with tool history.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test focused_read_target_for_directory --lib -q`: pass, 1 test.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Directory Read target matching now shares the
+  same module as other focused edit history/path projections.

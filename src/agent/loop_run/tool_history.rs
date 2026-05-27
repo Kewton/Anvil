@@ -342,6 +342,19 @@ pub(super) fn tool_path_matches_target(raw_path: &str, target: &Path, work_root:
     canonical_resolved == canonical_target
 }
 
+pub(super) fn focused_read_target_for_directory(resolved: &Path, target: &Path) -> bool {
+    if !resolved.is_dir() {
+        return false;
+    }
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    let canonical_resolved =
+        std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    canonical_resolved == canonical_parent
+}
+
 pub(super) fn is_preferred_read_edit_target(path: &Path) -> bool {
     is_implementation_file(path) && !is_test_file(path) && !is_setup_file(path)
 }
