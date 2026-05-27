@@ -1413,3 +1413,29 @@ Assessment:
 - No behavior change intended. This does not move the semantic weakening
   decision itself yet; it removes pure assertion parsing from `turn.rs` first
   so the eventual semantic filter extraction has a smaller dependency surface.
+
+### 2026-05-27 Slice 30
+
+Applied:
+
+- Added `repair_python_import_evidence.rs` for bounded Python local
+  import-contract evidence used by verifier repair validation.
+- Moved missing local module, missing imported symbol, and imported scalar
+  attribute-assumption evidence collection out of `turn.rs`.
+- Kept filesystem probing confined to `work_root`, with caller-supplied file
+  size limits, and added focused unit tests for the evidence collector.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_python_import_evidence --lib -q`: pass, 3 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3020 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. `turn.rs` still sequences verifier repair
+  validation, but Python import-contract probing is no longer embedded in the
+  dispatcher.

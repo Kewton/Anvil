@@ -2856,231 +2856,12 @@ fn python_from_imported_name_modules(excerpt: &str) -> HashMap<String, String> {
     names
 }
 
-fn python_missing_local_import_symbols(work_root: &Path, source: &str) -> Vec<(String, String)> {
-    let mut missing = Vec::new();
-    for line in source.lines() {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        let Some(rest) = trimmed.strip_prefix("from ") else {
-            continue;
-        };
-        let Some((module, imports)) = rest.split_once(" import ") else {
-            continue;
-        };
-        let module = module.trim();
-        let Some(module_path) = python_local_module_path_for_import_validation(work_root, module)
-        else {
-            continue;
-        };
-        if imports.trim().starts_with('*') {
-            continue;
-        }
-        let Ok(module_source) = std::fs::read_to_string(&module_path) else {
-            continue;
-        };
-        for (imported, _) in python_from_import_entries_for_validation(imports) {
-            if !python_identifier_for_diagnostic_is_safe(imported) {
-                continue;
-            }
-            if python_module_source_defines_name(&module_source, imported)
-                || python_local_submodule_exists_for_import_validation(work_root, module, imported)
-            {
-                continue;
-            }
-            missing.push((module.to_string(), imported.to_string()));
-        }
-    }
-    missing
-}
-
-fn python_missing_local_import_modules(work_root: &Path, source: &str) -> Vec<String> {
-    let mut missing = Vec::new();
-    for line in source.lines() {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        let Some(rest) = trimmed.strip_prefix("from ") else {
-            continue;
-        };
-        let Some((module, _imports)) = rest.split_once(" import ") else {
-            continue;
-        };
-        let module = module.trim();
-        if !python_module_name_for_import_validation_is_safe(module)
-            || python_local_module_path_for_import_validation(work_root, module).is_some()
-            || !python_local_module_root_exists_for_import_validation(work_root, module)
-        {
-            continue;
-        }
-        missing.push(module.to_string());
-    }
-    missing.sort();
-    missing.dedup();
-    missing
-}
-
-fn python_imported_scalar_attribute_assumptions(work_root: &Path, source: &str) -> Vec<String> {
-    let mut invalid = Vec::new();
-    for line in source.lines() {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        let Some(rest) = trimmed.strip_prefix("from ") else {
-            continue;
-        };
-        let Some((module, imports)) = rest.split_once(" import ") else {
-            continue;
-        };
-        let module = module.trim();
-        let Some(module_path) = python_local_module_path_for_import_validation(work_root, module)
-        else {
-            continue;
-        };
-        if imports.trim().starts_with('*') {
-            continue;
-        }
-        let Ok(module_source) = std::fs::read_to_string(&module_path) else {
-            continue;
-        };
-        for (imported, local_name) in python_from_import_entries_for_validation(imports) {
-            if !python_identifier_for_diagnostic_is_safe(imported)
-                || !python_identifier_for_diagnostic_is_safe(local_name)
-                || !python_module_source_definitively_binds_scalar(&module_source, imported)
-            {
-                continue;
-            }
-            for attr in python_imported_name_attribute_usages(source, local_name) {
-                invalid.push(format!("{module}.{imported}.{attr}"));
-            }
-        }
-    }
-    invalid
-}
-
-fn python_from_import_entries_for_validation(imports: &str) -> Vec<(&str, &str)> {
-    let mut entries = Vec::new();
-    for raw in imports.split(',') {
-        let cleaned =
-            raw.trim_matches(|ch: char| ch == '(' || ch == ')' || ch == '\\' || ch.is_whitespace());
-        let parts = cleaned.split_whitespace().collect::<Vec<_>>();
-        match parts.as_slice() {
-            [imported, "as", alias] => entries.push((*imported, *alias)),
-            [imported] => entries.push((*imported, *imported)),
-            _ => {}
-        }
-    }
-    entries
-}
-
-fn python_local_module_path_for_import_validation(
-    work_root: &Path,
-    module: &str,
-) -> Option<PathBuf> {
-    if !python_module_name_for_import_validation_is_safe(module) {
-        return None;
-    }
-    let root = std::fs::canonicalize(work_root).ok()?;
-    let relative = python_module_relative_path_for_import_validation(module)?;
-    let file_candidate = root.join(&relative).with_extension("py");
-    if let Some(path) = python_safe_local_module_candidate(&root, file_candidate) {
-        return Some(path);
-    }
-    let package_candidate = root.join(relative).join("__init__.py");
-    python_safe_local_module_candidate(&root, package_candidate)
-}
-
-fn python_local_submodule_exists_for_import_validation(
-    work_root: &Path,
-    module: &str,
-    name: &str,
-) -> bool {
-    if !python_module_name_for_import_validation_is_safe(module)
-        || !python_identifier_for_diagnostic_is_safe(name)
-    {
-        return false;
-    }
-    let combined = format!("{module}.{name}");
-    python_local_module_path_for_import_validation(work_root, &combined).is_some()
-}
-
-fn python_local_module_root_exists_for_import_validation(work_root: &Path, module: &str) -> bool {
-    let Some(root_name) = module.split('.').next() else {
-        return false;
-    };
-    if !python_identifier_for_diagnostic_is_safe(root_name) {
-        return false;
-    }
-    let Ok(root) = std::fs::canonicalize(work_root) else {
-        return false;
-    };
-    let file_candidate = root.join(root_name).with_extension("py");
-    if python_safe_local_module_candidate(&root, file_candidate).is_some() {
-        return true;
-    }
-    let dir_candidate = root.join(root_name);
-    if !dir_candidate.is_dir() {
-        return false;
-    }
-    let Ok(canonical) = std::fs::canonicalize(dir_candidate) else {
-        return false;
-    };
-    canonical.strip_prefix(root).is_ok()
-}
-
-fn python_safe_local_module_candidate(root: &Path, candidate: PathBuf) -> Option<PathBuf> {
-    if !candidate.is_file() {
-        return None;
-    }
-    let metadata = std::fs::metadata(&candidate).ok()?;
-    if metadata.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
-        return None;
-    }
-    let canonical = std::fs::canonicalize(candidate).ok()?;
-    canonical.strip_prefix(root).ok()?;
-    Some(canonical)
-}
-
-fn python_module_relative_path_for_import_validation(module: &str) -> Option<PathBuf> {
-    let mut relative = PathBuf::new();
-    for part in module.split('.') {
-        if !python_identifier_for_diagnostic_is_safe(part) {
-            return None;
-        }
-        relative.push(part);
-    }
-    Some(relative)
-}
-
 fn python_module_name_for_import_validation_is_safe(module: &str) -> bool {
     !module.is_empty()
         && !module.starts_with('.')
         && module
             .split('.')
             .all(python_identifier_for_diagnostic_is_safe)
-}
-
-fn python_module_source_defines_name(source: &str, name: &str) -> bool {
-    for line in source.lines() {
-        if line.chars().next().is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with(&format!("def {name}("))
-            || trimmed.starts_with(&format!("async def {name}("))
-            || trimmed.starts_with(&format!("class {name}("))
-            || trimmed.starts_with(&format!("class {name}:"))
-        {
-            return true;
-        }
-        if python_top_level_assignment_defines_name(trimmed, name)
-            || python_top_level_import_defines_name(trimmed, name)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn python_top_level_assignment_defines_name(line: &str, name: &str) -> bool {
@@ -3093,110 +2874,6 @@ fn python_top_level_assignment_defines_name(line: &str, name: &str) -> bool {
         .unwrap_or(assignment_head)
         .trim();
     binding_head == name
-}
-
-fn python_module_source_definitively_binds_scalar(source: &str, name: &str) -> bool {
-    for line in source.lines() {
-        if line.chars().next().is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        let Some((assignment_head, expression)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let binding_head = assignment_head
-            .split_once(':')
-            .map(|(head, _)| head)
-            .unwrap_or(assignment_head)
-            .trim();
-        if binding_head == name && python_expression_is_scalar_literal(expression.trim()) {
-            return true;
-        }
-    }
-    false
-}
-
-fn python_expression_is_scalar_literal(expression: &str) -> bool {
-    let expression = expression.trim().trim_end_matches(',');
-    if matches!(expression, "True" | "False" | "None") {
-        return true;
-    }
-    if (expression.starts_with('"') && expression.ends_with('"'))
-        || (expression.starts_with('\'') && expression.ends_with('\''))
-    {
-        return true;
-    }
-    let normalized = expression.replace('_', "");
-    normalized.parse::<i64>().is_ok() || normalized.parse::<f64>().is_ok()
-}
-
-fn python_imported_name_attribute_usages(source: &str, name: &str) -> Vec<String> {
-    let mut attrs = Vec::new();
-    let pattern = format!("{name}.");
-    for line in source.lines() {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        if stripped.trim_start().starts_with("from ") {
-            continue;
-        }
-        for (idx, _) in stripped.match_indices(&pattern) {
-            if stripped[..idx]
-                .chars()
-                .next_back()
-                .is_some_and(|ch| python_identifier_char_for_validation(ch) || ch == '.')
-            {
-                continue;
-            }
-            let attr_start = idx + pattern.len();
-            let attr = stripped[attr_start..]
-                .chars()
-                .take_while(|ch| python_identifier_char_for_validation(*ch))
-                .collect::<String>();
-            if python_identifier_for_diagnostic_is_safe(&attr) {
-                attrs.push(attr);
-            }
-        }
-    }
-    attrs
-}
-
-fn python_identifier_char_for_validation(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
-}
-
-fn python_top_level_import_defines_name(line: &str, name: &str) -> bool {
-    if let Some(rest) = line.strip_prefix("import ") {
-        return rest.split(',').any(|raw| {
-            let parts: Vec<_> = raw.split_whitespace().collect();
-            match parts.as_slice() {
-                [module, "as", alias] => {
-                    *alias == name && python_module_name_for_import_validation_is_safe(module)
-                }
-                [module] => module.split('.').next().is_some_and(|root| {
-                    root == name && python_module_name_for_import_validation_is_safe(module)
-                }),
-                _ => false,
-            }
-        });
-    }
-    if let Some(rest) = line.strip_prefix("from ") {
-        let Some((_module, imports)) = rest.split_once(" import ") else {
-            return false;
-        };
-        return imports.split(',').any(|raw| {
-            let parts: Vec<_> = raw.split_whitespace().collect();
-            match parts.as_slice() {
-                [imported, "as", alias] => {
-                    *alias == name && python_identifier_for_diagnostic_is_safe(imported)
-                }
-                [imported] => {
-                    *imported == name && python_identifier_for_diagnostic_is_safe(imported)
-                }
-                _ => false,
-            }
-        });
-    }
-    false
 }
 
 fn python_attr_path_for_diagnostic_is_safe(path: &str) -> bool {
@@ -24316,10 +23993,20 @@ fn validate_verifier_repair_intents_inner(
     if target_is_test_file {
         super::repair_patch_validation::validate_test_import_contract_evidence(
             super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
-                missing_modules: python_missing_local_import_modules(work_root, &contents),
-                missing_imports: python_missing_local_import_symbols(work_root, &contents),
-                scalar_attribute_assumptions: python_imported_scalar_attribute_assumptions(
+                missing_modules: super::repair_python_import_evidence::missing_local_import_modules(
+                    work_root,
+                    &contents,
+                    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+                ),
+                missing_imports: super::repair_python_import_evidence::missing_local_import_symbols(
+                    work_root,
+                    &contents,
+                    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+                ),
+                scalar_attribute_assumptions:
+                    super::repair_python_import_evidence::imported_scalar_attribute_assumptions(
                     work_root, &contents,
+                    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
                 ),
             },
         )

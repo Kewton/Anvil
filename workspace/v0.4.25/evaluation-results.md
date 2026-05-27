@@ -596,3 +596,26 @@ Assessment:
 
 - No behavior change intended. The new module is deliberately pure and only
   owns reusable assertion/output parsing.
+
+## Structural Verification: Slice 30
+
+Scope:
+
+- Extract bounded Python import-contract evidence gathering from `turn.rs`.
+- Preserve the existing validation semantics while moving local module probing
+  behind a narrow module API.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_python_import_evidence --lib -q`: pass, 3 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3020 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The new module owns the filesystem evidence
+  probe; the actor loop only supplies `work_root`, candidate contents, and
+  the file-size cap.

@@ -145,6 +145,9 @@ mod patch_provider;
 mod repair_patch_executor;
 // v0.4.25: pure patch-admission checks shared by verifier repair validation.
 mod repair_patch_validation;
+// v0.4.25: bounded Python local import-contract evidence for verifier repair
+// validation. Keeps filesystem probing out of the turn dispatcher.
+mod repair_python_import_evidence;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

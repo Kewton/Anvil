@@ -96,8 +96,8 @@ with legacy/fallback paths unable to override it.
 - Assert in tests that every verifier repair terminal path flows through
   `RepairJob::next_action`.
 - Continue deleting legacy bypass paths after they are covered by tests.
-- Move the shared Python diagnostic/test-weakening helper cluster to a
-  dedicated module before moving the remaining semantic generated-test
+- Continue moving the shared Python diagnostic/test-weakening helper cluster
+  to dedicated modules before moving the remaining semantic generated-test
   weakening filter out of `turn.rs`.
 - Consider whether extracting the final high-level validated-edit assembly
   wrapper is worth the coupling cost. The remaining logic is now primarily
@@ -156,3 +156,6 @@ with legacy/fallback paths unable to override it.
 - Current status: pure assertion/output parsing is now isolated in
   `repair_assertion_analysis.rs`; `turn.rs` still owns the semantic
   generated-test weakening decision and Python evidence gathering.
+- Current status: Python import-contract evidence gathering is now isolated in
+  `repair_python_import_evidence.rs`; `turn.rs` still owns the semantic
+  generated-test weakening decision and some Python diagnostic helper logic.
