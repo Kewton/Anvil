@@ -2127,3 +2127,29 @@ Assessment:
 
 - No behavior change intended. Failure signature/error/count extraction now
   shares the same module; `turn.rs` keeps only RepairJob construction logic.
+
+### 2026-05-27 Slice 57
+
+Applied:
+
+- Moved verifier rerun outcome classification from `turn.rs` to
+  `repair_job.rs`.
+- `turn.rs` now calls `repair_job::verifier_repair_rerun_outcome` while
+  constructing the next RepairJob.
+- Kept cluster-aware refinement (`rerun_outcome_with_cluster`) unchanged in
+  `repair_job.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_context_classifies_rerun_result --lib -q`: pass
+- `cargo test rerun_outcome --lib -q`: pass, 3 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Rerun outcome classification now lives next to
+  the RepairJob state vocabulary; `turn.rs` still constructs and stores the
+  job.

@@ -22276,8 +22276,11 @@ fn verifier_repair_context_from_failure(
     let previous_failure_signature =
         previous_context.map(|context| context.failure_signature.clone());
     let previous_failure_count = previous_context.and_then(|context| context.failure_count);
-    let rerun_outcome =
-        verifier_repair_rerun_outcome(previous_context, &failure_signature, failure_count);
+    let rerun_outcome = super::repair_job::verifier_repair_rerun_outcome(
+        previous_context,
+        &failure_signature,
+        failure_count,
+    );
     let previous_matching_context =
         previous_context.filter(|context| context.failure_signature == failure_signature);
     let repair_attempt = previous_matching_context
@@ -22441,27 +22444,6 @@ fn task_contract_verifier_failure_attempt_limit(
 /// classification once a diagnostic pass succeeds.
 fn classify_verifier_failure_type(_output: &str) -> super::VerifierFailureType {
     super::VerifierFailureType::Unknown
-}
-
-fn verifier_repair_rerun_outcome(
-    previous_context: Option<&super::repair_job::RepairJob>,
-    current_signature: &str,
-    current_count: Option<usize>,
-) -> Option<super::VerifierRepairRerunOutcome> {
-    let previous = previous_context?;
-    if let (Some(previous_count), Some(current_count)) = (previous.failure_count, current_count) {
-        if current_count < previous_count {
-            return Some(super::VerifierRepairRerunOutcome::Improved);
-        }
-        if current_count > previous_count {
-            return Some(super::VerifierRepairRerunOutcome::Worsened);
-        }
-    }
-    if previous.failure_signature == current_signature {
-        Some(super::VerifierRepairRerunOutcome::SameFailureRemaining)
-    } else {
-        Some(super::VerifierRepairRerunOutcome::NewFailure)
-    }
 }
 
 fn emit_repair_progress_classified_event(

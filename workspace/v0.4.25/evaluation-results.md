@@ -1220,3 +1220,26 @@ Assessment:
 
 - No behavior change intended. Verifier failure signature/count parsing now
   has one owner; the actor loop consumes the parsed count.
+
+## Structural Verification: Slice 57
+
+Scope:
+
+- Move verifier rerun outcome classification from `turn.rs` to
+  `repair_job.rs`.
+- Keep RepairJob construction in `turn.rs`; only the state-derived
+  classification helper moved.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_context_classifies_rerun_result --lib -q`: pass.
+- `cargo test rerun_outcome --lib -q`: pass, 3 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Rerun outcome classification is now owned by
+  the RepairJob module.

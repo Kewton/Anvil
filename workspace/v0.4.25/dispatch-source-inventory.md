@@ -230,3 +230,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier failure count parsing is now isolated in
   `verifier_failure_signature.rs`; `turn.rs` consumes the count while
   constructing RepairJob state.
+- Current status: verifier rerun outcome classification is now isolated in
+  `repair_job.rs`; `turn.rs` consumes the result while constructing the next
+  RepairJob.

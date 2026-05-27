@@ -2168,6 +2168,27 @@ pub(super) fn rebind_legacy_assessment_to_current_cluster(repair_job: &mut Repai
     repair_job.assessment_bound_cluster_id = Some(plan_cluster_id);
 }
 
+pub(super) fn verifier_repair_rerun_outcome(
+    previous_context: Option<&RepairJob>,
+    current_signature: &str,
+    current_count: Option<usize>,
+) -> Option<VerifierRepairRerunOutcome> {
+    let previous = previous_context?;
+    if let (Some(previous_count), Some(current_count)) = (previous.failure_count, current_count) {
+        if current_count < previous_count {
+            return Some(VerifierRepairRerunOutcome::Improved);
+        }
+        if current_count > previous_count {
+            return Some(VerifierRepairRerunOutcome::Worsened);
+        }
+    }
+    if previous.failure_signature == current_signature {
+        Some(VerifierRepairRerunOutcome::SameFailureRemaining)
+    } else {
+        Some(VerifierRepairRerunOutcome::NewFailure)
+    }
+}
+
 /// Issue #647 (Phase E.3 / S3-014): wrap the existing
 /// `verifier_repair_rerun_outcome` (which is failure_count-based and
 /// cluster-agnostic) with a cluster-id transition rule.
