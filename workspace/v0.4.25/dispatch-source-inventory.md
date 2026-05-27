@@ -280,3 +280,6 @@ with legacy/fallback paths unable to override it.
 - Current status: progress-display text sanitization and UTF-8-safe
   truncation are now isolated in `progress_text.rs`; `turn.rs` consumes the
   helpers while progress-line formatting remains local for now.
+- Current status: progress-display tool color, emoji, and ANSI paint helpers
+  are now isolated in `progress_text.rs`; `turn.rs` consumes style helpers but
+  no longer owns the mapping table.

@@ -157,7 +157,7 @@ use super::deterministic;
 use super::deterministic::empty_framework_app_files as deterministic_empty_framework_app_files;
 #[cfg(test)]
 use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
-use super::progress_text::{sanitize_for_progress, truncate};
+use super::progress_text::{paint, sanitize_for_progress, tool_color, tool_emoji, truncate};
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, quality_first_pass_observation,
@@ -20780,40 +20780,6 @@ mod tests {
                 .any(|obs| matches!(obs, ExternalImportObservation::PythonpathRejected { .. })),
             "external-import callback MUST fire with PythonpathRejected for an external PYTHONPATH component; got {external_import_calls:?}"
         );
-    }
-}
-
-const COLOR_RESET: &str = "\x1b[0m";
-
-fn tool_color(tool_name: &str) -> &'static str {
-    match tool_name {
-        "Write" => "\x1b[38;5;198m",
-        "Read" => "\x1b[38;5;87m",
-        "Edit" => "\x1b[38;5;208m",
-        "Bash" => "\x1b[38;5;226m",
-        "Glob" => "\x1b[38;5;51m",
-        "Grep" => "\x1b[38;5;39m",
-        _ => "\x1b[38;5;245m",
-    }
-}
-
-fn tool_emoji(tool_name: &str) -> &'static str {
-    match tool_name {
-        "Write" => "✏️",
-        "Read" => "📄",
-        "Edit" => "📝",
-        "Bash" => "⚡",
-        "Glob" => "🔍",
-        "Grep" => "🔎",
-        _ => "🔧",
-    }
-}
-
-fn paint(s: &str, color: &str, use_color: bool) -> String {
-    if use_color && !color.is_empty() {
-        format!("{color}{s}{COLOR_RESET}")
-    } else {
-        s.to_string()
     }
 }
 

@@ -1591,3 +1591,28 @@ Assessment:
 - No behavior change intended. Terminal-safety text helpers now have a
   dedicated module and direct unit coverage instead of living inside the
   actor-loop source file.
+
+## Structural Verification: Slice 73
+
+Scope:
+
+- Move progress-line tool color, emoji, and ANSI paint helpers from `turn.rs`
+  to `progress_text.rs`.
+- Keep full progress-line formatting in `turn.rs` while display style data is
+  separated from actor-loop logic.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test progress_text --lib -q`: pass, 9 tests.
+- `cargo test tool_style --lib -q`: pass, 2 tests.
+- `cargo test progress_line_emoji --lib -q`: pass, 1 test.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3053 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The progress style mapping and ANSI wrapper
+  are now covered in the display helper module rather than actor-loop tests
+  alone.
