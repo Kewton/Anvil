@@ -2227,6 +2227,59 @@ pub(super) fn verifier_repair_effective_target_hint(
     None
 }
 
+pub(super) fn apply_verifier_rerun_observation(
+    repair_context: &mut RepairJob,
+    previous_context: Option<&RepairJob>,
+) -> Option<PromotionResult> {
+    let previous_cluster_id = previous_context
+        .and_then(|context| context.semantic_plan.as_ref())
+        .map(|plan| plan.failure_cluster_id.clone());
+    let previous_repair_target_hint = previous_context
+        .and_then(verifier_repair_effective_target_hint)
+        .cloned();
+    let applied_outcome_promotion = record_applied_repair_outcome_for_rerun(
+        repair_context,
+        previous_repair_target_hint.as_ref(),
+    );
+    if let Some(outcome) = repair_context.rerun_outcome {
+        repair_context.apply_event(RepairJobEvent::VerifierObserved {
+            delta: outcome.into(),
+        });
+    }
+    apply_semantic_repair_dispatch_after_rerun(repair_context, previous_cluster_id.as_ref());
+    applied_outcome_promotion
+}
+
+fn record_applied_repair_outcome_for_rerun(
+    repair_context: &mut RepairJob,
+    previous_repair_target_hint: Option<&RecoveryTargetHint>,
+) -> Option<PromotionResult> {
+    let kind = repair_attempt_outcome_kind_from_rerun(repair_context.rerun_outcome?);
+    let plan = repair_context.semantic_plan.as_ref()?;
+    let outcome = RepairAttemptOutcome {
+        cluster: plan.failure_cluster_id.clone(),
+        role: plan.preferred_repair_role,
+        kind,
+    };
+    Some(match previous_repair_target_hint {
+        Some(target_hint) => {
+            repair_context.record_repair_attempt_outcome_for_target(outcome, target_hint)
+        }
+        None => repair_context.record_repair_attempt_outcome(outcome),
+    })
+}
+
+fn repair_attempt_outcome_kind_from_rerun(
+    outcome: VerifierRepairRerunOutcome,
+) -> RepairAttemptOutcomeKind {
+    match outcome {
+        VerifierRepairRerunOutcome::Improved => RepairAttemptOutcomeKind::AppliedImproved,
+        VerifierRepairRerunOutcome::SameFailureRemaining
+        | VerifierRepairRerunOutcome::NewFailure => RepairAttemptOutcomeKind::AppliedNoProgress,
+        VerifierRepairRerunOutcome::Worsened => RepairAttemptOutcomeKind::AppliedWorsened,
+    }
+}
+
 pub(super) fn malformed_repair_attempt_outcome_for_active_target(
     context: &RepairJob,
     active_target_hint: Option<&RecoveryTargetHint>,
@@ -3641,6 +3694,24 @@ mod tests {
         assert!(job.previous_failure_count.is_none());
         assert!(job.rerun_outcome.is_none());
         assert_eq!(job.repair_attempt, 0);
+    }
+
+    #[test]
+    fn apply_verifier_rerun_observation_records_delta_without_semantic_plan() {
+        let mut job = RepairJob {
+            rerun_outcome: Some(VerifierRepairRerunOutcome::Improved),
+            ..RepairJob::new_for_test()
+        };
+
+        let promotion = apply_verifier_rerun_observation(&mut job, None);
+
+        assert!(promotion.is_none());
+        assert_eq!(
+            job.lifecycle_events.last(),
+            Some(&RepairJobEvent::VerifierObserved {
+                delta: VerifierDelta::Improved,
+            })
+        );
     }
 
     #[test]

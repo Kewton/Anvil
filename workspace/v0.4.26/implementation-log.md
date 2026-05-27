@@ -131,6 +131,36 @@ Current effect:
   - max rough CC: `7`
   - rough CC >= 15: `0`
 
+### Slice 3: RepairJob Rerun Observation Boundary
+
+Implemented:
+
+- `src/agent/loop_run/repair_job.rs`
+  - `apply_verifier_rerun_observation`
+  - `record_applied_repair_outcome_for_rerun`
+  - `repair_attempt_outcome_kind_from_rerun`
+
+Wired into:
+
+- `src/agent/loop_run/turn.rs`
+  - both verifier-failure observation sites now delegate rerun outcome
+    ledger updates, verifier-observed lifecycle events, and semantic
+    post-rerun dispatch to `RepairJob`.
+
+Tests added:
+
+- rerun observation records a typed verifier delta even without a semantic
+  plan, while avoiding promotion side effects.
+
+Current effect:
+
+- duplicated repair-rerun state mutation no longer lives in two `turn.rs`
+  branches.
+- `drive_task_contract_verifier` and `drive_repair_job_verifier` dropped out
+  of the top-12 complexity list.
+- this is not yet the full `RepairDriver`; patch execution and diagnostic
+  execution still remain in `turn.rs`.
+
 ## Verification
 
 Commands run:
@@ -142,6 +172,7 @@ cargo test recovery_owner_gates_lower_level_fallbacks --lib -q
 cargo test model_request --lib -q
 cargo test verifier_driver --lib -q
 cargo test task_contract_verifier --lib -q
+cargo test repair_job --lib -q
 python3 -m unittest tests/test_complexity_report.py
 cargo clippy --all-targets -- -D warnings
 cargo test --lib -q
@@ -159,15 +190,15 @@ Results:
 - targeted Rust tests passed
 - Python complexity-report tests passed
 - `cargo clippy --all-targets -- -D warnings` passed
-- `cargo test --lib -q` passed: `3074 passed`
+- `cargo test --lib -q` passed: `3075 passed`
 - `cargo build --release` passed
 
 ## Current Complexity Snapshot
 
 | File | Functions | Avg Rough CC | Max Rough CC | CC >= 15 | CC >= 50 | Function LOC |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `src/agent/loop_run/turn.rs` | 1032 | 3.00 | 362 | 29 | 1 | 33039 |
-| `src/agent/loop_run/repair_job.rs` | 236 | 2.37 | 26 | 3 | 0 | 5806 |
+| `src/agent/loop_run/turn.rs` | 1032 | 2.98 | 362 | 29 | 1 | 32919 |
+| `src/agent/loop_run/repair_job.rs` | 240 | 2.39 | 26 | 3 | 0 | 5872 |
 | `src/agent/loop_run/model_request.rs` | 9 | 3.11 | 8 | 0 | 0 | 153 |
 | `src/agent/loop_run/tool_execution.rs` | 16 | 1.62 | 7 | 0 | 0 | 143 |
 | `src/agent/loop_run/verifier_driver.rs` | 32 | 2.19 | 7 | 0 | 0 | 462 |
@@ -181,16 +212,18 @@ Top remaining hotspots:
 | 40 | `turn.rs::request_assistant_reply_with_retry` |
 | 30 | `turn.rs::run_verifier_repair_pass_and_apply` |
 | 28 | `turn.rs::execute_tool_call` |
-| 25 | `turn.rs::drive_task_contract_verifier` |
-| 25 | `turn.rs::drive_repair_job_verifier` |
+| 28 | `turn.rs::answer_only_script_command_allowed` |
+| 26 | `repair_job.rs::rejected_reason_for_repair_error` |
+| 24 | `turn.rs::verifier_repair_pass_retry_message` |
+| 22 | `turn.rs::run_verifier_diagnostic_pass` |
 | 22 | `turn.rs::run_task_contract_verifier_once` |
 
 ## Remaining Work
 
 Next recommended slice:
 
-1. Continue Slice 2 by moving verifier command selection/execution into
-   `VerifierDriver` behind typed reports.
+1. Continue Slice 3 by moving repair pass execution/diagnostic dispatch behind
+   a `RepairDriver` boundary.
 2. Continue Slice 1 opportunistically until `execute_tool_call` becomes
    dispatch plus typed outcome conversion only.
 3. Defer `TurnDriver` until `VerifierDriver`, `RepairDriver`, and

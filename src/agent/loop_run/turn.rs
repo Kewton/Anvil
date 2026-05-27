@@ -8759,84 +8759,9 @@ impl Agent {
                         ),
                     };
                 }
-                // Issue #647 (MF2.2 / MF2.3): drive the cluster-aware
-                // sequential repair state machine after the new
-                // `RepairJob` is built (MF2.1 already carried the semantic
-                // plan and exhausted ledger over). `previous_cluster_id`
-                // is the failure_cluster_id from the previous turn — the
-                // dispatch wraps the base rerun outcome via
-                // `rerun_outcome_with_cluster` and advances to the next
-                // cluster (or falls back to re-diagnostic) accordingly.
-                // S7-005: the dispatch never touches the legacy retry
-                // counters (`repair_attempt`).
-                let previous_cluster_id = previous_repair_context
-                    .as_ref()
-                    .and_then(|context| context.semantic_plan.as_ref())
-                    .map(|plan| plan.failure_cluster_id.clone());
-                let previous_repair_target_hint = previous_repair_context
-                    .as_ref()
-                    .and_then(verifier_repair_effective_target_hint)
-                    .cloned();
-                // Issue #653 (S5-002 / S5-004 / DR3-004): Applied 系 lifecycle
-                // emission. `rerun_outcome` → `RepairAttemptOutcomeKind` 翻訳
-                // (`NewFailure` は `AppliedNoProgress` に畳む)。push は
-                // `apply_semantic_repair_dispatch_after_rerun` の **前** に
-                // 行う — dispatch 後では `semantic_plan` が次 cluster に
-                // 差し替わる可能性があり、旧 `(cluster, role)` を保持できなく
-                // なるため。`semantic_plan = None` の legacy path は ledger
-                // 非対象 (S5-004)。
-                //
-                // Issue #662: `PromotionResult.all_clusters_exhausted` の観察を
-                // この block 内で行い、emit は `self.repair_job = Some(...)` 後に
-                // 行う (emit shell は `self.repair_job` を参照するため)。
-                let mut applied_outcome_promotion: Option<super::repair_job::PromotionResult> =
-                    None;
-                {
-                    // S5-002: `SameFailureRemaining` と `NewFailure` は
-                    // どちらも progress なしとして同一 variant に畳む。
-                    let kind_opt = match repair_context.rerun_outcome {
-                        Some(super::VerifierRepairRerunOutcome::Improved) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedImproved,
-                        ),
-                        Some(super::VerifierRepairRerunOutcome::SameFailureRemaining)
-                        | Some(super::VerifierRepairRerunOutcome::NewFailure) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress,
-                        ),
-                        Some(super::VerifierRepairRerunOutcome::Worsened) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedWorsened,
-                        ),
-                        None => None,
-                    };
-                    // Issue #662: observe `PromotionResult.all_clusters_exhausted`
-                    // and defer the safe-stop emit until `self.repair_job =
-                    // Some(repair_context)` runs below — the emit shell reads
-                    // `self.repair_job` which is None at this point.
-                    if let (Some(kind), Some(plan)) =
-                        (kind_opt, repair_context.semantic_plan.as_ref())
-                    {
-                        let outcome = super::repair_attempt_outcome::RepairAttemptOutcome {
-                            cluster: plan.failure_cluster_id.clone(),
-                            role: plan.preferred_repair_role,
-                            kind,
-                        };
-                        applied_outcome_promotion =
-                            Some(match previous_repair_target_hint.as_ref() {
-                                Some(target_hint) => repair_context
-                                    .record_repair_attempt_outcome_for_target(outcome, target_hint),
-                                None => repair_context.record_repair_attempt_outcome(outcome),
-                            });
-                    }
-                }
-                if let Some(outcome) = repair_context.rerun_outcome {
-                    repair_context.apply_event(
-                        super::repair_job::RepairJobEvent::VerifierObserved {
-                            delta: outcome.into(),
-                        },
-                    );
-                }
-                super::repair_job::apply_semantic_repair_dispatch_after_rerun(
+                let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
                     &mut repair_context,
-                    previous_cluster_id.as_ref(),
+                    previous_repair_context.as_ref(),
                 );
                 *args.contract_verifier_repair_edit_count =
                     Some(args.repo_edit_calls_made_this_turn);
@@ -9257,54 +9182,9 @@ impl Agent {
                     };
                 }
 
-                let previous_cluster_id = previous_repair_context
-                    .semantic_plan
-                    .as_ref()
-                    .map(|plan| plan.failure_cluster_id.clone());
-                let previous_repair_target_hint =
-                    verifier_repair_effective_target_hint(&previous_repair_context).cloned();
-                let mut applied_outcome_promotion: Option<super::repair_job::PromotionResult> =
-                    None;
-                {
-                    let kind_opt = match repair_context.rerun_outcome {
-                        Some(super::VerifierRepairRerunOutcome::Improved) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedImproved,
-                        ),
-                        Some(super::VerifierRepairRerunOutcome::SameFailureRemaining)
-                        | Some(super::VerifierRepairRerunOutcome::NewFailure) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedNoProgress,
-                        ),
-                        Some(super::VerifierRepairRerunOutcome::Worsened) => Some(
-                            super::repair_attempt_outcome::RepairAttemptOutcomeKind::AppliedWorsened,
-                        ),
-                        None => None,
-                    };
-                    if let (Some(kind), Some(plan)) =
-                        (kind_opt, repair_context.semantic_plan.as_ref())
-                    {
-                        let outcome = super::repair_attempt_outcome::RepairAttemptOutcome {
-                            cluster: plan.failure_cluster_id.clone(),
-                            role: plan.preferred_repair_role,
-                            kind,
-                        };
-                        applied_outcome_promotion =
-                            Some(match previous_repair_target_hint.as_ref() {
-                                Some(target_hint) => repair_context
-                                    .record_repair_attempt_outcome_for_target(outcome, target_hint),
-                                None => repair_context.record_repair_attempt_outcome(outcome),
-                            });
-                    }
-                }
-                if let Some(outcome) = repair_context.rerun_outcome {
-                    repair_context.apply_event(
-                        super::repair_job::RepairJobEvent::VerifierObserved {
-                            delta: outcome.into(),
-                        },
-                    );
-                }
-                super::repair_job::apply_semantic_repair_dispatch_after_rerun(
+                let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
                     &mut repair_context,
-                    previous_cluster_id.as_ref(),
+                    Some(&previous_repair_context),
                 );
                 *args.contract_verifier_repair_edit_count =
                     Some(args.repo_edit_calls_made_this_turn);
