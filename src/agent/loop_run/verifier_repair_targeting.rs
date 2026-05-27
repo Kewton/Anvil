@@ -93,3 +93,72 @@ pub(super) fn missing_python_module_workspace_path(
     }
     Some(relative)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn verifier_diagnostic_path_input_rejects_unsafe_shapes() {
+        assert!(!verifier_diagnostic_path_input_is_safe(""));
+        assert!(!verifier_diagnostic_path_input_is_safe("../app/main.py"));
+        assert!(!verifier_diagnostic_path_input_is_safe("/tmp/app/main.py"));
+        assert!(!verifier_diagnostic_path_input_is_safe("app/with\0nul.py"));
+        assert!(!verifier_diagnostic_path_input_is_safe(
+            ".anvil-state/sessions/job.json"
+        ));
+        assert!(verifier_diagnostic_path_input_is_safe("app/main.py"));
+    }
+
+    #[test]
+    fn python_missing_external_dependency_ignores_local_modules() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(work_root.join("localpkg.py"), "").unwrap();
+
+        assert_eq!(
+            python_missing_external_dependency_name(
+                work_root,
+                "ModuleNotFoundError: No module named 'requests'"
+            )
+            .as_deref(),
+            Some("requests")
+        );
+        assert_eq!(
+            python_missing_external_dependency_name(
+                work_root,
+                "ModuleNotFoundError: No module named 'localpkg'"
+            ),
+            None
+        );
+        assert_eq!(
+            python_missing_external_dependency_name(
+                work_root,
+                "ModuleNotFoundError: No module named '../unsafe'"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_python_module_workspace_path_requires_package_parent() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app").join("services")).unwrap();
+        std::fs::write(work_root.join("app").join("__init__.py"), "").unwrap();
+
+        assert_eq!(
+            missing_python_module_workspace_path(work_root, "app.services.worker").as_deref(),
+            Some("app/services/worker.py")
+        );
+        assert_eq!(
+            missing_python_module_workspace_path(work_root, "app.missing.worker"),
+            None
+        );
+        assert_eq!(
+            missing_python_module_workspace_path(work_root, "other.services.worker"),
+            None
+        );
+    }
+}

@@ -1733,3 +1733,26 @@ Assessment:
 - No behavior change intended. Target/path parsing helpers are now isolated;
   `turn.rs` still owns the stateful admission boundary and the policy decision
   to promote a parsed candidate into an actual repair target.
+
+### 2026-05-27 Slice 42
+
+Applied:
+
+- Added module-local tests for `verifier_repair_targeting.rs`.
+- Covered unsafe diagnostic path rejection, ignored state paths, external
+  dependency detection that ignores local modules, and package-parent checks
+  for missing local Python module paths.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_targeting --lib -q`: pass, 3 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3030 tests when rerun outside sandbox
+
+Assessment:
+
+- No production behavior change. The extracted targeting boundary now has
+  local characterization tests, reducing dependence on large `turn.rs`
+  integration-style tests for path/module parsing invariants.

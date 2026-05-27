@@ -876,3 +876,22 @@ Assessment:
 - No behavior change intended. The extracted helpers only parse and filter
   candidate paths/modules; active repair admission remains in the existing
   SSOT call path.
+
+## Structural Verification: Slice 42
+
+Scope:
+
+- Add direct module tests for `verifier_repair_targeting.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 3 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3030 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The new tests make the extracted path/module
+  helper boundary independently verifiable.
