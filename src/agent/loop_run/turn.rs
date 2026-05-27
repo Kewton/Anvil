@@ -8,6 +8,7 @@ use super::auto_test::{
     build_agent_verifier_external_import_rejected_payload, build_agent_verifier_invoked_payload,
     classify_auto_test, count_compile_errors, count_test_failures,
 };
+use super::completion_evidence::is_repo_edit_no_op;
 use super::failure_packet::FailurePacketTimeoutKind;
 use super::feedback_kind_confirm::{
     self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
@@ -23172,18 +23173,6 @@ fn format_numbered_read_block(contents: &str) -> String {
         .join("\n")
 }
 
-/// Issue #646 (C2 / A4): no-op repo-edit detector. Compares the pre-tool
-/// content hash captured in `execute_tool_call` against the post-tool
-/// content hash. When both are `Some(x)` with equal values the Write/Edit
-/// did not modify the file and MUST NOT promote the path to `Owned`.
-///
-/// Returns `false` whenever the pre-tool hash is missing (first observation
-/// in the turn) or `None` (file didn't exist before the tool call), since
-/// those are real edits.
-fn is_repo_edit_no_op(pre_tool_hash: Option<&str>, current_hash: Option<&str>) -> bool {
-    matches!((pre_tool_hash, current_hash), (Some(p), Some(c)) if p == c)
-}
-
 fn focused_edit_policy_violation_feedback_note(
     unresolved_errors: &[String],
     allowed_tools: Option<&[&str]>,
@@ -24460,8 +24449,8 @@ mod progress_tests {
         focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
         framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
-        has_successful_repo_edit, implementation_quality_issue_for_request, is_repo_edit_no_op,
-        is_utf8_locale, last_read_tool_path, latest_page_copy_block_from_read,
+        has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
+        last_read_tool_path, latest_page_copy_block_from_read,
         latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
         parse_verifier_repair_assessment_reply, parse_verifier_repair_intent_reply,
         parse_verifier_repair_intents_reply, post_scaffold_continuation_active,
@@ -32116,19 +32105,6 @@ export default function App() {
             work_root,
             &scope
         ));
-    }
-
-    #[test]
-    fn no_op_repo_edit_detector_returns_true_only_for_matching_hashes() {
-        // Issue #646 (A4 / C2): the pure helper guarding
-        // `observe_evidence_from_repo_edit` against no-op Write/Edit calls.
-        // Identical pre/post hashes → no-op; any difference, or a None on
-        // either side, → real edit (insertion + evidence flow proceeds).
-        assert!(is_repo_edit_no_op(Some("abc"), Some("abc")));
-        assert!(!is_repo_edit_no_op(Some("abc"), Some("def")));
-        assert!(!is_repo_edit_no_op(None, Some("abc"))); // file didn't exist before
-        assert!(!is_repo_edit_no_op(Some("abc"), None)); // file deleted (treat as edit)
-        assert!(!is_repo_edit_no_op(None, None));
     }
 
     #[test]

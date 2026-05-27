@@ -264,3 +264,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier invocation and external-import rejection payload
   construction is now isolated in `auto_test.rs`; `turn.rs` owns emission
   timing/masking/dedup but not the verifier snapshot telemetry schema.
+- Current status: no-op repository edit detection is now isolated in
+  `completion_evidence.rs`; `turn.rs` owns tool-result observation timing but
+  not the content-hash predicate for RepoEdit evidence admission.

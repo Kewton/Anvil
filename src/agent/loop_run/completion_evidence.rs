@@ -172,6 +172,13 @@ pub(crate) fn classify_repo_edit_path<P: AsRef<Path>>(path: P) -> RepoEditCatego
     RepoEditCategory::Other
 }
 
+/// Returns true only when a repository edit tool completed but left the file
+/// content hash unchanged. Missing hashes are treated conservatively as real
+/// edits because they represent first observation, creation, or deletion.
+pub(crate) fn is_repo_edit_no_op(pre_tool_hash: Option<&str>, current_hash: Option<&str>) -> bool {
+    matches!((pre_tool_hash, current_hash), (Some(p), Some(c)) if p == c)
+}
+
 fn has_docs_extension(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
@@ -375,6 +382,15 @@ mod tests {
             classify_repo_edit_path(PathBuf::from("Makefile")),
             RepoEditCategory::Other
         );
+    }
+
+    #[test]
+    fn repo_edit_no_op_detector_returns_true_only_for_matching_hashes() {
+        assert!(is_repo_edit_no_op(Some("abc"), Some("abc")));
+        assert!(!is_repo_edit_no_op(Some("abc"), Some("def")));
+        assert!(!is_repo_edit_no_op(None, Some("abc"))); // file didn't exist before
+        assert!(!is_repo_edit_no_op(Some("abc"), None)); // file deleted
+        assert!(!is_repo_edit_no_op(None, None));
     }
 
     // ----------------------------- EvidenceSet basics ---------------------

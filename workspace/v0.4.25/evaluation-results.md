@@ -1473,3 +1473,28 @@ Assessment:
 
 - No behavior change intended. The verifier execution module now owns the
   sanitized payload projection for the verifier snapshot it already produces.
+
+## Structural Verification: Slice 68
+
+Scope:
+
+- Move no-op repo-edit content-hash detection from `turn.rs` to
+  `completion_evidence.rs`.
+- Keep actor-loop ownership of when to observe a tool result, but keep
+  RepoEdit evidence admission predicates with completion evidence.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test completion_evidence --lib -q`: pass, 27 tests.
+- `cargo test repo_edit_no_op --lib -q`: pass, 2 tests when rerun outside
+  sandbox.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. RepoEdit evidence category and no-op
+  detection now share the same pure module, reducing actor-loop policy
+  surface.

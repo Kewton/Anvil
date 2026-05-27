@@ -2410,3 +2410,31 @@ Assessment:
 - No behavior change intended. Verifier execution telemetry is now colocated
   with verifier execution/snapshot logic instead of remaining as actor-loop
   schema construction.
+
+### 2026-05-27 Slice 68
+
+Applied:
+
+- Moved the no-op repository edit detector from `turn.rs` to
+  `completion_evidence.rs`.
+- The completion-evidence module now owns both repo-edit path classification
+  and the content-hash guard that decides whether an edit can become
+  RepoEdit evidence.
+- Removed the duplicate actor-loop unit test and kept the pure invariant test
+  with the evidence module.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test completion_evidence --lib -q`: pass, 27 tests
+- `cargo test repo_edit_no_op --lib -q`: pass, 2 tests when rerun outside
+  sandbox
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Actor-loop repo-edit observation now consumes
+  a completion-evidence-owned no-op predicate instead of defining another
+  evidence admission rule locally.
