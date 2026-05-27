@@ -163,6 +163,9 @@ mod repair_framework_findings;
 // v0.4.25: diagnostic LLM assessment JSON boundary. Keeps schema-shape
 // tolerance and enum mapping out of the actor loop dispatcher.
 mod verifier_assessment_parser;
+// v0.4.25: verifier failure fingerprint/signature helpers. Keeps log
+// summarization out of the actor loop dispatcher.
+mod verifier_failure_signature;
 // v0.4.25: verifier-repair shadow telemetry and legacy brief projection.
 // Keeps observational payload shaping out of the actor loop dispatcher.
 mod verifier_repair_shadow;

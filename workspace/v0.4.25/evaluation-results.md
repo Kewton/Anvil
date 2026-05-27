@@ -939,3 +939,23 @@ Assessment:
 
 - No behavior change intended. The admission module now owns its basic
   ownership-gate characterization tests.
+
+## Structural Verification: Slice 45
+
+Scope:
+
+- Extract verifier failure signature and compact failure text helpers from
+  `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_failure_signature --lib -q`: pass, 2 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Failure fingerprint text shaping is now
+  independently owned; RepairJob context assembly remains in `turn.rs`.
