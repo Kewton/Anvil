@@ -1150,3 +1150,28 @@ Assessment:
 - Phase-1 repair-intent validation is now validation-owned.
 - `turn.rs` still owns the high-level sequence, Python evidence gathering,
   and weakening detector dispatch.
+
+### 2026-05-27 Slice 20
+
+Applied:
+
+- Moved repair-intent list bounds validation into
+  `repair_patch_validation.rs`.
+- `turn.rs` now maps the typed bounds error into the legacy
+  `ValidationFailure` carrier instead of owning the empty/too-many branches.
+- Added a module test for empty, too-many, and accepted bounds.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 29 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3011 tests when rerun outside sandbox
+
+Assessment:
+
+- The remaining `validate_verifier_repair_intents_inner` validation logic in
+  `turn.rs` is mostly orchestration, Python evidence gathering, and weakening
+  detector dispatch.

@@ -128,3 +128,5 @@ with legacy/fallback paths unable to override it.
 - Current status: per-intent path/text validation and edit-payload construction
   are now validation-owned; `turn.rs` only maps typed validation errors back
   into legacy repair rejection carriers.
+- Current status: repair-intent list bounds are now validation-owned; the
+  actor loop no longer owns empty/too-many intent branches.

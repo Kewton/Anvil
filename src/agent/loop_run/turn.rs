@@ -24602,16 +24602,11 @@ fn validate_verifier_repair_intents_inner(
     // check (validation rejection). Only the patch-validation cheap content
     // check can produce `CheapCheckOutcome::Unavailable`; this wrapper maps
     // the typed module error back into the legacy outcome carrier.
-    if intents.is_empty() {
-        return Err(ValidationFailure::failed(
-            "repair intent list must not be empty".to_string(),
-        ));
-    }
-    if intents.len() > VERIFIER_REPAIR_PASS_MAX_EDITS {
-        return Err(ValidationFailure::failed(
-            "repair intent list contained too many edits".to_string(),
-        ));
-    }
+    super::repair_patch_validation::validate_repair_intent_list_bounds(
+        intents.len(),
+        VERIFIER_REPAIR_PASS_MAX_EDITS,
+    )
+    .map_err(|err| ValidationFailure::failed(err.message().to_string()))?;
     let target_snapshot = super::repair_patch_validation::read_repair_target_snapshot(
         work_root,
         &target_hint.path,

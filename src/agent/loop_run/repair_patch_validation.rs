@@ -108,6 +108,21 @@ pub(super) enum RepairIntentPayloadValidationError {
     Input(RepairIntentInputError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RepairIntentListBoundsError {
+    Empty,
+    TooMany,
+}
+
+impl RepairIntentListBoundsError {
+    pub(super) fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "repair intent list must not be empty",
+            Self::TooMany => "repair intent list contained too many edits",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairTargetSnapshot {
     pub(super) relative_path: String,
@@ -545,6 +560,19 @@ pub(super) fn validate_repair_intent_not_replayed(
         .any(|applied| applied == fingerprint)
     {
         return Err(RepairCandidateDuplicateIntentError);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_repair_intent_list_bounds(
+    intent_count: usize,
+    max_intents: usize,
+) -> Result<(), RepairIntentListBoundsError> {
+    if intent_count == 0 {
+        return Err(RepairIntentListBoundsError::Empty);
+    }
+    if intent_count > max_intents {
+        return Err(RepairIntentListBoundsError::TooMany);
     }
     Ok(())
 }
@@ -1629,6 +1657,19 @@ mod tests {
             err,
             RepairIntentPayloadValidationError::Input(RepairIntentInputError::Noop)
         );
+    }
+
+    #[test]
+    fn repair_intent_list_bounds_rejects_empty_and_too_many() {
+        assert_eq!(
+            validate_repair_intent_list_bounds(0, 2).unwrap_err(),
+            RepairIntentListBoundsError::Empty
+        );
+        assert_eq!(
+            validate_repair_intent_list_bounds(3, 2).unwrap_err(),
+            RepairIntentListBoundsError::TooMany
+        );
+        assert!(validate_repair_intent_list_bounds(2, 2).is_ok());
     }
 
     #[test]
