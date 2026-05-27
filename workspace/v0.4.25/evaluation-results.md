@@ -510,3 +510,24 @@ Assessment:
 
 - No behavior change intended. The remaining actor-loop role is lifecycle
   event application, not classifier ownership.
+
+## Structural Verification: Slice 26
+
+Scope:
+
+- Move `ValidationFailure` stable reason-label projection out of `turn.rs`.
+- Keep the existing log labels unchanged.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Validation-owned typed failures now own their
+  telemetry label projection too.

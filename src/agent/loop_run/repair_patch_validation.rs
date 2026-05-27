@@ -131,6 +131,23 @@ impl ValidationFailure {
             rejection_signal: Some(signal),
         }
     }
+
+    pub(super) fn reason_label(&self) -> &'static str {
+        if self.weakening.is_some() {
+            return "weakening";
+        }
+        if let Some(signal) = self.rejection_signal {
+            return match signal {
+                RepairRejectionSignal::Noop => "noop",
+                RepairRejectionSignal::Duplicate => "duplicate",
+                RepairRejectionSignal::Malformed => "malformed",
+            };
+        }
+        match self.outcome {
+            CheapCheckOutcome::Failed(_) => "validation_failed",
+            CheapCheckOutcome::Unavailable => "cheap_check_unavailable",
+        }
+    }
 }
 
 impl From<String> for ValidationFailure {

@@ -1309,3 +1309,26 @@ Assessment:
 - No behavior change intended. `turn.rs` no longer owns repair lifecycle event
   classification for invalid patch errors; it still decides when to apply the
   returned event to the active job.
+
+### 2026-05-27 Slice 26
+
+Applied:
+
+- Moved `ValidationFailure` telemetry reason-label projection into
+  `repair_patch_validation.rs`.
+- Removed the remaining `turn.rs` helper that reinterpreted validation failure
+  fields for logging.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Validation-owned error data now also owns its
+  stable telemetry label.

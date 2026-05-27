@@ -14557,10 +14557,7 @@ impl Agent {
             &target_hint.path,
         ) {
             return VerifierRepairPassOutcome::Invalid {
-                error: format!(
-                    "verifier_repair_pass_invalid: {}",
-                    validation_failure_reason_label(&err)
-                ),
+                error: format!("verifier_repair_pass_invalid: {}", err.reason_label()),
                 repair_attempt_outcome: build_verifier_repair_pass_ledger_outcome(
                     err.weakening,
                     err.rejection_signal,
@@ -24092,7 +24089,7 @@ fn emit_patch_proposal_legacy_validation_comparison_event(
     let legacy_reason = legacy_validation
         .as_ref()
         .err()
-        .map(validation_failure_reason_label)
+        .map(ValidationFailure::reason_label)
         .unwrap_or("ok");
     let agreement = if shadow_validation.is_decisive() {
         Some(shadow_validation.accepted() == legacy_validation.is_ok())
@@ -24114,23 +24111,6 @@ fn emit_patch_proposal_legacy_validation_comparison_event(
             "decisive_agreement": agreement,
         }),
     );
-}
-
-fn validation_failure_reason_label(failure: &ValidationFailure) -> &'static str {
-    if failure.weakening.is_some() {
-        return "weakening";
-    }
-    if let Some(signal) = failure.rejection_signal {
-        return match signal {
-            RepairRejectionSignal::Noop => "noop",
-            RepairRejectionSignal::Duplicate => "duplicate",
-            RepairRejectionSignal::Malformed => "malformed",
-        };
-    }
-    match failure.outcome {
-        CheapCheckOutcome::Failed(_) => "validation_failed",
-        CheapCheckOutcome::Unavailable => "cheap_check_unavailable",
-    }
 }
 
 fn patch_proposal_target_contents_for_shadow(
