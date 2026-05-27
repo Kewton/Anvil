@@ -1429,3 +1429,25 @@ Assessment:
 
 - No behavior change intended. The actor loop no longer owns
   behavior-contract trust narrowing or prompt-payload size control.
+
+## Structural Verification: Slice 66
+
+Scope:
+
+- Move `agent.active_job.selected` payload construction from `turn.rs` to
+  `active_job_arbiter.rs`.
+- Keep log emission and dedup in `turn.rs`; colocate the schema with the
+  active-job projection owner.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test active_job_arbiter --lib -q`: pass, 46 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop now consumes the active-job
+  payload builder instead of owning that schema itself.

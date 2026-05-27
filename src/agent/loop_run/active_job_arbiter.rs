@@ -39,7 +39,9 @@ use super::task_contract::{
     VerifierPrerequisiteSignal, has_required_setup_artifact,
 };
 use super::tool_policy::EffectiveToolPolicy;
+use crate::logging::stable_path_hash;
 use crate::modes::plan_act::ExecutionMode;
+use crate::session::feedback::mask_secrets;
 
 /// Controller-facing next action for the pre-model part of the actor loop.
 ///
@@ -613,6 +615,112 @@ pub(super) fn project_policy(selection: &ActiveJobSelection) -> EffectiveToolPol
         .as_ref()
         .map(|c| c.policy.clone())
         .unwrap_or_else(EffectiveToolPolicy::unrestricted)
+}
+
+/// Issue #660 (Phase C / DD-5 / Stage 4 DR4-001/002) — pure builder that
+/// renders an `ActiveJobSelection` to the `agent.active_job.selected`
+/// payload. The payload schema (proposed to #666) is:
+///
+/// ```json
+/// {
+///   "iteration_seq": <u32>,
+///   "selected": {
+///     "job_kind": "<kind>|None",
+///     "desired_action": "<short type label>",
+///     "policy_reason": "<EffectiveToolPolicyReason::as_str()>",
+///     "allowed_tools_count": <u32>,
+///     "target_path_hash": "<hex16>|null"
+///   },
+///   "rejected": [{"job_kind": "<kind>", "rejection_reason": "LowerPriority|BudgetExhausted"}],
+///   "policy_projected": {"reason_label": "<...>", "allowed_tool_kinds": <u32>},
+///   "budget_state": {"repair_attempts": <u32>, "artifact_attempts": <u32>}
+/// }
+/// ```
+///
+/// Security invariants:
+/// - Raw verifier commands never appear; `DesiredAction::VerifierRepair`
+///   collapses to the static label `"verifier_repair"` only.
+/// - Raw `PathBuf` targets never appear; `target_path_hash` is the
+///   non-cryptographic correlator `stable_path_hash(mask_secrets(...))`.
+/// - Log emission still re-applies `mask_payload_inplace` in `turn.rs`.
+pub(super) fn build_active_job_selected_payload(
+    selection: &ActiveJobSelection,
+    iteration_seq: u32,
+    repair_attempts: u32,
+    artifact_attempts: u32,
+) -> serde_json::Value {
+    let projected_policy = project_policy(selection);
+    let policy_reason_label = projected_policy.reason().as_str();
+    let allowed_tool_kinds = projected_policy
+        .allowed_tool_names_for_prompt()
+        .map(|t| t.len() as u32)
+        .unwrap_or(0);
+
+    let selected_block = match selection.selected.as_ref() {
+        Some(candidate) => {
+            let target_path_hash = candidate
+                .desired_action
+                .target_path()
+                .map(|path| {
+                    // Never emit the raw path. The mask pass catches inline
+                    // credentials; the hash gives dataset consumers a stable
+                    // correlator without leaking the literal path.
+                    let masked = mask_secrets(&path.display().to_string());
+                    serde_json::Value::String(stable_path_hash(&masked))
+                })
+                .unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "job_kind": candidate.kind.as_str(),
+                "desired_action": candidate.desired_action.label(),
+                "policy_reason": candidate.policy.reason().as_str(),
+                "allowed_tools_count": candidate
+                    .policy
+                    .allowed_tool_names_for_prompt()
+                    .map(|t| t.len() as u32)
+                    .unwrap_or(0),
+                "target_path_hash": target_path_hash,
+            })
+        }
+        None => serde_json::json!({
+            "job_kind": "None",
+            "desired_action": serde_json::Value::Null,
+            "policy_reason": projected_policy.reason().as_str(),
+            "allowed_tools_count": allowed_tool_kinds,
+            "target_path_hash": serde_json::Value::Null,
+        }),
+    };
+
+    let rejected_block: Vec<serde_json::Value> = selection
+        .rejected
+        .iter()
+        .map(|rj| {
+            // `RejectionReason` only has `LowerPriority` and
+            // `BudgetExhausted` — both reduce to a single static label
+            // without leaking external strings.
+            let reason_label = match rj.reason {
+                RejectionReason::LowerPriority { .. } => "LowerPriority",
+                RejectionReason::BudgetExhausted { .. } => "BudgetExhausted",
+            };
+            serde_json::json!({
+                "job_kind": rj.kind.as_str(),
+                "rejection_reason": reason_label,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "iteration_seq": iteration_seq,
+        "selected": selected_block,
+        "rejected": rejected_block,
+        "policy_projected": {
+            "reason_label": policy_reason_label,
+            "allowed_tool_kinds": allowed_tool_kinds,
+        },
+        "budget_state": {
+            "repair_attempts": repair_attempts,
+            "artifact_attempts": artifact_attempts,
+        },
+    })
 }
 
 // Issue #661 DR1-002 / DR2-005: the previous `#[cfg(test)]` private

@@ -1,6 +1,7 @@
 use super::active_job_arbiter::{
     LoopControlAction, LoopControlInputs, RecoveryDispatchGate, RecoveryOwner,
-    determine_loop_control_action, loop_control_action_requires_missing_verifier_setup,
+    build_active_job_selected_payload, determine_loop_control_action,
+    loop_control_action_requires_missing_verifier_setup,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -23169,127 +23170,6 @@ fn format_numbered_read_block(contents: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-/// Issue #660 (Phase C / DD-5 / Stage 4 DR4-001/002) — pure builder that
-/// renders an `ActiveJobSelection` to the `agent.active_job.selected`
-/// payload. The payload schema (proposed to #666) is:
-///
-/// ```json
-/// {
-///   "iteration_seq": <u32>,
-///   "selected": {
-///     "job_kind": "<kind>|None",
-///     "desired_action": "<short type label>",
-///     "policy_reason": "<EffectiveToolPolicyReason::as_str()>",
-///     "allowed_tools_count": <u32>,
-///     "target_path_hash": "<hex16>|null"
-///   },
-///   "rejected": [{"job_kind": "<kind>", "rejection_reason": "LowerPriority|BudgetExhausted"}],
-///   "policy_projected": {"reason_label": "<...>", "allowed_tool_kinds": <u32>},
-///   "budget_state": {"repair_attempts": <u32>, "artifact_attempts": <u32>}
-/// }
-/// ```
-///
-/// **Security invariants** (§7 of design policy):
-/// - Raw verifier commands NEVER appear; `DesiredAction::VerifierRepair`
-///   collapses to the static label `"verifier_repair"` only.
-/// - Raw `PathBuf` targets NEVER appear; `target_path_hash` is the
-///   non-cryptographic correlator `crate::logging::stable_path_hash(
-///   mask_secrets(...))` (Issue #661 DR1-002: SSOT promoted from the
-///   prior `stable_path_hash_for_active_job` private helper to
-///   `logging.rs` so #659/#660/#661 path_hash values share one SSOT).
-/// - `log_llm_event` re-applies `mask_payload_inplace` as the final
-///   defense line.
-pub(super) fn build_active_job_selected_payload(
-    selection: &super::active_job_arbiter::ActiveJobSelection,
-    iteration_seq: u32,
-    repair_attempts: u32,
-    artifact_attempts: u32,
-) -> serde_json::Value {
-    let projected_policy = super::active_job_arbiter::project_policy(selection);
-    let policy_reason_label = projected_policy.reason().as_str();
-    let allowed_tool_kinds = projected_policy
-        .allowed_tool_names_for_prompt()
-        .map(|t| t.len() as u32)
-        .unwrap_or(0);
-
-    let selected_block = match selection.selected.as_ref() {
-        Some(candidate) => {
-            let target_path_hash = candidate
-                .desired_action
-                .target_path()
-                .map(|path| {
-                    // Stage 4 DR4-001: never emit the raw path. The mask
-                    // pass catches inline credentials; the hash gives
-                    // dataset consumers a stable correlator without
-                    // leaking the literal path.
-                    let masked =
-                        crate::session::feedback::mask_secrets(&path.display().to_string());
-                    serde_json::Value::String(stable_path_hash(&masked))
-                })
-                .unwrap_or(serde_json::Value::Null);
-            serde_json::json!({
-                "job_kind": candidate.kind.as_str(),
-                "desired_action": candidate.desired_action.label(),
-                "policy_reason": candidate.policy.reason().as_str(),
-                "allowed_tools_count": candidate
-                    .policy
-                    .allowed_tool_names_for_prompt()
-                    .map(|t| t.len() as u32)
-                    .unwrap_or(0),
-                "target_path_hash": target_path_hash,
-            })
-        }
-        None => serde_json::json!({
-            "job_kind": "None",
-            "desired_action": serde_json::Value::Null,
-            "policy_reason": projected_policy.reason().as_str(),
-            "allowed_tools_count": allowed_tool_kinds,
-            "target_path_hash": serde_json::Value::Null,
-        }),
-    };
-
-    let rejected_block: Vec<serde_json::Value> = selection
-        .rejected
-        .iter()
-        .map(|rj| {
-            // DR1-004: `RejectionReason` only has `LowerPriority` and
-            // `BudgetExhausted` — both reduce to a single static label
-            // without leaking external strings.
-            let reason_label = match rj.reason {
-                super::active_job_arbiter::RejectionReason::LowerPriority { .. } => "LowerPriority",
-                super::active_job_arbiter::RejectionReason::BudgetExhausted { .. } => {
-                    "BudgetExhausted"
-                }
-            };
-            serde_json::json!({
-                "job_kind": rj.kind.as_str(),
-                "rejection_reason": reason_label,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "iteration_seq": iteration_seq,
-        "selected": selected_block,
-        "rejected": rejected_block,
-        "policy_projected": {
-            "reason_label": policy_reason_label,
-            "allowed_tool_kinds": allowed_tool_kinds,
-        },
-        "budget_state": {
-            "repair_attempts": repair_attempts,
-            "artifact_attempts": artifact_attempts,
-        },
-    })
-}
-
-// Issue #661 DR1-002 / DR2-005: the previous `stable_path_hash_for_active_job`
-// private helper has been removed and `build_active_job_selected_payload`
-// now uses `crate::logging::stable_path_hash` directly. The hash algorithm
-// (16-hex `DefaultHasher`) is unchanged, so `agent.active_job.selected`
-// payload `target_path_hash` values remain byte-for-byte identical with
-// pre-migration emissions.
 
 /// Issue #661 iteration-4 Task 5.2 (DR1-005 / Section 8-1): pure builder for
 /// the `agent.verifier.invoked` event payload. Extracted as a free function

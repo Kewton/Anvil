@@ -2359,3 +2359,28 @@ Assessment:
 - No behavior change intended. Behavior-contract trust narrowing and payload
   size control now live with the behavior contract schema instead of inside
   actor-loop prompt assembly.
+
+### 2026-05-27 Slice 66
+
+Applied:
+
+- Moved `agent.active_job.selected` payload construction from `turn.rs` to
+  `active_job_arbiter.rs`.
+- The active-job arbiter now owns the sanitized projection of selected job,
+  rejected jobs, projected policy, and budget counters.
+- `turn.rs` still owns the emission timing/dedup path, but no longer owns the
+  selected-job payload schema.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test active_job_arbiter --lib -q`: pass, 46 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Active-job structured output is now colocated
+  with active-job selection/projection, reducing another actor-loop schema
+  responsibility.

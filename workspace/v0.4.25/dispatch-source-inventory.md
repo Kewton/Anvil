@@ -258,3 +258,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier prompt `behavior_contract` payload shaping is now
   isolated in `required_behavior.rs`; `turn.rs` attaches the shaped data but
   no longer owns cap/drop/truncation rules for that untrusted metadata.
+- Current status: `agent.active_job.selected` payload construction is now
+  isolated in `active_job_arbiter.rs`; `turn.rs` owns emission timing/dedup
+  but not the active-job selected/rejected schema projection.
