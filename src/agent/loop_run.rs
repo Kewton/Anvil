@@ -137,6 +137,9 @@ mod patch_proposal;
 // v0.4.16: patch-provider admission boundary. Providers propose concrete
 // edits only after the controller has accepted a repair plan.
 mod patch_provider;
+// v0.4.25: applies already validated verifier-repair patches with preimage
+// protection. This is intentionally separate from patch validation.
+mod repair_patch_executor;
 // v0.4.25: pure patch-admission checks shared by verifier repair validation.
 mod repair_patch_validation;
 // v0.4.13 Phase 6: verifier rerun progress classifier.

@@ -82,6 +82,9 @@ with legacy/fallback paths unable to override it.
   shared Python diagnostic helpers are separated.
 - Moved the validated repair edit carrier and hash construction into
   `repair_patch_validation.rs`.
+- Added `repair_patch_executor.rs` for the only workspace-mutating step in
+  verifier repair patch application. It applies a validated edit after
+  checking the target preimage hash still matches.
 
 ## Remaining Work
 
@@ -96,3 +99,5 @@ with legacy/fallback paths unable to override it.
 - Keep disk write/apply orchestration in `turn.rs` unless a separate
   executor boundary is introduced; patch validation should not silently mutate
   the workspace.
+- Current status: an executor boundary exists. `turn.rs` still decides when to
+  invoke it; the executor owns the write mechanics and preimage guard.

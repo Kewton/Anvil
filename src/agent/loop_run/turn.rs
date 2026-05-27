@@ -15077,7 +15077,9 @@ impl Agent {
                         if context.applied_repair_intents.contains(&edit.fingerprint) {
                             last_error =
                                 "duplicate repair edit intent for the same failure".to_string();
-                        } else if let Err(err) = apply_validated_verifier_repair_edit(&edit) {
+                        } else if let Err(err) =
+                            super::repair_patch_executor::apply_validated_repair_edit(&edit)
+                        {
                             last_error = format!("failed to apply {}: {err}", edit.relative_path);
                             break;
                         } else {
@@ -25329,18 +25331,6 @@ fn normalize_assert_literal_token(raw: &str) -> Option<String> {
     safe.then_some(normalized)
 }
 
-fn apply_validated_verifier_repair_edit(edit: &ValidatedVerifierRepairEdit) -> Result<(), String> {
-    let current = std::fs::read(&edit.canonical_path)
-        .map_err(|err| format!("failed to read current target before apply: {err}"))?;
-    let current_hash = sha256_hex(&current);
-    if current_hash != edit.preimage_hash {
-        return Err("preimage changed after validation".to_string());
-    }
-    std::fs::write(&edit.canonical_path, edit.updated_contents.as_bytes())
-        .map_err(|err| format!("failed to write validated repair target: {err}"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 fn verifier_repair_intent_fingerprint(
     context: &super::repair_job::RepairJob,
@@ -30371,18 +30361,18 @@ mod progress_tests {
         RepairRejectionSignal, VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
         VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
         ValidationFailure, VerifierRepairDecision, VerifierRepairIntent,
-        apply_validated_verifier_repair_edit, artifact_directed_tool_policy_error,
-        classify_verifier_failure_type, deterministic_empty_framework_app_files,
-        deterministic_empty_framework_game_files, deterministic_framework_app_files_needed,
-        deterministic_framework_game_files_needed, deterministic_support_target_relative,
-        diagnostic_target_allowed_by_confidence, effective_tool_batch_action,
-        effective_tool_policy_error_for_call, effective_tool_policy_error_for_call_with_scope,
-        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
-        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
-        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
-        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
-        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
+        artifact_directed_tool_policy_error, classify_verifier_failure_type,
+        deterministic_empty_framework_app_files, deterministic_empty_framework_game_files,
+        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
+        deterministic_support_target_relative, diagnostic_target_allowed_by_confidence,
+        effective_tool_batch_action, effective_tool_policy_error_for_call,
+        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
+        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
+        first_existing_impl_target, focused_edit_compact_anchor_note,
+        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
+        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
+        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
+        focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
@@ -31807,7 +31797,8 @@ mod progress_tests {
         let edit = validate_verifier_repair_intent(work_root, &context, &target, intent).unwrap();
         std::fs::write(&target_path, "value = 3\n").unwrap();
 
-        let err = apply_validated_verifier_repair_edit(&edit).unwrap_err();
+        let err =
+            super::super::repair_patch_executor::apply_validated_repair_edit(&edit).unwrap_err();
         assert!(err.contains("preimage changed"), "got: {err}");
         assert_eq!(
             std::fs::read_to_string(&target_path).unwrap(),

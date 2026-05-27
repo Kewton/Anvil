@@ -862,3 +862,38 @@ Assessment:
 - The next meaningful cleanup is to decide whether the Python diagnostic
   helpers should be extracted into a shared module before moving weakening
   detector dispatch.
+
+### 2026-05-27 Slice 10
+
+Applied:
+
+- Added `repair_patch_executor.rs` as the execution boundary for already
+  validated verifier-repair edits.
+- Moved disk apply logic out of `turn.rs`:
+  - read current target;
+  - verify preimage hash has not changed;
+  - write validated contents.
+- Kept target selection, authority, path validation, and edit construction out
+  of the executor. The executor only applies a previously validated edit.
+- Added executor module tests for:
+  - successful apply when preimage matches;
+  - rejection when preimage changed;
+  - read failure reporting.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_executor --lib -q`: pass, 3 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo test verifier_repair_apply_rejects_changed_preimage --lib -q`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 2999 tests when rerun outside sandbox
+
+Assessment:
+
+- `turn.rs` no longer owns patch apply mechanics; it orchestrates when the
+  executor is called.
+- The remaining `turn.rs` repair-validation responsibility is primarily the
+  weakening detector dispatch and the high-level sequence inside
+  `validate_verifier_repair_intents_inner`.
