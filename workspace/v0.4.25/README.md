@@ -1439,3 +1439,30 @@ Assessment:
 - No behavior change intended. `turn.rs` still sequences verifier repair
   validation, but Python import-contract probing is no longer embedded in the
   dispatcher.
+
+### 2026-05-27 Slice 31
+
+Applied:
+
+- Added `repair_python_test_analysis.rs` for Python pytest/test-fragment
+  analysis shared by verifier framework diagnostics and semantic test-repair
+  validation.
+- Moved local mutable fixture detection, disconnected fixture assertion
+  detection, and Python identifier-boundary line matching out of `turn.rs`.
+- Updated framework diagnostic and semantic weakening-filter call sites to use
+  the shared module.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_python_test_analysis --lib -q`: pass, 3 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3023 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. This reduces duplicated Python test analysis in
+  the actor loop and narrows the remaining semantic weakening filter
+  dependency surface.

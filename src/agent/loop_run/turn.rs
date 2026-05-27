@@ -33,6 +33,11 @@ use super::repair_patch_validation::{
     VerifierRepairIntent, build_verifier_repair_pass_ledger_outcome,
     validate_accepted_repair_plan_authorizes_target,
 };
+use super::repair_python_test_analysis::{
+    excerpt_asserts_fixture_state, excerpt_connects_fixture_to_system_under_test,
+    excerpt_has_disconnected_fixture_state_assertion, line_mentions_identifier,
+    pytest_local_mutable_fixture_names,
+};
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
@@ -2636,7 +2641,7 @@ fn verifier_framework_findings_for_diagnostic(
                 summary: "pytest setup imports a missing local module that implementation artifacts do not import; repair the generated test setup/imports before creating a provider module".to_string(),
             });
         }
-        if python_excerpt_has_disconnected_fixture_state_assertion(&excerpt.excerpt) {
+        if excerpt_has_disconnected_fixture_state_assertion(&excerpt.excerpt) {
             findings.push(VerifierDiagnosticFrameworkFinding {
                 kind: VerifierDiagnosticFrameworkFindingKind::DisconnectedFixtureStateAssertion,
                 path: excerpt.path.clone(),
@@ -2947,138 +2952,8 @@ fn python_module_source_uses_name_outside_definition(
         {
             return false;
         }
-        python_line_mentions_identifier(trimmed, name)
+        line_mentions_identifier(trimmed, name)
     })
-}
-
-fn python_excerpt_has_disconnected_fixture_state_assertion(excerpt: &str) -> bool {
-    let fixture_names = python_pytest_local_mutable_fixture_names(excerpt);
-    if fixture_names.is_empty() {
-        return false;
-    }
-    fixture_names.iter().any(|name| {
-        python_excerpt_asserts_fixture_state(excerpt, name)
-            && !python_excerpt_connects_fixture_to_system_under_test(excerpt, name)
-    })
-}
-
-fn python_pytest_local_mutable_fixture_names(excerpt: &str) -> HashSet<String> {
-    let lines = excerpt.lines().collect::<Vec<_>>();
-    let mut fixtures = HashSet::new();
-    let mut index = 0usize;
-    while index < lines.len() {
-        if !lines[index].trim_start().starts_with("@pytest.fixture") {
-            index += 1;
-            continue;
-        }
-        let mut def_index = index + 1;
-        while def_index < lines.len() && lines[def_index].trim().is_empty() {
-            def_index += 1;
-        }
-        let Some(name) = lines
-            .get(def_index)
-            .and_then(|line| python_def_name(line.trim_start()))
-        else {
-            index += 1;
-            continue;
-        };
-        let body_indent = lines
-            .get(def_index)
-            .map(|line| line.chars().take_while(|ch| ch.is_whitespace()).count() + 1)
-            .unwrap_or(1);
-        let mut body = String::new();
-        let mut body_index = def_index + 1;
-        while body_index < lines.len() {
-            let line = lines[body_index];
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let indent = line.chars().take_while(|ch| ch.is_whitespace()).count();
-                if indent < body_indent {
-                    break;
-                }
-            }
-            body.push_str(line);
-            body.push('\n');
-            body_index += 1;
-        }
-        if python_fixture_body_returns_local_mutable(&body) {
-            fixtures.insert(name.to_string());
-        }
-        index = body_index.max(index + 1);
-    }
-    fixtures
-}
-
-fn python_def_name(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("def ")?;
-    let name = rest.split_once('(')?.0.trim();
-    python_identifier_for_diagnostic_is_safe(name).then_some(name)
-}
-
-fn python_fixture_body_returns_local_mutable(body: &str) -> bool {
-    body.lines().any(|line| {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        matches!(
-            trimmed,
-            "return {}" | "return []" | "return set()" | "return dict()" | "return list()"
-        )
-    })
-}
-
-fn python_excerpt_asserts_fixture_state(excerpt: &str, fixture_name: &str) -> bool {
-    excerpt.lines().any(|line| {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim_start();
-        trimmed.starts_with("assert ")
-            && (trimmed.contains(&format!("len({fixture_name})"))
-                || trimmed.contains(&format!("{fixture_name} =="))
-                || trimmed.contains(&format!("{fixture_name} !="))
-                || trimmed.contains(&format!("{fixture_name}[")))
-    })
-}
-
-fn python_excerpt_connects_fixture_to_system_under_test(excerpt: &str, fixture_name: &str) -> bool {
-    excerpt.lines().any(|line| {
-        let stripped = strip_python_inline_comment_for_diagnostic(line);
-        let trimmed = stripped.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("assert ")
-            || trimmed.starts_with("def ")
-            || trimmed.starts_with("@")
-            || trimmed.starts_with("return ")
-        {
-            return false;
-        }
-        if !python_line_mentions_identifier(trimmed, fixture_name) {
-            return false;
-        }
-        trimmed.contains("dependency_overrides")
-            || trimmed.contains("monkeypatch")
-            || trimmed.contains("setattr(")
-            || trimmed.contains(".state.")
-            || trimmed.contains(".app.")
-            || trimmed.contains("override")
-            || trimmed.contains("patch(")
-    })
-}
-
-fn python_line_mentions_identifier(line: &str, name: &str) -> bool {
-    let Some(start) = line.find(name) else {
-        return false;
-    };
-    let before_ok = start == 0
-        || line[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()));
-    let end = start + name.len();
-    let after_ok = end >= line.len()
-        || line[end..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !(ch == '_' || ch.is_ascii_alphanumeric()));
-    before_ok && after_ok
 }
 
 fn python_from_imported_names(excerpt: &str) -> HashSet<String> {
@@ -24209,11 +24084,11 @@ fn disconnected_fixture_assertion_update_matches(
     before: &str,
     after: &str,
 ) -> bool {
-    let disconnected_fixtures = python_pytest_local_mutable_fixture_names(before)
+    let disconnected_fixtures = pytest_local_mutable_fixture_names(before)
         .into_iter()
         .filter(|name| {
-            python_excerpt_asserts_fixture_state(before, name)
-                && !python_excerpt_connects_fixture_to_system_under_test(before, name)
+            excerpt_asserts_fixture_state(before, name)
+                && !excerpt_connects_fixture_to_system_under_test(before, name)
         })
         .collect::<HashSet<_>>();
     if disconnected_fixtures.is_empty() {
@@ -24280,7 +24155,7 @@ fn test_only_missing_import_symbol_update_matches(
     let changed_non_asserts = changed_non_assert_lines(before, after);
     if !changed_non_asserts
         .iter()
-        .any(|line| python_line_mentions_identifier(line, &name))
+        .any(|line| line_mentions_identifier(line, &name))
     {
         return false;
     }

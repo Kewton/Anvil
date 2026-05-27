@@ -159,3 +159,6 @@ with legacy/fallback paths unable to override it.
 - Current status: Python import-contract evidence gathering is now isolated in
   `repair_python_import_evidence.rs`; `turn.rs` still owns the semantic
   generated-test weakening decision and some Python diagnostic helper logic.
+- Current status: Python pytest/test-fragment fixture analysis is now isolated
+  in `repair_python_test_analysis.rs`; `turn.rs` still owns semantic repair
+  authority decisions and the high-level weakening filter.

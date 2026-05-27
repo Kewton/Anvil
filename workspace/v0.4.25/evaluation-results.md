@@ -619,3 +619,26 @@ Assessment:
 - No behavior change intended. The new module owns the filesystem evidence
   probe; the actor loop only supplies `work_root`, candidate contents, and
   the file-size cap.
+
+## Structural Verification: Slice 31
+
+Scope:
+
+- Extract reusable Python pytest/test-fragment analysis from `turn.rs`.
+- Keep semantic repair authority decisions in `turn.rs` for now while moving
+  fixture-state and identifier-boundary parsing into a shared helper module.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_python_test_analysis --lib -q`: pass, 3 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3023 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The semantic weakening filter still lives in
+  `turn.rs`, but its Python fixture-analysis dependencies are no longer
+  embedded there.
