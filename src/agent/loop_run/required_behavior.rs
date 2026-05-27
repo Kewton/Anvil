@@ -83,6 +83,215 @@ pub(super) const LOW_CONFIDENCE_THRESHOLD: f32 = 0.5;
 #[allow(dead_code)]
 pub(super) const MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES: usize = 1200;
 
+/// Issue #665 (S5-005 / S7-003): build the `behavior_contract` JSON value to
+/// inject into diagnostic / repair user-message payloads. Caller-side
+/// projection is taken as-is when present, then the **serialized** size is
+/// capped at [`MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES`]. When the cap is
+/// exceeded the low-priority fields are dropped in this order:
+/// 1. `non_goals` (lowest priority — diagnostic prompts care less about
+///    "do not")
+/// 2. `verification_expectations`
+/// 3. `required_capabilities`
+/// 4. `behavior_goal` (highest priority — kept whenever possible)
+///
+/// If even the smallest envelope exceeds the cap, returns `null`. A
+/// `truncated=true` metadata key is added when any field was dropped.
+/// Returns `serde_json::Value::Null` when `projection` is `None`.
+pub(super) fn behavior_contract_payload_value(
+    projection: Option<&BehaviorContractProjection>,
+) -> serde_json::Value {
+    let Some(proj) = projection else {
+        return serde_json::Value::Null;
+    };
+    fn label_excerpt_value(item: &BoundedLabelWithExcerpt) -> serde_json::Value {
+        match item.excerpt.as_ref() {
+            Some(ex) => serde_json::json!({"label": item.label, "excerpt": ex}),
+            None => serde_json::json!({"label": item.label}),
+        }
+    }
+    fn vec_value(items: &[BoundedLabelWithExcerpt]) -> serde_json::Value {
+        serde_json::Value::Array(items.iter().map(label_excerpt_value).collect())
+    }
+    // Issue #665 (CB-003): char-boundary safe truncate of excerpts to
+    // EXCERPT_MAX_LEN / 2 before drop-order escalation. This keeps the
+    // most informative metadata field (behavior_goal) intact while still
+    // allowing the cap to be satisfied via shorter excerpts.
+    fn truncate_excerpt_char_safe(s: &str, target: usize) -> String {
+        if s.len() <= target {
+            return s.to_string();
+        }
+        let mut end = target.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    }
+    fn label_excerpt_value_truncated(
+        item: &BoundedLabelWithExcerpt,
+        excerpt_cap: usize,
+    ) -> serde_json::Value {
+        match item.excerpt.as_ref() {
+            Some(ex) => {
+                let truncated = truncate_excerpt_char_safe(ex, excerpt_cap);
+                serde_json::json!({"label": item.label, "excerpt": truncated})
+            }
+            None => serde_json::json!({"label": item.label}),
+        }
+    }
+    fn vec_value_truncated(
+        items: &[BoundedLabelWithExcerpt],
+        excerpt_cap: usize,
+    ) -> serde_json::Value {
+        serde_json::Value::Array(
+            items
+                .iter()
+                .map(|i| label_excerpt_value_truncated(i, excerpt_cap))
+                .collect(),
+        )
+    }
+
+    let mut behavior_goal = proj.behavior_goal.as_ref().map(label_excerpt_value);
+    let mut required_capabilities = vec_value(&proj.required_capabilities);
+    let mut verification_expectations = vec_value(&proj.verification_expectations);
+    let mut non_goals = vec_value(&proj.non_goals);
+    let mut truncated = false;
+    let cap = MAX_BEHAVIOR_CONTRACT_PROJECTION_BYTES;
+    let half_excerpt_cap = EXCERPT_MAX_LEN / 2;
+
+    fn assemble(
+        confidence: f32,
+        fields_used: &[&'static str],
+        behavior_goal: &Option<serde_json::Value>,
+        required_capabilities: &serde_json::Value,
+        verification_expectations: &serde_json::Value,
+        non_goals: &serde_json::Value,
+        truncated: bool,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("confidence".to_string(), serde_json::json!(confidence));
+        obj.insert("fields_used".to_string(), serde_json::json!(fields_used));
+        if let Some(g) = behavior_goal {
+            obj.insert("behavior_goal".to_string(), g.clone());
+        } else {
+            obj.insert("behavior_goal".to_string(), serde_json::Value::Null);
+        }
+        obj.insert(
+            "required_capabilities".to_string(),
+            required_capabilities.clone(),
+        );
+        obj.insert(
+            "verification_expectations".to_string(),
+            verification_expectations.clone(),
+        );
+        obj.insert("non_goals".to_string(), non_goals.clone());
+        if truncated {
+            obj.insert("truncated".to_string(), serde_json::Value::Bool(true));
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    let serialize_size = |v: &serde_json::Value| -> usize {
+        serde_json::to_string(v)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX)
+    };
+
+    let mut value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 0. (CB-003) Try truncating all excerpts to EXCERPT_MAX_LEN / 2 first.
+    //    This is a softer reduction than full field drops.
+    behavior_goal = proj
+        .behavior_goal
+        .as_ref()
+        .map(|i| label_excerpt_value_truncated(i, half_excerpt_cap));
+    required_capabilities = vec_value_truncated(&proj.required_capabilities, half_excerpt_cap);
+    verification_expectations =
+        vec_value_truncated(&proj.verification_expectations, half_excerpt_cap);
+    non_goals = vec_value_truncated(&proj.non_goals, half_excerpt_cap);
+    truncated = true;
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 1. Drop non_goals
+    non_goals = serde_json::Value::Array(vec![]);
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 2. Drop verification_expectations
+    verification_expectations = serde_json::Value::Array(vec![]);
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 3. Drop required_capabilities
+    required_capabilities = serde_json::Value::Array(vec![]);
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // 4. Drop behavior_goal
+    behavior_goal = None;
+    value = assemble(
+        proj.confidence,
+        &proj.fields_used,
+        &behavior_goal,
+        &required_capabilities,
+        &verification_expectations,
+        &non_goals,
+        truncated,
+    );
+    if serialize_size(&value) <= cap {
+        return value;
+    }
+    // Even the smallest envelope is over cap — return null (better than an
+    // attacker-controlled un-bounded payload).
+    serde_json::Value::Null
+}
+
 /// Redaction sentinels emitted by [`mask_secrets`] / related helpers. Any
 /// candidate term containing one of these is dropped from `domain_terms`.
 const REDACTION_SENTINELS: &[&str] = &["***", "<REDACTED>"];

@@ -1406,3 +1406,26 @@ Assessment:
 
 - No behavior change intended. Runtime policy rejection, target matching, and
   batch action selection are now policy-owned rather than actor-loop-owned.
+
+## Structural Verification: Slice 65
+
+Scope:
+
+- Move `behavior_contract` prompt-payload shaping from `turn.rs` to
+  `required_behavior.rs`.
+- Keep verifier prompt assembly in `turn.rs`, but keep behavior-contract cap
+  and truncation rules with the schema module.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test behavior_contract --lib -q`: pass, 25 tests.
+- `cargo test verifier_repair_pass_messages --lib -q`: pass, 1 test.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop no longer owns
+  behavior-contract trust narrowing or prompt-payload size control.

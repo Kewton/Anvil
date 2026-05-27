@@ -255,3 +255,6 @@ with legacy/fallback paths unable to override it.
 - Current status: effective tool-policy enforcement is now isolated in
   `tool_policy.rs`; `turn.rs` invokes policy checks but no longer owns
   focused-edit/artifact-directed/MissingVerifierJob rejection logic.
+- Current status: verifier prompt `behavior_contract` payload shaping is now
+  isolated in `required_behavior.rs`; `turn.rs` attaches the shaped data but
+  no longer owns cap/drop/truncation rules for that untrusted metadata.

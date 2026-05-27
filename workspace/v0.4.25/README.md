@@ -2332,3 +2332,30 @@ Assessment:
 - No behavior change intended. Tool-policy gatekeeping is now colocated with
   the policy data model, further reducing actor-loop responsibility and
   making active-job policy projection easier to audit.
+
+### 2026-05-27 Slice 65
+
+Applied:
+
+- Moved verifier prompt `behavior_contract` payload shaping from `turn.rs` to
+  `required_behavior.rs`.
+- The required-behavior module now owns the serialized size cap, excerpt
+  truncation, low-priority field drop order, and `truncated=true` metadata for
+  diagnostic/repair prompt payloads.
+- `turn.rs` now imports the shaped JSON value and only attaches it to verifier
+  diagnostic/repair prompt payloads.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test behavior_contract --lib -q`: pass, 25 tests
+- `cargo test verifier_repair_pass_messages --lib -q`: pass, 1 test
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Behavior-contract trust narrowing and payload
+  size control now live with the behavior contract schema instead of inside
+  actor-loop prompt assembly.
