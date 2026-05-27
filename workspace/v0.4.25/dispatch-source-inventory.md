@@ -212,3 +212,6 @@ with legacy/fallback paths unable to override it.
 - Current status: diagnostic path and missing setup target promotion are now
   isolated in `verifier_repair_targeting.rs`; `turn.rs` still owns semantic
   repair-plan construction and RepairJob state writes after admission.
+- Current status: pytest missing-dependency to missing setup candidate
+  generation is now isolated in `verifier_repair_targeting.rs`; `turn.rs`
+  consumes the generated hints only for diagnostic prompt context assembly.

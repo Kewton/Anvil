@@ -19,9 +19,7 @@ use super::reminder::{
 use super::repair_framework_findings::{
     VerifierDiagnosticFileExcerpt,
     findings_for_diagnostic as verifier_framework_findings_for_diagnostic,
-    missing_python_module_name_from_output,
-    output_or_command_looks_like_pytest as verifier_output_or_command_looks_like_pytest,
-    workspace_implementation_imports_python_module,
+    missing_python_module_name_from_output, workspace_implementation_imports_python_module,
 };
 #[cfg(test)]
 use super::repair_framework_findings::{
@@ -81,9 +79,9 @@ use super::verifier_repair_shadow::{
     verifier_repair_action_payload_for_context,
 };
 use super::verifier_repair_targeting::{
-    missing_python_module_workspace_path, python_missing_external_dependency_name,
-    recovery_target_hint_for_diagnostic_path, recovery_target_hint_for_existing_path,
-    recovery_target_hint_for_missing_setup_path, verifier_diagnostic_path_input_is_safe,
+    missing_python_module_workspace_path, recovery_target_hint_for_diagnostic_path,
+    recovery_target_hint_for_existing_path, verifier_diagnostic_missing_setup_candidates,
+    verifier_diagnostic_path_input_is_safe,
 };
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
@@ -23058,43 +23056,6 @@ fn verifier_repair_intents_fingerprint(
         relative_path,
         &repair_intent_edit_payloads(intents),
     )
-}
-
-fn verifier_diagnostic_missing_setup_candidates(
-    work_root: &Path,
-    context: &super::repair_job::RepairJob,
-    active_request: &str,
-) -> Vec<super::task_contract::RecoveryTargetHint> {
-    if !python_verifier_output_missing_external_dependency(work_root, context) {
-        return Vec::new();
-    }
-    let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, active_request);
-    let no_prior_edit = |_: &str| false;
-    let admission = RepairTargetAdmissionContext {
-        work_root,
-        scope: &scope,
-        edited_this_session_for: &no_prior_edit,
-        scaffold_changed_for: &no_prior_edit,
-    };
-    recovery_target_hint_for_missing_setup_path(
-        work_root,
-        "pyproject.toml",
-        "Python verifier cannot import a third-party dependency and no setup manifest is available",
-        super::VerifierDiagnosticFailureKind::DependencyMissing,
-        &admission,
-    )
-    .into_iter()
-    .collect()
-}
-
-fn python_verifier_output_missing_external_dependency(
-    work_root: &Path,
-    context: &super::repair_job::RepairJob,
-) -> bool {
-    if !verifier_output_or_command_looks_like_pytest(&context.command, &context.output_excerpt) {
-        return false;
-    }
-    python_missing_external_dependency_name(work_root, &context.output_excerpt).is_some()
 }
 
 fn recovery_target_hint_for_missing_local_module_path(

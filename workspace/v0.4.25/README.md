@@ -1959,3 +1959,32 @@ Assessment:
 - No behavior change intended. Diagnostic target promotion now has one module
   boundary. `turn.rs` still owns the stateful timing of diagnostic pass output,
   semantic plan construction, and RepairJob state updates.
+
+### 2026-05-27 Slice 51
+
+Applied:
+
+- Moved `verifier_diagnostic_missing_setup_candidates` and
+  `python_verifier_output_missing_external_dependency` from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Kept the behavior unchanged: only pytest-like verifier output with a missing
+  third-party dependency can synthesize the missing `pyproject.toml` setup
+  candidate.
+- Added tests for setup candidate synthesis, non-pytest rejection, and local
+  module rejection.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_targeting --lib -q`: pass, 10 tests
+- `cargo test missing_setup --lib -q`: pass, 6 tests
+- `cargo test recovery_target_hint --lib -q`: pass, 5 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3040 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Missing setup candidate generation is now a
+  read-only verifier-targeting responsibility; `turn.rs` only consumes the
+  generated hints while assembling the diagnostic prompt context.

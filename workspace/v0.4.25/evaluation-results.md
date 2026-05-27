@@ -1075,3 +1075,28 @@ Assessment:
 - No behavior change intended. The diagnostic target-promotion SSOT is no
   longer embedded in the actor loop; `turn.rs` retains only stateful repair
   orchestration around the module boundary.
+
+## Structural Verification: Slice 51
+
+Scope:
+
+- Move missing setup candidate generation from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Keep pytest/dependency gating and local-module exclusion unchanged.
+- Preserve `turn.rs` prompt-context assembly behavior.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 10 tests.
+- `cargo test missing_setup --lib -q`: pass, 6 tests.
+- `cargo test recovery_target_hint --lib -q`: pass, 5 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3040 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop no longer owns the Python
+  missing-setup candidate generator; the targeting module owns the read-only
+  evidence-to-hint conversion.

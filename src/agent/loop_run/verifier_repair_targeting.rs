@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::safety::path_guard::resolve_user_path;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
+use super::repair_framework_findings::output_or_command_looks_like_pytest;
 use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
 
 pub(super) fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
@@ -110,6 +111,43 @@ pub(super) fn recovery_target_hint_for_missing_setup_path(
         path,
         reason: reason.to_string(),
     })
+}
+
+pub(super) fn verifier_diagnostic_missing_setup_candidates(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    active_request: &str,
+) -> Vec<super::task_contract::RecoveryTargetHint> {
+    if !python_verifier_output_missing_external_dependency(work_root, context) {
+        return Vec::new();
+    }
+    let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, active_request);
+    let no_prior_edit = |_: &str| false;
+    let admission = RepairTargetAdmissionContext {
+        work_root,
+        scope: &scope,
+        edited_this_session_for: &no_prior_edit,
+        scaffold_changed_for: &no_prior_edit,
+    };
+    recovery_target_hint_for_missing_setup_path(
+        work_root,
+        "pyproject.toml",
+        "Python verifier cannot import a third-party dependency and no setup manifest is available",
+        super::VerifierDiagnosticFailureKind::DependencyMissing,
+        &admission,
+    )
+    .into_iter()
+    .collect()
+}
+
+pub(super) fn python_verifier_output_missing_external_dependency(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+) -> bool {
+    if !output_or_command_looks_like_pytest(&context.command, &context.output_excerpt) {
+        return false;
+    }
+    python_missing_external_dependency_name(work_root, &context.output_excerpt).is_some()
 }
 
 pub(super) fn python_missing_external_dependency_name(
@@ -352,6 +390,50 @@ mod tests {
                 &admission,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn verifier_diagnostic_missing_setup_candidates_adds_pyproject_for_pytest_dependency() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        let context = super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "ModuleNotFoundError: No module named 'fastapi'".to_string(),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let hints = verifier_diagnostic_missing_setup_candidates(work_root, &context, "");
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].path, "pyproject.toml");
+        assert_eq!(
+            hints[0].role,
+            super::super::task_contract::ArtifactRole::Setup
+        );
+    }
+
+    #[test]
+    fn verifier_diagnostic_missing_setup_candidates_ignores_non_pytest_or_local_modules() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(work_root.join("localpkg.py"), "").unwrap();
+        let non_pytest = super::super::repair_job::RepairJob {
+            command: "cargo test".to_string(),
+            output_excerpt: "ModuleNotFoundError: No module named 'fastapi'".to_string(),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+        let local_module = super::super::repair_job::RepairJob {
+            command: "python3 -m pytest".to_string(),
+            output_excerpt: "ModuleNotFoundError: No module named 'localpkg'".to_string(),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        assert!(
+            verifier_diagnostic_missing_setup_candidates(work_root, &non_pytest, "").is_empty()
+        );
+        assert!(
+            verifier_diagnostic_missing_setup_candidates(work_root, &local_module, "").is_empty()
         );
     }
 
