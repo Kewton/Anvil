@@ -22,7 +22,7 @@ use super::repair_job;
 use super::repair_job::VerifierRepairDecision;
 use super::repair_patch_validation::{
     CheapCheckOutcome, RepairRejectionSignal, ValidatedVerifierRepairEdit, ValidationFailure,
-    ValidationWeakening, VerifierRepairIntent,
+    ValidationWeakening, VerifierRepairIntent, build_verifier_repair_pass_ledger_outcome,
 };
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
@@ -197,63 +197,6 @@ enum VerifierRepairPassOutcome {
         relative_path: String,
     },
     Skipped,
-}
-
-/// Issue #653 (CB-001) / #662 (5-4-1): pure helper that derives the
-/// per-attempt ledger outcome for a single iteration of
-/// `run_verifier_repair_pass_and_apply`'s retry loop.
-///
-/// Contract:
-/// - Returns `Some(RejectedUnsafe { .. })` when `weakening = Some(...)` AND
-///   the repair job has an active semantic plan (priority 4, S5-003).
-/// - Returns `Some(Rejected{Malformed,Noop,Duplicate})` when
-///   `rejection_signal = Some(...)` AND the repair job has an active
-///   semantic plan (Issue #662 priorities 1-3).
-/// - When **both** are `Some(...)`, `weakening` wins — that mirrors the
-///   detection-order SSOT (5-4-1 priority 4 wins inside
-///   `validate_verifier_repair_intents` because the weakening detector runs
-///   only after the per-intent / fingerprint detectors have all passed,
-///   so this branch is structurally unreachable; the explicit precedence
-///   here is purely a defence-in-depth tie-breaker).
-/// - Returns `None` for every other attempt result (legacy path /
-///   exact-match failure / apply failure / LLM request failure / unexpected
-///   tool calls / `Unavailable`) so the caller can rely on
-///   `last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(...)`
-///   as an unconditional assignment per attempt, without stale outcomes
-///   from prior attempts leaking into `VerifierRepairPassOutcome::Invalid`.
-fn build_verifier_repair_pass_ledger_outcome(
-    weakening: Option<ValidationWeakening>,
-    rejection_signal: Option<RepairRejectionSignal>,
-    semantic_plan: Option<&super::repair_job::SemanticRepairPlan>,
-) -> Option<super::repair_attempt_outcome::RepairAttemptOutcome> {
-    let plan = semantic_plan?;
-    if let Some(w) = weakening {
-        return Some(super::repair_attempt_outcome::RepairAttemptOutcome {
-            cluster: plan.failure_cluster_id.clone(),
-            role: plan.preferred_repair_role,
-            kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
-                rejection: w.rejection,
-                pattern: w.pattern,
-            },
-        });
-    }
-    let signal = rejection_signal?;
-    let kind = match signal {
-        RepairRejectionSignal::Noop => {
-            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoop
-        }
-        RepairRejectionSignal::Duplicate => {
-            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedDuplicate
-        }
-        RepairRejectionSignal::Malformed => {
-            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedMalformed
-        }
-    };
-    Some(super::repair_attempt_outcome::RepairAttemptOutcome {
-        cluster: plan.failure_cluster_id.clone(),
-        role: plan.preferred_repair_role,
-        kind,
-    })
 }
 
 fn repair_lifecycle_rejected_reason_for_outcome(

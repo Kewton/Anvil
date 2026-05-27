@@ -1232,3 +1232,30 @@ Assessment:
 - The remaining actor-loop responsibility is still the high-level orchestration,
   Python evidence gathering, semantic test weakening filter, and conversion
   from validation result to repair attempt ledger/reporting.
+
+### 2026-05-27 Slice 23
+
+Applied:
+
+- Moved the pure `build_verifier_repair_pass_ledger_outcome` conversion into
+  `repair_patch_validation.rs`.
+- `turn.rs` still decides when to record the outcome, but no longer owns the
+  validation-signal-to-ledger-outcome mapping.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo test phase3_repair_pass_clears_stale_unsafe_outcome_between_attempts --lib -q`: pass, 1 test
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3013 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Validation-owned signals now convert to
+  validation-owned ledger outcomes before `turn.rs` records them.
+- The remaining actor-loop responsibility is narrower: orchestration, Python
+  evidence gathering, semantic test weakening filter, repair lifecycle event
+  recording, and final report wiring.

@@ -136,5 +136,7 @@ with legacy/fallback paths unable to override it.
   validation-owned; `turn.rs` still applies the semantic test weakening
   filter before mapping typed metadata into `ValidationFailure`.
 - Current status: verifier repair validation result carriers are now
-  validation-owned; `turn.rs` imports them and still owns ledger/report
-  conversion.
+  validation-owned; `turn.rs` imports them for repair pass control and report
+  wiring.
+- Current status: validation-signal-to-ledger-outcome conversion is now
+  validation-owned; `turn.rs` still owns when to record lifecycle events.

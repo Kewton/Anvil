@@ -164,6 +164,45 @@ impl ValidationFailure {
     }
 }
 
+/// Issue #653 (CB-001) / #662 (5-4-1): derive the per-attempt ledger outcome
+/// from a verifier repair validation result. The caller supplies the active
+/// semantic plan so non-semantic legacy validation failures stay outside the
+/// lifecycle ledger.
+pub(super) fn build_verifier_repair_pass_ledger_outcome(
+    weakening: Option<ValidationWeakening>,
+    rejection_signal: Option<RepairRejectionSignal>,
+    semantic_plan: Option<&super::repair_job::SemanticRepairPlan>,
+) -> Option<super::repair_attempt_outcome::RepairAttemptOutcome> {
+    let plan = semantic_plan?;
+    if let Some(w) = weakening {
+        return Some(super::repair_attempt_outcome::RepairAttemptOutcome {
+            cluster: plan.failure_cluster_id.clone(),
+            role: plan.preferred_repair_role,
+            kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedUnsafe {
+                rejection: w.rejection,
+                pattern: w.pattern,
+            },
+        });
+    }
+    let signal = rejection_signal?;
+    let kind = match signal {
+        RepairRejectionSignal::Noop => {
+            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoop
+        }
+        RepairRejectionSignal::Duplicate => {
+            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedDuplicate
+        }
+        RepairRejectionSignal::Malformed => {
+            super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedMalformed
+        }
+    };
+    Some(super::repair_attempt_outcome::RepairAttemptOutcome {
+        cluster: plan.failure_cluster_id.clone(),
+        role: plan.preferred_repair_role,
+        kind,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct RepairCandidateTestImportContractEvidence {
     pub(super) missing_modules: Vec<String>,

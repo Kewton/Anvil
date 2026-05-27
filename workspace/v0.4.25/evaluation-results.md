@@ -440,3 +440,27 @@ Assessment:
 
 - No behavior change intended. The validation module now owns both the typed
   rejection checks and the typed validation result carrier.
+
+## Structural Verification: Slice 23
+
+Scope:
+
+- Move validation-signal-to-ledger-outcome conversion out of `turn.rs`.
+- Preserve the existing retry-loop contract that only semantic repair attempts
+  become repair-attempt ledger entries.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo test phase3_repair_pass_clears_stale_unsafe_outcome_between_attempts --lib -q`: pass, 1 test.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3013 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop records outcomes, while the
+  validation module owns the mapping from validation signals to ledger outcome
+  variants.
