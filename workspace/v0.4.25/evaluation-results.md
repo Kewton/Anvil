@@ -1566,3 +1566,28 @@ Assessment:
 
 - No behavior change intended. Directory Read target matching now shares the
   same module as other focused edit history/path projections.
+
+## Structural Verification: Slice 72
+
+Scope:
+
+- Move progress-display text sanitization and UTF-8-safe truncation from
+  `turn.rs` to `progress_text.rs`.
+- Keep progress-line formatting in `turn.rs` for now; split only the pure
+  terminal-safety helpers.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test progress_text --lib -q`: pass, 7 tests.
+- `cargo test progress_line --lib -q`: pass, 9 tests.
+- `cargo test sanitize --lib -q`: pass, 68 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3051 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Terminal-safety text helpers now have a
+  dedicated module and direct unit coverage instead of living inside the
+  actor-loop source file.

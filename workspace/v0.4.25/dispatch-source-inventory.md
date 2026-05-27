@@ -277,3 +277,6 @@ with legacy/fallback paths unable to override it.
 - Current status: focused-read directory target matching is now isolated in
   `tool_history.rs`; `turn.rs` consumes the path/target decision but no
   longer owns the filesystem canonicalization helper.
+- Current status: progress-display text sanitization and UTF-8-safe
+  truncation are now isolated in `progress_text.rs`; `turn.rs` consumes the
+  helpers while progress-line formatting remains local for now.

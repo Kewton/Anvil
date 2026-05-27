@@ -157,6 +157,7 @@ use super::deterministic;
 use super::deterministic::empty_framework_app_files as deterministic_empty_framework_app_files;
 #[cfg(test)]
 use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
+use super::progress_text::{sanitize_for_progress, truncate};
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, quality_first_pass_observation,
@@ -1587,20 +1588,6 @@ fn extract_current_request_paths(agent: &Agent, work_root: &std::path::Path) -> 
     }
     out.truncate(prompting::MAX_CURRENT_REQUEST_PATHS);
     out
-}
-
-/// UTF-8-safe truncation: keeps at most `max` characters and appends `...`
-/// when the input was longer. Never splits a multi-byte code point.
-fn truncate(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((byte_idx, _)) => {
-            let mut out = String::with_capacity(byte_idx + 3);
-            out.push_str(&s[..byte_idx]);
-            out.push_str("...");
-            out
-        }
-        None => s.to_string(),
-    }
 }
 
 fn raw_mode_safe_text(text: &str) -> String {
@@ -20794,24 +20781,6 @@ mod tests {
             "external-import callback MUST fire with PythonpathRejected for an external PYTHONPATH component; got {external_import_calls:?}"
         );
     }
-}
-
-/// Replace control characters (C0, DEL, and C1) with spaces, then trim trailing
-/// whitespace. Required for model-derived text so that newlines or ANSI escape
-/// sequences cannot be injected into the terminal. C1 (`U+0080..U+009F`) is
-/// included because some terminals interpret 8-bit CSI (`U+009B`) and OSC
-/// (`U+009D`) equivalently to `ESC [` and `ESC ]`.
-fn sanitize_for_progress(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let cp = ch as u32;
-        if cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp) {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    out.trim_end().to_string()
 }
 
 const COLOR_RESET: &str = "\x1b[0m";

@@ -2513,3 +2513,29 @@ Assessment:
 - No behavior change intended. Focused read path matching is now part of the
   shared tool-history/path projection layer instead of an actor-loop-local
   helper.
+
+### 2026-05-27 Slice 72
+
+Applied:
+
+- Added `progress_text.rs` for progress-display string sanitization and
+  UTF-8-safe truncation.
+- Moved `sanitize_for_progress` and `truncate` out of `turn.rs`.
+- Kept existing progress-line behavior unchanged; `turn.rs` now imports the
+  display-text helpers.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test progress_text --lib -q`: pass, 7 tests
+- `cargo test progress_line --lib -q`: pass, 9 tests
+- `cargo test sanitize --lib -q`: pass, 68 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3051 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Terminal-safety text handling is now isolated
+  from the actor loop, and the added module-level tests pin the shared helper
+  behavior directly.

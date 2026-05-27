@@ -103,6 +103,7 @@ mod project_verifier;
 // v0.4.22: generic completion probe. Private helper that can advance to
 // verifier execution when current-turn artifacts are physically present even
 // if the legacy artifact projection is still asking for another edit.
+mod progress_text;
 mod project_probe;
 mod protocol;
 mod quality;
