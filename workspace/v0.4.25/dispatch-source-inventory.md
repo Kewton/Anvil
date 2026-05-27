@@ -115,3 +115,6 @@ with legacy/fallback paths unable to override it.
 - Current status: parsed repair patch intent data is now owned by
   `repair_patch_validation.rs`; `turn.rs` still parses provider replies and
   orchestrates validation.
+- Current status: patch proposal parsing caps, malformed-reply error mapping,
+  and proposal-to-intent conversion are now validation-owned; `turn.rs` only
+  supplies configured limits through thin wrappers.

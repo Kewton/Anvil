@@ -1005,3 +1005,31 @@ Assessment:
   boundary.
 - `turn.rs` still owns patch proposal parsing and high-level validation
   orchestration.
+
+### 2026-05-27 Slice 15
+
+Applied:
+
+- Moved patch proposal parsing caps, patch-proposal error mapping, and
+  `PatchProposal -> VerifierRepairIntent` conversion into
+  `repair_patch_validation.rs`.
+- Left `turn.rs` with thin wrappers that only pass the configured verifier
+  repair limits.
+- Preserved existing repair-intent reason compaction behavior, including
+  secret masking, whitespace collapse, and UTF-8-safe ellipsis truncation.
+- Added module tests for bounded conversion and output-cap rejection.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 22 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3004 tests when rerun outside sandbox
+
+Assessment:
+
+- Patch proposal shaping logic is now owned by the patch-validation boundary.
+- `turn.rs` still owns the high-level validation wrapper, semantic test-edit
+  gate, and weakening detector dispatch.

@@ -11,6 +11,7 @@ use super::repair_brief::{AllowedChangeKind, SourceOfTruth};
 use super::repair_plan::AcceptedRepairPlan;
 use super::task_contract::RecoveryTargetHint;
 use crate::safety::path_guard::resolve_user_path;
+use crate::session::feedback::mask_secrets;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use sha2::{Digest, Sha256};
 
@@ -40,6 +41,13 @@ pub(super) struct VerifierRepairIntent {
     pub(super) new_string: String,
     pub(super) reason: String,
     pub(super) replace_all: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VerifierRepairIntentLimits {
+    pub(super) max_output_bytes: usize,
+    pub(super) max_edits: usize,
+    pub(super) max_reason_chars: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +472,102 @@ pub(super) fn validate_repair_intent_not_replayed(
         return Err(RepairCandidateDuplicateIntentError);
     }
     Ok(())
+}
+
+pub(super) fn parse_verifier_repair_patch_proposal_reply(
+    reply: &str,
+    limits: VerifierRepairIntentLimits,
+) -> Result<super::patch_proposal::PatchProposal, String> {
+    if reply.len() > limits.max_output_bytes {
+        return Err("repair reply exceeded output cap".to_string());
+    }
+    super::patch_proposal::parse_patch_proposal_reply(reply)
+        .map_err(patch_proposal_error_to_repair_intent_error)
+}
+
+pub(super) fn patch_proposal_to_verifier_repair_intents(
+    proposal: super::patch_proposal::PatchProposal,
+    limits: VerifierRepairIntentLimits,
+) -> Result<Vec<VerifierRepairIntent>, String> {
+    if proposal.edits.is_empty() {
+        return Err("repair reply edits array must not be empty".to_string());
+    }
+    if proposal.edits.len() > limits.max_edits {
+        return Err("repair reply contained too many edits".to_string());
+    }
+    let root_reason = if proposal.explanation.is_empty() {
+        proposal.risk.as_str()
+    } else {
+        proposal.explanation.as_str()
+    };
+    Ok(proposal
+        .edits
+        .into_iter()
+        .map(|edit| VerifierRepairIntent {
+            path: proposal.target_path.clone(),
+            old_string: edit.old_string,
+            new_string: edit.new_string,
+            reason: if edit.reason.is_empty() {
+                compact_repair_intent_reason(root_reason, limits.max_reason_chars)
+            } else {
+                compact_repair_intent_reason(&edit.reason, limits.max_reason_chars)
+            },
+            replace_all: edit.replace_all,
+        })
+        .collect())
+}
+
+fn patch_proposal_error_to_repair_intent_error(
+    err: super::patch_proposal::PatchProposalError,
+) -> String {
+    match err {
+        super::patch_proposal::PatchProposalError::ToolMarkup => {
+            "repair reply contained tool-call shaped markup".to_string()
+        }
+        super::patch_proposal::PatchProposalError::JsonMissing => {
+            "repair reply must contain a JSON object".to_string()
+        }
+        super::patch_proposal::PatchProposalError::JsonMalformed => {
+            "repair reply was not valid JSON".to_string()
+        }
+        super::patch_proposal::PatchProposalError::ObjectMissing => {
+            "repair reply must be a JSON object".to_string()
+        }
+        super::patch_proposal::PatchProposalError::MissingField(field) => {
+            if field == "target_path" {
+                "repair reply missing string field: path".to_string()
+            } else {
+                format!("repair reply missing string field: {field}")
+            }
+        }
+        super::patch_proposal::PatchProposalError::EditsEmpty => {
+            "repair reply edits array must not be empty".to_string()
+        }
+        super::patch_proposal::PatchProposalError::TooManyEdits => {
+            "repair reply contained too many edits".to_string()
+        }
+        super::patch_proposal::PatchProposalError::EditMalformed => {
+            "repair reply edits must be JSON objects".to_string()
+        }
+    }
+}
+
+fn compact_repair_intent_reason(input: &str, max_chars: usize) -> String {
+    let masked = mask_secrets(input);
+    let collapsed = masked.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars_with_ellipsis(&collapsed, max_chars)
+}
+
+fn truncate_chars_with_ellipsis(input: &str, max_chars: usize) -> String {
+    match input.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => {
+            let mut out = String::with_capacity(byte_idx + 3);
+            out.push_str(&input[..byte_idx]);
+            out.push_str("...");
+            out
+        }
+        None => input.to_string(),
+    }
 }
 
 pub(super) fn validate_repair_intent_text_payload(
@@ -1274,6 +1378,49 @@ mod tests {
             "duplicate repair edit intent for the same failure"
         );
         assert!(validate_repair_intent_not_replayed(&applied, "other").is_ok());
+    }
+
+    #[test]
+    fn patch_proposal_conversion_builds_bounded_repair_intents() {
+        let proposal = super::super::patch_proposal::PatchProposal {
+            target_path: "app/main.py".to_string(),
+            edits: vec![super::super::patch_proposal::PatchEdit {
+                old_string: "return 201".to_string(),
+                new_string: "return 200".to_string(),
+                reason: "  align   status   code  ".to_string(),
+                replace_all: false,
+            }],
+            explanation: "fallback explanation".to_string(),
+            risk: "low".to_string(),
+        };
+        let limits = VerifierRepairIntentLimits {
+            max_output_bytes: 128,
+            max_edits: 4,
+            max_reason_chars: 20,
+        };
+
+        let intents = patch_proposal_to_verifier_repair_intents(proposal, limits).unwrap();
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].path, "app/main.py");
+        assert_eq!(intents[0].old_string, "return 201");
+        assert_eq!(intents[0].new_string, "return 200");
+        assert_eq!(intents[0].reason, "align status code");
+        assert!(!intents[0].replace_all);
+    }
+
+    #[test]
+    fn patch_proposal_reply_parser_rejects_output_over_cap() {
+        let limits = VerifierRepairIntentLimits {
+            max_output_bytes: 4,
+            max_edits: 4,
+            max_reason_chars: 20,
+        };
+
+        let err = parse_verifier_repair_patch_proposal_reply("{\"target_path\":\"x\"}", limits)
+            .unwrap_err();
+
+        assert_eq!(err, "repair reply exceeded output cap");
     }
 
     #[test]

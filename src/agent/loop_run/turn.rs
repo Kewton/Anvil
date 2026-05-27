@@ -24323,80 +24323,30 @@ fn parse_verifier_repair_intents_reply(reply: &str) -> Result<Vec<VerifierRepair
     patch_proposal_to_verifier_repair_intents(proposal)
 }
 
+fn verifier_repair_intent_limits() -> super::repair_patch_validation::VerifierRepairIntentLimits {
+    super::repair_patch_validation::VerifierRepairIntentLimits {
+        max_output_bytes: VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES,
+        max_edits: VERIFIER_REPAIR_PASS_MAX_EDITS,
+        max_reason_chars: VERIFIER_REPAIR_PASS_MAX_REASON_CHARS,
+    }
+}
+
 fn parse_verifier_repair_patch_proposal_reply(
     reply: &str,
 ) -> Result<super::patch_proposal::PatchProposal, String> {
-    if reply.len() > VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES {
-        return Err("repair reply exceeded output cap".to_string());
-    }
-    super::patch_proposal::parse_patch_proposal_reply(reply)
-        .map_err(patch_proposal_error_to_repair_intent_error)
+    super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
+        reply,
+        verifier_repair_intent_limits(),
+    )
 }
 
 fn patch_proposal_to_verifier_repair_intents(
     proposal: super::patch_proposal::PatchProposal,
 ) -> Result<Vec<VerifierRepairIntent>, String> {
-    if proposal.edits.is_empty() {
-        return Err("repair reply edits array must not be empty".to_string());
-    }
-    if proposal.edits.len() > VERIFIER_REPAIR_PASS_MAX_EDITS {
-        return Err("repair reply contained too many edits".to_string());
-    }
-    let root_reason = if proposal.explanation.is_empty() {
-        proposal.risk.as_str()
-    } else {
-        proposal.explanation.as_str()
-    };
-    Ok(proposal
-        .edits
-        .into_iter()
-        .map(|edit| VerifierRepairIntent {
-            path: proposal.target_path.clone(),
-            old_string: edit.old_string,
-            new_string: edit.new_string,
-            reason: if edit.reason.is_empty() {
-                compact_verifier_failure_text(root_reason, VERIFIER_REPAIR_PASS_MAX_REASON_CHARS)
-            } else {
-                compact_verifier_failure_text(&edit.reason, VERIFIER_REPAIR_PASS_MAX_REASON_CHARS)
-            },
-            replace_all: edit.replace_all,
-        })
-        .collect())
-}
-
-fn patch_proposal_error_to_repair_intent_error(
-    err: super::patch_proposal::PatchProposalError,
-) -> String {
-    match err {
-        super::patch_proposal::PatchProposalError::ToolMarkup => {
-            "repair reply contained tool-call shaped markup".to_string()
-        }
-        super::patch_proposal::PatchProposalError::JsonMissing => {
-            "repair reply must contain a JSON object".to_string()
-        }
-        super::patch_proposal::PatchProposalError::JsonMalformed => {
-            "repair reply was not valid JSON".to_string()
-        }
-        super::patch_proposal::PatchProposalError::ObjectMissing => {
-            "repair reply must be a JSON object".to_string()
-        }
-        super::patch_proposal::PatchProposalError::MissingField(field) => {
-            if field == "target_path" {
-                "repair reply missing string field: path".to_string()
-            } else {
-                format!("repair reply missing string field: {field}")
-            }
-        }
-        super::patch_proposal::PatchProposalError::EditsEmpty => {
-            "repair reply edits array must not be empty".to_string()
-        }
-        super::patch_proposal::PatchProposalError::TooManyEdits => {
-            "repair reply contained too many edits".to_string()
-        }
-        super::patch_proposal::PatchProposalError::EditMalformed => {
-            "repair reply edits must be JSON objects".to_string()
-        }
-    }
+    super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
+        proposal,
+        verifier_repair_intent_limits(),
+    )
 }
 
 fn emit_patch_proposal_shadow_validation_event(
