@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::agent::orchestration::RepoVerification;
 use crate::safety::path_guard::resolve_user_path;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
@@ -16,6 +17,24 @@ pub(super) struct VerifierRepairTargetCandidate {
     pub(super) line: Option<usize>,
     score: usize,
     ordinal: usize,
+}
+
+pub(super) fn changed_files_for_verifier(
+    accumulated: &[RepoVerification],
+    current: &RepoVerification,
+) -> Vec<String> {
+    let mut files = HashSet::new();
+    for verif in accumulated.iter().chain(std::iter::once(current)) {
+        for file in &verif.all_changed_files {
+            if is_ignored_workspace_display_path(file) {
+                continue;
+            }
+            files.insert(file.clone());
+        }
+    }
+    let mut files: Vec<String> = files.into_iter().collect();
+    files.sort();
+    files
 }
 
 pub(super) fn extract_path_like_tokens(text: &str) -> impl Iterator<Item = &str> {

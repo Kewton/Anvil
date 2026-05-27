@@ -1315,3 +1315,23 @@ Assessment:
 - No behavior change intended. The task-contract recovery planner now receives
   verifier repair state from the RepairJob state module, not from duplicated
   actor-loop projection logic.
+
+## Structural Verification: Slice 61
+
+Scope:
+
+- Move verifier changed-file aggregation from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Keep the actor loop responsible only for deciding when to collect a repo
+  snapshot; the targeting module owns the normalized changed-file list.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test changed_files --lib -q`: pass, 5 tests.
+- `cargo test verifier_repair_target --lib -q`: pass, 20 tests.
+
+Assessment:
+
+- No behavior change intended. The normalized changed-file list now lives next
+  to the code that consumes changed files for verifier target hints.

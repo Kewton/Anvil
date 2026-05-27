@@ -84,7 +84,7 @@ use super::verifier_repair_shadow::{
     verifier_repair_action_payload_for_context,
 };
 use super::verifier_repair_targeting::{
-    extract_path_like_tokens, recovery_target_hint_for_diagnostic_path,
+    changed_files_for_verifier, extract_path_like_tokens, recovery_target_hint_for_diagnostic_path,
     verifier_diagnostic_missing_setup_candidates, verifier_diagnostic_path_input_is_safe,
     verifier_repair_missing_local_module_provider, verifier_repair_preferred_local_import_source,
     verifier_repair_stale_assertion_test_target,
@@ -2066,24 +2066,6 @@ fn should_apply_repo_change_partial_progress_recovery(
         && repo_edit_calls_made_this_turn > 0
         && contract_allows_generic_recovery
         && reply_looks_like_future_work(final_reply)
-}
-
-fn changed_files_for_verifier(
-    accumulated: &[RepoVerification],
-    current: &RepoVerification,
-) -> Vec<String> {
-    let mut files = HashSet::new();
-    for verif in accumulated.iter().chain(std::iter::once(current)) {
-        for file in &verif.all_changed_files {
-            if is_ignored_workspace_display_path(file) {
-                continue;
-            }
-            files.insert(file.clone());
-        }
-    }
-    let mut files: Vec<String> = files.into_iter().collect();
-    files.sort();
-    files
 }
 
 fn task_contract_verifier_repair_note(

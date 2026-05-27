@@ -242,3 +242,6 @@ with legacy/fallback paths unable to override it.
 - Current status: task-contract-facing verifier repair state projection is
   now isolated in `repair_job.rs`; `turn.rs` keeps only a thin adapter that
   passes the Agent-owned pending flag and per-turn edit counters.
+- Current status: verifier changed-file aggregation is now isolated in
+  `verifier_repair_targeting.rs`; `turn.rs` only decides when to capture repo
+  snapshots and passes the normalized list into verifier repair state.

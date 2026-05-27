@@ -2231,3 +2231,23 @@ Assessment:
 - No behavior change intended. Task-contract recovery now receives verifier
   repair state from the RepairJob module instead of duplicating projection
   logic inside the actor loop.
+
+### 2026-05-27 Slice 61
+
+Applied:
+
+- Moved verifier changed-file aggregation from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- `turn.rs` now consumes a targeting-owned helper before constructing or
+  updating repair jobs.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test changed_files --lib -q`: pass, 5 tests
+- `cargo test verifier_repair_target --lib -q`: pass, 20 tests
+
+Assessment:
+
+- No behavior change intended. Changed-file normalization is now colocated
+  with verifier repair target parsing and hint generation.
