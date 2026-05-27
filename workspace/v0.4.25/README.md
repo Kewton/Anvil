@@ -2304,3 +2304,31 @@ Assessment:
 - No behavior change intended. Tool-history evidence is now a neutral support
   module, reducing reverse dependencies between the RepairJob state machine
   and the actor loop dispatcher.
+
+### 2026-05-27 Slice 64
+
+Applied:
+
+- Moved tool-policy enforcement from `turn.rs` to `tool_policy.rs`.
+- `tool_policy.rs` now owns focused-edit policy errors, artifact-directed
+  path matching, MissingVerifierJob scope checks, setup-bootstrap Bash command
+  filtering, and batch truncation/rejection decisions.
+- Moved `workspace_relative_path_for_tool_arg` into the policy module so
+  path-target comparisons and scope checks share one policy-owned helper.
+- `turn.rs` now imports policy decisions instead of defining them inline.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test focused_edit_target_already_read --lib -q`: pass, 1 test
+- `cargo test effective_tool_policy --lib -q`: pass, 8 tests when rerun
+  outside sandbox
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Tool-policy gatekeeping is now colocated with
+  the policy data model, further reducing actor-loop responsibility and
+  making active-job policy projection easier to audit.

@@ -1,6 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+use super::task_workspace_scope::TaskWorkspaceScope;
+use crate::ollama::xml_fallback::ToolCall;
+use crate::safety::path_guard::resolve_user_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EffectiveToolPolicy {
@@ -184,4 +187,396 @@ impl EffectiveToolPolicy {
     pub(super) fn reason(&self) -> EffectiveToolPolicyReason {
         self.reason
     }
+}
+
+pub(super) fn focused_edit_tool_policy_error(
+    name: &str,
+    arguments: &serde_json::Value,
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+) -> Option<String> {
+    let path_display = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let path_matches = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|raw_path| {
+            super::tool_history::tool_path_matches_target(raw_path, target, work_root)
+        });
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+
+    if !target.is_file() {
+        if name != "Write" || !path_matches {
+            return Some(format!(
+                "focused edit recovery rejected {rejected_tool}; only allows Write on missing target {path_display}"
+            ));
+        }
+        return None;
+    }
+
+    if target_already_read {
+        if name != "Edit" || !path_matches {
+            return Some(format!(
+                "focused edit recovery rejected {rejected_tool}; only allows Edit on {path_display} after the file has already been read"
+            ));
+        }
+        return None;
+    }
+
+    match name {
+        "Read" | "Edit" if path_matches => None,
+        _ => Some(format!(
+            "focused edit recovery rejected {rejected_tool}; only allows Read or Edit on {path_display} until the first edit succeeds"
+        )),
+    }
+}
+
+/// Legacy non-scope wrapper kept for unit tests and tests-only re-exports.
+/// Production code MUST use [`effective_tool_policy_error_for_call_with_scope`]
+/// so the MissingVerifierJob scope gate fires (Issue #646 A1/A3).
+#[cfg(test)]
+pub(super) fn effective_tool_policy_error_for_call(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+) -> Option<String> {
+    effective_tool_policy_error_for_call_with_scope(policy, name, arguments, work_root, None)
+}
+
+/// Issue #646 (A1/A3): scope-aware variant. When `scope` is provided and the
+/// policy is a `VerifierRepair`-reasoned restricted policy WITHOUT a
+/// focused-edit or artifact-directed target (i.e. the MissingVerifierJob
+/// fallback whitelist), the file-targeting tool calls must additionally pass
+/// `scope.contains(...)` on the resolved path argument. Out-of-scope writes
+/// are rejected even though `Write`/`Edit`/`Bash` would otherwise satisfy
+/// the tool-name whitelist.
+pub(super) fn effective_tool_policy_error_for_call_with_scope(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    scope: Option<&TaskWorkspaceScope>,
+) -> Option<String> {
+    if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt()
+        && !allowed_tools.contains(&name)
+    {
+        // Issue #664 iteration-3 (CB2-003): when the LLM calls `Bash`
+        // under an artifact-directed recovery policy (Read/Write/Edit-
+        // only allow set), the allow-list check fires *before* the
+        // SetupBootstrap branch below could classify the rejection as a
+        // BashOutOfPolicy. To keep the caller-side string-match in
+        // `execute_tool_call_with_optional_policy_resolution` reachable
+        // (which routes the rejection through
+        // `record_artifact_completion_bash_violation` so the structured
+        // report emits `category = "bash_out_of_policy"`), we emit the
+        // same `"artifact-directed recovery rejected Bash"` shape that
+        // the artifact-directed path uses. Otherwise the rejection
+        // would surface as the generic `"tool policy rejected Bash"`
+        // string and the BashOutOfPolicy branch would be unreachable.
+        if policy.reason() == EffectiveToolPolicyReason::ArtifactDirectedRecovery && name == "Bash"
+        {
+            let target_display = policy_target_path(policy)
+                .map(|target| {
+                    target
+                        .strip_prefix(work_root)
+                        .unwrap_or(target)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .unwrap_or_else(|| "the active target".to_string());
+            return Some(format!(
+                "artifact-directed recovery rejected Bash; only allows Read, Write, or Edit on {target_display}"
+            ));
+        }
+        return Some(restricted_tool_policy_error(
+            policy,
+            name,
+            allowed_tools,
+            work_root,
+        ));
+    }
+
+    // Issue #664 (DS1-001 二段防衛): SetupBootstrap allows `Bash` only at
+    // the tool-name layer, but `cargo test` / `echo hi` / `curl ...` would
+    // pass the allowlist. The command-level allow set is decided here via
+    // `crate::tools::bash::is_setup_command`. Non-Setup commands are
+    // rejected with a clear error.
+    if policy.reason() == EffectiveToolPolicyReason::SetupBootstrap && name == "Bash" {
+        let Some(command) = arguments.get("command").and_then(serde_json::Value::as_str) else {
+            return Some("setup bootstrap bash requires a string `command` argument".to_string());
+        };
+        if !crate::tools::bash::is_setup_command(command) {
+            return Some(
+                "setup bootstrap only allows dependency-install Bash commands (BashCommandClass::EnvSetup)"
+                    .to_string(),
+            );
+        }
+    }
+
+    if let Some(focused) = policy.focused_edit_policy() {
+        return focused_edit_tool_policy_error(
+            name,
+            arguments,
+            &focused.target,
+            work_root,
+            focused.target_already_read,
+        );
+    }
+
+    if let Some(artifact) = policy.artifact_directed_policy() {
+        return artifact_directed_tool_policy_error(name, arguments, &artifact.target, work_root);
+    }
+
+    // Issue #646 (A1/A3): MissingVerifierJob fallback scope enforcement.
+    if policy.reason() == EffectiveToolPolicyReason::VerifierRepair
+        && let Some(scope) = scope
+        && let Some(err) = missing_verifier_scope_policy_error(name, arguments, work_root, scope)
+    {
+        return Some(err);
+    }
+
+    None
+}
+
+/// Issue #646 (A1/A3): rejects file-targeting tool calls whose resolved path
+/// argument falls outside the active `TaskWorkspaceScope`. Applies only when
+/// the policy reason is `VerifierRepair` and the policy carries no specific
+/// target (i.e. the MissingVerifierJob whitelist case).
+fn missing_verifier_scope_policy_error(
+    name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    scope: &TaskWorkspaceScope,
+) -> Option<String> {
+    if !matches!(name, "Write" | "Edit") {
+        return None;
+    }
+    let raw_path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+    let relative = workspace_relative_path_for_tool_arg(work_root, raw_path)?;
+    if scope.contains(&relative) {
+        return None;
+    }
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    Some(format!(
+        "MissingVerifierJob policy rejected {rejected_tool}; path {relative} is outside the active workspace scope"
+    ))
+}
+
+pub(super) fn artifact_directed_tool_policy_error(
+    name: &str,
+    arguments: &serde_json::Value,
+    target: &Path,
+    work_root: &Path,
+) -> Option<String> {
+    // CB-003: SSOT target match — compare on the workspace-relative
+    // canonical form derived from `resolve_user_path` (used by both
+    // `task_workspace_scope` and `ArtifactCompletionJob.target_path`).
+    let path_matches = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|raw_path| {
+            tool_path_matches_target_via_workspace_ssot(raw_path, target, work_root)
+        });
+    if path_matches {
+        return None;
+    }
+
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    let path_display = target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Some(format!(
+        "artifact-directed recovery rejected {rejected_tool}; only allows Read, Write, or Edit on {path_display}"
+    ))
+}
+
+/// CB-003 / CB2-002: SSOT target match for the artifact-directed policy gate.
+pub(super) fn tool_path_matches_target_via_workspace_ssot(
+    raw_path: &str,
+    target: &Path,
+    work_root: &Path,
+) -> bool {
+    let Some(input_rel) = workspace_relative_path_for_tool_arg(work_root, raw_path) else {
+        return false;
+    };
+    let target_str = target.to_string_lossy();
+    let Some(target_rel) = workspace_relative_path_for_tool_arg(work_root, &target_str) else {
+        return false;
+    };
+    if input_rel != target_rel {
+        return false;
+    }
+    if !ancestor_chain_has_no_dangling_symlinks(work_root, raw_path) {
+        return false;
+    }
+    if !ancestor_chain_has_no_dangling_symlinks(work_root, &target_str) {
+        return false;
+    }
+    true
+}
+
+fn ancestor_chain_has_no_dangling_symlinks(work_root: &Path, raw_path: &str) -> bool {
+    let input = Path::new(raw_path);
+    let candidate: PathBuf = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        work_root.join(input)
+    };
+    super::artifact_ownership::nearest_existing_ancestor_within_work_root(work_root, &candidate)
+}
+
+fn restricted_tool_policy_error(
+    policy: &EffectiveToolPolicy,
+    name: &str,
+    allowed_tools: &[&str],
+    work_root: &Path,
+) -> String {
+    let rejected_tool = compact_tool_name_for_policy_feedback(name);
+    let allowed = if allowed_tools.is_empty() {
+        "none".to_string()
+    } else {
+        allowed_tools.join(", ")
+    };
+    let mut message = format!(
+        "tool policy rejected {rejected_tool}; allowed tools: {allowed}; reason: {}",
+        policy.reason().as_str()
+    );
+    if let Some(target) = policy_target_path(policy) {
+        let path_display = target
+            .strip_prefix(work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/");
+        message.push_str("; target: ");
+        message.push_str(&path_display);
+    }
+    message
+}
+
+fn policy_target_path(policy: &EffectiveToolPolicy) -> Option<&Path> {
+    policy
+        .focused_edit_policy()
+        .map(|focused| focused.target.as_path())
+        .or_else(|| {
+            policy
+                .artifact_directed_policy()
+                .map(|artifact| artifact.target.as_path())
+        })
+}
+
+fn compact_tool_name_for_policy_feedback(name: &str) -> String {
+    let mut compact = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        .take(32)
+        .collect::<String>();
+    if compact.is_empty() {
+        compact.push_str("unknown-tool");
+    }
+    compact
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FocusedEditBatchAction {
+    Accept,
+    TruncateToFirst,
+    Reject(String),
+}
+
+pub(super) fn focused_edit_tool_batch_action(
+    tool_calls: &[ToolCall],
+    target: &Path,
+    work_root: &Path,
+    target_already_read: bool,
+) -> FocusedEditBatchAction {
+    let Some(first_tool_call) = tool_calls.first() else {
+        return FocusedEditBatchAction::Accept;
+    };
+
+    let first_call_error = focused_edit_tool_policy_error(
+        &first_tool_call.name,
+        &first_tool_call.arguments,
+        target,
+        work_root,
+        target_already_read,
+    );
+
+    if tool_calls.len() == 1 {
+        return first_call_error
+            .map(FocusedEditBatchAction::Reject)
+            .unwrap_or(FocusedEditBatchAction::Accept);
+    }
+
+    if first_call_error.is_none() {
+        FocusedEditBatchAction::TruncateToFirst
+    } else {
+        FocusedEditBatchAction::Reject(first_call_error.unwrap_or_default())
+    }
+}
+
+/// Legacy non-scope wrapper kept for unit tests and tests-only re-exports.
+/// Production code MUST use [`effective_tool_batch_action_with_scope`].
+#[cfg(test)]
+pub(super) fn effective_tool_batch_action(
+    tool_calls: &[ToolCall],
+    policy: &EffectiveToolPolicy,
+    work_root: &Path,
+) -> FocusedEditBatchAction {
+    effective_tool_batch_action_with_scope(tool_calls, policy, work_root, None)
+}
+
+/// Issue #646 (A1/A3): scope-aware variant of [`effective_tool_batch_action`].
+/// Forwarded scope is consulted only by the MissingVerifierJob fallback
+/// branch inside `effective_tool_policy_error_for_call_with_scope`.
+pub(super) fn effective_tool_batch_action_with_scope(
+    tool_calls: &[ToolCall],
+    policy: &EffectiveToolPolicy,
+    work_root: &Path,
+    scope: Option<&TaskWorkspaceScope>,
+) -> FocusedEditBatchAction {
+    let Some(first_tool_call) = tool_calls.first() else {
+        return FocusedEditBatchAction::Accept;
+    };
+
+    if let Some(err) = effective_tool_policy_error_for_call_with_scope(
+        policy,
+        &first_tool_call.name,
+        &first_tool_call.arguments,
+        work_root,
+        scope,
+    ) {
+        return FocusedEditBatchAction::Reject(err);
+    }
+
+    if let Some(focused) = policy.focused_edit_policy() {
+        return focused_edit_tool_batch_action(
+            tool_calls,
+            &focused.target,
+            work_root,
+            focused.target_already_read,
+        );
+    }
+
+    if policy.artifact_directed_policy().is_some() && tool_calls.len() > 1 {
+        return FocusedEditBatchAction::TruncateToFirst;
+    }
+
+    FocusedEditBatchAction::Accept
+}
+
+pub(super) fn workspace_relative_path_for_tool_arg(
+    work_root: &Path,
+    raw_path: &str,
+) -> Option<String> {
+    let resolved = resolve_user_path(work_root, raw_path).ok()?;
+    let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let relative = resolved.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }

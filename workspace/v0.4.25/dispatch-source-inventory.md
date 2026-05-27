@@ -252,3 +252,6 @@ with legacy/fallback paths unable to override it.
 - Current status: tool-call history evidence projection is now isolated in
   `tool_history.rs`; `turn.rs` and `repair_job.rs` consume the same helper,
   and the verifier repair decision bridge no longer calls back into `turn.rs`.
+- Current status: effective tool-policy enforcement is now isolated in
+  `tool_policy.rs`; `turn.rs` invokes policy checks but no longer owns
+  focused-edit/artifact-directed/MissingVerifierJob rejection logic.

@@ -1382,3 +1382,27 @@ Assessment:
 - No behavior change intended. Focused-edit and verifier-repair logic now
   share tool-history evidence through a neutral helper module instead of
   routing RepairJob test decisions back through the actor loop.
+
+## Structural Verification: Slice 64
+
+Scope:
+
+- Move effective tool-policy enforcement helpers from `turn.rs` to
+  `tool_policy.rs`.
+- Keep `turn.rs` responsible for invoking the policy during tool-call
+  handling, not for defining the policy gate itself.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test focused_edit_target_already_read --lib -q`: pass, 1 test.
+- `cargo test effective_tool_policy --lib -q`: pass, 8 tests when rerun
+  outside sandbox.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Runtime policy rejection, target matching, and
+  batch action selection are now policy-owned rather than actor-loop-owned.
