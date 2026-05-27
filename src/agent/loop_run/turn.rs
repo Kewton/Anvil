@@ -23,6 +23,7 @@ use super::repair_job::VerifierRepairDecision;
 use super::repair_patch_validation::{
     CheapCheckOutcome, RepairRejectionSignal, ValidatedVerifierRepairEdit, ValidationFailure,
     ValidationWeakening, VerifierRepairIntent, build_verifier_repair_pass_ledger_outcome,
+    validate_accepted_repair_plan_authorizes_target,
 };
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
@@ -24168,69 +24169,6 @@ fn validate_verifier_repair_intents_with_accepted_plan(
     )
 }
 
-fn validate_accepted_repair_plan_authorizes_target(
-    accepted_plan: &super::repair_plan::AcceptedRepairPlan,
-    target_hint: &super::task_contract::RecoveryTargetHint,
-    relative_path: &str,
-) -> Result<(), ValidationFailure> {
-    super::repair_patch_validation::validate_accepted_plan_authorizes_target(
-        accepted_plan,
-        target_hint,
-        relative_path,
-    )
-    .map_err(|err| match err {
-        super::repair_patch_validation::RepairPlanTargetAuthorizationError::TargetMismatch => {
-            ValidationFailure::failed_with_signal(
-                err.message().to_string(),
-                RepairRejectionSignal::Malformed,
-            )
-        }
-        super::repair_patch_validation::RepairPlanTargetAuthorizationError::RoleMismatch
-        | super::repair_patch_validation::RepairPlanTargetAuthorizationError::InsufficientEvidence
-        | super::repair_patch_validation::RepairPlanTargetAuthorizationError::AmbiguousAuthority => {
-            ValidationFailure::failed(err.message().to_string())
-        }
-    })
-}
-
-fn validation_failure_from_repair_intent_input_error(
-    err: super::repair_patch_validation::RepairIntentInputError,
-) -> ValidationFailure {
-    match err {
-        super::repair_patch_validation::RepairIntentInputError::EmptyOldString => {
-            ValidationFailure::failed_with_signal(
-                err.message().to_string(),
-                RepairRejectionSignal::Malformed,
-            )
-        }
-        super::repair_patch_validation::RepairIntentInputError::Noop => {
-            ValidationFailure::failed_with_signal(
-                err.message().to_string(),
-                RepairRejectionSignal::Noop,
-            )
-        }
-        super::repair_patch_validation::RepairIntentInputError::EditTooLarge
-        | super::repair_patch_validation::RepairIntentInputError::Markup
-        | super::repair_patch_validation::RepairIntentInputError::IntroducesSecret
-        | super::repair_patch_validation::RepairIntentInputError::SuspiciousShellPayload => {
-            ValidationFailure::failed(err.message().to_string())
-        }
-    }
-}
-
-fn validation_failure_from_repair_intent_payload_validation_error(
-    err: super::repair_patch_validation::RepairIntentPayloadValidationError,
-) -> ValidationFailure {
-    match err {
-        super::repair_patch_validation::RepairIntentPayloadValidationError::TargetPath(err) => {
-            ValidationFailure::failed(err.message())
-        }
-        super::repair_patch_validation::RepairIntentPayloadValidationError::Input(err) => {
-            validation_failure_from_repair_intent_input_error(err)
-        }
-    }
-}
-
 fn validate_verifier_repair_intents_inner(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -24291,11 +24229,13 @@ fn validate_verifier_repair_intents_inner(
         super::repair_patch_validation::validate_repair_intents_and_build_edit_payloads(
             work_root,
             &canonical,
-            &relative_path,
-            &intents,
-            VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
-        )
-        .map_err(validation_failure_from_repair_intent_payload_validation_error)?;
+        &relative_path,
+        &intents,
+        VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairIntentPayloadValidationError::into_validation_failure,
+    )?;
 
     // Issue #662 (5-4-1 priority 3, Codex CB-001): history-driven duplicate
     // detector. Runs **before** the in-memory apply so a replay of an

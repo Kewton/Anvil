@@ -147,3 +147,6 @@ with legacy/fallback paths unable to override it.
   to the active job.
 - Current status: validation failure to telemetry reason-label projection is
   now validation-owned.
+- Current status: typed repair-intent validation errors now convert to
+  `ValidationFailure` inside `repair_patch_validation.rs`; `turn.rs` no longer
+  owns those mapping wrappers.

@@ -1332,3 +1332,27 @@ Assessment:
 
 - No behavior change intended. Validation-owned error data now also owns its
   stable telemetry label.
+
+### 2026-05-27 Slice 27
+
+Applied:
+
+- Moved repair-intent typed error to `ValidationFailure` conversion into
+  `repair_patch_validation.rs`.
+- Added a validation-owned wrapper for accepted repair-plan target
+  authorization that returns `ValidationFailure` directly.
+- Removed the corresponding conversion wrappers from `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. `turn.rs` now receives `ValidationFailure`
+  directly from validation-owned typed error conversions.

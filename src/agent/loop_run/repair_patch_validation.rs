@@ -482,6 +482,32 @@ impl RepairIntentInputError {
             }
         }
     }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        match self {
+            Self::EmptyOldString => ValidationFailure::failed_with_signal(
+                self.message().to_string(),
+                RepairRejectionSignal::Malformed,
+            ),
+            Self::Noop => ValidationFailure::failed_with_signal(
+                self.message().to_string(),
+                RepairRejectionSignal::Noop,
+            ),
+            Self::EditTooLarge
+            | Self::Markup
+            | Self::IntroducesSecret
+            | Self::SuspiciousShellPayload => ValidationFailure::failed(self.message().to_string()),
+        }
+    }
+}
+
+impl RepairIntentPayloadValidationError {
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        match self {
+            Self::TargetPath(err) => ValidationFailure::failed(err.message()),
+            Self::Input(err) => err.into_validation_failure(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +549,18 @@ impl RepairPlanTargetAuthorizationError {
             }
         }
     }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        match self {
+            Self::TargetMismatch => ValidationFailure::failed_with_signal(
+                self.message().to_string(),
+                RepairRejectionSignal::Malformed,
+            ),
+            Self::RoleMismatch | Self::InsufficientEvidence | Self::AmbiguousAuthority => {
+                ValidationFailure::failed(self.message().to_string())
+            }
+        }
+    }
 }
 
 pub(super) fn validate_accepted_plan_authorizes_target(
@@ -547,6 +585,15 @@ pub(super) fn validate_accepted_plan_authorizes_target(
         return Err(RepairPlanTargetAuthorizationError::AmbiguousAuthority);
     }
     Ok(())
+}
+
+pub(super) fn validate_accepted_repair_plan_authorizes_target(
+    accepted_plan: &AcceptedRepairPlan,
+    target_hint: &RecoveryTargetHint,
+    relative_path: &str,
+) -> Result<(), ValidationFailure> {
+    validate_accepted_plan_authorizes_target(accepted_plan, target_hint, relative_path)
+        .map_err(RepairPlanTargetAuthorizationError::into_validation_failure)
 }
 
 pub(super) fn is_repair_path_input_safe(raw_path: &str) -> bool {
