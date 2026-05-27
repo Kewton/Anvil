@@ -2075,3 +2075,31 @@ Assessment:
 - No behavior change intended. Semantic failure report enrichment now lives
   with semantic repair planning. `turn.rs` still owns diagnostic-pass
   sequencing and RepairJob state writes.
+
+### 2026-05-27 Slice 55
+
+Applied:
+
+- Moved verifier-output target candidate parsing from `turn.rs` to
+  `verifier_repair_targeting.rs`:
+  - `VerifierRepairTargetCandidate`
+  - path-like token extraction
+  - verifier-output target selection
+  - changed-file hint generation
+- `turn.rs` now consumes the targeting module for both failure-output targets
+  and changed-file hints.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_target --lib -q`: pass, 20 tests
+- `cargo test verifier_repair_context --lib -q`: pass, 7 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3044 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Verifier output parsing and changed-file target
+  hinting are now verifier-targeting responsibilities; `turn.rs` still owns
+  RepairJob construction and state carry-over.

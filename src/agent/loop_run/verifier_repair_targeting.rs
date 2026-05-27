@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::safety::path_guard::resolve_user_path;
@@ -8,6 +9,33 @@ use super::repair_framework_findings::{
     workspace_implementation_imports_python_module,
 };
 use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifierRepairTargetCandidate {
+    pub(super) hint: super::task_contract::RecoveryTargetHint,
+    pub(super) line: Option<usize>,
+    score: usize,
+    ordinal: usize,
+}
+
+pub(super) fn extract_path_like_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || c == ':' || c == '"' || c == '\'')
+        .map(|t| t.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';')))
+        .filter(|t| {
+            !t.is_empty()
+                && t.contains('/')
+                && (t.contains(".rs")
+                    || t.contains(".py")
+                    || t.contains(".ts")
+                    || t.contains(".tsx")
+                    || t.contains(".js")
+                    || t.contains(".jsx")
+                    || t.contains(".go")
+                    || t.contains(".java")
+                    || t.contains(".toml")
+                    || t.contains(".json"))
+        })
+}
 
 pub(super) fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
     let path = raw_path.trim();
@@ -373,6 +401,195 @@ pub(super) fn missing_python_module_workspace_path(
         return None;
     }
     Some(relative)
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_target_hint_from_output(
+    work_root: &Path,
+    output: &str,
+    changed_files: &[String],
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    verifier_repair_target_candidate_from_output(work_root, output, changed_files)
+        .map(|candidate| candidate.hint)
+}
+
+pub(super) fn verifier_repair_target_candidate_from_output(
+    work_root: &Path,
+    output: &str,
+    changed_files: &[String],
+) -> Option<VerifierRepairTargetCandidate> {
+    let mut candidates = Vec::<VerifierRepairTargetCandidate>::new();
+    let mut ordinal = 0usize;
+
+    for line in output.lines() {
+        if verifier_output_line_is_non_fatal_warning(line) {
+            continue;
+        }
+        for path in extract_path_like_tokens(line) {
+            if let Some(candidate) =
+                verifier_repair_candidate_from_path(work_root, path, line, true, ordinal)
+            {
+                insert_verifier_repair_candidate(&mut candidates, candidate);
+                ordinal = ordinal.saturating_add(1);
+            }
+        }
+    }
+
+    for path in changed_files {
+        if let Some(candidate) =
+            verifier_repair_candidate_from_path(work_root, path, "", false, ordinal)
+        {
+            insert_verifier_repair_candidate(&mut candidates, candidate);
+            ordinal = ordinal.saturating_add(1);
+        }
+    }
+
+    candidates.into_iter().max_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| b.ordinal.cmp(&a.ordinal))
+    })
+}
+
+pub(super) fn verifier_repair_changed_file_hints(
+    work_root: &Path,
+    changed_files: &[String],
+) -> Vec<super::task_contract::RecoveryTargetHint> {
+    let mut seen = HashSet::new();
+    let mut hints = Vec::new();
+    for (ordinal, path) in changed_files.iter().enumerate() {
+        let Some(candidate) =
+            verifier_repair_candidate_from_path(work_root, path, "", false, ordinal)
+        else {
+            continue;
+        };
+        if seen.insert(candidate.hint.path.clone()) {
+            hints.push(super::task_contract::RecoveryTargetHint {
+                reason: "changed workspace file is a possible verifier repair target".to_string(),
+                ..candidate.hint
+            });
+        }
+    }
+    hints
+}
+
+fn verifier_repair_candidate_from_path(
+    work_root: &Path,
+    raw_path: &str,
+    source_line: &str,
+    from_verifier_output: bool,
+    ordinal: usize,
+) -> Option<VerifierRepairTargetCandidate> {
+    let Ok(resolved) = resolve_user_path(work_root, raw_path) else {
+        return None;
+    };
+    if !resolved.is_file() {
+        return None;
+    }
+    let canonical_root = work_root.canonicalize().ok();
+    let relative = if let Some(root) = canonical_root.as_ref() {
+        resolved.strip_prefix(root).ok()
+    } else {
+        resolved.strip_prefix(work_root).ok()
+    }?;
+    let path = relative.to_string_lossy().replace('\\', "/");
+    if is_ignored_workspace_display_path(&path) {
+        return None;
+    }
+    let category = super::completion_evidence::classify_repo_edit_path(Path::new(&path));
+    let role = super::task_contract::role_from_repo_edit(category)?;
+    let line = from_verifier_output
+        .then(|| verifier_line_number_for_path(source_line, raw_path))
+        .flatten();
+    let role_score = match role {
+        super::task_contract::ArtifactRole::Implementation => 30,
+        super::task_contract::ArtifactRole::Setup => 25,
+        super::task_contract::ArtifactRole::Test => 15,
+        super::task_contract::ArtifactRole::UsageDocs => 5,
+    };
+    let import_provider_score = if from_verifier_output
+        && role == super::task_contract::ArtifactRole::Implementation
+        && verifier_line_names_import_provider(source_line)
+    {
+        40
+    } else {
+        0
+    };
+    let score = usize::from(from_verifier_output) * 50
+        + usize::from(line.is_some()) * 30
+        + role_score
+        + import_provider_score;
+    Some(VerifierRepairTargetCandidate {
+        hint: super::task_contract::RecoveryTargetHint {
+            role,
+            path,
+            reason: "verifier output or changed files identify this artifact as repair target"
+                .to_string(),
+        },
+        line,
+        score,
+        ordinal,
+    })
+}
+
+fn verifier_line_names_import_provider(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("cannot import name")
+        || lower.contains("unresolved import")
+        || lower.contains("has no exported member")
+        || lower.contains("attempted import error")
+        || lower.contains("is not exported from")
+}
+
+fn insert_verifier_repair_candidate(
+    candidates: &mut Vec<VerifierRepairTargetCandidate>,
+    candidate: VerifierRepairTargetCandidate,
+) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|existing| existing.hint.path == candidate.hint.path)
+    {
+        if candidate.score > existing.score
+            || (candidate.score == existing.score && candidate.ordinal < existing.ordinal)
+        {
+            *existing = candidate;
+        }
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn verifier_output_line_is_non_fatal_warning(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    (lower.contains("warning") || lower.contains("warnings summary"))
+        && !lower.starts_with("error")
+        && !lower.starts_with("failed ")
+        && !lower.starts_with("e   ")
+        && !lower.starts_with("e ")
+        && !lower.starts_with("thread '")
+}
+
+fn verifier_line_number_for_path(line: &str, raw_path: &str) -> Option<usize> {
+    let idx = line.find(raw_path)?;
+    let rest = &line[idx + raw_path.len()..];
+    if let Some(number) = rest.strip_prefix(':').and_then(parse_leading_usize) {
+        return Some(number);
+    }
+    rest.find("line ")
+        .and_then(|idx| parse_leading_usize(&rest[idx + "line ".len()..]))
+}
+
+fn parse_leading_usize(input: &str) -> Option<usize> {
+    let digits = input
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 #[cfg(test)]

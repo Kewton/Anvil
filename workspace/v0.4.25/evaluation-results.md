@@ -1175,3 +1175,26 @@ Assessment:
 - No behavior change intended. Semantic report enrichment is no longer
   embedded in `turn.rs`; the actor loop keeps only the orchestration around
   diagnostic output and RepairJob state.
+
+## Structural Verification: Slice 55
+
+Scope:
+
+- Move verifier-output target candidate parsing and changed-file hint
+  generation from `turn.rs` to `verifier_repair_targeting.rs`.
+- Keep `turn.rs` responsible for RepairJob construction and previous-state
+  carry-over.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_target --lib -q`: pass, 20 tests.
+- `cargo test verifier_repair_context --lib -q`: pass, 7 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3044 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The parser and hint generation are no longer
+  embedded in the actor loop; `turn.rs` consumes the normalized candidates.
