@@ -82,7 +82,8 @@ use super::verifier_repair_shadow::{
 };
 use super::verifier_repair_targeting::{
     diagnostic_missing_setup_path_is_controller_writable, missing_python_module_workspace_path,
-    python_missing_external_dependency_name, verifier_diagnostic_path_input_is_safe,
+    python_missing_external_dependency_name, recovery_target_hint_for_existing_path,
+    verifier_diagnostic_path_input_is_safe,
 };
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
@@ -23057,37 +23058,6 @@ fn verifier_repair_intents_fingerprint(
         relative_path,
         &repair_intent_edit_payloads(intents),
     )
-}
-
-fn recovery_target_hint_for_existing_path(
-    work_root: &Path,
-    raw_path: &str,
-    reason: &str,
-) -> Option<super::task_contract::RecoveryTargetHint> {
-    if !verifier_diagnostic_path_input_is_safe(raw_path) {
-        return None;
-    }
-    let resolved = resolve_user_path(work_root, raw_path).ok()?;
-    if !resolved.is_file() {
-        return None;
-    }
-    let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
-    let canonical = std::fs::canonicalize(&resolved).ok()?;
-    if !canonical.is_file() {
-        return None;
-    }
-    let relative = canonical.strip_prefix(root).ok()?;
-    let path = relative.to_string_lossy().replace('\\', "/");
-    if is_ignored_workspace_display_path(&path) {
-        return None;
-    }
-    let category = super::completion_evidence::classify_repo_edit_path(Path::new(&path));
-    let role = super::task_contract::role_from_repo_edit(category)?;
-    Some(super::task_contract::RecoveryTargetHint {
-        role,
-        path,
-        reason: reason.to_string(),
-    })
 }
 
 fn recovery_target_hint_for_diagnostic_path(

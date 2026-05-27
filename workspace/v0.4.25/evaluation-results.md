@@ -1023,3 +1023,28 @@ Assessment:
 
 - No behavior change intended. Mapping responsibility is no longer duplicated
   between `turn.rs` and `task_contract.rs`.
+
+## Structural Verification: Slice 49
+
+Scope:
+
+- Move existing-file path to `RecoveryTargetHint` conversion from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Add local tests for safe path classification and ignored/unsafe path
+  rejection.
+- Preserve admission sequencing in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_repair_targeting --lib -q`: pass, 5 tests.
+- `cargo test recovery_target_hint --lib -q`: pass, 2 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3035 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The path-to-hint conversion boundary is closer
+  to verifier repair targeting; `turn.rs` only invokes it as part of the
+  stateful diagnostic repair flow.

@@ -206,3 +206,6 @@ with legacy/fallback paths unable to override it.
 - Current status: repo-edit-category to artifact-role mapping is now consumed
   through `task_contract::role_from_repo_edit`; the duplicate table in
   `turn.rs` has been removed.
+- Current status: existing-file path to `RecoveryTargetHint` conversion is now
+  isolated in `verifier_repair_targeting.rs`; `turn.rs` still owns diagnostic
+  admission sequencing and RepairJob state updates.

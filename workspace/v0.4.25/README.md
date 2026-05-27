@@ -1903,3 +1903,29 @@ Assessment:
 
 - No behavior change intended. Repo-edit-category to artifact-role mapping now
   has one owner instead of a duplicated table in `turn.rs`.
+
+### 2026-05-27 Slice 49
+
+Applied:
+
+- Moved `recovery_target_hint_for_existing_path` from `turn.rs` to
+  `verifier_repair_targeting.rs`.
+- Added local characterization tests for safe existing implementation/test
+  path classification and unsafe/ignored path rejection.
+- Left diagnostic admission sequencing and RepairJob state writes in
+  `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_repair_targeting --lib -q`: pass, 5 tests
+- `cargo test recovery_target_hint --lib -q`: pass, 2 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3035 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Existing-path to repair-target hint conversion
+  is now owned by the verifier repair targeting module; `turn.rs` still owns
+  when that hint is promoted through admission.
