@@ -642,3 +642,27 @@ Assessment:
 - No behavior change intended. The semantic weakening filter still lives in
   `turn.rs`, but its Python fixture-analysis dependencies are no longer
   embedded there.
+
+## Structural Verification: Slice 32
+
+Scope:
+
+- Extract semantic generated-test weakening admission from `turn.rs`.
+- Keep the generic weakening detector in `repair_patch_validation.rs`; the new
+  module only decides whether specific generated-test expectation edits have
+  enough diagnostic/authority evidence to be admitted.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_test_weakening_filter --lib -q`: pass, 2 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3025 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop now invokes a dedicated semantic
+  filter instead of owning the expected-literal and test-only repair admission
+  details.

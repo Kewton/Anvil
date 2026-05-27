@@ -1466,3 +1466,29 @@ Assessment:
 - No behavior change intended. This reduces duplicated Python test analysis in
   the actor loop and narrows the remaining semantic weakening filter
   dependency surface.
+
+### 2026-05-27 Slice 32
+
+Applied:
+
+- Added `repair_test_weakening_filter.rs` for semantic generated-test
+  weakening admission.
+- Moved expected-literal, disconnected-fixture-observation, and
+  test-only-missing-import-symbol allowance checks out of `turn.rs`.
+- Left `turn.rs` responsible only for invoking the filter after the generic
+  weakening detector has produced patterns.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_test_weakening_filter --lib -q`: pass, 2 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3025 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Semantic test-repair authority checks now live
+  behind a dedicated module boundary instead of being embedded in verifier
+  repair validation orchestration.

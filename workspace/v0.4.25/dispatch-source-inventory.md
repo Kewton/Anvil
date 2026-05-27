@@ -162,3 +162,6 @@ with legacy/fallback paths unable to override it.
 - Current status: Python pytest/test-fragment fixture analysis is now isolated
   in `repair_python_test_analysis.rs`; `turn.rs` still owns semantic repair
   authority decisions and the high-level weakening filter.
+- Current status: semantic generated-test weakening admission is now isolated
+  in `repair_test_weakening_filter.rs`; `turn.rs` only invokes it after the
+  generic weakening detector reports patterns.

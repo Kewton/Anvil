@@ -151,6 +151,9 @@ mod repair_python_import_evidence;
 // v0.4.25: Python pytest/test-fragment analysis shared by verifier framework
 // diagnostics and semantic test-repair validation.
 mod repair_python_test_analysis;
+// v0.4.25: semantic test weakening admission filter. Keeps verifier repair
+// authority decisions out of the actor loop.
+mod repair_test_weakening_filter;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

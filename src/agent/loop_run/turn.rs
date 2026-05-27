@@ -16,12 +16,7 @@ use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::reminder::{
     self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
 };
-use super::repair_assertion_analysis::{
-    assert_line_update_has_observed_pair, changed_assert_equalities, changed_assert_lines,
-    changed_non_assert_lines, count_assert_lines, observed_assert_equal_pairs,
-    pytest_output_suggests_shared_state_leak, python_assert_line_is_obvious_weakening,
-    python_assert_line_observes_fixture_state,
-};
+use super::repair_assertion_analysis::pytest_output_suggests_shared_state_leak;
 #[cfg(test)]
 use super::repair_job;
 #[cfg(test)]
@@ -34,9 +29,7 @@ use super::repair_patch_validation::{
     validate_accepted_repair_plan_authorizes_target,
 };
 use super::repair_python_test_analysis::{
-    excerpt_asserts_fixture_state, excerpt_connects_fixture_to_system_under_test,
     excerpt_has_disconnected_fixture_state_assertion, line_mentions_identifier,
-    pytest_local_mutable_fixture_names,
 };
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
@@ -23905,7 +23898,7 @@ fn validate_verifier_repair_intents_inner(
             &contents,
         );
     let weakening = if weakening_detection.target_is_test_file {
-        filter_test_weakening_for_observed_assert_update(
+        super::repair_test_weakening_filter::filter_weakening_for_observed_assert_update(
             weakening_detection.patterns,
             context,
             &original_contents,
@@ -23964,204 +23957,6 @@ fn repair_intent_edit_payloads(
             replace_all: intent.replace_all,
         })
         .collect()
-}
-
-fn filter_test_weakening_for_observed_assert_update(
-    patterns: Vec<super::spec_authority::WeakeningPattern>,
-    context: &super::repair_job::RepairJob,
-    before: &str,
-    after: &str,
-) -> Vec<super::spec_authority::WeakeningPattern> {
-    use super::spec_authority::WeakeningPattern::{AssertionDeleted, LiteralOnlyExpectedChange};
-
-    if patterns.is_empty() {
-        return patterns;
-    }
-    let only_expected_assert_update = patterns
-        .iter()
-        .all(|pattern| matches!(pattern, AssertionDeleted | LiteralOnlyExpectedChange));
-    if !only_expected_assert_update {
-        return patterns;
-    }
-    if count_assert_lines(after) < count_assert_lines(before) {
-        return patterns;
-    }
-    if classify_test_repair_allowed_change_kind(context, before, after).is_some() {
-        Vec::new()
-    } else {
-        patterns
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VerifierRepairAllowedChangeKind {
-    ExpectedLiteral,
-    DisconnectedFixtureObservation,
-    TestOnlyMissingImportSymbol,
-}
-
-fn classify_test_repair_allowed_change_kind(
-    context: &super::repair_job::RepairJob,
-    before: &str,
-    after: &str,
-) -> Option<VerifierRepairAllowedChangeKind> {
-    if !test_expectation_alignment_allowed_by_authority(context) {
-        return None;
-    }
-    if observed_assert_update_matches_repair_context(context, before, after) {
-        return Some(VerifierRepairAllowedChangeKind::ExpectedLiteral);
-    }
-    if disconnected_fixture_assertion_update_matches(context, before, after) {
-        return Some(VerifierRepairAllowedChangeKind::DisconnectedFixtureObservation);
-    }
-    test_only_missing_import_symbol_update_matches(context, before, after)
-        .then_some(VerifierRepairAllowedChangeKind::TestOnlyMissingImportSymbol)
-}
-
-fn test_expectation_alignment_allowed_by_authority(context: &super::repair_job::RepairJob) -> bool {
-    let Some(plan) = context.semantic_plan.as_ref() else {
-        return false;
-    };
-    if matches!(
-        plan.semantic_cause,
-        super::VerifierDiagnosticFailureKind::TestBug
-    ) || matches!(
-        plan.semantic_report.failure_kind,
-        super::VerifierDiagnosticFailureKind::TestBug
-    ) {
-        return true;
-    }
-    !matches!(
-        plan.spec_authority,
-        super::spec_authority::SpecAuthority::UserRequest
-    )
-}
-
-fn observed_assert_update_matches_repair_context(
-    context: &super::repair_job::RepairJob,
-    before: &str,
-    after: &str,
-) -> bool {
-    let deleted_asserts = changed_assert_equalities(before, after);
-    let added_asserts = changed_assert_equalities(after, before);
-    if deleted_asserts.is_empty()
-        || added_asserts.is_empty()
-        || deleted_asserts.len() != added_asserts.len()
-    {
-        return false;
-    }
-
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    let observed_pairs = observed_assert_equal_pairs(&diagnostic_text);
-    if observed_pairs.is_empty() {
-        return false;
-    }
-
-    deleted_asserts.iter().all(|(old_lhs, old_expected)| {
-        added_asserts.iter().any(|(new_lhs, new_expected)| {
-            old_lhs == new_lhs
-                && observed_pairs
-                    .iter()
-                    .any(|(actual, expected)| actual == new_expected && expected == old_expected)
-        })
-    }) && added_asserts.iter().all(|(new_lhs, new_expected)| {
-        deleted_asserts.iter().any(|(old_lhs, old_expected)| {
-            old_lhs == new_lhs
-                && observed_pairs
-                    .iter()
-                    .any(|(actual, expected)| actual == new_expected && expected == old_expected)
-        })
-    })
-}
-
-fn disconnected_fixture_assertion_update_matches(
-    context: &super::repair_job::RepairJob,
-    before: &str,
-    after: &str,
-) -> bool {
-    let disconnected_fixtures = pytest_local_mutable_fixture_names(before)
-        .into_iter()
-        .filter(|name| {
-            excerpt_asserts_fixture_state(before, name)
-                && !excerpt_connects_fixture_to_system_under_test(before, name)
-        })
-        .collect::<HashSet<_>>();
-    if disconnected_fixtures.is_empty() {
-        return false;
-    }
-    if count_assert_lines(after) < count_assert_lines(before) {
-        return false;
-    }
-    let deleted_asserts = changed_assert_lines(before, after);
-    if deleted_asserts.is_empty() {
-        return false;
-    }
-    let added_asserts = changed_assert_lines(after, before);
-    if added_asserts.len() < deleted_asserts.len() {
-        return false;
-    }
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    let observed_pairs = observed_assert_equal_pairs(&diagnostic_text);
-    deleted_asserts.iter().all(|line| {
-        let fixture_observation = disconnected_fixtures
-            .iter()
-            .any(|name| python_assert_line_observes_fixture_state(line, name));
-        fixture_observation
-            || added_asserts
-                .iter()
-                .any(|added| assert_line_update_has_observed_pair(line, added, &observed_pairs))
-    }) && added_asserts
-        .iter()
-        .all(|line| !python_assert_line_is_obvious_weakening(line))
-}
-
-fn test_only_missing_import_symbol_update_matches(
-    context: &super::repair_job::RepairJob,
-    before: &str,
-    after: &str,
-) -> bool {
-    let diagnostic_text = format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    );
-    let Some((name, module)) = missing_python_import_name_from_output(&diagnostic_text) else {
-        return false;
-    };
-    if !python_source_imports_name_from_module(before, &module, &name)
-        || python_source_imports_name_from_module(after, &module, &name)
-    {
-        return false;
-    }
-    if count_assert_lines(after) < count_assert_lines(before) {
-        return false;
-    }
-    let deleted_asserts = changed_assert_lines(before, after);
-    let added_asserts = changed_assert_lines(after, before);
-    if !deleted_asserts.is_empty() && added_asserts.len() < deleted_asserts.len() {
-        return false;
-    }
-    let changed_non_asserts = changed_non_assert_lines(before, after);
-    if !changed_non_asserts
-        .iter()
-        .any(|line| line_mentions_identifier(line, &name))
-    {
-        return false;
-    }
-    added_asserts
-        .iter()
-        .all(|line| !python_assert_line_is_obvious_weakening(line))
 }
 
 #[cfg(test)]
