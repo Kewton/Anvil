@@ -30,25 +30,36 @@
       "rough_cc_ge_threshold": 0
     },
     {
-      "avg_rough_cc": 2.90,
-      "function_loc": 33047,
-      "functions": 1076,
-      "max_rough_cc": 320,
+      "avg_rough_cc": 2.9,
+      "function_loc": 33067,
+      "functions": 1078,
+      "max_rough_cc": 277,
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc_ge_high_threshold": 1,
-      "rough_cc_ge_threshold": 22
+      "rough_cc_ge_threshold": 23
     }
   ],
+  "files_analyzed": 4,
+  "functions_analyzed": 1346,
   "high_threshold": 50,
+  "root": "/Users/maenokota/share/work/github_kewton/Anvil-develop",
+  "schema_version": 1,
   "script_schema_version": 1,
   "threshold": 15,
   "top_functions": [
     {
-      "line": 5777,
-      "loc": 2587,
+      "line": 6027,
+      "loc": 2394,
       "name": "run_actor_loop",
       "path": "src/agent/loop_run/turn.rs",
-      "rough_cc": 320
+      "rough_cc": 277
+    },
+    {
+      "line": 5812,
+      "loc": 200,
+      "name": "drive_actor_loop_pre_reply_phase",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 37
     },
     {
       "line": 1211,
@@ -65,14 +76,14 @@
       "rough_cc": 26
     },
     {
-      "line": 2290,
+      "line": 2325,
       "loc": 68,
       "name": "verifier_file_excerpt_for_line",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 21
     },
     {
-      "line": 12585,
+      "line": 12642,
       "loc": 150,
       "name": "run_verifier_repair_pass_and_apply",
       "path": "src/agent/loop_run/turn.rs",
@@ -86,30 +97,23 @@
       "rough_cc": 20
     },
     {
-      "line": 4072,
+      "line": 4107,
       "loc": 161,
       "name": "maybe_extract_case_record",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 19
     },
     {
-      "line": 22121,
+      "line": 22178,
       "loc": 30,
       "name": "synthesized_missing_test_target_path_for_request",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 19
     },
     {
-      "line": 3375,
+      "line": 3410,
       "loc": 142,
       "name": "maybe_invoke_work_mode_confirm",
-      "path": "src/agent/loop_run/turn.rs",
-      "rough_cc": 18
-    },
-    {
-      "line": 5472,
-      "loc": 99,
-      "name": "maybe_handle_missing_repo_edit_recovery",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 18
     }

@@ -1722,6 +1722,41 @@ struct PostReplyRecoveryArgs<'a, 'b> {
     framework_app_fallback_materialized: &'b mut bool,
 }
 
+struct ActorLoopPreReplyArgs<'a, 'b> {
+    before_snapshot: &'a RepoSnapshot,
+    accumulated: &'a [RepoVerification],
+    task_contract: Option<&'a super::task_contract::TaskContract>,
+    repo_edit_calls_made_this_turn: &'b mut usize,
+    contract_verification_retries: &'b mut usize,
+    contract_verifier_repair_edit_count: &'b mut Option<usize>,
+    repo_change_retries: &'b mut usize,
+    verifier_repair_retries: &'b mut usize,
+    task_contract_verify_commands_collected: &'b mut Vec<String>,
+    task_contract_verifier_passed_in_loop: &'b mut bool,
+    framework_app_fallback_materialized: &'b mut bool,
+    action_expectation: recovery::ActionExpectation,
+    stream_output: bool,
+    last_iter: usize,
+    interrupt_flag: &'a InterruptFlag,
+}
+
+enum ActorLoopPreReplyOutcome {
+    Continue,
+    Done {
+        final_prose: String,
+    },
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+    ReplyPrepared {
+        reply: AssistantReply,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+        missing_verifier_setup_turn: bool,
+        recovery_owner: RecoveryOwner,
+    },
+}
+
 struct TaskContractVerifierFlowArgs<'a, 'b> {
     before_snapshot: &'a RepoSnapshot,
     accumulated: &'a [RepoVerification],
@@ -5774,6 +5809,221 @@ impl Agent {
         Some(PostReplyRecoveryOutcome::Continue)
     }
 
+    fn drive_actor_loop_pre_reply_phase(
+        &mut self,
+        args: ActorLoopPreReplyArgs<'_, '_>,
+    ) -> ActorLoopPreReplyOutcome {
+        if args.interrupt_flag.is_set() {
+            return ActorLoopPreReplyOutcome::Exit {
+                reason: ExitReason::Interrupted,
+                error_text: String::new(),
+            };
+        }
+
+        let pre_model_task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan
+            || (self.task_contract_verifier_repair_pending && self.repair_job.is_some())
+        {
+            None
+        } else {
+            args.task_contract.as_ref().map(|contract| {
+                self.task_contract_recovery_action(
+                    contract,
+                    *args.contract_verifier_repair_edit_count,
+                    *args.repo_edit_calls_made_this_turn,
+                )
+            })
+        };
+        let loop_control_action = determine_loop_control_action(LoopControlInputs {
+            mode: self.session.mode_state.mode,
+            task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
+            repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
+            missing_verifier_next_action: self
+                .missing_verifier_job
+                .as_ref()
+                .map(|job| job.next_action()),
+            task_contract_action: pre_model_task_contract_action.clone(),
+        });
+        let recovery_owner = RecoveryOwner::from_control_action(
+            &loop_control_action,
+            pre_model_task_contract_action.as_ref(),
+        );
+        let recovery_dispatch_gate = RecoveryDispatchGate::from_owner(recovery_owner);
+        let missing_verifier_setup_turn =
+            loop_control_action_requires_missing_verifier_setup(&loop_control_action);
+        match loop_control_action {
+            LoopControlAction::ContinueRepairJob { next_action: _ } => {
+                let outcome = self.dispatch_repair_job_step(
+                    TaskContractVerifierFlowArgs {
+                        before_snapshot: args.before_snapshot,
+                        accumulated: args.accumulated,
+                        repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
+                        task_contract: args.task_contract,
+                        contract_verification_retries: args.contract_verification_retries,
+                        contract_verifier_repair_edit_count: args
+                            .contract_verifier_repair_edit_count,
+                        repo_change_retries: args.repo_change_retries,
+                        verifier_repair_retries: args.verifier_repair_retries,
+                        task_contract_verify_commands_collected: args
+                            .task_contract_verify_commands_collected,
+                        task_contract_verifier_passed_in_loop: args
+                            .task_contract_verifier_passed_in_loop,
+                        last_iter: args.last_iter,
+                    },
+                    args.repo_edit_calls_made_this_turn,
+                );
+                return Self::actor_loop_pre_reply_flow_outcome(outcome);
+            }
+            LoopControlAction::ContinueMissingVerifierJob { next_action } => {
+                if let Some(outcome) = self.dispatch_missing_verifier_job_step(
+                    TaskContractVerifierFlowArgs {
+                        before_snapshot: args.before_snapshot,
+                        accumulated: args.accumulated,
+                        repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
+                        task_contract: args.task_contract,
+                        contract_verification_retries: args.contract_verification_retries,
+                        contract_verifier_repair_edit_count: args
+                            .contract_verifier_repair_edit_count,
+                        repo_change_retries: args.repo_change_retries,
+                        verifier_repair_retries: args.verifier_repair_retries,
+                        task_contract_verify_commands_collected: args
+                            .task_contract_verify_commands_collected,
+                        task_contract_verifier_passed_in_loop: args
+                            .task_contract_verifier_passed_in_loop,
+                        last_iter: args.last_iter,
+                    },
+                    next_action,
+                ) {
+                    return Self::actor_loop_pre_reply_flow_outcome(outcome);
+                }
+            }
+            LoopControlAction::RunVerifier => {
+                let outcome = self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
+                    before_snapshot: args.before_snapshot,
+                    accumulated: args.accumulated,
+                    repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
+                    task_contract: args.task_contract,
+                    contract_verification_retries: args.contract_verification_retries,
+                    contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
+                    repo_change_retries: args.repo_change_retries,
+                    verifier_repair_retries: args.verifier_repair_retries,
+                    task_contract_verify_commands_collected: args
+                        .task_contract_verify_commands_collected,
+                    task_contract_verifier_passed_in_loop: args
+                        .task_contract_verifier_passed_in_loop,
+                    last_iter: args.last_iter,
+                });
+                return Self::actor_loop_pre_reply_flow_outcome(outcome);
+            }
+            LoopControlAction::RequestModelTurn => {}
+        }
+
+        if args.action_expectation == recovery::ActionExpectation::RepoChange
+            && recovery_dispatch_gate.allows_deterministic_fallback()
+            && *args.repo_edit_calls_made_this_turn == 0
+            && self.maybe_materialize_mode_deterministic_fallback(args.last_iter)
+        {
+            return ActorLoopPreReplyOutcome::Continue;
+        }
+
+        if args.action_expectation == recovery::ActionExpectation::RepoChange
+            && recovery_dispatch_gate.allows_deterministic_fallback()
+            && *args.repo_edit_calls_made_this_turn == 0
+            && should_try_framework_app_fallback(
+                args.last_iter,
+                *args.framework_app_fallback_materialized,
+            )
+            && self.maybe_materialize_framework_game_fallback(args.last_iter)
+        {
+            *args.framework_app_fallback_materialized = true;
+            self.push_system_note(framework_app_fallback_continuation_note().to_string());
+            return ActorLoopPreReplyOutcome::Continue;
+        }
+
+        if *args.repo_edit_calls_made_this_turn == 0
+            && recovery_dispatch_gate.allows_deterministic_fallback()
+            && self.current_request_needs_playable_ui_quality_gate()
+            && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
+        {
+            match self.maybe_apply_deterministic_polish_fallback(&request, &target_path) {
+                Ok(true) => {
+                    write_stdout_rendered(
+                        &format_iteration_status(
+                            args.last_iter,
+                            self.config.max_iterations,
+                            "Polish fallback",
+                            &format!("Applied deterministic visual polish to {target_path}."),
+                            self.footer.current_cols(),
+                        ),
+                        true,
+                    );
+                    self.session.record_feedback_if_unset(
+                        build_feedback_for_deterministic_content_fallback(&self.work_root),
+                    );
+                    self.push_deterministic_ui_recovery_continuation_note(
+                        &target_path,
+                        (*args.repo_change_retries).saturating_add(1),
+                    );
+                    return ActorLoopPreReplyOutcome::Continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    return ActorLoopPreReplyOutcome::Exit {
+                        reason: ExitReason::TransportError,
+                        error_text: err,
+                    };
+                }
+            }
+        }
+
+        match self.request_assistant_reply_with_retry(
+            args.stream_output,
+            args.interrupt_flag,
+            recovery_dispatch_gate,
+        ) {
+            Ok(reply) => ActorLoopPreReplyOutcome::ReplyPrepared {
+                reply,
+                recovery_dispatch_gate,
+                missing_verifier_setup_turn,
+                recovery_owner,
+            },
+            Err(err) => {
+                let reason = if err == USER_INTERRUPT_ERROR {
+                    ExitReason::Interrupted
+                } else if lifecycle::is_tool_call_format_error(&err) {
+                    ExitReason::ToolCallFormatError
+                } else {
+                    ExitReason::TransportError
+                };
+                if err != USER_INTERRUPT_ERROR
+                    && (lifecycle::is_native_tool_parser_failure(&err)
+                        || lifecycle::is_tool_call_format_error(&err)
+                        || lifecycle::is_native_tool_transport_failure(&err))
+                {
+                    let frame = build_feedback_for_tool_protocol_failure(&err, &self.work_root);
+                    self.session.record_feedback(frame);
+                }
+                ActorLoopPreReplyOutcome::Exit {
+                    reason,
+                    error_text: err,
+                }
+            }
+        }
+    }
+
+    fn actor_loop_pre_reply_flow_outcome(
+        outcome: TaskContractVerifierFlowOutcome,
+    ) -> ActorLoopPreReplyOutcome {
+        match outcome {
+            TaskContractVerifierFlowOutcome::Continue => ActorLoopPreReplyOutcome::Continue,
+            TaskContractVerifierFlowOutcome::Done { final_prose } => {
+                ActorLoopPreReplyOutcome::Done { final_prose }
+            }
+            TaskContractVerifierFlowOutcome::Exit { reason, error_text } => {
+                ActorLoopPreReplyOutcome::Exit { reason, error_text }
+            }
+        }
+    }
+
     fn run_actor_loop(
         &mut self,
         action_expectation: recovery::ActionExpectation,
@@ -5990,245 +6240,52 @@ impl Agent {
             // which collapsed all same-turn re-emits to a single value).
             self.emit_active_job_selected_if_changed(iter_count as u32);
 
-            // Boundary 1: before requesting the next assistant reply. Lets us
-            // bail out between iterations without starting a fresh LLM call.
-            if interrupt_flag.is_set() {
-                exit_reason = ExitReason::Interrupted;
-                break 'outer;
-            }
-
-            let pre_model_task_contract_action = if self.session.mode_state.mode
-                == ExecutionMode::Plan
-                || (self.task_contract_verifier_repair_pending && self.repair_job.is_some())
-            {
-                None
-            } else {
-                task_contract.as_ref().map(|contract| {
-                    self.task_contract_recovery_action(
-                        contract,
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                    )
-                })
-            };
-            let loop_control_action = determine_loop_control_action(LoopControlInputs {
-                mode: self.session.mode_state.mode,
-                task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
-                repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
-                missing_verifier_next_action: self
-                    .missing_verifier_job
-                    .as_ref()
-                    .map(|job| job.next_action()),
-                task_contract_action: pre_model_task_contract_action.clone(),
-            });
-            let recovery_owner = RecoveryOwner::from_control_action(
-                &loop_control_action,
-                pre_model_task_contract_action.as_ref(),
-            );
-            let recovery_dispatch_gate = RecoveryDispatchGate::from_owner(recovery_owner);
-            let missing_verifier_setup_turn =
-                loop_control_action_requires_missing_verifier_setup(&loop_control_action);
-            match loop_control_action {
-                LoopControlAction::ContinueRepairJob { next_action: _ } => {
-                    match self.dispatch_repair_job_step(
-                        TaskContractVerifierFlowArgs {
-                            before_snapshot: &before_snapshot,
-                            accumulated: &accumulated,
-                            repo_edit_calls_made_this_turn,
-                            task_contract: task_contract.as_ref(),
-                            contract_verification_retries: &mut contract_verification_retries,
-                            contract_verifier_repair_edit_count:
-                                &mut contract_verifier_repair_edit_count,
-                            repo_change_retries: &mut repo_change_retries,
-                            verifier_repair_retries: &mut verifier_repair_retries,
-                            task_contract_verify_commands_collected:
-                                &mut task_contract_verify_commands_collected,
-                            task_contract_verifier_passed_in_loop:
-                                &mut task_contract_verifier_passed_in_loop,
-                            last_iter,
-                        },
-                        &mut repo_edit_calls_made_this_turn,
-                    ) {
-                        TaskContractVerifierFlowOutcome::Continue => continue,
-                        TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                            final_prose = prose;
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
-                        }
-                        TaskContractVerifierFlowOutcome::Exit {
-                            reason,
-                            error_text: verifier_error,
-                        } => {
-                            exit_reason = reason;
-                            error_text = verifier_error;
-                            break 'outer;
-                        }
-                    }
-                }
-                LoopControlAction::ContinueMissingVerifierJob { next_action } => {
-                    if let Some(outcome) = self.dispatch_missing_verifier_job_step(
-                        TaskContractVerifierFlowArgs {
-                            before_snapshot: &before_snapshot,
-                            accumulated: &accumulated,
-                            repo_edit_calls_made_this_turn,
-                            task_contract: task_contract.as_ref(),
-                            contract_verification_retries: &mut contract_verification_retries,
-                            contract_verifier_repair_edit_count:
-                                &mut contract_verifier_repair_edit_count,
-                            repo_change_retries: &mut repo_change_retries,
-                            verifier_repair_retries: &mut verifier_repair_retries,
-                            task_contract_verify_commands_collected:
-                                &mut task_contract_verify_commands_collected,
-                            task_contract_verifier_passed_in_loop:
-                                &mut task_contract_verifier_passed_in_loop,
-                            last_iter,
-                        },
-                        next_action,
-                    ) {
-                        match outcome {
-                            TaskContractVerifierFlowOutcome::Continue => continue,
-                            TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                                final_prose = prose;
-                                exit_reason = ExitReason::Done;
-                                break 'outer;
-                            }
-                            TaskContractVerifierFlowOutcome::Exit {
-                                reason,
-                                error_text: verifier_error,
-                            } => {
-                                exit_reason = reason;
-                                error_text = verifier_error;
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-                LoopControlAction::RunVerifier => {
-                    match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
-                        before_snapshot: &before_snapshot,
-                        accumulated: &accumulated,
-                        repo_edit_calls_made_this_turn,
-                        task_contract: task_contract.as_ref(),
-                        contract_verification_retries: &mut contract_verification_retries,
-                        contract_verifier_repair_edit_count:
-                            &mut contract_verifier_repair_edit_count,
-                        repo_change_retries: &mut repo_change_retries,
-                        verifier_repair_retries: &mut verifier_repair_retries,
-                        task_contract_verify_commands_collected:
-                            &mut task_contract_verify_commands_collected,
-                        task_contract_verifier_passed_in_loop:
-                            &mut task_contract_verifier_passed_in_loop,
-                        last_iter,
-                    }) {
-                        TaskContractVerifierFlowOutcome::Continue => continue,
-                        TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                            final_prose = prose;
-                            exit_reason = ExitReason::Done;
-                            break 'outer;
-                        }
-                        TaskContractVerifierFlowOutcome::Exit {
-                            reason,
-                            error_text: verifier_error,
-                        } => {
-                            exit_reason = reason;
-                            error_text = verifier_error;
-                            break 'outer;
-                        }
-                    }
-                }
-                LoopControlAction::RequestModelTurn => {}
-            }
-
-            if action_expectation == recovery::ActionExpectation::RepoChange
-                && recovery_dispatch_gate.allows_deterministic_fallback()
-                && repo_edit_calls_made_this_turn == 0
-                && self.maybe_materialize_mode_deterministic_fallback(last_iter)
-            {
-                continue;
-            }
-
-            if action_expectation == recovery::ActionExpectation::RepoChange
-                && recovery_dispatch_gate.allows_deterministic_fallback()
-                && repo_edit_calls_made_this_turn == 0
-                && should_try_framework_app_fallback(last_iter, framework_app_fallback_materialized)
-                && self.maybe_materialize_framework_game_fallback(last_iter)
-            {
-                framework_app_fallback_materialized = true;
-                self.push_system_note(framework_app_fallback_continuation_note().to_string());
-                continue;
-            }
-
-            if repo_edit_calls_made_this_turn == 0
-                && recovery_dispatch_gate.allows_deterministic_fallback()
-                && self.current_request_needs_playable_ui_quality_gate()
-                && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
-            {
-                match self.maybe_apply_deterministic_polish_fallback(&request, &target_path) {
-                    Ok(true) => {
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Polish fallback",
-                                &format!("Applied deterministic visual polish to {target_path}."),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        // Issue #455 / D2: deterministic content fallback success.
-                        // Record a ToolProtocolFailure frame tagged
-                        // `deterministic_content_fallback` so the Reminder
-                        // Sidecar can hint the next turn to produce non-fallback
-                        // output. First-eligible-failure-wins guard (D4) keeps
-                        // earlier this-turn failure frames intact.
-                        self.session.record_feedback_if_unset(
-                            build_feedback_for_deterministic_content_fallback(&self.work_root),
-                        );
-                        self.push_deterministic_ui_recovery_continuation_note(
-                            &target_path,
-                            repo_change_retries.saturating_add(1),
-                        );
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        exit_reason = ExitReason::TransportError;
-                        error_text = err;
+            let (reply, recovery_dispatch_gate, missing_verifier_setup_turn, recovery_owner) =
+                match self.drive_actor_loop_pre_reply_phase(ActorLoopPreReplyArgs {
+                    before_snapshot: &before_snapshot,
+                    accumulated: &accumulated,
+                    task_contract: task_contract.as_ref(),
+                    repo_edit_calls_made_this_turn: &mut repo_edit_calls_made_this_turn,
+                    contract_verification_retries: &mut contract_verification_retries,
+                    contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
+                    repo_change_retries: &mut repo_change_retries,
+                    verifier_repair_retries: &mut verifier_repair_retries,
+                    task_contract_verify_commands_collected:
+                        &mut task_contract_verify_commands_collected,
+                    task_contract_verifier_passed_in_loop:
+                        &mut task_contract_verifier_passed_in_loop,
+                    framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
+                    action_expectation,
+                    stream_output,
+                    last_iter,
+                    interrupt_flag: &interrupt_flag,
+                }) {
+                    ActorLoopPreReplyOutcome::Continue => continue,
+                    ActorLoopPreReplyOutcome::Done { final_prose: prose } => {
+                        final_prose = prose;
+                        exit_reason = ExitReason::Done;
                         break 'outer;
                     }
-                }
-            }
-
-            let reply = match self.request_assistant_reply_with_retry(
-                stream_output,
-                &interrupt_flag,
-                recovery_dispatch_gate,
-            ) {
-                Ok(r) => r,
-                Err(err) => {
-                    exit_reason = if err == USER_INTERRUPT_ERROR {
-                        ExitReason::Interrupted
-                    } else if lifecycle::is_tool_call_format_error(&err) {
-                        ExitReason::ToolCallFormatError
-                    } else {
-                        ExitReason::TransportError
-                    };
-                    // CB-001: tool parser / format / transport failures
-                    // surface here as Err. Record a ToolProtocolFailure
-                    // FeedbackFrame so the session reflects the agent
-                    // protocol break, not just the exit reason.
-                    if err != USER_INTERRUPT_ERROR
-                        && (lifecycle::is_native_tool_parser_failure(&err)
-                            || lifecycle::is_tool_call_format_error(&err)
-                            || lifecycle::is_native_tool_transport_failure(&err))
-                    {
-                        let frame = build_feedback_for_tool_protocol_failure(&err, &self.work_root);
-                        self.session.record_feedback(frame);
+                    ActorLoopPreReplyOutcome::Exit {
+                        reason,
+                        error_text: loop_error,
+                    } => {
+                        exit_reason = reason;
+                        error_text = loop_error;
+                        break 'outer;
                     }
-                    error_text = err;
-                    break 'outer;
-                }
-            };
+                    ActorLoopPreReplyOutcome::ReplyPrepared {
+                        reply,
+                        recovery_dispatch_gate,
+                        missing_verifier_setup_turn,
+                        recovery_owner,
+                    } => (
+                        reply,
+                        recovery_dispatch_gate,
+                        missing_verifier_setup_turn,
+                        recovery_owner,
+                    ),
+                };
 
             // Boundary 2: right after the Ollama response completes. This is
             // the AC-10 checkpoint — mid-flight cancel is out of scope.
