@@ -24,6 +24,11 @@ use super::repair_brief::AllowedChangeKind;
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::{ArtifactRole, RecoveryTargetHint};
+#[cfg(test)]
+use super::tool_history::{
+    focused_edit_target_already_read, latest_successful_read_existing_path,
+    latest_verifier_repair_note_index,
+};
 use super::verifier_failure_signature::{
     verifier_failure_count, verifier_failure_error_kind, verifier_failure_signature,
 };
@@ -34,6 +39,8 @@ use super::{
     VerifierDiagnosticFailureKind, VerifierFailureType, VerifierRepairAssessment,
     VerifierRepairRerunOutcome,
 };
+#[cfg(test)]
+use crate::safety::path_guard::resolve_user_path;
 #[cfg(test)]
 use crate::session::store::ConversationMessage;
 
@@ -1568,12 +1575,12 @@ pub(super) fn verifier_repair_decision(
     // Transitional missing-job state, used by MissingVerifierJob and legacy
     // target discovery before a concrete verifier failure packet exists.
     let target = job
-        .and_then(|job| super::turn::verifier_repair_context_target_path(work_root, job))
+        .and_then(|job| verifier_repair_context_target_path(work_root, job))
         .or_else(|| {
-            super::turn::latest_successful_read_existing_path(
+            latest_successful_read_existing_path(
                 messages,
                 work_root,
-                super::turn::latest_verifier_repair_note_index(messages),
+                latest_verifier_repair_note_index(messages),
             )
         });
     let Some(target) = target else {
@@ -1615,11 +1622,17 @@ fn verifier_repair_decision_for_target(
     if !target.is_file() {
         return VerifierRepairDecision::NeedWrite(target);
     }
-    if super::turn::focused_edit_target_already_read(messages, &target, work_root) {
+    if focused_edit_target_already_read(messages, &target, work_root) {
         VerifierRepairDecision::NeedEdit(target)
     } else {
         VerifierRepairDecision::NeedFreshRead(target)
     }
+}
+
+#[cfg(test)]
+fn verifier_repair_context_target_path(work_root: &Path, job: &RepairJob) -> Option<PathBuf> {
+    let hint = verifier_repair_effective_target_hint(job)?;
+    resolve_user_path(work_root, &hint.path).ok()
 }
 
 /// Issue #647 (CB-013 / CB-015): detect the "advanced semantic_plan +

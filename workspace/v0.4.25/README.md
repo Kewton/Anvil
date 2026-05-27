@@ -2275,3 +2275,32 @@ Assessment:
 
 - No behavior change intended. Tool policy is now a neutral projection module;
   active-job arbitration no longer depends on `turn.rs` for policy types.
+
+### 2026-05-27 Slice 63
+
+Applied:
+
+- Added `tool_history.rs` for conversation/tool-call evidence projection.
+- Moved focused-edit read evidence, latest successful read lookup, verifier
+  repair note index lookup, target-path matching, and preferred read/edit
+  target classification out of `turn.rs`.
+- Updated `repair_job.rs` test decision bridge to consume `tool_history.rs`
+  directly instead of calling back into `turn.rs`.
+- Removed the duplicate test-only verifier repair target-path helper from
+  `turn.rs`; the RepairJob module now owns the local test bridge.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test focused_edit_target_already_read --lib -q`: pass, 1 test
+- `cargo test verifier_repair_decision --lib -q`: pass, 2 tests
+- `cargo test repair_job --lib -q`: pass, 143 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Tool-history evidence is now a neutral support
+  module, reducing reverse dependencies between the RepairJob state machine
+  and the actor loop dispatcher.

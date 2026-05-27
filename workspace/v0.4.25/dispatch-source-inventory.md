@@ -249,3 +249,6 @@ with legacy/fallback paths unable to override it.
 - Current status: effective tool policy types are now isolated in
   `tool_policy.rs`; `active_job_arbiter.rs` no longer depends on `turn.rs`
   for the selected-job policy projection.
+- Current status: tool-call history evidence projection is now isolated in
+  `tool_history.rs`; `turn.rs` and `repair_job.rs` consume the same helper,
+  and the verifier repair decision bridge no longer calls back into `turn.rs`.

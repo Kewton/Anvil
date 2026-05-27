@@ -1357,3 +1357,28 @@ Assessment:
 - No behavior change intended. Tool policy projection is now independent of
   the actor loop, reducing coupling between active-job arbitration and
   turn-level orchestration.
+
+## Structural Verification: Slice 63
+
+Scope:
+
+- Move tool-call history/evidence projections from `turn.rs` to
+  `tool_history.rs`.
+- Remove the remaining `repair_job.rs -> turn.rs` dependency in the verifier
+  repair decision test bridge.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test focused_edit_target_already_read --lib -q`: pass, 1 test.
+- `cargo test verifier_repair_decision --lib -q`: pass, 2 tests.
+- `cargo test repair_job --lib -q`: pass, 143 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Focused-edit and verifier-repair logic now
+  share tool-history evidence through a neutral helper module instead of
+  routing RepairJob test decisions back through the actor loop.
