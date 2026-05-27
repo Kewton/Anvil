@@ -46,12 +46,13 @@ use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy_assessment,
     build_semantic_repair_plan_from_report_with_authority_input,
     build_spec_authority_input_for_active_request, diagnostic_target_allowed_by_confidence,
-    first_role_kind_compatible_diagnostic_target, merge_legacy_targets_into_clusters,
-    sort_admitted_by_authority_role_priority,
+    enrich_failure_clusters_with_admitted_targets, first_role_kind_compatible_diagnostic_target,
+    merge_legacy_targets_into_clusters,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
     build_semantic_repair_plan_from_report, default_spec_authority_input,
+    sort_admitted_by_authority_role_priority,
 };
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
@@ -23057,55 +23058,6 @@ fn verifier_repair_intents_fingerprint(
     )
 }
 
-/// Issue #647 / CB-017 A''' (Commit 3, CR-1 V2 / CR-3 V2 / CR-5):
-/// for every failure cluster, admit each `proposed_target_candidate` via
-/// the SSOT `recovery_target_hint_for_diagnostic_path` (which composes
-/// syntactic safety + Owned admission + setup-target gating), dedup the
-/// admitted hints by `(role, path)`, and sort them with the
-/// authority/failure-kind decision table in
-/// [`sort_admitted_by_authority_role_priority`].
-///
-/// CR-3 V2: `candidate.role_hint` is **advisory only** — it is never passed
-/// to the admission helper. The admitted hint's role is decided by
-/// `recovery_target_hint_for_existing_path`'s path classification.
-///
-/// CR-1 V2: the admission SSOT is invoked exactly once per candidate. We do
-/// NOT additionally call `admit_repair_target_hint` after the fact (that
-/// would double-gate Owned).
-pub(super) fn enrich_failure_clusters_with_admitted_targets(
-    report: &mut super::semantic_failure::SemanticFailureReport,
-    work_root: &Path,
-    admission_ctx: &RepairTargetAdmissionContext<'_>,
-    spec_authority: super::spec_authority::SpecAuthority,
-) {
-    let failure_kind = report.failure_kind;
-    for cluster in report.failure_clusters.iter_mut() {
-        let mut admitted: Vec<super::task_contract::RecoveryTargetHint> = Vec::new();
-        for candidate in cluster.proposed_target_candidates.iter() {
-            // recovery_target_hint_for_diagnostic_path is the SSOT — it
-            // composes syntactic safety + Owned admission via
-            // admit_repair_target_hint. role_hint is intentionally not
-            // forwarded (CR-3 V2).
-            if let Some(hint) = recovery_target_hint_for_diagnostic_path(
-                work_root,
-                &candidate.raw_path,
-                &candidate.reason,
-                failure_kind,
-                admission_ctx,
-            ) {
-                admitted.push(hint);
-            }
-        }
-        // (role, path) dedup — Codex nice-to-have 2.
-        admitted.sort_by(|a, b| (a.role, &a.path).cmp(&(b.role, &b.path)));
-        admitted.dedup_by(|a, b| a.role == b.role && a.path == b.path);
-        // Role priority sort (TestBug override / SetupRepair defensive /
-        // default impl-first). Stable sort with (rank, path) tie-breaker.
-        sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
-        cluster.admitted_cluster_targets = admitted;
-    }
-}
-
 /// Boundary helper that converts a parsed diagnostic reply into the
 /// legacy `super::VerifierRepairAssessment` value used by the rest of the
 /// verifier-repair pipeline.
@@ -38730,7 +38682,7 @@ export default function App() {
     /// double-gate Owned).
     #[test]
     fn cb017_enrich_calls_admission_ssot_exactly_once_per_candidate() {
-        let src = include_str!("turn.rs");
+        let src = include_str!("semantic_repair_planning.rs");
         let fn_pos = src
             .find("pub(super) fn enrich_failure_clusters_with_admitted_targets(")
             .expect("enrich function must exist");
@@ -39159,7 +39111,7 @@ export default function App() {
     fn cb017_enrich_uses_explicit_spec_authority_argument() {
         // Grep half: confirm the enrich signature names spec_authority and
         // the body has no `current_spec_authority_for(` helper invocation.
-        let src = include_str!("turn.rs");
+        let src = include_str!("semantic_repair_planning.rs");
         let fn_pos = src
             .find("pub(super) fn enrich_failure_clusters_with_admitted_targets(")
             .expect("enrich function must exist");

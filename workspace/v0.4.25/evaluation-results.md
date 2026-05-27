@@ -1150,3 +1150,28 @@ Assessment:
 
 - No behavior change intended. Repair target selection for these two read-only
   cases is no longer actor-loop responsibility.
+
+## Structural Verification: Slice 54
+
+Scope:
+
+- Move semantic failure cluster target enrichment from `turn.rs` to
+  `semantic_repair_planning.rs`.
+- Preserve explicit `SpecAuthority` threading and the diagnostic target
+  admission SSOT.
+- Update structural grep tests to the new owner file.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test cb017_enrich --lib -q`: pass, 2 tests.
+- `cargo test cb017 --lib -q`: pass, 40 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3044 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Semantic report enrichment is no longer
+  embedded in `turn.rs`; the actor loop keeps only the orchestration around
+  diagnostic output and RepairJob state.

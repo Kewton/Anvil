@@ -221,3 +221,6 @@ with legacy/fallback paths unable to override it.
 - Current status: local import provider preference and stale assertion
   test-retarget selection are now isolated in `verifier_repair_targeting.rs`;
   `turn.rs` still owns assessment bridge sequencing and state writes.
+- Current status: semantic failure cluster enrichment is now isolated in
+  `semantic_repair_planning.rs`; `turn.rs` still owns diagnostic-pass
+  sequencing and RepairJob state writes.

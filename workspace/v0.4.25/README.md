@@ -2046,3 +2046,32 @@ Assessment:
 - No behavior change intended. Target-choice policy for import-contract and
   unresolved assertion repair is no longer embedded in `turn.rs`; the actor
   loop still owns only when to apply those choices to the assessment bridge.
+
+### 2026-05-27 Slice 54
+
+Applied:
+
+- Moved `enrich_failure_clusters_with_admitted_targets` from `turn.rs` to
+  `semantic_repair_planning.rs`.
+- Kept its dependencies explicit:
+  - target admission still flows through
+    `verifier_repair_targeting::recovery_target_hint_for_diagnostic_path`
+  - role ordering still uses
+    `sort_admitted_by_authority_role_priority`
+- Updated structural tests to inspect the new owner file instead of
+  `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test cb017_enrich --lib -q`: pass, 2 tests
+- `cargo test cb017 --lib -q`: pass, 40 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3044 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Semantic failure report enrichment now lives
+  with semantic repair planning. `turn.rs` still owns diagnostic-pass
+  sequencing and RepairJob state writes.
