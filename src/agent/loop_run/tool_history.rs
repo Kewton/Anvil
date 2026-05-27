@@ -206,6 +206,28 @@ pub(super) fn latest_truncated_tool_call_note_index(
         .map(|index| offset + index)
 }
 
+/// Build `recent_tool_summary` for the photon mapper from recent assistant
+/// tool calls. Only tool names and JSON argument summaries are included;
+/// tool results are intentionally excluded so stdout/stderr do not leak into
+/// the memory-advisory context.
+pub(super) fn build_recent_tool_summary(
+    messages: &[ConversationMessage],
+) -> Vec<crate::photon::mapper::RecentToolCall> {
+    use crate::photon::mapper::{MAX_CONTEXT_PACK_RECENT_TOOLS, RecentToolCall};
+
+    messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        .flat_map(|m| m.tool_calls.iter())
+        .take(MAX_CONTEXT_PACK_RECENT_TOOLS)
+        .map(|tc| RecentToolCall {
+            name: tc.name.clone(),
+            args_summary: tc.arguments.to_string(),
+        })
+        .collect()
+}
+
 pub(super) fn has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
     messages: &[ConversationMessage],
     work_root: &Path,
@@ -357,4 +379,52 @@ pub(super) fn focused_read_target_for_directory(resolved: &Path, target: &Path) 
 
 pub(super) fn is_preferred_read_edit_target(path: &Path) -> bool {
     is_implementation_file(path) && !is_test_file(path) && !is_setup_file(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recent_tool_summary_uses_assistant_calls_only() {
+        let messages = vec![
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "1".to_string(),
+                    name: "Write".to_string(),
+                    arguments: json!({"path": "src/lib.rs", "content": "secret output"}),
+                }],
+            ),
+            ConversationMessage::tool(
+                "Write".to_string(),
+                "tool stdout must not appear".to_string(),
+            ),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "2".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "cargo test"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "test output".to_string()),
+        ];
+
+        let summary = build_recent_tool_summary(&messages);
+
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].name, "Bash");
+        assert_eq!(
+            summary[0].args_summary,
+            json!({"command": "cargo test"}).to_string()
+        );
+        assert_eq!(summary[1].name, "Write");
+        assert!(
+            summary
+                .iter()
+                .all(|item| !item.args_summary.contains("tool stdout"))
+        );
+    }
 }

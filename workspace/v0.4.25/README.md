@@ -1,5 +1,9 @@
 # v0.4.25 Work Plan: Complete Remaining Repair-Control Cleanup
 
+Latest executable checklist:
+
+- `workspace/v0.4.25/complete-remaining-work-plan.md`
+
 ## Purpose
 
 This plan closes the remaining structural gaps in Anvil's local-LLM control
@@ -2615,3 +2619,61 @@ Assessment:
 
 - No behavior change intended. Color/Unicode display capability detection is
   now fully outside the actor loop, with the public re-export preserved.
+
+### 2026-05-27 Slice 76
+
+Applied:
+
+- Continued Workstream I by moving progress-line width budgeting and
+  multiline field formatting from `turn.rs` to `progress_text.rs`.
+- Moved the corresponding width-budget tests out of `turn.rs` and into the
+  display helper module.
+- Continued Workstream A/L by moving the PAM `recent_tool_summary` history
+  projection from `turn.rs` to `tool_history.rs`.
+- Added direct coverage proving recent tool summaries use assistant tool-call
+  arguments only and do not include tool-result stdout/stderr.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test progress_available_width --lib -q`: pass, 5 tests
+- `cargo test recent_tool_summary --lib -q`: pass, 1 test
+- `cargo test format_progress_line --lib -q`: pass, 1 test
+- `cargo clippy --all-targets -- -D warnings`: pass
+
+Assessment:
+
+- No behavior change intended. This slice removes more display/history
+  projection from the actor loop without touching verifier repair state
+  transitions.
+- The remaining high-value cleanup is still dispatch-source finalization and
+  verifier repair pipeline boundaries; this slice only reduces surrounding
+  complexity so those changes are easier to review.
+
+### 2026-05-27 Slice 77
+
+Applied:
+
+- Continued Workstream B/C by moving malformed verifier-repair attempt outcome
+  construction from `turn.rs` into `repair_job.rs`.
+- The actor loop still decides when an invalid repair proposal is observed,
+  but the projection from active semantic plan + active target to
+  `RepairAttemptOutcome::RejectedMalformed` now lives with repair-job state.
+
+Verification:
+
+- `cargo fmt --check`: pass after `cargo fmt`
+- `cargo test malformed_repair_attempt_outcome --lib -q`: pass, 0 matching
+  tests
+- `cargo test repair_job --lib -q`: pass, 143 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3055 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. This is a small but important boundary cleanup:
+  `turn.rs` no longer constructs this repair-ledger outcome directly.
+- The sandboxed full lib test run failed only because `mockito` could not
+  start local test servers (`Operation not permitted`). The same command
+  passed with normal local loopback permissions.

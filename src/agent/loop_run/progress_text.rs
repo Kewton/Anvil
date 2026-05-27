@@ -64,6 +64,58 @@ pub(super) fn paint(s: &str, color: &str, use_color: bool) -> String {
     }
 }
 
+/// Compute the argument-summary budget for a progress line given the current
+/// terminal width.
+///
+/// Subtracts the fixed chrome (`[iter N/M]  `, optional emoji, tool name, and
+/// the two-space separator) plus 3 chars reserved for the `...` ellipsis that
+/// [`truncate`] appends when the input exceeds the budget, then clamps the
+/// result to `MIN_ARG_BUDGET`. When `cols` is `None`, the caller falls back to
+/// the historical fixed budget.
+pub(super) fn progress_available_width(
+    cols: Option<u16>,
+    tool_name: &str,
+    iter_human: usize,
+    max_iterations: usize,
+    use_unicode: bool,
+) -> usize {
+    const DEFAULT_ARG_BUDGET: usize = 57;
+    const MIN_ARG_BUDGET: usize = 20;
+    const ELLIPSIS_RESERVE: usize = 3;
+
+    let Some(cols) = cols else {
+        return DEFAULT_ARG_BUDGET;
+    };
+
+    let iter_prefix = format!("[iter {iter_human}/{max_iterations}]  ");
+    let emoji_width = if use_unicode {
+        tool_emoji(tool_name).chars().count() + 1
+    } else {
+        0
+    };
+    let chrome = iter_prefix.len() + emoji_width + tool_name.chars().count() + 2;
+
+    (cols as usize)
+        .saturating_sub(chrome)
+        .saturating_sub(ELLIPSIS_RESERVE)
+        .max(MIN_ARG_BUDGET)
+}
+
+pub(super) fn progress_detail_budget(cols: Option<u16>, prefix: &str) -> usize {
+    cols.map(|value| value as usize)
+        .unwrap_or(96)
+        .saturating_sub(prefix.chars().count())
+        .max(24)
+}
+
+pub(super) fn format_progress_field(prefix: &str, value: &str, cols: Option<u16>) -> String {
+    let budget = progress_detail_budget(cols, prefix);
+    format!(
+        "{prefix}{}",
+        truncate(&sanitize_for_progress(value), budget)
+    )
+}
+
 pub(super) fn is_utf8_locale(lang: &str) -> bool {
     let lower = lang.to_ascii_lowercase();
     lower
@@ -150,6 +202,37 @@ mod tests {
             "\x1b[38;5;226mBash\x1b[0m"
         );
         assert_eq!(paint("Bash", tool_color("Bash"), false), "Bash");
+    }
+
+    #[test]
+    fn progress_available_width_none_returns_default() {
+        assert_eq!(progress_available_width(None, "Bash", 1, 12, false), 57);
+    }
+
+    #[test]
+    fn progress_available_width_large_cols_returns_budget() {
+        assert_eq!(
+            progress_available_width(Some(200), "Bash", 1, 12, false),
+            200 - "[iter 1/12]  ".len() - "Bash".len() - 2 - 3
+        );
+    }
+
+    #[test]
+    fn progress_available_width_small_cols_clamps_to_min() {
+        assert_eq!(progress_available_width(Some(30), "Bash", 1, 12, false), 20);
+    }
+
+    #[test]
+    fn progress_available_width_zero_cols_clamps_to_min() {
+        assert_eq!(progress_available_width(Some(0), "Bash", 1, 12, false), 20);
+    }
+
+    #[test]
+    fn progress_available_width_emoji_accounts_for_vs16() {
+        assert_eq!(
+            progress_available_width(Some(200), "Write", 1, 12, true),
+            200 - "[iter 1/12]  ".len() - "✏️".chars().count() - 1 - "Write".len() - 2 - 3
+        );
     }
 
     #[test]

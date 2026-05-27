@@ -34,7 +34,8 @@ use super::repair_job::VerifierRepairDecision;
 #[cfg(test)]
 use super::repair_job::classify_verifier_failure_type;
 use super::repair_job::{
-    verifier_repair_context_from_failure, verifier_repair_effective_target_hint,
+    malformed_repair_attempt_outcome_for_active_target, verifier_repair_context_from_failure,
+    verifier_repair_effective_target_hint,
 };
 #[cfg(test)]
 use super::repair_patch_validation::ValidationWeakening;
@@ -67,7 +68,7 @@ use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
 use super::tool_history::{
-    focused_edit_target_already_read, focused_read_target_for_directory,
+    build_recent_tool_summary, focused_edit_target_already_read, focused_read_target_for_directory,
     has_successful_non_plan_repo_edit,
     has_successful_non_plan_repo_edit_after_latest_truncated_tool_call, is_plan_file_tool_call,
     is_preferred_read_edit_target, latest_read_exchange_for_target,
@@ -160,8 +161,8 @@ use super::deterministic::empty_framework_game_files as deterministic_empty_fram
 #[cfg(test)]
 use super::progress_text::is_utf8_locale;
 use super::progress_text::{
-    no_color_requested, paint, sanitize_for_progress, tool_color, tool_emoji, truncate,
-    unicode_supported,
+    format_progress_field, no_color_requested, paint, progress_available_width,
+    sanitize_for_progress, tool_color, tool_emoji, truncate, unicode_supported,
 };
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
@@ -21470,19 +21471,6 @@ fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
     }
 }
 
-fn malformed_repair_attempt_outcome_for_active_target(
-    context: &super::repair_job::RepairJob,
-    active_target_hint: Option<&super::task_contract::RecoveryTargetHint>,
-) -> Option<super::repair_attempt_outcome::RepairAttemptOutcome> {
-    let plan = context.semantic_plan.as_ref()?;
-    let target_hint = active_target_hint?;
-    Some(super::repair_attempt_outcome::RepairAttemptOutcome {
-        cluster: plan.failure_cluster_id.clone(),
-        role: target_hint.role,
-        kind: super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedMalformed,
-    })
-}
-
 /// v0.4.11: after an invalid controller repair proposal is recorded in the
 /// repair ledger, the next policy decision may have advanced to a fresh
 /// diagnostic or a different concrete target. Only those transitions count as
@@ -23435,67 +23423,10 @@ fn compact_progress_path(path: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
-/// Compute the argument-summary budget for a progress line given the current
-/// terminal width (issue #432 §4.3.1).
-///
-/// Subtracts the fixed chrome (`[iter N/M]  `, optional emoji, tool name, and
-/// the two-space separator) plus 3 chars reserved for the `...` ellipsis that
-/// `truncate()` appends when the input exceeds the budget, then clamps the
-/// result to `MIN_ARG_BUDGET` (20). When `cols` is `None` (footer disabled /
-/// handle absent / first-tick race) the caller falls back to
-/// `DEFAULT_ARG_BUDGET` (57), preserving the pre-#432 behaviour.
-pub(super) fn progress_available_width(
-    cols: Option<u16>,
-    tool_name: &str,
-    iter_human: usize,
-    max_iterations: usize,
-    use_unicode: bool,
-) -> usize {
-    const DEFAULT_ARG_BUDGET: usize = 57;
-    const MIN_ARG_BUDGET: usize = 20;
-    // truncate() appends "..." (3 chars) when it fires, so reserve those chars
-    // up-front. Otherwise a fully-truncated Bash command overflows cols by 3.
-    const ELLIPSIS_RESERVE: usize = 3;
-
-    let Some(cols) = cols else {
-        return DEFAULT_ARG_BUDGET;
-    };
-
-    // Chrome must stay in sync with the `format!` in `format_progress_line`:
-    //   "[iter N/M]  " + (emoji " ")? + tool_name + "  "
-    let iter_prefix = format!("[iter {iter_human}/{max_iterations}]  ");
-    let emoji_width = if use_unicode {
-        tool_emoji(tool_name).chars().count() + 1
-    } else {
-        0
-    };
-    let chrome = iter_prefix.len() + emoji_width + tool_name.chars().count() + 2;
-
-    (cols as usize)
-        .saturating_sub(chrome)
-        .saturating_sub(ELLIPSIS_RESERVE)
-        .max(MIN_ARG_BUDGET)
-}
-
 /// Format a single-line per-iteration progress line. ANSI color is only
 /// applied to the tool name when `use_color` is true, and emoji is prepended
 /// when `use_unicode` is true. `cols` is the current terminal width from the
 /// footer broadcaster; `None` falls back to the pre-#432 fixed budget.
-fn progress_detail_budget(cols: Option<u16>, prefix: &str) -> usize {
-    cols.map(|value| value as usize)
-        .unwrap_or(96)
-        .saturating_sub(prefix.chars().count())
-        .max(24)
-}
-
-fn format_progress_field(prefix: &str, value: &str, cols: Option<u16>) -> String {
-    let budget = progress_detail_budget(cols, prefix);
-    format!(
-        "{prefix}{}",
-        truncate(&sanitize_for_progress(value), budget)
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn format_progress_line(
     tool_name: &str,
@@ -23608,28 +23539,6 @@ fn format_blocked_progress_line(
             display.action
         )
     }
-}
-
-/// Issue #555: build `recent_tool_summary` for the photon mapper from the
-/// last `MAX_CONTEXT_PACK_RECENT_TOOLS` assistant messages that contain tool
-/// calls. Only the call name and JSON-serialised arguments are captured;
-/// tool result messages are intentionally excluded (no stdout/stderr).
-fn build_recent_tool_summary(
-    messages: &[crate::session::store::ConversationMessage],
-) -> Vec<crate::photon::mapper::RecentToolCall> {
-    use crate::photon::mapper::{MAX_CONTEXT_PACK_RECENT_TOOLS, RecentToolCall};
-
-    messages
-        .iter()
-        .rev()
-        .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
-        .flat_map(|m| m.tool_calls.iter())
-        .take(MAX_CONTEXT_PACK_RECENT_TOOLS)
-        .map(|tc| RecentToolCall {
-            name: tc.name.clone(),
-            args_summary: tc.arguments.to_string(),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -24202,7 +24111,7 @@ mod progress_tests {
         latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
         parse_verifier_repair_assessment_reply, parse_verifier_repair_intent_reply,
         parse_verifier_repair_intents_reply, post_scaffold_continuation_active,
-        post_scaffold_recovery_active, progress_available_width, prune_plan_mode_messages,
+        post_scaffold_recovery_active, prune_plan_mode_messages,
         recent_deterministic_framework_app_fallback_seen, recent_scaffold_command_seen,
         recent_truncated_tool_call_attempt, render_deterministic_scaffold_continuation_note,
         repo_change_request_text, request_needs_playable_ui_quality_gate, sanitize_for_progress,
@@ -34066,45 +33975,6 @@ export default function App() {
         assert!(
             !use_streaming_transport,
             "focused pre-read turns should bypass streaming transport"
-        );
-    }
-
-    #[test]
-    fn progress_available_width_none_returns_default() {
-        assert_eq!(progress_available_width(None, "Bash", 1, 12, false), 57);
-    }
-
-    #[test]
-    fn progress_available_width_large_cols_returns_budget() {
-        // cols=200, tool_name="Bash" (4 chars), use_unicode=false
-        // iter_prefix "[iter 1/12]  " = 13 chars; chrome = 13 + 0 + 4 + 2 = 19
-        // ellipsis reserve = 3; expected budget = 200 - 19 - 3 = 178
-        assert_eq!(
-            progress_available_width(Some(200), "Bash", 1, 12, false),
-            178
-        );
-    }
-
-    #[test]
-    fn progress_available_width_small_cols_clamps_to_min() {
-        // cols=30; chrome + ellipsis = 22; 30 - 22 = 8 → clamp to 20
-        assert_eq!(progress_available_width(Some(30), "Bash", 1, 12, false), 20);
-    }
-
-    #[test]
-    fn progress_available_width_zero_cols_clamps_to_min() {
-        // saturating_sub to 0 → max(20)
-        assert_eq!(progress_available_width(Some(0), "Bash", 1, 12, false), 20);
-    }
-
-    #[test]
-    fn progress_available_width_emoji_accounts_for_vs16() {
-        // "Write" emoji is `✏️` (U+270F + U+FE0F VS16), `.chars().count() == 2`.
-        // iter_prefix "[iter 1/12]  " = 13; emoji_width = 2 + 1 = 3; name = 5; +2 → chrome=23
-        // ellipsis reserve = 3; cols=200 → 200 - 23 - 3 = 174
-        assert_eq!(
-            progress_available_width(Some(200), "Write", 1, 12, true),
-            174
         );
     }
 

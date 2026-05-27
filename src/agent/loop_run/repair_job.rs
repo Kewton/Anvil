@@ -2227,6 +2227,19 @@ pub(super) fn verifier_repair_effective_target_hint(
     None
 }
 
+pub(super) fn malformed_repair_attempt_outcome_for_active_target(
+    context: &RepairJob,
+    active_target_hint: Option<&RecoveryTargetHint>,
+) -> Option<RepairAttemptOutcome> {
+    let plan = context.semantic_plan.as_ref()?;
+    let target_hint = active_target_hint?;
+    Some(RepairAttemptOutcome {
+        cluster: plan.failure_cluster_id.clone(),
+        role: target_hint.role,
+        kind: RepairAttemptOutcomeKind::RejectedMalformed,
+    })
+}
+
 pub(super) fn task_contract_repair_state_from_job(
     pending: bool,
     job: Option<&RepairJob>,
