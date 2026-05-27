@@ -1272,3 +1272,24 @@ Assessment:
 - No behavior change intended. RepairJob context construction now has one
   dispatch-adjacent owner, reducing the amount of verifier repair state wiring
   embedded in the actor loop.
+
+## Structural Verification: Slice 59
+
+Scope:
+
+- Move effective verifier repair target selection from `turn.rs` to
+  `repair_job.rs`.
+- Remove the `repair_job.rs` to `turn.rs` dependency for active repair target
+  projection.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test target_hint --lib -q`: pass, 13 tests.
+- `cargo test verifier_repair_context --lib -q`: pass, 7 tests.
+- `cargo test repair_job --lib -q`: pass, 143 tests.
+
+Assessment:
+
+- No behavior change intended. Target selection now sits next to the
+  semantic-plan exhaustion state it depends on.

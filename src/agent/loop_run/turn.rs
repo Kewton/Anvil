@@ -30,7 +30,9 @@ use super::repair_job;
 use super::repair_job::VerifierRepairDecision;
 #[cfg(test)]
 use super::repair_job::classify_verifier_failure_type;
-use super::repair_job::verifier_repair_context_from_failure;
+use super::repair_job::{
+    verifier_repair_context_from_failure, verifier_repair_effective_target_hint,
+};
 #[cfg(test)]
 use super::repair_patch_validation::ValidationWeakening;
 use super::repair_patch_validation::{
@@ -22953,65 +22955,6 @@ pub(super) fn verifier_repair_context_target_path(
 ) -> Option<PathBuf> {
     let hint = verifier_repair_effective_target_hint(context)?;
     resolve_user_path(work_root, &hint.path).ok()
-}
-
-pub(super) fn verifier_repair_effective_target_hint(
-    context: &super::repair_job::RepairJob,
-) -> Option<&super::task_contract::RecoveryTargetHint> {
-    // Issue #647 (CB-007 / CB-015): when a `SemanticRepairPlan` is active
-    // and the job is in the stale state (per `semantic_plan_is_stale`), the
-    // freshly re-built `assessment.repair_target_hint` can be stale — the
-    // re-diagnostic LLM commonly re-proposes the just-exhausted cluster
-    // because the same failure text is still visible. `assign_semantic_plan_preserving_exhausted`
-    // walks the new plan past the exhausted entry, but nothing rebuilds
-    // the assessment hint to follow that walk. Returning the stale hint
-    // would make the repair editor keep attacking the exhausted cluster.
-    //
-    // We deliberately do NOT try to map `assessment.repair_target_hint.path`
-    // to a `FailureClusterKey` (no such mapping is recorded by the parser),
-    // and we keep the legacy `semantic_plan = None` path bit-for-bit
-    // identical so SetupRepair / pre-semantic flows are unaffected
-    // (DR3-001 / "semantic_plan = None 経路は既存挙動" constraint).
-    //
-    // The CB-015 generation-aware rule (subsumes the legacy
-    // `semantic_plan.is_some() && !exhausted_attempts.is_empty()`):
-    //   stale (plan.gen >= job.gen, exhausted non-empty)
-    //     → return None (force re-diagnostic against the current cluster).
-    //   fresh (plan.gen < job.gen, post-re-diagnostic)
-    //     → assessment has been refreshed for the current cluster; legacy
-    //       behaviour stands and the controller can route to NeedFreshRead /
-    //       NeedEdit.
-    //   semantic_plan = None
-    //     → legacy behaviour (unchanged).
-    if super::repair_job::semantic_plan_is_stale(context) {
-        return None;
-    }
-    // v0.4.10: once a semantic repair target has been exhausted for the
-    // active cluster, do not let the legacy assessment fallback pick the same
-    // path again. If another admitted target remains, use it; if all admitted
-    // targets are exhausted, return None so the no-candidate / safe-stop path
-    // can take over instead of falling back to an unrelated latest Read.
-    if context.has_exhausted_repair_targets() {
-        if let Some(next) = context.current_unexhausted_semantic_target() {
-            return Some(next);
-        }
-        if context.current_semantic_targets_all_exhausted() {
-            return None;
-        }
-    }
-    if let Some(assessment) = context.assessment.as_ref() {
-        if let Some(next) = assessment
-            .repair_plan
-            .get(context.applied_repair_intents.len())
-        {
-            return (!context.is_repair_hint_exhausted(next)).then_some(next);
-        }
-        return assessment
-            .repair_target_hint
-            .as_ref()
-            .filter(|hint| !context.is_repair_hint_exhausted(hint));
-    }
-    None
 }
 
 /// Thin wrapper retained for in-file callers and existing tests. Delegates

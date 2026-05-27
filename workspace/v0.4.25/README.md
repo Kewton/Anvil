@@ -2184,3 +2184,26 @@ Assessment:
 - No behavior change intended. RepairJob lifecycle state construction now has
   one owner in `repair_job.rs`; `turn.rs` keeps verifier observation and
   orchestration only.
+
+### 2026-05-27 Slice 59
+
+Applied:
+
+- Moved effective verifier repair target selection from `turn.rs` to
+  `repair_job.rs`.
+- Removed one reverse dependency where `repair_job.rs` called back into
+  `turn.rs` to determine the active repair target.
+- `turn.rs` now imports `verifier_repair_effective_target_hint` as a
+  RepairJob-owned projection.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test target_hint --lib -q`: pass, 13 tests
+- `cargo test verifier_repair_context --lib -q`: pass, 7 tests
+- `cargo test repair_job --lib -q`: pass, 143 tests
+
+Assessment:
+
+- No behavior change intended. The active repair target is now derived in the
+  same module that owns semantic-plan exhaustion and RepairJob state.

@@ -1669,7 +1669,7 @@ pub(super) fn task_contract_repair_state(
         | VerifierRepairDecision::NeedFreshRead(_)
         | VerifierRepairDecision::NeedWrite(_)
         | VerifierRepairDecision::NeedEdit(_) => VerifierRepairState::WaitingForEdit {
-            target_hint: super::turn::verifier_repair_effective_target_hint(job)
+            target_hint: verifier_repair_effective_target_hint(job)
                 .cloned()
                 .or_else(|| job.repair_target_hint.clone())
                 .or_else(|| job.target_hint.clone()),
@@ -2172,6 +2172,46 @@ pub(super) fn rebind_legacy_assessment_to_current_cluster(repair_job: &mut Repai
     }
     // CR-4 V2: rebind 後は新しい cluster_id に bind。
     repair_job.assessment_bound_cluster_id = Some(plan_cluster_id);
+}
+
+pub(super) fn verifier_repair_effective_target_hint(
+    context: &RepairJob,
+) -> Option<&RecoveryTargetHint> {
+    // Issue #647 (CB-007 / CB-015): when a `SemanticRepairPlan` is active
+    // and the job is in the stale state, a freshly rebuilt legacy
+    // `assessment.repair_target_hint` may still point at the exhausted
+    // cluster. In that state the job must replan instead of continuing to
+    // route edits to the stale target.
+    if semantic_plan_is_stale(context) {
+        return None;
+    }
+
+    // Once a semantic repair target has been exhausted for the active
+    // cluster, do not let the legacy assessment fallback pick the same path
+    // again. If another admitted target remains, use it; if all admitted
+    // targets are exhausted, return None so the state machine can replan or
+    // safe stop instead of falling back to an unrelated latest read.
+    if context.has_exhausted_repair_targets() {
+        if let Some(next) = context.current_unexhausted_semantic_target() {
+            return Some(next);
+        }
+        if context.current_semantic_targets_all_exhausted() {
+            return None;
+        }
+    }
+    if let Some(assessment) = context.assessment.as_ref() {
+        if let Some(next) = assessment
+            .repair_plan
+            .get(context.applied_repair_intents.len())
+        {
+            return (!context.is_repair_hint_exhausted(next)).then_some(next);
+        }
+        return assessment
+            .repair_target_hint
+            .as_ref()
+            .filter(|hint| !context.is_repair_hint_exhausted(hint));
+    }
+    None
 }
 
 pub(super) fn verifier_repair_context_from_failure(

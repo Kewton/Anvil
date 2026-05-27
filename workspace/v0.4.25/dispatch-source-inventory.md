@@ -236,3 +236,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier failure to `RepairJob` context construction is now
   isolated in `repair_job.rs`; `turn.rs` only invokes the builder after
   verifier observation and no longer owns signature/count/carry-over assembly.
+- Current status: effective verifier repair target selection is now isolated
+  in `repair_job.rs`; `turn.rs` imports it as a projection and one
+  `repair_job.rs` to `turn.rs` reverse dependency has been removed.
