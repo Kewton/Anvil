@@ -177,3 +177,7 @@ with legacy/fallback paths unable to override it.
 - Current status: semantic failure report parsing is now isolated in
   `verifier_assessment_parser.rs`; `turn.rs` still owns fallback synthesis,
   repair-plan construction, and RepairJob state updates.
+- Current status: semantic fallback synthesis and `SemanticRepairPlan`
+  construction are now isolated in `semantic_repair_planning.rs`; `turn.rs`
+  still owns diagnostic pass sequencing, admitted-target enrichment, and
+  RepairJob state updates.

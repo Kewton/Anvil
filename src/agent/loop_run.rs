@@ -168,6 +168,10 @@ mod safe_stop_payload;
 // *not* re-exported (DR3-001) — future consumers (`turn.rs`, `repair_job.rs`)
 // reach in via `super::semantic_failure::*`.
 mod semantic_failure;
+// v0.4.25: semantic verifier-repair planning bridge. Converts parsed
+// diagnostic reports and admitted legacy assessments into SemanticRepairPlan
+// values outside the actor loop dispatcher.
+mod semantic_repair_planning;
 pub mod slash_commands;
 // Issue #647 (Phase A.2): spec-authority enum + tie-break scoring + test/impl
 // weakening detectors. Module is intentionally *not* re-exported (DR3-001) —

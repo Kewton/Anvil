@@ -1598,3 +1598,29 @@ Assessment:
 - No behavior change intended. Both legacy assessment parsing and semantic
   report parsing now share the same diagnostic JSON extraction boundary
   outside the actor loop.
+
+### 2026-05-27 Slice 37
+
+Applied:
+
+- Added `semantic_repair_planning.rs`.
+- Moved legacy assessment to `SemanticFailureReport` synthesis, admitted
+  assessment fallback synthesis, spec-authority input construction, and
+  `SemanticRepairPlan` construction out of `turn.rs`.
+- Kept `turn.rs` responsible for diagnostic pass sequencing, workspace
+  admission, report enrichment, and RepairJob state writes.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test semantic_failure --lib -q`: pass, 40 tests
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Semantic repair planning is now a dedicated
+  bridge module; the actor loop no longer owns the value-construction details
+  for `SemanticFailureReport` / `SemanticRepairPlan`.
