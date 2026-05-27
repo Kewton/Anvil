@@ -1624,3 +1624,27 @@ Assessment:
 - No behavior change intended. Semantic repair planning is now a dedicated
   bridge module; the actor loop no longer owns the value-construction details
   for `SemanticFailureReport` / `SemanticRepairPlan`.
+
+### 2026-05-27 Slice 38
+
+Applied:
+
+- Added `verifier_repair_shadow.rs`.
+- Moved verifier-repair shadow telemetry payload construction,
+  `FailurePacket` projection for shadow comparison, repair-action payload
+  projection, and legacy diagnostic brief projection out of `turn.rs`.
+- Kept `turn.rs` responsible only for choosing when to emit the shadow event.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo test semantic_failure --lib -q`: pass, 40 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Observational payload shaping is no longer
+  embedded in the actor loop dispatcher.

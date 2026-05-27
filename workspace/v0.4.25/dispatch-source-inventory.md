@@ -181,3 +181,6 @@ with legacy/fallback paths unable to override it.
   construction are now isolated in `semantic_repair_planning.rs`; `turn.rs`
   still owns diagnostic pass sequencing, admitted-target enrichment, and
   RepairJob state updates.
+- Current status: verifier-repair shadow telemetry and legacy brief
+  projection are now isolated in `verifier_repair_shadow.rs`; `turn.rs` still
+  owns when to emit telemetry.

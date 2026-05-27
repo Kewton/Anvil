@@ -780,3 +780,25 @@ Assessment:
 - No behavior change intended. The new module owns deterministic semantic
   report fallback and plan construction; `turn.rs` only invokes it at the
   diagnostic boundary.
+
+## Structural Verification: Slice 38
+
+Scope:
+
+- Extract verifier repair shadow telemetry and legacy brief projection from
+  `turn.rs`.
+- Preserve event emission and state-control timing in `turn.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests.
+- `cargo test semantic_failure --lib -q`: pass, 40 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop now delegates shadow payload
+  construction instead of owning telemetry projection details.
