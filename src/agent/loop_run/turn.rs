@@ -45,7 +45,8 @@ use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
     build_semantic_failure_report_from_legacy_assessment,
     build_semantic_repair_plan_from_report_with_authority_input,
-    build_spec_authority_input_for_active_request,
+    build_spec_authority_input_for_active_request, merge_legacy_targets_into_clusters,
+    sort_admitted_by_authority_role_priority,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
@@ -23386,116 +23387,6 @@ fn verifier_repair_missing_local_module_provider(
     )
 }
 
-/// Issue #647 / CB-017 A''' (Commit 3, CR-2 V2): merge legacy
-/// `ParsedVerifierRepairAssessment` targets into the first cluster of a
-/// `SemanticFailureReport` **only when every cluster is targetless**.
-///
-/// Policy (all-or-nothing): partial output (some clusters target_paths, some
-/// not) is never merged — targetless clusters are skipped downstream by
-/// `first_repairable_cluster` / `next_repairable_cluster`. Merging into a
-/// random "first" cluster on partial output would break the LLM-supplied
-/// cluster ↔ path binding.
-///
-/// `role_hint` is always `None` because `ParsedVerifierRepairTarget` does
-/// not carry a role; the admitted hint's role is decided later by
-/// `recovery_target_hint_for_existing_path` (CR-3 V2). Each appended
-/// candidate's `raw_path` / `reason` is sanitized via
-/// `sanitize_repair_job_text_with_char_cap` so the parse-boundary invariant
-/// (same SSOT as `parse_semantic_failure_report`) holds.
-pub(super) fn merge_legacy_targets_into_clusters(
-    report: &mut super::semantic_failure::SemanticFailureReport,
-    parsed: &ParsedVerifierRepairAssessment,
-) {
-    let all_empty = report
-        .failure_clusters
-        .iter()
-        .all(|c| c.proposed_target_candidates.is_empty());
-    if !all_empty {
-        return;
-    }
-    let Some(first_cluster) = report.failure_clusters.first_mut() else {
-        return;
-    };
-    for target in &parsed.repair_targets {
-        if first_cluster.proposed_target_candidates.len()
-            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
-        {
-            break;
-        }
-        first_cluster.proposed_target_candidates.push(
-            super::semantic_failure::RawClusterTargetCandidate {
-                raw_path: super::repair_job::sanitize_repair_job_text_with_char_cap(
-                    &target.path,
-                    super::semantic_failure::MAX_RAW_PATH_CHARS,
-                ),
-                role_hint: None,
-                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
-                    &target.reason,
-                    240,
-                ),
-            },
-        );
-    }
-    for entry in &parsed.repair_plan {
-        if first_cluster.proposed_target_candidates.len()
-            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
-        {
-            break;
-        }
-        // Dedup-by-path: a path already appended via `repair_targets` is not
-        // re-appended via `repair_plan`. We compare against the sanitized
-        // entry that was pushed (the same SSOT is applied to the new entry
-        // below) so a path string that differs only in trailing whitespace /
-        // control chars still dedupes correctly.
-        let sanitized_path = super::repair_job::sanitize_repair_job_text_with_char_cap(
-            &entry.path,
-            super::semantic_failure::MAX_RAW_PATH_CHARS,
-        );
-        if first_cluster
-            .proposed_target_candidates
-            .iter()
-            .any(|c| c.raw_path == sanitized_path)
-        {
-            continue;
-        }
-        first_cluster.proposed_target_candidates.push(
-            super::semantic_failure::RawClusterTargetCandidate {
-                raw_path: sanitized_path,
-                role_hint: None,
-                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
-                    &entry.reason,
-                    240,
-                ),
-            },
-        );
-    }
-    for path in &parsed.secondary_targets {
-        if first_cluster.proposed_target_candidates.len()
-            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
-        {
-            break;
-        }
-        let sanitized_path = super::repair_job::sanitize_repair_job_text_with_char_cap(
-            path,
-            super::semantic_failure::MAX_RAW_PATH_CHARS,
-        );
-        if first_cluster
-            .proposed_target_candidates
-            .iter()
-            .any(|c| c.raw_path == sanitized_path)
-        {
-            continue;
-        }
-        first_cluster.proposed_target_candidates.push(
-            super::semantic_failure::RawClusterTargetCandidate {
-                raw_path: sanitized_path,
-                role_hint: None,
-                reason: "diagnostic secondary target".to_string(),
-            },
-        );
-    }
-}
-
 /// Issue #647 / CB-017 A''' (Commit 3, CR-1 V2 / CR-3 V2 / CR-5):
 /// for every failure cluster, admit each `proposed_target_candidate` via
 /// the SSOT `recovery_target_hint_for_diagnostic_path` (which composes
@@ -23543,83 +23434,6 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
         sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
         cluster.admitted_cluster_targets = admitted;
     }
-}
-
-/// Issue #647 / CB-017 A''' (Commit 3, CR-5 V2): stable role-priority sort
-/// for an `admitted_cluster_targets` slice.
-///
-/// Decision table:
-///
-/// | `failure_kind` / authority                                | Order                                          |
-/// |-----------------------------------------------------------|------------------------------------------------|
-/// | `TestBug` (override)                                      | Test > Impl > UsageDocs > Setup                |
-/// | `DependencyMissing` / `ConfigOrVerifierError` (defensive) | Setup > Impl > UsageDocs > Test                |
-/// | `AssertionMismatch` + User/Behavior contract              | Impl > Test > UsageDocs > Setup                |
-/// | `AssertionMismatch` + Impl/interface/LLM-test authority   | Test > Impl > UsageDocs > Setup                |
-/// | everything else                                           | Impl > UsageDocs > Setup > Test                |
-///
-/// The sort is stable and uses `(rank, path)` as the sort key so ties (two
-/// targets of the same role) resolve in deterministic path order.
-pub(super) fn sort_admitted_by_authority_role_priority(
-    admitted: &mut [super::task_contract::RecoveryTargetHint],
-    spec_authority: super::spec_authority::SpecAuthority,
-    failure_kind: super::VerifierDiagnosticFailureKind,
-) {
-    let primary_rank_for = |role: super::task_contract::ArtifactRole| -> u8 {
-        if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug) {
-            return match role {
-                super::task_contract::ArtifactRole::Test => 0,
-                super::task_contract::ArtifactRole::Implementation => 1,
-                super::task_contract::ArtifactRole::UsageDocs => 2,
-                super::task_contract::ArtifactRole::Setup => 3,
-            };
-        }
-        if matches!(
-            failure_kind,
-            super::VerifierDiagnosticFailureKind::DependencyMissing
-                | super::VerifierDiagnosticFailureKind::ConfigOrVerifierError
-        ) {
-            return match role {
-                super::task_contract::ArtifactRole::Setup => 0,
-                super::task_contract::ArtifactRole::Implementation => 1,
-                super::task_contract::ArtifactRole::UsageDocs => 2,
-                super::task_contract::ArtifactRole::Test => 3,
-            };
-        }
-        if matches!(
-            failure_kind,
-            super::VerifierDiagnosticFailureKind::AssertionMismatch
-        ) {
-            return match spec_authority {
-                super::spec_authority::SpecAuthority::UserRequest
-                | super::spec_authority::SpecAuthority::BehaviorContract => match role {
-                    super::task_contract::ArtifactRole::Implementation => 0,
-                    super::task_contract::ArtifactRole::Test => 1,
-                    super::task_contract::ArtifactRole::UsageDocs => 2,
-                    super::task_contract::ArtifactRole::Setup => 3,
-                },
-                super::spec_authority::SpecAuthority::VerifiedPublicInterface
-                | super::spec_authority::SpecAuthority::ImplementationContract
-                | super::spec_authority::SpecAuthority::LlmGeneratedTest => match role {
-                    super::task_contract::ArtifactRole::Test => 0,
-                    super::task_contract::ArtifactRole::Implementation => 1,
-                    super::task_contract::ArtifactRole::UsageDocs => 2,
-                    super::task_contract::ArtifactRole::Setup => 3,
-                },
-            };
-        }
-        match role {
-            super::task_contract::ArtifactRole::Implementation => 0,
-            super::task_contract::ArtifactRole::UsageDocs => 1,
-            super::task_contract::ArtifactRole::Setup => 2,
-            super::task_contract::ArtifactRole::Test => 3,
-        }
-    };
-    admitted.sort_by(|a, b| {
-        let pa = primary_rank_for(a.role);
-        let pb = primary_rank_for(b.role);
-        pa.cmp(&pb).then_with(|| a.path.cmp(&b.path))
-    });
 }
 
 fn diagnostic_target_allowed_by_confidence(
@@ -39637,11 +39451,13 @@ export default function App() {
         // Take a generous slice of the function body (up to the next top-level
         // `pub(super) fn` / `fn ` declaration).
         let after = &src[fn_pos..];
-        let next_fn = after[1..]
-            .find("\npub(super) fn ")
-            .or_else(|| after[1..].find("\nfn "))
-            .map(|n| n + 1)
-            .unwrap_or(after.len());
+        let next_pub_fn = after[1..].find("\npub(super) fn ");
+        let next_private_fn = after[1..].find("\nfn ");
+        let next_fn = match (next_pub_fn, next_private_fn) {
+            (Some(a), Some(b)) => a.min(b) + 1,
+            (Some(a), None) | (None, Some(a)) => a + 1,
+            (None, None) => after.len(),
+        };
         let body = &after[..next_fn];
         assert!(
             body.contains("recovery_target_hint_for_diagnostic_path"),

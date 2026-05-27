@@ -1648,3 +1648,30 @@ Assessment:
 
 - No behavior change intended. Observational payload shaping is no longer
   embedded in the actor loop dispatcher.
+
+### 2026-05-27 Slice 39
+
+Applied:
+
+- Moved legacy target merge and admitted-target role-priority sorting into
+  `semantic_repair_planning.rs`.
+- Kept `enrich_failure_clusters_with_admitted_targets` in `turn.rs` because
+  it still intentionally verifies the admission SSOT call path.
+- Hardened the existing grep-style structure test so its function-body slice
+  stops at the closest next function declaration, not only the next
+  `pub(super)` declaration.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test cb017_ --lib -q`: pass, 40 tests
+- `cargo test semantic_failure --lib -q`: pass, 40 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Pure semantic planning helpers are outside the
+  actor loop; the admission-enrichment function remains in `turn.rs` until
+  the SSOT structure test is replaced by a less source-layout-sensitive seam.

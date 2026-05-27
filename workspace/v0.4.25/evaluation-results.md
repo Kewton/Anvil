@@ -802,3 +802,26 @@ Assessment:
 
 - No behavior change intended. The actor loop now delegates shadow payload
   construction instead of owning telemetry projection details.
+
+## Structural Verification: Slice 39
+
+Scope:
+
+- Extract legacy target merge and admitted-target priority sorting into
+  `semantic_repair_planning.rs`.
+- Keep admission enrichment in `turn.rs` for now.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test cb017_ --lib -q`: pass, 40 tests.
+- `cargo test semantic_failure --lib -q`: pass, 40 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. A source-layout-sensitive grep test had to be
+  made robust after the adjacent `pub(super)` function was moved; production
+  behavior stayed unchanged.

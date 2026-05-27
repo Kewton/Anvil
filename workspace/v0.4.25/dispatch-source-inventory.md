@@ -184,3 +184,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier-repair shadow telemetry and legacy brief
   projection are now isolated in `verifier_repair_shadow.rs`; `turn.rs` still
   owns when to emit telemetry.
+- Current status: semantic legacy target merge and admitted-target priority
+  sorting are now isolated in `semantic_repair_planning.rs`; `turn.rs` still
+  owns admission enrichment because it verifies the admission SSOT path.

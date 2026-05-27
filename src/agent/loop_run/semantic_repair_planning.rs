@@ -1,5 +1,156 @@
 use super::verifier_assessment_parser::ParsedVerifierRepairAssessment;
 
+pub(super) fn merge_legacy_targets_into_clusters(
+    report: &mut super::semantic_failure::SemanticFailureReport,
+    parsed: &ParsedVerifierRepairAssessment,
+) {
+    let all_empty = report
+        .failure_clusters
+        .iter()
+        .all(|c| c.proposed_target_candidates.is_empty());
+    if !all_empty {
+        return;
+    }
+    let Some(first_cluster) = report.failure_clusters.first_mut() else {
+        return;
+    };
+    for target in &parsed.repair_targets {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &target.path,
+                    super::semantic_failure::MAX_RAW_PATH_CHARS,
+                ),
+                role_hint: None,
+                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &target.reason,
+                    240,
+                ),
+            },
+        );
+    }
+    for entry in &parsed.repair_plan {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        let sanitized_path = super::repair_job::sanitize_repair_job_text_with_char_cap(
+            &entry.path,
+            super::semantic_failure::MAX_RAW_PATH_CHARS,
+        );
+        if first_cluster
+            .proposed_target_candidates
+            .iter()
+            .any(|c| c.raw_path == sanitized_path)
+        {
+            continue;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: sanitized_path,
+                role_hint: None,
+                reason: super::repair_job::sanitize_repair_job_text_with_char_cap(
+                    &entry.reason,
+                    240,
+                ),
+            },
+        );
+    }
+    for path in &parsed.secondary_targets {
+        if first_cluster.proposed_target_candidates.len()
+            >= super::semantic_failure::MAX_PROPOSED_TARGETS_PER_CLUSTER
+        {
+            break;
+        }
+        let sanitized_path = super::repair_job::sanitize_repair_job_text_with_char_cap(
+            path,
+            super::semantic_failure::MAX_RAW_PATH_CHARS,
+        );
+        if first_cluster
+            .proposed_target_candidates
+            .iter()
+            .any(|c| c.raw_path == sanitized_path)
+        {
+            continue;
+        }
+        first_cluster.proposed_target_candidates.push(
+            super::semantic_failure::RawClusterTargetCandidate {
+                raw_path: sanitized_path,
+                role_hint: None,
+                reason: "diagnostic secondary target".to_string(),
+            },
+        );
+    }
+}
+
+pub(super) fn sort_admitted_by_authority_role_priority(
+    admitted: &mut [super::task_contract::RecoveryTargetHint],
+    spec_authority: super::spec_authority::SpecAuthority,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+) {
+    let primary_rank_for = |role: super::task_contract::ArtifactRole| -> u8 {
+        if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug) {
+            return match role {
+                super::task_contract::ArtifactRole::Test => 0,
+                super::task_contract::ArtifactRole::Implementation => 1,
+                super::task_contract::ArtifactRole::UsageDocs => 2,
+                super::task_contract::ArtifactRole::Setup => 3,
+            };
+        }
+        if matches!(
+            failure_kind,
+            super::VerifierDiagnosticFailureKind::DependencyMissing
+                | super::VerifierDiagnosticFailureKind::ConfigOrVerifierError
+        ) {
+            return match role {
+                super::task_contract::ArtifactRole::Setup => 0,
+                super::task_contract::ArtifactRole::Implementation => 1,
+                super::task_contract::ArtifactRole::UsageDocs => 2,
+                super::task_contract::ArtifactRole::Test => 3,
+            };
+        }
+        if matches!(
+            failure_kind,
+            super::VerifierDiagnosticFailureKind::AssertionMismatch
+        ) {
+            return match spec_authority {
+                super::spec_authority::SpecAuthority::UserRequest
+                | super::spec_authority::SpecAuthority::BehaviorContract => match role {
+                    super::task_contract::ArtifactRole::Implementation => 0,
+                    super::task_contract::ArtifactRole::Test => 1,
+                    super::task_contract::ArtifactRole::UsageDocs => 2,
+                    super::task_contract::ArtifactRole::Setup => 3,
+                },
+                super::spec_authority::SpecAuthority::VerifiedPublicInterface
+                | super::spec_authority::SpecAuthority::ImplementationContract
+                | super::spec_authority::SpecAuthority::LlmGeneratedTest => match role {
+                    super::task_contract::ArtifactRole::Test => 0,
+                    super::task_contract::ArtifactRole::Implementation => 1,
+                    super::task_contract::ArtifactRole::UsageDocs => 2,
+                    super::task_contract::ArtifactRole::Setup => 3,
+                },
+            };
+        }
+        match role {
+            super::task_contract::ArtifactRole::Implementation => 0,
+            super::task_contract::ArtifactRole::UsageDocs => 1,
+            super::task_contract::ArtifactRole::Setup => 2,
+            super::task_contract::ArtifactRole::Test => 3,
+        }
+    };
+    admitted.sort_by(|a, b| {
+        let pa = primary_rank_for(a.role);
+        let pb = primary_rank_for(b.role);
+        pa.cmp(&pb).then_with(|| a.path.cmp(&b.path))
+    });
+}
+
 pub(super) fn build_semantic_failure_report_from_legacy(
     parsed: &ParsedVerifierRepairAssessment,
     repair_job: &super::repair_job::RepairJob,
