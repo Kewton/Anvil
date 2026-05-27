@@ -66,6 +66,13 @@ use super::verifier_assessment_parser::{
     parse_semantic_failure_report_from_reply, parse_verifier_repair_assessment_reply,
     verifier_failure_type_for_diagnostic_kind,
 };
+use super::verifier_diagnostic_attempt::{
+    VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, verifier_diagnostic_attempt_spec,
+};
+#[cfg(test)]
+use super::verifier_diagnostic_attempt::{
+    VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
+};
 use super::verifier_failure_signature::{
     compact_verifier_failure_text, verifier_failure_error_kind, verifier_failure_signature,
 };
@@ -144,10 +151,7 @@ const EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK: &str =
 const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
 const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
-const VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS: u64 = 45;
-const VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS: u64 = 90;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
-pub(super) const VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT: usize = 3;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
 const VERIFIER_REPAIR_PASS_TIMEOUT_SECS: u64 = 90;
@@ -23742,47 +23746,6 @@ fn parse_leading_usize(input: &str) -> Option<usize> {
         None
     } else {
         digits.parse().ok()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifierDiagnosticAttemptSpec {
-    model: String,
-    timeout_secs: u64,
-    role: &'static str,
-}
-
-fn verifier_diagnostic_attempt_spec(
-    main_model: &str,
-    sidecar_model: Option<&str>,
-    attempts_done: usize,
-) -> Option<VerifierDiagnosticAttemptSpec> {
-    if attempts_done >= VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT {
-        return None;
-    }
-    let sidecar = sidecar_model.filter(|model| *model != main_model);
-    match (attempts_done, sidecar) {
-        (0, Some(model)) => Some(VerifierDiagnosticAttemptSpec {
-            model: model.to_string(),
-            timeout_secs: VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
-            role: "sidecar",
-        }),
-        (0, None) => Some(VerifierDiagnosticAttemptSpec {
-            model: main_model.to_string(),
-            timeout_secs: VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
-            role: "main",
-        }),
-        (1, Some(_)) => Some(VerifierDiagnosticAttemptSpec {
-            model: main_model.to_string(),
-            timeout_secs: VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
-            role: "main_fallback",
-        }),
-        (1, None) | (2, _) => Some(VerifierDiagnosticAttemptSpec {
-            model: main_model.to_string(),
-            timeout_secs: VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
-            role: "main_retry",
-        }),
-        _ => None,
     }
 }
 

@@ -886,7 +886,7 @@ impl RepairJob {
         }
         if self.repeated_rejected_attempt().is_some() {
             if self.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
             {
                 return RepairNextAction::Replan;
             }
@@ -896,7 +896,7 @@ impl RepairJob {
         }
         if self.assessment.is_none() {
             if self.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
             {
                 return RepairNextAction::RequestDiagnostic;
             }
@@ -906,7 +906,7 @@ impl RepairJob {
         }
         if semantic_plan_is_stale(self) {
             if self.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
             {
                 return RepairNextAction::RequestDiagnostic;
             }
@@ -916,7 +916,7 @@ impl RepairJob {
         }
         if self.needs_diagnostic_after_target_exhaustion() {
             if self.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
             {
                 return RepairNextAction::RequestDiagnostic;
             }
@@ -926,7 +926,7 @@ impl RepairJob {
         }
         if self.current_semantic_targets_all_exhausted() {
             if self.assessment_attempts
-                < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
             {
                 return RepairNextAction::Replan;
             }
@@ -997,7 +997,7 @@ impl RepairJob {
         match self.lifecycle_events.last()? {
             RepairJobEvent::DiagnosticMalformed => {
                 if self.assessment_attempts
-                    < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                    < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
                 {
                     Some(RepairNextAction::RequestDiagnostic)
                 } else {
@@ -1021,7 +1021,7 @@ impl RepairJob {
                 VerifierDelta::Improved => {
                     if self.needs_diagnostic_after_target_exhaustion() {
                         if self.assessment_attempts
-                            < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                            < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
                         {
                             return Some(RepairNextAction::Replan);
                         }
@@ -1036,7 +1036,7 @@ impl RepairJob {
                 | VerifierDelta::Worsened
                 | VerifierDelta::DifferentFailure => {
                     if self.assessment_attempts
-                        < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+                        < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
                     {
                         RepairNextAction::Replan
                     } else {
@@ -2937,7 +2937,7 @@ mod tests {
             RepairAttemptKey::from_target(&target, Some(AllowedChangeKind::FixTestImportOrSetup));
         let mut job = RepairJob {
             assessment: Some(verifier_assessment_for_target(target)),
-            assessment_attempts: crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
+            assessment_attempts: crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
             ..RepairJob::new_for_test()
         };
 
@@ -2985,7 +2985,8 @@ mod tests {
         job.apply_event(RepairJobEvent::DiagnosticMalformed);
         assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
 
-        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.assessment_attempts =
+            crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
         job.apply_event(RepairJobEvent::DiagnosticMalformed);
         assert_eq!(
             job.next_action(),
@@ -3048,14 +3049,17 @@ mod tests {
     #[test]
     fn synthetic_verifier_e2e_malformed_diagnostics_end_in_safe_stop() {
         let mut job = RepairJob::new_for_test();
-        for attempt in 0..crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT {
+        for attempt in 0
+            ..crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+        {
             job.assessment_attempts = attempt;
             job.apply_event(RepairJobEvent::DiagnosticMalformed);
-            if attempt + 1 < crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT {
+            if attempt + 1 < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT {
                 assert_eq!(job.next_action(), RepairNextAction::RequestDiagnostic);
             }
         }
-        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.assessment_attempts =
+            crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
         job.apply_event(RepairJobEvent::DiagnosticMalformed);
 
         assert_eq!(
@@ -3086,7 +3090,8 @@ mod tests {
         });
         assert_eq!(job.next_action(), RepairNextAction::Replan);
 
-        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.assessment_attempts =
+            crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
         job.apply_event(RepairJobEvent::PatchRejected {
             key,
             reason: RejectedAttemptReason::MalformedPatch,
@@ -6712,7 +6717,8 @@ mod tests {
             summary: None,
             source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
         });
-        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.assessment_attempts =
+            crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
         job.apply_event(RepairJobEvent::VerifierObserved {
             delta: VerifierDelta::Improved,
         });
@@ -6754,7 +6760,8 @@ mod tests {
         let decision = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(0), 0);
         assert_eq!(decision, VerifierRepairDecision::NeedDiagnostic);
 
-        job.assessment_attempts = crate::agent::loop_run::turn::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
+        job.assessment_attempts =
+            crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT;
         let exhausted = verifier_repair_decision(true, Some(&job), &[], &work_root, Some(0), 0);
         assert_eq!(exhausted, VerifierRepairDecision::DiagnosticUnavailable);
     }

@@ -200,3 +200,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier failure signature / compact failure text shaping is
   now isolated in `verifier_failure_signature.rs`; `turn.rs` still owns
   RepairJob context assembly and state writes.
+- Current status: diagnostic LLM attempt scheduling is now isolated in
+  `verifier_diagnostic_attempt.rs`; `turn.rs` still owns the provider call and
+  diagnostic pass state updates.

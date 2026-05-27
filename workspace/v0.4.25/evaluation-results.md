@@ -979,3 +979,24 @@ Assessment:
 
 - No behavior change intended. Test ownership now follows the extracted
   failure-signature module.
+
+## Structural Verification: Slice 47
+
+Scope:
+
+- Extract diagnostic LLM attempt schedule and timeout constants from `turn.rs`.
+- Update `repair_job.rs` test references to the new module.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_diagnostic_attempt_spec --lib -q`: pass, 1 test.
+- `cargo test repair_job --lib -q`: pass, 143 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Diagnostic attempt scheduling is isolated;
+  diagnostic execution remains in `turn.rs`.

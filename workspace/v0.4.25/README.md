@@ -1853,3 +1853,28 @@ Assessment:
 
 - No production behavior change. The failure-signature module now owns its
   characterization tests directly.
+
+### 2026-05-27 Slice 47
+
+Applied:
+
+- Added `verifier_diagnostic_attempt.rs`.
+- Moved diagnostic LLM attempt limit, timeout constants, attempt spec type,
+  and scheduling function out of `turn.rs`.
+- Updated `repair_job.rs` tests to reference the new diagnostic attempt module
+  instead of depending on `turn.rs` for the attempt limit.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_diagnostic_attempt_spec --lib -q`: pass, 1 test
+- `cargo test repair_job --lib -q`: pass, 143 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3033 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Diagnostic retry scheduling is now a dedicated
+  value module; `turn.rs` still owns the actual LLM call and diagnostic pass
+  state updates.
