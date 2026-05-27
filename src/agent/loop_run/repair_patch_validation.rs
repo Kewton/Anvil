@@ -50,6 +50,13 @@ pub(super) struct VerifierRepairIntentLimits {
     pub(super) max_reason_chars: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct RepairCandidateTestImportContractEvidence {
+    pub(super) missing_modules: Vec<String>,
+    pub(super) missing_imports: Vec<(String, String)>,
+    pub(super) scalar_attribute_assumptions: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairCandidateApplyResult {
     pub(super) updated_contents: String,
@@ -186,6 +193,47 @@ impl RepairCandidateTestEditPlanError {
                 "repair intent rejected: test edit requires a non-empty \
                  repair_hypothesis in the SemanticRepairPlan"
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RepairCandidateTestImportContractError {
+    MissingModules(Vec<String>),
+    MissingImportSymbols(Vec<(String, String)>),
+    ScalarAttributeAssumptions(Vec<String>),
+}
+
+impl RepairCandidateTestImportContractError {
+    pub(super) fn message(&self) -> String {
+        match self {
+            Self::MissingModules(modules) => format!(
+                "repair intent rejected: test imports missing local module(s): {}",
+                modules
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::MissingImportSymbols(imports) => format!(
+                "repair intent rejected: test imports missing local symbol(s): {}",
+                imports
+                    .iter()
+                    .take(4)
+                    .map(|(module, name)| format!("{module}.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::ScalarAttributeAssumptions(symbols) => format!(
+                "repair intent rejected: test assumes attribute access on imported scalar local symbol(s): {}",
+                symbols
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -507,6 +555,29 @@ pub(super) fn validate_test_edit_semantic_plan(
         repair_hypothesis.ok_or(RepairCandidateTestEditPlanError::MissingPlan)?;
     if repair_hypothesis.trim().is_empty() {
         return Err(RepairCandidateTestEditPlanError::EmptyHypothesis);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_test_import_contract_evidence(
+    evidence: RepairCandidateTestImportContractEvidence,
+) -> Result<(), RepairCandidateTestImportContractError> {
+    if !evidence.missing_modules.is_empty() {
+        return Err(RepairCandidateTestImportContractError::MissingModules(
+            evidence.missing_modules,
+        ));
+    }
+    if !evidence.missing_imports.is_empty() {
+        return Err(
+            RepairCandidateTestImportContractError::MissingImportSymbols(evidence.missing_imports),
+        );
+    }
+    if !evidence.scalar_attribute_assumptions.is_empty() {
+        return Err(
+            RepairCandidateTestImportContractError::ScalarAttributeAssumptions(
+                evidence.scalar_attribute_assumptions,
+            ),
+        );
     }
     Ok(())
 }
@@ -1481,6 +1552,58 @@ mod tests {
         assert!(validate_test_edit_semantic_plan(true, false, Some("fix expectation")).is_ok());
         assert!(validate_test_edit_semantic_plan(false, false, None).is_ok());
         assert!(validate_test_edit_semantic_plan(true, true, None).is_ok());
+    }
+
+    #[test]
+    fn test_import_contract_evidence_rejects_missing_modules_first() {
+        let err =
+            validate_test_import_contract_evidence(RepairCandidateTestImportContractEvidence {
+                missing_modules: vec!["missing_pkg".to_string()],
+                missing_imports: vec![("app.main".to_string(), "app".to_string())],
+                scalar_attribute_assumptions: vec!["app.value".to_string()],
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            err.message(),
+            "repair intent rejected: test imports missing local module(s): missing_pkg"
+        );
+    }
+
+    #[test]
+    fn test_import_contract_evidence_rejects_missing_symbols() {
+        let err =
+            validate_test_import_contract_evidence(RepairCandidateTestImportContractEvidence {
+                missing_imports: vec![("app.main".to_string(), "app".to_string())],
+                ..RepairCandidateTestImportContractEvidence::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            err.message(),
+            "repair intent rejected: test imports missing local symbol(s): app.main.app"
+        );
+    }
+
+    #[test]
+    fn test_import_contract_evidence_rejects_scalar_attribute_assumptions() {
+        let err =
+            validate_test_import_contract_evidence(RepairCandidateTestImportContractEvidence {
+                scalar_attribute_assumptions: vec!["app.COUNTER.value".to_string()],
+                ..RepairCandidateTestImportContractEvidence::default()
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            err.message(),
+            "repair intent rejected: test assumes attribute access on imported scalar local symbol(s): app.COUNTER.value"
+        );
+        assert!(
+            validate_test_import_contract_evidence(
+                RepairCandidateTestImportContractEvidence::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

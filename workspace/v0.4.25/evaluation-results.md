@@ -334,3 +334,24 @@ Assessment:
 
 - No behavior change intended. The actor loop now delegates one more
   patch-admission decision to `repair_patch_validation`.
+
+## Structural Verification: Slice 18
+
+Scope:
+
+- Move test import-contract evidence admission out of `turn.rs`.
+- Preserve existing rejection priority and message text.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting.
+- `cargo test repair_patch_validation --lib -q`: pass, 26 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3008 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Python evidence gathering remains in `turn.rs`,
+  but reject authority and message construction now live in validation.

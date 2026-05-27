@@ -1091,3 +1091,33 @@ Assessment:
   actor-loop logic.
 - `turn.rs` still owns Python import-contract checks and weakening detector
   dispatch.
+
+### 2026-05-27 Slice 18
+
+Applied:
+
+- Moved test import-contract evidence admission into
+  `repair_patch_validation.rs`.
+- `turn.rs` still gathers Python-specific evidence through existing helper
+  functions, but no longer owns the reject priority or message construction
+  for:
+  - missing local modules;
+  - missing local import symbols;
+  - attribute access assumptions on imported scalar local symbols.
+- Added module tests for rejection priority, each message shape, and the empty
+  evidence success case.
+
+Verification:
+
+- `cargo fmt --check`: pass after formatting
+- `cargo test repair_patch_validation --lib -q`: pass, 26 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3008 tests when rerun outside sandbox
+
+Assessment:
+
+- Another test-edit admission rule is validation-owned.
+- Python evidence collection remains in `turn.rs` until the Python diagnostic
+  helpers are moved to a dedicated module.

@@ -123,3 +123,5 @@ with legacy/fallback paths unable to override it.
 - Current status: the pure test-edit `SemanticRepairPlan` gate is now
   validation-owned; `turn.rs` only supplies the test-file classification,
   accepted-plan presence, and optional repair hypothesis.
+- Current status: test import-contract evidence admission is now
+  validation-owned; `turn.rs` still gathers Python-specific evidence.

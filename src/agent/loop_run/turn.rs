@@ -24734,43 +24734,16 @@ fn validate_verifier_repair_intents_inner(
     )
     .map_err(|err| ValidationFailure::failed(err.message().to_string()))?;
     if target_is_test_file {
-        let missing_modules = python_missing_local_import_modules(work_root, &contents);
-        if !missing_modules.is_empty() {
-            let summary = missing_modules
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ValidationFailure::failed(format!(
-                "repair intent rejected: test imports missing local module(s): {summary}"
-            )));
-        }
-        let missing_imports = python_missing_local_import_symbols(work_root, &contents);
-        if !missing_imports.is_empty() {
-            let summary = missing_imports
-                .iter()
-                .take(4)
-                .map(|(module, name)| format!("{module}.{name}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ValidationFailure::failed(format!(
-                "repair intent rejected: test imports missing local symbol(s): {summary}"
-            )));
-        }
-        let invalid_attr_assumptions =
-            python_imported_scalar_attribute_assumptions(work_root, &contents);
-        if !invalid_attr_assumptions.is_empty() {
-            let summary = invalid_attr_assumptions
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ValidationFailure::failed(format!(
-                "repair intent rejected: test assumes attribute access on imported scalar local symbol(s): {summary}"
-            )));
-        }
+        super::repair_patch_validation::validate_test_import_contract_evidence(
+            super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
+                missing_modules: python_missing_local_import_modules(work_root, &contents),
+                missing_imports: python_missing_local_import_symbols(work_root, &contents),
+                scalar_attribute_assumptions: python_imported_scalar_attribute_assumptions(
+                    work_root, &contents,
+                ),
+            },
+        )
+        .map_err(|err| ValidationFailure::failed(err.message()))?;
     }
 
     // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): apply the deterministic
