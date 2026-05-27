@@ -41,6 +41,11 @@ use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_la
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tester;
+use super::verifier_assessment_parser::{
+    ParsedVerifierRepairAssessment, ParsedVerifierRepairTarget,
+    extract_diagnostic_reply_json_value, parse_verifier_repair_assessment_reply,
+    verifier_failure_type_for_diagnostic_kind,
+};
 use super::work_mode_confirm::{
     self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
     WorkModeConfirmInputs, WorkModeConfirmOutcome, build_work_mode_confirm_log_payload,
@@ -56,7 +61,7 @@ use crate::modes::plan_act::{
     ModeClassification, PlanStage, TaskProfile, WorkMode, classify_work_mode_json,
 };
 use crate::ollama::client::SIDECAR_SUMMARY_TIMEOUT_SECS;
-use crate::ollama::xml_fallback::{normalize_tool_call_arguments, strip_think_tags};
+use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
@@ -112,11 +117,8 @@ const VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS: u64 = 45;
 const VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS: u64 = 90;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
 pub(super) const VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT: usize = 3;
-const VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES: usize = 16_384;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
-const VERIFIER_DIAGNOSTIC_MAX_SUMMARY_CHARS: usize = 240;
-const VERIFIER_DIAGNOSTIC_MAX_REASON_CHARS: usize = 180;
 const VERIFIER_REPAIR_PASS_TIMEOUT_SECS: u64 = 90;
 const VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS: u64 = 180;
 const VERIFIER_REPAIR_PASS_MAX_PREDICT: usize = 2_048;
@@ -22645,95 +22647,6 @@ fn verifier_repair_changed_file_hints(
     hints
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ParsedVerifierRepairAssessment {
-    pub(super) failure_kind: super::VerifierDiagnosticFailureKind,
-    pub(super) probable_cause_role: Option<super::task_contract::ArtifactRole>,
-    pub(super) repair_targets: Vec<ParsedVerifierRepairTarget>,
-    pub(super) repair_plan: Vec<ParsedVerifierRepairTarget>,
-    pub(super) secondary_targets: Vec<String>,
-    pub(super) do_not_edit_tests_without_evidence: bool,
-    pub(super) summary: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ParsedVerifierRepairTarget {
-    pub(super) path: String,
-    pub(super) confidence: f64,
-    pub(super) reason: String,
-}
-
-fn parse_verifier_repair_assessment_reply(reply: &str) -> Option<ParsedVerifierRepairAssessment> {
-    let stripped = strip_think_tags(reply);
-    let trimmed = truncate(stripped.trim(), VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES);
-    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        trimmed.as_str()
-    } else {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        if end <= start {
-            return None;
-        }
-        &trimmed[start..=end]
-    };
-    let value: serde_json::Value = serde_json::from_str(json_text).ok()?;
-    let object = value.as_object()?;
-    let failure_kind = object
-        .get("failure_kind")
-        .or_else(|| object.get("failure_type"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(verifier_diagnostic_failure_kind_from_str)
-        .unwrap_or(super::VerifierDiagnosticFailureKind::Unknown);
-    let probable_cause_role = object
-        .get("probable_cause_role")
-        .or_else(|| object.get("root_cause_role"))
-        .or_else(|| object.get("role"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(artifact_role_from_assessment_str);
-    let repair_targets = verifier_assessment_field(object, &["repair_targets", "targets"])
-        .map(parse_verifier_repair_targets_value)
-        .unwrap_or_default();
-    let legacy_target =
-        verifier_assessment_field(object, &["repair_target", "target", "target_file", "path"])
-            .and_then(parse_verifier_repair_target_value);
-    let repair_targets = if repair_targets.is_empty() {
-        legacy_target.into_iter().collect::<Vec<_>>()
-    } else {
-        repair_targets
-    };
-    let repair_plan = verifier_assessment_field(object, &["repair_plan", "plan", "steps"])
-        .map(parse_verifier_repair_targets_value)
-        .unwrap_or_default();
-    let secondary_targets = verifier_assessment_field(
-        object,
-        &["secondary_targets", "needed_reads", "related_files"],
-    )
-    .map(parse_verifier_secondary_targets_value)
-    .unwrap_or_default();
-    let do_not_edit_tests_without_evidence = object
-        .get("do_not_edit_tests_without_evidence")
-        .or_else(|| object.get("avoid_test_edits_without_evidence"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let summary = object
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .map(|summary| {
-            compact_verifier_failure_text(summary, VERIFIER_DIAGNOSTIC_MAX_SUMMARY_CHARS)
-        })
-        .filter(|summary| !summary.is_empty());
-
-    Some(ParsedVerifierRepairAssessment {
-        failure_kind,
-        probable_cause_role,
-        repair_targets,
-        repair_plan,
-        secondary_targets,
-        do_not_edit_tests_without_evidence,
-        summary,
-    })
-}
-
 #[cfg(test)]
 fn parse_verifier_repair_intent_reply(reply: &str) -> Result<VerifierRepairIntent, String> {
     parse_verifier_repair_intents_reply(reply)?
@@ -23185,172 +23098,6 @@ fn verifier_repair_intents_fingerprint(
         relative_path,
         &repair_intent_edit_payloads(intents),
     )
-}
-
-fn verifier_assessment_field<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
-) -> Option<&'a serde_json::Value> {
-    keys.iter().find_map(|key| object.get(*key))
-}
-
-fn parse_verifier_repair_targets_value(
-    value: &serde_json::Value,
-) -> Vec<ParsedVerifierRepairTarget> {
-    match value {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .filter_map(parse_verifier_repair_target_value)
-            .take(3)
-            .collect(),
-        _ => parse_verifier_repair_target_value(value)
-            .into_iter()
-            .collect(),
-    }
-}
-
-fn parse_verifier_secondary_targets_value(value: &serde_json::Value) -> Vec<String> {
-    match value {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .filter_map(parse_verifier_repair_target_value)
-            .map(|target| target.path)
-            .take(3)
-            .collect(),
-        _ => parse_verifier_repair_target_value(value)
-            .map(|target| vec![target.path])
-            .unwrap_or_default(),
-    }
-}
-
-fn parse_verifier_repair_target_value(
-    value: &serde_json::Value,
-) -> Option<ParsedVerifierRepairTarget> {
-    if let Some(path) = value.as_str() {
-        let path = path.trim();
-        if path.is_empty() || path == "null" || path == "unknown" {
-            return None;
-        }
-        return Some(ParsedVerifierRepairTarget {
-            path: path.to_string(),
-            confidence: 0.5,
-            reason: "diagnostic LLM selected this repair target".to_string(),
-        });
-    }
-    let object = value.as_object()?;
-    let path = verifier_assessment_field(
-        object,
-        &[
-            "path",
-            "target",
-            "file",
-            "filename",
-            "target_file",
-            "target_path",
-        ],
-    )
-    .and_then(serde_json::Value::as_str)?
-    .trim();
-    if path.is_empty() || path == "null" || path == "unknown" {
-        return None;
-    }
-    let confidence = object
-        .get("confidence")
-        .and_then(|value| {
-            value
-                .as_f64()
-                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
-        })
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.5)
-        .clamp(0.0, 1.0);
-    let reason = object
-        .get("reason")
-        .or_else(|| object.get("intent"))
-        .or_else(|| object.get("summary"))
-        .or_else(|| object.get("cause"))
-        .and_then(serde_json::Value::as_str)
-        .map(|reason| compact_verifier_failure_text(reason, VERIFIER_DIAGNOSTIC_MAX_REASON_CHARS))
-        .filter(|reason| !reason.is_empty())
-        .unwrap_or_else(|| "diagnostic LLM selected this repair target".to_string());
-    Some(ParsedVerifierRepairTarget {
-        path: path.to_string(),
-        confidence,
-        reason,
-    })
-}
-
-fn verifier_diagnostic_failure_kind_from_str(
-    value: &str,
-) -> Option<super::VerifierDiagnosticFailureKind> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "dependency_missing" | "import_or_dependency" | "dependency" | "missing_dependency" => {
-            Some(super::VerifierDiagnosticFailureKind::DependencyMissing)
-        }
-        "local_import_contract_mismatch" | "local_symbol_import_error" | "contract_mismatch" => {
-            Some(super::VerifierDiagnosticFailureKind::LocalImportContractMismatch)
-        }
-        "compile_or_syntax_error" | "compile_or_syntax" | "compile" | "syntax" => {
-            Some(super::VerifierDiagnosticFailureKind::CompileOrSyntaxError)
-        }
-        "assertion_mismatch" | "assertion_failure" | "assertion" | "test_assertion" => {
-            Some(super::VerifierDiagnosticFailureKind::AssertionMismatch)
-        }
-        "runtime_error" | "runtime" => Some(super::VerifierDiagnosticFailureKind::RuntimeError),
-        "test_bug" | "bad_test" => Some(super::VerifierDiagnosticFailureKind::TestBug),
-        "config_or_verifier_error"
-        | "missing_verifier_or_config"
-        | "missing_verifier"
-        | "config" => Some(super::VerifierDiagnosticFailureKind::ConfigOrVerifierError),
-        "unknown" => Some(super::VerifierDiagnosticFailureKind::Unknown),
-        _ => None,
-    }
-}
-
-fn verifier_failure_type_for_diagnostic_kind(
-    kind: super::VerifierDiagnosticFailureKind,
-    fallback: super::VerifierFailureType,
-) -> super::VerifierFailureType {
-    match kind {
-        super::VerifierDiagnosticFailureKind::DependencyMissing => {
-            super::VerifierFailureType::ImportOrDependency
-        }
-        // Issue #638 (設計判断 #3): LocalImportContractMismatch → ImportOrDependency
-        // so `verifier_repair_preferred_local_import_source` fires correctly when
-        // the derived_failure_type is passed to the helper.
-        super::VerifierDiagnosticFailureKind::LocalImportContractMismatch => {
-            super::VerifierFailureType::ImportOrDependency
-        }
-        super::VerifierDiagnosticFailureKind::RuntimeError
-        | super::VerifierDiagnosticFailureKind::TestBug => super::VerifierFailureType::RuntimeError,
-        super::VerifierDiagnosticFailureKind::CompileOrSyntaxError => {
-            super::VerifierFailureType::CompileOrSyntax
-        }
-        super::VerifierDiagnosticFailureKind::AssertionMismatch => {
-            super::VerifierFailureType::AssertionFailure
-        }
-        super::VerifierDiagnosticFailureKind::ConfigOrVerifierError => {
-            super::VerifierFailureType::MissingVerifierOrConfig
-        }
-        super::VerifierDiagnosticFailureKind::Unknown => fallback,
-    }
-}
-
-fn artifact_role_from_assessment_str(value: &str) -> Option<super::task_contract::ArtifactRole> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "implementation" | "impl" | "code" | "source" => {
-            Some(super::task_contract::ArtifactRole::Implementation)
-        }
-        "test" | "tests" => Some(super::task_contract::ArtifactRole::Test),
-        "usage_docs" | "docs" | "documentation" | "readme" => {
-            Some(super::task_contract::ArtifactRole::UsageDocs)
-        }
-        "setup" | "config" | "dependency" | "dependencies" => {
-            Some(super::task_contract::ArtifactRole::Setup)
-        }
-        "unknown" => None,
-        _ => None,
-    }
 }
 
 fn recovery_target_hint_for_existing_path(
@@ -24044,33 +23791,6 @@ fn verifier_repair_stale_assertion_test_target(
     // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
     // 6 source categories: stale-assertion test re-target.
     admit_repair_target_hint(promoted, admission)
-}
-
-/// Issue #647 (Phase D): extract the JSON object value from a diagnostic LLM
-/// reply, mirroring the SSOT preamble used by
-/// [`parse_verifier_repair_assessment_reply`] (strip `<think>` tags →
-/// trim/truncate → find the outermost `{ … }`). Returns `None` on any
-/// extraction or `serde_json` parse failure.
-///
-/// Phase D wires this helper into `run_verifier_diagnostic_pass` so the
-/// existing `ParsedVerifierRepairAssessment` parse and the new
-/// `parse_semantic_failure_report` parse share an identical JSON-extraction
-/// boundary. Keeping the extraction logic colocated avoids drift between
-/// the two parse paths.
-fn extract_diagnostic_reply_json_value(reply: &str) -> Option<serde_json::Value> {
-    let stripped = strip_think_tags(reply);
-    let trimmed = truncate(stripped.trim(), VERIFIER_DIAGNOSTIC_MAX_OUTPUT_BYTES);
-    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        trimmed.clone()
-    } else {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        if end <= start {
-            return None;
-        }
-        trimmed[start..=end].to_string()
-    };
-    serde_json::from_str(&json_text).ok()
 }
 
 /// Issue #647 (Phase D / D.1): parse a diagnostic LLM reply into an

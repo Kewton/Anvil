@@ -157,6 +157,9 @@ mod repair_test_weakening_filter;
 // v0.4.25: objective framework/test-runner findings used as bounded evidence
 // for verifier diagnostics.
 mod repair_framework_findings;
+// v0.4.25: diagnostic LLM assessment JSON boundary. Keeps schema-shape
+// tolerance and enum mapping out of the actor loop dispatcher.
+mod verifier_assessment_parser;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

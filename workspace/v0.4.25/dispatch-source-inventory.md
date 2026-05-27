@@ -168,3 +168,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier framework/test-runner finding generation is now
   isolated in `repair_framework_findings.rs`; `turn.rs` still owns diagnostic
   prompt assembly and parsed-assessment override application.
+- Current status: diagnostic LLM assessment parsing is now isolated in
+  `verifier_assessment_parser.rs`; `turn.rs` still owns workspace admission,
+  semantic plan construction, and RepairJob state transitions.

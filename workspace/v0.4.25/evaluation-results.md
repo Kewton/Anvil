@@ -689,3 +689,26 @@ Assessment:
 - No behavior change intended. The new module owns objective language/test
   runner evidence; `turn.rs` still owns how that evidence is merged into the
   parsed diagnostic assessment.
+
+## Structural Verification: Slice 34
+
+Scope:
+
+- Extract diagnostic LLM assessment parsing from `turn.rs`.
+- Keep workspace admission, semantic planning, and RepairJob state updates in
+  `turn.rs` for this slice.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The parser module owns JSON extraction,
+  bounded text compaction, target-list parsing, role parsing, and failure-kind
+  mapping; the dispatcher no longer owns diagnostic schema drift handling.

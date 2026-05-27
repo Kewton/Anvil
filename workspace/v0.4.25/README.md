@@ -1519,3 +1519,30 @@ Assessment:
 - No behavior change intended. Framework finding generation is now a bounded
   evidence module; `turn.rs` still decides how that evidence affects the
   parsed verifier assessment.
+
+### 2026-05-27 Slice 34
+
+Applied:
+
+- Added `verifier_assessment_parser.rs` for diagnostic LLM assessment JSON
+  extraction, schema-shape tolerance, legacy repair-target parsing, and
+  diagnostic failure-kind to verifier failure-type mapping.
+- Moved `ParsedVerifierRepairAssessment` / `ParsedVerifierRepairTarget` out
+  of `turn.rs`.
+- Reused the extracted JSON boundary for semantic failure report parsing so
+  legacy and semantic diagnostic paths continue to share one extraction rule.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_diagnostic_ --lib -q`: pass, 21 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3027 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. `turn.rs` now receives a parsed diagnostic
+  assessment and remains responsible for workspace admission and repair-state
+  orchestration, while parser-specific schema drift handling is isolated.
