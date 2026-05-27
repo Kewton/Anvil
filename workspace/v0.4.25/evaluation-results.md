@@ -553,3 +553,25 @@ Assessment:
 
 - No behavior change intended. Repair patch validation now owns the typed error
   to validation-result boundary.
+
+## Structural Verification: Slice 28
+
+Scope:
+
+- Move the remaining typed validation error to validation-result conversion
+  helpers out of `turn.rs`.
+- Keep all existing branch semantics and rejection signals unchanged.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests.
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. The actor loop now delegates validation error
+  shaping to the validation module.

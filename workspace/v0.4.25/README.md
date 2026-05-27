@@ -1356,3 +1356,34 @@ Assessment:
 
 - No behavior change intended. `turn.rs` now receives `ValidationFailure`
   directly from validation-owned typed error conversions.
+
+### 2026-05-27 Slice 28
+
+Applied:
+
+- Moved remaining typed validation error conversions into
+  `repair_patch_validation.rs`:
+  - list bounds
+  - target read errors
+  - duplicate/no-op candidate errors
+  - test edit plan and import-contract errors
+  - weakening errors
+  - duplicate binding errors
+  - candidate content cheap-check projection
+- `turn.rs` now wires those conversions instead of constructing
+  `ValidationFailure` inline for each branch.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test repair_patch_validation --lib -q`: pass, 31 tests
+- `cargo test validate_verifier_repair_intents --lib -q`: pass, 24 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3014 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. `turn.rs` no longer owns typed validation error
+  shaping; its remaining validation responsibilities are orchestration,
+  Python evidence gathering, and semantic generated-test weakening filtering.

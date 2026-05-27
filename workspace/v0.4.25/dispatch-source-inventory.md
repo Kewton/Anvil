@@ -150,3 +150,6 @@ with legacy/fallback paths unable to override it.
 - Current status: typed repair-intent validation errors now convert to
   `ValidationFailure` inside `repair_patch_validation.rs`; `turn.rs` no longer
   owns those mapping wrappers.
+- Current status: remaining typed validation errors now convert to
+  validation-result carriers inside `repair_patch_validation.rs`; `turn.rs`
+  still sequences the checks and gathers Python evidence.

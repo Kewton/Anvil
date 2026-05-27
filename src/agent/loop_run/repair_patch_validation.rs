@@ -291,6 +291,10 @@ impl RepairIntentListBoundsError {
             Self::TooMany => "repair intent list contained too many edits",
         }
     }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed(self.message().to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +337,10 @@ impl RepairTargetReadError {
             Self::NotUtf8 => "repair target is not valid UTF-8 text".to_string(),
         }
     }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed(self.message())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,12 +357,28 @@ pub(super) enum RepairCandidateContentError {
     Unavailable,
 }
 
+impl RepairCandidateContentError {
+    pub(super) fn into_cheap_check_outcome(self) -> CheapCheckOutcome {
+        match self {
+            Self::CheapCheckFailed(message) => CheapCheckOutcome::Failed(message),
+            Self::Unavailable => CheapCheckOutcome::Unavailable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RepairCandidateNoopError;
 
 impl RepairCandidateNoopError {
     pub(super) fn message(self) -> &'static str {
         "repair intent applied but produced no net change to the file"
+    }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed_with_signal(
+            self.message().to_string(),
+            RepairRejectionSignal::Noop,
+        )
     }
 }
 
@@ -364,6 +388,13 @@ pub(super) struct RepairCandidateDuplicateIntentError;
 impl RepairCandidateDuplicateIntentError {
     pub(super) fn message(self) -> &'static str {
         "duplicate repair edit intent for the same failure"
+    }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed_with_signal(
+            self.message().to_string(),
+            RepairRejectionSignal::Duplicate,
+        )
     }
 }
 
@@ -385,6 +416,10 @@ impl RepairCandidateTestEditPlanError {
                  repair_hypothesis in the SemanticRepairPlan"
             }
         }
+    }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed(self.message().to_string())
     }
 }
 
@@ -427,6 +462,10 @@ impl RepairCandidateTestImportContractError {
             ),
         }
     }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed(self.message())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +488,18 @@ impl RepairCandidateWeakeningError {
             "repair intent rejected: test/impl weakening detected ({:?})",
             self.patterns
         )
+    }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        let weakening_meta = match (self.rejection, self.pattern) {
+            (Some(rejection), Some(pattern)) => Some(ValidationWeakening { rejection, pattern }),
+            _ => None,
+        };
+        ValidationFailure {
+            outcome: CheapCheckOutcome::Failed(self.message()),
+            weakening: weakening_meta,
+            rejection_signal: None,
+        }
     }
 }
 
@@ -529,6 +580,10 @@ impl DuplicateBindingRepairError {
             "repair intent rejected: duplicate binding still present after candidate edit ({})",
             self.still_duplicate.join(", ")
         )
+    }
+
+    pub(super) fn into_validation_failure(self) -> ValidationFailure {
+        ValidationFailure::failed_with_signal(self.message(), RepairRejectionSignal::Duplicate)
     }
 }
 

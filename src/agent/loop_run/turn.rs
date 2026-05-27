@@ -20,9 +20,11 @@ use super::reminder::{
 use super::repair_job;
 #[cfg(test)]
 use super::repair_job::VerifierRepairDecision;
+#[cfg(test)]
+use super::repair_patch_validation::ValidationWeakening;
 use super::repair_patch_validation::{
     CheapCheckOutcome, RepairRejectionSignal, ValidatedVerifierRepairEdit, ValidationFailure,
-    ValidationWeakening, VerifierRepairIntent, build_verifier_repair_pass_ledger_outcome,
+    VerifierRepairIntent, build_verifier_repair_pass_ledger_outcome,
     validate_accepted_repair_plan_authorizes_target,
 };
 #[cfg(test)]
@@ -24184,13 +24186,15 @@ fn validate_verifier_repair_intents_inner(
         intents.len(),
         VERIFIER_REPAIR_PASS_MAX_EDITS,
     )
-    .map_err(|err| ValidationFailure::failed(err.message().to_string()))?;
+    .map_err(
+        super::repair_patch_validation::RepairIntentListBoundsError::into_validation_failure,
+    )?;
     let target_snapshot = super::repair_patch_validation::read_repair_target_snapshot(
         work_root,
         &target_hint.path,
         VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
     )
-    .map_err(|err| ValidationFailure::failed(err.message()))?;
+    .map_err(super::repair_patch_validation::RepairTargetReadError::into_validation_failure)?;
     let canonical = target_snapshot.canonical_path;
     let relative_path = target_snapshot.relative_path;
     let original_contents = target_snapshot.contents;
@@ -24259,12 +24263,9 @@ fn validate_verifier_repair_intents_inner(
         &context.applied_repair_intents,
         &fingerprint,
     )
-    .map_err(|err| {
-        ValidationFailure::failed_with_signal(
-            err.message().to_string(),
-            RepairRejectionSignal::Duplicate,
-        )
-    })?;
+    .map_err(
+        super::repair_patch_validation::RepairCandidateDuplicateIntentError::into_validation_failure,
+    )?;
 
     // Phase 2: in-memory apply. Per-intent input validation has already
     // passed; remaining failures here surface as unsigned exact/replace-all
@@ -24283,12 +24284,7 @@ fn validate_verifier_repair_intents_inner(
         &original_contents,
         &contents,
     )
-    .map_err(|err| {
-        ValidationFailure::failed_with_signal(
-            err.message().to_string(),
-            RepairRejectionSignal::Noop,
-        )
-    })?;
+    .map_err(super::repair_patch_validation::RepairCandidateNoopError::into_validation_failure)?;
     // Issue #647 (MF3 / codex final review): SemanticRepairPlan gate for test
     // edits. Test files (`is_test_file`) may only be edited when the
     // RepairJob carries a `SemanticRepairPlan` with both a determined
@@ -24308,7 +24304,9 @@ fn validate_verifier_repair_intents_inner(
             .as_ref()
             .map(|plan| plan.repair_hypothesis.as_str()),
     )
-    .map_err(|err| ValidationFailure::failed(err.message().to_string()))?;
+    .map_err(
+        super::repair_patch_validation::RepairCandidateTestEditPlanError::into_validation_failure,
+    )?;
     if target_is_test_file {
         super::repair_patch_validation::validate_test_import_contract_evidence(
             super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
@@ -24319,7 +24317,9 @@ fn validate_verifier_repair_intents_inner(
                 ),
             },
         )
-        .map_err(|err| ValidationFailure::failed(err.message()))?;
+        .map_err(
+            super::repair_patch_validation::RepairCandidateTestImportContractError::into_validation_failure,
+        )?;
     }
 
     // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): run weakening
@@ -24350,44 +24350,26 @@ fn validate_verifier_repair_intents_inner(
         weakening,
         weakening_detection.rejection_kind,
     )
-    .map_err(|err| {
-        // Issue #653 (DR1-001): emission **文字列** は維持 (controller / log /
-        // test 既存挙動非破壊)。構造化 metadata は `ValidationFailure.weakening`
-        // から call site で取り回す。
-        let weakening_meta = match (err.rejection, err.pattern) {
-            (Some(rejection), Some(pattern)) => Some(ValidationWeakening { rejection, pattern }),
-            // Defensive: should never happen because weakening is non-empty and
-            // rejection_kind is Some when we entered this branch.
-            _ => None,
-        };
-        ValidationFailure {
-            outcome: CheapCheckOutcome::Failed(err.message()),
-            weakening: weakening_meta,
-            rejection_signal: None,
-        }
-    })?;
+    .map_err(
+        super::repair_patch_validation::RepairCandidateWeakeningError::into_validation_failure,
+    )?;
     super::repair_patch_validation::validate_duplicate_binding_repair_candidate(
         &relative_path,
         context,
         &original_contents,
         &contents,
     )
-    .map_err(|err| {
-        ValidationFailure::failed_with_signal(err.message(), RepairRejectionSignal::Duplicate)
-    })?;
+    .map_err(
+        super::repair_patch_validation::DuplicateBindingRepairError::into_validation_failure,
+    )?;
     super::repair_patch_validation::validate_repair_candidate_contents(
         &relative_path,
         &contents,
         used_whitespace_fallback,
     )
-    .map_err(|err| match err {
-        super::repair_patch_validation::RepairCandidateContentError::CheapCheckFailed(message) => {
-            CheapCheckOutcome::Failed(message)
-        }
-        super::repair_patch_validation::RepairCandidateContentError::Unavailable => {
-            CheapCheckOutcome::Unavailable
-        }
-    })?;
+    .map_err(
+        super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
+    )?;
 
     // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran
     // **before** the in-memory apply above. The remaining branches here
