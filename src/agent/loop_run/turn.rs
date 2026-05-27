@@ -1823,6 +1823,73 @@ enum ActorLoopNoToolReplyOutcome {
     },
 }
 
+struct ActorLoopTaskContractReplyArgs<'a, 'b> {
+    before_snapshot: &'a RepoSnapshot,
+    accumulated: &'a [RepoVerification],
+    task_contract: Option<&'a super::task_contract::TaskContract>,
+    task_contract_action: Option<&'a super::task_contract::ArtifactRecoveryAction>,
+    final_reply: &'a str,
+    current_reply_tool_call_count: usize,
+    repo_edit_calls_made_this_turn: usize,
+    last_iter: usize,
+    contract_completion_retries: &'b mut usize,
+    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
+    contract_verification_retries: &'b mut usize,
+    contract_verifier_repair_edit_count: &'b mut Option<usize>,
+    repo_change_retries: &'b mut usize,
+    verifier_repair_retries: &'b mut usize,
+    task_contract_verify_commands_collected: &'b mut Vec<String>,
+    task_contract_verifier_passed_in_loop: &'b mut bool,
+    no_tool_retries: &'b mut usize,
+    contract_deterministic_fallback_materialized: &'b mut bool,
+}
+
+enum ActorLoopTaskContractReplyOutcome {
+    Proceed,
+    Continue,
+    Done {
+        final_prose: String,
+    },
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+}
+
+struct ActorLoopTaskContractContinueArgs<'a, 'b> {
+    contract: &'a super::task_contract::TaskContract,
+    action: &'a super::task_contract::ArtifactRecoveryAction,
+    missing: &'a [super::task_contract::ArtifactRole],
+    target_hint: &'a Option<super::task_contract::RecoveryTargetHint>,
+    final_reply: &'a str,
+    current_reply_tool_call_count: usize,
+    last_iter: usize,
+    contract_completion_retries: &'b mut usize,
+    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
+    contract_deterministic_fallback_materialized: &'b mut bool,
+}
+
+struct ActorLoopTaskContractToolRecoveryArgs<'a, 'b> {
+    contract: &'a super::task_contract::TaskContract,
+    decision: &'a super::task_contract::CompletionDecision,
+    target_hint: Option<super::task_contract::RecoveryTargetHint>,
+    missing: &'a [super::task_contract::ArtifactRole],
+    final_reply: &'a str,
+    last_iter: usize,
+    contract_completion_retries: &'b mut usize,
+    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
+}
+
+struct ActorLoopTaskContractIncompleteArgs<'a, 'b> {
+    contract: &'a super::task_contract::TaskContract,
+    decision: super::task_contract::CompletionDecision,
+    target_hint: Option<super::task_contract::RecoveryTargetHint>,
+    missing: &'a [super::task_contract::ArtifactRole],
+    last_iter: usize,
+    contract_completion_retries: &'b mut usize,
+    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
+}
+
 #[derive(Clone, Copy)]
 enum ActorLoopMissingRepoChangeReplyKind {
     Empty,
@@ -6396,6 +6463,348 @@ impl Agent {
         }
     }
 
+    fn handle_actor_loop_task_contract_reply(
+        &mut self,
+        args: ActorLoopTaskContractReplyArgs<'_, '_>,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        let (Some(contract), Some(action)) = (args.task_contract, args.task_contract_action) else {
+            return ActorLoopTaskContractReplyOutcome::Proceed;
+        };
+
+        match action {
+            super::task_contract::ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint,
+            } => self.handle_actor_loop_task_contract_continue_action(
+                ActorLoopTaskContractContinueArgs {
+                    contract,
+                    action,
+                    missing,
+                    target_hint,
+                    final_reply: args.final_reply,
+                    current_reply_tool_call_count: args.current_reply_tool_call_count,
+                    last_iter: args.last_iter,
+                    contract_completion_retries: args.contract_completion_retries,
+                    contract_completion_role_retries: args.contract_completion_role_retries,
+                    contract_deterministic_fallback_materialized: args
+                        .contract_deterministic_fallback_materialized,
+                },
+            ),
+            super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => self
+                .handle_actor_loop_task_contract_repair_artifact(
+                    args.last_iter,
+                    args.verifier_repair_retries,
+                ),
+            super::task_contract::ArtifactRecoveryAction::RunVerifier => {
+                self.handle_actor_loop_task_contract_run_verifier(args)
+            }
+            super::task_contract::ArtifactRecoveryAction::Done => {
+                ActorLoopTaskContractReplyOutcome::Proceed
+            }
+            super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
+                self.handle_actor_loop_task_contract_safe_stop(*reason, args.last_iter)
+            }
+        }
+    }
+
+    fn handle_actor_loop_task_contract_continue_action(
+        &mut self,
+        args: ActorLoopTaskContractContinueArgs<'_, '_>,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        let decision = super::task_contract::CompletionDecision::Continue {
+            missing: args.missing.to_vec(),
+        };
+        let target_hint = args
+            .target_hint
+            .clone()
+            .or_else(|| self.task_contract_recovery_target(&decision))
+            .and_then(|hint| {
+                self.set_artifact_recovery_target_from_hint(
+                    hint,
+                    (*args.contract_completion_retries).saturating_add(1),
+                )
+            });
+        if task_contract_continue_requires_tool_recovery(
+            Some(args.action),
+            args.current_reply_tool_call_count,
+        ) {
+            return self.handle_actor_loop_task_contract_tool_recovery(
+                ActorLoopTaskContractToolRecoveryArgs {
+                    contract: args.contract,
+                    decision: &decision,
+                    target_hint,
+                    missing: args.missing,
+                    final_reply: args.final_reply,
+                    last_iter: args.last_iter,
+                    contract_completion_retries: args.contract_completion_retries,
+                    contract_completion_role_retries: args.contract_completion_role_retries,
+                },
+            );
+        }
+        if !*args.contract_deterministic_fallback_materialized
+            && self.maybe_materialize_task_contract_fallback(&decision, args.last_iter)
+        {
+            *args.contract_deterministic_fallback_materialized = true;
+            self.set_artifact_recovery_target_for_decision(
+                &decision,
+                (*args.contract_completion_retries).saturating_add(1),
+            );
+            let scaffold_note = "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response.";
+            self.push_system_note(scaffold_note.to_string());
+            return ActorLoopTaskContractReplyOutcome::Continue;
+        }
+        self.handle_actor_loop_task_contract_incomplete_artifacts(
+            ActorLoopTaskContractIncompleteArgs {
+                contract: args.contract,
+                decision,
+                target_hint,
+                missing: args.missing,
+                last_iter: args.last_iter,
+                contract_completion_retries: args.contract_completion_retries,
+                contract_completion_role_retries: args.contract_completion_role_retries,
+            },
+        )
+    }
+
+    fn handle_actor_loop_task_contract_tool_recovery(
+        &mut self,
+        args: ActorLoopTaskContractToolRecoveryArgs<'_, '_>,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        *args.contract_completion_retries = (*args.contract_completion_retries).saturating_add(1);
+        let role = args
+            .missing
+            .first()
+            .copied()
+            .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+        let kind = if args.final_reply.is_empty() {
+            super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool
+        } else {
+            super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly
+        };
+        if self.record_artifact_completion_attempt(kind, Vec::new()) {
+            return ActorLoopTaskContractReplyOutcome::Exit {
+                reason: ExitReason::MissingRepoEdits,
+                error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
+            };
+        }
+        let artifact_attempt =
+            increment_artifact_completion_role_attempt(args.contract_completion_role_retries, role);
+        let attempt_limit = args.contract.artifact_completion_attempt_limit();
+        if artifact_attempt >= attempt_limit {
+            let expected_target = args
+                .target_hint
+                .as_ref()
+                .map(|hint| hint.path.clone())
+                .or_else(|| {
+                    self.current_artifact_recovery_target
+                        .as_ref()
+                        .map(|target| target.path.clone())
+                });
+            self.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+            return ActorLoopTaskContractReplyOutcome::Exit {
+                reason: ExitReason::MissingRepoEdits,
+                error_text: format!(
+                    "assistant stopped before editing required artifact role {}",
+                    role.label()
+                ),
+            };
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                "Task contract requires a repository edit on the current artifact target.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        if !self.push_artifact_directed_recovery_note(artifact_attempt) {
+            self.push_system_note(
+                super::task_contract::render_contract_recovery_note_with_hint(
+                    args.decision,
+                    self.active_request_text().as_deref().unwrap_or_default(),
+                    artifact_attempt,
+                    attempt_limit,
+                    args.target_hint.as_ref(),
+                ),
+            );
+        }
+        ActorLoopTaskContractReplyOutcome::Continue
+    }
+
+    fn handle_actor_loop_task_contract_incomplete_artifacts(
+        &mut self,
+        args: ActorLoopTaskContractIncompleteArgs<'_, '_>,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        *args.contract_completion_retries += 1;
+        let missing_labels = args
+            .missing
+            .iter()
+            .map(|role| role.label())
+            .collect::<Vec<_>>();
+        let role = args
+            .missing
+            .first()
+            .copied()
+            .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+        let artifact_attempt =
+            increment_artifact_completion_role_attempt(args.contract_completion_role_retries, role);
+        let attempt_limit = args.contract.artifact_completion_attempt_limit();
+        if artifact_attempt >= attempt_limit {
+            let expected_target = args
+                .target_hint
+                .as_ref()
+                .map(|hint| hint.path.clone())
+                .or_else(|| {
+                    self.current_artifact_recovery_target
+                        .as_ref()
+                        .map(|target| target.path.clone())
+                });
+            self.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+            return ActorLoopTaskContractReplyOutcome::Exit {
+                reason: ExitReason::MissingRepoEdits,
+                error_text: format!(
+                    "task contract incomplete; missing required artifact(s): {}",
+                    missing_labels.join(", ")
+                ),
+            };
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Task contract",
+                &format!(
+                    "Asked the model to complete missing artifact(s): {}.",
+                    missing_labels.join(", ")
+                ),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        log_llm_event(
+            "agent.task_contract.incomplete",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "iter": args.last_iter,
+                "missing": missing_labels,
+            }),
+        );
+        self.push_system_note(
+            super::task_contract::render_contract_recovery_note_with_hint(
+                &args.decision,
+                self.active_request_text().as_deref().unwrap_or_default(),
+                artifact_attempt,
+                attempt_limit,
+                args.target_hint.as_ref(),
+            ),
+        );
+        ActorLoopTaskContractReplyOutcome::Continue
+    }
+
+    fn handle_actor_loop_task_contract_repair_artifact(
+        &mut self,
+        last_iter: usize,
+        verifier_repair_retries: &mut usize,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        self.repair_job_artifact_attempts = self.repair_job_artifact_attempts.saturating_add(1);
+        *verifier_repair_retries = self.repair_job_artifact_attempts;
+        if self.repair_job_artifact_attempts >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
+            let role = self
+                .current_artifact_recovery_target
+                .as_ref()
+                .map(|target| target.role)
+                .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+            let expected_target = self
+                .current_artifact_recovery_target
+                .as_ref()
+                .map(|target| target.path.clone())
+                .or_else(|| {
+                    self.repair_job
+                        .as_ref()
+                        .and_then(|job| job.target_hint.as_ref())
+                        .map(|hint| hint.path.clone())
+                });
+            self.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+            return ActorLoopTaskContractReplyOutcome::Exit {
+                reason: ExitReason::MissingRepoEdits,
+                error_text: "assistant stopped before repairing the verifier failure".to_string(),
+            };
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                "Verifier repair requires a repository edit before verification is retried.",
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        if !self.push_verifier_repair_recovery_note(*verifier_repair_retries)
+            && !self.push_artifact_directed_recovery_note(*verifier_repair_retries)
+        {
+            self.push_system_note(task_contract_verifier_edit_required_note(
+                *verifier_repair_retries,
+                TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            ));
+        }
+        ActorLoopTaskContractReplyOutcome::Continue
+    }
+
+    fn handle_actor_loop_task_contract_run_verifier(
+        &mut self,
+        args: ActorLoopTaskContractReplyArgs<'_, '_>,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
+            before_snapshot: args.before_snapshot,
+            accumulated: args.accumulated,
+            repo_edit_calls_made_this_turn: args.repo_edit_calls_made_this_turn,
+            task_contract: args.task_contract,
+            contract_verification_retries: args.contract_verification_retries,
+            contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
+            repo_change_retries: args.repo_change_retries,
+            verifier_repair_retries: args.verifier_repair_retries,
+            task_contract_verify_commands_collected: args.task_contract_verify_commands_collected,
+            task_contract_verifier_passed_in_loop: args.task_contract_verifier_passed_in_loop,
+            last_iter: args.last_iter,
+        }) {
+            TaskContractVerifierFlowOutcome::Continue => {
+                *args.no_tool_retries = 0;
+                ActorLoopTaskContractReplyOutcome::Continue
+            }
+            TaskContractVerifierFlowOutcome::Done { final_prose } => {
+                ActorLoopTaskContractReplyOutcome::Done { final_prose }
+            }
+            TaskContractVerifierFlowOutcome::Exit { reason, error_text } => {
+                ActorLoopTaskContractReplyOutcome::Exit { reason, error_text }
+            }
+        }
+    }
+
+    fn handle_actor_loop_task_contract_safe_stop(
+        &mut self,
+        reason: super::task_contract::SafeStopReason,
+        last_iter: usize,
+    ) -> ActorLoopTaskContractReplyOutcome {
+        let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
+        log_llm_event(
+            "agent.task_contract.safe_stop",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "iter": last_iter,
+                "outcome": log_outcome,
+            }),
+        );
+        ActorLoopTaskContractReplyOutcome::Exit {
+            reason: mapped_reason,
+            error_text: mapped_reason.default_error_text().to_string(),
+        }
+    }
+
     fn handle_actor_loop_missing_repo_change_reply(
         &mut self,
         args: ActorLoopMissingRepoChangeReplyArgs<'_>,
@@ -7930,319 +8339,44 @@ impl Agent {
                     )
                 })
             };
-            if let (Some(contract), Some(action)) =
-                (task_contract.as_ref(), task_contract_action.as_ref())
-            {
-                match action {
-                    super::task_contract::ArtifactRecoveryAction::Continue {
-                        missing,
-                        target_hint,
-                    } => {
-                        let decision = super::task_contract::CompletionDecision::Continue {
-                            missing: missing.clone(),
-                        };
-                        let target_hint = target_hint
-                            .clone()
-                            .or_else(|| self.task_contract_recovery_target(&decision))
-                            .and_then(|hint| {
-                                self.set_artifact_recovery_target_from_hint(
-                                    hint,
-                                    contract_completion_retries.saturating_add(1),
-                                )
-                            });
-                        if task_contract_continue_requires_tool_recovery(
-                            Some(action),
-                            current_reply_tool_call_count,
-                        ) {
-                            contract_completion_retries =
-                                contract_completion_retries.saturating_add(1);
-                            let role = missing
-                                .first()
-                                .copied()
-                                .unwrap_or(super::task_contract::ArtifactRole::Implementation);
-                            // Issue #652 PR-003/PR-004: record the missing-
-                            // tool-call event against the active
-                            // `ArtifactCompletionJob` (no-op when no job
-                            // exists) BEFORE the legacy retry counter
-                            // budget check, so the role-specific retry budget
-                            // budget is the authoritative exit signal when
-                            // the Test job is in flight. Without this
-                            // recording, the legacy 4-attempt budget below
-                            // would race the job and exit first, skipping
-                            // the `artifact_completion_failed` diagnostic
-                            // emission (working_memory error, system note,
-                            // eval log event).
-                            let kind = if final_reply.is_empty() {
-                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool
-                            } else {
-                                super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly
-                            };
-                            if self.record_artifact_completion_attempt(kind, Vec::new()) {
-                                exit_reason = ExitReason::MissingRepoEdits;
-                                error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
-                                break 'outer;
-                            }
-                            let artifact_attempt = increment_artifact_completion_role_attempt(
-                                &mut contract_completion_role_retries,
-                                role,
-                            );
-                            let attempt_limit = contract.artifact_completion_attempt_limit();
-                            if artifact_attempt >= attempt_limit {
-                                // Issue #654 (E.2): role-specific retry budget
-                                // exhausted before the assistant edited the
-                                // required artifact for the current role.
-                                let expected_target = target_hint
-                                    .as_ref()
-                                    .map(|hint| hint.path.clone())
-                                    .or_else(|| {
-                                        self.current_artifact_recovery_target
-                                            .as_ref()
-                                            .map(|target| target.path.clone())
-                                    });
-                                self.emit_safe_stop_report_for_artifact_completion_failed(
-                                    role,
-                                    expected_target,
-                                );
-                                exit_reason = ExitReason::MissingRepoEdits;
-                                error_text = format!(
-                                    "assistant stopped before editing required artifact role {}",
-                                    role.label()
-                                );
-                                break 'outer;
-                            }
-                            write_stdout_rendered(
-                                &format_iteration_status(
-                                    last_iter,
-                                    self.config.max_iterations,
-                                    "Retry requested",
-                                    "Task contract requires a repository edit on the current artifact target.",
-                                    self.footer.current_cols(),
-                                ),
-                                true,
-                            );
-                            if !self.push_artifact_directed_recovery_note(artifact_attempt) {
-                                self.push_system_note(
-                                    super::task_contract::render_contract_recovery_note_with_hint(
-                                        &decision,
-                                        self.active_request_text().as_deref().unwrap_or_default(),
-                                        artifact_attempt,
-                                        attempt_limit,
-                                        target_hint.as_ref(),
-                                    ),
-                                );
-                            }
-                            continue;
-                        }
-                        if !contract_deterministic_fallback_materialized
-                            && self.maybe_materialize_task_contract_fallback(&decision, last_iter)
-                        {
-                            contract_deterministic_fallback_materialized = true;
-                            self.set_artifact_recovery_target_for_decision(
-                                &decision,
-                                contract_completion_retries.saturating_add(1),
-                            );
-                            let scaffold_note = "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response.";
-                            self.push_system_note(scaffold_note.to_string());
-                            continue;
-                        }
-                        contract_completion_retries += 1;
-                        let missing_labels =
-                            missing.iter().map(|role| role.label()).collect::<Vec<_>>();
-                        let role = missing
-                            .first()
-                            .copied()
-                            .unwrap_or(super::task_contract::ArtifactRole::Implementation);
-                        let artifact_attempt = increment_artifact_completion_role_attempt(
-                            &mut contract_completion_role_retries,
-                            role,
-                        );
-                        let attempt_limit = contract.artifact_completion_attempt_limit();
-                        if artifact_attempt >= attempt_limit {
-                            // Issue #654 (E.2): role-specific retry budget
-                            // exhausted with the task contract still missing
-                            // required artifact(s). Emit a structured
-                            // `artifact_completion_failed` report carrying the
-                            // first missing role + target hint before exiting.
-                            let expected_target = target_hint
-                                .as_ref()
-                                .map(|hint| hint.path.clone())
-                                .or_else(|| {
-                                    self.current_artifact_recovery_target
-                                        .as_ref()
-                                        .map(|target| target.path.clone())
-                                });
-                            self.emit_safe_stop_report_for_artifact_completion_failed(
-                                role,
-                                expected_target,
-                            );
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = format!(
-                                "task contract incomplete; missing required artifact(s): {}",
-                                missing_labels.join(", ")
-                            );
-                            break 'outer;
-                        }
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Task contract",
-                                &format!(
-                                    "Asked the model to complete missing artifact(s): {}.",
-                                    missing_labels.join(", ")
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        log_llm_event(
-                            "agent.task_contract.incomplete",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "turn_index": self.current_turn_index,
-                                "iter": last_iter,
-                                "missing": missing_labels,
-                            }),
-                        );
-                        self.push_system_note(
-                            super::task_contract::render_contract_recovery_note_with_hint(
-                                &decision,
-                                self.active_request_text().as_deref().unwrap_or_default(),
-                                artifact_attempt,
-                                attempt_limit,
-                                target_hint.as_ref(),
-                            ),
-                        );
-                        continue;
-                    }
-                    super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-                        // Issue #637: bound RepairArtifact loop by
-                        // `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT` (= 3).
-                        // Distinct from `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT`
-                        // (= 6), which sets the wider repair-pass budget.
-                        self.repair_job_artifact_attempts =
-                            self.repair_job_artifact_attempts.saturating_add(1);
-                        verifier_repair_retries = self.repair_job_artifact_attempts;
-                        if self.repair_job_artifact_attempts >= TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
-                        {
-                            // Issue #654 (E.2): RepairArtifact retry budget
-                            // exhausted — the verifier-driven repair could not
-                            // produce the required edit. `repair_job` IS set
-                            // on this path so the emitted report carries real
-                            // failure_signature / command / output_excerpt.
-                            let role = self
-                                .current_artifact_recovery_target
-                                .as_ref()
-                                .map(|target| target.role)
-                                .unwrap_or(super::task_contract::ArtifactRole::Implementation);
-                            let expected_target = self
-                                .current_artifact_recovery_target
-                                .as_ref()
-                                .map(|target| target.path.clone())
-                                .or_else(|| {
-                                    self.repair_job
-                                        .as_ref()
-                                        .and_then(|job| job.target_hint.as_ref())
-                                        .map(|hint| hint.path.clone())
-                                });
-                            self.emit_safe_stop_report_for_artifact_completion_failed(
-                                role,
-                                expected_target,
-                            );
-                            exit_reason = ExitReason::MissingRepoEdits;
-                            error_text = "assistant stopped before repairing the verifier failure"
-                                .to_string();
-                            break 'outer;
-                        }
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                last_iter,
-                                self.config.max_iterations,
-                                "Retry requested",
-                                "Verifier repair requires a repository edit before verification is retried.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        if !self.push_verifier_repair_recovery_note(verifier_repair_retries)
-                            && !self.push_artifact_directed_recovery_note(verifier_repair_retries)
-                        {
-                            self.push_system_note(task_contract_verifier_edit_required_note(
-                                verifier_repair_retries,
-                                TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                            ));
-                        }
-                        continue;
-                    }
-                    super::task_contract::ArtifactRecoveryAction::RunVerifier => {
-                        match self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
-                            before_snapshot: &before_snapshot,
-                            accumulated: &accumulated,
-                            repo_edit_calls_made_this_turn,
-                            task_contract: task_contract.as_ref(),
-                            contract_verification_retries: &mut contract_verification_retries,
-                            contract_verifier_repair_edit_count:
-                                &mut contract_verifier_repair_edit_count,
-                            repo_change_retries: &mut repo_change_retries,
-                            verifier_repair_retries: &mut verifier_repair_retries,
-                            task_contract_verify_commands_collected:
-                                &mut task_contract_verify_commands_collected,
-                            task_contract_verifier_passed_in_loop:
-                                &mut task_contract_verifier_passed_in_loop,
-                            last_iter,
-                        }) {
-                            TaskContractVerifierFlowOutcome::Continue => {
-                                no_tool_retries = 0;
-                                continue;
-                            }
-                            TaskContractVerifierFlowOutcome::Done { final_prose: prose } => {
-                                final_prose = prose;
-                                exit_reason = ExitReason::Done;
-                                break 'outer;
-                            }
-                            TaskContractVerifierFlowOutcome::Exit {
-                                reason,
-                                error_text: verifier_error,
-                            } => {
-                                exit_reason = reason;
-                                error_text = verifier_error;
-                                break 'outer;
-                            }
-                        }
-                    }
-                    super::task_contract::ArtifactRecoveryAction::Done => {}
-                    // Issue #651 Phase 4.2: SafeStop is the structured
-                    // stop dispatch. Map each `SafeStopReason` to a
-                    // distinct `ExitReason` so the run summary surfaces
-                    // why we stopped without claiming Done. Additional
-                    // structured reporting (Issue #654) will hang off
-                    // these ExitReason variants. `_ =>` fallback stays
-                    // forbidden per design judgement #2 so a future
-                    // SafeStopReason variant lights up here at compile
-                    // time.
-                    super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
-                        let (mapped_reason, log_outcome) = match reason {
-                            super::task_contract::SafeStopReason::VerifierWeak => {
-                                (ExitReason::SafeStopVerifierWeak, "safe_stop_verifier_weak")
-                            }
-                            super::task_contract::SafeStopReason::VerifierMissing => (
-                                ExitReason::SafeStopVerifierMissing,
-                                "safe_stop_verifier_missing",
-                            ),
-                        };
-                        log_llm_event(
-                            "agent.task_contract.safe_stop",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "turn_index": self.current_turn_index,
-                                "iter": last_iter,
-                                "outcome": log_outcome,
-                            }),
-                        );
-                        exit_reason = mapped_reason;
-                        error_text = mapped_reason.default_error_text().to_string();
-                        break 'outer;
-                    }
+            match self.handle_actor_loop_task_contract_reply(ActorLoopTaskContractReplyArgs {
+                before_snapshot: &before_snapshot,
+                accumulated: &accumulated,
+                task_contract: task_contract.as_ref(),
+                task_contract_action: task_contract_action.as_ref(),
+                final_reply: &final_reply,
+                current_reply_tool_call_count,
+                repo_edit_calls_made_this_turn,
+                last_iter,
+                contract_completion_retries: &mut contract_completion_retries,
+                contract_completion_role_retries: &mut contract_completion_role_retries,
+                contract_verification_retries: &mut contract_verification_retries,
+                contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
+                repo_change_retries: &mut repo_change_retries,
+                verifier_repair_retries: &mut verifier_repair_retries,
+                task_contract_verify_commands_collected:
+                    &mut task_contract_verify_commands_collected,
+                task_contract_verifier_passed_in_loop: &mut task_contract_verifier_passed_in_loop,
+                no_tool_retries: &mut no_tool_retries,
+                contract_deterministic_fallback_materialized:
+                    &mut contract_deterministic_fallback_materialized,
+            }) {
+                ActorLoopTaskContractReplyOutcome::Proceed => {}
+                ActorLoopTaskContractReplyOutcome::Continue => continue,
+                ActorLoopTaskContractReplyOutcome::Done {
+                    final_prose: next_final_prose,
+                } => {
+                    final_prose = next_final_prose;
+                    exit_reason = ExitReason::Done;
+                    break 'outer;
+                }
+                ActorLoopTaskContractReplyOutcome::Exit {
+                    reason,
+                    error_text: next_error_text,
+                } => {
+                    exit_reason = reason;
+                    error_text = next_error_text;
+                    break 'outer;
                 }
             }
             match self.handle_actor_loop_no_tool_reply(ActorLoopNoToolReplyArgs {
