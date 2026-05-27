@@ -64,6 +64,27 @@ pub(super) fn paint(s: &str, color: &str, use_color: bool) -> String {
     }
 }
 
+pub(super) fn is_utf8_locale(lang: &str) -> bool {
+    let lower = lang.to_ascii_lowercase();
+    lower
+        .split(['.', '_', '@', ';', ',', ' '])
+        .any(|t| t == "utf-8" || t == "utf8")
+}
+
+pub(crate) fn unicode_supported() -> bool {
+    if std::env::var_os("ANVIL_NO_EMOJI").is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+        if let Ok(v) = std::env::var(key)
+            && is_utf8_locale(&v)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +144,32 @@ mod tests {
             "\x1b[38;5;226mBash\x1b[0m"
         );
         assert_eq!(paint("Bash", tool_color("Bash"), false), "Bash");
+    }
+
+    #[test]
+    fn is_utf8_locale_table() {
+        let true_cases = [
+            "en_US.UTF-8",
+            "en_US.utf-8",
+            "C.UTF8",
+            "C.utf8",
+            "ja_JP.UTF-8@Modifier",
+            "en_US.UTF-8;POSIX",
+        ];
+        let false_cases = [
+            "",
+            "C",
+            "POSIX",
+            "en_US.utf-800",
+            "xutf8x",
+            "utf-88",
+            "en_US.ISO-8859-1",
+        ];
+        for c in true_cases {
+            assert!(is_utf8_locale(c), "expected true for {c:?}");
+        }
+        for c in false_cases {
+            assert!(!is_utf8_locale(c), "expected false for {c:?}");
+        }
     }
 }

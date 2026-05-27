@@ -283,3 +283,6 @@ with legacy/fallback paths unable to override it.
 - Current status: progress-display tool color, emoji, and ANSI paint helpers
   are now isolated in `progress_text.rs`; `turn.rs` consumes style helpers but
   no longer owns the mapping table.
+- Current status: UTF-8 locale detection and `unicode_supported` are now
+  isolated in `progress_text.rs`; the crate-level re-export remains available
+  for TUI markdown while `turn.rs` consumes it as a display helper.

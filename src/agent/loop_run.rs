@@ -491,10 +491,11 @@ pub(crate) mod work_mode_confirm;
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
 pub use footer::{FooterHandle, FooterLease};
 
-// Re-export env helpers from `turn` so `src/tui/markdown.rs` can reuse the
+// Re-export env helpers so `src/tui/markdown.rs` can reuse the
 // existing POSIX-compliant NO_COLOR and UTF-8 locale logic without duplicating
 // it. `mod turn;` itself stays private; only these two fns leak out (issue #431).
-pub(crate) use turn::{no_color_requested, unicode_supported};
+pub(crate) use progress_text::unicode_supported;
+pub(crate) use turn::no_color_requested;
 
 // Issue #453: expose the precaution prompt selector so integration tests in
 // `tests/` (and any future callers) can validate the Act-mode prompt

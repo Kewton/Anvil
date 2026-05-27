@@ -157,7 +157,11 @@ use super::deterministic;
 use super::deterministic::empty_framework_app_files as deterministic_empty_framework_app_files;
 #[cfg(test)]
 use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
-use super::progress_text::{paint, sanitize_for_progress, tool_color, tool_emoji, truncate};
+#[cfg(test)]
+use super::progress_text::is_utf8_locale;
+use super::progress_text::{
+    paint, sanitize_for_progress, tool_color, tool_emoji, truncate, unicode_supported,
+};
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, quality_first_pass_observation,
@@ -16472,27 +16476,6 @@ if __name__ == "__main__":
 /// (https://no-color.org/): `NO_COLOR` is set to any non-empty value.
 pub(crate) fn no_color_requested() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
-}
-
-fn is_utf8_locale(lang: &str) -> bool {
-    let lower = lang.to_ascii_lowercase();
-    lower
-        .split(['.', '_', '@', ';', ',', ' '])
-        .any(|t| t == "utf-8" || t == "utf8")
-}
-
-pub(crate) fn unicode_supported() -> bool {
-    if std::env::var_os("ANVIL_NO_EMOJI").is_some_and(|v| !v.is_empty()) {
-        return false;
-    }
-    for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
-        if let Ok(v) = std::env::var(key)
-            && is_utf8_locale(&v)
-        {
-            return true;
-        }
-    }
-    false
 }
 
 /// Issue #606 T-1.6 / Issue #607: pure projection from a Bash outcome to an

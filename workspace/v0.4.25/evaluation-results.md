@@ -1616,3 +1616,26 @@ Assessment:
 - No behavior change intended. The progress style mapping and ANSI wrapper
   are now covered in the display helper module rather than actor-loop tests
   alone.
+
+## Structural Verification: Slice 74
+
+Scope:
+
+- Move UTF-8 locale detection and `unicode_supported` from `turn.rs` to
+  `progress_text.rs`.
+- Preserve the public loop-run re-export used by TUI markdown rendering.
+
+Verification:
+
+- `cargo fmt --check`: pass.
+- `cargo test progress_text --lib -q`: pass, 10 tests.
+- `cargo test unicode_supported --lib -q`: pass, 2 tests.
+- `cargo test is_utf8_locale --lib -q`: pass, 2 tests.
+- `cargo clippy --all-targets -- -D warnings`: pass.
+- `cargo build --release`: pass.
+- `cargo test --lib -q`: pass, 3054 tests when rerun outside sandbox.
+
+Assessment:
+
+- No behavior change intended. Display capability detection is now colocated
+  with progress display helpers instead of the actor loop.

@@ -2564,3 +2564,29 @@ Assessment:
 - No behavior change intended. Progress display styling is now isolated from
   the actor loop with direct unit coverage for the mapping table and ANSI
   wrapping behavior.
+
+### 2026-05-27 Slice 74
+
+Applied:
+
+- Moved UTF-8 locale detection and `unicode_supported` from `turn.rs` to
+  `progress_text.rs`.
+- Updated the crate-level re-export so `tui/markdown.rs` continues to consume
+  `unicode_supported` without depending on `turn.rs`.
+- Kept environment-mutating tests in `turn.rs` under their existing guard and
+  added locale parsing coverage in `progress_text.rs`.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test progress_text --lib -q`: pass, 10 tests
+- `cargo test unicode_supported --lib -q`: pass, 2 tests
+- `cargo test is_utf8_locale --lib -q`: pass, 2 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3054 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Unicode capability detection now lives with
+  progress display text/styling, and `turn.rs` no longer owns locale parsing.
