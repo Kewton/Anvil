@@ -2103,3 +2103,27 @@ Assessment:
 - No behavior change intended. Verifier output parsing and changed-file target
   hinting are now verifier-targeting responsibilities; `turn.rs` still owns
   RepairJob construction and state carry-over.
+
+### 2026-05-27 Slice 56
+
+Applied:
+
+- Moved generic verifier failure-count extraction from `turn.rs` to
+  `verifier_failure_signature.rs`.
+- Kept `turn.rs` responsible for using the count while building
+  `RepairJob`; only the pure output parser moved.
+- Added module-local coverage for failure summary parsing.
+
+Verification:
+
+- `cargo fmt --check`: pass
+- `cargo test verifier_failure_signature --lib -q`: pass, 3 tests
+- `cargo test verifier_failure_count --lib -q`: pass, 2 tests
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo build --release`: pass
+- `cargo test --lib -q`: pass, 3045 tests when rerun outside sandbox
+
+Assessment:
+
+- No behavior change intended. Failure signature/error/count extraction now
+  shares the same module; `turn.rs` keeps only RepairJob construction logic.

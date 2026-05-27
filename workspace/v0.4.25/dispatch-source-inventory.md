@@ -227,3 +227,6 @@ with legacy/fallback paths unable to override it.
 - Current status: verifier-output target candidate parsing and changed-file
   hint generation are now isolated in `verifier_repair_targeting.rs`;
   `turn.rs` still owns RepairJob construction and previous-state carry-over.
+- Current status: verifier failure count parsing is now isolated in
+  `verifier_failure_signature.rs`; `turn.rs` consumes the count while
+  constructing RepairJob state.

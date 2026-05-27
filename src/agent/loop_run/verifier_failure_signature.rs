@@ -119,6 +119,64 @@ pub(super) fn verifier_failure_signature(
     compact_verifier_failure_text(&parts.join(" "), 220)
 }
 
+pub(super) fn verifier_failure_count(output: &str) -> Option<usize> {
+    let mut summary_total = 0usize;
+    let mut saw_summary_count = false;
+    for line in output.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        for index in 1..tokens.len() {
+            if !verifier_failure_count_word(tokens[index]) {
+                continue;
+            }
+            let Some(count) = verifier_failure_count_number(tokens[index - 1]) else {
+                continue;
+            };
+            saw_summary_count = true;
+            summary_total = summary_total.saturating_add(count);
+        }
+    }
+    if saw_summary_count && summary_total > 0 {
+        return Some(summary_total);
+    }
+
+    let line_count = output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start().to_ascii_lowercase();
+            trimmed.starts_with("failed ")
+                || trimmed.starts_with("error ")
+                || trimmed.starts_with("error:")
+                || trimmed.starts_with("e   ")
+                || (trimmed.starts_with("thread '") && trimmed.contains("panicked"))
+        })
+        .count();
+    if line_count > 0 {
+        Some(line_count)
+    } else if !output.trim().is_empty() {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn verifier_failure_count_word(token: &str) -> bool {
+    matches!(
+        token
+            .trim_matches(|ch: char| !ch.is_ascii_alphabetic())
+            .to_ascii_lowercase()
+            .as_str(),
+        "failed" | "failure" | "failures" | "error" | "errors" | "panic" | "panics"
+    )
+}
+
+fn verifier_failure_count_number(token: &str) -> Option<usize> {
+    let number = token
+        .trim_matches(|ch: char| !ch.is_ascii_digit())
+        .parse::<usize>()
+        .ok()?;
+    Some(number)
+}
+
 pub(super) fn compact_verifier_failure_text(input: &str, max_chars: usize) -> String {
     let masked = crate::session::feedback::mask_secrets(input);
     let collapsed = masked.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -191,5 +249,26 @@ mod tests {
         assert!(sig_b.contains("AssertionError"));
         assert!(!sig_a.contains("float_type"));
         assert!(!sig_b.contains("201"));
+    }
+
+    #[test]
+    fn verifier_failure_count_parses_generic_failure_summaries() {
+        assert_eq!(
+            verifier_failure_count(
+                "=========================== short test summary info ===========================\n\
+                 FAILED tests/test_api.py::test_create - AssertionError\n\
+                 ERROR tests/test_api.py::test_import - ImportError\n\
+                 ================= 1 failed, 1 error in 0.12s ================="
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            verifier_failure_count("test result: FAILED. 1718 passed; 6 failed; 0 ignored"),
+            Some(6)
+        );
+        assert_eq!(
+            verifier_failure_count("error[E0425]: cannot find value `x` in this scope"),
+            Some(1)
+        );
     }
 }

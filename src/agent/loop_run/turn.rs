@@ -72,7 +72,8 @@ use super::verifier_diagnostic_attempt::{
     VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
 };
 use super::verifier_failure_signature::{
-    compact_verifier_failure_text, verifier_failure_error_kind, verifier_failure_signature,
+    compact_verifier_failure_text, verifier_failure_count, verifier_failure_error_kind,
+    verifier_failure_signature,
 };
 use super::verifier_repair_shadow::{
     build_verifier_repair_pipeline_shadow_payload, legacy_repair_brief_input_from_assessment,
@@ -22440,64 +22441,6 @@ fn task_contract_verifier_failure_attempt_limit(
 /// classification once a diagnostic pass succeeds.
 fn classify_verifier_failure_type(_output: &str) -> super::VerifierFailureType {
     super::VerifierFailureType::Unknown
-}
-
-fn verifier_failure_count(output: &str) -> Option<usize> {
-    let mut summary_total = 0usize;
-    let mut saw_summary_count = false;
-    for line in output.lines() {
-        let tokens = line.split_whitespace().collect::<Vec<_>>();
-        for index in 1..tokens.len() {
-            if !verifier_failure_count_word(tokens[index]) {
-                continue;
-            }
-            let Some(count) = verifier_failure_count_number(tokens[index - 1]) else {
-                continue;
-            };
-            saw_summary_count = true;
-            summary_total = summary_total.saturating_add(count);
-        }
-    }
-    if saw_summary_count && summary_total > 0 {
-        return Some(summary_total);
-    }
-
-    let line_count = output
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start().to_ascii_lowercase();
-            trimmed.starts_with("failed ")
-                || trimmed.starts_with("error ")
-                || trimmed.starts_with("error:")
-                || trimmed.starts_with("e   ")
-                || (trimmed.starts_with("thread '") && trimmed.contains("panicked"))
-        })
-        .count();
-    if line_count > 0 {
-        Some(line_count)
-    } else if !output.trim().is_empty() {
-        Some(1)
-    } else {
-        None
-    }
-}
-
-fn verifier_failure_count_word(token: &str) -> bool {
-    matches!(
-        token
-            .trim_matches(|ch: char| !ch.is_ascii_alphabetic())
-            .to_ascii_lowercase()
-            .as_str(),
-        "failed" | "failure" | "failures" | "error" | "errors" | "panic" | "panics"
-    )
-}
-
-fn verifier_failure_count_number(token: &str) -> Option<usize> {
-    let number = token
-        .trim_matches(|ch: char| !ch.is_ascii_digit())
-        .parse::<usize>()
-        .ok()?;
-    Some(number)
 }
 
 fn verifier_repair_rerun_outcome(
