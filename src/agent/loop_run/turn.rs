@@ -163,9 +163,9 @@ use super::verifier_orchestration::{
     verifier_framework_signal_for_context, verifier_repair_context_diagnostics,
     verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
     verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
-    verifier_repair_safe_stop_message, verifier_repair_target_display,
-    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
-    verifier_setup_policy_message,
+    verifier_repair_policy_for_target_hint, verifier_repair_safe_stop_message,
+    verifier_repair_target_display, verifier_repair_transition_message,
+    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
 };
 #[cfg(test)]
 use super::verifier_orchestration::{
@@ -18532,101 +18532,6 @@ fn model_assessment_to_verifier_repair_assessment(
 /// argument is kept so the `Agent::task_contract_verifier_repair_pending`
 /// flag and the repair-job presence remain decoupled at the call sites
 /// (Issue #637: SSOT for the decision lives in `repair_job`).
-#[cfg(test)]
-fn verifier_repair_decision(
-    pending: bool,
-    context: Option<&super::repair_job::RepairJob>,
-    messages: &[ConversationMessage],
-    work_root: &Path,
-    repair_edit_count: Option<usize>,
-    repo_edit_calls_made_this_turn: usize,
-) -> VerifierRepairDecision {
-    repair_job::verifier_repair_decision(
-        pending,
-        context,
-        messages,
-        work_root,
-        repair_edit_count,
-        repo_edit_calls_made_this_turn,
-    )
-}
-
-#[cfg(test)]
-fn verifier_repair_policy_for_decision(decision: VerifierRepairDecision) -> EffectiveToolPolicy {
-    match decision {
-        VerifierRepairDecision::NeedDiagnostic => {
-            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
-        }
-        VerifierRepairDecision::DiagnosticUnavailable => {
-            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
-        }
-        VerifierRepairDecision::NeedFreshRead(target) => EffectiveToolPolicy::focused_edit(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Read"],
-            target,
-            false,
-        ),
-        VerifierRepairDecision::NeedWrite(target) => EffectiveToolPolicy::focused_edit(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Write"],
-            target,
-            false,
-        ),
-        VerifierRepairDecision::NeedEdit(target) => EffectiveToolPolicy::focused_edit(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Edit"],
-            target,
-            true,
-        ),
-        VerifierRepairDecision::NeedTargetDiscovery => EffectiveToolPolicy::restricted(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Read", "Glob", "Grep"],
-        ),
-        VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {
-            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
-        }
-    }
-}
-
-fn verifier_repair_policy_for_target_hint(
-    target_hint: &super::task_contract::RecoveryTargetHint,
-    messages: &[ConversationMessage],
-    work_root: &Path,
-) -> EffectiveToolPolicy {
-    let Some(relative) = super::repair_job::safe_relative_path_string(&target_hint.path) else {
-        return EffectiveToolPolicy::restricted(
-            EffectiveToolPolicyReason::VerifierRepair,
-            Vec::new(),
-        );
-    };
-    let target = work_root.join(relative);
-    let target = std::fs::canonicalize(&target).unwrap_or(target);
-    if !target.is_file() {
-        return EffectiveToolPolicy::focused_edit(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Write"],
-            target,
-            false,
-        );
-    }
-    let target_already_read = focused_edit_target_already_read(messages, &target, work_root);
-    if target_already_read {
-        EffectiveToolPolicy::focused_edit(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Edit"],
-            target,
-            true,
-        )
-    } else {
-        EffectiveToolPolicy::focused_edit(
-            EffectiveToolPolicyReason::VerifierRepair,
-            vec!["Read"],
-            target,
-            false,
-        )
-    }
-}
-
 const PYTHON_REQUEST_PATTERNS: &[&str] = &["fastapi", "python", ".py"];
 const PYTHON_REQUEST_JA_PATTERNS: &[&str] = &["Pythonで", "FastAPIで"];
 const RUST_REQUEST_PATTERNS: &[&str] = &["rust", "cargo test", "cargo"];
@@ -20227,7 +20132,8 @@ mod progress_tests {
     };
     use super::super::verifier_orchestration::{
         task_contract_verifier_target_discovery_note, verifier_diagnostic_messages,
-        verifier_file_excerpt_for_line, verifier_repair_pass_messages,
+        verifier_file_excerpt_for_line, verifier_repair_decision, verifier_repair_pass_messages,
+        verifier_repair_policy_for_decision, verifier_repair_policy_for_target_hint,
     };
     use super::{
         EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction,
@@ -20268,13 +20174,12 @@ mod progress_tests {
         tool_emoji, unicode_supported, validate_accepted_repair_plan_authorizes_target,
         validate_verifier_repair_intent, validate_verifier_repair_intents,
         validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_attempt_spec,
-        verifier_repair_context_from_failure, verifier_repair_decision,
-        verifier_repair_effective_target_hint, verifier_repair_intent_fingerprint,
-        verifier_repair_intents_fingerprint, verifier_repair_invalid_can_continue,
-        verifier_repair_pass_retry_message, verifier_repair_policy_for_decision,
-        verifier_repair_policy_for_target_hint, verifier_repair_preferred_local_import_source,
-        verifier_repair_stale_assertion_test_target, verifier_repair_target_candidate_from_output,
-        verifier_repair_target_hint_from_output, workspace_appears_empty,
+        verifier_repair_context_from_failure, verifier_repair_effective_target_hint,
+        verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
+        verifier_repair_invalid_can_continue, verifier_repair_pass_retry_message,
+        verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
+        verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
+        workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -28518,8 +28423,14 @@ export default function App() {
             ..super::super::repair_job::RepairJob::new_for_test()
         };
 
-        let decision =
-            super::verifier_repair_decision(true, Some(&job), &[], work_root, Some(0), 0);
+        let decision = super::super::verifier_orchestration::verifier_repair_decision(
+            true,
+            Some(&job),
+            &[],
+            work_root,
+            Some(0),
+            0,
+        );
         let super::VerifierRepairDecision::NeedWrite(path) = decision else {
             panic!("expected NeedWrite for missing provider target, got {decision:?}");
         };
