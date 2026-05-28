@@ -18824,6 +18824,21 @@ mod tests {
     }
 
     #[test]
+    fn plan_write_status_prefers_approval_then_next() {
+        let ready = "## Goal\n- g\n## Constraints\n- c\n## Deliverables\n- d\n## Acceptance Criteria\n- a\n## Quality Bar\n- q\n## First Action\n- f\n## Verification\n- v\n## Execution Plan\n- e\n## Verification Plan\n- vp\n## Risks / Fallbacks\n- r\n";
+        assert_eq!(
+            super::plan_write_status(ready, 12),
+            Some("Approval ready | delta +12B".to_string())
+        );
+
+        let staged = "## Goal\n- g\n";
+        assert_eq!(
+            super::plan_write_status(staged, -3),
+            Some("Next: Constraints | delta -3B".to_string())
+        );
+    }
+
+    #[test]
     fn wm_parse_status_maps_fallback_reasons_to_public_statuses() {
         let confirmation = super::work_mode_confirm::WorkModeConfirmation {
             mode: crate::modes::plan_act::WorkMode::GenericCode,
@@ -24323,6 +24338,85 @@ fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
     None
 }
 
+fn plan_write_previous_contents(
+    raw_path: &str,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> String {
+    if raw_path.is_empty() {
+        String::new()
+    } else if plan_path_matches(raw_path, work_root, plan_path) {
+        plan_path
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    } else {
+        resolve_user_path(work_root, raw_path)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    }
+}
+
+struct PlanWriteSectionDelta {
+    previous_sections: Vec<&'static str>,
+    current_sections: Vec<&'static str>,
+    added_sections: Vec<&'static str>,
+    removed_sections: Vec<&'static str>,
+    focus_sections: Vec<&'static str>,
+}
+
+fn build_plan_write_section_delta(previous: &str, new_text: &str) -> PlanWriteSectionDelta {
+    let previous_sections = plan_sections_with_content(previous);
+    let current_sections = plan_sections_with_content(new_text);
+    let changed_sections = current_sections
+        .iter()
+        .copied()
+        .filter(|section| {
+            let old_body = plan_section_body_for_progress(previous, section).unwrap_or_default();
+            let new_body = plan_section_body_for_progress(new_text, section).unwrap_or_default();
+            sanitize_for_progress(old_body) != sanitize_for_progress(new_body)
+        })
+        .collect::<Vec<_>>();
+    let added_sections = current_sections
+        .iter()
+        .copied()
+        .filter(|section| !previous_sections.contains(section))
+        .collect::<Vec<_>>();
+    let removed_sections = previous_sections
+        .iter()
+        .copied()
+        .filter(|section| !current_sections.contains(section))
+        .collect::<Vec<_>>();
+    let focus_sections = if !changed_sections.is_empty() {
+        changed_sections
+    } else if !current_sections.is_empty() {
+        current_sections.clone()
+    } else {
+        Vec::new()
+    };
+    PlanWriteSectionDelta {
+        previous_sections,
+        current_sections,
+        added_sections,
+        removed_sections,
+        focus_sections,
+    }
+}
+
+fn plan_write_status(new_text: &str, delta: isize) -> Option<String> {
+    let next = lifecycle::plan_next_stage_sections(new_text);
+    if lifecycle::plan_missing_sections(new_text).is_empty() {
+        Some(format!("Approval ready | delta {delta:+}B"))
+    } else if !next.is_empty() {
+        Some(format!(
+            "Next: {} | delta {delta:+}B",
+            join_sections_for_progress(&next)
+        ))
+    } else {
+        Some(format!("delta {delta:+}B"))
+    }
+}
+
 fn plan_phase_from_sections(
     sections: &[&str],
     current_stage: PlanStage,
@@ -24387,81 +24481,40 @@ fn summarize_plan_write(
     plan_path: Option<&Path>,
     current_stage: PlanStage,
 ) -> PlanWriteSummary {
-    let previous = if raw_path.is_empty() {
-        String::new()
-    } else if plan_path_matches(raw_path, work_root, plan_path) {
-        plan_path
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default()
-    } else {
-        resolve_user_path(work_root, raw_path)
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default()
-    };
-    let previous_sections = plan_sections_with_content(&previous);
-    let current_sections = plan_sections_with_content(new_text);
-    let changed_sections = current_sections
-        .iter()
-        .copied()
-        .filter(|section| {
-            let old_body = plan_section_body_for_progress(&previous, section).unwrap_or_default();
-            let new_body = plan_section_body_for_progress(new_text, section).unwrap_or_default();
-            sanitize_for_progress(old_body) != sanitize_for_progress(new_body)
-        })
-        .collect::<Vec<_>>();
-    let added_sections = current_sections
-        .iter()
-        .copied()
-        .filter(|section| !previous_sections.contains(section))
-        .collect::<Vec<_>>();
-    let removed_sections = previous_sections
-        .iter()
-        .copied()
-        .filter(|section| !current_sections.contains(section))
-        .collect::<Vec<_>>();
-    let focus_sections = if !changed_sections.is_empty() {
-        changed_sections.clone()
-    } else if !current_sections.is_empty() {
-        current_sections.clone()
-    } else {
-        Vec::new()
-    };
-    let verb = if !removed_sections.is_empty() {
+    let previous = plan_write_previous_contents(raw_path, work_root, plan_path);
+    let delta_sections = build_plan_write_section_delta(&previous, new_text);
+    let verb = if !delta_sections.removed_sections.is_empty() {
         "Rewrite"
-    } else if previous_sections.is_empty() {
+    } else if delta_sections.previous_sections.is_empty() {
         "Draft"
-    } else if !added_sections.is_empty() {
+    } else if !delta_sections.added_sections.is_empty() {
         "Add"
     } else if tool_name == "Edit" {
         "Revise"
     } else {
         "Update"
     };
-    let action = if focus_sections.is_empty() {
+    let action = if delta_sections.focus_sections.is_empty() {
         "Update plan draft".to_string()
     } else {
-        format!("{verb} {}", join_sections_for_progress(&focus_sections))
+        format!(
+            "{verb} {}",
+            join_sections_for_progress(&delta_sections.focus_sections)
+        )
     };
-    let note = plan_section_excerpt(new_text, &focus_sections).or_else(|| {
-        let fallback = current_sections.clone();
+    let note = plan_section_excerpt(new_text, &delta_sections.focus_sections).or_else(|| {
+        let fallback = delta_sections.current_sections.clone();
         plan_section_excerpt(new_text, &fallback)
     });
     let delta = new_text.len() as isize - previous.len() as isize;
-    let next = lifecycle::plan_next_stage_sections(new_text);
     let approval_ready = lifecycle::plan_missing_sections(new_text).is_empty();
-    let status = if approval_ready {
-        Some(format!("Approval ready | delta {delta:+}B"))
-    } else if !next.is_empty() {
-        Some(format!(
-            "Next: {} | delta {delta:+}B",
-            join_sections_for_progress(&next)
-        ))
-    } else {
-        Some(format!("delta {delta:+}B"))
-    };
-    let phase =
-        plan_phase_from_sections(&focus_sections, current_stage, approval_ready).to_string();
+    let status = plan_write_status(new_text, delta);
+    let phase = plan_phase_from_sections(
+        &delta_sections.focus_sections,
+        current_stage,
+        approval_ready,
+    )
+    .to_string();
     let signature = format!("{}|{}|{}", phase, action, note.clone().unwrap_or_default());
     PlanWriteSummary {
         action,
