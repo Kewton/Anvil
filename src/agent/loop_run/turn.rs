@@ -233,12 +233,6 @@ const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
-/// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
-/// exhaustion break-points (NoTool / ProseOnly / cross-iteration flag) in
-/// `run_actor_loop`. Defined as a single constant so the three sites
-/// stay aligned and any future copy survives review.
-const ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT: &str =
-    "artifact completion role-specific retry budget exhausted";
 
 /// Issue #652 PR-001 SSOT: outcome of
 /// `Agent::maybe_install_artifact_completion_job_for_hint`. The
@@ -1744,20 +1738,21 @@ fn reply_looks_like_future_work(reply: &str) -> bool {
 }
 
 use super::actor_loop_flow::{
-    ActorLoopCompletionArgs, ActorLoopCompletionOutcome, ActorLoopEmptyReplyArgs,
-    ActorLoopMissingRepoChangeReplyArgs, ActorLoopMissingRepoChangeReplyKind,
-    ActorLoopMissingRepoChangeRetryExhaustedArgs, ActorLoopMissingRepoChangeRetryPromptArgs,
-    ActorLoopNoToolReplyArgs, ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs,
-    ActorLoopPlanToolFollowupOutcome, ActorLoopPostToolCleanupArgs,
-    ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
+    ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
+    ActorLoopEmptyReplyArgs, ActorLoopMissingRepoChangeReplyArgs,
+    ActorLoopMissingRepoChangeReplyKind, ActorLoopMissingRepoChangeRetryExhaustedArgs,
+    ActorLoopMissingRepoChangeRetryPromptArgs, ActorLoopNoToolReplyArgs,
+    ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome,
+    ActorLoopPostToolCleanupArgs, ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
     ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyControlState,
     ActorLoopPreReplyOutcome, ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs,
     ActorLoopTaskContractContinueArgs, ActorLoopTaskContractIncompleteArgs,
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, missing_repo_edit_recovery_allowed,
-    missing_repo_edits_finalize_outcome, repair_job_done_outcome,
+    TaskContractVerifierFlowOutcome, missing_repo_change_budget_exhausted_outcome,
+    missing_repo_edit_recovery_allowed, missing_repo_edits_finalize_outcome,
+    repair_job_done_outcome,
 };
 
 struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -7800,13 +7795,6 @@ impl Agent {
         }
     }
 
-    fn missing_repo_change_budget_exhausted_outcome(&self) -> ActorLoopNoToolReplyOutcome {
-        ActorLoopNoToolReplyOutcome::Exit {
-            reason: ExitReason::MissingRepoEdits,
-            error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
-        }
-    }
-
     fn handle_empty_missing_repo_change_retry(
         &mut self,
         repo_change_retries: usize,
@@ -7820,7 +7808,7 @@ impl Agent {
             super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
             Vec::new(),
         ) {
-            return self.missing_repo_change_budget_exhausted_outcome();
+            return missing_repo_change_budget_exhausted_outcome();
         }
         ActorLoopNoToolReplyOutcome::Continue
     }
@@ -7848,7 +7836,7 @@ impl Agent {
             super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
             Vec::new(),
         ) {
-            return self.missing_repo_change_budget_exhausted_outcome();
+            return missing_repo_change_budget_exhausted_outcome();
         }
         ActorLoopNoToolReplyOutcome::Continue
     }

@@ -22,6 +22,13 @@ use super::interrupt::InterruptFlag;
 use super::summary::ExitReason;
 use super::tool_policy::EffectiveToolPolicy;
 
+/// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
+/// exhaustion break-points (NoTool / ProseOnly / cross-iteration flag) in
+/// `run_actor_loop`. Defined as a single constant so the three sites
+/// stay aligned and any future copy survives review.
+pub(super) const ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT: &str =
+    "artifact completion role-specific retry budget exhausted";
+
 pub(super) enum TaskContractVerifierFlowOutcome {
     Continue,
     Done {
@@ -361,6 +368,13 @@ pub(super) struct ActorLoopProseOnlyReplyArgs<'a, 'b> {
     pub(super) no_tool_retries: &'b mut usize,
     pub(super) framework_app_fallback_materialized: &'b mut bool,
     pub(super) final_reply: &'a str,
+}
+
+pub(super) fn missing_repo_change_budget_exhausted_outcome() -> ActorLoopNoToolReplyOutcome {
+    ActorLoopNoToolReplyOutcome::Exit {
+        reason: ExitReason::MissingRepoEdits,
+        error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
+    }
 }
 
 pub(super) fn missing_repo_edit_recovery_allowed(args: &PostReplyRecoveryArgs<'_, '_>) -> bool {
