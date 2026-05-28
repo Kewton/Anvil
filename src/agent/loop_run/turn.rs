@@ -22734,6 +22734,206 @@ fn validate_verifier_repair_intents_with_accepted_plan(
     )
 }
 
+struct RepairValidationTargetState {
+    canonical: PathBuf,
+    relative_path: String,
+    original_contents: String,
+}
+
+struct PreparedRepairIntentEdits<'a> {
+    edit_payloads: Vec<super::repair_patch_validation::RepairIntentEdit<'a>>,
+    fingerprint: String,
+}
+
+struct AppliedRepairCandidate {
+    contents: String,
+    used_whitespace_fallback: bool,
+}
+
+fn load_repair_validation_target(
+    work_root: &Path,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    accepted_plan: Option<&super::repair_plan::AcceptedRepairPlan>,
+) -> Result<RepairValidationTargetState, ValidationFailure> {
+    let target_snapshot = super::repair_patch_validation::read_repair_target_snapshot(
+        work_root,
+        &target_hint.path,
+        VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+    )
+    .map_err(super::repair_patch_validation::RepairTargetReadError::into_validation_failure)?;
+    let canonical = target_snapshot.canonical_path;
+    let relative_path = target_snapshot.relative_path;
+    if let Some(accepted_plan) = accepted_plan {
+        validate_accepted_repair_plan_authorizes_target(
+            accepted_plan,
+            target_hint,
+            &relative_path,
+        )?;
+    }
+    Ok(RepairValidationTargetState {
+        canonical,
+        relative_path,
+        original_contents: target_snapshot.contents,
+    })
+}
+
+fn prepare_verifier_repair_edit_payloads<'a>(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    canonical: &Path,
+    relative_path: &str,
+    intents: &'a [VerifierRepairIntent],
+) -> Result<PreparedRepairIntentEdits<'a>, ValidationFailure> {
+    let edit_payloads = super::repair_patch_validation::validate_repair_intents_and_build_edit_payloads(
+        work_root,
+        canonical,
+        relative_path,
+        intents,
+        VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairIntentPayloadValidationError::into_validation_failure,
+    )?;
+    let fingerprint = super::repair_patch_validation::repair_intent_edits_fingerprint(
+        &context.failure_signature,
+        relative_path,
+        &edit_payloads,
+    );
+    super::repair_patch_validation::validate_repair_intent_not_replayed(
+        &context.applied_repair_intents,
+        &fingerprint,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateDuplicateIntentError::into_validation_failure,
+    )?;
+    Ok(PreparedRepairIntentEdits {
+        edit_payloads,
+        fingerprint,
+    })
+}
+
+fn apply_verifier_repair_edit_payloads(
+    original_contents: &str,
+    edit_payloads: &[super::repair_patch_validation::RepairIntentEdit<'_>],
+) -> Result<AppliedRepairCandidate, ValidationFailure> {
+    let apply_result =
+        super::repair_patch_validation::apply_repair_intent_edits(original_contents, edit_payloads)
+            .map_err(ValidationFailure::failed)?;
+    super::repair_patch_validation::validate_repair_candidate_changed(
+        original_contents,
+        &apply_result.updated_contents,
+    )
+    .map_err(super::repair_patch_validation::RepairCandidateNoopError::into_validation_failure)?;
+    Ok(AppliedRepairCandidate {
+        contents: apply_result.updated_contents,
+        used_whitespace_fallback: apply_result.used_whitespace_fallback,
+    })
+}
+
+fn build_repair_test_import_contract_evidence(
+    work_root: &Path,
+    contents: &str,
+) -> super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
+    super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
+        missing_modules: super::repair_python_import_evidence::missing_local_import_modules(
+            work_root,
+            contents,
+            VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+        ),
+        missing_imports: super::repair_python_import_evidence::missing_local_import_symbols(
+            work_root,
+            contents,
+            VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+        ),
+        scalar_attribute_assumptions:
+            super::repair_python_import_evidence::imported_scalar_attribute_assumptions(
+                work_root,
+                contents,
+                VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+            ),
+    }
+}
+
+fn validate_verifier_repair_test_constraints(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    accepted_plan_present: bool,
+    relative_path: &str,
+    contents: &str,
+) -> Result<(), ValidationFailure> {
+    let target_is_test_file = is_test_file(Path::new(relative_path));
+    super::repair_patch_validation::validate_test_edit_semantic_plan(
+        target_is_test_file,
+        accepted_plan_present,
+        context
+            .semantic_plan
+            .as_ref()
+            .map(|plan| plan.repair_hypothesis.as_str()),
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateTestEditPlanError::into_validation_failure,
+    )?;
+    if target_is_test_file {
+        super::repair_patch_validation::validate_test_import_contract_evidence(
+            build_repair_test_import_contract_evidence(work_root, contents),
+        )
+        .map_err(
+            super::repair_patch_validation::RepairCandidateTestImportContractError::into_validation_failure,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_verifier_repair_post_apply_candidate(
+    context: &super::repair_job::RepairJob,
+    relative_path: &str,
+    original_contents: &str,
+    contents: &str,
+    used_whitespace_fallback: bool,
+) -> Result<(), ValidationFailure> {
+    let weakening_detection =
+        super::repair_patch_validation::detect_repair_candidate_weakening_patterns(
+            relative_path,
+            original_contents,
+            contents,
+        );
+    let weakening = if weakening_detection.target_is_test_file {
+        super::repair_test_weakening_filter::filter_weakening_for_observed_assert_update(
+            weakening_detection.patterns,
+            context,
+            original_contents,
+            contents,
+        )
+    } else {
+        weakening_detection.patterns
+    };
+    super::repair_patch_validation::validate_repair_candidate_weakening_patterns(
+        weakening,
+        weakening_detection.rejection_kind,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateWeakeningError::into_validation_failure,
+    )?;
+    super::repair_patch_validation::validate_duplicate_binding_repair_candidate(
+        relative_path,
+        context,
+        original_contents,
+        contents,
+    )
+    .map_err(
+        super::repair_patch_validation::DuplicateBindingRepairError::into_validation_failure,
+    )?;
+    super::repair_patch_validation::validate_repair_candidate_contents(
+        relative_path,
+        contents,
+        used_whitespace_fallback,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
+    )?;
+    Ok(())
+}
+
 fn validate_verifier_repair_intents_inner(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -22752,196 +22952,38 @@ fn validate_verifier_repair_intents_inner(
     .map_err(
         super::repair_patch_validation::RepairIntentListBoundsError::into_validation_failure,
     )?;
-    let target_snapshot = super::repair_patch_validation::read_repair_target_snapshot(
+    let RepairValidationTargetState {
+        canonical,
+        relative_path,
+        original_contents,
+    } = load_repair_validation_target(work_root, target_hint, accepted_plan)?;
+    let PreparedRepairIntentEdits {
+        edit_payloads,
+        fingerprint,
+    } = prepare_verifier_repair_edit_payloads(
         work_root,
-        &target_hint.path,
-        VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-    )
-    .map_err(super::repair_patch_validation::RepairTargetReadError::into_validation_failure)?;
-    let canonical = target_snapshot.canonical_path;
-    let relative_path = target_snapshot.relative_path;
-    let original_contents = target_snapshot.contents;
-    let mut contents = original_contents.clone();
-    if let Some(accepted_plan) = accepted_plan {
-        validate_accepted_repair_plan_authorizes_target(
-            accepted_plan,
-            target_hint,
-            &relative_path,
-        )?;
-    }
-
-    // Issue #662 (Codex CB-001): split the per-intent loop into two phases so
-    // the duplicate fingerprint check (priority 3) runs **before** the
-    // in-memory apply. The previous single-pass loop fused per-intent input
-    // validation (path / size / markdown / secret / shell — and the `Noop`
-    // priority-2 check) **with** the in-memory `apply_exact_once`. In the
-    // production replay scenario the same intent is re-proposed after a
-    // previous successful apply: the file on disk now holds `new_string`, so
-    // `apply_exact_once(old_string, new_string)` fails first (unsigned
-    // `repair intent exact edit rejected: ...`) and `RepairRejectionSignal::
-    // Duplicate` is never produced — `record_controller_verifier_repair_invalid`
-    // then records a ledger-non-target outcome and the `count >= 2`
-    // promotion to `exhausted_attempts` never fires.
-    //
-    // Phase 1 below validates each intent against its own bytes (no file
-    // read). Phase 2 (after the fingerprint duplicate check) runs the
-    // in-memory apply. The detection-order SSOT (5-4-1: Malformed →
-    // **Noop → Duplicate** → Unsafe → Applied) is preserved because the
-    // priority-2 Noop check stays in Phase 1.
-
-    // ---- Phase 1: per-intent input-only validation (no file read /
-    // ---- no on-disk apply). Each check inspects only the intent's own
-    // ---- bytes plus the previously-resolved canonical target path.
-    let edit_payloads =
-        super::repair_patch_validation::validate_repair_intents_and_build_edit_payloads(
-            work_root,
-            &canonical,
+        context,
+        &canonical,
         &relative_path,
         &intents,
-        VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
-    )
-    .map_err(
-        super::repair_patch_validation::RepairIntentPayloadValidationError::into_validation_failure,
     )?;
-
-    // Issue #662 (5-4-1 priority 3, Codex CB-001): history-driven duplicate
-    // detector. Runs **before** the in-memory apply so a replay of an
-    // already-applied intent surfaces as `RepairRejectionSignal::Duplicate`
-    // (and feeds the `count >= 2` promotion path) instead of being absorbed
-    // by an unsigned `exact edit rejected` failure when the on-disk file
-    // already holds `new_string`. The fingerprint inputs (`failure_signature`,
-    // `relative_path`, each intent's `old_string` / `new_string` /
-    // `replace_all`) are all available without touching the on-disk
-    // post-apply state, so this is a pure-input check.
-    //
-    // The fingerprint deliberately excludes raw `old_string` / `new_string`
-    // from outcome payloads downstream (see
-    // `RepairAttemptOutcomeKind::RejectedDuplicate`).
-    let fingerprint = super::repair_patch_validation::repair_intent_edits_fingerprint(
-        &context.failure_signature,
-        &relative_path,
-        &edit_payloads,
-    );
-    super::repair_patch_validation::validate_repair_intent_not_replayed(
-        &context.applied_repair_intents,
-        &fingerprint,
-    )
-    .map_err(
-        super::repair_patch_validation::RepairCandidateDuplicateIntentError::into_validation_failure,
-    )?;
-
-    // Phase 2: in-memory apply. Per-intent input validation has already
-    // passed; remaining failures here surface as unsigned exact/replace-all
-    // rejections (which remain ledger-non-target by design).
-    let apply_result =
-        super::repair_patch_validation::apply_repair_intent_edits(&contents, &edit_payloads)
-            .map_err(ValidationFailure::failed)?;
-    contents = apply_result.updated_contents;
-    let used_whitespace_fallback = apply_result.used_whitespace_fallback;
-    // Issue #662 (5-4-1 priority 2 — apply-side noop branch): all per-intent
-    // edits applied cleanly but the resulting file contents are identical to
-    // the pre-edit snapshot (e.g. multiple intents that cancel out). This is
-    // a no-op outcome that should still cost the same `count >= 2` promotion
-    // budget as the per-intent noop branch above.
-    super::repair_patch_validation::validate_repair_candidate_changed(
-        &original_contents,
-        &contents,
-    )
-    .map_err(super::repair_patch_validation::RepairCandidateNoopError::into_validation_failure)?;
-    // Issue #647 (MF3 / codex final review): SemanticRepairPlan gate for test
-    // edits. Test files (`is_test_file`) may only be edited when the
-    // RepairJob carries a `SemanticRepairPlan` with both a determined
-    // `spec_authority` (enum closed set, never None) and a non-empty
-    // `repair_hypothesis`. Issue 受入条件: "test edit is allowed only when
-    // SpecAuthority and RepairHypothesis exist" / "test edit must preserve
-    // verification intent". This pre-gate runs before the weakening detector
-    // so that semantic_plan = None always rejects regardless of whether the
-    // edit text itself appears benign. Impl edits remain unaffected (impl
-    // repair has wider latitude — only test edits are gated here).
-    let target_is_test_file = is_test_file(Path::new(&relative_path));
-    super::repair_patch_validation::validate_test_edit_semantic_plan(
-        target_is_test_file,
-        accepted_plan.is_some(),
-        context
-            .semantic_plan
-            .as_ref()
-            .map(|plan| plan.repair_hypothesis.as_str()),
-    )
-    .map_err(
-        super::repair_patch_validation::RepairCandidateTestEditPlanError::into_validation_failure,
-    )?;
-    if target_is_test_file {
-        super::repair_patch_validation::validate_test_import_contract_evidence(
-            super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
-                missing_modules: super::repair_python_import_evidence::missing_local_import_modules(
-                    work_root,
-                    &contents,
-                    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-                ),
-                missing_imports: super::repair_python_import_evidence::missing_local_import_symbols(
-                    work_root,
-                    &contents,
-                    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-                ),
-                scalar_attribute_assumptions:
-                    super::repair_python_import_evidence::imported_scalar_attribute_assumptions(
-                    work_root, &contents,
-                    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-                ),
-            },
-        )
-        .map_err(
-            super::repair_patch_validation::RepairCandidateTestImportContractError::into_validation_failure,
-        )?;
-    }
-
-    // Issue #647 (Phase F / S1-004 / S1-007 / S3-011): run weakening
-    // admission at the repair editor boundary. The validation module owns
-    // file-kind detector dispatch; this boundary still applies the
-    // context-sensitive generated-test expectation filter before mapping the
-    // typed rejection into the legacy `ValidationFailure` carrier.
-    // Issue #653 (DR1-001 / DR3-002): record which detector branch produced the
-    // weakening so the call site can build a `RepairAttemptOutcome::RejectedUnsafe`
-    // with the right `RepairRejectionKind` without re-parsing message text.
-    let weakening_detection =
-        super::repair_patch_validation::detect_repair_candidate_weakening_patterns(
-            &relative_path,
-            &original_contents,
-            &contents,
-        );
-    let weakening = if weakening_detection.target_is_test_file {
-        super::repair_test_weakening_filter::filter_weakening_for_observed_assert_update(
-            weakening_detection.patterns,
-            context,
-            &original_contents,
-            &contents,
-        )
-    } else {
-        weakening_detection.patterns
-    };
-    super::repair_patch_validation::validate_repair_candidate_weakening_patterns(
-        weakening,
-        weakening_detection.rejection_kind,
-    )
-    .map_err(
-        super::repair_patch_validation::RepairCandidateWeakeningError::into_validation_failure,
-    )?;
-    super::repair_patch_validation::validate_duplicate_binding_repair_candidate(
-        &relative_path,
+    let AppliedRepairCandidate {
+        contents,
+        used_whitespace_fallback,
+    } = apply_verifier_repair_edit_payloads(&original_contents, &edit_payloads)?;
+    validate_verifier_repair_test_constraints(
+        work_root,
         context,
-        &original_contents,
-        &contents,
-    )
-    .map_err(
-        super::repair_patch_validation::DuplicateBindingRepairError::into_validation_failure,
-    )?;
-    super::repair_patch_validation::validate_repair_candidate_contents(
+        accepted_plan.is_some(),
         &relative_path,
+        &contents,
+    )?;
+    validate_verifier_repair_post_apply_candidate(
+        context,
+        &relative_path,
+        &original_contents,
         &contents,
         used_whitespace_fallback,
-    )
-    .map_err(
-        super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
     )?;
 
     // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran
