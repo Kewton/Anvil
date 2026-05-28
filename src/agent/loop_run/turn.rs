@@ -2608,49 +2608,90 @@ fn verifier_file_excerpt_for_line(
     let target_index = target_line
         .saturating_sub(1)
         .min(lines.len().saturating_sub(1));
-    let mut start = target_index;
-    let mut end = target_index.saturating_add(1);
-    let mut current_len = lines[target_index].len();
-    let mut before_turn = true;
-    while current_len < max_bytes {
-        let mut expanded = false;
-        if before_turn && start > 0 {
-            let next_len = current_len.saturating_add(lines[start - 1].len());
-            if next_len <= max_bytes {
-                start -= 1;
-                current_len = next_len;
-                expanded = true;
-            }
-        } else if !before_turn && end < lines.len() {
-            let next_len = current_len.saturating_add(lines[end].len());
-            if next_len <= max_bytes {
-                current_len = next_len;
-                end += 1;
-                expanded = true;
-            }
-        }
-        before_turn = !before_turn;
-        if !expanded {
-            if start == 0 && end >= lines.len() {
-                break;
-            }
-            let can_expand_before =
-                start > 0 && current_len.saturating_add(lines[start - 1].len()) <= max_bytes;
-            let can_expand_after =
-                end < lines.len() && current_len.saturating_add(lines[end].len()) <= max_bytes;
-            if !can_expand_before && !can_expand_after {
-                break;
-            }
+    let mut window = VerifierExcerptWindow::new(target_index, lines[target_index].len());
+    while window.current_len < max_bytes {
+        if !window.try_expand_preferred_side(&lines, max_bytes)
+            && !window.can_expand_any_side(&lines, max_bytes)
+        {
+            break;
         }
     }
+    build_verifier_excerpt(&lines, window, max_bytes)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifierExcerptWindow {
+    start: usize,
+    end: usize,
+    current_len: usize,
+    prefer_before: bool,
+}
+
+impl VerifierExcerptWindow {
+    fn new(target_index: usize, target_len: usize) -> Self {
+        Self {
+            start: target_index,
+            end: target_index.saturating_add(1),
+            current_len: target_len,
+            prefer_before: true,
+        }
+    }
+
+    fn can_expand_before(self, lines: &[&str], max_bytes: usize) -> bool {
+        self.start > 0 && self.current_len.saturating_add(lines[self.start - 1].len()) <= max_bytes
+    }
+
+    fn can_expand_after(self, lines: &[&str], max_bytes: usize) -> bool {
+        self.end < lines.len()
+            && self.current_len.saturating_add(lines[self.end].len()) <= max_bytes
+    }
+
+    fn can_expand_any_side(self, lines: &[&str], max_bytes: usize) -> bool {
+        self.can_expand_before(lines, max_bytes) || self.can_expand_after(lines, max_bytes)
+    }
+
+    fn try_expand_preferred_side(&mut self, lines: &[&str], max_bytes: usize) -> bool {
+        let expanded = if self.prefer_before {
+            self.try_expand_before(lines, max_bytes)
+        } else {
+            self.try_expand_after(lines, max_bytes)
+        };
+        self.prefer_before = !self.prefer_before;
+        expanded
+    }
+
+    fn try_expand_before(&mut self, lines: &[&str], max_bytes: usize) -> bool {
+        if !self.can_expand_before(lines, max_bytes) {
+            return false;
+        }
+        self.start -= 1;
+        self.current_len = self.current_len.saturating_add(lines[self.start].len());
+        true
+    }
+
+    fn try_expand_after(&mut self, lines: &[&str], max_bytes: usize) -> bool {
+        if !self.can_expand_after(lines, max_bytes) {
+            return false;
+        }
+        self.current_len = self.current_len.saturating_add(lines[self.end].len());
+        self.end += 1;
+        true
+    }
+}
+
+fn build_verifier_excerpt(
+    lines: &[&str],
+    window: VerifierExcerptWindow,
+    max_bytes: usize,
+) -> String {
     let mut excerpt = String::new();
-    if start > 0 {
+    if window.start > 0 {
         excerpt.push_str("...[truncated before target line]...\n");
     }
-    for line in &lines[start..end] {
+    for line in &lines[window.start..window.end] {
         excerpt.push_str(line);
     }
-    if end < lines.len() {
+    if window.end < lines.len() {
         if !excerpt.ends_with('\n') {
             excerpt.push('\n');
         }
@@ -30429,6 +30470,17 @@ E   assert [{'id': 1}] == []\n";
         assert!(excerpt.contains("line 100"));
         assert!(excerpt.contains("truncated before target line"));
         assert!(!excerpt.contains("line 1\n"));
+    }
+
+    #[test]
+    fn verifier_file_excerpt_without_positive_target_uses_head_tail() {
+        let text = (1..=120)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let excerpt = verifier_file_excerpt_for_line(&text, Some(0), 120);
+
+        assert!(excerpt.contains("...[truncated]..."));
+        assert!(!excerpt.contains("truncated before target line"));
     }
 
     // Issue #638 (Phase 2, Task 2.1): deleted `verifier_failure_classifies_indentation_error_as_syntax`
