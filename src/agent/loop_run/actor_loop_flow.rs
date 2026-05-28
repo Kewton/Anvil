@@ -755,6 +755,130 @@ pub(super) fn actor_loop_pre_reply_flow_outcome(
     }
 }
 
+pub(super) fn drive_actor_loop_pre_reply_phase(
+    agent: &mut Agent,
+    mut args: ActorLoopPreReplyArgs<'_, '_>,
+) -> ActorLoopPreReplyOutcome {
+    if args.interrupt_flag.is_set() {
+        return ActorLoopPreReplyOutcome::Exit {
+            reason: ExitReason::Interrupted,
+            error_text: String::new(),
+        };
+    }
+    let control_state = build_actor_loop_pre_reply_control_state(agent, &args);
+    if let Some(outcome) =
+        handle_actor_loop_pre_reply_control_action(agent, &mut args, &control_state)
+    {
+        return outcome;
+    }
+    if let Some(outcome) = handle_actor_loop_pre_reply_fallbacks(
+        agent,
+        &mut args,
+        control_state.recovery_dispatch_gate,
+    ) {
+        return outcome;
+    }
+    request_actor_loop_pre_reply_model_turn(agent, &args, control_state)
+}
+
+pub(super) fn build_actor_loop_pre_reply_control_state(
+    agent: &mut Agent,
+    args: &ActorLoopPreReplyArgs<'_, '_>,
+) -> ActorLoopPreReplyControlState {
+    let pre_model_task_contract_action = if agent.session.mode_state.mode
+        == super::ExecutionMode::Plan
+        || (agent.task_contract_verifier_repair_pending && agent.repair_job.is_some())
+    {
+        None
+    } else {
+        args.task_contract.map(|contract| {
+            agent.task_contract_recovery_action(
+                contract,
+                *args.contract_verifier_repair_edit_count,
+                *args.repo_edit_calls_made_this_turn,
+            )
+        })
+    };
+    let loop_control_action = super::active_job_arbiter::determine_loop_control_action(
+        super::active_job_arbiter::LoopControlInputs {
+            mode: agent.session.mode_state.mode,
+            task_contract_verifier_repair_pending: agent.task_contract_verifier_repair_pending,
+            repair_next_action: agent.repair_job.as_ref().map(|job| job.next_action()),
+            missing_verifier_next_action: agent
+                .missing_verifier_job
+                .as_ref()
+                .map(|job| job.next_action()),
+            task_contract_action: pre_model_task_contract_action.clone(),
+        },
+    );
+    let recovery_owner = RecoveryOwner::from_control_action(
+        &loop_control_action,
+        pre_model_task_contract_action.as_ref(),
+    );
+    ActorLoopPreReplyControlState {
+        missing_verifier_setup_turn:
+            super::active_job_arbiter::loop_control_action_requires_missing_verifier_setup(
+                &loop_control_action,
+            ),
+        recovery_dispatch_gate: RecoveryDispatchGate::from_owner(recovery_owner),
+        recovery_owner,
+        loop_control_action,
+    }
+}
+
+pub(super) fn handle_actor_loop_pre_reply_control_action(
+    agent: &mut Agent,
+    args: &mut ActorLoopPreReplyArgs<'_, '_>,
+    control_state: &ActorLoopPreReplyControlState,
+) -> Option<ActorLoopPreReplyOutcome> {
+    let flow_args = super::turn::TaskContractVerifierFlowArgs {
+        before_snapshot: args.before_snapshot,
+        accumulated: args.accumulated,
+        repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
+        task_contract: args.task_contract,
+        contract_verification_retries: args.contract_verification_retries,
+        contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
+        repo_change_retries: args.repo_change_retries,
+        verifier_repair_retries: args.verifier_repair_retries,
+        task_contract_verify_commands_collected: args.task_contract_verify_commands_collected,
+        task_contract_verifier_passed_in_loop: args.task_contract_verifier_passed_in_loop,
+        last_iter: args.last_iter,
+    };
+    match control_state.loop_control_action.clone() {
+        LoopControlAction::ContinueRepairJob { .. } => {
+            let outcome =
+                agent.dispatch_repair_job_step(flow_args, args.repo_edit_calls_made_this_turn);
+            Some(actor_loop_pre_reply_flow_outcome(outcome))
+        }
+        LoopControlAction::ContinueMissingVerifierJob { next_action } => agent
+            .dispatch_missing_verifier_job_step(flow_args, next_action)
+            .map(actor_loop_pre_reply_flow_outcome),
+        LoopControlAction::RunVerifier => Some(actor_loop_pre_reply_flow_outcome(
+            agent.drive_task_contract_verifier(flow_args),
+        )),
+        LoopControlAction::RequestModelTurn => None,
+    }
+}
+
+pub(super) fn handle_actor_loop_pre_reply_fallbacks(
+    agent: &mut Agent,
+    args: &mut ActorLoopPreReplyArgs<'_, '_>,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+) -> Option<ActorLoopPreReplyOutcome> {
+    if maybe_continue_actor_loop_mode_deterministic_fallback(agent, args, recovery_dispatch_gate) {
+        return Some(ActorLoopPreReplyOutcome::Continue);
+    }
+    if maybe_continue_actor_loop_framework_fallback(agent, args, recovery_dispatch_gate) {
+        return Some(ActorLoopPreReplyOutcome::Continue);
+    }
+    if let Some(outcome) =
+        maybe_handle_actor_loop_playable_ui_fallback(agent, args, recovery_dispatch_gate)
+    {
+        return Some(outcome);
+    }
+    None
+}
+
 pub(super) fn maybe_continue_actor_loop_mode_deterministic_fallback(
     agent: &mut Agent,
     args: &mut ActorLoopPreReplyArgs<'_, '_>,
