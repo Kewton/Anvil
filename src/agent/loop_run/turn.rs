@@ -2123,6 +2123,14 @@ fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) 
     }
 }
 
+fn repair_job_done_outcome() -> TaskContractVerifierFlowOutcome {
+    TaskContractVerifierFlowOutcome::Done {
+        final_prose:
+            "Completed requested repository changes and verified them with the required verifier."
+                .to_string(),
+    }
+}
+
 fn task_contract_needs_verification(
     mode: ExecutionMode,
     contract: Option<&super::task_contract::TaskContract>,
@@ -10198,157 +10206,148 @@ impl Agent {
 
         match step {
             super::repair_job::RepairStep::RunDiagnostic => {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Verifier diagnostic",
-                        "Running short-lived diagnostic LLM pass outside the main session.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                match self.run_verifier_diagnostic_pass() {
-                    VerifierDiagnosticPassOutcome::Accepted => {
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                args.last_iter,
-                                self.config.max_iterations,
-                                "Verifier diagnostic",
-                                "Accepted validated diagnostic result; continuing verifier repair.",
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        TaskContractVerifierFlowOutcome::Continue
-                    }
-                    VerifierDiagnosticPassOutcome::RetryPending { error } => {
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                args.last_iter,
-                                self.config.max_iterations,
-                                "Verifier diagnostic",
-                                &format!(
-                                    "Diagnostic pass failed ({error}); retrying with fallback model."
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        TaskContractVerifierFlowOutcome::Continue
-                    }
-                    VerifierDiagnosticPassOutcome::Unavailable { error } => {
-                        self.emit_safe_stop_report_for_repair_terminal(
-                            super::repair_job::RepairTerminalReason::DiagnosticUnavailable,
-                        );
-                        TaskContractVerifierFlowOutcome::Exit {
-                            reason: ExitReason::VerifierFailed,
-                            error_text: format!(
-                                "verifier repair diagnostic_unavailable: {error}"
-                            ),
-                        }
-                    }
-                    VerifierDiagnosticPassOutcome::Skipped => {
-                        self.emit_safe_stop_report_for_repair_terminal(
-                            super::repair_job::RepairTerminalReason::DiagnosticUnavailable,
-                        );
-                        TaskContractVerifierFlowOutcome::Exit {
-                            reason: ExitReason::VerifierFailed,
-                            error_text:
-                                "verifier repair diagnostic skipped after committed dispatch"
-                                    .to_string(),
-                        }
-                    }
-                }
+                self.handle_repair_job_diagnostic_step(args)
             }
-            super::repair_job::RepairStep::RunPatchProvider { target_hint } => {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Verifier repair",
-                        "Running controller-applied repair pass for the selected target.",
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                match self.run_verifier_repair_pass_and_apply(&target_hint) {
-                    VerifierRepairPassOutcome::Applied { relative_path } => {
-                        *repo_edit_calls_made_this_turn =
-                            repo_edit_calls_made_this_turn.saturating_add(1);
-                        *args.repo_change_retries = 0;
-                        *args.verifier_repair_retries = 0;
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                args.last_iter,
-                                self.config.max_iterations,
-                                "Verifier repair",
-                                &format!(
-                                    "Applied controller repair edit to {relative_path}; verifier will rerun."
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        TaskContractVerifierFlowOutcome::Continue
-                    }
-                    VerifierRepairPassOutcome::Invalid {
-                        error,
-                        repair_attempt_outcome,
-                    } => {
-                        self.record_controller_verifier_repair_invalid(
-                            &error,
-                            repair_attempt_outcome,
-                        );
-                        self.dispatch_after_repair_patch_rejection(
-                            args.last_iter,
-                            error,
-                            Some(target_hint),
-                        )
-                    }
-                    VerifierRepairPassOutcome::Unavailable { relative_path } => {
-                        self.record_controller_verifier_repair_invalid(
-                            &format!(
-                                "verifier repair unavailable: no safe cheap check available for {relative_path}"
-                            ),
-                            None,
-                        );
-                        write_stdout_rendered(
-                            &format_iteration_status(
-                                args.last_iter,
-                                self.config.max_iterations,
-                                "Verifier repair",
-                                &format!(
-                                    "No safe cheap check available for {relative_path}; continuing through repair job state."
-                                ),
-                                self.footer.current_cols(),
-                            ),
-                            true,
-                        );
-                        TaskContractVerifierFlowOutcome::Continue
-                    }
-                    VerifierRepairPassOutcome::Skipped => TaskContractVerifierFlowOutcome::Exit {
-                        reason: ExitReason::VerifierFailed,
-                        error_text: "verifier repair patch provider skipped after committed dispatch"
-                            .to_string(),
-                    },
-                }
-            }
-            super::repair_job::RepairStep::RunVerifier => {
-                self.drive_repair_job_verifier(args)
-            }
+            super::repair_job::RepairStep::RunPatchProvider { target_hint } => self
+                .handle_repair_job_patch_provider_step(
+                    args,
+                    repo_edit_calls_made_this_turn,
+                    target_hint,
+                ),
+            super::repair_job::RepairStep::RunVerifier => self.drive_repair_job_verifier(args),
             super::repair_job::RepairStep::SafeStop { reason } => {
-                self.emit_safe_stop_report_for_repair_terminal(reason);
+                self.repair_job_safe_stop_outcome(reason)
+            }
+            super::repair_job::RepairStep::Done => repair_job_done_outcome(),
+        }
+    }
+
+    fn handle_repair_job_diagnostic_step(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+    ) -> TaskContractVerifierFlowOutcome {
+        self.write_repair_job_step_status(
+            args.last_iter,
+            "Verifier diagnostic",
+            "Running short-lived diagnostic LLM pass outside the main session.",
+        );
+        match self.run_verifier_diagnostic_pass() {
+            VerifierDiagnosticPassOutcome::Accepted => {
+                self.write_repair_job_step_status(
+                    args.last_iter,
+                    "Verifier diagnostic",
+                    "Accepted validated diagnostic result; continuing verifier repair.",
+                );
+                TaskContractVerifierFlowOutcome::Continue
+            }
+            VerifierDiagnosticPassOutcome::RetryPending { error } => {
+                self.write_repair_job_step_status(
+                    args.last_iter,
+                    "Verifier diagnostic",
+                    &format!("Diagnostic pass failed ({error}); retrying with fallback model."),
+                );
+                TaskContractVerifierFlowOutcome::Continue
+            }
+            VerifierDiagnosticPassOutcome::Unavailable { error } => {
+                self.emit_safe_stop_report_for_repair_terminal(
+                    super::repair_job::RepairTerminalReason::DiagnosticUnavailable,
+                );
                 TaskContractVerifierFlowOutcome::Exit {
-                    reason: repair_terminal_exit_reason(reason),
-                    error_text: format!("verifier repair safe stop: {}", reason.as_str()),
+                    reason: ExitReason::VerifierFailed,
+                    error_text: format!("verifier repair diagnostic_unavailable: {error}"),
                 }
             }
-            super::repair_job::RepairStep::Done => TaskContractVerifierFlowOutcome::Done {
-                final_prose:
-                    "Completed requested repository changes and verified them with the required verifier."
-                        .to_string(),
+            VerifierDiagnosticPassOutcome::Skipped => TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::VerifierFailed,
+                error_text: self.repair_job_diagnostic_skipped_error(),
             },
+        }
+    }
+
+    fn handle_repair_job_patch_provider_step(
+        &mut self,
+        args: TaskContractVerifierFlowArgs<'_, '_>,
+        repo_edit_calls_made_this_turn: &mut usize,
+        target_hint: super::task_contract::RecoveryTargetHint,
+    ) -> TaskContractVerifierFlowOutcome {
+        self.write_repair_job_step_status(
+            args.last_iter,
+            "Verifier repair",
+            "Running controller-applied repair pass for the selected target.",
+        );
+        match self.run_verifier_repair_pass_and_apply(&target_hint) {
+            VerifierRepairPassOutcome::Applied { relative_path } => {
+                *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
+                *args.repo_change_retries = 0;
+                *args.verifier_repair_retries = 0;
+                self.write_repair_job_step_status(
+                    args.last_iter,
+                    "Verifier repair",
+                    &format!(
+                        "Applied controller repair edit to {relative_path}; verifier will rerun."
+                    ),
+                );
+                TaskContractVerifierFlowOutcome::Continue
+            }
+            VerifierRepairPassOutcome::Invalid {
+                error,
+                repair_attempt_outcome,
+            } => {
+                self.record_controller_verifier_repair_invalid(&error, repair_attempt_outcome);
+                self.dispatch_after_repair_patch_rejection(args.last_iter, error, Some(target_hint))
+            }
+            VerifierRepairPassOutcome::Unavailable { relative_path } => {
+                self.record_controller_verifier_repair_invalid(
+                    &format!(
+                        "verifier repair unavailable: no safe cheap check available for {relative_path}"
+                    ),
+                    None,
+                );
+                self.write_repair_job_step_status(
+                    args.last_iter,
+                    "Verifier repair",
+                    &format!(
+                        "No safe cheap check available for {relative_path}; continuing through repair job state."
+                    ),
+                );
+                TaskContractVerifierFlowOutcome::Continue
+            }
+            VerifierRepairPassOutcome::Skipped => TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::VerifierFailed,
+                error_text: "verifier repair patch provider skipped after committed dispatch"
+                    .to_string(),
+            },
+        }
+    }
+
+    fn write_repair_job_step_status(&self, last_iter: usize, title: &str, message: &str) {
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                title,
+                message,
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+    }
+
+    fn repair_job_diagnostic_skipped_error(&mut self) -> String {
+        self.emit_safe_stop_report_for_repair_terminal(
+            super::repair_job::RepairTerminalReason::DiagnosticUnavailable,
+        );
+        "verifier repair diagnostic skipped after committed dispatch".to_string()
+    }
+
+    fn repair_job_safe_stop_outcome(
+        &mut self,
+        reason: super::repair_job::RepairTerminalReason,
+    ) -> TaskContractVerifierFlowOutcome {
+        self.emit_safe_stop_report_for_repair_terminal(reason);
+        TaskContractVerifierFlowOutcome::Exit {
+            reason: repair_terminal_exit_reason(reason),
+            error_text: format!("verifier repair safe stop: {}", reason.as_str()),
         }
     }
 
