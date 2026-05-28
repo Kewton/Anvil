@@ -488,6 +488,59 @@ pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
     Some(PostReplyRecoveryOutcome::Continue)
 }
 
+pub(super) fn maybe_handle_python_test_artifact_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if args.repo_edit_calls_made_this_turn == 0
+        || !agent.active_python_request_requires_tests()
+        || agent.python_test_artifact_exists()
+        || agent.python_verifier_available_for_requested_tests()
+    {
+        return None;
+    }
+    *args.python_test_retries += 1;
+    if *args.python_test_retries >= 2 {
+        let (final_prose, exit_reason, error_text) = match agent
+            .maybe_materialize_python_test_fallback()
+        {
+            Ok(Some(path)) => (
+                format!(
+                    "Added the requested Python test artifact with deterministic fallback: {path}."
+                ),
+                ExitReason::Done,
+                String::new(),
+            ),
+            Ok(None) => (
+                String::new(),
+                ExitReason::MissingRepoEdits,
+                "assistant did not add the requested Python test artifact".to_string(),
+            ),
+            Err(err) => (String::new(), ExitReason::TransportError, err),
+        };
+        return Some(PostReplyRecoveryOutcome::Finalize {
+            final_prose,
+            exit_reason,
+            error_text,
+        });
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Quality gate",
+            "Asked the model to add the requested Python test file or self-test command.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    agent.push_system_note(
+        "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
+            .to_string(),
+    );
+    Some(PostReplyRecoveryOutcome::Continue)
+}
+
 pub(super) fn maybe_continue_missing_repo_framework_fallback(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
