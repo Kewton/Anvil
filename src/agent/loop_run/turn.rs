@@ -287,6 +287,17 @@ struct PreparedVerifierRepairPass {
     model: String,
 }
 
+enum VerifierRepairAttemptProgress {
+    Return(VerifierRepairPassOutcome),
+    Continue {
+        last_error: String,
+        last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome>,
+    },
+    Break {
+        last_error: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct StructuredTaskContractVerifierRun {
     plan: AutoTestPlan,
@@ -1252,6 +1263,18 @@ fn answer_only_script_command_allowed(command: &str) -> bool {
         return false;
     }
     answer_only_script_starts_with_any(&lower, ANSWER_ONLY_SCRIPT_ALLOWED_PREFIXES)
+}
+
+fn verifier_repair_pass_request_error_message(err: &str, attempt_timeout_secs: u64) -> String {
+    let lower_error = err.to_ascii_lowercase();
+    if lower_error.contains("timeout") || lower_error.contains("timed out") {
+        format!(
+            "verifier_repair_pass_timeout: patch provider request timed out after \
+             {attempt_timeout_secs}s"
+        )
+    } else {
+        format!("repair LLM request failed: {err}")
+    }
 }
 
 // --- Issue #450 FeedbackFrame builders --------------------------------
@@ -13352,106 +13375,46 @@ impl Agent {
             // Issue #653 CB-001: 各 attempt 開始時にリセット。これ以降の branch で
             // 明示的に `Some(...)` を入れた場合のみ最終 `Invalid` outcome に伝播する。
             last_invalid_outcome = None;
-            let Some(attempt_timeout_secs) =
-                verifier_repair_pass_attempt_timeout_secs(pass_started.elapsed())
+            let elapsed = pass_started.elapsed();
+            let Some(attempt_timeout_secs) = verifier_repair_pass_attempt_timeout_secs(elapsed)
             else {
-                last_error = verifier_repair_pass_timeout_error(pass_started.elapsed());
-                log_llm_event(
-                    "agent.verifier_repair_pass.timeout",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "model": &prepared.model,
-                        "path": target_hint.path,
-                        "attempt": attempt,
-                        "elapsed_secs": pass_started.elapsed().as_secs(),
-                        "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-                    }),
+                last_error = self.verifier_repair_pass_wall_clock_timeout_error(
+                    &prepared,
+                    target_hint,
+                    attempt,
+                    elapsed,
                 );
                 break;
             };
-            let repair_client = match self
-                .client
-                .clone_with_overrides(attempt_timeout_secs, VERIFIER_REPAIR_PASS_MAX_PREDICT)
-            {
+            let repair_client = match self.verifier_repair_pass_client(attempt_timeout_secs) {
                 Ok(client) => client,
                 Err(err) => {
-                    last_error =
-                        format!("verifier_repair_pass_invalid: client clone failed: {err}");
+                    last_error = err;
                     break;
                 }
             };
-            let reply = match repair_client
-                .chat_text_json_control(&prepared.model, &prepared.messages)
-            {
-                Ok(reply) => reply,
-                Err(err) => {
-                    let raw_error = err.to_string();
-                    let lower_error = raw_error.to_ascii_lowercase();
-                    last_error =
-                        if lower_error.contains("timeout") || lower_error.contains("timed out") {
-                            format!(
-                                "verifier_repair_pass_timeout: patch provider request timed out \
-                             after {attempt_timeout_secs}s"
-                            )
-                        } else {
-                            format!("repair LLM request failed: {err}")
-                        };
-                    if last_error.contains("verifier_repair_pass_timeout") {
-                        log_llm_event(
-                            "agent.verifier_repair_pass.timeout",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "model": &prepared.model,
-                                "path": target_hint.path,
-                                "attempt": attempt,
-                                "elapsed_secs": pass_started.elapsed().as_secs(),
-                                "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-                                "attempt_timeout_secs": attempt_timeout_secs,
-                            }),
-                        );
-                    }
-                    break;
+            let reply = repair_client.chat_text_json_control(&prepared.model, &prepared.messages);
+            match self.handle_verifier_repair_pass_attempt(
+                &mut prepared,
+                target_hint,
+                attempt,
+                attempt_timeout_secs,
+                elapsed,
+                reply,
+            ) {
+                VerifierRepairAttemptProgress::Return(outcome) => return outcome,
+                VerifierRepairAttemptProgress::Continue {
+                    last_error: attempt_error,
+                    last_invalid_outcome: attempt_outcome,
+                } => {
+                    last_error = attempt_error;
+                    last_invalid_outcome = attempt_outcome;
                 }
-            };
-            if !reply.tool_calls.is_empty() {
-                last_error = "repair reply contained unexpected tool calls".to_string();
-            } else {
-                match self.handle_verifier_repair_pass_reply(
-                    &mut prepared,
-                    target_hint,
-                    attempt,
-                    &reply.content,
-                ) {
-                    Ok(outcome) => return outcome,
-                    Err(ValidationFailure {
-                        outcome: CheapCheckOutcome::Failed(message),
-                        weakening,
-                        rejection_signal,
-                    }) => {
-                        last_invalid_outcome = build_verifier_repair_pass_ledger_outcome(
-                            weakening,
-                            rejection_signal,
-                            prepared.context.semantic_plan.as_ref(),
-                        );
-                        last_error = message;
-                    }
-                    Err(ValidationFailure {
-                        outcome: CheapCheckOutcome::Unavailable,
-                        ..
-                    }) => {
-                        log_llm_event(
-                            "agent.verifier_repair_pass.unavailable",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "model": &prepared.model,
-                                "target_path": target_hint.path,
-                                "attempt": attempt,
-                            }),
-                        );
-                        return VerifierRepairPassOutcome::Unavailable {
-                            relative_path: target_hint.path.clone(),
-                        };
-                    }
+                VerifierRepairAttemptProgress::Break {
+                    last_error: attempt_error,
+                } => {
+                    last_error = attempt_error;
+                    break;
                 }
             }
 
@@ -13475,6 +13438,116 @@ impl Agent {
         VerifierRepairPassOutcome::Invalid {
             error,
             repair_attempt_outcome: last_invalid_outcome,
+        }
+    }
+
+    fn verifier_repair_pass_client(
+        &self,
+        attempt_timeout_secs: u64,
+    ) -> Result<OllamaClient, String> {
+        self.client
+            .clone_with_overrides(attempt_timeout_secs, VERIFIER_REPAIR_PASS_MAX_PREDICT)
+            .map_err(|err| format!("verifier_repair_pass_invalid: client clone failed: {err}"))
+    }
+
+    fn verifier_repair_pass_wall_clock_timeout_error(
+        &self,
+        prepared: &PreparedVerifierRepairPass,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+        attempt: usize,
+        elapsed: Duration,
+    ) -> String {
+        let error = verifier_repair_pass_timeout_error(elapsed);
+        self.log_verifier_repair_pass_timeout(prepared, target_hint, attempt, elapsed, None);
+        error
+    }
+
+    fn log_verifier_repair_pass_timeout(
+        &self,
+        prepared: &PreparedVerifierRepairPass,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+        attempt: usize,
+        elapsed: Duration,
+        attempt_timeout_secs: Option<u64>,
+    ) {
+        log_llm_event(
+            "agent.verifier_repair_pass.timeout",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "model": &prepared.model,
+                "path": target_hint.path,
+                "attempt": attempt,
+                "elapsed_secs": elapsed.as_secs(),
+                "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
+                "attempt_timeout_secs": attempt_timeout_secs,
+            }),
+        );
+    }
+
+    fn handle_verifier_repair_pass_attempt(
+        &mut self,
+        prepared: &mut PreparedVerifierRepairPass,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+        attempt: usize,
+        attempt_timeout_secs: u64,
+        elapsed: Duration,
+        reply: Result<AssistantReply, String>,
+    ) -> VerifierRepairAttemptProgress {
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(err) => {
+                let last_error =
+                    verifier_repair_pass_request_error_message(&err, attempt_timeout_secs);
+                if last_error.contains("verifier_repair_pass_timeout") {
+                    self.log_verifier_repair_pass_timeout(
+                        prepared,
+                        target_hint,
+                        attempt,
+                        elapsed,
+                        Some(attempt_timeout_secs),
+                    );
+                }
+                return VerifierRepairAttemptProgress::Break { last_error };
+            }
+        };
+        if !reply.tool_calls.is_empty() {
+            return VerifierRepairAttemptProgress::Continue {
+                last_error: "repair reply contained unexpected tool calls".to_string(),
+                last_invalid_outcome: None,
+            };
+        }
+        match self.handle_verifier_repair_pass_reply(prepared, target_hint, attempt, &reply.content)
+        {
+            Ok(outcome) => VerifierRepairAttemptProgress::Return(outcome),
+            Err(ValidationFailure {
+                outcome: CheapCheckOutcome::Failed(message),
+                weakening,
+                rejection_signal,
+            }) => VerifierRepairAttemptProgress::Continue {
+                last_error: message,
+                last_invalid_outcome: build_verifier_repair_pass_ledger_outcome(
+                    weakening,
+                    rejection_signal,
+                    prepared.context.semantic_plan.as_ref(),
+                ),
+            },
+            Err(ValidationFailure {
+                outcome: CheapCheckOutcome::Unavailable,
+                ..
+            }) => {
+                log_llm_event(
+                    "agent.verifier_repair_pass.unavailable",
+                    serde_json::json!({
+                        "session_id": self.session_store.session_id(),
+                        "model": &prepared.model,
+                        "target_path": target_hint.path,
+                        "attempt": attempt,
+                    }),
+                );
+                VerifierRepairAttemptProgress::Return(VerifierRepairPassOutcome::Unavailable {
+                    relative_path: target_hint.path.clone(),
+                })
+            }
         }
     }
 
@@ -25788,6 +25861,18 @@ mod progress_tests {
 
         assert!(message.contains("made no change"));
         assert!(message.contains("new_string that is different"));
+    }
+
+    #[test]
+    fn verifier_repair_pass_request_error_message_labels_timeouts() {
+        assert!(
+            super::verifier_repair_pass_request_error_message("request timed out", 12)
+                .contains("verifier_repair_pass_timeout")
+        );
+        assert_eq!(
+            super::verifier_repair_pass_request_error_message("connection reset", 12),
+            "repair LLM request failed: connection reset"
+        );
     }
 
     #[test]
