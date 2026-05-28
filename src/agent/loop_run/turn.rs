@@ -3990,6 +3990,10 @@ fn task_contract_safe_stop_clear_tag(reason: super::task_contract::SafeStopReaso
     }
 }
 
+fn plan_tool_followup_done_message() -> String {
+    "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string()
+}
+
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
     if yes_mode {
         tester::ApprovalMode::Auto
@@ -7553,85 +7557,106 @@ impl Agent {
 
     fn handle_actor_loop_plan_tool_followup(
         &mut self,
-        args: ActorLoopPlanToolFollowupArgs<'_>,
+        mut args: ActorLoopPlanToolFollowupArgs<'_>,
     ) -> ActorLoopPlanToolFollowupOutcome {
         if self.session.mode_state.mode != ExecutionMode::Plan {
             return ActorLoopPlanToolFollowupOutcome::Proceed;
         }
         if args.plan_ready_after_tool {
             return ActorLoopPlanToolFollowupOutcome::Done {
-                final_prose:
-                    "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                        .to_string(),
+                final_prose: plan_tool_followup_done_message(),
             };
         }
-        if args.plan_file_edit_calls_this_turn > 0 {
-            let plan_contents = self
-                .current_plan_contents()
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
-            let missing_after = lifecycle::plan_missing_sections(&plan_contents);
-            let made_section_progress = args
-                .plan_missing_before_turn
-                .is_none_or(|before| missing_after.len() < before);
-            if made_section_progress {
-                *args.plan_progress_retries = 0;
-                *args.plan_exploration_only_turns = 0;
-                return ActorLoopPlanToolFollowupOutcome::Proceed;
-            }
-            *args.plan_progress_retries += 1;
-            if *args.plan_progress_retries >= 2 {
-                return match self
-                    .materialize_deterministic_fallback_plan(
-                        "agent.plan.non_progress_edit_fallback_materialized",
-                    ) {
-                    Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
-                        final_prose:
-                            "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                                .to_string(),
-                    },
-                    Ok(false) => ActorLoopPlanToolFollowupOutcome::Exit {
-                        reason: ExitReason::PlanIncomplete,
-                        error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
-                    },
-                    Err(err) => ActorLoopPlanToolFollowupOutcome::Exit {
-                        reason: ExitReason::TransportError,
-                        error_text: err,
-                    },
-                };
-            }
-            self.push_system_note(recovery::plan_progress_recovery_note(
-                self.session.mode_state.plan_stage,
-                &lifecycle::plan_next_stage_sections(&plan_contents),
-                &missing_after,
-                *args.plan_progress_retries,
-            ));
-            return ActorLoopPlanToolFollowupOutcome::Proceed;
+        if let Some(outcome) = self.handle_plan_file_edit_followup(&mut args) {
+            return outcome;
         }
+        if let Some(outcome) = self.handle_plan_exploration_followup(&mut args) {
+            return outcome;
+        }
+        ActorLoopPlanToolFollowupOutcome::Proceed
+    }
+
+    fn handle_plan_file_edit_followup(
+        &mut self,
+        args: &mut ActorLoopPlanToolFollowupArgs<'_>,
+    ) -> Option<ActorLoopPlanToolFollowupOutcome> {
+        if args.plan_file_edit_calls_this_turn == 0 {
+            return None;
+        }
+        let plan_contents = self
+            .current_plan_contents()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
+        let missing_after = lifecycle::plan_missing_sections(&plan_contents);
+        let made_section_progress = args
+            .plan_missing_before_turn
+            .is_none_or(|before| missing_after.len() < before);
+        if made_section_progress {
+            *args.plan_progress_retries = 0;
+            *args.plan_exploration_only_turns = 0;
+            return Some(ActorLoopPlanToolFollowupOutcome::Proceed);
+        }
+        *args.plan_progress_retries += 1;
+        if *args.plan_progress_retries >= 2 {
+            return Some(self.handle_non_progress_plan_edit_fallback());
+        }
+        self.push_system_note(recovery::plan_progress_recovery_note(
+            self.session.mode_state.plan_stage,
+            &lifecycle::plan_next_stage_sections(&plan_contents),
+            &missing_after,
+            *args.plan_progress_retries,
+        ));
+        Some(ActorLoopPlanToolFollowupOutcome::Proceed)
+    }
+
+    fn handle_non_progress_plan_edit_fallback(&mut self) -> ActorLoopPlanToolFollowupOutcome {
+        match self.materialize_deterministic_fallback_plan(
+            "agent.plan.non_progress_edit_fallback_materialized",
+        ) {
+            Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
+                final_prose: plan_tool_followup_done_message(),
+            },
+            Ok(false) => ActorLoopPlanToolFollowupOutcome::Exit {
+                reason: ExitReason::PlanIncomplete,
+                error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+            },
+            Err(err) => ActorLoopPlanToolFollowupOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            },
+        }
+    }
+
+    fn handle_plan_exploration_followup(
+        &mut self,
+        args: &mut ActorLoopPlanToolFollowupArgs<'_>,
+    ) -> Option<ActorLoopPlanToolFollowupOutcome> {
         if args.plan_exploration_calls_this_turn >= 2 {
-            return self
-                .handle_actor_loop_plan_exploration_only_turn(
+            return Some(
+                self.handle_actor_loop_plan_exploration_only_turn(
                     args.last_iter,
                     "exploration_only_turn",
                     args.plan_progress_retries,
                 )
-                .map_or(ActorLoopPlanToolFollowupOutcome::Proceed, |outcome| outcome);
+                .unwrap_or(ActorLoopPlanToolFollowupOutcome::Proceed),
+            );
         }
-        if args.plan_exploration_calls_this_turn > 0 {
-            *args.plan_exploration_only_turns += 1;
-            if *args.plan_exploration_only_turns >= 1 {
-                let outcome = self.handle_actor_loop_plan_exploration_only_turn(
-                    args.last_iter,
-                    "repeated_exploration_only_turns",
-                    args.plan_progress_retries,
-                );
-                *args.plan_exploration_only_turns = 0;
-                return outcome.map_or(ActorLoopPlanToolFollowupOutcome::Proceed, |value| value);
-            }
+        if args.plan_exploration_calls_this_turn == 0 {
+            return None;
         }
-        ActorLoopPlanToolFollowupOutcome::Proceed
+        *args.plan_exploration_only_turns += 1;
+        if *args.plan_exploration_only_turns >= 1 {
+            let outcome = self.handle_actor_loop_plan_exploration_only_turn(
+                args.last_iter,
+                "repeated_exploration_only_turns",
+                args.plan_progress_retries,
+            );
+            *args.plan_exploration_only_turns = 0;
+            return Some(outcome.unwrap_or(ActorLoopPlanToolFollowupOutcome::Proceed));
+        }
+        Some(ActorLoopPlanToolFollowupOutcome::Proceed)
     }
 
     fn handle_actor_loop_plan_exploration_only_turn(
