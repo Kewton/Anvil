@@ -22910,6 +22910,34 @@ fn verifier_repair_target_display(target: &Path, work_root: &Path) -> String {
         .replace('\\', "/")
 }
 
+const PYTHON_REQUEST_PATTERNS: &[&str] = &["fastapi", "python", ".py"];
+const PYTHON_REQUEST_JA_PATTERNS: &[&str] = &["Pythonで", "FastAPIで"];
+const RUST_REQUEST_PATTERNS: &[&str] = &["rust", "cargo test", "cargo"];
+const RUST_REQUEST_JA_PATTERNS: &[&str] = &["Rustで", "Rust"];
+const RUST_LIBRARY_REQUEST_PATTERNS: &[&str] = &["library", "crate"];
+const RUST_LIBRARY_REQUEST_JA_PATTERNS: &[&str] = &["ライブラリ", "クレート"];
+const TYPESCRIPT_REQUEST_PATTERNS: &[&str] = &["typescript", "type script", ".ts"];
+const JAVASCRIPT_REQUEST_PATTERNS: &[&str] = &["javascript", "node", "npm test"];
+const PYTHON_TEST_REQUEST_PATTERNS: &[&str] =
+    &["fastapi", "flask", "django", "python", "pytest", ".py"];
+
+fn lower_contains_any(lower: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+fn request_contains_any(request: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| request.contains(pattern))
+}
+
+fn request_matches_family(
+    lower: &str,
+    request: &str,
+    lower_patterns: &[&str],
+    request_patterns: &[&str],
+) -> bool {
+    lower_contains_any(lower, lower_patterns) || request_contains_any(request, request_patterns)
+}
+
 fn synthesized_missing_implementation_target_path_for_request(
     role: super::task_contract::ArtifactRole,
     request: &str,
@@ -22918,24 +22946,26 @@ fn synthesized_missing_implementation_target_path_for_request(
         return None;
     }
     let lower = request.to_ascii_lowercase();
-    if lower.contains("fastapi")
-        || lower.contains("python")
-        || lower.contains(".py")
-        || request.contains("Pythonで")
-        || request.contains("FastAPIで")
-    {
+    if request_matches_family(
+        &lower,
+        request,
+        PYTHON_REQUEST_PATTERNS,
+        PYTHON_REQUEST_JA_PATTERNS,
+    ) {
         return Some("main.py".to_string());
     }
-    if lower.contains("rust")
-        || lower.contains("cargo")
-        || request.contains("Rustで")
-        || request.contains("Rust")
-    {
-        if lower.contains("library")
-            || lower.contains("crate")
-            || request.contains("ライブラリ")
-            || request.contains("クレート")
-        {
+    if request_matches_family(
+        &lower,
+        request,
+        RUST_REQUEST_PATTERNS,
+        RUST_REQUEST_JA_PATTERNS,
+    ) {
+        if request_matches_family(
+            &lower,
+            request,
+            RUST_LIBRARY_REQUEST_PATTERNS,
+            RUST_LIBRARY_REQUEST_JA_PATTERNS,
+        ) {
             return Some("src/lib.rs".to_string());
         }
         return Some("src/main.rs".to_string());
@@ -22947,28 +22977,21 @@ fn synthesized_missing_test_target_path_for_request(
     request: &str,
 ) -> Option<(&'static str, &'static str)> {
     let lower = request.to_ascii_lowercase();
-    if lower.contains("rust")
-        || lower.contains("cargo test")
-        || lower.contains("cargo")
-        || request.contains("Rustで")
-    {
+    if request_matches_family(&lower, request, RUST_REQUEST_PATTERNS, &["Rustで"]) {
         return Some(("tests/main.rs", "rust"));
     }
-    if lower.contains("typescript") || lower.contains("type script") || lower.contains(".ts") {
+    if lower_contains_any(&lower, TYPESCRIPT_REQUEST_PATTERNS) {
         return Some(("tests/main.test.ts", "typescript"));
     }
-    if lower.contains("javascript") || lower.contains("node") || lower.contains("npm test") {
+    if lower_contains_any(&lower, JAVASCRIPT_REQUEST_PATTERNS) {
         return Some(("tests/main.test.js", "javascript"));
     }
-    if lower.contains("fastapi")
-        || lower.contains("flask")
-        || lower.contains("django")
-        || lower.contains("python")
-        || lower.contains("pytest")
-        || lower.contains(".py")
-        || request.contains("Pythonで")
-        || request.contains("FastAPIで")
-    {
+    if request_matches_family(
+        &lower,
+        request,
+        PYTHON_TEST_REQUEST_PATTERNS,
+        PYTHON_REQUEST_JA_PATTERNS,
+    ) {
         return Some(("tests/test_main.py", "python"));
     }
     None
@@ -24403,6 +24426,26 @@ mod truncate_tests {
                 "Rustライブラリを作成し、cargo testで動くテストコードも実装してください。"
             ),
             Some(("tests/main.rs", "rust"))
+        );
+    }
+
+    #[test]
+    fn synthesized_missing_test_target_for_typescript_uses_ts_test_path() {
+        assert_eq!(
+            super::synthesized_missing_test_target_path_for_request(
+                "TypeScript で実装し、.ts のテストも追加してください。"
+            ),
+            Some(("tests/main.test.ts", "typescript"))
+        );
+    }
+
+    #[test]
+    fn synthesized_missing_test_target_for_python_uses_pytest_path() {
+        assert_eq!(
+            super::synthesized_missing_test_target_path_for_request(
+                "FastAPIでAPIを作成し、pytestで確認してください。"
+            ),
+            Some(("tests/test_main.py", "python"))
         );
     }
 
