@@ -194,7 +194,7 @@ use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
 use crate::session::store::{
     ScaffoldArtifactFileSnapshot, ScaffoldArtifactRole, ScaffoldArtifactSnapshot, WorkingMemory,
 };
-use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_target};
+use crate::tools::registry::{BashErrorClass, ToolSpec};
 use crate::util::file_classify::is_test_file;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use sha2::{Digest, Sha256};
@@ -14631,13 +14631,13 @@ mod tests {
     fn plan_write_status_prefers_approval_then_next() {
         let ready = "## Goal\n- g\n## Constraints\n- c\n## Deliverables\n- d\n## Acceptance Criteria\n- a\n## Quality Bar\n- q\n## First Action\n- f\n## Verification\n- v\n## Execution Plan\n- e\n## Verification Plan\n- vp\n## Risks / Fallbacks\n- r\n";
         assert_eq!(
-            super::plan_write_status(ready, 12),
+            super::super::actor_loop_flow::plan_write_status(ready, 12),
             Some("Approval ready | delta +12B".to_string())
         );
 
         let staged = "## Goal\n- g\n";
         assert_eq!(
-            super::plan_write_status(staged, -3),
+            super::super::actor_loop_flow::plan_write_status(staged, -3),
             Some("Next: Constraints | delta -3B".to_string())
         );
     }
@@ -17965,25 +17965,6 @@ pub(super) struct ProgressDisplay {
     pub(super) status: Option<String>,
 }
 
-pub(super) struct PlanWriteSummary {
-    pub(super) action: String,
-    pub(super) note: Option<String>,
-    pub(super) status: Option<String>,
-    pub(super) phase: String,
-    pub(super) signature: String,
-}
-
-pub(super) fn plan_path_matches(
-    raw_path: &str,
-    work_root: &Path,
-    plan_path: Option<&Path>,
-) -> bool {
-    resolve_plan_mode_write_target(work_root, raw_path, plan_path)
-        .ok()
-        .flatten()
-        .is_some()
-}
-
 fn progress_path_display(
     raw_path: &str,
     work_root: &Path,
@@ -17993,7 +17974,7 @@ fn progress_path_display(
     if raw_path.is_empty() {
         return "<missing path>".to_string();
     }
-    if plan_path_matches(raw_path, work_root, plan_path) {
+    if super::actor_loop_flow::plan_path_matches(raw_path, work_root, plan_path) {
         return compact_progress_path(
             &sanitize_for_progress(&plan_path.unwrap().display().to_string()),
             max_chars,
@@ -20098,7 +20079,7 @@ fn format_numbered_read_block(contents: &str) -> String {
         .join("\n")
 }
 
-fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
+pub(super) fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
     [
         "Goal",
         "Constraints",
@@ -20116,7 +20097,10 @@ fn plan_sections_with_content(contents: &str) -> Vec<&'static str> {
     .collect()
 }
 
-fn plan_section_body_for_progress<'a>(contents: &'a str, section: &str) -> Option<&'a str> {
+pub(super) fn plan_section_body_for_progress<'a>(
+    contents: &'a str,
+    section: &str,
+) -> Option<&'a str> {
     let mut start = None;
     let mut end = contents.len();
     let mut offset = 0usize;
@@ -20134,155 +20118,6 @@ fn plan_section_body_for_progress<'a>(contents: &'a str, section: &str) -> Optio
         offset += line.len() + 1;
     }
     start.map(|idx| &contents[idx..end])
-}
-
-pub(super) fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
-    for section in sections {
-        let Some(body) = plan_section_body_for_progress(contents, section) else {
-            continue;
-        };
-        for line in body.lines().map(str::trim) {
-            if line.is_empty()
-                || line == "-"
-                || matches!(
-                    line,
-                    "1." | "2."
-                        | "3."
-                        | "1. First slice:"
-                        | "2. Next phases:"
-                        | "3. Review checkpoint:"
-                )
-            {
-                continue;
-            }
-            let cleaned = line.trim_start_matches("- ").trim();
-            return Some(format!(
-                "{section}: {}",
-                truncate(&sanitize_for_progress(cleaned), 72)
-            ));
-        }
-    }
-    None
-}
-
-pub(super) fn plan_write_previous_contents(
-    raw_path: &str,
-    work_root: &Path,
-    plan_path: Option<&Path>,
-) -> String {
-    if raw_path.is_empty() {
-        String::new()
-    } else if plan_path_matches(raw_path, work_root, plan_path) {
-        plan_path
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default()
-    } else {
-        resolve_user_path(work_root, raw_path)
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default()
-    }
-}
-
-pub(super) struct PlanWriteSectionDelta {
-    pub(super) previous_sections: Vec<&'static str>,
-    pub(super) current_sections: Vec<&'static str>,
-    pub(super) added_sections: Vec<&'static str>,
-    pub(super) removed_sections: Vec<&'static str>,
-    pub(super) focus_sections: Vec<&'static str>,
-}
-
-pub(super) fn build_plan_write_section_delta(
-    previous: &str,
-    new_text: &str,
-) -> PlanWriteSectionDelta {
-    let previous_sections = plan_sections_with_content(previous);
-    let current_sections = plan_sections_with_content(new_text);
-    let changed_sections = current_sections
-        .iter()
-        .copied()
-        .filter(|section| {
-            let old_body = plan_section_body_for_progress(previous, section).unwrap_or_default();
-            let new_body = plan_section_body_for_progress(new_text, section).unwrap_or_default();
-            sanitize_for_progress(old_body) != sanitize_for_progress(new_body)
-        })
-        .collect::<Vec<_>>();
-    let added_sections = current_sections
-        .iter()
-        .copied()
-        .filter(|section| !previous_sections.contains(section))
-        .collect::<Vec<_>>();
-    let removed_sections = previous_sections
-        .iter()
-        .copied()
-        .filter(|section| !current_sections.contains(section))
-        .collect::<Vec<_>>();
-    let focus_sections = if !changed_sections.is_empty() {
-        changed_sections
-    } else if !current_sections.is_empty() {
-        current_sections.clone()
-    } else {
-        Vec::new()
-    };
-    PlanWriteSectionDelta {
-        previous_sections,
-        current_sections,
-        added_sections,
-        removed_sections,
-        focus_sections,
-    }
-}
-
-pub(super) fn plan_write_status(new_text: &str, delta: isize) -> Option<String> {
-    let next = lifecycle::plan_next_stage_sections(new_text);
-    if lifecycle::plan_missing_sections(new_text).is_empty() {
-        Some(format!("Approval ready | delta {delta:+}B"))
-    } else if !next.is_empty() {
-        Some(format!(
-            "Next: {} | delta {delta:+}B",
-            join_sections_for_progress(&next)
-        ))
-    } else {
-        Some(format!("delta {delta:+}B"))
-    }
-}
-
-pub(super) fn plan_phase_from_sections(
-    sections: &[&str],
-    current_stage: PlanStage,
-    approval_ready: bool,
-) -> &'static str {
-    if approval_ready {
-        "Approval review"
-    } else if sections.iter().any(|section| {
-        matches!(
-            *section,
-            "First Action"
-                | "Verification"
-                | "Execution Plan"
-                | "Verification Plan"
-                | "Risks / Fallbacks"
-        )
-    }) {
-        "Define next action"
-    } else if sections
-        .iter()
-        .any(|section| matches!(*section, "Acceptance Criteria" | "Quality Bar"))
-    {
-        "Define quality bar"
-    } else if sections
-        .iter()
-        .any(|section| matches!(*section, "Goal" | "Constraints" | "Deliverables"))
-    {
-        "Draft foundation"
-    } else {
-        match current_stage {
-            PlanStage::Stage1 => "Draft foundation",
-            PlanStage::Stage2 => "Define next action",
-            PlanStage::Stage3 => "Approval review",
-            PlanStage::Ready => "Approval review",
-        }
-    }
 }
 
 fn summarize_plan_read(contents: &str) -> (String, Option<String>) {
@@ -20361,23 +20196,24 @@ fn tool_display_write(
     current_stage: PlanStage,
 ) -> ProgressDisplay {
     let content = tool_display_str_arg(arguments, "content");
-    let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-        let summary = super::actor_loop_flow::summarize_plan_write(
-            "Write",
-            raw_path,
-            content,
-            work_root,
-            plan_path,
-            current_stage,
-        );
-        (summary.action, summary.note, summary.status)
-    } else {
-        (
-            "Write file".to_string(),
-            tool_display_preview_note(content),
-            Some(format!("{}B", content.len())),
-        )
-    };
+    let (action, note, status) =
+        if super::actor_loop_flow::plan_path_matches(raw_path, work_root, plan_path) {
+            let summary = super::actor_loop_flow::summarize_plan_write(
+                "Write",
+                raw_path,
+                content,
+                work_root,
+                plan_path,
+                current_stage,
+            );
+            (summary.action, summary.note, summary.status)
+        } else {
+            (
+                "Write file".to_string(),
+                tool_display_preview_note(content),
+                Some(format!("{}B", content.len())),
+            )
+        };
     ProgressDisplay {
         action,
         path: Some(path_display),
@@ -20395,23 +20231,24 @@ fn tool_display_edit(
     current_stage: PlanStage,
 ) -> ProgressDisplay {
     let new_text = tool_display_str_arg(arguments, "new_string");
-    let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-        let summary = super::actor_loop_flow::summarize_plan_write(
-            "Edit",
-            raw_path,
-            new_text,
-            work_root,
-            plan_path,
-            current_stage,
-        );
-        (summary.action, summary.note, summary.status)
-    } else {
-        (
-            "Revise file".to_string(),
-            tool_display_preview_note(new_text),
-            None,
-        )
-    };
+    let (action, note, status) =
+        if super::actor_loop_flow::plan_path_matches(raw_path, work_root, plan_path) {
+            let summary = super::actor_loop_flow::summarize_plan_write(
+                "Edit",
+                raw_path,
+                new_text,
+                work_root,
+                plan_path,
+                current_stage,
+            );
+            (summary.action, summary.note, summary.status)
+        } else {
+            (
+                "Revise file".to_string(),
+                tool_display_preview_note(new_text),
+                None,
+            )
+        };
     ProgressDisplay {
         action,
         path: Some(path_display),
@@ -20436,11 +20273,12 @@ fn tool_display_read(
 ) -> ProgressDisplay {
     let line_suffix = read_line_suffix(arguments);
     let path = format!("{path_display}{line_suffix}");
-    let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-        tool_display_plan_read(plan_path, current_stage)
-    } else {
-        tool_display_workspace_read(raw_path, work_root, &line_suffix)
-    };
+    let (action, note, status) =
+        if super::actor_loop_flow::plan_path_matches(raw_path, work_root, plan_path) {
+            tool_display_plan_read(plan_path, current_stage)
+        } else {
+            tool_display_workspace_read(raw_path, work_root, &line_suffix)
+        };
     ProgressDisplay {
         action,
         path: Some(compact_progress_path(&path, arg_budget.max(48))),
@@ -20464,7 +20302,7 @@ fn tool_display_plan_read(
         (!next.is_empty()).then(|| {
             format!(
                 "Current phase: {}",
-                plan_phase_from_sections(&next, current_stage, false)
+                super::actor_loop_flow::plan_phase_from_sections(&next, current_stage, false)
             )
         })
     };
