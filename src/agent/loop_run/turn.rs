@@ -19,6 +19,7 @@ use super::actor_loop_flow::{
     TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
     maybe_handle_answer_only_future_work_recovery, maybe_handle_answer_only_inadequate_recovery,
+    maybe_handle_repo_change_partial_progress_recovery,
     missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
     missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
 };
@@ -1839,7 +1840,7 @@ fn increment_artifact_completion_role_attempt(
     *entry
 }
 
-fn should_apply_repo_change_partial_progress_recovery(
+pub(super) fn should_apply_repo_change_partial_progress_recovery(
     action_expectation: recovery::ActionExpectation,
     repo_edit_calls_made_this_turn: usize,
     final_reply: &str,
@@ -5814,7 +5815,7 @@ impl Agent {
         if let Some(outcome) = maybe_handle_answer_only_inadequate_recovery(self, &mut args) {
             return Some(outcome);
         }
-        if let Some(outcome) = self.maybe_handle_repo_change_partial_progress_recovery(&mut args) {
+        if let Some(outcome) = maybe_handle_repo_change_partial_progress_recovery(self, &mut args) {
             return Some(outcome);
         }
         if let Some(outcome) = self.maybe_handle_repo_change_quality_gate_recovery(&mut args) {
@@ -5960,47 +5961,6 @@ impl Agent {
             "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
                 .to_string(),
         );
-        Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn maybe_handle_repo_change_partial_progress_recovery(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if !should_apply_repo_change_partial_progress_recovery(
-            args.action_expectation,
-            args.repo_edit_calls_made_this_turn,
-            args.final_reply,
-            args.task_contract_action,
-        ) || !args
-            .recovery_dispatch_gate
-            .allows_generic_repo_change_recovery()
-        {
-            return None;
-        }
-        *args.repo_change_retries += 1;
-        if *args.repo_change_retries >= 3 {
-            return Some(PostReplyRecoveryOutcome::Finalize {
-                final_prose: String::new(),
-                exit_reason: ExitReason::MissingRepoEdits,
-                error_text: ExitReason::MissingRepoEdits
-                    .default_error_text()
-                    .to_string(),
-            });
-        }
-        write_stdout_rendered(
-            &format_iteration_status(
-                args.last_iter,
-                self.config.max_iterations,
-                "Retry requested",
-                "A small edit landed, but the model answered with next-step prose instead of a completed result. Asked it to keep implementing with tools.",
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        self.push_system_note(recovery::repo_change_partial_progress_note(
-            *args.repo_change_retries,
-        ));
         Some(PostReplyRecoveryOutcome::Continue)
     }
 
