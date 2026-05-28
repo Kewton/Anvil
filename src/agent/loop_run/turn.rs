@@ -3698,6 +3698,30 @@ fn preflight_work_mode_skip_reason(
     }
 }
 
+fn preflight_quality_confirm_skip_reason(
+    mode: ExecutionMode,
+    env_disabled: bool,
+    quality_confirm_called_this_turn: bool,
+) -> Option<quality_confirm::QualityConfirmSkipReason> {
+    if mode == ExecutionMode::Plan {
+        Some(quality_confirm::QualityConfirmSkipReason::PlanMode)
+    } else if env_disabled {
+        Some(quality_confirm::QualityConfirmSkipReason::EnvDisabled)
+    } else if quality_confirm_called_this_turn {
+        Some(quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed)
+    } else {
+        None
+    }
+}
+
+fn quality_confirm_cached_result(
+    last_quality_confirm_result: Option<&(u64, QualityConfirmation)>,
+    content_hash: u64,
+) -> Option<QualityConfirmation> {
+    last_quality_confirm_result
+        .and_then(|(hash, cached)| (*hash == content_hash).then(|| cached.clone()))
+}
+
 fn work_mode_confirm_parse_status(outcome: &WorkModeConfirmOutcome) -> WorkModeConfirmParseStatus {
     match outcome {
         WorkModeConfirmOutcome::Confirmed(_) => WorkModeConfirmParseStatus::Ok,
@@ -3736,6 +3760,25 @@ fn log_work_mode_confirm_outcome(
         first_pass,
         latency_ms,
         work_mode_confirm_parse_status(outcome),
+    );
+    log_llm_event(event, payload);
+}
+
+fn log_quality_confirm_outcome(
+    outcome: &QualityConfirmOutcome,
+    session_id: &str,
+    sidecar_model: Option<&str>,
+    turn_index: usize,
+    observation: &super::quality::QualityFirstPassObservation,
+    latency_ms: Option<u64>,
+) {
+    let (event, payload) = build_quality_confirm_log_payload(
+        outcome,
+        session_id,
+        turn_index,
+        sidecar_model,
+        observation,
+        latency_ms,
     );
     log_llm_event(event, payload);
 }
@@ -4151,87 +4194,43 @@ impl Agent {
         let session_id = self.session_store.session_id().to_string();
         let sidecar_model = self.models.sidecar.clone();
         let turn_index = self.current_turn_index;
-
-        // 1. Plan mode gate. Quality second-pass is an Act-mode tool.
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            let outcome = QualityConfirmOutcome::Skipped {
-                reason: quality_confirm::QualityConfirmSkipReason::PlanMode,
-            };
-            let (event, payload) = build_quality_confirm_log_payload(
-                &outcome,
-                &session_id,
-                turn_index,
-                sidecar_model.as_deref(),
-                &observation,
-                None,
-            );
-            log_llm_event(event, payload);
-            return observation.issue;
-        }
-
-        // 2. env disable.
-        if quality_confirm::quality_confirm_disabled(|k: &str| std::env::var(k)) {
-            let outcome = QualityConfirmOutcome::Skipped {
-                reason: quality_confirm::QualityConfirmSkipReason::EnvDisabled,
-            };
-            let (event, payload) = build_quality_confirm_log_payload(
-                &outcome,
-                &session_id,
-                turn_index,
-                sidecar_model.as_deref(),
-                &observation,
-                None,
-            );
-            log_llm_event(event, payload);
-            return observation.issue;
-        }
-
-        // Compute the memo key once for both cache lookup and cache write.
         let content_hash = quality_confirm_cache_key(request, content);
-
-        // 3 / 4. per-turn cap consumed.
-        if self.quality_confirm_called_this_turn {
-            // 4. cache hit?
-            if let Some((hash, cached)) = &self.last_quality_confirm_result
-                && *hash == content_hash
+        if let Some(skip_reason) = preflight_quality_confirm_skip_reason(
+            self.session.mode_state.mode,
+            quality_confirm::quality_confirm_disabled(|k: &str| std::env::var(k)),
+            self.quality_confirm_called_this_turn,
+        ) {
+            if skip_reason == quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed
+                && let Some(cached) = quality_confirm_cached_result(
+                    self.last_quality_confirm_result.as_ref(),
+                    content_hash,
+                )
             {
-                let cached_clone = cached.clone();
-                let outcome = QualityConfirmOutcome::Confirmed(cached_clone.clone());
-                let (event, payload) = build_quality_confirm_log_payload(
+                let outcome = QualityConfirmOutcome::Confirmed(cached.clone());
+                log_quality_confirm_outcome(
                     &outcome,
                     &session_id,
-                    turn_index,
                     sidecar_model.as_deref(),
+                    turn_index,
                     &observation,
                     None,
                 );
-                log_llm_event(event, payload);
-                return cached_clone.issue;
+                return cached.issue;
             }
-            // 3. miss — surface PerTurnCapConsumed, first-pass issue is kept.
             let outcome = QualityConfirmOutcome::Skipped {
-                reason: quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed,
+                reason: skip_reason,
             };
-            let (event, payload) = build_quality_confirm_log_payload(
+            log_quality_confirm_outcome(
                 &outcome,
                 &session_id,
-                turn_index,
                 sidecar_model.as_deref(),
+                turn_index,
                 &observation,
                 None,
             );
-            log_llm_event(event, payload);
             return observation.issue;
         }
 
-        // 5. orchestrator dispatch.
-        //
-        // CB-001 fix: only consume the per-turn cap when the sidecar is
-        // actually dispatched — i.e. when `should_request_quality_confirmation`
-        // will return true AND a sidecar model is available. Pre-evaluating
-        // the predicate here keeps the cap guard faithful: early-fail /
-        // all_zero / all_strong Skips do not consume the cap so a subsequent
-        // callsite with a genuine borderline excerpt still gets second-pass.
         let will_dispatch =
             sidecar_model.is_some() && should_request_quality_confirmation(&observation);
         let inputs = QualityConfirmInputs {
@@ -4243,12 +4242,32 @@ impl Agent {
             model: sidecar_model.as_deref(),
         };
         let attempt_started = Instant::now();
-        let outcome = if sidecar_model.is_some() {
+        let outcome =
+            self.run_quality_confirm_attempt(inputs, sidecar_model.as_deref(), will_dispatch);
+        let latency_ms = attempt_started.elapsed().as_millis() as u64;
+        let final_issue = self.resolve_quality_confirm_issue(&outcome, content_hash, &observation);
+        log_quality_confirm_outcome(
+            &outcome,
+            &session_id,
+            sidecar_model.as_deref(),
+            turn_index,
+            &observation,
+            Some(latency_ms),
+        );
+
+        final_issue
+    }
+
+    fn run_quality_confirm_attempt(
+        &mut self,
+        inputs: QualityConfirmInputs<'_>,
+        sidecar_model: Option<&str>,
+        will_dispatch: bool,
+    ) -> QualityConfirmOutcome {
+        if let Some(sidecar_name) = sidecar_model {
             if will_dispatch {
-                // Cap consumed only when we actually attempt the sidecar call.
                 self.quality_confirm_called_this_turn = true;
             }
-            let sidecar_name = sidecar_model.clone().expect("sidecar_model is Some here");
             let confirm_client = self
                 .client
                 .clone_with_overrides(QUALITY_CONFIRM_TIMEOUT_SECS, 384)
@@ -4256,14 +4275,9 @@ impl Agent {
             run_quality_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
                 Some(c) => c
                     .chat_text(
-                        &sidecar_name,
+                        sidecar_name,
                         &[ConversationMessage::user(prompt.to_string())],
                     )
-                    // CB-002 fix: if the sidecar returns tool_calls alongside
-                    // or instead of a text response, treat it as Malformed so
-                    // the strict SecondPassResponse parser rejects it and we
-                    // fail-open to first-pass. This guards against XML-fallback
-                    // sidecar responses that extract tool calls from content.
                     .and_then(|reply| {
                         if !reply.tool_calls.is_empty() {
                             Err("sidecar reply contained unexpected tool_calls".to_string())
@@ -4274,49 +4288,35 @@ impl Agent {
                 None => Err("client clone_with_overrides failed".to_string()),
             })
         } else {
-            // sidecar None — orchestrator returns Fallback(SidecarUnavailable)
-            // without invoking the closure. We do not consume the per-turn cap
-            // (defensive — symmetric with WorkMode / FeedbackKind).
             run_quality_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
-        };
-        let latency_ms = attempt_started.elapsed().as_millis() as u64;
+        }
+    }
 
-        // Resolve the final issue + cache result for downstream callsites.
-        let final_issue: Option<String> = match &outcome {
+    fn resolve_quality_confirm_issue(
+        &mut self,
+        outcome: &QualityConfirmOutcome,
+        content_hash: u64,
+        observation: &super::quality::QualityFirstPassObservation,
+    ) -> Option<String> {
+        match outcome {
             QualityConfirmOutcome::Confirmed(c) => {
-                // Cache the resolved confirmation for in-turn reuse.
                 self.last_quality_confirm_result = Some((content_hash, c.clone()));
                 c.issue.clone()
             }
             QualityConfirmOutcome::Skipped { .. } | QualityConfirmOutcome::Fallback { .. } => {
-                // Fallback / non-dispatch skip — cache the first-pass issue
-                // under FirstPass source so cache-hit emissions remain
-                // faithful (DR4-005).
-                let fallback = QualityConfirmation {
-                    issue: observation.issue.clone(),
-                    reason: None,
-                    source: QualityConfirmationSource::FirstPass,
-                };
-                // Only memoize when we actually dispatched (cap consumed) —
-                // otherwise the cache lookup branch above never fires.
                 if self.quality_confirm_called_this_turn {
-                    self.last_quality_confirm_result = Some((content_hash, fallback));
+                    self.last_quality_confirm_result = Some((
+                        content_hash,
+                        QualityConfirmation {
+                            issue: observation.issue.clone(),
+                            reason: None,
+                            source: QualityConfirmationSource::FirstPass,
+                        },
+                    ));
                 }
                 observation.issue.clone()
             }
-        };
-
-        let (event, payload) = build_quality_confirm_log_payload(
-            &outcome,
-            &session_id,
-            turn_index,
-            sidecar_model.as_deref(),
-            &observation,
-            Some(latency_ms),
-        );
-        log_llm_event(event, payload);
-
-        final_issue
+        }
     }
 
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
@@ -18427,6 +18427,43 @@ mod tests {
         );
         assert_eq!(
             super::preflight_work_mode_skip_reason(false, ExecutionMode::Act, false),
+            None
+        );
+    }
+
+    #[test]
+    fn quality_confirm_preflight_skip_reason_preserves_gate_priority() {
+        assert_eq!(
+            super::preflight_quality_confirm_skip_reason(ExecutionMode::Plan, true, true),
+            Some(super::quality_confirm::QualityConfirmSkipReason::PlanMode)
+        );
+        assert_eq!(
+            super::preflight_quality_confirm_skip_reason(ExecutionMode::Act, true, true),
+            Some(super::quality_confirm::QualityConfirmSkipReason::EnvDisabled)
+        );
+        assert_eq!(
+            super::preflight_quality_confirm_skip_reason(ExecutionMode::Act, false, true),
+            Some(super::quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed)
+        );
+        assert_eq!(
+            super::preflight_quality_confirm_skip_reason(ExecutionMode::Act, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn quality_confirm_cached_result_requires_matching_hash() {
+        let cached = super::QualityConfirmation {
+            issue: Some("cached issue".to_string()),
+            reason: None,
+            source: super::QualityConfirmationSource::FirstPass,
+        };
+        assert_eq!(
+            super::quality_confirm_cached_result(Some(&(7, cached.clone())), 7),
+            Some(cached.clone())
+        );
+        assert_eq!(
+            super::quality_confirm_cached_result(Some(&(7, cached)), 8),
             None
         );
     }
