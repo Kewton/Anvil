@@ -45,6 +45,7 @@ use super::Agent;
 use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, RecoveryOwner};
 use super::interrupt::InterruptFlag;
 use super::summary::ExitReason;
+use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::EffectiveToolPolicy;
 
 /// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
@@ -444,6 +445,60 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
         return Some(PostReplyRecoveryOutcome::Continue);
     }
     None
+}
+
+pub(super) fn maybe_continue_missing_repo_framework_fallback(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> bool {
+    if !super::turn::should_try_framework_app_fallback(
+        args.last_iter,
+        *args.framework_app_fallback_materialized,
+    ) || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
+    {
+        return false;
+    }
+    *args.framework_app_fallback_materialized = true;
+    agent.push_system_note(super::turn::framework_app_fallback_continuation_note().to_string());
+    true
+}
+
+pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    match agent.maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag) {
+        super::turn::ScaffoldFallbackResult::Applied => {
+            *args.repo_change_retries = 0;
+            Some(PostReplyRecoveryOutcome::Continue)
+        }
+        super::turn::ScaffoldFallbackResult::Failed
+        | super::turn::ScaffoldFallbackResult::Skipped => {
+            *args.repo_change_retries += 1;
+            if *args.repo_change_retries >= 3 {
+                return Some(missing_repo_edits_finalize_outcome());
+            }
+            agent.push_system_note(recovery::repo_change_recovery_note(
+                *args.repo_change_retries,
+            ));
+            Some(PostReplyRecoveryOutcome::Continue)
+        }
+        super::turn::ScaffoldFallbackResult::NotApplicable => None,
+    }
+}
+
+pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usize) {
+    if let Some(target) = agent.focused_edit_recovery_target() {
+        let target_already_read =
+            focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
+        let note =
+            agent.focused_edit_no_tool_note_for_target(&target, target_already_read, attempt);
+        agent.push_system_note(note);
+        return;
+    }
+    if !agent.push_artifact_directed_recovery_note(attempt) {
+        agent.push_system_note(recovery::repo_change_recovery_note(attempt));
+    }
 }
 
 pub(super) fn maybe_handle_answer_only_future_work_recovery(
