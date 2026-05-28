@@ -9,21 +9,12 @@ use super::actor_loop_flow::missing_repo_edits_finalize_outcome;
 #[cfg(test)]
 use super::actor_loop_flow::plan_tool_followup_done_message;
 use super::actor_loop_flow::{
-    ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
-    ActorLoopMissingRepoChangeReplyKind, ActorLoopNoToolReplyArgs, ActorLoopNoToolReplyOutcome,
-    ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome, ActorLoopPostToolCleanupArgs,
-    ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
-    ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyOutcome,
-    ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
-    ActorLoopToolPreparationArgs, ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs,
-    PostReplyRecoveryOutcome, TaskContractVerifierFlowOutcome, drive_actor_loop_pre_reply_phase,
-    drive_actor_loop_tool_preparation_phase, handle_actor_loop_completion,
-    handle_actor_loop_no_tool_reply, handle_actor_loop_plan_tool_followup,
-    handle_actor_loop_post_tool_cleanup, handle_actor_loop_post_tool_fallbacks,
-    handle_actor_loop_task_contract_reply, handle_post_reply_recovery, repair_job_done_outcome,
+    ActorLoopMissingRepoChangeReplyKind, TaskContractVerifierFlowOutcome, repair_job_done_outcome,
+    run_actor_loop,
 };
 #[cfg(test)]
 use super::actor_loop_flow::{
+    PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
     actor_loop_pre_reply_deterministic_fallback_allowed,
     actor_loop_pre_reply_repo_change_fallback_allowed,
 };
@@ -114,7 +105,7 @@ use super::tool_execution::{
 use super::tool_history::{
     build_recent_tool_summary, focused_edit_target_already_read, focused_read_target_for_directory,
     has_successful_non_plan_repo_edit,
-    has_successful_non_plan_repo_edit_after_latest_truncated_tool_call, is_plan_file_tool_call,
+    has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
     is_preferred_read_edit_target, latest_read_exchange_for_target,
     latest_successful_read_existing_path, latest_user_turn_slice,
     latest_verifier_repair_note_index, recent_truncated_tool_call_attempt,
@@ -187,9 +178,7 @@ use super::work_mode_confirm::{
     run_work_mode_confirm_with_strategy,
 };
 use super::*;
-use crate::agent::orchestration::{
-    RepoSnapshot, RepoVerification, capture_repo_snapshot, verify_repo_progress,
-};
+use crate::agent::orchestration::{RepoSnapshot, RepoVerification, verify_repo_progress};
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{
@@ -220,8 +209,8 @@ use super::deterministic::empty_framework_game_files as deterministic_empty_fram
 #[cfg(test)]
 use super::progress_text::is_utf8_locale;
 use super::progress_text::{
-    format_progress_field, no_color_requested, paint, progress_available_width,
-    sanitize_for_progress, tool_color, tool_emoji, truncate, unicode_supported,
+    format_progress_field, paint, progress_available_width, sanitize_for_progress, tool_color,
+    tool_emoji, truncate,
 };
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
@@ -239,7 +228,7 @@ use super::quality_confirm::{
 use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
-const LOG_ARGS_MAX_CHARS: usize = 200;
+pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
 
 // Issue #634: SSOT for specialized-fallback ログ event 名。emit 側 / test 側の
 // 双方が参照し、typo による検証無効化を防ぐ。文字列値そのものは既存テスト互換の
@@ -251,7 +240,7 @@ const EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT: &str =
     "agent.deterministic_format_error_small_edit";
 const EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK: &str =
     "agent.empty_workspace.deterministic_python_test_fallback";
-const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
+pub(super) const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 pub(super) const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
 const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
@@ -528,14 +517,15 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn production_repair_dispatch_does_not_call_legacy_decision_bridge() {
-        let src = include_str!("turn.rs");
+        let turn_src = include_str!("turn.rs");
+        let actor_loop_flow_src = include_str!("actor_loop_flow.rs");
         let run_actor_loop = function_body(
-            src,
-            "\n    fn run_actor_loop(",
-            "\n    pub(super) fn push_system_note(",
+            actor_loop_flow_src,
+            "\npub(super) fn run_actor_loop(",
+            "\n    let mut last_iter = 0usize;\n",
         );
         let arbiter_candidates = function_body(
-            src,
+            turn_src,
             "\n    fn build_arbiter_candidates(",
             "\n    pub(super) fn current_workspace_scope(",
         );
@@ -1497,7 +1487,10 @@ fn bash_outcome_primary_error(
 /// CB-001: build a FeedbackFrame for a pre-dispatch unsafe-block case
 /// detected by `recovery::should_block_bash_command`. The command never
 /// runs, so there is no exit_code / stdout / stderr — just a marker.
-fn build_feedback_for_unsafe_block(command: &str, workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_unsafe_block(
+    command: &str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::UnsafeCommandBlocked,
         command: Some(command.to_string()),
@@ -1566,7 +1559,7 @@ fn build_feedback_for_edit_failure(
 /// CB-001: build a FeedbackFrame when the final `verify_repo_progress`
 /// call reports `made_any_progress() == false` and no other feedback
 /// has been recorded this turn.
-fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::NoRepoProgress,
         primary_error: Some("turn ended without modifying repository files".to_string()),
@@ -1628,7 +1621,7 @@ pub(super) fn build_feedback_for_deterministic_content_fallback(
 /// `last_feedback_changed_this_turn` so that Bash failures, auto_test
 /// outcomes, unsafe blocks, and tool-protocol failures still take
 /// precedence under the design 5.5 last-write-wins ordering.
-fn should_record_no_repo_progress(
+pub(super) fn should_record_no_repo_progress(
     repo_edit_calls_made_this_turn: usize,
     final_made_any_progress: bool,
     last_feedback_changed_this_turn: bool,
@@ -2821,13 +2814,13 @@ pub(super) fn format_iteration_status(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PlanExplorationKey {
-    stage: String,
-    tool_name: String,
-    normalized_args: String,
+pub(super) struct PlanExplorationKey {
+    pub(super) stage: String,
+    pub(super) tool_name: String,
+    pub(super) normalized_args: String,
 }
 
-fn normalize_plan_exploration_key(
+pub(super) fn normalize_plan_exploration_key(
     tool_name: &str,
     arguments: &serde_json::Value,
     work_root: &Path,
@@ -2934,7 +2927,7 @@ pub(super) fn log_plan_stall(
     );
 }
 
-fn progress_stage_label(
+pub(super) fn progress_stage_label(
     mode: ExecutionMode,
     plan_stage: PlanStage,
     tool_name: &str,
@@ -3233,7 +3226,7 @@ fn sort_precautions_for_prompt<'a>(
     active
 }
 
-fn build_stats(
+pub(super) fn build_stats(
     accumulated: Vec<RepoVerification>,
     final_verif: RepoVerification,
     iter_used: usize,
@@ -5572,7 +5565,7 @@ impl Agent {
     ///   `summary_ids_adopted` array is NOT emitted in the event payload
     ///   (DR4-NEW-004 — only counts and static-allowlist strings cross the
     ///   audit boundary).
-    fn invoke_photon_evaluate(&mut self) {
+    pub(super) fn invoke_photon_evaluate(&mut self) {
         if self.photon.is_none() {
             return;
         }
@@ -5809,7 +5802,8 @@ impl Agent {
             );
         }
 
-        self.run_actor_loop(
+        run_actor_loop(
+            self,
             action_expectation,
             requires_action,
             stream_output,
@@ -5818,7 +5812,9 @@ impl Agent {
         )
     }
 
-    fn prepare_actor_loop_turn_state(&mut self) -> Option<super::task_contract::TaskContract> {
+    pub(super) fn prepare_actor_loop_turn_state(
+        &mut self,
+    ) -> Option<super::task_contract::TaskContract> {
         // Issue #455 / D4 / CB-001: clear the in-snapshot turn-scoped flag
         // so first-eligible-failure-wins starts fresh on this turn. The
         // flag lives on `SessionSnapshot` itself (`#[serde(skip)]`), is set
@@ -5969,1183 +5965,6 @@ impl Agent {
             ExitReason::VerifierFailed
         } else {
             ExitReason::ToolCallFormatError
-        }
-    }
-
-    fn run_actor_loop(
-        &mut self,
-        action_expectation: recovery::ActionExpectation,
-        requires_action: bool,
-        stream_output: bool,
-        restart_convergence_mode: bool,
-        monitor: &mut InterruptMonitor,
-    ) -> LoopResult {
-        let use_color = io::stdout().is_terminal() && !no_color_requested();
-        let use_unicode = unicode_supported();
-        let start = Instant::now();
-        let mut before_snapshot = capture_repo_snapshot(&self.work_root);
-        let mut accumulated: Vec<RepoVerification> = Vec::new();
-        let mut last_known_root = self.work_root.clone();
-        let task_contract = self.prepare_actor_loop_turn_state();
-
-        let mut tool_calls_made_this_turn = 0usize;
-        let mut repo_edit_calls_made_this_turn = 0usize;
-        let mut empty_retries = 0usize;
-        let mut no_tool_retries = 0usize;
-        let mut repo_change_retries = 0usize;
-        let mut verifier_repair_retries = 0usize;
-        let mut focused_policy_retries = 0usize;
-        let mut contract_completion_retries = 0usize;
-        let mut contract_completion_role_retries =
-            HashMap::<super::task_contract::ArtifactRole, usize>::new();
-        let mut contract_verification_retries = 0usize;
-        let mut contract_verifier_repair_edit_count: Option<usize> = None;
-        let mut task_contract_verifier_passed_in_loop = false;
-        let mut task_contract_verify_commands_collected = Vec::<String>::new();
-        let mut python_test_retries = 0usize;
-        let mut plan_progress_retries = 0usize;
-        let mut plan_exploration_only_turns = 0usize;
-        let mut plan_exploration_counts = HashMap::<PlanExplorationKey, usize>::new();
-        let mut plan_write_signature_counts = HashMap::<String, usize>::new();
-        let mut recent_bash_commands = Vec::<String>::new();
-        let mut install_commands_seen = 0usize;
-        let mut logged_plan_first_write = false;
-        let mut logged_act_first_repo_edit = false;
-        let mut framework_app_fallback_materialized = false;
-        let mut contract_deterministic_fallback_materialized = false;
-
-        let mut exit_reason = ExitReason::MaxIterations;
-        let mut error_text = String::new();
-        let mut last_iter = 0usize;
-        let mut final_prose = String::new();
-        // Issue #471: collect all LLM-requested tool calls BEFORE any
-        // focused-edit truncation so the eval log records the full intent
-        // (DR3-003).
-        let mut tool_call_summaries: Vec<crate::session::eval_log::ToolCallSummary> = Vec::new();
-
-        let interrupt_flag = monitor.flag();
-
-        'outer: for iter_count in 0..self.config.max_iterations {
-            last_iter = iter_count + 1;
-            let approx_tokens = approximate_token_count(&self.session.messages);
-            tracing::debug!(iter = iter_count, tokens = approx_tokens, "iter");
-            // Publish per-turn token count to the footer (issue #430, AC12).
-            // Reuses the value we just computed — O(1), no second walk over
-            // `messages`. No-op when the footer handle is disabled.
-            self.footer.publish_tokens(approx_tokens);
-
-            // Issue #660 (Phase C / DD-4): emit `agent.active_job.selected`
-            // at the head of every iteration when the selection differs from
-            // the previous emission. Per-turn diff-based dedup state lives
-            // on `self.last_active_job_selection`, reset at
-            // `handle_user_message` entry adjacent to
-            // `safe_stop_report_emitted`. The helper itself is the only emit
-            // site; raw verifier commands / raw paths are redacted by the
-            // pure `build_active_job_selected_payload` builder (DR4-001/002).
-            //
-            // Codex CB-002: pass the actor-loop `iter_count` as the
-            // payload's `iteration_seq` so the field name and the value
-            // semantics agree (previously the per-turn index was passed,
-            // which collapsed all same-turn re-emits to a single value).
-            self.emit_active_job_selected_if_changed(iter_count as u32);
-
-            let (reply, recovery_dispatch_gate, missing_verifier_setup_turn, recovery_owner) =
-                match drive_actor_loop_pre_reply_phase(
-                    self,
-                    ActorLoopPreReplyArgs {
-                        before_snapshot: &before_snapshot,
-                        accumulated: &accumulated,
-                        task_contract: task_contract.as_ref(),
-                        repo_edit_calls_made_this_turn: &mut repo_edit_calls_made_this_turn,
-                        contract_verification_retries: &mut contract_verification_retries,
-                        contract_verifier_repair_edit_count:
-                            &mut contract_verifier_repair_edit_count,
-                        repo_change_retries: &mut repo_change_retries,
-                        verifier_repair_retries: &mut verifier_repair_retries,
-                        task_contract_verify_commands_collected:
-                            &mut task_contract_verify_commands_collected,
-                        task_contract_verifier_passed_in_loop:
-                            &mut task_contract_verifier_passed_in_loop,
-                        framework_app_fallback_materialized:
-                            &mut framework_app_fallback_materialized,
-                        action_expectation,
-                        stream_output,
-                        last_iter,
-                        interrupt_flag: &interrupt_flag,
-                    },
-                ) {
-                    ActorLoopPreReplyOutcome::Continue => continue,
-                    ActorLoopPreReplyOutcome::Done { final_prose: prose } => {
-                        final_prose = prose;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    ActorLoopPreReplyOutcome::Exit {
-                        reason,
-                        error_text: loop_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = loop_error;
-                        break 'outer;
-                    }
-                    ActorLoopPreReplyOutcome::ReplyPrepared {
-                        reply,
-                        recovery_dispatch_gate,
-                        missing_verifier_setup_turn,
-                        recovery_owner,
-                    } => (
-                        reply,
-                        recovery_dispatch_gate,
-                        missing_verifier_setup_turn,
-                        recovery_owner,
-                    ),
-                };
-
-            // Boundary 2: right after the Ollama response completes. This is
-            // the AC-10 checkpoint — mid-flight cancel is out of scope.
-            if interrupt_flag.is_set() {
-                exit_reason = ExitReason::Interrupted;
-                break 'outer;
-            }
-
-            let AssistantReply {
-                content: reply_content,
-                tool_calls: reply_tool_calls,
-                ..
-            } = reply;
-
-            let (current_reply_tool_call_count, prepared_tool_calls, effective_tool_policy) =
-                match drive_actor_loop_tool_preparation_phase(
-                    self,
-                    ActorLoopToolPreparationArgs {
-                        reply_tool_calls,
-                        task_contract: task_contract.as_ref(),
-                        tool_call_summaries: &mut tool_call_summaries,
-                        focused_policy_retries: &mut focused_policy_retries,
-                        contract_completion_role_retries: &mut contract_completion_role_retries,
-                        missing_verifier_setup_turn,
-                        recovery_dispatch_gate,
-                        recovery_owner,
-                        last_iter,
-                    },
-                ) {
-                    ActorLoopToolPreparationOutcome::Continue => continue,
-                    ActorLoopToolPreparationOutcome::Done { final_prose: prose } => {
-                        final_prose = prose;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    ActorLoopToolPreparationOutcome::Exit {
-                        reason,
-                        error_text: tool_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = tool_error;
-                        break 'outer;
-                    }
-                    ActorLoopToolPreparationOutcome::Prepared {
-                        current_reply_tool_call_count,
-                        prepared_tool_calls,
-                        effective_tool_policy,
-                    } => (
-                        current_reply_tool_call_count,
-                        prepared_tool_calls,
-                        effective_tool_policy,
-                    ),
-                };
-
-            if !prepared_tool_calls.is_empty() {
-                let mut plan_file_edit_calls_this_turn = 0usize;
-                let mut plan_exploration_calls_this_turn = 0usize;
-                let mut plan_ready_after_tool = false;
-                let mut bash_only_tool_turn = true;
-                let current_plan_stage = self.session.mode_state.plan_stage;
-                let plan_missing_before_turn =
-                    if self.session.mode_state.mode == ExecutionMode::Plan {
-                        self.current_plan_contents()
-                            .ok()
-                            .flatten()
-                            .map(|contents| lifecycle::plan_missing_sections(&contents).len())
-                    } else {
-                        None
-                    };
-                let plan_exploration_budget =
-                    lifecycle::plan_stage_exploration_budget(current_plan_stage);
-                tool_calls_made_this_turn += prepared_tool_calls.len();
-                repo_edit_calls_made_this_turn += prepared_tool_calls
-                    .iter()
-                    .filter(|tool_call| recovery::tool_call_counts_as_repo_edit(&tool_call.name))
-                    .count();
-                empty_retries = 0;
-                no_tool_retries = 0;
-                focused_policy_retries = 0;
-                if repo_edit_calls_made_this_turn > 0 {
-                    repo_change_retries = 0;
-                }
-
-                self.session.messages.push(ConversationMessage::assistant(
-                    reply_content,
-                    prepared_tool_calls.clone(),
-                ));
-                let mut emitted_bash_loop_note = false;
-                for tool_call in prepared_tool_calls {
-                    let tool_name = tool_call.name.clone();
-                    if tool_name != "Bash" {
-                        bash_only_tool_turn = false;
-                    }
-                    let args_str = tool_call.arguments.to_string();
-                    let bash_command = if tool_name == "Bash" {
-                        tool_call
-                            .arguments
-                            .get("command")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default()
-                            .to_string()
-                    } else {
-                        String::new()
-                    };
-                    if self.session.mode_state.mode == ExecutionMode::Plan {
-                        if is_plan_file_tool_call(
-                            &tool_name,
-                            &tool_call.arguments,
-                            &self.work_root,
-                            self.session.mode_state.active_plan_path.as_deref(),
-                        ) {
-                            plan_file_edit_calls_this_turn += 1;
-                            if !logged_plan_first_write {
-                                logged_plan_first_write = true;
-                                log_llm_event(
-                                    "agent.milestone.plan_first_write",
-                                    serde_json::json!({
-                                        "session_id": self.session_store.session_id(),
-                                        "iter": last_iter,
-                                        "tool": tool_name,
-                                        "path": tool_call.arguments.get("path").and_then(serde_json::Value::as_str),
-                                    }),
-                                );
-                            }
-                        } else if matches!(tool_name.as_str(), "Read" | "Glob" | "Grep") {
-                            plan_exploration_calls_this_turn += 1;
-                        }
-                    }
-                    if self.session.mode_state.mode == ExecutionMode::Act
-                        && recovery::tool_call_counts_as_repo_edit(&tool_name)
-                        && !logged_act_first_repo_edit
-                    {
-                        logged_act_first_repo_edit = true;
-                        log_llm_event(
-                            "agent.milestone.act_first_repo_edit",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "iter": last_iter,
-                                "task_profile": self.session.mode_state.task_profile.as_str(),
-                                "tool": tool_name,
-                                "path": tool_call.arguments.get("path").and_then(serde_json::Value::as_str),
-                            }),
-                        );
-                    }
-                    let block_restart_discovery = recovery::should_block_restart_discovery(
-                        &tool_name,
-                        restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
-                    );
-                    let repeated_plan_exploration =
-                        if self.session.mode_state.mode == ExecutionMode::Plan {
-                            normalize_plan_exploration_key(
-                                &tool_name,
-                                &tool_call.arguments,
-                                &self.work_root,
-                                current_plan_stage.as_str(),
-                            )
-                            .map(|key| {
-                                let count = plan_exploration_counts.entry(key.clone()).or_insert(0);
-                                *count += 1;
-                                if *count == PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD {
-                                    log_llm_event(
-                                        "agent.plan.repeated_exploration_detected",
-                                        serde_json::json!({
-                                            "session_id": self.session_store.session_id(),
-                                            "iter": last_iter,
-                                            "stage": key.stage,
-                                            "tool": key.tool_name,
-                                            "normalized_args": key.normalized_args,
-                                            "count": *count,
-                                        }),
-                                    );
-                                }
-                                *count >= PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD
-                            })
-                            .unwrap_or(false)
-                        } else {
-                            false
-                        };
-                    // Issue #664: `recovery::should_block_bash_command` is the
-                    // legacy recovery-side semantics (DR1-001 案 B). SetupBootstrap
-                    // policy projection uses `bash::is_setup_command` instead.
-                    #[allow(deprecated)]
-                    let block_bash_loop = tool_name == "Bash"
-                        && recovery::should_block_bash_command(
-                            &bash_command,
-                            &recent_bash_commands,
-                            install_commands_seen,
-                        );
-                    let block_repeated_plan_exploration = self.session.mode_state.mode
-                        == ExecutionMode::Plan
-                        && matches!(tool_name.as_str(), "Read" | "Glob" | "Grep")
-                        && repeated_plan_exploration;
-                    let block_plan_exploration = self.session.mode_state.mode
-                        == ExecutionMode::Plan
-                        && matches!(tool_name.as_str(), "Read" | "Glob" | "Grep")
-                        && plan_exploration_budget > 0
-                        && plan_exploration_calls_this_turn > plan_exploration_budget;
-                    tracing::debug!(
-                        tool = %tool_name,
-                        args = %truncate(&args_str, LOG_ARGS_MAX_CHARS),
-                        "tool call"
-                    );
-                    // Issue #430 Phase D: pause footer redraw for the whole
-                    // tool dispatch (progress println, spinner, child-process
-                    // fd-inheriting exec, optional approve prompt). The guard
-                    // drops at the end of this iteration so the worker resumes
-                    // before the next loop tick.
-                    let _footer_freeze = self.footer.freeze_for_inference();
-                    let progress = if block_restart_discovery {
-                        format_blocked_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                            "Restart discovery blocked",
-                            "Resume from the current repo state instead of restarting broad discovery.",
-                            self.session.mode_state.active_plan_path.as_deref(),
-                            current_plan_stage,
-                        )
-                    } else if block_bash_loop {
-                        format_blocked_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                            "Bash loop blocked",
-                            "Repeated shell command detected; choose a different next step.",
-                            self.session.mode_state.active_plan_path.as_deref(),
-                            current_plan_stage,
-                        )
-                    } else if block_plan_exploration {
-                        format_blocked_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                            "Plan exploration blocked",
-                            "Exploration budget reached for this stage; write the next missing plan section.",
-                            self.session.mode_state.active_plan_path.as_deref(),
-                            current_plan_stage,
-                        )
-                    } else if block_repeated_plan_exploration {
-                        format_blocked_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                            "Plan exploration blocked",
-                            "Repeated exploration detected; move the plan forward instead of rereading.",
-                            self.session.mode_state.active_plan_path.as_deref(),
-                            current_plan_stage,
-                        )
-                    } else {
-                        let live_plan_stage = if self.session.mode_state.mode == ExecutionMode::Plan
-                        {
-                            self.current_plan_contents()
-                                .ok()
-                                .flatten()
-                                .map(|contents| lifecycle::current_plan_stage(&contents))
-                                .unwrap_or(current_plan_stage)
-                        } else {
-                            current_plan_stage
-                        };
-                        let stage_label = progress_stage_label(
-                            self.session.mode_state.mode,
-                            live_plan_stage,
-                            &tool_name,
-                            &tool_call.arguments,
-                            &self.work_root,
-                            self.session.mode_state.active_plan_path.as_deref(),
-                        );
-                        let write_retry_label = if self.session.mode_state.mode
-                            == ExecutionMode::Plan
-                            && is_plan_file_tool_call(
-                                &tool_name,
-                                &tool_call.arguments,
-                                &self.work_root,
-                                self.session.mode_state.active_plan_path.as_deref(),
-                            ) {
-                            let raw_path = tool_call
-                                .arguments
-                                .get("path")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default();
-                            let source_text = tool_call
-                                .arguments
-                                .get("content")
-                                .or_else(|| tool_call.arguments.get("new_string"))
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default();
-                            let summary = summarize_plan_write(
-                                &tool_name,
-                                raw_path,
-                                source_text,
-                                &self.work_root,
-                                self.session.mode_state.active_plan_path.as_deref(),
-                                live_plan_stage,
-                            );
-                            let count = plan_write_signature_counts
-                                .entry(summary.signature)
-                                .and_modify(|value| *value += 1)
-                                .or_insert(1);
-                            (*count > 1).then(|| format!("Model rewrite #{}", *count))
-                        } else {
-                            None
-                        };
-                        format_progress_line(
-                            &tool_name,
-                            &tool_call.arguments,
-                            iter_count + 1,
-                            self.config.max_iterations,
-                            &self.work_root,
-                            use_color,
-                            use_unicode,
-                            self.footer.current_cols(),
-                            self.session.mode_state.active_plan_path.as_deref(),
-                            live_plan_stage,
-                            write_retry_label.as_deref(),
-                            stage_label.as_deref(),
-                        )
-                    };
-                    write_stdout_rendered(&progress, true);
-                    // approve-guard: tools Bash/Write/Edit may invoke an
-                    // interactive approve prompt in `tools/registry.rs`. We
-                    // must not let the spinner write to stderr while stdin is
-                    // being read. Skip spinner in that narrow case; RAII
-                    // scope ends when execute_tool_call returns for all
-                    // other branches.
-                    let needs_approve_prompt =
-                        matches!(tool_name.as_str(), "Bash" | "Write" | "Edit")
-                            && !self.config.yes_mode
-                            && io::stdin().is_terminal();
-                    let start_spinner_for_exec = !needs_approve_prompt;
-                    // Yield raw mode to the approve `stdin().read_line` and park
-                    // the daemon thread until `resume()` is called. Idempotent,
-                    // so a tool that never triggers the prompt is unaffected.
-                    if needs_approve_prompt {
-                        monitor.pause();
-                    }
-                    let raw_result = if block_restart_discovery {
-                        recovery::broad_restart_discovery_error(&tool_name)
-                    } else if block_repeated_plan_exploration {
-                        let next_sections = self
-                            .current_plan_contents()
-                            .ok()
-                            .flatten()
-                            .map(|contents| lifecycle::plan_next_stage_sections(&contents))
-                            .unwrap_or_default();
-                        log_llm_event(
-                            "agent.plan.guard_blocked",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "iter": last_iter,
-                                "tool": tool_name,
-                                "reason": "repeated_exploration",
-                                "stage": current_plan_stage.as_str(),
-                            }),
-                        );
-                        recovery::repeated_plan_exploration_error(
-                            current_plan_stage,
-                            &next_sections,
-                            &tool_name,
-                        )
-                    } else if block_plan_exploration {
-                        let next_sections = self
-                            .current_plan_contents()
-                            .ok()
-                            .flatten()
-                            .map(|contents| lifecycle::plan_next_stage_sections(&contents))
-                            .unwrap_or_default();
-                        log_llm_event(
-                            "agent.plan.guard_blocked",
-                            serde_json::json!({
-                                "session_id": self.session_store.session_id(),
-                                "iter": last_iter,
-                                "tool": tool_name,
-                                "reason": "exploration_budget",
-                                "stage": current_plan_stage.as_str(),
-                                "budget": plan_exploration_budget,
-                            }),
-                        );
-                        recovery::plan_stage_budget_error(
-                            current_plan_stage,
-                            &next_sections,
-                            plan_exploration_budget,
-                        )
-                    } else if tool_name == "Bash" {
-                        recent_bash_commands.push(bash_command.clone());
-                        // Issue #664: legacy recovery-side classifier; retains
-                        // `cargo install` semantics for the install-loop counter.
-                        // SetupBootstrap policy projection uses
-                        // `bash::is_setup_command` instead.
-                        #[allow(deprecated)]
-                        let is_install = recovery::is_dependency_install_command(&bash_command);
-                        if is_install {
-                            install_commands_seen += 1;
-                        }
-                        if block_bash_loop {
-                            emitted_bash_loop_note = true;
-                            // CB-001: pre-dispatch unsafe/repeated-block path.
-                            // Record an UnsafeCommandBlocked frame so the
-                            // session reflects the gate decision.
-                            let frame =
-                                build_feedback_for_unsafe_block(&bash_command, &self.work_root);
-                            self.session.record_feedback(frame);
-                            // Issue #456: count this unsafe block toward the
-                            // turn-local AnvilScore counter.
-                            self.session.unsafe_blocks_this_turn =
-                                self.session.unsafe_blocks_this_turn.saturating_add(1);
-                            recovery::repeated_bash_error(&bash_command)
-                        } else if start_spinner_for_exec {
-                            let _sp = Spinner::start(format!("running {tool_name}..."));
-                            self.execute_tool_call(
-                                &tool_name,
-                                &tool_call.arguments,
-                                Some(&effective_tool_policy),
-                                Some(interrupt_flag.flag.clone()),
-                            )
-                        } else {
-                            self.execute_tool_call(
-                                &tool_name,
-                                &tool_call.arguments,
-                                Some(&effective_tool_policy),
-                                Some(interrupt_flag.flag.clone()),
-                            )
-                        }
-                    } else if start_spinner_for_exec {
-                        let _sp = Spinner::start(format!("running {tool_name}..."));
-                        self.execute_tool_call(
-                            &tool_name,
-                            &tool_call.arguments,
-                            Some(&effective_tool_policy),
-                            Some(interrupt_flag.flag.clone()),
-                        )
-                    } else {
-                        self.execute_tool_call(
-                            &tool_name,
-                            &tool_call.arguments,
-                            Some(&effective_tool_policy),
-                            Some(interrupt_flag.flag.clone()),
-                        )
-                    };
-                    if needs_approve_prompt {
-                        monitor.resume();
-                    }
-
-                    // detect work_root change after each tool execution
-                    if self.work_root != last_known_root {
-                        let verif = verify_repo_progress(&before_snapshot, &last_known_root);
-                        accumulated.push(verif);
-                        before_snapshot = capture_repo_snapshot(&self.work_root);
-                        last_known_root = self.work_root.clone();
-                    }
-
-                    let compact_result = prompting::compact_tool_result(&tool_name, raw_result);
-                    self.session
-                        .messages
-                        .push(ConversationMessage::tool(tool_name.clone(), compact_result));
-
-                    // CB-002: if an artifact-directed WrongTarget rejection
-                    // just exhausted the role-specific retry budget inside
-                    // `execute_tool_call`, the actor loop must terminate
-                    // with `MissingRepoEdits` mirror to the NoTool /
-                    // ProseOnly exhaustion exits above (lines 6566 /
-                    // 6741). The flag was flipped in
-                    // `record_artifact_completion_attempt` and is reset
-                    // at `handle_user_message` head.
-                    if self.artifact_completion_exhausted_this_turn {
-                        exit_reason = ExitReason::MissingRepoEdits;
-                        error_text = ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string();
-                        break 'outer;
-                    }
-
-                    if self.session.mode_state.mode == ExecutionMode::Plan
-                        && is_plan_file_tool_call(
-                            &tool_name,
-                            &tool_call.arguments,
-                            &self.work_root,
-                            self.session.mode_state.active_plan_path.as_deref(),
-                        )
-                        && self
-                            .current_plan_contents()
-                            .ok()
-                            .flatten()
-                            .is_some_and(|contents| {
-                                self.plan_is_approval_ready_with_fallback(&contents)
-                            })
-                    {
-                        plan_ready_after_tool = true;
-                        break;
-                    }
-                }
-                match handle_actor_loop_plan_tool_followup(
-                    self,
-                    ActorLoopPlanToolFollowupArgs {
-                        last_iter,
-                        plan_ready_after_tool,
-                        plan_file_edit_calls_this_turn,
-                        plan_exploration_calls_this_turn,
-                        plan_missing_before_turn,
-                        plan_progress_retries: &mut plan_progress_retries,
-                        plan_exploration_only_turns: &mut plan_exploration_only_turns,
-                    },
-                ) {
-                    ActorLoopPlanToolFollowupOutcome::Proceed => {}
-                    ActorLoopPlanToolFollowupOutcome::Done { final_prose: prose } => {
-                        final_prose = prose;
-                        exit_reason = ExitReason::Done;
-                        break 'outer;
-                    }
-                    ActorLoopPlanToolFollowupOutcome::Exit {
-                        reason,
-                        error_text: followup_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = followup_error;
-                        break 'outer;
-                    }
-                }
-                match handle_actor_loop_post_tool_fallbacks(
-                    self,
-                    ActorLoopPostToolFallbackArgs {
-                        last_iter,
-                        action_expectation,
-                        recovery_dispatch_gate,
-                        emitted_bash_loop_note,
-                        bash_only_tool_turn,
-                        repo_edit_calls_made_this_turn,
-                        tool_calls_made_this_turn,
-                        logged_act_first_repo_edit,
-                        repo_change_retries: &mut repo_change_retries,
-                    },
-                ) {
-                    ActorLoopPostToolFallbackOutcome::Proceed => {}
-                    ActorLoopPostToolFallbackOutcome::Continue => continue,
-                    ActorLoopPostToolFallbackOutcome::Exit {
-                        reason,
-                        error_text: followup_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = followup_error;
-                        break 'outer;
-                    }
-                }
-                match handle_actor_loop_post_tool_cleanup(
-                    self,
-                    ActorLoopPostToolCleanupArgs {
-                        task_contract: task_contract.as_ref(),
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                        contract_completion_retries,
-                        tool_calls_made_this_turn,
-                        interrupt_flag: &interrupt_flag,
-                    },
-                ) {
-                    ActorLoopPostToolCleanupOutcome::Continue => continue,
-                    ActorLoopPostToolCleanupOutcome::Exit {
-                        reason,
-                        error_text: cleanup_error,
-                    } => {
-                        exit_reason = reason;
-                        error_text = cleanup_error;
-                        break 'outer;
-                    }
-                }
-            }
-
-            let final_reply = reply_content.trim().to_string();
-            if missing_verifier_setup_turn {
-                if self.record_missing_verifier_setup_failure(last_iter, "no setup edit emitted") {
-                    exit_reason = ExitReason::MissingVerification;
-                    error_text =
-                        "task contract requires verification, but the MissingVerifierJob setup budget is exhausted"
-                            .to_string();
-                    break 'outer;
-                }
-                continue;
-            }
-            let task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan {
-                None
-            } else {
-                task_contract.as_ref().map(|contract| {
-                    self.task_contract_recovery_action(
-                        contract,
-                        contract_verifier_repair_edit_count,
-                        repo_edit_calls_made_this_turn,
-                    )
-                })
-            };
-            match handle_actor_loop_task_contract_reply(
-                self,
-                ActorLoopTaskContractReplyArgs {
-                    before_snapshot: &before_snapshot,
-                    accumulated: &accumulated,
-                    task_contract: task_contract.as_ref(),
-                    task_contract_action: task_contract_action.as_ref(),
-                    final_reply: &final_reply,
-                    current_reply_tool_call_count,
-                    repo_edit_calls_made_this_turn,
-                    last_iter,
-                    contract_completion_retries: &mut contract_completion_retries,
-                    contract_completion_role_retries: &mut contract_completion_role_retries,
-                    contract_verification_retries: &mut contract_verification_retries,
-                    contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
-                    repo_change_retries: &mut repo_change_retries,
-                    verifier_repair_retries: &mut verifier_repair_retries,
-                    task_contract_verify_commands_collected:
-                        &mut task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop:
-                        &mut task_contract_verifier_passed_in_loop,
-                    no_tool_retries: &mut no_tool_retries,
-                    contract_deterministic_fallback_materialized:
-                        &mut contract_deterministic_fallback_materialized,
-                },
-            ) {
-                ActorLoopTaskContractReplyOutcome::Proceed => {}
-                ActorLoopTaskContractReplyOutcome::Continue => continue,
-                ActorLoopTaskContractReplyOutcome::Done {
-                    final_prose: next_final_prose,
-                } => {
-                    final_prose = next_final_prose;
-                    exit_reason = ExitReason::Done;
-                    break 'outer;
-                }
-                ActorLoopTaskContractReplyOutcome::Exit {
-                    reason,
-                    error_text: next_error_text,
-                } => {
-                    exit_reason = reason;
-                    error_text = next_error_text;
-                    break 'outer;
-                }
-            }
-            match handle_actor_loop_no_tool_reply(
-                self,
-                ActorLoopNoToolReplyArgs {
-                    last_iter,
-                    action_expectation,
-                    requires_action,
-                    recovery_dispatch_gate,
-                    final_reply: &final_reply,
-                    tool_calls_made_this_turn,
-                    repo_change_retries: &mut repo_change_retries,
-                    plan_progress_retries: &mut plan_progress_retries,
-                    empty_retries: &mut empty_retries,
-                    no_tool_retries: &mut no_tool_retries,
-                    framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
-                },
-            ) {
-                ActorLoopNoToolReplyOutcome::NotHandled => {}
-                ActorLoopNoToolReplyOutcome::Continue => continue,
-                ActorLoopNoToolReplyOutcome::Done {
-                    final_prose: next_final_prose,
-                } => {
-                    final_prose = next_final_prose;
-                    exit_reason = ExitReason::Done;
-                    break 'outer;
-                }
-                ActorLoopNoToolReplyOutcome::Exit {
-                    reason,
-                    error_text: next_error_text,
-                } => {
-                    exit_reason = reason;
-                    error_text = next_error_text;
-                    break 'outer;
-                }
-            }
-
-            if let Some(outcome) = handle_post_reply_recovery(
-                self,
-                PostReplyRecoveryArgs {
-                    last_iter,
-                    action_expectation,
-                    requires_action,
-                    recovery_dispatch_gate,
-                    repo_edit_calls_made_this_turn,
-                    final_reply: &final_reply,
-                    task_contract_action: task_contract_action.as_ref(),
-                    interrupt_flag: &interrupt_flag,
-                    repo_change_retries: &mut repo_change_retries,
-                    python_test_retries: &mut python_test_retries,
-                    no_tool_retries: &mut no_tool_retries,
-                    framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
-                },
-            ) {
-                match outcome {
-                    PostReplyRecoveryOutcome::Continue => continue,
-                    PostReplyRecoveryOutcome::Finalize {
-                        final_prose: next_final_prose,
-                        exit_reason: next_exit_reason,
-                        error_text: next_error_text,
-                    } => {
-                        final_prose = next_final_prose;
-                        exit_reason = next_exit_reason;
-                        error_text = next_error_text;
-                        break 'outer;
-                    }
-                }
-            }
-
-            match handle_actor_loop_completion(
-                self,
-                ActorLoopCompletionArgs {
-                    last_iter,
-                    final_reply: &final_reply,
-                    plan_progress_retries: &mut plan_progress_retries,
-                },
-            ) {
-                ActorLoopCompletionOutcome::Continue => continue,
-                ActorLoopCompletionOutcome::Done {
-                    final_prose: next_final_prose,
-                } => {
-                    final_prose = next_final_prose;
-                    exit_reason = ExitReason::Done;
-                    break 'outer;
-                }
-                ActorLoopCompletionOutcome::Exit {
-                    reason,
-                    error_text: next_error_text,
-                } => {
-                    exit_reason = reason;
-                    error_text = next_error_text;
-                    break 'outer;
-                }
-            }
-        }
-
-        // Single exit point: compute stats and return LoopResult
-        let duration_secs = start.elapsed().as_secs();
-        let final_verif = verify_repo_progress(&before_snapshot, &self.work_root);
-        // CB-001 / CB2-002: NoRepoProgress is only recorded when *this turn*
-        // attempted at least one repo-mutating tool call (Write / Edit) but
-        // produced no measurable repo diff, AND no other FeedbackFrame has
-        // already been recorded this turn. Read-only / answer-only turns
-        // (no Write/Edit attempted) intentionally leave `last_feedback`
-        // untouched so consumers do not mistake a successful investigation
-        // for a "no progress" failure (design 5.5 last-write-wins).
-        if should_record_no_repo_progress(
-            repo_edit_calls_made_this_turn,
-            final_verif.made_any_progress(),
-            self.session.eligible_feedback_recorded_this_turn,
-        ) {
-            // Issue #455 / D4: switch to first-eligible-failure-wins so a
-            // deterministic content fallback / NoToolCall frame recorded
-            // earlier in this turn is preserved over the post-loop
-            // NoRepoProgress signal.
-            let frame = build_feedback_for_no_repo_progress(&self.work_root);
-            self.session.record_feedback_if_unset(frame);
-        }
-        // Issue #456: maintain `consecutive_no_progress_turns` baseline. A
-        // turn that produced verifiable progress resets the counter; a turn
-        // that recorded NoRepoProgress increments it. Other failure shapes
-        // (build/test failure with diff, parser failure, etc.) leave the
-        // counter unchanged.
-        if final_verif.made_any_progress() {
-            self.session.consecutive_no_progress_turns = 0;
-        } else if matches!(
-            self.session.last_feedback.as_ref().map(|f| f.kind.clone()),
-            Some(FeedbackKind::NoRepoProgress)
-        ) {
-            self.session.consecutive_no_progress_turns =
-                self.session.consecutive_no_progress_turns.saturating_add(1);
-        }
-        // Issue #601: populate per-turn counters that Case F no-progress
-        // detection consumes. The SSOT for `iter_count_this_turn` is the
-        // local `last_iter.min(self.config.max_iterations)` expression below
-        // (S5-002 — `self.last_iter` field does NOT exist; only the local
-        // mutable `last_iter` in the actor loop exists). For
-        // `tool_calls_this_turn` the SSOT is the local
-        // `tool_calls_made_this_turn` counter. Populate happens here, after
-        // the loop exits but before any post-loop hook reads the values
-        // (Reminder / CaseRecord / AntiPattern / photon evaluate all run
-        // below this line).
-        self.session.iter_count_this_turn = last_iter.min(self.config.max_iterations);
-        self.session.tool_calls_this_turn = tool_calls_made_this_turn;
-        let stats = build_stats(
-            accumulated,
-            final_verif.clone(),
-            last_iter.min(self.config.max_iterations),
-            self.config.max_iterations,
-            duration_secs,
-        );
-        if exit_reason == ExitReason::ToolCallFormatError
-            && model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
-            && stats.total_changed > 0
-            && self.session.mode_state.mode == ExecutionMode::Act
-            && (!self.active_python_request_requires_tests() || self.python_test_artifact_exists())
-        {
-            // Issue #634: 旧文言は qwen3.5 を名指ししていたが、capability ベース
-            // (`finish_after_edit_format_error`) に統一されたためモデル非依存の文言に変更。
-            final_prose =
-                "Applied repository edits before a malformed follow-up tool call.".to_string();
-            exit_reason = ExitReason::Done;
-            error_text.clear();
-        }
-        let mut verify_commands_collected = task_contract_verify_commands_collected;
-        verify_commands_collected.extend(self.run_post_loop_success_verifier(
-            &final_verif,
-            &stats,
-            repo_edit_calls_made_this_turn,
-            task_contract_verifier_passed_in_loop,
-            &mut exit_reason,
-            &mut error_text,
-        ));
-        // Issue #452: Reminder Sidecar (post-loop hook). Picks up
-        // NoRepoProgress / auto_test / NoVerifierAvailable frames recorded
-        // after the actor loop exited. Per-turn cap means this no-ops if the
-        // iteration-internal hook already ran.
-        self.maybe_invoke_reminder(&interrupt_flag);
-        // Issue #462: CaseRecord extraction (post-loop, after Reminder, before
-        // turn_completed event). Pure success-condition + scrub + persist; no
-        // sidecar / LLM calls. Failures are logged and never propagate.
-        //
-        // DR2-008 (Issue #604): now returns `Option<CaseRecord>` so the
-        // post-loop auto-promote hook can consume the freshly-extracted record
-        // without re-reading from disk.
-        let extracted_case = self.maybe_extract_case_record(&stats, &verify_commands_collected);
-        // Issue #464: AntiPatternRecord extraction (post-loop, after CaseRecord).
-        // Triggered by the latest eligible failure feedback. Pure upsert; no
-        // sidecar / LLM calls.
-        self.maybe_extract_anti_pattern();
-
-        // [Issue #556] post-loop photon evaluate hook — must run before
-        // build_eval_record so last_photon_eval_summary is populated.
-        // Clear per-turn context_pack_response here (no longer needed).
-        self.photon_context_pack_response = None;
-        if self.session.mode_state.mode != ExecutionMode::Plan {
-            self.invoke_photon_evaluate();
-        } else if self.photon.is_some() {
-            log_llm_event(
-                "agent.photon_evaluate.skipped",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "reason": "plan_mode",
-                }),
-            );
-        }
-
-        // Issue #604 (Task 5.2): post-loop auto-promote hook. Order B —
-        // runs *after* invoke_photon_evaluate, before build_eval_record so
-        // `last_auto_promote_outcome` is populated for `EvalRecord.auto_promote`.
-        // Fail-open: the hook never panics or interrupts the agent loop.
-        {
-            use crate::agent::loop_run::auto_promote::{
-                AutoPromoteConfig, invoke_photon_auto_promote,
-            };
-            use crate::session::auto_promote_scrub::ScrubMode;
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            let now_unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let interrupted = interrupt_flag.is_set();
-            let session_id = self.session_store.session_id().to_string();
-            let turn_idx = self.current_turn_index as u64;
-            let state_root = self.session_store.state_root().to_path_buf();
-            let cfg = AutoPromoteConfig {
-                enabled: self.config.photon_auto_promote,
-                force_disabled: self.config.photon_no_auto_promote,
-                dry_run: self.config.photon_auto_promote_dry_run,
-                scrub_mode: ScrubMode::from_env_str_or_default(
-                    &self.config.photon_auto_promote_scrub_mode,
-                ),
-            };
-            // Per-turn cap: set BEFORE invoking on non-Interrupted/non-Disabled
-            // paths. DR2-010 — Interrupted intentionally leaves the flag false
-            // so the next turn can re-try. The hook itself never flips it
-            // (the flag is the caller's responsibility).
-            let will_invoke = !interrupted
-                && cfg.enabled
-                && !cfg.force_disabled
-                && self.photon.is_some()
-                && !self.session.auto_promote_called_this_turn;
-            if will_invoke {
-                self.session.auto_promote_called_this_turn = true;
-            }
-            // Borrow split: read all `&self`-only fields first, then re-borrow
-            // `self.photon` and call the free function.
-            let plan_mode = self.session.mode_state.mode == ExecutionMode::Plan;
-            let auto_called = self.session.auto_promote_called_this_turn;
-            // NB: `should_auto_promote` re-checks `auto_called` and routes to
-            // `PerTurnCapConsumed` only if the flag was *already* true on
-            // entry. Because we just flipped it ABOVE (on the will_invoke path),
-            // we pass the pre-flip value here.
-            let auto_called_for_gate = if will_invoke { false } else { auto_called };
-            let extracted_this_turn = self.session.case_record_extracted_this_turn;
-            let photon_ref = self.photon.as_ref();
-            let outcome = invoke_photon_auto_promote(
-                &session_id,
-                turn_idx,
-                plan_mode,
-                auto_called_for_gate,
-                extracted_this_turn,
-                extracted_case.as_ref(),
-                &state_root,
-                now_unix,
-                interrupted,
-                photon_ref,
-                &cfg,
-            );
-            self.last_auto_promote_outcome = Some(outcome);
-        }
-
-        // Issue #471: write structured eval log record (turn-level snapshot).
-        {
-            use crate::session::eval_log::{
-                AnvilScoreSummary, ChangedFileClasses, EvalPrecautionSnapshot,
-                FeedbackFrameSummary, build_eval_record, write_eval_record,
-            };
-            use crate::session::precaution::PrecautionStatus;
-            use std::time::{SystemTime, UNIX_EPOCH};
-
-            let ts_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let active_task = self
-                .session
-                .working_memory
-                .active_task
-                .as_deref()
-                .unwrap_or("");
-            let session_id = self.session_store.session_id().to_string();
-            let model = self.models.main.clone();
-            let mode_str = format!("{:?}", self.session.mode_state.mode);
-            let tool_protocol = if self.native_tools_enabled {
-                "native"
-            } else {
-                "xml"
-            };
-            let feedback_summary =
-                self.session
-                    .last_feedback
-                    .as_ref()
-                    .map(|ff| FeedbackFrameSummary {
-                        kind: format!("{:?}", ff.kind),
-                        excerpt: {
-                            let raw = format!("{}{}", ff.stdout_excerpt(), ff.stderr_excerpt());
-                            let masked = crate::session::feedback::mask_secrets(&raw);
-                            if masked.len()
-                                > crate::session::eval_log::MAX_EVAL_FEEDBACK_EXCERPT_BYTES
-                            {
-                                let mut end =
-                                    crate::session::eval_log::MAX_EVAL_FEEDBACK_EXCERPT_BYTES;
-                                while !masked.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                format!("{}…", &masked[..end])
-                            } else {
-                                masked
-                            }
-                        },
-                    });
-            let precaution_snapshots: Vec<EvalPrecautionSnapshot> = self
-                .session
-                .working_memory
-                .active_precautions
-                .iter()
-                .filter(|p| p.status == PrecautionStatus::Active)
-                .map(EvalPrecautionSnapshot::from)
-                .collect();
-            let anvil_summary = self
-                .session
-                .last_anvil_score
-                .as_ref()
-                .map(AnvilScoreSummary::from);
-            let changed_classes = ChangedFileClasses {
-                test: stats.changed_test_count,
-                impl_files: stats.changed_impl_count,
-                setup: stats.changed_setup_count,
-            };
-            let mut record = build_eval_record(
-                &session_id,
-                ts_ms,
-                active_task,
-                &model,
-                &mode_str,
-                tool_protocol,
-                &tool_call_summaries,
-                feedback_summary,
-                &precaution_snapshots,
-                anvil_summary,
-                changed_classes,
-                &verify_commands_collected,
-                self.last_case_retrieval_summary.take(),
-                self.last_photon_eval_summary.take(),
-                self.last_auto_promote_outcome.clone(),
-                exit_reason.label(),
-            );
-            record.photon_canary = self.config.photon_canary;
-            write_eval_record(&record);
-        }
-
-        // Issue #659 (Task 2.2 / Task 2.7): end-of-turn ArtifactLedger
-        // observability. The turn_summary event fires once per termination
-        // path (both SafeStop and Done); the dual-source divergence
-        // assertion runs adjacent so the adapter-period contract
-        // (`turn_edited_relative_paths` == ledger RepoEdit projection) is
-        // pinned at the same boundary that the summary publishes.
-        self.assert_dual_source_alignment_at_turn_end();
-        self.record_turn_end_artifact_ledger_summary();
-
-        log_llm_event(
-            "agent.milestone.turn_completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "mode": format!("{:?}", self.session.mode_state.mode),
-                "task_profile": self.session.mode_state.task_profile.as_str(),
-                "exit_reason": exit_reason.label(),
-                "iter_used": stats.iter_used,
-                "iter_max": stats.iter_max,
-                "duration_secs": stats.duration_secs,
-                "total_changed": stats.total_changed,
-                "changed_files": stats.changed_files.clone(),
-            }),
-        );
-
-        if exit_reason.is_success() {
-            self.session.messages.push(ConversationMessage::assistant(
-                final_prose.clone(),
-                Vec::new(),
-            ));
-            Ok((final_prose, stats))
-        } else {
-            if error_text.is_empty() {
-                error_text = exit_reason.default_error_text().to_string();
-            }
-            Err((exit_reason, error_text, stats))
         }
     }
 
@@ -9070,7 +7889,7 @@ impl Agent {
         }
     }
 
-    fn current_assistant_model(&self) -> String {
+    pub(super) fn current_assistant_model(&self) -> String {
         assistant_model_for_mode(
             self.session.mode_state.mode,
             &self.models.main,
@@ -12114,7 +10933,7 @@ impl Agent {
         ));
     }
 
-    fn execute_tool_call(
+    pub(super) fn execute_tool_call(
         &mut self,
         name: &str,
         arguments: &serde_json::Value,
@@ -19667,12 +18486,12 @@ struct ProgressDisplay {
     status: Option<String>,
 }
 
-struct PlanWriteSummary {
-    action: String,
-    note: Option<String>,
-    status: Option<String>,
-    phase: String,
-    signature: String,
+pub(super) struct PlanWriteSummary {
+    pub(super) action: String,
+    pub(super) note: Option<String>,
+    pub(super) status: Option<String>,
+    pub(super) phase: String,
+    pub(super) signature: String,
 }
 
 fn plan_path_matches(raw_path: &str, work_root: &Path, plan_path: Option<&Path>) -> bool {
@@ -22019,7 +20838,7 @@ fn summarize_plan_read(contents: &str) -> (String, Option<String>) {
     }
 }
 
-fn summarize_plan_write(
+pub(super) fn summarize_plan_write(
     tool_name: &str,
     raw_path: &str,
     new_text: &str,
@@ -22472,7 +21291,7 @@ pub(super) fn format_progress_line(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn format_blocked_progress_line(
+pub(super) fn format_blocked_progress_line(
     tool_name: &str,
     arguments: &serde_json::Value,
     iter_human: usize,
