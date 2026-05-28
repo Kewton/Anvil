@@ -697,6 +697,64 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
     }
 }
 
+pub(super) fn actor_loop_pre_reply_deterministic_fallback_allowed(
+    repo_edit_calls_made_this_turn: usize,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+) -> bool {
+    repo_edit_calls_made_this_turn == 0 && recovery_dispatch_gate.allows_deterministic_fallback()
+}
+
+pub(super) fn actor_loop_pre_reply_repo_change_fallback_allowed(
+    action_expectation: recovery::ActionExpectation,
+    repo_edit_calls_made_this_turn: usize,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+) -> bool {
+    action_expectation == recovery::ActionExpectation::RepoChange
+        && actor_loop_pre_reply_deterministic_fallback_allowed(
+            repo_edit_calls_made_this_turn,
+            recovery_dispatch_gate,
+        )
+}
+
+pub(super) fn actor_loop_pre_reply_request_error(
+    agent: &mut Agent,
+    err: String,
+) -> ActorLoopPreReplyOutcome {
+    let reason = if err == super::turn::USER_INTERRUPT_ERROR {
+        ExitReason::Interrupted
+    } else if super::lifecycle::is_tool_call_format_error(&err) {
+        ExitReason::ToolCallFormatError
+    } else {
+        ExitReason::TransportError
+    };
+    if err != super::turn::USER_INTERRUPT_ERROR
+        && (super::lifecycle::is_native_tool_parser_failure(&err)
+            || super::lifecycle::is_tool_call_format_error(&err)
+            || super::lifecycle::is_native_tool_transport_failure(&err))
+    {
+        let frame = super::turn::build_feedback_for_tool_protocol_failure(&err, &agent.work_root);
+        agent.session.record_feedback(frame);
+    }
+    ActorLoopPreReplyOutcome::Exit {
+        reason,
+        error_text: err,
+    }
+}
+
+pub(super) fn actor_loop_pre_reply_flow_outcome(
+    outcome: TaskContractVerifierFlowOutcome,
+) -> ActorLoopPreReplyOutcome {
+    match outcome {
+        TaskContractVerifierFlowOutcome::Continue => ActorLoopPreReplyOutcome::Continue,
+        TaskContractVerifierFlowOutcome::Done { final_prose } => {
+            ActorLoopPreReplyOutcome::Done { final_prose }
+        }
+        TaskContractVerifierFlowOutcome::Exit { reason, error_text } => {
+            ActorLoopPreReplyOutcome::Exit { reason, error_text }
+        }
+    }
+}
+
 pub(super) fn handle_actor_loop_rejected_tool_batch(
     agent: &mut Agent,
     args: ActorLoopRejectedToolBatchArgs<'_, '_>,

@@ -20,7 +20,9 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, handle_actor_loop_rejected_tool_batch,
+    TaskContractVerifierFlowOutcome, actor_loop_pre_reply_deterministic_fallback_allowed,
+    actor_loop_pre_reply_flow_outcome, actor_loop_pre_reply_repo_change_fallback_allowed,
+    actor_loop_pre_reply_request_error, handle_actor_loop_rejected_tool_batch,
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
     handle_post_reply_recovery, missing_repo_change_budget_exhausted_outcome,
     plan_tool_followup_done_message, repair_job_done_outcome,
@@ -253,7 +255,7 @@ const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
-const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
+pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
 /// Issue #652 PR-001 SSOT: outcome of
@@ -1529,7 +1531,10 @@ fn build_feedback_for_unsafe_block_reason(
 /// CB-001: build a FeedbackFrame for a tool-protocol failure detected
 /// by `lifecycle::is_native_tool_parser_failure` /
 /// `is_tool_call_format_error` / `is_native_tool_transport_failure`.
-fn build_feedback_for_tool_protocol_failure(err: &str, workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_tool_protocol_failure(
+    err: &str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::ToolProtocolFailure,
         primary_error: Some(err.to_string()),
@@ -5893,12 +5898,12 @@ impl Agent {
             LoopControlAction::ContinueRepairJob { .. } => {
                 let outcome =
                     self.dispatch_repair_job_step(flow_args, args.repo_edit_calls_made_this_turn);
-                Some(Self::actor_loop_pre_reply_flow_outcome(outcome))
+                Some(actor_loop_pre_reply_flow_outcome(outcome))
             }
             LoopControlAction::ContinueMissingVerifierJob { next_action } => self
                 .dispatch_missing_verifier_job_step(flow_args, next_action)
-                .map(Self::actor_loop_pre_reply_flow_outcome),
-            LoopControlAction::RunVerifier => Some(Self::actor_loop_pre_reply_flow_outcome(
+                .map(actor_loop_pre_reply_flow_outcome),
+            LoopControlAction::RunVerifier => Some(actor_loop_pre_reply_flow_outcome(
                 self.drive_task_contract_verifier(flow_args),
             )),
             LoopControlAction::RequestModelTurn => None,
@@ -5925,32 +5930,12 @@ impl Agent {
         None
     }
 
-    fn actor_loop_pre_reply_deterministic_fallback_allowed(
-        repo_edit_calls_made_this_turn: usize,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> bool {
-        repo_edit_calls_made_this_turn == 0
-            && recovery_dispatch_gate.allows_deterministic_fallback()
-    }
-
-    fn actor_loop_pre_reply_repo_change_fallback_allowed(
-        action_expectation: recovery::ActionExpectation,
-        repo_edit_calls_made_this_turn: usize,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> bool {
-        action_expectation == recovery::ActionExpectation::RepoChange
-            && Self::actor_loop_pre_reply_deterministic_fallback_allowed(
-                repo_edit_calls_made_this_turn,
-                recovery_dispatch_gate,
-            )
-    }
-
     fn maybe_continue_actor_loop_mode_deterministic_fallback(
         &mut self,
         args: &mut ActorLoopPreReplyArgs<'_, '_>,
         recovery_dispatch_gate: RecoveryDispatchGate,
     ) -> bool {
-        Self::actor_loop_pre_reply_repo_change_fallback_allowed(
+        actor_loop_pre_reply_repo_change_fallback_allowed(
             args.action_expectation,
             *args.repo_edit_calls_made_this_turn,
             recovery_dispatch_gate,
@@ -5962,7 +5947,7 @@ impl Agent {
         args: &mut ActorLoopPreReplyArgs<'_, '_>,
         recovery_dispatch_gate: RecoveryDispatchGate,
     ) -> bool {
-        if !Self::actor_loop_pre_reply_repo_change_fallback_allowed(
+        if !actor_loop_pre_reply_repo_change_fallback_allowed(
             args.action_expectation,
             *args.repo_edit_calls_made_this_turn,
             recovery_dispatch_gate,
@@ -5983,7 +5968,7 @@ impl Agent {
         args: &mut ActorLoopPreReplyArgs<'_, '_>,
         recovery_dispatch_gate: RecoveryDispatchGate,
     ) -> Option<ActorLoopPreReplyOutcome> {
-        if !Self::actor_loop_pre_reply_deterministic_fallback_allowed(
+        if !actor_loop_pre_reply_deterministic_fallback_allowed(
             *args.repo_edit_calls_made_this_turn,
             recovery_dispatch_gate,
         ) || !self.current_request_needs_playable_ui_quality_gate()
@@ -6021,29 +6006,7 @@ impl Agent {
                 missing_verifier_setup_turn: control_state.missing_verifier_setup_turn,
                 recovery_owner: control_state.recovery_owner,
             },
-            Err(err) => self.actor_loop_pre_reply_request_error(err),
-        }
-    }
-
-    fn actor_loop_pre_reply_request_error(&mut self, err: String) -> ActorLoopPreReplyOutcome {
-        let reason = if err == USER_INTERRUPT_ERROR {
-            ExitReason::Interrupted
-        } else if lifecycle::is_tool_call_format_error(&err) {
-            ExitReason::ToolCallFormatError
-        } else {
-            ExitReason::TransportError
-        };
-        if err != USER_INTERRUPT_ERROR
-            && (lifecycle::is_native_tool_parser_failure(&err)
-                || lifecycle::is_tool_call_format_error(&err)
-                || lifecycle::is_native_tool_transport_failure(&err))
-        {
-            let frame = build_feedback_for_tool_protocol_failure(&err, &self.work_root);
-            self.session.record_feedback(frame);
-        }
-        ActorLoopPreReplyOutcome::Exit {
-            reason,
-            error_text: err,
+            Err(err) => actor_loop_pre_reply_request_error(self, err),
         }
     }
 
@@ -6189,20 +6152,6 @@ impl Agent {
             }
         }
         task_contract
-    }
-
-    fn actor_loop_pre_reply_flow_outcome(
-        outcome: TaskContractVerifierFlowOutcome,
-    ) -> ActorLoopPreReplyOutcome {
-        match outcome {
-            TaskContractVerifierFlowOutcome::Continue => ActorLoopPreReplyOutcome::Continue,
-            TaskContractVerifierFlowOutcome::Done { final_prose } => {
-                ActorLoopPreReplyOutcome::Done { final_prose }
-            }
-            TaskContractVerifierFlowOutcome::Exit { reason, error_text } => {
-                ActorLoopPreReplyOutcome::Exit { reason, error_text }
-            }
-        }
     }
 
     fn drive_actor_loop_tool_preparation_phase(
@@ -32073,24 +32022,26 @@ export default function App() {
         let allowed = super::RecoveryDispatchGate::from_owner(super::RecoveryOwner::None);
         let blocked = super::RecoveryDispatchGate::from_owner(super::RecoveryOwner::RepairJob);
 
-        assert!(super::Agent::actor_loop_pre_reply_deterministic_fallback_allowed(0, allowed));
-        assert!(!super::Agent::actor_loop_pre_reply_deterministic_fallback_allowed(1, allowed));
-        assert!(!super::Agent::actor_loop_pre_reply_deterministic_fallback_allowed(0, blocked));
+        assert!(super::actor_loop_pre_reply_deterministic_fallback_allowed(
+            0, allowed
+        ));
+        assert!(!super::actor_loop_pre_reply_deterministic_fallback_allowed(
+            1, allowed
+        ));
+        assert!(!super::actor_loop_pre_reply_deterministic_fallback_allowed(
+            0, blocked
+        ));
 
-        assert!(
-            super::Agent::actor_loop_pre_reply_repo_change_fallback_allowed(
-                super::recovery::ActionExpectation::RepoChange,
-                0,
-                allowed,
-            )
-        );
-        assert!(
-            !super::Agent::actor_loop_pre_reply_repo_change_fallback_allowed(
-                super::recovery::ActionExpectation::None,
-                0,
-                allowed,
-            )
-        );
+        assert!(super::actor_loop_pre_reply_repo_change_fallback_allowed(
+            super::recovery::ActionExpectation::RepoChange,
+            0,
+            allowed,
+        ));
+        assert!(!super::actor_loop_pre_reply_repo_change_fallback_allowed(
+            super::recovery::ActionExpectation::None,
+            0,
+            allowed,
+        ));
     }
 
     #[test]
