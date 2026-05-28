@@ -206,12 +206,9 @@ use super::deterministic;
 use super::deterministic::empty_framework_app_files as deterministic_empty_framework_app_files;
 #[cfg(test)]
 use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
+use super::progress_text::{format_progress_field, sanitize_for_progress, truncate};
 #[cfg(test)]
-use super::progress_text::is_utf8_locale;
-use super::progress_text::{
-    format_progress_field, paint, progress_available_width, sanitize_for_progress, tool_color,
-    tool_emoji, truncate,
-};
+use super::progress_text::{is_utf8_locale, tool_color, tool_emoji};
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, quality_first_pass_observation,
@@ -18396,11 +18393,11 @@ mod tests {
 /// `arg_budget` caps the Bash command display length (issue #432). Other tool
 /// arms currently ignore this budget; the uniform signature lets the caller
 /// compute the budget once via `progress_available_width`.
-struct ProgressDisplay {
-    action: String,
-    path: Option<String>,
-    note: Option<String>,
-    status: Option<String>,
+pub(super) struct ProgressDisplay {
+    pub(super) action: String,
+    pub(super) path: Option<String>,
+    pub(super) note: Option<String>,
+    pub(super) status: Option<String>,
 }
 
 pub(super) struct PlanWriteSummary {
@@ -20807,7 +20804,7 @@ pub(super) fn summarize_plan_write(
     }
 }
 
-fn tool_display(
+pub(super) fn tool_display(
     tool_name: &str,
     arguments: &serde_json::Value,
     work_root: &std::path::Path,
@@ -21144,119 +21141,6 @@ fn compact_progress_path(path: &str, max_chars: usize) -> String {
 /// when `use_unicode` is true. `cols` is the current terminal width from the
 /// footer broadcaster; `None` falls back to the pre-#432 fixed budget.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn format_progress_line(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    iter_human: usize,
-    max_iterations: usize,
-    work_root: &std::path::Path,
-    use_color: bool,
-    use_unicode: bool,
-    cols: Option<u16>,
-    plan_path: Option<&Path>,
-    current_stage: PlanStage,
-    status_prefix: Option<&str>,
-    stage_label: Option<&str>,
-) -> String {
-    let arg_budget =
-        progress_available_width(cols, tool_name, iter_human, max_iterations, use_unicode);
-    let display = tool_display(
-        tool_name,
-        arguments,
-        work_root,
-        plan_path,
-        current_stage,
-        arg_budget,
-    );
-    // Sanitize before painting so an adversarial tool_name cannot inject escapes.
-    // emoji は &'static str ハードコードなので再 sanitize は不要。
-    let safe_tool_name = sanitize_for_progress(tool_name);
-    let label = if use_unicode {
-        format!("{} {}", tool_emoji(tool_name), safe_tool_name)
-    } else {
-        safe_tool_name
-    };
-    let painted = paint(&label, tool_color(tool_name), use_color);
-    if matches!(tool_name, "Read" | "Write" | "Edit") {
-        let mut lines = Vec::new();
-        let stage = stage_label.unwrap_or("Working");
-        lines.push(format!("[iter {iter_human}/{max_iterations}] {stage}"));
-        lines.push(format!("  tool:   {painted}"));
-        lines.push(format_progress_field("  action: ", &display.action, cols));
-        if let Some(path) = display.path {
-            lines.push(format_progress_field("  file:   ", &path, cols));
-        }
-        if let Some(note) = display.note {
-            lines.push(format_progress_field("  note:   ", &note, cols));
-        }
-        if let Some(status) = display.status {
-            let combined_status = status_prefix
-                .map(|prefix| format!("{prefix} | {status}"))
-                .unwrap_or(status);
-            lines.push(format_progress_field("  status: ", &combined_status, cols));
-        } else if let Some(prefix) = status_prefix {
-            lines.push(format_progress_field("  status: ", prefix, cols));
-        }
-        lines.push(String::new());
-        lines.join("\n")
-    } else {
-        format!(
-            "[iter {iter_human}/{max_iterations}]  {painted}  {}",
-            display.action
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn format_blocked_progress_line(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    iter_human: usize,
-    max_iterations: usize,
-    work_root: &std::path::Path,
-    use_color: bool,
-    use_unicode: bool,
-    cols: Option<u16>,
-    headline: &str,
-    note: &str,
-    plan_path: Option<&Path>,
-    current_stage: PlanStage,
-) -> String {
-    let arg_budget =
-        progress_available_width(cols, headline, iter_human, max_iterations, use_unicode);
-    let display = tool_display(
-        tool_name,
-        arguments,
-        work_root,
-        plan_path,
-        current_stage,
-        arg_budget,
-    );
-    let label = if use_unicode {
-        format!("⛔ {headline}")
-    } else {
-        headline.to_string()
-    };
-    let painted = paint(&label, "\x1b[38;5;196m", use_color);
-    if matches!(tool_name, "Read" | "Write" | "Edit") {
-        let mut lines = Vec::new();
-        lines.push(format!("[iter {iter_human}/{max_iterations}] {headline}"));
-        lines.push(format!("  tool:   {painted}"));
-        lines.push(format_progress_field("  action: ", &display.action, cols));
-        if let Some(path) = display.path {
-            lines.push(format_progress_field("  file:   ", &path, cols));
-        }
-        lines.push(format_progress_field("  status: ", note, cols));
-        lines.push(String::new());
-        lines.join("\n")
-    } else {
-        format!(
-            "[iter {iter_human}/{max_iterations}]  {painted}  {}",
-            display.action
-        )
-    }
-}
-
 #[cfg(test)]
 mod truncate_tests {
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
@@ -21865,6 +21749,7 @@ mod truncate_tests {
 
 #[cfg(test)]
 mod progress_tests {
+    use super::super::actor_loop_flow::{format_blocked_progress_line, format_progress_line};
     use super::super::repair_job::{
         SNAPSHOT_FIELD_BYTE_CAP, sanitize_repair_job_text, truncate_for_snapshot,
     };
@@ -21889,8 +21774,8 @@ mod progress_tests {
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
         focused_edit_tool_batch_action, focused_edit_tool_policy_error,
-        focused_read_target_for_directory, format_blocked_progress_line, format_progress_line,
-        framework_app_fallback_continuation_note, has_successful_non_plan_repo_edit,
+        focused_read_target_for_directory, framework_app_fallback_continuation_note,
+        has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
         has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
         last_read_tool_path, latest_page_copy_block_from_read,

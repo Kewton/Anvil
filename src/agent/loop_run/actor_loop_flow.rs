@@ -42,7 +42,7 @@ use crate::agent::orchestration::{
 use crate::agent::recovery;
 use crate::logging::log_llm_event;
 use crate::model_capabilities::model_capabilities;
-use crate::modes::plan_act::ExecutionMode;
+use crate::modes::plan_act::{ExecutionMode, PlanStage};
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::session::feedback::FeedbackKind;
@@ -52,7 +52,10 @@ use super::Agent;
 use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, RecoveryOwner};
 use super::interrupt::{InterruptFlag, InterruptMonitor};
 use super::lifecycle;
-use super::progress_text::truncate;
+use super::progress_text::{
+    format_progress_field, paint, progress_available_width, sanitize_for_progress, tool_color,
+    tool_emoji, truncate,
+};
 use super::progress_text::{no_color_requested, unicode_supported};
 use super::spinner::Spinner;
 use super::summary::{ExitReason, LoopResult, LoopStats};
@@ -62,9 +65,8 @@ use super::tool_policy::EffectiveToolPolicy;
 use super::turn::{
     LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, PlanExplorationKey,
     build_feedback_for_no_repo_progress, build_feedback_for_unsafe_block,
-    format_blocked_progress_line, format_progress_line, normalize_plan_exploration_key,
-    progress_stage_label, should_record_no_repo_progress, summarize_plan_write,
-    write_stdout_rendered,
+    normalize_plan_exploration_key, progress_stage_label, should_record_no_repo_progress,
+    summarize_plan_write, tool_display, write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
@@ -3970,5 +3972,119 @@ pub(super) fn build_stats(
         changed_impl_count: impl_changed,
         changed_test_count: test_changed,
         changed_setup_count: setup_changed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn format_progress_line(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    iter_human: usize,
+    max_iterations: usize,
+    work_root: &std::path::Path,
+    use_color: bool,
+    use_unicode: bool,
+    cols: Option<u16>,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+    status_prefix: Option<&str>,
+    stage_label: Option<&str>,
+) -> String {
+    let arg_budget =
+        progress_available_width(cols, tool_name, iter_human, max_iterations, use_unicode);
+    let display = tool_display(
+        tool_name,
+        arguments,
+        work_root,
+        plan_path,
+        current_stage,
+        arg_budget,
+    );
+    // Sanitize before painting so an adversarial tool_name cannot inject escapes.
+    // emoji は &'static str ハードコードなので再 sanitize は不要。
+    let safe_tool_name = sanitize_for_progress(tool_name);
+    let label = if use_unicode {
+        format!("{} {}", tool_emoji(tool_name), safe_tool_name)
+    } else {
+        safe_tool_name
+    };
+    let painted = paint(&label, tool_color(tool_name), use_color);
+    if matches!(tool_name, "Read" | "Write" | "Edit") {
+        let mut lines = Vec::new();
+        let stage = stage_label.unwrap_or("Working");
+        lines.push(format!("[iter {iter_human}/{max_iterations}] {stage}"));
+        lines.push(format!("  tool:   {painted}"));
+        lines.push(format_progress_field("  action: ", &display.action, cols));
+        if let Some(path) = display.path {
+            lines.push(format_progress_field("  file:   ", &path, cols));
+        }
+        if let Some(note) = display.note {
+            lines.push(format_progress_field("  note:   ", &note, cols));
+        }
+        if let Some(status) = display.status {
+            let combined_status = status_prefix
+                .map(|prefix| format!("{prefix} | {status}"))
+                .unwrap_or(status);
+            lines.push(format_progress_field("  status: ", &combined_status, cols));
+        } else if let Some(prefix) = status_prefix {
+            lines.push(format_progress_field("  status: ", prefix, cols));
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    } else {
+        format!(
+            "[iter {iter_human}/{max_iterations}]  {painted}  {}",
+            display.action
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn format_blocked_progress_line(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    iter_human: usize,
+    max_iterations: usize,
+    work_root: &std::path::Path,
+    use_color: bool,
+    use_unicode: bool,
+    cols: Option<u16>,
+    headline: &str,
+    note: &str,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+) -> String {
+    let arg_budget =
+        progress_available_width(cols, headline, iter_human, max_iterations, use_unicode);
+    let display = tool_display(
+        tool_name,
+        arguments,
+        work_root,
+        plan_path,
+        current_stage,
+        arg_budget,
+    );
+    let label = if use_unicode {
+        format!("⛔ {headline}")
+    } else {
+        headline.to_string()
+    };
+    let painted = paint(&label, "\x1b[38;5;196m", use_color);
+    if matches!(tool_name, "Read" | "Write" | "Edit") {
+        let mut lines = Vec::new();
+        lines.push(format!("[iter {iter_human}/{max_iterations}] {headline}"));
+        lines.push(format!("  tool:   {painted}"));
+        lines.push(format_progress_field("  action: ", &display.action, cols));
+        if let Some(path) = display.path {
+            lines.push(format_progress_field("  file:   ", &path, cols));
+        }
+        lines.push(format_progress_field("  status: ", note, cols));
+        lines.push(String::new());
+        lines.join("\n")
+    } else {
+        format!(
+            "[iter {iter_human}/{max_iterations}]  {painted}  {}",
+            display.action
+        )
     }
 }
