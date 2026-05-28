@@ -1208,47 +1208,50 @@ fn answer_only_script_execution_fallback_response(output: &str) -> String {
     )
 }
 
+const ANSWER_ONLY_SCRIPT_ALLOWED_PREFIXES: &[&str] =
+    &["bash ", "sh ", "./", "python ", "python3 ", "node "];
+const ANSWER_ONLY_SCRIPT_BLOCKED_CONTAINS: &[&str] = &[
+    " >", ">>", " 2>", " | ", " && ", " || ", ";", " rm ", " mv ", " cp ", " touch ", " mkdir ",
+    " tee ", "sed -i", "perl -pi",
+];
+const ANSWER_ONLY_SCRIPT_BLOCKED_PREFIXES: &[&str] =
+    &["rm ", "mv ", "cp ", "touch ", "mkdir ", "tee "];
+
+fn answer_only_script_contains_any(command: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| command.contains(pattern))
+}
+
+fn answer_only_script_starts_with_any(command: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| command.starts_with(prefix))
+}
+
+fn answer_only_cd_segment_allowed(segment: &str) -> bool {
+    segment.starts_with("cd ") && !answer_only_script_contains_any(segment, &[";", "|", ">"])
+}
+
+fn answer_only_cd_chained_script_tail(command: &str) -> Option<&str> {
+    let (cd_segment, rest) = command.split_once(" && ")?;
+    answer_only_cd_segment_allowed(cd_segment).then_some(rest)
+}
+
+fn answer_only_script_has_blocked_operation(command: &str) -> bool {
+    answer_only_script_contains_any(command, ANSWER_ONLY_SCRIPT_BLOCKED_CONTAINS)
+        || answer_only_script_starts_with_any(command, ANSWER_ONLY_SCRIPT_BLOCKED_PREFIXES)
+}
+
 fn answer_only_script_command_allowed(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if let Some((cd_segment, rest)) = lower.split_once(" && ")
-        && cd_segment.starts_with("cd ")
-        && !cd_segment.contains(';')
-        && !cd_segment.contains('|')
-        && !cd_segment.contains('>')
-    {
+    if let Some(rest) = answer_only_cd_chained_script_tail(&lower) {
         return answer_only_script_command_allowed(rest);
     }
-    if lower.contains(" >")
-        || lower.contains(">>")
-        || lower.contains(" 2>")
-        || lower.contains(" | ")
-        || lower.contains(" && ")
-        || lower.contains(" || ")
-        || lower.contains(';')
-        || lower.contains(" rm ")
-        || lower.starts_with("rm ")
-        || lower.contains(" mv ")
-        || lower.starts_with("mv ")
-        || lower.contains(" cp ")
-        || lower.starts_with("cp ")
-        || lower.contains(" touch ")
-        || lower.starts_with("touch ")
-        || lower.contains(" mkdir ")
-        || lower.starts_with("mkdir ")
-        || lower.contains(" tee ")
-        || lower.starts_with("tee ")
-        || lower.contains("sed -i")
-        || lower.contains("perl -pi")
-    {
+    if answer_only_script_has_blocked_operation(&lower) {
         return false;
     }
-    ["bash ", "sh ", "./", "python ", "python3 ", "node "]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    answer_only_script_starts_with_any(&lower, ANSWER_ONLY_SCRIPT_ALLOWED_PREFIXES)
 }
 
 // --- Issue #450 FeedbackFrame builders --------------------------------
@@ -17376,8 +17379,15 @@ mod tests {
         assert!(answer_only_script_command_allowed(
             "cd /tmp/project && bash check_env.sh"
         ));
+        assert!(answer_only_script_command_allowed("python3 check_env.py"));
         assert!(!answer_only_script_command_allowed(
             "bash check_env.sh > out.txt"
+        ));
+        assert!(!answer_only_script_command_allowed(
+            "cd /tmp; pwd && bash check_env.sh"
+        ));
+        assert!(!answer_only_script_command_allowed(
+            "bash check_env.sh && bash next_step.sh"
         ));
         assert!(!answer_only_script_command_allowed("rm generated.txt"));
     }

@@ -575,48 +575,76 @@ pub(super) fn rejected_reason_for_repair_attempt_outcome_kind(
     }
 }
 
+const REPAIR_ERROR_TIMEOUT_PATTERNS: &[&str] = &[
+    "verifier_repair_pass_timeout",
+    "provider timeout",
+    "provider timed out",
+    "request timed out",
+    "timed out",
+    "timeout",
+];
+const REPAIR_ERROR_NO_SAFE_TARGET_PATTERNS: &[&str] =
+    &["no safe repair target", "no safe candidate"];
+const REPAIR_ERROR_AMBIGUOUS_PATTERNS: &[&str] = &["ambiguous", "authority"];
+const REPAIR_ERROR_WRONG_TARGET_PATTERNS: &[&str] = &[
+    "target_mismatch",
+    "wrong target",
+    "does not match selected repair target",
+];
+const REPAIR_ERROR_DUPLICATE_PATTERNS: &[&str] = &["duplicate"];
+const REPAIR_ERROR_NOOP_PATTERNS: &[&str] = &["noop", "no-op", "no changes"];
+const REPAIR_ERROR_UNSAFE_PATTERNS: &[&str] = &["weakening", "unsafe"];
+const REPAIR_ERROR_MALFORMED_PATTERNS: &[&str] = &[
+    "json",
+    "malformed",
+    "tool calls",
+    "admission rejected",
+    "missing string field",
+    "edits array",
+];
+const REPAIR_ERROR_REASON_PATTERNS: &[(RejectedAttemptReason, &[&str])] = &[
+    (
+        RejectedAttemptReason::ProviderTimeout,
+        REPAIR_ERROR_TIMEOUT_PATTERNS,
+    ),
+    (
+        RejectedAttemptReason::NoSafeCandidate,
+        REPAIR_ERROR_NO_SAFE_TARGET_PATTERNS,
+    ),
+    (
+        RejectedAttemptReason::AmbiguousAuthority,
+        REPAIR_ERROR_AMBIGUOUS_PATTERNS,
+    ),
+    (
+        RejectedAttemptReason::WrongTarget,
+        REPAIR_ERROR_WRONG_TARGET_PATTERNS,
+    ),
+    (
+        RejectedAttemptReason::DuplicatePatch,
+        REPAIR_ERROR_DUPLICATE_PATTERNS,
+    ),
+    (RejectedAttemptReason::NoopPatch, REPAIR_ERROR_NOOP_PATTERNS),
+    (
+        RejectedAttemptReason::UnsafePatch,
+        REPAIR_ERROR_UNSAFE_PATTERNS,
+    ),
+    (
+        RejectedAttemptReason::MalformedPatch,
+        REPAIR_ERROR_MALFORMED_PATTERNS,
+    ),
+];
+
+fn repair_error_matches_any(lower: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
 pub(super) fn rejected_reason_for_repair_error(error: &str) -> Option<RejectedAttemptReason> {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("verifier_repair_pass_timeout")
-        || lower.contains("provider timeout")
-        || lower.contains("provider timed out")
-        || lower.contains("request timed out")
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-    {
-        return Some(RejectedAttemptReason::ProviderTimeout);
-    }
-    if lower.contains("no safe repair target") || lower.contains("no safe candidate") {
-        return Some(RejectedAttemptReason::NoSafeCandidate);
-    }
-    if lower.contains("ambiguous") || lower.contains("authority") {
-        return Some(RejectedAttemptReason::AmbiguousAuthority);
-    }
-    if lower.contains("target_mismatch")
-        || lower.contains("wrong target")
-        || lower.contains("does not match selected repair target")
-    {
-        return Some(RejectedAttemptReason::WrongTarget);
-    }
-    if lower.contains("duplicate") {
-        return Some(RejectedAttemptReason::DuplicatePatch);
-    }
-    if lower.contains("noop") || lower.contains("no-op") || lower.contains("no changes") {
-        return Some(RejectedAttemptReason::NoopPatch);
-    }
-    if lower.contains("weakening") || lower.contains("unsafe") {
-        return Some(RejectedAttemptReason::UnsafePatch);
-    }
-    if lower.contains("json")
-        || lower.contains("malformed")
-        || lower.contains("tool calls")
-        || lower.contains("admission rejected")
-        || lower.contains("missing string field")
-        || lower.contains("edits array")
-    {
-        return Some(RejectedAttemptReason::MalformedPatch);
-    }
-    None
+    REPAIR_ERROR_REASON_PATTERNS
+        .iter()
+        .find_map(|(reason, patterns)| {
+            repair_error_matches_any(&lower, patterns).then_some(*reason)
+        })
 }
 
 pub(super) fn lifecycle_event_for_repair_error(
@@ -624,10 +652,10 @@ pub(super) fn lifecycle_event_for_repair_error(
     active_target_hint: Option<&RecoveryTargetHint>,
 ) -> Option<RepairJobEvent> {
     let lower = error.to_ascii_lowercase();
-    if lower.contains("ambiguous") || lower.contains("authority") {
+    if repair_error_matches_any(&lower, REPAIR_ERROR_AMBIGUOUS_PATTERNS) {
         return Some(RepairJobEvent::AmbiguousAuthority);
     }
-    if lower.contains("no safe repair target") || lower.contains("no safe candidate") {
+    if repair_error_matches_any(&lower, REPAIR_ERROR_NO_SAFE_TARGET_PATTERNS) {
         return Some(RepairJobEvent::NoSafeTarget);
     }
     let target_hint = active_target_hint?;
@@ -898,54 +926,22 @@ impl RepairJob {
             };
         }
         if self.repeated_rejected_attempt().is_some() {
-            if self.assessment_attempts
-                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-            {
-                return RepairNextAction::Replan;
-            }
-            return RepairNextAction::SafeStop {
-                reason: RepairTerminalReason::PatchRejectedRepeatedly,
-            };
+            return self.replan_or_safe_stop(RepairTerminalReason::PatchRejectedRepeatedly);
         }
         if self.assessment.is_none() {
-            if self.assessment_attempts
-                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-            {
-                return RepairNextAction::RequestDiagnostic;
-            }
-            return RepairNextAction::SafeStop {
-                reason: RepairTerminalReason::DiagnosticUnavailable,
-            };
+            return self
+                .request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable);
         }
         if semantic_plan_is_stale(self) {
-            if self.assessment_attempts
-                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-            {
-                return RepairNextAction::RequestDiagnostic;
-            }
-            return RepairNextAction::SafeStop {
-                reason: RepairTerminalReason::DiagnosticUnavailable,
-            };
+            return self
+                .request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable);
         }
         if self.needs_diagnostic_after_target_exhaustion() {
-            if self.assessment_attempts
-                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-            {
-                return RepairNextAction::RequestDiagnostic;
-            }
-            return RepairNextAction::SafeStop {
-                reason: RepairTerminalReason::RepairBudgetExhausted,
-            };
+            return self
+                .request_diagnostic_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted);
         }
         if self.current_semantic_targets_all_exhausted() {
-            if self.assessment_attempts
-                < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-            {
-                return RepairNextAction::Replan;
-            }
-            return RepairNextAction::SafeStop {
-                reason: RepairTerminalReason::NoSafeRepairTarget,
-            };
+            return self.replan_or_safe_stop(RepairTerminalReason::NoSafeRepairTarget);
         }
         let Some(target_hint) = self.current_repair_target_hint_for_next_action() else {
             return RepairNextAction::SafeStop {
@@ -1006,19 +1002,40 @@ impl RepairJob {
         self.rejected_attempts.push(attempt);
     }
 
+    fn diagnostic_retry_budget_available(&self) -> bool {
+        self.assessment_attempts
+            < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
+    }
+
+    fn request_diagnostic_or_safe_stop(&self, reason: RepairTerminalReason) -> RepairNextAction {
+        if self.diagnostic_retry_budget_available() {
+            RepairNextAction::RequestDiagnostic
+        } else {
+            RepairNextAction::SafeStop { reason }
+        }
+    }
+
+    fn replan_or_safe_stop(&self, reason: RepairTerminalReason) -> RepairNextAction {
+        if self.diagnostic_retry_budget_available() {
+            RepairNextAction::Replan
+        } else {
+            RepairNextAction::SafeStop { reason }
+        }
+    }
+
+    fn next_action_for_improved_verifier_observation(&self) -> Option<RepairNextAction> {
+        if self.needs_diagnostic_after_target_exhaustion() {
+            return Some(self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted));
+        }
+        let target_hint = self.current_repair_target_hint_for_next_action()?;
+        Some(RepairNextAction::RequestPatch { target_hint })
+    }
+
     fn next_action_from_latest_event(&self) -> Option<RepairNextAction> {
         match self.lifecycle_events.last()? {
-            RepairJobEvent::DiagnosticMalformed => {
-                if self.assessment_attempts
-                    < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-                {
-                    Some(RepairNextAction::RequestDiagnostic)
-                } else {
-                    Some(RepairNextAction::SafeStop {
-                        reason: RepairTerminalReason::DiagnosticUnavailable,
-                    })
-                }
-            }
+            RepairJobEvent::DiagnosticMalformed => Some(
+                self.request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable),
+            ),
             RepairJobEvent::DiagnosticUnavailable => Some(RepairNextAction::SafeStop {
                 reason: RepairTerminalReason::DiagnosticUnavailable,
             }),
@@ -1032,31 +1049,12 @@ impl RepairJob {
             RepairJobEvent::VerifierObserved { delta } => Some(match delta {
                 VerifierDelta::Passed => RepairNextAction::VerifiedDone,
                 VerifierDelta::Improved => {
-                    if self.needs_diagnostic_after_target_exhaustion() {
-                        if self.assessment_attempts
-                            < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-                        {
-                            return Some(RepairNextAction::Replan);
-                        }
-                        return Some(RepairNextAction::SafeStop {
-                            reason: RepairTerminalReason::RepairBudgetExhausted,
-                        });
-                    }
-                    let target_hint = self.current_repair_target_hint_for_next_action()?;
-                    RepairNextAction::RequestPatch { target_hint }
+                    return self.next_action_for_improved_verifier_observation();
                 }
                 VerifierDelta::Unchanged
                 | VerifierDelta::Worsened
                 | VerifierDelta::DifferentFailure => {
-                    if self.assessment_attempts
-                        < crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT
-                    {
-                        RepairNextAction::Replan
-                    } else {
-                        RepairNextAction::SafeStop {
-                            reason: RepairTerminalReason::RepairBudgetExhausted,
-                        }
-                    }
+                    self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted)
                 }
                 VerifierDelta::VerifierUnavailable => RepairNextAction::SafeStop {
                     reason: RepairTerminalReason::VerifierUnavailable,
@@ -3096,6 +3094,37 @@ mod tests {
     fn missing_verifier_job_allowed_tool_names_match_first_class_state() {
         let job = MissingVerifierJob::new(3, 0);
         assert_eq!(job.allowed_tool_names(), &["Write", "Edit"]);
+    }
+
+    #[test]
+    fn rejected_reason_for_repair_error_respects_pattern_precedence() {
+        let cases = [
+            (
+                "provider timed out after duplicate patch attempt",
+                Some(RejectedAttemptReason::ProviderTimeout),
+            ),
+            (
+                "no safe candidate because authority remained ambiguous",
+                Some(RejectedAttemptReason::NoSafeCandidate),
+            ),
+            (
+                "duplicate noop unsafe patch proposal",
+                Some(RejectedAttemptReason::DuplicatePatch),
+            ),
+            (
+                "admission rejected: missing string field in json payload",
+                Some(RejectedAttemptReason::MalformedPatch),
+            ),
+            ("plain unrelated error", None),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                rejected_reason_for_repair_error(input),
+                expected,
+                "unexpected classification for {input:?}",
+            );
+        }
     }
 
     #[test]
