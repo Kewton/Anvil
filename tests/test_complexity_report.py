@@ -10,7 +10,7 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "complexity_report.py"
-BASELINE = REPO_ROOT / "workspace" / "v0.4.25" / "complexity-baseline.json"
+BASELINE = REPO_ROOT / "tests" / "fixtures" / "complexity-baseline.json"
 
 
 class TestComplexityReport(unittest.TestCase):
