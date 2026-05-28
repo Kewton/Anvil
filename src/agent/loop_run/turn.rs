@@ -51,13 +51,11 @@ use super::repair_driver::{
     verifier_repair_pass_attempt_timeout_secs, verifier_repair_pass_retry_message,
     verifier_repair_pass_timeout_error,
 };
-use super::repair_framework_findings::{
-    VerifierDiagnosticFileExcerpt,
-    findings_for_diagnostic as verifier_framework_findings_for_diagnostic,
-};
+use super::repair_framework_findings::findings_for_diagnostic as verifier_framework_findings_for_diagnostic;
 #[cfg(test)]
 use super::repair_framework_findings::{
-    VerifierDiagnosticFrameworkFinding, VerifierDiagnosticFrameworkFindingKind,
+    VerifierDiagnosticFileExcerpt, VerifierDiagnosticFrameworkFinding,
+    VerifierDiagnosticFrameworkFindingKind,
 };
 #[cfg(test)]
 use super::repair_job;
@@ -162,11 +160,13 @@ use super::verifier_orchestration::{
     StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
     VerifierRepairAttemptProgress, task_contract_verifier_failure_attempt_limit,
     task_contract_verifier_repair_note, task_contract_verifier_targeted_edit_required_note,
+    verifier_diagnostic_file_excerpts, verifier_file_excerpt_for_line,
     verifier_framework_signal_for_context, verifier_repair_context_diagnostics,
-    verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
-    verifier_repair_pass_request_error_message, verifier_repair_safe_stop_message,
-    verifier_repair_target_display, verifier_repair_transition_message,
-    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
+    verifier_repair_context_line_for_path, verifier_repair_diagnostic_pending_note,
+    verifier_repair_intent_limits, verifier_repair_pass_request_error_message,
+    verifier_repair_safe_stop_message, verifier_repair_target_display,
+    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
+    verifier_setup_policy_message,
 };
 #[cfg(test)]
 use super::verifier_orchestration::{
@@ -179,9 +179,8 @@ use super::verifier_repair_shadow::{
 };
 use super::verifier_repair_targeting::{
     changed_files_for_verifier, extract_path_like_tokens, recovery_target_hint_for_diagnostic_path,
-    verifier_diagnostic_missing_setup_candidates, verifier_diagnostic_path_input_is_safe,
-    verifier_repair_missing_local_module_provider, verifier_repair_preferred_local_import_source,
-    verifier_repair_stale_assertion_test_target,
+    verifier_diagnostic_missing_setup_candidates, verifier_repair_missing_local_module_provider,
+    verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
 #[cfg(test)]
 use super::verifier_repair_targeting::{
@@ -255,8 +254,6 @@ pub(super) const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 pub(super) const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
 pub(super) const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
-const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
-const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
 pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
@@ -1687,87 +1684,6 @@ Only include paths present in changed_candidates or safe_file_excerpts. Treat `f
     ]
 }
 
-fn verifier_diagnostic_file_excerpts(
-    work_root: &Path,
-    context: &super::repair_job::RepairJob,
-) -> Vec<VerifierDiagnosticFileExcerpt> {
-    let mut seen = HashSet::new();
-    let mut hints = Vec::new();
-    if let Some(hint) = context.target_hint.as_ref()
-        && seen.insert(hint.path.clone())
-    {
-        hints.push(hint.clone());
-    }
-    for hint in &context.changed_file_hints {
-        if seen.insert(hint.path.clone()) {
-            hints.push(hint.clone());
-        }
-        if hints.len() >= VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS {
-            break;
-        }
-    }
-    hints
-        .into_iter()
-        .filter_map(|hint| {
-            let target_line = verifier_repair_context_line_for_path(context, &hint.path);
-            let excerpt =
-                safe_verifier_diagnostic_file_excerpt(work_root, &hint.path, target_line)?;
-            Some(VerifierDiagnosticFileExcerpt {
-                path: hint.path,
-                role: hint.role,
-                excerpt,
-            })
-        })
-        .collect()
-}
-
-fn verifier_repair_context_line_for_path(
-    context: &super::repair_job::RepairJob,
-    path: &str,
-) -> Option<usize> {
-    let target = context.target_hint.as_ref()?;
-    if target.path == path {
-        context.target_line
-    } else {
-        None
-    }
-}
-
-fn safe_verifier_diagnostic_file_excerpt(
-    work_root: &Path,
-    raw_path: &str,
-    target_line: Option<usize>,
-) -> Option<String> {
-    if !verifier_diagnostic_path_input_is_safe(raw_path) {
-        return None;
-    }
-    let resolved = resolve_user_path(work_root, raw_path).ok()?;
-    if !resolved.is_file() {
-        return None;
-    }
-    let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
-    let canonical = std::fs::canonicalize(&resolved).ok()?;
-    if canonical.strip_prefix(root).is_err() {
-        return None;
-    }
-    let bytes = std::fs::read(canonical).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    let lines = verifier_file_excerpt_for_line(
-        &text,
-        target_line,
-        VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES,
-    );
-    // Issue #638 (Task 1.8 + Codex CB-002): align with the snapshot SSOT
-    // pipeline — mask_secrets → mask_header_family → control-char neutralize.
-    // This redacts Authorization / Cookie / X-API-Key / X-Auth-Token header
-    // values AND keeps C0 + DEL out of the diagnostic prompt payload.
-    let sanitized = super::repair_job::mask_secrets_headers_and_neutralize(&lines);
-    Some(truncate(
-        &sanitized,
-        VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES,
-    ))
-}
-
 fn verifier_repair_pass_messages(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -1908,130 +1824,6 @@ fn safe_verifier_repair_file_excerpt(
         VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES,
     );
     Some(super::repair_job::mask_code_excerpt_preserving_patch_anchors(&excerpt))
-}
-
-fn verifier_file_excerpt_for_line(
-    text: &str,
-    target_line: Option<usize>,
-    max_bytes: usize,
-) -> String {
-    let Some(target_line) = target_line.filter(|line| *line > 0) else {
-        return head_tail_excerpt(text, max_bytes);
-    };
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
-    if lines.is_empty() {
-        return String::new();
-    }
-    let target_index = target_line
-        .saturating_sub(1)
-        .min(lines.len().saturating_sub(1));
-    let mut window = VerifierExcerptWindow::new(target_index, lines[target_index].len());
-    while window.current_len < max_bytes {
-        if !window.try_expand_preferred_side(&lines, max_bytes)
-            && !window.can_expand_any_side(&lines, max_bytes)
-        {
-            break;
-        }
-    }
-    build_verifier_excerpt(&lines, window, max_bytes)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct VerifierExcerptWindow {
-    start: usize,
-    end: usize,
-    current_len: usize,
-    prefer_before: bool,
-}
-
-impl VerifierExcerptWindow {
-    fn new(target_index: usize, target_len: usize) -> Self {
-        Self {
-            start: target_index,
-            end: target_index.saturating_add(1),
-            current_len: target_len,
-            prefer_before: true,
-        }
-    }
-
-    fn can_expand_before(self, lines: &[&str], max_bytes: usize) -> bool {
-        self.start > 0 && self.current_len.saturating_add(lines[self.start - 1].len()) <= max_bytes
-    }
-
-    fn can_expand_after(self, lines: &[&str], max_bytes: usize) -> bool {
-        self.end < lines.len()
-            && self.current_len.saturating_add(lines[self.end].len()) <= max_bytes
-    }
-
-    fn can_expand_any_side(self, lines: &[&str], max_bytes: usize) -> bool {
-        self.can_expand_before(lines, max_bytes) || self.can_expand_after(lines, max_bytes)
-    }
-
-    fn try_expand_preferred_side(&mut self, lines: &[&str], max_bytes: usize) -> bool {
-        let expanded = if self.prefer_before {
-            self.try_expand_before(lines, max_bytes)
-        } else {
-            self.try_expand_after(lines, max_bytes)
-        };
-        self.prefer_before = !self.prefer_before;
-        expanded
-    }
-
-    fn try_expand_before(&mut self, lines: &[&str], max_bytes: usize) -> bool {
-        if !self.can_expand_before(lines, max_bytes) {
-            return false;
-        }
-        self.start -= 1;
-        self.current_len = self.current_len.saturating_add(lines[self.start].len());
-        true
-    }
-
-    fn try_expand_after(&mut self, lines: &[&str], max_bytes: usize) -> bool {
-        if !self.can_expand_after(lines, max_bytes) {
-            return false;
-        }
-        self.current_len = self.current_len.saturating_add(lines[self.end].len());
-        self.end += 1;
-        true
-    }
-}
-
-fn build_verifier_excerpt(
-    lines: &[&str],
-    window: VerifierExcerptWindow,
-    max_bytes: usize,
-) -> String {
-    let mut excerpt = String::new();
-    if window.start > 0 {
-        excerpt.push_str("...[truncated before target line]...\n");
-    }
-    for line in &lines[window.start..window.end] {
-        excerpt.push_str(line);
-    }
-    if window.end < lines.len() {
-        if !excerpt.ends_with('\n') {
-            excerpt.push('\n');
-        }
-        excerpt.push_str("...[truncated after target line]...\n");
-    }
-    truncate(&excerpt, max_bytes)
-}
-
-fn head_tail_excerpt(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let side = max_bytes.saturating_sub(64) / 2;
-    let head = truncate(text, side);
-    let mut tail_start = text.len().saturating_sub(side);
-    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    let tail = text.get(tail_start..).unwrap_or_default();
-    format!("{head}\n...[truncated]...\n{tail}")
 }
 
 fn task_contract_no_verifier_note(
