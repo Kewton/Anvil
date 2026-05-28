@@ -20,12 +20,19 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, actor_loop_pre_reply_deterministic_fallback_allowed,
-    actor_loop_pre_reply_flow_outcome, actor_loop_pre_reply_repo_change_fallback_allowed,
-    actor_loop_pre_reply_request_error, handle_actor_loop_rejected_tool_batch,
-    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
-    handle_post_reply_recovery, missing_repo_change_budget_exhausted_outcome,
+    TaskContractVerifierFlowOutcome, actor_loop_pre_reply_flow_outcome,
+    handle_actor_loop_rejected_tool_batch, handle_non_progress_plan_edit_fallback,
+    handle_plan_progress_prose_only_fallback, handle_post_reply_recovery,
+    maybe_continue_actor_loop_framework_fallback,
+    maybe_continue_actor_loop_mode_deterministic_fallback,
+    maybe_handle_actor_loop_playable_ui_fallback, missing_repo_change_budget_exhausted_outcome,
     plan_tool_followup_done_message, repair_job_done_outcome,
+    request_actor_loop_pre_reply_model_turn,
+};
+#[cfg(test)]
+use super::actor_loop_flow::{
+    actor_loop_pre_reply_deterministic_fallback_allowed,
+    actor_loop_pre_reply_repo_change_fallback_allowed,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -5832,7 +5839,7 @@ impl Agent {
         {
             return outcome;
         }
-        self.request_actor_loop_pre_reply_model_turn(&args, control_state)
+        request_actor_loop_pre_reply_model_turn(self, &args, control_state)
     }
 
     fn build_actor_loop_pre_reply_control_state(
@@ -5915,99 +5922,19 @@ impl Agent {
         args: &mut ActorLoopPreReplyArgs<'_, '_>,
         recovery_dispatch_gate: RecoveryDispatchGate,
     ) -> Option<ActorLoopPreReplyOutcome> {
-        if self.maybe_continue_actor_loop_mode_deterministic_fallback(args, recovery_dispatch_gate)
+        if maybe_continue_actor_loop_mode_deterministic_fallback(self, args, recovery_dispatch_gate)
         {
             return Some(ActorLoopPreReplyOutcome::Continue);
         }
-        if self.maybe_continue_actor_loop_framework_fallback(args, recovery_dispatch_gate) {
+        if maybe_continue_actor_loop_framework_fallback(self, args, recovery_dispatch_gate) {
             return Some(ActorLoopPreReplyOutcome::Continue);
         }
         if let Some(outcome) =
-            self.maybe_handle_actor_loop_playable_ui_fallback(args, recovery_dispatch_gate)
+            maybe_handle_actor_loop_playable_ui_fallback(self, args, recovery_dispatch_gate)
         {
             return Some(outcome);
         }
         None
-    }
-
-    fn maybe_continue_actor_loop_mode_deterministic_fallback(
-        &mut self,
-        args: &mut ActorLoopPreReplyArgs<'_, '_>,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> bool {
-        actor_loop_pre_reply_repo_change_fallback_allowed(
-            args.action_expectation,
-            *args.repo_edit_calls_made_this_turn,
-            recovery_dispatch_gate,
-        ) && self.maybe_materialize_mode_deterministic_fallback(args.last_iter)
-    }
-
-    fn maybe_continue_actor_loop_framework_fallback(
-        &mut self,
-        args: &mut ActorLoopPreReplyArgs<'_, '_>,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> bool {
-        if !actor_loop_pre_reply_repo_change_fallback_allowed(
-            args.action_expectation,
-            *args.repo_edit_calls_made_this_turn,
-            recovery_dispatch_gate,
-        ) || !should_try_framework_app_fallback(
-            args.last_iter,
-            *args.framework_app_fallback_materialized,
-        ) || !self.maybe_materialize_framework_game_fallback(args.last_iter)
-        {
-            return false;
-        }
-        *args.framework_app_fallback_materialized = true;
-        self.push_system_note(framework_app_fallback_continuation_note().to_string());
-        true
-    }
-
-    fn maybe_handle_actor_loop_playable_ui_fallback(
-        &mut self,
-        args: &mut ActorLoopPreReplyArgs<'_, '_>,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> Option<ActorLoopPreReplyOutcome> {
-        if !actor_loop_pre_reply_deterministic_fallback_allowed(
-            *args.repo_edit_calls_made_this_turn,
-            recovery_dispatch_gate,
-        ) || !self.current_request_needs_playable_ui_quality_gate()
-        {
-            return None;
-        }
-        let (request, target_path) = self.accepted_repo_change_polish_target()?;
-        match self.handle_actor_loop_post_tool_polish_fallback(
-            args.last_iter,
-            &request,
-            &target_path,
-            args.repo_change_retries,
-        ) {
-            ActorLoopPostToolFallbackOutcome::Continue => Some(ActorLoopPreReplyOutcome::Continue),
-            ActorLoopPostToolFallbackOutcome::Exit { reason, error_text } => {
-                Some(ActorLoopPreReplyOutcome::Exit { reason, error_text })
-            }
-            ActorLoopPostToolFallbackOutcome::Proceed => None,
-        }
-    }
-
-    fn request_actor_loop_pre_reply_model_turn(
-        &mut self,
-        args: &ActorLoopPreReplyArgs<'_, '_>,
-        control_state: ActorLoopPreReplyControlState,
-    ) -> ActorLoopPreReplyOutcome {
-        match self.request_assistant_reply_with_retry(
-            args.stream_output,
-            args.interrupt_flag,
-            control_state.recovery_dispatch_gate,
-        ) {
-            Ok(reply) => ActorLoopPreReplyOutcome::ReplyPrepared {
-                reply,
-                recovery_dispatch_gate: control_state.recovery_dispatch_gate,
-                missing_verifier_setup_turn: control_state.missing_verifier_setup_turn,
-                recovery_owner: control_state.recovery_owner,
-            },
-            Err(err) => actor_loop_pre_reply_request_error(self, err),
-        }
     }
 
     fn prepare_actor_loop_turn_state(&mut self) -> Option<super::task_contract::TaskContract> {
@@ -6893,7 +6820,7 @@ impl Agent {
         ActorLoopPostToolFallbackOutcome::Proceed
     }
 
-    fn handle_actor_loop_post_tool_polish_fallback(
+    pub(super) fn handle_actor_loop_post_tool_polish_fallback(
         &mut self,
         last_iter: usize,
         request: &str,
@@ -10208,7 +10135,7 @@ impl Agent {
         }
     }
 
-    fn request_assistant_reply_with_retry(
+    pub(super) fn request_assistant_reply_with_retry(
         &mut self,
         stream_output: bool,
         interrupt_flag: &InterruptFlag,
@@ -15448,7 +15375,10 @@ impl Agent {
         ));
     }
 
-    fn maybe_materialize_mode_deterministic_fallback(&mut self, last_iter: usize) -> bool {
+    pub(super) fn maybe_materialize_mode_deterministic_fallback(
+        &mut self,
+        last_iter: usize,
+    ) -> bool {
         if !self
             .config
             .deterministic_fallback
@@ -15884,7 +15814,7 @@ impl Agent {
         Some((request, relative, issue))
     }
 
-    fn accepted_repo_change_polish_target(&mut self) -> Option<(String, String)> {
+    pub(super) fn accepted_repo_change_polish_target(&mut self) -> Option<(String, String)> {
         if !self.session.mode_state.policy().allow_polish_fallback {
             return None;
         }
