@@ -1031,11 +1031,8 @@ impl RepairJob {
         Some(RepairNextAction::RequestPatch { target_hint })
     }
 
-    fn next_action_from_latest_event(&self) -> Option<RepairNextAction> {
-        match self.lifecycle_events.last()? {
-            RepairJobEvent::DiagnosticMalformed => Some(
-                self.request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable),
-            ),
+    fn next_action_for_terminal_event(event: &RepairJobEvent) -> Option<RepairNextAction> {
+        match event {
             RepairJobEvent::DiagnosticUnavailable => Some(RepairNextAction::SafeStop {
                 reason: RepairTerminalReason::DiagnosticUnavailable,
             }),
@@ -1045,21 +1042,41 @@ impl RepairJob {
             RepairJobEvent::NoSafeTarget => Some(RepairNextAction::SafeStop {
                 reason: RepairTerminalReason::NoSafeRepairTarget,
             }),
-            RepairJobEvent::PatchApplied { .. } => Some(RepairNextAction::RerunVerifier),
-            RepairJobEvent::VerifierObserved { delta } => Some(match delta {
-                VerifierDelta::Passed => RepairNextAction::VerifiedDone,
-                VerifierDelta::Improved => {
-                    return self.next_action_for_improved_verifier_observation();
-                }
-                VerifierDelta::Unchanged
-                | VerifierDelta::Worsened
-                | VerifierDelta::DifferentFailure => {
-                    self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted)
-                }
-                VerifierDelta::VerifierUnavailable => RepairNextAction::SafeStop {
-                    reason: RepairTerminalReason::VerifierUnavailable,
-                },
+            _ => None,
+        }
+    }
+
+    fn next_action_for_verifier_delta(&self, delta: VerifierDelta) -> Option<RepairNextAction> {
+        match delta {
+            VerifierDelta::Passed => Some(RepairNextAction::VerifiedDone),
+            VerifierDelta::Improved => self.next_action_for_improved_verifier_observation(),
+            VerifierDelta::Unchanged
+            | VerifierDelta::Worsened
+            | VerifierDelta::DifferentFailure => {
+                Some(self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted))
+            }
+            VerifierDelta::VerifierUnavailable => Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::VerifierUnavailable,
             }),
+        }
+    }
+
+    fn next_action_from_latest_event(&self) -> Option<RepairNextAction> {
+        let event = self.lifecycle_events.last()?;
+        if let Some(action) = Self::next_action_for_terminal_event(event) {
+            return Some(action);
+        }
+        match event {
+            RepairJobEvent::DiagnosticMalformed => Some(
+                self.request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable),
+            ),
+            RepairJobEvent::PatchApplied { .. } => Some(RepairNextAction::RerunVerifier),
+            RepairJobEvent::VerifierObserved { delta } => {
+                self.next_action_for_verifier_delta(*delta)
+            }
+            RepairJobEvent::DiagnosticUnavailable
+            | RepairJobEvent::AmbiguousAuthority
+            | RepairJobEvent::NoSafeTarget => None,
             RepairJobEvent::PatchRejected { .. } | RepairJobEvent::PlanAccepted => None,
         }
     }
@@ -3393,6 +3410,63 @@ mod tests {
             RepairNextAction::SafeStop {
                 reason: RepairTerminalReason::DiagnosticUnavailable
             }
+        );
+    }
+
+    #[test]
+    fn terminal_event_helper_maps_safe_stop_events() {
+        assert_eq!(
+            RepairJob::next_action_for_terminal_event(&RepairJobEvent::DiagnosticUnavailable),
+            Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::DiagnosticUnavailable
+            })
+        );
+        assert_eq!(
+            RepairJob::next_action_for_terminal_event(&RepairJobEvent::AmbiguousAuthority),
+            Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::AmbiguousSpecSafeStop
+            })
+        );
+        assert_eq!(
+            RepairJob::next_action_for_terminal_event(&RepairJobEvent::NoSafeTarget),
+            Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::NoSafeRepairTarget
+            })
+        );
+        assert_eq!(
+            RepairJob::next_action_for_terminal_event(&RepairJobEvent::PlanAccepted),
+            None
+        );
+    }
+
+    #[test]
+    fn verifier_delta_helper_preserves_retry_and_terminal_mapping() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target.clone())),
+            repair_target_hint: Some(target.clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action_for_verifier_delta(VerifierDelta::Passed),
+            Some(RepairNextAction::VerifiedDone)
+        );
+        assert_eq!(
+            job.next_action_for_verifier_delta(VerifierDelta::Improved),
+            Some(RepairNextAction::RequestPatch {
+                target_hint: target
+            })
+        );
+        assert_eq!(
+            job.next_action_for_verifier_delta(VerifierDelta::Worsened),
+            Some(RepairNextAction::Replan)
+        );
+        assert_eq!(
+            job.next_action_for_verifier_delta(VerifierDelta::VerifierUnavailable),
+            Some(RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::VerifierUnavailable
+            })
         );
     }
 
