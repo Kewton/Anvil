@@ -3796,6 +3796,15 @@ fn photon_context_pack_completion_status(
     }
 }
 
+struct DeterministicScaffoldSpec {
+    label: &'static str,
+    event: &'static str,
+    scaffold_kind: &'static str,
+    files: Vec<(PathBuf, String)>,
+}
+
+type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
+
 fn verifier_repair_transition_message() -> String {
     "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step.".to_string()
 }
@@ -16101,6 +16110,144 @@ impl Agent {
         None
     }
 
+    fn mode_deterministic_scaffold_spec(
+        &self,
+        request: &str,
+        policy: &crate::modes::plan_act::ModePolicy,
+    ) -> Option<DeterministicScaffoldSpec> {
+        // Issue #634: Python ブランチのみ experimental flag 経由で隔離。
+        // Docs ブランチ (`agent.empty_workspace.deterministic_docs`) は本 Issue で
+        // touch せず、既存 `policy.allow_docs_deterministic_fallback` 経路を維持。
+        if super::policy_allows_python_specialized_fallback(policy, &self.config) {
+            if let Some(files) = deterministic::fastapi_scaffold_files(request) {
+                return Some(DeterministicScaffoldSpec {
+                    label: "FastAPI scaffold",
+                    event: EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
+                    scaffold_kind: "FastAPI",
+                    files,
+                });
+            }
+            let (script_name, sample_name) = self.python_csv_names_from_request_and_anvil(request);
+            let files = deterministic::empty_python_cli_files_with_names(
+                request,
+                script_name.as_deref(),
+                sample_name.as_deref(),
+            )?;
+            return Some(DeterministicScaffoldSpec {
+                label: "Python scaffold",
+                event: EVENT_DETERMINISTIC_PYTHON_CLI,
+                scaffold_kind: "Python",
+                files,
+            });
+        }
+        if policy.allow_docs_deterministic_fallback {
+            return deterministic::empty_docs_files(request).map(|files| {
+                DeterministicScaffoldSpec {
+                    label: "Docs scaffold",
+                    event: "agent.empty_workspace.deterministic_docs",
+                    scaffold_kind: "Docs",
+                    files,
+                }
+            });
+        }
+        None
+    }
+
+    fn write_deterministic_scaffold_files(
+        &mut self,
+        files: Vec<(PathBuf, String)>,
+        error_prefix: &str,
+        skip_existing: bool,
+    ) -> Option<WrittenScaffoldArtifacts> {
+        let mut written = Vec::<PathBuf>::new();
+        let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
+        for (relative, content) in files {
+            let target = self.work_root.join(&relative);
+            if skip_existing && target.exists() {
+                continue;
+            }
+            if let Some(parent) = target.parent()
+                && let Err(err) = std::fs::create_dir_all(parent)
+            {
+                self.session.working_memory.note_error(format!(
+                    "{error_prefix}: failed to create {}: {err}",
+                    parent.display()
+                ));
+                return None;
+            }
+            if let Err(err) = std::fs::write(&target, content.as_bytes()) {
+                self.session.working_memory.note_error(format!(
+                    "{error_prefix}: failed to write {}: {err}",
+                    target.display()
+                ));
+                return None;
+            }
+            let relative_display = relative.to_string_lossy().to_string();
+            snapshot_files.push(scaffold_file_snapshot(
+                &relative_display.replace('\\', "/"),
+                content.as_bytes(),
+            ));
+            self.session
+                .working_memory
+                .note_touched_file(normalize_memory_path(&relative_display, &self.work_root));
+            written.push(relative);
+        }
+        Some((written, snapshot_files))
+    }
+
+    fn finalize_deterministic_scaffold_materialization(
+        &mut self,
+        request: &str,
+        last_iter: usize,
+        spec: &DeterministicScaffoldSpec,
+        assistant_context: &str,
+        written: Vec<PathBuf>,
+        snapshot_files: Vec<ScaffoldArtifactFileSnapshot>,
+    ) {
+        let written_paths = written
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                self.config.max_iterations,
+                spec.label,
+                &format!(
+                    "Materialized deterministic scaffold files: {}.",
+                    written_paths.join(", ")
+                ),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        log_llm_event(
+            spec.event,
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "work_root": self.work_root.display().to_string(),
+                "work_mode": self.session.mode_state.work_mode.as_str(),
+                "fallback_level": self.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "bootstrap_scaffold",
+                "completion_evidence": false,
+                "files": written_paths,
+            }),
+        );
+        self.record_scaffold_artifact_snapshot(request, snapshot_files);
+        self.session.messages.push(ConversationMessage::assistant(
+            format!(
+                "Created deterministic {} scaffold files as {assistant_context}: {}. This is not task completion.",
+                spec.scaffold_kind,
+                written_paths.join(", ")
+            ),
+            Vec::new(),
+        ));
+        self.push_system_note(render_deterministic_scaffold_continuation_note(
+            request,
+            &written_paths,
+        ));
+    }
+
     fn maybe_materialize_mode_deterministic_fallback(&mut self, last_iter: usize) -> bool {
         if !self
             .config
@@ -16113,127 +16260,27 @@ impl Agent {
         let Some(request) = self.active_request_text() else {
             return false;
         };
-        // Issue #634: Python ブランチのみ experimental flag 経由で隔離。
-        // Docs ブランチ (`agent.empty_workspace.deterministic_docs`) は本 Issue で
-        // touch せず、既存 `policy.allow_docs_deterministic_fallback` 経路を維持。
-        let (label, event, files, scaffold_kind) =
-            if super::policy_allows_python_specialized_fallback(&policy, &self.config) {
-                if let Some(files) = deterministic::fastapi_scaffold_files(&request) {
-                    (
-                        "FastAPI scaffold",
-                        EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
-                        files,
-                        "FastAPI",
-                    )
-                } else {
-                    let (script_name, sample_name) =
-                        self.python_csv_names_from_request_and_anvil(&request);
-                    (
-                        "Python scaffold",
-                        EVENT_DETERMINISTIC_PYTHON_CLI,
-                        match deterministic::empty_python_cli_files_with_names(
-                            &request,
-                            script_name.as_deref(),
-                            sample_name.as_deref(),
-                        ) {
-                            Some(files) => files,
-                            None => return false,
-                        },
-                        "Python",
-                    )
-                }
-            } else if policy.allow_docs_deterministic_fallback {
-                (
-                    "Docs scaffold",
-                    "agent.empty_workspace.deterministic_docs",
-                    match deterministic::empty_docs_files(&request) {
-                        Some(files) => files,
-                        None => return false,
-                    },
-                    "Docs",
-                )
-            } else {
-                return false;
-            };
+        let Some(mut spec) = self.mode_deterministic_scaffold_spec(&request, &policy) else {
+            return false;
+        };
         if !self.workspace_appears_empty() {
             return false;
         }
-
-        let mut written = Vec::<PathBuf>::new();
-        let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
-        for (relative, content) in files {
-            let target = self.work_root.join(&relative);
-            if let Some(parent) = target.parent()
-                && let Err(err) = std::fs::create_dir_all(parent)
-            {
-                self.session.working_memory.note_error(format!(
-                    "deterministic fallback: failed to create {}: {err}",
-                    parent.display()
-                ));
-                return false;
-            }
-            if let Err(err) = std::fs::write(&target, content.as_bytes()) {
-                self.session.working_memory.note_error(format!(
-                    "deterministic fallback: failed to write {}: {err}",
-                    target.display()
-                ));
-                return false;
-            }
-            let relative_display = relative.to_string_lossy().replace('\\', "/");
-            snapshot_files.push(scaffold_file_snapshot(
-                &relative_display,
-                content.as_bytes(),
-            ));
-            self.session
-                .working_memory
-                .note_touched_file(normalize_memory_path(
-                    &relative.to_string_lossy(),
-                    &self.work_root,
-                ));
-            written.push(relative);
-        }
-
-        let written_paths = written
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        write_stdout_rendered(
-            &format_iteration_status(
-                last_iter,
-                self.config.max_iterations,
-                label,
-                &format!(
-                    "Materialized deterministic scaffold files: {}.",
-                    written_paths.join(", ")
-                ),
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        log_llm_event(
-            event,
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "work_root": self.work_root.display().to_string(),
-                "work_mode": self.session.mode_state.work_mode.as_str(),
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "bootstrap_scaffold",
-                "completion_evidence": false,
-                "files": written_paths,
-            }),
-        );
-        self.record_scaffold_artifact_snapshot(&request, snapshot_files);
-        self.session.messages.push(ConversationMessage::assistant(
-            format!(
-                "Created deterministic {scaffold_kind} scaffold files as bootstrap only: {}. This is not task completion.",
-                written_paths.join(", ")
-            ),
-            Vec::new(),
-        ));
-        self.push_system_note(render_deterministic_scaffold_continuation_note(
+        let Some((written, snapshot_files)) = self.write_deterministic_scaffold_files(
+            std::mem::take(&mut spec.files),
+            "deterministic fallback",
+            false,
+        ) else {
+            return false;
+        };
+        self.finalize_deterministic_scaffold_materialization(
             &request,
-            &written_paths,
-        ));
+            last_iter,
+            &spec,
+            "bootstrap only",
+            written,
+            snapshot_files,
+        );
         true
     }
 
@@ -16268,85 +16315,30 @@ impl Agent {
         let Some(files) = deterministic::fastapi_scaffold_files(&request) else {
             return false;
         };
-
-        let mut written = Vec::<PathBuf>::new();
-        let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
-        for (relative, content) in files {
-            let target = self.work_root.join(&relative);
-            if target.exists() {
-                continue;
-            }
-            if let Some(parent) = target.parent()
-                && let Err(err) = std::fs::create_dir_all(parent)
-            {
-                self.session.working_memory.note_error(format!(
-                    "task contract deterministic fallback: failed to create {}: {err}",
-                    parent.display()
-                ));
-                return false;
-            }
-            if let Err(err) = std::fs::write(&target, content.as_bytes()) {
-                self.session.working_memory.note_error(format!(
-                    "task contract deterministic fallback: failed to write {}: {err}",
-                    target.display()
-                ));
-                return false;
-            }
-            let relative_display = relative.to_string_lossy().to_string();
-            snapshot_files.push(scaffold_file_snapshot(
-                &relative_display.replace('\\', "/"),
-                content.as_bytes(),
-            ));
-            self.session
-                .working_memory
-                .note_touched_file(normalize_memory_path(&relative_display, &self.work_root));
-            written.push(relative);
-        }
+        let mut spec = DeterministicScaffoldSpec {
+            label: "Task scaffold",
+            event: "agent.task_contract.deterministic_fastapi_scaffold",
+            scaffold_kind: "FastAPI",
+            files,
+        };
+        let Some((written, snapshot_files)) = self.write_deterministic_scaffold_files(
+            std::mem::take(&mut spec.files),
+            "task contract deterministic fallback",
+            true,
+        ) else {
+            return false;
+        };
         if written.is_empty() {
             return false;
         }
-
-        let written_paths = written
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        write_stdout_rendered(
-            &format_iteration_status(
-                last_iter,
-                self.config.max_iterations,
-                "Task scaffold",
-                &format!(
-                    "Materialized deterministic scaffold files: {}.",
-                    written_paths.join(", ")
-                ),
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        log_llm_event(
-            "agent.task_contract.deterministic_fastapi_scaffold",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "work_root": self.work_root.display().to_string(),
-                "work_mode": self.session.mode_state.work_mode.as_str(),
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "bootstrap_scaffold",
-                "completion_evidence": false,
-                "files": written_paths,
-            }),
-        );
-        self.record_scaffold_artifact_snapshot(&request, snapshot_files);
-        self.session.messages.push(ConversationMessage::assistant(
-            format!(
-                "Created deterministic FastAPI scaffold files as contract recovery: {}. This is not task completion.",
-                written_paths.join(", ")
-            ),
-            Vec::new(),
-        ));
-        self.push_system_note(render_deterministic_scaffold_continuation_note(
+        self.finalize_deterministic_scaffold_materialization(
             &request,
-            &written_paths,
-        ));
+            last_iter,
+            &spec,
+            "contract recovery",
+            written,
+            snapshot_files,
+        );
         true
     }
 
