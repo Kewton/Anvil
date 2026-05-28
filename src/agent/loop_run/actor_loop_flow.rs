@@ -64,9 +64,11 @@ use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
 use super::turn::{
     LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, PlanExplorationKey,
-    build_feedback_for_no_repo_progress, build_feedback_for_unsafe_block,
-    normalize_plan_exploration_key, progress_stage_label, should_record_no_repo_progress,
-    summarize_plan_write, tool_display, write_stdout_rendered,
+    PlanWriteSummary, build_feedback_for_no_repo_progress, build_feedback_for_unsafe_block,
+    build_plan_write_section_delta, join_sections_for_progress, normalize_exploration_path,
+    plan_path_matches, plan_phase_from_sections, plan_section_excerpt,
+    plan_write_previous_contents, plan_write_status, should_record_no_repo_progress, tool_display,
+    write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
@@ -876,14 +878,14 @@ pub(super) fn handle_actor_loop_empty_reply(
                 "Retry requested",
                 &format!(
                     "The model returned an empty reply. Asked it to continue the plan by writing {}.",
-                    super::turn::join_sections_for_progress(&next_sections)
+                    join_sections_for_progress(&next_sections)
                 ),
                 agent.footer.current_cols(),
             ),
             true,
         );
         let missing_sections = super::lifecycle::plan_missing_sections(&plan_contents);
-        super::turn::log_plan_stall(
+        log_plan_stall(
             agent.session_store.session_id(),
             args.last_iter,
             "empty_reply",
@@ -980,14 +982,14 @@ fn handle_plan_progress_prose_only_reply(
             "Retry requested",
             &format!(
                 "The model answered without tool calls. Asked it to update {} with Write or Edit.",
-                super::turn::join_sections_for_progress(&next_sections)
+                join_sections_for_progress(&next_sections)
             ),
             agent.footer.current_cols(),
         ),
         true,
     );
     let missing_sections = super::lifecycle::plan_missing_sections(&plan_contents);
-    super::turn::log_plan_stall(
+    log_plan_stall(
         agent.session_store.session_id(),
         args.last_iter,
         "no_tool_reply",
@@ -1312,13 +1314,13 @@ pub(super) fn handle_actor_loop_completion(
                     "Plan still incomplete",
                     &format!(
                         "Asked the model to finish {} before approval.",
-                        super::turn::join_sections_for_progress(&missing_sections)
+                        join_sections_for_progress(&missing_sections)
                     ),
                     agent.footer.current_cols(),
                 ),
                 true,
             );
-            super::turn::log_plan_stall(
+            log_plan_stall(
                 agent.session_store.session_id(),
                 args.last_iter,
                 "plan_incomplete_after_reply",
@@ -1683,7 +1685,7 @@ fn handle_actor_loop_plan_exploration_only_turn(
             let missing_sections = super::lifecycle::plan_missing_sections(&contents);
             if !missing_sections.is_empty() {
                 *plan_progress_retries += 1;
-                super::turn::log_plan_stall(
+                log_plan_stall(
                     agent.session_store.session_id(),
                     last_iter,
                     stall_reason,
@@ -4087,4 +4089,172 @@ pub(super) fn format_blocked_progress_line(
             display.action
         )
     }
+}
+
+pub(super) fn summarize_plan_write(
+    tool_name: &str,
+    raw_path: &str,
+    new_text: &str,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+) -> PlanWriteSummary {
+    let previous = plan_write_previous_contents(raw_path, work_root, plan_path);
+    let delta_sections = build_plan_write_section_delta(&previous, new_text);
+    let verb = if !delta_sections.removed_sections.is_empty() {
+        "Rewrite"
+    } else if delta_sections.previous_sections.is_empty() {
+        "Draft"
+    } else if !delta_sections.added_sections.is_empty() {
+        "Add"
+    } else if tool_name == "Edit" {
+        "Revise"
+    } else {
+        "Update"
+    };
+    let action = if delta_sections.focus_sections.is_empty() {
+        "Update plan draft".to_string()
+    } else {
+        format!(
+            "{verb} {}",
+            join_sections_for_progress(&delta_sections.focus_sections)
+        )
+    };
+    let note = plan_section_excerpt(new_text, &delta_sections.focus_sections).or_else(|| {
+        let fallback = delta_sections.current_sections.clone();
+        plan_section_excerpt(new_text, &fallback)
+    });
+    let delta = new_text.len() as isize - previous.len() as isize;
+    let approval_ready = lifecycle::plan_missing_sections(new_text).is_empty();
+    let status = plan_write_status(new_text, delta);
+    let phase = plan_phase_from_sections(
+        &delta_sections.focus_sections,
+        current_stage,
+        approval_ready,
+    )
+    .to_string();
+    let signature = format!("{}|{}|{}", phase, action, note.clone().unwrap_or_default());
+    PlanWriteSummary {
+        action,
+        note,
+        status,
+        phase,
+        signature,
+    }
+}
+
+pub(super) fn progress_stage_label(
+    mode: ExecutionMode,
+    plan_stage: PlanStage,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> Option<String> {
+    if mode != ExecutionMode::Plan {
+        return Some("Implementation".to_string());
+    }
+    let raw_path = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if plan_path_matches(raw_path, work_root, plan_path) {
+        if tool_name == "Read" {
+            return Some(if plan_stage == PlanStage::Ready {
+                "Approval review".to_string()
+            } else {
+                "Plan review".to_string()
+            });
+        }
+        let source_text = arguments
+            .get("content")
+            .or_else(|| arguments.get("new_string"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let summary = summarize_plan_write(
+            tool_name,
+            raw_path,
+            source_text,
+            work_root,
+            plan_path,
+            plan_stage,
+        );
+        return Some(summary.phase);
+    }
+    Some("Repo exploration".to_string())
+}
+
+pub(super) fn log_plan_stall(
+    session_id: &str,
+    iter: usize,
+    reason: &str,
+    stage: PlanStage,
+    next_sections: &[&str],
+    missing_sections: &[&str],
+    attempt: usize,
+) {
+    log_llm_event(
+        "agent.plan.stalled",
+        serde_json::json!({
+            "session_id": session_id,
+            "iter": iter,
+            "reason": reason,
+            "stage": stage.as_str(),
+            "next_sections": next_sections,
+            "missing_sections": missing_sections,
+            "attempt": attempt,
+        }),
+    );
+}
+
+pub(super) fn normalize_plan_exploration_key(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    work_root: &Path,
+    stage: &str,
+) -> Option<PlanExplorationKey> {
+    let normalized_args = match tool_name {
+        "Read" => {
+            let path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+            let path = normalize_exploration_path(path, work_root);
+            let start_line = arguments
+                .get("start_line")
+                .and_then(serde_json::Value::as_u64);
+            let end_line = arguments
+                .get("end_line")
+                .and_then(serde_json::Value::as_u64);
+            serde_json::json!({
+                "path": path,
+                "start_line": start_line,
+                "end_line": end_line,
+            })
+            .to_string()
+        }
+        "Glob" => serde_json::json!({
+            "pattern": arguments
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)?
+                .trim(),
+        })
+        .to_string(),
+        "Grep" => serde_json::json!({
+            "pattern": arguments
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)?
+                .trim(),
+            "glob": arguments.get("glob").and_then(serde_json::Value::as_str),
+            "case_sensitive": arguments
+                .get("case_sensitive")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+        .to_string(),
+        _ => return None,
+    };
+
+    Some(PlanExplorationKey {
+        stage: stage.to_string(),
+        tool_name: tool_name.to_string(),
+        normalized_args,
+    })
 }

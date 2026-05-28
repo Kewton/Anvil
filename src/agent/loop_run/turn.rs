@@ -2817,59 +2817,7 @@ pub(super) struct PlanExplorationKey {
     pub(super) normalized_args: String,
 }
 
-pub(super) fn normalize_plan_exploration_key(
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    work_root: &Path,
-    stage: &str,
-) -> Option<PlanExplorationKey> {
-    let normalized_args = match tool_name {
-        "Read" => {
-            let path = arguments.get("path").and_then(serde_json::Value::as_str)?;
-            let path = normalize_exploration_path(path, work_root);
-            let start_line = arguments
-                .get("start_line")
-                .and_then(serde_json::Value::as_u64);
-            let end_line = arguments
-                .get("end_line")
-                .and_then(serde_json::Value::as_u64);
-            serde_json::json!({
-                "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
-            })
-            .to_string()
-        }
-        "Glob" => serde_json::json!({
-            "pattern": arguments
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)?
-                .trim(),
-        })
-        .to_string(),
-        "Grep" => serde_json::json!({
-            "pattern": arguments
-                .get("pattern")
-                .and_then(serde_json::Value::as_str)?
-                .trim(),
-            "glob": arguments.get("glob").and_then(serde_json::Value::as_str),
-            "case_sensitive": arguments
-                .get("case_sensitive")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-        })
-        .to_string(),
-        _ => return None,
-    };
-
-    Some(PlanExplorationKey {
-        stage: stage.to_string(),
-        tool_name: tool_name.to_string(),
-        normalized_args,
-    })
-}
-
-fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
+pub(super) fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
     let input = Path::new(raw_path);
     if input.is_relative() {
         let cleaned = input
@@ -2899,70 +2847,6 @@ fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
     }
 
     raw_path.trim().replace('\\', "/")
-}
-
-pub(super) fn log_plan_stall(
-    session_id: &str,
-    iter: usize,
-    reason: &str,
-    stage: PlanStage,
-    next_sections: &[&str],
-    missing_sections: &[&str],
-    attempt: usize,
-) {
-    log_llm_event(
-        "agent.plan.stalled",
-        serde_json::json!({
-            "session_id": session_id,
-            "iter": iter,
-            "reason": reason,
-            "stage": stage.as_str(),
-            "next_sections": next_sections,
-            "missing_sections": missing_sections,
-            "attempt": attempt,
-        }),
-    );
-}
-
-pub(super) fn progress_stage_label(
-    mode: ExecutionMode,
-    plan_stage: PlanStage,
-    tool_name: &str,
-    arguments: &serde_json::Value,
-    work_root: &Path,
-    plan_path: Option<&Path>,
-) -> Option<String> {
-    if mode != ExecutionMode::Plan {
-        return Some("Implementation".to_string());
-    }
-    let raw_path = arguments
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    if plan_path_matches(raw_path, work_root, plan_path) {
-        if tool_name == "Read" {
-            return Some(if plan_stage == PlanStage::Ready {
-                "Approval review".to_string()
-            } else {
-                "Plan review".to_string()
-            });
-        }
-        let source_text = arguments
-            .get("content")
-            .or_else(|| arguments.get("new_string"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let summary = summarize_plan_write(
-            tool_name,
-            raw_path,
-            source_text,
-            work_root,
-            plan_path,
-            plan_stage,
-        );
-        return Some(summary.phase);
-    }
-    Some("Repo exploration".to_string())
 }
 
 fn sync_package_json_with_existing_lock(
@@ -13815,6 +13699,7 @@ fn build_task_contract_verifier_exit_zero_evidence_bound(
 
 #[cfg(test)]
 mod tests {
+    use super::super::actor_loop_flow::normalize_plan_exploration_key;
     use super::ExitReason;
     use super::{
         PlanExplorationKey, TaskContractVerifierOutcome, answer_only_reply_is_inadequate,
@@ -13824,9 +13709,8 @@ mod tests {
         classify_verifier_timeout, deterministic_timeout_fallback_plan,
         effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
         non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
-        normalize_plan_exploration_key, repair_terminal_exit_reason,
-        request_explicitly_requests_script_execution, should_fallback_plan_model_after_timeout,
-        should_materialize_plan_after_timeout,
+        repair_terminal_exit_reason, request_explicitly_requests_script_execution,
+        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_structured_missing_outcome, task_contract_verifier_safe_stop_mapping,
         task_contract_verifier_transport_error_to_outcome, verifier_repair_context_from_failure,
@@ -18408,7 +18292,11 @@ pub(super) struct PlanWriteSummary {
     pub(super) signature: String,
 }
 
-fn plan_path_matches(raw_path: &str, work_root: &Path, plan_path: Option<&Path>) -> bool {
+pub(super) fn plan_path_matches(
+    raw_path: &str,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+) -> bool {
     resolve_plan_mode_write_target(work_root, raw_path, plan_path)
         .ok()
         .flatten()
@@ -20588,7 +20476,7 @@ fn plan_section_body_for_progress<'a>(contents: &'a str, section: &str) -> Optio
     start.map(|idx| &contents[idx..end])
 }
 
-fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
+pub(super) fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
     for section in sections {
         let Some(body) = plan_section_body_for_progress(contents, section) else {
             continue;
@@ -20617,7 +20505,7 @@ fn plan_section_excerpt(contents: &str, sections: &[&str]) -> Option<String> {
     None
 }
 
-fn plan_write_previous_contents(
+pub(super) fn plan_write_previous_contents(
     raw_path: &str,
     work_root: &Path,
     plan_path: Option<&Path>,
@@ -20636,15 +20524,18 @@ fn plan_write_previous_contents(
     }
 }
 
-struct PlanWriteSectionDelta {
-    previous_sections: Vec<&'static str>,
-    current_sections: Vec<&'static str>,
-    added_sections: Vec<&'static str>,
-    removed_sections: Vec<&'static str>,
-    focus_sections: Vec<&'static str>,
+pub(super) struct PlanWriteSectionDelta {
+    pub(super) previous_sections: Vec<&'static str>,
+    pub(super) current_sections: Vec<&'static str>,
+    pub(super) added_sections: Vec<&'static str>,
+    pub(super) removed_sections: Vec<&'static str>,
+    pub(super) focus_sections: Vec<&'static str>,
 }
 
-fn build_plan_write_section_delta(previous: &str, new_text: &str) -> PlanWriteSectionDelta {
+pub(super) fn build_plan_write_section_delta(
+    previous: &str,
+    new_text: &str,
+) -> PlanWriteSectionDelta {
     let previous_sections = plan_sections_with_content(previous);
     let current_sections = plan_sections_with_content(new_text);
     let changed_sections = current_sections
@@ -20682,7 +20573,7 @@ fn build_plan_write_section_delta(previous: &str, new_text: &str) -> PlanWriteSe
     }
 }
 
-fn plan_write_status(new_text: &str, delta: isize) -> Option<String> {
+pub(super) fn plan_write_status(new_text: &str, delta: isize) -> Option<String> {
     let next = lifecycle::plan_next_stage_sections(new_text);
     if lifecycle::plan_missing_sections(new_text).is_empty() {
         Some(format!("Approval ready | delta {delta:+}B"))
@@ -20696,7 +20587,7 @@ fn plan_write_status(new_text: &str, delta: isize) -> Option<String> {
     }
 }
 
-fn plan_phase_from_sections(
+pub(super) fn plan_phase_from_sections(
     sections: &[&str],
     current_stage: PlanStage,
     approval_ready: bool,
@@ -20749,58 +20640,6 @@ fn summarize_plan_read(contents: &str) -> (String, Option<String>) {
             format!("Missing: {}", join_sections_for_progress(&missing))
         };
         ("Review plan draft".to_string(), Some(note))
-    }
-}
-
-pub(super) fn summarize_plan_write(
-    tool_name: &str,
-    raw_path: &str,
-    new_text: &str,
-    work_root: &Path,
-    plan_path: Option<&Path>,
-    current_stage: PlanStage,
-) -> PlanWriteSummary {
-    let previous = plan_write_previous_contents(raw_path, work_root, plan_path);
-    let delta_sections = build_plan_write_section_delta(&previous, new_text);
-    let verb = if !delta_sections.removed_sections.is_empty() {
-        "Rewrite"
-    } else if delta_sections.previous_sections.is_empty() {
-        "Draft"
-    } else if !delta_sections.added_sections.is_empty() {
-        "Add"
-    } else if tool_name == "Edit" {
-        "Revise"
-    } else {
-        "Update"
-    };
-    let action = if delta_sections.focus_sections.is_empty() {
-        "Update plan draft".to_string()
-    } else {
-        format!(
-            "{verb} {}",
-            join_sections_for_progress(&delta_sections.focus_sections)
-        )
-    };
-    let note = plan_section_excerpt(new_text, &delta_sections.focus_sections).or_else(|| {
-        let fallback = delta_sections.current_sections.clone();
-        plan_section_excerpt(new_text, &fallback)
-    });
-    let delta = new_text.len() as isize - previous.len() as isize;
-    let approval_ready = lifecycle::plan_missing_sections(new_text).is_empty();
-    let status = plan_write_status(new_text, delta);
-    let phase = plan_phase_from_sections(
-        &delta_sections.focus_sections,
-        current_stage,
-        approval_ready,
-    )
-    .to_string();
-    let signature = format!("{}|{}|{}", phase, action, note.clone().unwrap_or_default());
-    PlanWriteSummary {
-        action,
-        note,
-        status,
-        phase,
-        signature,
     }
 }
 
@@ -20863,7 +20702,7 @@ fn tool_display_write(
 ) -> ProgressDisplay {
     let content = tool_display_str_arg(arguments, "content");
     let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-        let summary = summarize_plan_write(
+        let summary = super::actor_loop_flow::summarize_plan_write(
             "Write",
             raw_path,
             content,
@@ -20897,7 +20736,7 @@ fn tool_display_edit(
 ) -> ProgressDisplay {
     let new_text = tool_display_str_arg(arguments, "new_string");
     let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-        let summary = summarize_plan_write(
+        let summary = super::actor_loop_flow::summarize_plan_write(
             "Edit",
             raw_path,
             new_text,
