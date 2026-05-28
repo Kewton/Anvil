@@ -8347,7 +8347,7 @@ impl Agent {
 
     fn handle_actor_loop_prose_only_reply(
         &mut self,
-        args: ActorLoopProseOnlyReplyArgs<'_, '_>,
+        mut args: ActorLoopProseOnlyReplyArgs<'_, '_>,
     ) -> ActorLoopNoToolReplyOutcome {
         if args.tool_calls_made_this_turn != 0 {
             return ActorLoopNoToolReplyOutcome::NotHandled;
@@ -8367,71 +8367,87 @@ impl Agent {
             );
         }
         if args.action_expectation == recovery::ActionExpectation::PlanProgress {
-            let plan_contents = self
-                .current_plan_contents()
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            if self.plan_is_substantive_with_fallback(&plan_contents) {
-                return ActorLoopNoToolReplyOutcome::Done {
-                    final_prose: args.final_reply.to_string(),
-                };
-            }
-            let current_stage = lifecycle::current_plan_stage(&plan_contents);
-            let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
-            *args.plan_progress_retries += 1;
-            if *args.plan_progress_retries >= 2 {
-                return match self
-                    .materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
-                {
-                    Ok(true) => ActorLoopNoToolReplyOutcome::Done {
-                        final_prose:
-                            "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                                .to_string(),
-                    },
-                    Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
-                        reason: ExitReason::PlanIncomplete,
-                        error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
-                    },
-                    Err(err) => ActorLoopNoToolReplyOutcome::Exit {
-                        reason: ExitReason::TransportError,
-                        error_text: err,
-                    },
-                };
-            }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Retry requested",
-                    &format!(
-                        "The model answered without tool calls. Asked it to update {} with Write or Edit.",
-                        join_sections_for_progress(&next_sections)
-                    ),
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
-            log_plan_stall(
-                self.session_store.session_id(),
-                args.last_iter,
-                "no_tool_reply",
-                current_stage,
-                &next_sections,
-                &missing_sections,
-                *args.plan_progress_retries,
-            );
-            self.push_system_note(recovery::plan_no_tool_recovery_note(
-                current_stage,
-                &next_sections,
-                *args.plan_progress_retries,
-            ));
-            return ActorLoopNoToolReplyOutcome::Continue;
+            return self.handle_plan_progress_prose_only_reply(&mut args);
         }
+        self.handle_generic_prose_only_retry(args.last_iter, args.no_tool_retries)
+    }
 
-        *args.no_tool_retries += 1;
-        if *args.no_tool_retries >= 3 {
+    fn handle_plan_progress_prose_only_reply(
+        &mut self,
+        args: &mut ActorLoopProseOnlyReplyArgs<'_, '_>,
+    ) -> ActorLoopNoToolReplyOutcome {
+        let plan_contents = self
+            .current_plan_contents()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if self.plan_is_substantive_with_fallback(&plan_contents) {
+            return ActorLoopNoToolReplyOutcome::Done {
+                final_prose: args.final_reply.to_string(),
+            };
+        }
+        let current_stage = lifecycle::current_plan_stage(&plan_contents);
+        let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
+        *args.plan_progress_retries += 1;
+        if *args.plan_progress_retries >= 2 {
+            return self.handle_plan_progress_prose_only_fallback();
+        }
+        write_stdout_rendered(
+            &format_iteration_status(
+                args.last_iter,
+                self.config.max_iterations,
+                "Retry requested",
+                &format!(
+                    "The model answered without tool calls. Asked it to update {} with Write or Edit.",
+                    join_sections_for_progress(&next_sections)
+                ),
+                self.footer.current_cols(),
+            ),
+            true,
+        );
+        let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+        log_plan_stall(
+            self.session_store.session_id(),
+            args.last_iter,
+            "no_tool_reply",
+            current_stage,
+            &next_sections,
+            &missing_sections,
+            *args.plan_progress_retries,
+        );
+        self.push_system_note(recovery::plan_no_tool_recovery_note(
+            current_stage,
+            &next_sections,
+            *args.plan_progress_retries,
+        ));
+        ActorLoopNoToolReplyOutcome::Continue
+    }
+
+    fn handle_plan_progress_prose_only_fallback(&mut self) -> ActorLoopNoToolReplyOutcome {
+        match self
+            .materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
+        {
+            Ok(true) => ActorLoopNoToolReplyOutcome::Done {
+                final_prose: plan_tool_followup_done_message(),
+            },
+            Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
+                reason: ExitReason::PlanIncomplete,
+                error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+            },
+            Err(err) => ActorLoopNoToolReplyOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            },
+        }
+    }
+
+    fn handle_generic_prose_only_retry(
+        &mut self,
+        last_iter: usize,
+        no_tool_retries: &mut usize,
+    ) -> ActorLoopNoToolReplyOutcome {
+        *no_tool_retries += 1;
+        if *no_tool_retries >= 3 {
             self.session
                 .record_feedback_if_unset(build_feedback_for_no_tool_call(
                     "no_tool_retries_exhausted",
@@ -8444,7 +8460,7 @@ impl Agent {
         }
         write_stdout_rendered(
             &format_iteration_status(
-                args.last_iter,
+                last_iter,
                 self.config.max_iterations,
                 "Retry requested",
                 "The model answered without tool calls. Asked it to continue with concrete actions.",
@@ -8452,7 +8468,7 @@ impl Agent {
             ),
             true,
         );
-        self.push_system_note(recovery::no_tool_recovery_note(*args.no_tool_retries));
+        self.push_system_note(recovery::no_tool_recovery_note(*no_tool_retries));
         ActorLoopNoToolReplyOutcome::Continue
     }
 
@@ -18796,6 +18812,14 @@ mod tests {
                 super::task_contract::SafeStopReason::VerifierMissing
             ),
             "task_contract_safe_stop_verifier_missing"
+        );
+    }
+
+    #[test]
+    fn plan_tool_followup_done_message_matches_expected_prompt() {
+        assert_eq!(
+            super::plan_tool_followup_done_message(),
+            "Plan complete. Reply yes to execute, no to revise, or provide feedback."
         );
     }
 
