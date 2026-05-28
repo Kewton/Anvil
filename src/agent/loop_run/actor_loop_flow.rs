@@ -697,6 +697,210 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
     }
 }
 
+pub(super) fn handle_actor_loop_rejected_tool_batch(
+    agent: &mut Agent,
+    args: ActorLoopRejectedToolBatchArgs<'_, '_>,
+) -> ActorLoopToolPreparationOutcome {
+    let focused_retry = args.effective_tool_policy.focused_edit_policy().cloned();
+    let artifact_retry = args
+        .effective_tool_policy
+        .artifact_directed_policy()
+        .cloned();
+    agent.session.working_memory.note_error(args.err);
+    if let Some(outcome) = maybe_handle_rejected_tool_batch_missing_verifier(
+        agent,
+        args.missing_verifier_setup_turn,
+        args.last_iter,
+    ) {
+        return outcome;
+    }
+    if let Some(outcome) = maybe_handle_rejected_tool_batch_artifact(
+        agent,
+        args.last_iter,
+        artifact_retry.is_some(),
+        args.task_contract,
+        args.contract_completion_role_retries,
+    ) {
+        return outcome;
+    }
+
+    *args.focused_policy_retries += 1;
+    if let Some(outcome) = maybe_handle_rejected_tool_batch_focused_retry_exhausted(
+        agent,
+        focused_retry.is_some(),
+        *args.focused_policy_retries,
+        args.recovery_dispatch_gate,
+        args.recovery_owner,
+    ) {
+        return outcome;
+    }
+    if super::turn::unrestricted_policy_retry_exhausted(
+        focused_retry.is_some(),
+        *args.focused_policy_retries,
+    ) {
+        return ActorLoopToolPreparationOutcome::Exit {
+            reason: ExitReason::ToolCallFormatError,
+            error_text: "assistant kept calling tools outside the current tool policy".to_string(),
+        };
+    }
+    let retry_status_note =
+        super::turn::rejected_tool_batch_retry_status_note(focused_retry.is_some());
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            retry_status_note,
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    if let Some(policy) = focused_retry {
+        let note = agent.focused_edit_no_tool_note_for_policy(
+            &policy,
+            args.effective_tool_policy,
+            *args.focused_policy_retries,
+        );
+        agent.push_system_note(note);
+    } else {
+        agent.push_system_note(format!(
+            "The previous tool call violated the current tool policy and was not executed. Emit exactly one allowed tool call now. tool_policy_retry_attempt={}",
+            *args.focused_policy_retries
+        ));
+    }
+    ActorLoopToolPreparationOutcome::Continue
+}
+
+pub(super) fn maybe_handle_rejected_tool_batch_missing_verifier(
+    agent: &mut Agent,
+    missing_verifier_setup_turn: bool,
+    last_iter: usize,
+) -> Option<ActorLoopToolPreparationOutcome> {
+    if !missing_verifier_setup_turn {
+        return None;
+    }
+    if agent.record_missing_verifier_setup_failure(last_iter, "tool policy violation") {
+        return Some(ActorLoopToolPreparationOutcome::Exit {
+            reason: ExitReason::MissingVerification,
+            error_text:
+                "task contract requires verification, but the MissingVerifierJob setup budget is exhausted"
+                    .to_string(),
+        });
+    }
+    Some(ActorLoopToolPreparationOutcome::Continue)
+}
+
+pub(super) fn maybe_handle_rejected_tool_batch_artifact(
+    agent: &mut Agent,
+    last_iter: usize,
+    artifact_retry_present: bool,
+    task_contract: Option<&super::task_contract::TaskContract>,
+    contract_completion_role_retries: &mut HashMap<super::task_contract::ArtifactRole, usize>,
+) -> Option<ActorLoopToolPreparationOutcome> {
+    if !artifact_retry_present {
+        return None;
+    }
+    let role = agent
+        .current_artifact_recovery_target
+        .as_ref()
+        .map(|target| target.role)
+        .unwrap_or(super::task_contract::ArtifactRole::Implementation);
+    if agent.record_artifact_completion_attempt(
+        super::artifact_completion_job::ArtifactAttemptOutcomeKind::RolePolicyViolation,
+        vec!["focused_edit_batch_reject".to_string()],
+    ) {
+        return Some(ActorLoopToolPreparationOutcome::Exit {
+            reason: ExitReason::MissingRepoEdits,
+            error_text: format!(
+                "artifact completion role-policy violation budget exhausted for role {}",
+                role.label()
+            ),
+        });
+    }
+    let artifact_attempt = super::turn::increment_artifact_completion_role_attempt(
+        contract_completion_role_retries,
+        role,
+    );
+    let attempt_limit = task_contract
+        .as_ref()
+        .map(|contract| contract.artifact_completion_attempt_limit())
+        .unwrap_or(4);
+    if artifact_attempt >= attempt_limit {
+        let expected_target = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .map(|target| target.path.clone());
+        agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+        return Some(ActorLoopToolPreparationOutcome::Exit {
+            reason: ExitReason::MissingRepoEdits,
+            error_text: format!(
+                "artifact edit rejected repeatedly for required role {}",
+                role.label()
+            ),
+        });
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            "Artifact completion rejected an invalid tool call before execution; asked for one allowed edit on the target.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    if !agent.push_artifact_directed_recovery_note(artifact_attempt) {
+        agent.push_system_note(format!(
+            "[Artifact Completion] Previous tool call was rejected and was not executed. Missing role: {}. Emit exactly one allowed tool call on the current target path now. artifact_completion_attempt={artifact_attempt}/{attempt_limit}",
+            role.label()
+        ));
+    }
+    Some(ActorLoopToolPreparationOutcome::Continue)
+}
+
+pub(super) fn maybe_handle_rejected_tool_batch_focused_retry_exhausted(
+    agent: &mut Agent,
+    focused_retry_present: bool,
+    focused_policy_retries: usize,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    recovery_owner: RecoveryOwner,
+) -> Option<ActorLoopToolPreparationOutcome> {
+    if !super::turn::focused_policy_retry_exhausted(focused_retry_present, focused_policy_retries) {
+        return None;
+    }
+    if !recovery_dispatch_gate.allows_focused_edit_recovery() {
+        return Some(ActorLoopToolPreparationOutcome::Exit {
+            reason: Agent::tool_policy_violation_exit_reason(recovery_owner),
+            error_text:
+                "verifier-owned recovery rejected invalid tool calls repeatedly before an allowed repair edit"
+                    .to_string(),
+        });
+    }
+    let request = agent.active_request_text().unwrap_or_default();
+    let fallback = match agent.maybe_apply_local_llm_small_edit_fallback(&request) {
+        Ok(fallback) => fallback,
+        Err(err) => {
+            return Some(ActorLoopToolPreparationOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            });
+        }
+    };
+    if let Some(relative) = fallback {
+        return Some(ActorLoopToolPreparationOutcome::Done {
+            final_prose: format!(
+                "Applied a verified small edit fallback after the local model could not produce a compact edit for {relative}."
+            ),
+        });
+    }
+    Some(ActorLoopToolPreparationOutcome::Exit {
+        reason: ExitReason::MissingRepoEdits,
+        error_text: ExitReason::MissingRepoEdits
+            .default_error_text()
+            .to_string(),
+    })
+}
+
 pub(super) fn handle_post_reply_recovery(
     agent: &mut Agent,
     mut args: PostReplyRecoveryArgs<'_, '_>,
