@@ -23751,147 +23751,215 @@ fn tool_display(
     current_stage: PlanStage,
     arg_budget: usize,
 ) -> ProgressDisplay {
-    let str_arg = |key: &str| -> &str {
-        arguments
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    };
-    let raw_path = str_arg("path");
+    let raw_path = tool_display_str_arg(arguments, "path");
     let path_display = progress_path_display(raw_path, work_root, plan_path, arg_budget.max(48));
     match tool_name {
-        "Write" => {
-            let content = arguments
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-                let summary = summarize_plan_write(
-                    "Write",
-                    raw_path,
-                    content,
-                    work_root,
-                    plan_path,
-                    current_stage,
-                );
-                (summary.action, summary.note, summary.status)
-            } else {
-                (
-                    "Write file".to_string(),
-                    (!text_preview(content, 72).is_empty())
-                        .then(|| format!("Preview: {}", text_preview(content, 72))),
-                    arguments
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|c| format!("{}B", c.len())),
-                )
-            };
-            ProgressDisplay {
-                action,
-                path: Some(path_display),
-                note,
-                status,
-            }
-        }
-        "Edit" => {
-            let new_text = arguments
-                .get("new_string")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-                let summary = summarize_plan_write(
-                    "Edit",
-                    raw_path,
-                    new_text,
-                    work_root,
-                    plan_path,
-                    current_stage,
-                );
-                (summary.action, summary.note, summary.status)
-            } else {
-                (
-                    "Revise file".to_string(),
-                    (!text_preview(new_text, 72).is_empty())
-                        .then(|| format!("Preview: {}", text_preview(new_text, 72))),
-                    None,
-                )
-            };
-            ProgressDisplay {
-                action,
-                path: Some(path_display),
-                note,
-                status,
-            }
-        }
-        "Read" => {
-            let line_suffix = read_line_suffix(arguments);
-            let path = format!("{path_display}{line_suffix}");
-            let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
-                let contents = plan_path
-                    .and_then(|path| std::fs::read_to_string(path).ok())
-                    .unwrap_or_default();
-                let (action, note) = summarize_plan_read(&contents);
-                let status = if lifecycle::current_plan_stage(&contents) == PlanStage::Ready {
-                    Some("Approval ready".to_string())
-                } else {
-                    let next = lifecycle::plan_next_stage_sections(&contents);
-                    (!next.is_empty()).then(|| {
-                        format!(
-                            "Current phase: {}",
-                            plan_phase_from_sections(&next, current_stage, false)
-                        )
-                    })
-                };
-                (action, note, status)
-            } else if !line_suffix.is_empty() {
-                let (preview, extra) = read_preview(raw_path, work_root);
-                (
-                    format!("Read lines {}", line_suffix.trim_start_matches(':')),
-                    preview.map(|preview| format!("Preview: {preview}")),
-                    extra,
-                )
-            } else {
-                let (preview, extra) = read_preview(raw_path, work_root);
-                (
-                    "Read file".to_string(),
-                    preview.map(|preview| format!("Preview: {preview}")),
-                    extra,
-                )
-            };
-            ProgressDisplay {
-                action,
-                path: Some(compact_progress_path(&path, arg_budget.max(48))),
-                note,
-                status,
-            }
-        }
-        "Bash" => {
-            let sanitized = sanitize_for_progress(str_arg("command"));
-            ProgressDisplay {
-                action: format!("Run {}", truncate(&sanitized, arg_budget.saturating_sub(4))),
-                path: None,
-                note: None,
-                status: None,
-            }
-        }
-        "Glob" | "Grep" => ProgressDisplay {
-            action: format!(
-                "Search {}",
-                truncate(
-                    &sanitize_for_progress(str_arg("pattern")),
-                    arg_budget.saturating_sub(7)
-                )
-            ),
-            path: None,
-            note: None,
-            status: None,
-        },
-        _ => ProgressDisplay {
-            action: truncate(&sanitize_for_progress(tool_name), arg_budget),
-            path: None,
-            note: None,
-            status: None,
-        },
+        "Write" => tool_display_write(
+            arguments,
+            raw_path,
+            path_display,
+            work_root,
+            plan_path,
+            current_stage,
+        ),
+        "Edit" => tool_display_edit(
+            arguments,
+            raw_path,
+            path_display,
+            work_root,
+            plan_path,
+            current_stage,
+        ),
+        "Read" => tool_display_read(
+            arguments,
+            raw_path,
+            path_display,
+            work_root,
+            plan_path,
+            current_stage,
+            arg_budget,
+        ),
+        "Bash" => tool_display_bash(arguments, arg_budget),
+        "Glob" | "Grep" => tool_display_search(arguments, arg_budget),
+        _ => tool_display_default(tool_name, arg_budget),
+    }
+}
+
+fn tool_display_str_arg<'a>(arguments: &'a serde_json::Value, key: &str) -> &'a str {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn tool_display_write(
+    arguments: &serde_json::Value,
+    raw_path: &str,
+    path_display: String,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+) -> ProgressDisplay {
+    let content = tool_display_str_arg(arguments, "content");
+    let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
+        let summary = summarize_plan_write(
+            "Write",
+            raw_path,
+            content,
+            work_root,
+            plan_path,
+            current_stage,
+        );
+        (summary.action, summary.note, summary.status)
+    } else {
+        (
+            "Write file".to_string(),
+            tool_display_preview_note(content),
+            Some(format!("{}B", content.len())),
+        )
+    };
+    ProgressDisplay {
+        action,
+        path: Some(path_display),
+        note,
+        status,
+    }
+}
+
+fn tool_display_edit(
+    arguments: &serde_json::Value,
+    raw_path: &str,
+    path_display: String,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+) -> ProgressDisplay {
+    let new_text = tool_display_str_arg(arguments, "new_string");
+    let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
+        let summary = summarize_plan_write(
+            "Edit",
+            raw_path,
+            new_text,
+            work_root,
+            plan_path,
+            current_stage,
+        );
+        (summary.action, summary.note, summary.status)
+    } else {
+        (
+            "Revise file".to_string(),
+            tool_display_preview_note(new_text),
+            None,
+        )
+    };
+    ProgressDisplay {
+        action,
+        path: Some(path_display),
+        note,
+        status,
+    }
+}
+
+fn tool_display_preview_note(contents: &str) -> Option<String> {
+    let preview = text_preview(contents, 72);
+    (!preview.is_empty()).then(|| format!("Preview: {preview}"))
+}
+
+fn tool_display_read(
+    arguments: &serde_json::Value,
+    raw_path: &str,
+    path_display: String,
+    work_root: &Path,
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+    arg_budget: usize,
+) -> ProgressDisplay {
+    let line_suffix = read_line_suffix(arguments);
+    let path = format!("{path_display}{line_suffix}");
+    let (action, note, status) = if plan_path_matches(raw_path, work_root, plan_path) {
+        tool_display_plan_read(plan_path, current_stage)
+    } else {
+        tool_display_workspace_read(raw_path, work_root, &line_suffix)
+    };
+    ProgressDisplay {
+        action,
+        path: Some(compact_progress_path(&path, arg_budget.max(48))),
+        note,
+        status,
+    }
+}
+
+fn tool_display_plan_read(
+    plan_path: Option<&Path>,
+    current_stage: PlanStage,
+) -> (String, Option<String>, Option<String>) {
+    let contents = plan_path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let (action, note) = summarize_plan_read(&contents);
+    let status = if lifecycle::current_plan_stage(&contents) == PlanStage::Ready {
+        Some("Approval ready".to_string())
+    } else {
+        let next = lifecycle::plan_next_stage_sections(&contents);
+        (!next.is_empty()).then(|| {
+            format!(
+                "Current phase: {}",
+                plan_phase_from_sections(&next, current_stage, false)
+            )
+        })
+    };
+    (action, note, status)
+}
+
+fn tool_display_workspace_read(
+    raw_path: &str,
+    work_root: &Path,
+    line_suffix: &str,
+) -> (String, Option<String>, Option<String>) {
+    let (preview, extra) = read_preview(raw_path, work_root);
+    let action = if line_suffix.is_empty() {
+        "Read file".to_string()
+    } else {
+        format!("Read lines {}", line_suffix.trim_start_matches(':'))
+    };
+    (
+        action,
+        preview.map(|preview| format!("Preview: {preview}")),
+        extra,
+    )
+}
+
+fn tool_display_bash(arguments: &serde_json::Value, arg_budget: usize) -> ProgressDisplay {
+    let sanitized = sanitize_for_progress(tool_display_str_arg(arguments, "command"));
+    ProgressDisplay {
+        action: format!("Run {}", truncate(&sanitized, arg_budget.saturating_sub(4))),
+        path: None,
+        note: None,
+        status: None,
+    }
+}
+
+fn tool_display_search(arguments: &serde_json::Value, arg_budget: usize) -> ProgressDisplay {
+    ProgressDisplay {
+        action: format!(
+            "Search {}",
+            truncate(
+                &sanitize_for_progress(tool_display_str_arg(arguments, "pattern")),
+                arg_budget.saturating_sub(7)
+            )
+        ),
+        path: None,
+        note: None,
+        status: None,
+    }
+}
+
+fn tool_display_default(tool_name: &str, arg_budget: usize) -> ProgressDisplay {
+    ProgressDisplay {
+        action: truncate(&sanitize_for_progress(tool_name), arg_budget),
+        path: None,
+        note: None,
+        status: None,
     }
 }
 
