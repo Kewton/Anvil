@@ -137,8 +137,7 @@ use super::verifier_assessment_parser::{
     verifier_failure_type_for_diagnostic_kind,
 };
 use super::verifier_diagnostic_attempt::{
-    VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, VerifierDiagnosticAttemptSpec,
-    verifier_diagnostic_attempt_spec,
+    VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, verifier_diagnostic_attempt_spec,
 };
 #[cfg(test)]
 use super::verifier_diagnostic_attempt::{
@@ -159,6 +158,11 @@ use super::verifier_driver::{
 use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
 use super::verifier_failure_signature::verifier_failure_count;
+use super::verifier_orchestration::{
+    JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
+    StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
+    VerifierRepairAttemptProgress,
+};
 use super::verifier_repair_shadow::{
     build_verifier_repair_pipeline_shadow_payload, legacy_repair_brief_input_from_assessment,
     verifier_repair_action_payload_for_context,
@@ -179,7 +183,7 @@ use super::work_mode_confirm::{
     run_work_mode_confirm_with_strategy,
 };
 use super::*;
-use crate::agent::orchestration::{RepoSnapshot, RepoVerification, verify_repo_progress};
+use crate::agent::orchestration::verify_repo_progress;
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{
@@ -245,73 +249,6 @@ const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
 pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
-
-/// Issue #652 PR-001 SSOT: outcome of
-/// `Agent::maybe_install_artifact_completion_job_for_hint`. The
-/// caller (`set_artifact_recovery_target_from_hint`) uses this to
-/// decide whether to commit the `current_artifact_recovery_target`
-/// projection (`InstalledOrSkipped`) or clear it atomically
-/// (`ValidationFailed`).
-///
-/// `ValidationFailed` is emitted ONLY for Test-role hints that did not
-/// pass `ArtifactCompletionJob::new` validation; non-Test roles always
-/// return `InstalledOrSkipped` because they do not install a job today.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobInstallOutcome {
-    /// Either a new job was installed, an existing job's identity-refresh
-    /// was kept, or the hint role does not require a job. Caller may
-    /// commit the projection.
-    InstalledOrSkipped,
-    /// A Test-role hint failed `ArtifactCompletionJob::new` validation.
-    /// Caller MUST clear `current_artifact_recovery_target` as well so
-    /// the projection cannot survive without a backing job (PR-001 SSOT
-    /// invariant).
-    ValidationFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VerifierDiagnosticPassOutcome {
-    Accepted,
-    RetryPending { error: String },
-    Unavailable { error: String },
-    Skipped,
-}
-
-#[derive(Debug, Clone)]
-struct PreparedVerifierDiagnosticPass {
-    context: super::repair_job::RepairJob,
-    attempt_spec: VerifierDiagnosticAttemptSpec,
-    active_request: String,
-    behavior_projection: Option<super::required_behavior::BehaviorContractProjection>,
-}
-
-#[derive(Debug, Clone)]
-struct PreparedVerifierRepairPass {
-    context: super::repair_job::RepairJob,
-    accepted_plan: super::repair_plan::AcceptedRepairPlan,
-    messages: Vec<ConversationMessage>,
-    model: String,
-}
-
-enum VerifierRepairAttemptProgress {
-    Return(VerifierRepairPassOutcome),
-    Continue {
-        last_error: String,
-        last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome>,
-    },
-    Break {
-        last_error: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct StructuredTaskContractVerifierRun {
-    plan: AutoTestPlan,
-    command: super::auto_test::VerifierCommand,
-    display_command: String,
-    bound_test_artifacts_count: usize,
-    bound_test_artifacts_paths: Vec<String>,
-}
 
 #[derive(Debug, Clone, Copy)]
 struct AssistantReplyRetryState {
@@ -1602,20 +1539,6 @@ fn extract_current_request_paths(agent: &Agent, work_root: &std::path::Path) -> 
 
 fn raw_mode_safe_text(text: &str) -> String {
     text.replace('\n', "\r\n")
-}
-
-pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
-    pub(super) before_snapshot: &'a RepoSnapshot,
-    pub(super) accumulated: &'a [RepoVerification],
-    pub(super) repo_edit_calls_made_this_turn: usize,
-    pub(super) task_contract: Option<&'a super::task_contract::TaskContract>,
-    pub(super) contract_verification_retries: &'b mut usize,
-    pub(super) contract_verifier_repair_edit_count: &'b mut Option<usize>,
-    pub(super) repo_change_retries: &'b mut usize,
-    pub(super) verifier_repair_retries: &'b mut usize,
-    pub(super) task_contract_verify_commands_collected: &'b mut Vec<String>,
-    pub(super) task_contract_verifier_passed_in_loop: &'b mut bool,
-    pub(super) last_iter: usize,
 }
 
 fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) -> ExitReason {

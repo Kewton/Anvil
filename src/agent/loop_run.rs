@@ -194,6 +194,16 @@ mod verifier_repair_shadow;
 // path safety and Python module/dependency candidate parsing out of the actor
 // loop dispatcher.
 mod verifier_repair_targeting;
+// Issue #682 (parent #680, Phase 2): verifier orchestration data types
+// extracted from `turn.rs`. Hosts 7 pub(super) types
+// (JobInstallOutcome / VerifierDiagnosticPassOutcome /
+// PreparedVerifierDiagnosticPass / PreparedVerifierRepairPass /
+// VerifierRepairAttemptProgress / StructuredTaskContractVerifierRun /
+// TaskContractVerifierFlowArgs). Module is intentionally *not*
+// re-exported (DR3-001) — `turn.rs` is the only in-crate consumer.
+// Dispatch methods on `impl Agent` stay in turn.rs and will be migrated
+// in follow-up PRs (mirrors Phase 1 / actor_loop_flow pattern).
+mod verifier_orchestration;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
