@@ -4,6 +4,8 @@ use super::active_job_arbiter::{
     loop_control_action_requires_missing_verifier_setup,
 };
 #[cfg(test)]
+use super::actor_loop_flow::missing_repo_edit_recovery_allowed;
+#[cfg(test)]
 use super::actor_loop_flow::missing_repo_edits_finalize_outcome;
 use super::actor_loop_flow::{
     ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
@@ -18,14 +20,12 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
-    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
-    maybe_continue_missing_repo_framework_fallback, maybe_continue_missing_repo_scaffold_fallback,
-    maybe_handle_answer_only_future_work_recovery, maybe_handle_answer_only_inadequate_recovery,
+    TaskContractVerifierFlowOutcome, handle_non_progress_plan_edit_fallback,
+    handle_plan_progress_prose_only_fallback, maybe_handle_answer_only_future_work_recovery,
+    maybe_handle_answer_only_inadequate_recovery, maybe_handle_missing_repo_edit_recovery,
     maybe_handle_python_test_artifact_recovery, maybe_handle_repo_change_partial_progress_recovery,
     maybe_handle_repo_change_quality_gate_recovery, missing_repo_change_budget_exhausted_outcome,
-    missing_repo_edit_recovery_allowed, plan_tool_followup_done_message,
-    push_missing_repo_edit_retry_note, repair_job_done_outcome,
+    plan_tool_followup_done_message, repair_job_done_outcome,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -5812,7 +5812,7 @@ impl Agent {
         if let Some(outcome) = maybe_handle_answer_only_future_work_recovery(self, &mut args) {
             return Some(outcome);
         }
-        if let Some(outcome) = self.maybe_handle_missing_repo_edit_recovery(&mut args) {
+        if let Some(outcome) = maybe_handle_missing_repo_edit_recovery(self, &mut args) {
             return Some(outcome);
         }
         if let Some(outcome) = maybe_handle_python_test_artifact_recovery(self, &mut args) {
@@ -5829,37 +5829,6 @@ impl Agent {
         }
 
         None
-    }
-
-    fn maybe_handle_missing_repo_edit_recovery(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if !missing_repo_edit_recovery_allowed(args) {
-            return None;
-        }
-        if maybe_continue_missing_repo_framework_fallback(self, args) {
-            return Some(PostReplyRecoveryOutcome::Continue);
-        }
-        if let Some(outcome) = maybe_continue_missing_repo_scaffold_fallback(self, args) {
-            return Some(outcome);
-        }
-        *args.repo_change_retries += 1;
-        if *args.repo_change_retries >= 3 {
-            return Some(finalize_missing_repo_edit_retry_exhausted(self));
-        }
-        write_stdout_rendered(
-            &format_iteration_status(
-                args.last_iter,
-                self.config.max_iterations,
-                "Retry requested",
-                "The turn finished without repository edits. Asked the model to continue implementing changes.",
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        push_missing_repo_edit_retry_note(self, *args.repo_change_retries);
-        Some(PostReplyRecoveryOutcome::Continue)
     }
 
     fn drive_actor_loop_pre_reply_phase(

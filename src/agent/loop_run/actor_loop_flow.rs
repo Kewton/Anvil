@@ -612,6 +612,37 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
     Some(PostReplyRecoveryOutcome::Continue)
 }
 
+pub(super) fn maybe_handle_missing_repo_edit_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if !missing_repo_edit_recovery_allowed(args) {
+        return None;
+    }
+    if maybe_continue_missing_repo_framework_fallback(agent, args) {
+        return Some(PostReplyRecoveryOutcome::Continue);
+    }
+    if let Some(outcome) = maybe_continue_missing_repo_scaffold_fallback(agent, args) {
+        return Some(outcome);
+    }
+    *args.repo_change_retries += 1;
+    if *args.repo_change_retries >= 3 {
+        return Some(finalize_missing_repo_edit_retry_exhausted(agent));
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            "The turn finished without repository edits. Asked the model to continue implementing changes.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    push_missing_repo_edit_retry_note(agent, *args.repo_change_retries);
+    Some(PostReplyRecoveryOutcome::Continue)
+}
+
 pub(super) fn maybe_continue_missing_repo_framework_fallback(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
