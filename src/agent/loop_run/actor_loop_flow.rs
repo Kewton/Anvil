@@ -34,7 +34,7 @@
 //! DR3-001: `pub(super)` limited. `loop_run.rs` MUST NOT re-export via
 //! `pub use`. `turn.rs` is the only in-crate consumer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::agent::orchestration::{
     RepoSnapshot, RepoVerification, capture_repo_snapshot, verify_repo_progress,
@@ -55,20 +55,22 @@ use super::lifecycle;
 use super::progress_text::truncate;
 use super::progress_text::{no_color_requested, unicode_supported};
 use super::spinner::Spinner;
-use super::summary::{ExitReason, LoopResult};
+use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
 use super::turn::{
     LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, PlanExplorationKey,
-    build_feedback_for_no_repo_progress, build_feedback_for_unsafe_block, build_stats,
+    build_feedback_for_no_repo_progress, build_feedback_for_unsafe_block,
     format_blocked_progress_line, format_progress_line, normalize_plan_exploration_key,
     progress_stage_label, should_record_no_repo_progress, summarize_plan_write,
     write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
+use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::time::Instant;
 
 /// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
@@ -3885,5 +3887,88 @@ pub(super) fn run_actor_loop(
             error_text = exit_reason.default_error_text().to_string();
         }
         Err((exit_reason, error_text, stats))
+    }
+}
+
+pub(super) fn build_stats(
+    accumulated: Vec<RepoVerification>,
+    final_verif: RepoVerification,
+    iter_used: usize,
+    iter_max: usize,
+    duration_secs: u64,
+) -> LoopStats {
+    let mut all_changed: HashSet<String> = HashSet::new();
+    let mut all_changed_full: HashSet<String> = HashSet::new();
+    let mut impl_changed = 0usize;
+    let mut test_changed = 0usize;
+    let mut setup_changed = 0usize;
+    let mut other_changed = 0usize;
+    let mut deleted_changed = 0usize;
+
+    for verif in accumulated.iter().chain(std::iter::once(&final_verif)) {
+        for f in &verif.changed_files {
+            if is_ignored_workspace_display_path(f) {
+                continue;
+            }
+            all_changed.insert(f.clone());
+        }
+        for f in &verif.all_changed_files {
+            if is_ignored_workspace_display_path(f) {
+                continue;
+            }
+            all_changed_full.insert(f.clone());
+        }
+        if verif
+            .all_changed_files
+            .iter()
+            .all(|f| !is_ignored_workspace_display_path(f))
+        {
+            impl_changed += verif.implementation_files_changed;
+            test_changed += verif.test_files_changed;
+            setup_changed += verif.setup_files_changed;
+            other_changed += verif.other_files_changed;
+            deleted_changed += verif.deleted_files_changed;
+        } else {
+            for f in &verif.all_changed_files {
+                if is_ignored_workspace_display_path(f) {
+                    continue;
+                }
+                let (path, deleted) = f
+                    .strip_suffix(" (deleted)")
+                    .map(|path| (path, true))
+                    .unwrap_or((f.as_str(), false));
+                if deleted {
+                    deleted_changed += 1;
+                } else if crate::util::file_classify::is_test_file(Path::new(path)) {
+                    test_changed += 1;
+                } else if crate::util::file_classify::is_setup_file(Path::new(path)) {
+                    setup_changed += 1;
+                } else if crate::util::file_classify::is_implementation_file(Path::new(path)) {
+                    impl_changed += 1;
+                } else {
+                    other_changed += 1;
+                }
+            }
+        }
+    }
+
+    let total_changed =
+        impl_changed + test_changed + setup_changed + other_changed + deleted_changed;
+    let mut changed_files: Vec<String> = all_changed.into_iter().collect();
+    changed_files.sort();
+    changed_files.truncate(16);
+    let mut all_changed_files: Vec<String> = all_changed_full.into_iter().collect();
+    all_changed_files.sort();
+
+    LoopStats {
+        iter_used,
+        iter_max,
+        duration_secs,
+        changed_files: changed_files.into_boxed_slice(),
+        all_changed_files: all_changed_files.into_boxed_slice(),
+        total_changed,
+        changed_impl_count: impl_changed,
+        changed_test_count: test_changed,
+        changed_setup_count: setup_changed,
     }
 }
