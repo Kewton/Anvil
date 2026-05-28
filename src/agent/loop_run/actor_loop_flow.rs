@@ -755,6 +755,85 @@ pub(super) fn actor_loop_pre_reply_flow_outcome(
     }
 }
 
+pub(super) fn handle_actor_loop_post_tool_cleanup(
+    agent: &mut Agent,
+    args: ActorLoopPostToolCleanupArgs<'_>,
+) -> ActorLoopPostToolCleanupOutcome {
+    sync_post_tool_contract_recovery_target(agent, &args);
+    agent.maybe_invoke_reminder(args.interrupt_flag);
+    run_post_tool_cleanup_compaction(
+        agent,
+        args.tool_calls_made_this_turn,
+        args.repo_edit_calls_made_this_turn,
+    );
+    if let Some(outcome) = post_tool_cleanup_interrupt_outcome(args.interrupt_flag) {
+        return outcome;
+    }
+    ActorLoopPostToolCleanupOutcome::Continue
+}
+
+fn sync_post_tool_contract_recovery_target(
+    agent: &mut Agent,
+    args: &ActorLoopPostToolCleanupArgs<'_>,
+) {
+    if agent.session.mode_state.mode == super::ExecutionMode::Plan {
+        return;
+    }
+    let Some(contract) = args.task_contract else {
+        return;
+    };
+    let action = agent.task_contract_recovery_action(
+        contract,
+        args.contract_verifier_repair_edit_count,
+        args.repo_edit_calls_made_this_turn,
+    );
+    match action {
+        super::task_contract::ArtifactRecoveryAction::Continue { .. }
+        | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
+            agent.set_artifact_recovery_target_for_action(
+                &action,
+                args.contract_completion_retries.saturating_add(1),
+            );
+        }
+        super::task_contract::ArtifactRecoveryAction::RunVerifier
+        | super::task_contract::ArtifactRecoveryAction::Done => {
+            agent.clear_artifact_recovery_target("contract_artifacts_satisfied");
+        }
+        super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
+            agent.clear_artifact_recovery_target(super::turn::task_contract_safe_stop_clear_tag(
+                reason,
+            ));
+        }
+    }
+}
+
+fn run_post_tool_cleanup_compaction(
+    agent: &mut Agent,
+    tool_calls_made_this_turn: usize,
+    repo_edit_calls_made_this_turn: usize,
+) {
+    if agent.session.mode_state.mode == super::ExecutionMode::Plan {
+        return;
+    }
+    let compacted = agent
+        .maybe_compact_late_turn_session(tool_calls_made_this_turn, repo_edit_calls_made_this_turn);
+    if !compacted {
+        agent.maybe_compact_session(super::DEFAULT_KEEP_TAIL);
+    }
+}
+
+fn post_tool_cleanup_interrupt_outcome(
+    interrupt_flag: &InterruptFlag,
+) -> Option<ActorLoopPostToolCleanupOutcome> {
+    if interrupt_flag.is_set() {
+        return Some(ActorLoopPostToolCleanupOutcome::Exit {
+            reason: ExitReason::Interrupted,
+            error_text: String::new(),
+        });
+    }
+    None
+}
+
 pub(super) fn handle_actor_loop_completion(
     agent: &mut Agent,
     args: ActorLoopCompletionArgs<'_, '_>,
