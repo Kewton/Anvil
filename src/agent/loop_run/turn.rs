@@ -1277,6 +1277,36 @@ fn verifier_repair_pass_request_error_message(err: &str, attempt_timeout_secs: u
     }
 }
 
+fn case_record_auto_test_active(score: &crate::session::anvil_score::AnvilScore) -> bool {
+    score.build_passed.is_some() || score.tests_passed.is_some()
+}
+
+fn case_record_extraction_succeeded(
+    score: &crate::session::anvil_score::AnvilScore,
+    repo_edit_succeeded_this_turn: bool,
+    unsafe_blocks_this_turn: usize,
+) -> bool {
+    if case_record_auto_test_active(score) {
+        score.build_passed == Some(true)
+            && score.tests_passed == Some(true)
+            && score.user_visible_artifact
+            && score.unsafe_actions_blocked == 0
+            && score.consecutive_no_progress_turns == 0
+    } else {
+        repo_edit_succeeded_this_turn
+            && unsafe_blocks_this_turn == 0
+            && score.consecutive_no_progress_turns == 0
+    }
+}
+
+fn case_record_initial_feedback(
+    last_feedback: Option<&crate::session::feedback::FeedbackFrame>,
+) -> Vec<crate::session::feedback::FeedbackKind> {
+    last_feedback
+        .map(|feedback| vec![feedback.kind.clone()])
+        .unwrap_or_default()
+}
+
 // --- Issue #450 FeedbackFrame builders --------------------------------
 //
 // Each helper builds a `FeedbackFrameDraft`, then funnels it through
@@ -4464,32 +4494,23 @@ impl Agent {
         }
 
         // Success condition (Issue #462 spec).
-        let Some(score) = self.session.last_anvil_score.as_ref() else {
+        let Some(score) = self.session.last_anvil_score.clone() else {
             // No AnvilScore computed for this turn (e.g., TransportError) — skip silently.
-            self.session.case_record_extracted_this_turn = true;
-            return None;
+            return self.finish_case_record_extraction(None);
         };
-        let auto_test_active = score.build_passed.is_some() || score.tests_passed.is_some();
+        let auto_test_active = case_record_auto_test_active(&score);
         // CB-002 (codex review fix): the auto_test success branch now also
         // requires `unsafe_actions_blocked == 0` to prevent a turn where
         // an unsafe command was blocked in the same turn from extracting
         // a CaseRecord solely because build / tests / artifact were green.
         // This matches the verifier-less fallback and
         // `case_photon_bridge::is_eligible_for_promotion`'s full_pass check.
-        let success = if auto_test_active {
-            score.build_passed == Some(true)
-                && score.tests_passed == Some(true)
-                && score.user_visible_artifact
-                && score.unsafe_actions_blocked == 0
-                && score.consecutive_no_progress_turns == 0
-        } else {
-            self.session.repo_edit_succeeded_this_turn
-                && self.session.unsafe_blocks_this_turn == 0
-                && score.consecutive_no_progress_turns == 0
-        };
-        if !success {
-            self.session.case_record_extracted_this_turn = true;
-            return None;
+        if !case_record_extraction_succeeded(
+            &score,
+            self.session.repo_edit_succeeded_this_turn,
+            self.session.unsafe_blocks_this_turn,
+        ) {
+            return self.finish_case_record_extraction(None);
         }
 
         // language_stack derivation (agent layer; reuses `auto_test::has_*`).
@@ -4502,12 +4523,7 @@ impl Agent {
         // initial_feedback: take the kind of the latest recorded feedback as a
         // single-item list (Issue Out of Scope: rich N-frame history is for
         // CBR follow-up Issue).
-        let initial_feedback: Vec<crate::session::feedback::FeedbackKind> = self
-            .session
-            .last_feedback
-            .as_ref()
-            .map(|f| vec![f.kind.clone()])
-            .unwrap_or_default();
+        let initial_feedback = case_record_initial_feedback(self.session.last_feedback.as_ref());
         let workspace_key = self.session.workspace_key.clone();
 
         let inputs = case_record::CaseRecordInputs {
@@ -4519,7 +4535,7 @@ impl Agent {
             active_precautions: &active_precautions,
             changed_files: &stats.changed_files,
             verify_commands,
-            anvil_score: score,
+            anvil_score: &score,
             repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
             unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
             auto_test_active,
@@ -4534,8 +4550,7 @@ impl Agent {
                     "reason": "extract_returned_none",
                 }),
             );
-            self.session.case_record_extracted_this_turn = true;
-            return None;
+            return self.finish_case_record_extraction(None);
         };
 
         // Dry-run gate (DR3-002 / Issue): extract still runs so log payloads
@@ -4549,16 +4564,30 @@ impl Agent {
                     "case_id": record.case_id,
                 }),
             );
-            self.session.case_record_extracted_this_turn = true;
             // DR2-008: Issue #604 — return the extracted record even on
             // dry_run so the post-loop auto-promote hook can still see what
             // would have been promoted (dry_run is observability-only).
-            return Some(record);
+            return self.finish_case_record_extraction(Some(record));
         }
 
+        let persist_ok = self.persist_case_record(&record, started);
+        self.finish_case_record_extraction(persist_ok.then_some(record))
+    }
+
+    fn finish_case_record_extraction<T>(&mut self, result: Option<T>) -> Option<T> {
+        self.session.case_record_extracted_this_turn = true;
+        result
+    }
+
+    fn persist_case_record(
+        &self,
+        record: &crate::session::case_record::CaseRecord,
+        started: std::time::Instant,
+    ) -> bool {
+        use crate::session::case_record;
+
         let state_root = self.session_store.state_root().to_path_buf();
-        let persist_outcome = case_record::persist(&state_root, &record);
-        let persist_ok = match persist_outcome {
+        match case_record::persist(&state_root, record) {
             Ok(bytes) => {
                 let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
                 log_llm_event(
@@ -4583,19 +4612,17 @@ impl Agent {
                 );
                 false
             }
-            Err(e) => {
+            Err(err) => {
                 log_llm_event(
                     "agent.case_record.failed",
                     serde_json::json!({
                         "session_id": self.session_store.session_id(),
-                        "error": e.to_string(),
+                        "error": err.to_string(),
                     }),
                 );
                 false
             }
-        };
-        self.session.case_record_extracted_this_turn = true;
-        if persist_ok { Some(record) } else { None }
+        }
     }
 
     /// Issue #463: build and (when applicable) inject a `Relevant Local Cases:`
@@ -24447,6 +24474,46 @@ mod truncate_tests {
             ),
             Some(("tests/test_main.py", "python"))
         );
+    }
+
+    #[test]
+    fn case_record_success_accepts_clean_auto_test_turn() {
+        let score = crate::session::anvil_score::AnvilScore {
+            build_passed: Some(true),
+            tests_passed: Some(true),
+            unsafe_actions_blocked: 0,
+            consecutive_no_progress_turns: 0,
+            user_visible_artifact: true,
+            ..Default::default()
+        };
+
+        assert!(super::case_record_extraction_succeeded(&score, false, 1));
+    }
+
+    #[test]
+    fn case_record_success_rejects_blocked_auto_test_turn() {
+        let score = crate::session::anvil_score::AnvilScore {
+            build_passed: Some(true),
+            tests_passed: Some(true),
+            unsafe_actions_blocked: 1,
+            consecutive_no_progress_turns: 0,
+            user_visible_artifact: true,
+            ..Default::default()
+        };
+
+        assert!(!super::case_record_extraction_succeeded(&score, true, 0));
+    }
+
+    #[test]
+    fn case_record_success_requires_clean_repo_edit_without_auto_test() {
+        let score = crate::session::anvil_score::AnvilScore {
+            consecutive_no_progress_turns: 0,
+            ..Default::default()
+        };
+
+        assert!(super::case_record_extraction_succeeded(&score, true, 0));
+        assert!(!super::case_record_extraction_succeeded(&score, false, 0));
+        assert!(!super::case_record_extraction_succeeded(&score, true, 1));
     }
 
     #[test]
