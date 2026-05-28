@@ -697,6 +697,32 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
     }
 }
 
+pub(super) fn handle_post_reply_recovery(
+    agent: &mut Agent,
+    mut args: PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if let Some(outcome) = maybe_handle_answer_only_future_work_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
+    if let Some(outcome) = maybe_handle_missing_repo_edit_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
+    if let Some(outcome) = maybe_handle_python_test_artifact_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
+    if let Some(outcome) = maybe_handle_answer_only_inadequate_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
+    if let Some(outcome) = maybe_handle_repo_change_partial_progress_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
+    if let Some(outcome) = maybe_handle_repo_change_quality_gate_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
+
+    None
+}
+
 pub(super) fn maybe_handle_answer_only_future_work_recovery(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,

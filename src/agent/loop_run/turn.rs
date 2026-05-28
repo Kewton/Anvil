@@ -21,11 +21,9 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
     TaskContractVerifierFlowOutcome, handle_non_progress_plan_edit_fallback,
-    handle_plan_progress_prose_only_fallback, maybe_handle_answer_only_future_work_recovery,
-    maybe_handle_answer_only_inadequate_recovery, maybe_handle_missing_repo_edit_recovery,
-    maybe_handle_python_test_artifact_recovery, maybe_handle_repo_change_partial_progress_recovery,
-    maybe_handle_repo_change_quality_gate_recovery, missing_repo_change_budget_exhausted_outcome,
-    plan_tool_followup_done_message, repair_job_done_outcome,
+    handle_plan_progress_prose_only_fallback, handle_post_reply_recovery,
+    missing_repo_change_budget_exhausted_outcome, plan_tool_followup_done_message,
+    repair_job_done_outcome,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -5805,32 +5803,6 @@ impl Agent {
         )
     }
 
-    fn handle_post_reply_recovery(
-        &mut self,
-        mut args: PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if let Some(outcome) = maybe_handle_answer_only_future_work_recovery(self, &mut args) {
-            return Some(outcome);
-        }
-        if let Some(outcome) = maybe_handle_missing_repo_edit_recovery(self, &mut args) {
-            return Some(outcome);
-        }
-        if let Some(outcome) = maybe_handle_python_test_artifact_recovery(self, &mut args) {
-            return Some(outcome);
-        }
-        if let Some(outcome) = maybe_handle_answer_only_inadequate_recovery(self, &mut args) {
-            return Some(outcome);
-        }
-        if let Some(outcome) = maybe_handle_repo_change_partial_progress_recovery(self, &mut args) {
-            return Some(outcome);
-        }
-        if let Some(outcome) = maybe_handle_repo_change_quality_gate_recovery(self, &mut args) {
-            return Some(outcome);
-        }
-
-        None
-    }
-
     fn drive_actor_loop_pre_reply_phase(
         &mut self,
         mut args: ActorLoopPreReplyArgs<'_, '_>,
@@ -8572,20 +8544,23 @@ impl Agent {
                 }
             }
 
-            if let Some(outcome) = self.handle_post_reply_recovery(PostReplyRecoveryArgs {
-                last_iter,
-                action_expectation,
-                requires_action,
-                recovery_dispatch_gate,
-                repo_edit_calls_made_this_turn,
-                final_reply: &final_reply,
-                task_contract_action: task_contract_action.as_ref(),
-                interrupt_flag: &interrupt_flag,
-                repo_change_retries: &mut repo_change_retries,
-                python_test_retries: &mut python_test_retries,
-                no_tool_retries: &mut no_tool_retries,
-                framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
-            }) {
+            if let Some(outcome) = handle_post_reply_recovery(
+                self,
+                PostReplyRecoveryArgs {
+                    last_iter,
+                    action_expectation,
+                    requires_action,
+                    recovery_dispatch_gate,
+                    repo_edit_calls_made_this_turn,
+                    final_reply: &final_reply,
+                    task_contract_action: task_contract_action.as_ref(),
+                    interrupt_flag: &interrupt_flag,
+                    repo_change_retries: &mut repo_change_retries,
+                    python_test_retries: &mut python_test_retries,
+                    no_tool_retries: &mut no_tool_retries,
+                    framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
+                },
+            ) {
                 match outcome {
                     PostReplyRecoveryOutcome::Continue => continue,
                     PostReplyRecoveryOutcome::Finalize {
