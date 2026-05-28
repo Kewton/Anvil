@@ -437,6 +437,27 @@ pub(super) fn repair_job_done_outcome() -> TaskContractVerifierFlowOutcome {
     }
 }
 
+pub(super) fn finalize_missing_repo_edit_retry_exhausted(
+    agent: &mut Agent,
+) -> PostReplyRecoveryOutcome {
+    let request = agent.active_request_text().unwrap_or_default();
+    match agent.maybe_apply_local_llm_small_edit_fallback(&request) {
+        Ok(Some(relative)) => PostReplyRecoveryOutcome::Finalize {
+            final_prose: format!(
+                "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+            ),
+            exit_reason: ExitReason::Done,
+            error_text: String::new(),
+        },
+        Ok(None) => missing_repo_edits_finalize_outcome(),
+        Err(err) => PostReplyRecoveryOutcome::Finalize {
+            final_prose: String::new(),
+            exit_reason: ExitReason::TransportError,
+            error_text: err,
+        },
+    }
+}
+
 pub(super) fn missing_repo_edits_finalize_outcome() -> PostReplyRecoveryOutcome {
     PostReplyRecoveryOutcome::Finalize {
         final_prose: String::new(),

@@ -1750,10 +1750,10 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, handle_non_progress_plan_edit_fallback,
-    handle_plan_progress_prose_only_fallback, missing_repo_change_budget_exhausted_outcome,
-    missing_repo_edit_recovery_allowed, missing_repo_edits_finalize_outcome,
-    plan_tool_followup_done_message, repair_job_done_outcome,
+    TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
+    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
+    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
+    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
 };
 
 struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -5871,7 +5871,7 @@ impl Agent {
         }
         *args.repo_change_retries += 1;
         if *args.repo_change_retries >= 3 {
-            return Some(self.finalize_missing_repo_edit_retry_exhausted());
+            return Some(finalize_missing_repo_edit_retry_exhausted(self));
         }
         write_stdout_rendered(
             &format_iteration_status(
@@ -5923,25 +5923,6 @@ impl Agent {
                 Some(PostReplyRecoveryOutcome::Continue)
             }
             ScaffoldFallbackResult::NotApplicable => None,
-        }
-    }
-
-    fn finalize_missing_repo_edit_retry_exhausted(&mut self) -> PostReplyRecoveryOutcome {
-        let request = self.active_request_text().unwrap_or_default();
-        match self.maybe_apply_local_llm_small_edit_fallback(&request) {
-            Ok(Some(relative)) => PostReplyRecoveryOutcome::Finalize {
-                final_prose: format!(
-                    "Applied a verified small edit fallback after the local model stopped before editing {relative}."
-                ),
-                exit_reason: ExitReason::Done,
-                error_text: String::new(),
-            },
-            Ok(None) => missing_repo_edits_finalize_outcome(),
-            Err(err) => PostReplyRecoveryOutcome::Finalize {
-                final_prose: String::new(),
-                exit_reason: ExitReason::TransportError,
-                error_text: err,
-            },
         }
     }
 
@@ -16778,7 +16759,7 @@ if __name__ == "__main__":
         Ok(true)
     }
 
-    fn maybe_apply_local_llm_small_edit_fallback(
+    pub(super) fn maybe_apply_local_llm_small_edit_fallback(
         &mut self,
         request: &str,
     ) -> Result<Option<String>, String> {
