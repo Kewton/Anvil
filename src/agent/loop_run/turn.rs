@@ -3698,6 +3698,22 @@ fn preflight_work_mode_skip_reason(
     }
 }
 
+fn preflight_feedback_kind_skip_reason(
+    feedback_kind_confirm_called_this_turn: bool,
+    mode: ExecutionMode,
+    env_disabled: bool,
+) -> Option<feedback_kind_confirm::FeedbackKindSkipReason> {
+    if mode == ExecutionMode::Plan {
+        Some(feedback_kind_confirm::FeedbackKindSkipReason::PlanMode)
+    } else if env_disabled {
+        Some(feedback_kind_confirm::FeedbackKindSkipReason::EnvDisabled)
+    } else if feedback_kind_confirm_called_this_turn {
+        Some(feedback_kind_confirm::FeedbackKindSkipReason::PerTurnCapConsumed)
+    } else {
+        None
+    }
+}
+
 fn preflight_quality_confirm_skip_reason(
     mode: ExecutionMode,
     env_disabled: bool,
@@ -3762,6 +3778,43 @@ fn log_work_mode_confirm_outcome(
         work_mode_confirm_parse_status(outcome),
     );
     log_llm_event(event, payload);
+}
+
+fn log_feedback_kind_confirm_outcome(
+    outcome: &FeedbackKindConfirmOutcome,
+    session_id: &str,
+    turn_index: usize,
+    first_pass: &FeedbackKind,
+    sidecar_model: Option<&str>,
+    combined_bytes: usize,
+    latency_ms: Option<u64>,
+) {
+    let (event, payload) = build_feedback_kind_confirm_log_payload(
+        outcome,
+        session_id,
+        turn_index,
+        first_pass,
+        sidecar_model,
+        combined_bytes,
+        latency_ms,
+    );
+    log_llm_event(event, payload);
+}
+
+fn override_feedback_kind_from_outcome(
+    outcome: &FeedbackKindConfirmOutcome,
+    first_pass: &FeedbackKind,
+) -> Option<FeedbackKind> {
+    match outcome {
+        FeedbackKindConfirmOutcome::Confirmed(c)
+            if c.source
+                == feedback_kind_confirm::FeedbackKindConfirmationSource::SecondPassOverridden
+                && &c.kind != first_pass =>
+        {
+            Some(c.kind.clone())
+        }
+        _ => None,
+    }
 }
 
 fn log_quality_confirm_outcome(
@@ -4312,13 +4365,15 @@ impl Agent {
         let sidecar_model = self.models.sidecar.clone();
         let turn_index = self.current_turn_index;
         let combined_bytes = combined_output.len();
-
-        // 1. Plan mode gate. Always skip — second-pass is an Act-mode tool.
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            let outcome = FeedbackKindConfirmOutcome::Skipped {
-                reason: feedback_kind_confirm::FeedbackKindSkipReason::PlanMode,
-            };
-            let (event, payload) = build_feedback_kind_confirm_log_payload(
+        let env_disabled =
+            feedback_kind_confirm::feedback_kind_confirm_disabled(|k: &str| std::env::var(k));
+        if let Some(reason) = preflight_feedback_kind_skip_reason(
+            self.feedback_kind_confirm_called_this_turn,
+            self.session.mode_state.mode,
+            env_disabled,
+        ) {
+            let outcome = FeedbackKindConfirmOutcome::Skipped { reason };
+            log_feedback_kind_confirm_outcome(
                 &outcome,
                 &session_id,
                 turn_index,
@@ -4327,50 +4382,8 @@ impl Agent {
                 combined_bytes,
                 None,
             );
-            log_llm_event(event, payload);
             return None;
         }
-
-        // 2. env disable.
-        if feedback_kind_confirm::feedback_kind_confirm_disabled(|k: &str| std::env::var(k)) {
-            let outcome = FeedbackKindConfirmOutcome::Skipped {
-                reason: feedback_kind_confirm::FeedbackKindSkipReason::EnvDisabled,
-            };
-            let (event, payload) = build_feedback_kind_confirm_log_payload(
-                &outcome,
-                &session_id,
-                turn_index,
-                first_pass,
-                sidecar_model.as_deref(),
-                combined_bytes,
-                None,
-            );
-            log_llm_event(event, payload);
-            return None;
-        }
-
-        // 3. per-turn cap.
-        if self.feedback_kind_confirm_called_this_turn {
-            let outcome = FeedbackKindConfirmOutcome::Skipped {
-                reason: feedback_kind_confirm::FeedbackKindSkipReason::PerTurnCapConsumed,
-            };
-            let (event, payload) = build_feedback_kind_confirm_log_payload(
-                &outcome,
-                &session_id,
-                turn_index,
-                first_pass,
-                sidecar_model.as_deref(),
-                combined_bytes,
-                None,
-            );
-            log_llm_event(event, payload);
-            return None;
-        }
-
-        // 4. orchestrator dispatch. Build inputs and (when model is Some)
-        // consume the per-turn cap BEFORE invoking the orchestrator so any
-        // closure failure path (timeout / transport / malformed / oversized)
-        // cannot re-trigger a second dispatch within the same turn.
         let inputs = FeedbackKindConfirmInputs {
             first_pass,
             combined_output,
@@ -4379,52 +4392,10 @@ impl Agent {
             model: sidecar_model.as_deref(),
         };
         let attempt_started = Instant::now();
-        let outcome = if sidecar_model.is_some() {
-            self.feedback_kind_confirm_called_this_turn = true;
-            let sidecar_name = sidecar_model.clone().expect("sidecar_model is Some here");
-            let confirm_client = self
-                .client
-                .clone_with_overrides(FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, 384)
-                .ok();
-            run_feedback_kind_confirm_with_strategy(inputs, |prompt| {
-                match confirm_client.as_ref() {
-                    Some(c) => c
-                        .chat_text(
-                            &sidecar_name,
-                            &[ConversationMessage::user(prompt.to_string())],
-                        )
-                        .map(|reply| reply.content),
-                    None => Err("client clone_with_overrides failed".to_string()),
-                }
-            })
-        } else {
-            // `model.is_none()` — orchestrator returns Fallback(SidecarUnavailable)
-            // without invoking the closure. We do NOT consume the per-turn cap
-            // because no LLM dispatch was attempted (symmetric with
-            // `maybe_invoke_work_mode_confirm`).
-            run_feedback_kind_confirm_with_strategy(inputs, |_| {
-                Err("sidecar unavailable".to_string())
-            })
-        };
+        let outcome = self.run_feedback_kind_confirm_attempt(inputs, &sidecar_model);
         let latency_ms = attempt_started.elapsed().as_millis() as u64;
-
-        // Extract the override kind before we move `outcome` into the payload
-        // builder. We override only on `Confirmed(SecondPassOverridden)` where
-        // the resolved kind actually differs from the first-pass kind; both
-        // `Confirmed(SecondPassConfirmed)` and every `Fallback` keep
-        // `first_pass`.
-        let override_kind = match &outcome {
-            FeedbackKindConfirmOutcome::Confirmed(c)
-                if c.source
-                    == feedback_kind_confirm::FeedbackKindConfirmationSource::SecondPassOverridden
-                    && &c.kind != first_pass =>
-            {
-                Some(c.kind.clone())
-            }
-            _ => None,
-        };
-
-        let (event, payload) = build_feedback_kind_confirm_log_payload(
+        let override_kind = override_feedback_kind_from_outcome(&outcome, first_pass);
+        log_feedback_kind_confirm_outcome(
             &outcome,
             &session_id,
             turn_index,
@@ -4433,9 +4404,36 @@ impl Agent {
             combined_bytes,
             Some(latency_ms),
         );
-        log_llm_event(event, payload);
-
         override_kind
+    }
+
+    fn run_feedback_kind_confirm_attempt(
+        &mut self,
+        inputs: FeedbackKindConfirmInputs<'_>,
+        sidecar_model: &Option<String>,
+    ) -> FeedbackKindConfirmOutcome {
+        if let Some(sidecar_name) = sidecar_model.as_ref() {
+            self.feedback_kind_confirm_called_this_turn = true;
+            let confirm_client = self
+                .client
+                .clone_with_overrides(FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, 384)
+                .ok();
+            run_feedback_kind_confirm_with_strategy(inputs, |prompt| {
+                match confirm_client.as_ref() {
+                    Some(c) => c
+                        .chat_text(
+                            sidecar_name,
+                            &[ConversationMessage::user(prompt.to_string())],
+                        )
+                        .map(|reply| reply.content),
+                    None => Err("client clone_with_overrides failed".to_string()),
+                }
+            })
+        } else {
+            run_feedback_kind_confirm_with_strategy(inputs, |_| {
+                Err("sidecar unavailable".to_string())
+            })
+        }
     }
 
     /// Issue #580: Quality-gate second-pass confirmation wrapper. Replaces
@@ -18835,6 +18833,52 @@ mod tests {
         assert_eq!(
             super::plan_write_status(staged, -3),
             Some("Next: Constraints | delta -3B".to_string())
+        );
+    }
+
+    #[test]
+    fn preflight_feedback_kind_skip_reason_prefers_plan_then_env_then_cap() {
+        assert_eq!(
+            super::preflight_feedback_kind_skip_reason(false, ExecutionMode::Plan, false),
+            Some(super::feedback_kind_confirm::FeedbackKindSkipReason::PlanMode)
+        );
+        assert_eq!(
+            super::preflight_feedback_kind_skip_reason(false, ExecutionMode::Act, true),
+            Some(super::feedback_kind_confirm::FeedbackKindSkipReason::EnvDisabled)
+        );
+        assert_eq!(
+            super::preflight_feedback_kind_skip_reason(true, ExecutionMode::Act, false),
+            Some(super::feedback_kind_confirm::FeedbackKindSkipReason::PerTurnCapConsumed)
+        );
+    }
+
+    #[test]
+    fn override_feedback_kind_from_outcome_only_applies_second_pass_override() {
+        let first_pass = crate::session::feedback::FeedbackKind::CompileError;
+        let overridden = super::FeedbackKindConfirmOutcome::Confirmed(
+            super::feedback_kind_confirm::FeedbackKindConfirmation {
+                kind: crate::session::feedback::FeedbackKind::TestFailure,
+                reason: None,
+                source:
+                    super::feedback_kind_confirm::FeedbackKindConfirmationSource::SecondPassOverridden,
+            },
+        );
+        assert_eq!(
+            super::override_feedback_kind_from_outcome(&overridden, &first_pass),
+            Some(crate::session::feedback::FeedbackKind::TestFailure)
+        );
+
+        let confirmed = super::FeedbackKindConfirmOutcome::Confirmed(
+            super::feedback_kind_confirm::FeedbackKindConfirmation {
+                kind: crate::session::feedback::FeedbackKind::CompileError,
+                reason: None,
+                source:
+                    super::feedback_kind_confirm::FeedbackKindConfirmationSource::SecondPassConfirmed,
+            },
+        );
+        assert_eq!(
+            super::override_feedback_kind_from_outcome(&confirmed, &first_pass),
+            None
         );
     }
 
