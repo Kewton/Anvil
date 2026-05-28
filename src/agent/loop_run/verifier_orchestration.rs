@@ -36,6 +36,8 @@
 //! re-imports `TaskContractVerifierFlowArgs` via `super::turn::` until
 //! a follow-up Phase 2 PR moves the consumer-side reference.
 
+use std::path::Path;
+
 use super::auto_test::{AutoTestPlan, VerifierCommand};
 use super::repair_attempt_outcome::RepairAttemptOutcome;
 use super::repair_driver::VerifierRepairPassOutcome;
@@ -43,6 +45,9 @@ use super::repair_job::RepairJob;
 use super::repair_plan::AcceptedRepairPlan;
 use super::required_behavior::BehaviorContractProjection;
 use super::task_contract::TaskContract;
+use super::turn::{
+    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
+};
 use super::verifier_diagnostic_attempt::VerifierDiagnosticAttemptSpec;
 use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
 use crate::session::store::ConversationMessage;
@@ -116,4 +121,61 @@ pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
     pub(super) task_contract_verify_commands_collected: &'b mut Vec<String>,
     pub(super) task_contract_verifier_passed_in_loop: &'b mut bool,
     pub(super) last_iter: usize,
+}
+
+pub(super) fn verifier_repair_pass_request_error_message(
+    err: &str,
+    attempt_timeout_secs: u64,
+) -> String {
+    let lower_error = err.to_ascii_lowercase();
+    if lower_error.contains("timeout") || lower_error.contains("timed out") {
+        format!(
+            "verifier_repair_pass_timeout: patch provider request timed out after \
+             {attempt_timeout_secs}s"
+        )
+    } else {
+        format!("repair LLM request failed: {err}")
+    }
+}
+
+#[cfg(test)]
+pub(super) fn task_contract_verifier_target_discovery_note(
+    attempt: usize,
+    attempt_limit: usize,
+) -> String {
+    format!(
+        "[Task Contract Verification] The verifier already failed, but Anvil did not identify a safe workspace repair target yet. Do not rerun verification and do not answer in prose. Emit exactly one Read, Glob, or Grep tool call to identify the local file to repair. Do not use Bash, Write, or Edit until a target file is known. task_contract_verify_discovery_attempt={attempt}/{attempt_limit}"
+    )
+}
+
+pub(super) fn verifier_repair_transition_message() -> String {
+    "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step.".to_string()
+}
+
+pub(super) fn verifier_repair_safe_stop_message() -> String {
+    "[Verifier Repair Policy] Verifier repair cannot continue safely. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
+        .to_string()
+}
+
+pub(super) fn verifier_repair_unsafe_target_message() -> String {
+    "[Verifier Repair Policy] Verifier repair target is unsafe or unavailable. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
+        .to_string()
+}
+
+pub(super) fn verifier_repair_target_display(target: &Path, work_root: &Path) -> String {
+    target
+        .strip_prefix(work_root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+pub(super) fn task_contract_verifier_failure_attempt_limit(
+    previous_context: Option<&super::repair_job::RepairJob>,
+) -> usize {
+    if previous_context.is_some() {
+        TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT
+    } else {
+        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
+    }
 }
