@@ -3878,6 +3878,14 @@ fn verifier_repair_context_diagnostics(context: Option<&super::repair_job::Repai
         .unwrap_or_else(|| " Failure signature: <unknown>.".to_string())
 }
 
+fn anti_pattern_failed_action_summary(frame: &FeedbackFrame) -> String {
+    frame
+        .primary_error
+        .clone()
+        .or_else(|| frame.command().map(|s| s.to_string()))
+        .unwrap_or_else(|| format!("{:?}", frame.kind))
+}
+
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
     if yes_mode {
         tester::ApprovalMode::Auto
@@ -5000,62 +5008,22 @@ impl Agent {
     pub(super) fn maybe_extract_anti_pattern(&mut self) {
         use crate::session::anti_pattern;
 
-        // Plan-mode gate: never extract in Plan mode.
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            return;
-        }
-        // Per-turn cap.
-        if self.session.anti_pattern_extracted_this_turn {
-            return;
-        }
-        // Disable env.
-        if anti_pattern::anti_pattern_disabled(|k| std::env::var(k)) {
-            log_llm_event(
-                "agent.anti_pattern.disabled",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                }),
-            );
-            self.session.anti_pattern_extracted_this_turn = true;
-            return;
-        }
-
-        // Eligible failure FeedbackFrame is the trigger.
-        let Some(frame) = self.session.last_feedback.as_ref() else {
-            self.session.anti_pattern_extracted_this_turn = true;
+        let Some(frame) = self.anti_pattern_extraction_feedback() else {
             return;
         };
-        if !anti_pattern::is_repeat_eligible_kind(&frame.kind) {
-            self.session.anti_pattern_extracted_this_turn = true;
+        let kind = frame.kind.clone();
+
+        if anti_pattern::anti_pattern_dry_run(|k| std::env::var(k)) {
+            self.log_anti_pattern_skip("dry_run", Some(&kind), None);
+            self.finish_anti_pattern_extraction();
             return;
         }
 
-        // Build the failed_action_summary from primary_error → command → kind.
-        let summary_owned: String = frame
-            .primary_error
-            .clone()
-            .or_else(|| frame.command().map(|s| s.to_string()))
-            .unwrap_or_else(|| format!("{:?}", frame.kind));
-
+        let summary_owned = anti_pattern_failed_action_summary(&frame);
         let language_stack = derive_language_stack(&self.work_root);
         let active_task = self.session.working_memory.active_task.clone();
         let workspace_key = self.session.workspace_key.clone();
         let touched_files = self.session.working_memory.touched_files.clone();
-        let kind = frame.kind.clone();
-
-        if anti_pattern::anti_pattern_dry_run(|k| std::env::var(k)) {
-            log_llm_event(
-                "agent.anti_pattern.skipped",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "reason": "dry_run",
-                    "feedback_kind": serde_json::to_value(&kind).unwrap_or_default(),
-                }),
-            );
-            self.session.anti_pattern_extracted_this_turn = true;
-            return;
-        }
-
         let inputs = anti_pattern::AntiPatternRecordInputs {
             workspace_key: &workspace_key,
             work_root: &self.work_root,
@@ -5068,74 +5036,122 @@ impl Agent {
 
         let started = std::time::Instant::now();
         let state_root = self.session_store.state_root().to_path_buf();
-        match anti_pattern::extract_or_increment(&state_root, &inputs) {
-            Ok(anti_pattern::ExtractOutcome::Created(record)) => {
-                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
-                log_llm_event(
-                    "agent.anti_pattern.extracted",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "anti_pattern_id": record.anti_pattern_id,
-                        "outcome": "created",
-                        "repeat_count": record.repeat_count,
-                        "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
-                        "compute_ms": compute_ms,
-                    }),
-                );
+        self.log_anti_pattern_extract_result(
+            anti_pattern::extract_or_increment(&state_root, &inputs),
+            started,
+        );
+        self.finish_anti_pattern_extraction();
+    }
+
+    fn anti_pattern_extraction_feedback(&mut self) -> Option<FeedbackFrame> {
+        use crate::session::anti_pattern;
+
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return None;
+        }
+        if self.session.anti_pattern_extracted_this_turn {
+            return None;
+        }
+        if anti_pattern::anti_pattern_disabled(|k| std::env::var(k)) {
+            log_llm_event(
+                "agent.anti_pattern.disabled",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                }),
+            );
+            self.finish_anti_pattern_extraction();
+            return None;
+        }
+        let Some(frame) = self.session.last_feedback.clone() else {
+            self.finish_anti_pattern_extraction();
+            return None;
+        };
+        if !anti_pattern::is_repeat_eligible_kind(&frame.kind) {
+            self.finish_anti_pattern_extraction();
+            return None;
+        }
+        Some(frame)
+    }
+
+    fn finish_anti_pattern_extraction(&mut self) {
+        self.session.anti_pattern_extracted_this_turn = true;
+    }
+
+    fn log_anti_pattern_skip(
+        &self,
+        reason: &str,
+        feedback_kind: Option<&FeedbackKind>,
+        bytes: Option<usize>,
+    ) {
+        let mut payload = serde_json::json!({
+            "session_id": self.session_store.session_id(),
+            "reason": reason,
+        });
+        if let Some(kind) = feedback_kind {
+            payload["feedback_kind"] = serde_json::to_value(kind).unwrap_or_default();
+        }
+        if let Some(bytes) = bytes {
+            payload["bytes"] = serde_json::json!(bytes);
+        }
+        log_llm_event("agent.anti_pattern.skipped", payload);
+    }
+
+    fn log_anti_pattern_extracted(
+        &self,
+        record: &crate::session::anti_pattern::AntiPatternRecord,
+        outcome: &str,
+        started: std::time::Instant,
+    ) {
+        let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
+        log_llm_event(
+            "agent.anti_pattern.extracted",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "anti_pattern_id": record.anti_pattern_id,
+                "outcome": outcome,
+                "repeat_count": record.repeat_count,
+                "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
+                "compute_ms": compute_ms,
+            }),
+        );
+    }
+
+    fn log_anti_pattern_extract_result(
+        &self,
+        result: Result<
+            crate::session::anti_pattern::ExtractOutcome,
+            crate::session::anti_pattern::PersistError,
+        >,
+        started: std::time::Instant,
+    ) {
+        use crate::session::anti_pattern::{ExtractOutcome, PersistError};
+
+        match result {
+            Ok(ExtractOutcome::Created(record)) => {
+                self.log_anti_pattern_extracted(&record, "created", started);
             }
-            Ok(anti_pattern::ExtractOutcome::Incremented(record)) => {
-                let compute_ms = started.elapsed().as_secs_f64() * 1000.0;
-                log_llm_event(
-                    "agent.anti_pattern.extracted",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "anti_pattern_id": record.anti_pattern_id,
-                        "outcome": "incremented",
-                        "repeat_count": record.repeat_count,
-                        "feedback_kind": serde_json::to_value(&record.feedback_kind).unwrap_or_default(),
-                        "compute_ms": compute_ms,
-                    }),
-                );
+            Ok(ExtractOutcome::Incremented(record)) => {
+                self.log_anti_pattern_extracted(&record, "incremented", started);
             }
-            Ok(anti_pattern::ExtractOutcome::SkippedIneligibleKind) => {
-                log_llm_event(
-                    "agent.anti_pattern.skipped",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "reason": "ineligible_kind",
-                    }),
-                );
+            Ok(ExtractOutcome::SkippedIneligibleKind) => {
+                self.log_anti_pattern_skip("ineligible_kind", None, None);
             }
-            Ok(anti_pattern::ExtractOutcome::SkippedNoActiveTask) => {
-                log_llm_event(
-                    "agent.anti_pattern.skipped",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "reason": "no_active_task",
-                    }),
-                );
+            Ok(ExtractOutcome::SkippedNoActiveTask) => {
+                self.log_anti_pattern_skip("no_active_task", None, None);
             }
-            Err(anti_pattern::PersistError::TooLarge { bytes }) => {
-                log_llm_event(
-                    "agent.anti_pattern.skipped",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "reason": "too_large",
-                        "bytes": bytes,
-                    }),
-                );
+            Err(PersistError::TooLarge { bytes }) => {
+                self.log_anti_pattern_skip("too_large", None, Some(bytes));
             }
-            Err(e) => {
+            Err(err) => {
                 log_llm_event(
                     "agent.anti_pattern.failed",
                     serde_json::json!({
                         "session_id": self.session_store.session_id(),
-                        "error": e.to_string(),
+                        "error": err.to_string(),
                     }),
                 );
             }
         }
-        self.session.anti_pattern_extracted_this_turn = true;
     }
 
     /// Issue #464: build and (when applicable) inject an `Avoid Patterns:`
@@ -18519,6 +18535,65 @@ mod tests {
     fn verifier_repair_transition_messages_are_stable() {
         assert!(super::verifier_repair_transition_message().contains("transition is pending"));
         assert!(super::verifier_repair_safe_stop_message().contains("cannot continue safely"));
+    }
+
+    #[test]
+    fn anti_pattern_failed_action_summary_prefers_primary_error_then_command_then_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+        let with_primary = super::build_feedback_frame(
+            super::FeedbackFrameDraft {
+                command: Some("cargo test".to_string()),
+                exit_code: Some(1),
+                kind: super::FeedbackKind::TestFailure,
+                stdout: String::new(),
+                stderr: String::new(),
+                primary_error: Some("assertion failed".to_string()),
+                suspected_files: Vec::new(),
+                changed_files: Vec::new(),
+            },
+            workspace,
+        );
+        assert_eq!(
+            super::anti_pattern_failed_action_summary(&with_primary),
+            "assertion failed"
+        );
+
+        let with_command = super::build_feedback_frame(
+            super::FeedbackFrameDraft {
+                command: Some("cargo test".to_string()),
+                exit_code: Some(1),
+                kind: super::FeedbackKind::TestFailure,
+                stdout: String::new(),
+                stderr: String::new(),
+                primary_error: None,
+                suspected_files: Vec::new(),
+                changed_files: Vec::new(),
+            },
+            workspace,
+        );
+        assert_eq!(
+            super::anti_pattern_failed_action_summary(&with_command),
+            "cargo test"
+        );
+
+        let with_kind = super::build_feedback_frame(
+            super::FeedbackFrameDraft {
+                command: None,
+                exit_code: Some(1),
+                kind: super::FeedbackKind::TestFailure,
+                stdout: String::new(),
+                stderr: String::new(),
+                primary_error: None,
+                suspected_files: Vec::new(),
+                changed_files: Vec::new(),
+            },
+            workspace,
+        );
+        assert_eq!(
+            super::anti_pattern_failed_action_summary(&with_kind),
+            "TestFailure"
+        );
     }
 
     #[test]
