@@ -3,6 +3,24 @@ use super::active_job_arbiter::{
     build_active_job_selected_payload, determine_loop_control_action,
     loop_control_action_requires_missing_verifier_setup,
 };
+use super::actor_loop_flow::{
+    ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
+    ActorLoopEmptyReplyArgs, ActorLoopMissingRepoChangeReplyArgs,
+    ActorLoopMissingRepoChangeReplyKind, ActorLoopMissingRepoChangeRetryExhaustedArgs,
+    ActorLoopMissingRepoChangeRetryPromptArgs, ActorLoopNoToolReplyArgs,
+    ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome,
+    ActorLoopPostToolCleanupArgs, ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
+    ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyControlState,
+    ActorLoopPreReplyOutcome, ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs,
+    ActorLoopTaskContractContinueArgs, ActorLoopTaskContractIncompleteArgs,
+    ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
+    ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
+    ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
+    TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
+    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
+    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
+    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
+};
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
     build_agent_verifier_external_import_rejected_payload, build_agent_verifier_invoked_payload,
@@ -233,12 +251,6 @@ const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPTS: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES: usize = 1_400;
 const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
-/// Issue #652: `error_text` shared by the three `ArtifactCompletionJob`
-/// exhaustion break-points (NoTool / ProseOnly / cross-iteration flag) in
-/// `run_actor_loop`. Defined as a single constant so the three sites
-/// stay aligned and any future copy survives review.
-const ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT: &str =
-    "artifact completion role-specific retry budget exhausted";
 
 /// Issue #652 PR-001 SSOT: outcome of
 /// `Agent::maybe_install_artifact_completion_job_for_hint`. The
@@ -1743,341 +1755,6 @@ fn reply_looks_like_future_work(reply: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
-enum TaskContractVerifierFlowOutcome {
-    Continue,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-enum PostReplyRecoveryOutcome {
-    Continue,
-    Finalize {
-        final_prose: String,
-        exit_reason: ExitReason,
-        error_text: String,
-    },
-}
-
-struct PostReplyRecoveryArgs<'a, 'b> {
-    last_iter: usize,
-    action_expectation: recovery::ActionExpectation,
-    requires_action: bool,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    repo_edit_calls_made_this_turn: usize,
-    final_reply: &'a str,
-    task_contract_action: Option<&'a super::task_contract::ArtifactRecoveryAction>,
-    interrupt_flag: &'a InterruptFlag,
-    repo_change_retries: &'b mut usize,
-    python_test_retries: &'b mut usize,
-    no_tool_retries: &'b mut usize,
-    framework_app_fallback_materialized: &'b mut bool,
-}
-
-struct ActorLoopPreReplyArgs<'a, 'b> {
-    before_snapshot: &'a RepoSnapshot,
-    accumulated: &'a [RepoVerification],
-    task_contract: Option<&'a super::task_contract::TaskContract>,
-    repo_edit_calls_made_this_turn: &'b mut usize,
-    contract_verification_retries: &'b mut usize,
-    contract_verifier_repair_edit_count: &'b mut Option<usize>,
-    repo_change_retries: &'b mut usize,
-    verifier_repair_retries: &'b mut usize,
-    task_contract_verify_commands_collected: &'b mut Vec<String>,
-    task_contract_verifier_passed_in_loop: &'b mut bool,
-    framework_app_fallback_materialized: &'b mut bool,
-    action_expectation: recovery::ActionExpectation,
-    stream_output: bool,
-    last_iter: usize,
-    interrupt_flag: &'a InterruptFlag,
-}
-
-enum ActorLoopPreReplyOutcome {
-    Continue,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-    ReplyPrepared {
-        reply: AssistantReply,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-        missing_verifier_setup_turn: bool,
-        recovery_owner: RecoveryOwner,
-    },
-}
-
-#[derive(Clone)]
-struct ActorLoopPreReplyControlState {
-    loop_control_action: LoopControlAction,
-    recovery_owner: RecoveryOwner,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    missing_verifier_setup_turn: bool,
-}
-
-struct ActorLoopToolPreparationArgs<'a, 'b> {
-    reply_tool_calls: Vec<ToolCall>,
-    task_contract: Option<&'a super::task_contract::TaskContract>,
-    tool_call_summaries: &'b mut Vec<crate::session::eval_log::ToolCallSummary>,
-    focused_policy_retries: &'b mut usize,
-    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
-    missing_verifier_setup_turn: bool,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    recovery_owner: RecoveryOwner,
-    last_iter: usize,
-}
-
-struct ActorLoopRejectedToolBatchArgs<'a, 'b> {
-    err: String,
-    effective_tool_policy: &'a EffectiveToolPolicy,
-    task_contract: Option<&'a super::task_contract::TaskContract>,
-    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
-    focused_policy_retries: &'b mut usize,
-    missing_verifier_setup_turn: bool,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    recovery_owner: RecoveryOwner,
-    last_iter: usize,
-}
-
-enum ActorLoopToolPreparationOutcome {
-    Continue,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-    Prepared {
-        current_reply_tool_call_count: usize,
-        prepared_tool_calls: Vec<ToolCall>,
-        effective_tool_policy: EffectiveToolPolicy,
-    },
-}
-
-struct ActorLoopNoToolReplyArgs<'a, 'b> {
-    last_iter: usize,
-    action_expectation: recovery::ActionExpectation,
-    requires_action: bool,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    final_reply: &'a str,
-    tool_calls_made_this_turn: usize,
-    repo_change_retries: &'b mut usize,
-    plan_progress_retries: &'b mut usize,
-    empty_retries: &'b mut usize,
-    no_tool_retries: &'b mut usize,
-    framework_app_fallback_materialized: &'b mut bool,
-}
-
-enum ActorLoopNoToolReplyOutcome {
-    NotHandled,
-    Continue,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-struct ActorLoopTaskContractReplyArgs<'a, 'b> {
-    before_snapshot: &'a RepoSnapshot,
-    accumulated: &'a [RepoVerification],
-    task_contract: Option<&'a super::task_contract::TaskContract>,
-    task_contract_action: Option<&'a super::task_contract::ArtifactRecoveryAction>,
-    final_reply: &'a str,
-    current_reply_tool_call_count: usize,
-    repo_edit_calls_made_this_turn: usize,
-    last_iter: usize,
-    contract_completion_retries: &'b mut usize,
-    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
-    contract_verification_retries: &'b mut usize,
-    contract_verifier_repair_edit_count: &'b mut Option<usize>,
-    repo_change_retries: &'b mut usize,
-    verifier_repair_retries: &'b mut usize,
-    task_contract_verify_commands_collected: &'b mut Vec<String>,
-    task_contract_verifier_passed_in_loop: &'b mut bool,
-    no_tool_retries: &'b mut usize,
-    contract_deterministic_fallback_materialized: &'b mut bool,
-}
-
-enum ActorLoopTaskContractReplyOutcome {
-    Proceed,
-    Continue,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-struct ActorLoopTaskContractContinueArgs<'a, 'b> {
-    contract: &'a super::task_contract::TaskContract,
-    action: &'a super::task_contract::ArtifactRecoveryAction,
-    missing: &'a [super::task_contract::ArtifactRole],
-    target_hint: &'a Option<super::task_contract::RecoveryTargetHint>,
-    final_reply: &'a str,
-    current_reply_tool_call_count: usize,
-    last_iter: usize,
-    contract_completion_retries: &'b mut usize,
-    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
-    contract_deterministic_fallback_materialized: &'b mut bool,
-}
-
-struct ActorLoopTaskContractToolRecoveryArgs<'a, 'b> {
-    contract: &'a super::task_contract::TaskContract,
-    decision: &'a super::task_contract::CompletionDecision,
-    target_hint: Option<super::task_contract::RecoveryTargetHint>,
-    missing: &'a [super::task_contract::ArtifactRole],
-    final_reply: &'a str,
-    last_iter: usize,
-    contract_completion_retries: &'b mut usize,
-    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
-}
-
-struct ActorLoopTaskContractIncompleteArgs<'a, 'b> {
-    contract: &'a super::task_contract::TaskContract,
-    decision: super::task_contract::CompletionDecision,
-    target_hint: Option<super::task_contract::RecoveryTargetHint>,
-    missing: &'a [super::task_contract::ArtifactRole],
-    last_iter: usize,
-    contract_completion_retries: &'b mut usize,
-    contract_completion_role_retries: &'b mut HashMap<super::task_contract::ArtifactRole, usize>,
-}
-
-struct ActorLoopPlanToolFollowupArgs<'a> {
-    last_iter: usize,
-    plan_ready_after_tool: bool,
-    plan_file_edit_calls_this_turn: usize,
-    plan_exploration_calls_this_turn: usize,
-    plan_missing_before_turn: Option<usize>,
-    plan_progress_retries: &'a mut usize,
-    plan_exploration_only_turns: &'a mut usize,
-}
-
-enum ActorLoopPlanToolFollowupOutcome {
-    Proceed,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-struct ActorLoopCompletionArgs<'a, 'b> {
-    last_iter: usize,
-    final_reply: &'a str,
-    plan_progress_retries: &'b mut usize,
-}
-
-enum ActorLoopCompletionOutcome {
-    Continue,
-    Done {
-        final_prose: String,
-    },
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-struct ActorLoopPostToolFallbackArgs<'a> {
-    last_iter: usize,
-    action_expectation: recovery::ActionExpectation,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    emitted_bash_loop_note: bool,
-    bash_only_tool_turn: bool,
-    repo_edit_calls_made_this_turn: usize,
-    tool_calls_made_this_turn: usize,
-    logged_act_first_repo_edit: bool,
-    repo_change_retries: &'a mut usize,
-}
-
-enum ActorLoopPostToolFallbackOutcome {
-    Proceed,
-    Continue,
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-struct ActorLoopPostToolCleanupArgs<'a> {
-    task_contract: Option<&'a super::task_contract::TaskContract>,
-    contract_verifier_repair_edit_count: Option<usize>,
-    repo_edit_calls_made_this_turn: usize,
-    contract_completion_retries: usize,
-    tool_calls_made_this_turn: usize,
-    interrupt_flag: &'a InterruptFlag,
-}
-
-enum ActorLoopPostToolCleanupOutcome {
-    Continue,
-    Exit {
-        reason: ExitReason,
-        error_text: String,
-    },
-}
-
-#[derive(Clone, Copy)]
-enum ActorLoopMissingRepoChangeReplyKind {
-    Empty,
-    ProseOnly,
-}
-
-struct ActorLoopMissingRepoChangeReplyArgs<'a> {
-    kind: ActorLoopMissingRepoChangeReplyKind,
-    last_iter: usize,
-    repo_change_retries: &'a mut usize,
-    framework_app_fallback_materialized: &'a mut bool,
-}
-
-struct ActorLoopMissingRepoChangeRetryPromptArgs {
-    kind: ActorLoopMissingRepoChangeReplyKind,
-    last_iter: usize,
-    repo_change_retries: usize,
-}
-
-struct ActorLoopMissingRepoChangeRetryExhaustedArgs<'a> {
-    last_iter: usize,
-    repo_change_retries: usize,
-    framework_app_fallback_materialized: &'a mut bool,
-}
-
-struct ActorLoopEmptyReplyArgs<'b> {
-    last_iter: usize,
-    action_expectation: recovery::ActionExpectation,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    requires_action: bool,
-    repo_change_retries: &'b mut usize,
-    plan_progress_retries: &'b mut usize,
-    empty_retries: &'b mut usize,
-    framework_app_fallback_materialized: &'b mut bool,
-}
-
-struct ActorLoopProseOnlyReplyArgs<'a, 'b> {
-    last_iter: usize,
-    action_expectation: recovery::ActionExpectation,
-    recovery_dispatch_gate: RecoveryDispatchGate,
-    tool_calls_made_this_turn: usize,
-    repo_change_retries: &'b mut usize,
-    plan_progress_retries: &'b mut usize,
-    no_tool_retries: &'b mut usize,
-    framework_app_fallback_materialized: &'b mut bool,
-    final_reply: &'a str,
-}
-
 struct TaskContractVerifierFlowArgs<'a, 'b> {
     before_snapshot: &'a RepoSnapshot,
     accumulated: &'a [RepoVerification],
@@ -2120,14 +1797,6 @@ fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) 
         Some(super::repair_job::StopReason::RepairExhausted) => ExitReason::RepairExhausted,
         Some(_) => ExitReason::RepairSafeStop,
         None => ExitReason::VerifierFailed,
-    }
-}
-
-fn repair_job_done_outcome() -> TaskContractVerifierFlowOutcome {
-    TaskContractVerifierFlowOutcome::Done {
-        final_prose:
-            "Completed requested repository changes and verified them with the required verifier."
-                .to_string(),
     }
 }
 
@@ -4041,10 +3710,6 @@ fn task_contract_safe_stop_clear_tag(reason: super::task_contract::SafeStopReaso
             "task_contract_safe_stop_verifier_missing"
         }
     }
-}
-
-fn plan_tool_followup_done_message() -> String {
-    "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string()
 }
 
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
@@ -6194,7 +5859,7 @@ impl Agent {
         &mut self,
         args: &mut PostReplyRecoveryArgs<'_, '_>,
     ) -> Option<PostReplyRecoveryOutcome> {
-        if !Self::missing_repo_edit_recovery_allowed(args) {
+        if !missing_repo_edit_recovery_allowed(args) {
             return None;
         }
         if self.maybe_continue_missing_repo_framework_fallback(args) {
@@ -6205,7 +5870,7 @@ impl Agent {
         }
         *args.repo_change_retries += 1;
         if *args.repo_change_retries >= 3 {
-            return Some(self.finalize_missing_repo_edit_retry_exhausted());
+            return Some(finalize_missing_repo_edit_retry_exhausted(self));
         }
         write_stdout_rendered(
             &format_iteration_status(
@@ -6219,14 +5884,6 @@ impl Agent {
         );
         self.push_missing_repo_edit_retry_note(*args.repo_change_retries);
         Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn missing_repo_edit_recovery_allowed(args: &PostReplyRecoveryArgs<'_, '_>) -> bool {
-        args.action_expectation == recovery::ActionExpectation::RepoChange
-            && args.repo_edit_calls_made_this_turn == 0
-            && args
-                .recovery_dispatch_gate
-                .allows_generic_repo_change_recovery()
     }
 
     fn maybe_continue_missing_repo_framework_fallback(
@@ -6265,25 +5922,6 @@ impl Agent {
                 Some(PostReplyRecoveryOutcome::Continue)
             }
             ScaffoldFallbackResult::NotApplicable => None,
-        }
-    }
-
-    fn finalize_missing_repo_edit_retry_exhausted(&mut self) -> PostReplyRecoveryOutcome {
-        let request = self.active_request_text().unwrap_or_default();
-        match self.maybe_apply_local_llm_small_edit_fallback(&request) {
-            Ok(Some(relative)) => PostReplyRecoveryOutcome::Finalize {
-                final_prose: format!(
-                    "Applied a verified small edit fallback after the local model stopped before editing {relative}."
-                ),
-                exit_reason: ExitReason::Done,
-                error_text: String::new(),
-            },
-            Ok(None) => missing_repo_edits_finalize_outcome(),
-            Err(err) => PostReplyRecoveryOutcome::Finalize {
-                final_prose: String::new(),
-                exit_reason: ExitReason::TransportError,
-                error_text: err,
-            },
         }
     }
 
@@ -7598,7 +7236,7 @@ impl Agent {
         }
         *args.plan_progress_retries += 1;
         if *args.plan_progress_retries >= 2 {
-            return Some(self.handle_non_progress_plan_edit_fallback());
+            return Some(handle_non_progress_plan_edit_fallback(self));
         }
         self.push_system_note(recovery::plan_progress_recovery_note(
             self.session.mode_state.plan_stage,
@@ -7607,24 +7245,6 @@ impl Agent {
             *args.plan_progress_retries,
         ));
         Some(ActorLoopPlanToolFollowupOutcome::Proceed)
-    }
-
-    fn handle_non_progress_plan_edit_fallback(&mut self) -> ActorLoopPlanToolFollowupOutcome {
-        match self.materialize_deterministic_fallback_plan(
-            "agent.plan.non_progress_edit_fallback_materialized",
-        ) {
-            Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
-                final_prose: plan_tool_followup_done_message(),
-            },
-            Ok(false) => ActorLoopPlanToolFollowupOutcome::Exit {
-                reason: ExitReason::PlanIncomplete,
-                error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
-            },
-            Err(err) => ActorLoopPlanToolFollowupOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
     }
 
     fn handle_plan_exploration_followup(
@@ -8134,13 +7754,6 @@ impl Agent {
         }
     }
 
-    fn missing_repo_change_budget_exhausted_outcome(&self) -> ActorLoopNoToolReplyOutcome {
-        ActorLoopNoToolReplyOutcome::Exit {
-            reason: ExitReason::MissingRepoEdits,
-            error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
-        }
-    }
-
     fn handle_empty_missing_repo_change_retry(
         &mut self,
         repo_change_retries: usize,
@@ -8154,7 +7767,7 @@ impl Agent {
             super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
             Vec::new(),
         ) {
-            return self.missing_repo_change_budget_exhausted_outcome();
+            return missing_repo_change_budget_exhausted_outcome();
         }
         ActorLoopNoToolReplyOutcome::Continue
     }
@@ -8182,7 +7795,7 @@ impl Agent {
             super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
             Vec::new(),
         ) {
-            return self.missing_repo_change_budget_exhausted_outcome();
+            return missing_repo_change_budget_exhausted_outcome();
         }
         ActorLoopNoToolReplyOutcome::Continue
     }
@@ -8388,7 +8001,7 @@ impl Agent {
         let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
         *args.plan_progress_retries += 1;
         if *args.plan_progress_retries >= 2 {
-            return self.handle_plan_progress_prose_only_fallback();
+            return handle_plan_progress_prose_only_fallback(self);
         }
         write_stdout_rendered(
             &format_iteration_status(
@@ -8419,24 +8032,6 @@ impl Agent {
             *args.plan_progress_retries,
         ));
         ActorLoopNoToolReplyOutcome::Continue
-    }
-
-    fn handle_plan_progress_prose_only_fallback(&mut self) -> ActorLoopNoToolReplyOutcome {
-        match self
-            .materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
-        {
-            Ok(true) => ActorLoopNoToolReplyOutcome::Done {
-                final_prose: plan_tool_followup_done_message(),
-            },
-            Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
-                reason: ExitReason::PlanIncomplete,
-                error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
-            },
-            Err(err) => ActorLoopNoToolReplyOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
     }
 
     fn handle_generic_prose_only_retry(
@@ -11751,7 +11346,7 @@ impl Agent {
         }))
     }
 
-    fn materialize_deterministic_fallback_plan(
+    pub(super) fn materialize_deterministic_fallback_plan(
         &mut self,
         event_name: &str,
     ) -> Result<bool, String> {
@@ -17163,7 +16758,7 @@ if __name__ == "__main__":
         Ok(true)
     }
 
-    fn maybe_apply_local_llm_small_edit_fallback(
+    pub(super) fn maybe_apply_local_llm_small_edit_fallback(
         &mut self,
         request: &str,
     ) -> Result<Option<String>, String> {
@@ -22498,16 +22093,6 @@ fn deterministic_framework_app_files_needed(
 
 fn should_try_framework_app_fallback(last_iter: usize, already_materialized: bool) -> bool {
     last_iter > 1 && !already_materialized
-}
-
-fn missing_repo_edits_finalize_outcome() -> PostReplyRecoveryOutcome {
-    PostReplyRecoveryOutcome::Finalize {
-        final_prose: String::new(),
-        exit_reason: ExitReason::MissingRepoEdits,
-        error_text: ExitReason::MissingRepoEdits
-            .default_error_text()
-            .to_string(),
-    }
 }
 
 fn framework_app_fallback_continuation_note() -> &'static str {
@@ -32963,7 +32548,7 @@ export default function App() {
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             };
-            assert!(super::Agent::missing_repo_edit_recovery_allowed(&args));
+            assert!(super::missing_repo_edit_recovery_allowed(&args));
         }
 
         {
@@ -32983,9 +32568,7 @@ export default function App() {
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             };
-            assert!(!super::Agent::missing_repo_edit_recovery_allowed(
-                &blocked_args
-            ));
+            assert!(!super::missing_repo_edit_recovery_allowed(&blocked_args));
         }
     }
 
