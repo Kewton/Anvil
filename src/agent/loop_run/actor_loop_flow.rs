@@ -363,6 +363,14 @@ pub(super) struct ActorLoopProseOnlyReplyArgs<'a, 'b> {
     pub(super) final_reply: &'a str,
 }
 
+pub(super) fn missing_repo_edit_recovery_allowed(args: &PostReplyRecoveryArgs<'_, '_>) -> bool {
+    args.action_expectation == recovery::ActionExpectation::RepoChange
+        && args.repo_edit_calls_made_this_turn == 0
+        && args
+            .recovery_dispatch_gate
+            .allows_generic_repo_change_recovery()
+}
+
 pub(super) fn repair_job_done_outcome() -> TaskContractVerifierFlowOutcome {
     TaskContractVerifierFlowOutcome::Done {
         final_prose:

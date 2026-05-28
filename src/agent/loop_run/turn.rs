@@ -1756,7 +1756,8 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, missing_repo_edits_finalize_outcome, repair_job_done_outcome,
+    TaskContractVerifierFlowOutcome, missing_repo_edit_recovery_allowed,
+    missing_repo_edits_finalize_outcome, repair_job_done_outcome,
 };
 
 struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -5867,7 +5868,7 @@ impl Agent {
         &mut self,
         args: &mut PostReplyRecoveryArgs<'_, '_>,
     ) -> Option<PostReplyRecoveryOutcome> {
-        if !Self::missing_repo_edit_recovery_allowed(args) {
+        if !missing_repo_edit_recovery_allowed(args) {
             return None;
         }
         if self.maybe_continue_missing_repo_framework_fallback(args) {
@@ -5892,14 +5893,6 @@ impl Agent {
         );
         self.push_missing_repo_edit_retry_note(*args.repo_change_retries);
         Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn missing_repo_edit_recovery_allowed(args: &PostReplyRecoveryArgs<'_, '_>) -> bool {
-        args.action_expectation == recovery::ActionExpectation::RepoChange
-            && args.repo_edit_calls_made_this_turn == 0
-            && args
-                .recovery_dispatch_gate
-                .allows_generic_repo_change_recovery()
     }
 
     fn maybe_continue_missing_repo_framework_fallback(
@@ -32626,7 +32619,7 @@ export default function App() {
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             };
-            assert!(super::Agent::missing_repo_edit_recovery_allowed(&args));
+            assert!(super::missing_repo_edit_recovery_allowed(&args));
         }
 
         {
@@ -32646,9 +32639,7 @@ export default function App() {
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             };
-            assert!(!super::Agent::missing_repo_edit_recovery_allowed(
-                &blocked_args
-            ));
+            assert!(!super::missing_repo_edit_recovery_allowed(&blocked_args));
         }
     }
 
