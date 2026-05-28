@@ -18,8 +18,9 @@ use super::actor_loop_flow::{
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
     TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
-    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
-    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
+    maybe_handle_answer_only_future_work_recovery, missing_repo_change_budget_exhausted_outcome,
+    missing_repo_edit_recovery_allowed, missing_repo_edits_finalize_outcome,
+    plan_tool_followup_done_message, repair_job_done_outcome,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -1704,7 +1705,7 @@ fn raw_mode_safe_text(text: &str) -> String {
     text.replace('\n', "\r\n")
 }
 
-fn reply_looks_like_future_work(reply: &str) -> bool {
+pub(super) fn reply_looks_like_future_work(reply: &str) -> bool {
     let normalized = reply.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         return false;
@@ -2613,7 +2614,7 @@ fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
     .map(ToString::to_string)
 }
 
-fn write_stdout_rendered(text: &str, trailing_newline: bool) {
+pub(super) fn write_stdout_rendered(text: &str, trailing_newline: bool) {
     let mut out = io::stdout().lock();
     let rendered = raw_mode_safe_text(text);
     let _ = out.write_all(rendered.as_bytes());
@@ -2788,7 +2789,7 @@ fn deterministic_timeout_fallback_plan(
     )
 }
 
-fn format_iteration_status(
+pub(super) fn format_iteration_status(
     iter_human: usize,
     max_iterations: usize,
     headline: &str,
@@ -5798,7 +5799,7 @@ impl Agent {
         &mut self,
         mut args: PostReplyRecoveryArgs<'_, '_>,
     ) -> Option<PostReplyRecoveryOutcome> {
-        if let Some(outcome) = self.maybe_handle_answer_only_future_work_recovery(&mut args) {
+        if let Some(outcome) = maybe_handle_answer_only_future_work_recovery(self, &mut args) {
             return Some(outcome);
         }
         if let Some(outcome) = self.maybe_handle_missing_repo_edit_recovery(&mut args) {
@@ -5817,41 +5818,6 @@ impl Agent {
             return Some(outcome);
         }
 
-        None
-    }
-
-    fn maybe_handle_answer_only_future_work_recovery(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if !args.requires_action
-            && self.answer_only_mode_active()
-            && reply_looks_like_future_work(args.final_reply)
-        {
-            *args.no_tool_retries += 1;
-            if *args.no_tool_retries >= 1 {
-                return Some(PostReplyRecoveryOutcome::Finalize {
-                    final_prose: self.answer_only_fallback_response(),
-                    exit_reason: ExitReason::Done,
-                    error_text: String::new(),
-                });
-            }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Retry requested",
-                    "The model answered with next-step prose in answer-only mode. Asked it to answer directly without more tools.",
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            self.push_system_note(
-                "[Answer-only Recovery] Answer the user's request now using only the context already inspected. Do not announce the next action, do not use tools, do not edit files, and do not ask the user to run anything."
-                    .to_string(),
-            );
-            return Some(PostReplyRecoveryOutcome::Continue);
-        }
         None
     }
 
@@ -15802,7 +15768,7 @@ impl Agent {
         ))
     }
 
-    fn answer_only_mode_active(&self) -> bool {
+    pub(super) fn answer_only_mode_active(&self) -> bool {
         // Issue #576 / DR3-001: tool policy must honour the second-pass-
         // corrected `session.mode_state.work_mode` as the single source of
         // truth. The previous OR with `infer_work_mode_from_text(active_request_text())`
@@ -16929,7 +16895,7 @@ if __name__ == "__main__":
             .map(ConversationMessage::system)
     }
 
-    fn answer_only_fallback_response(&self) -> String {
+    pub(super) fn answer_only_fallback_response(&self) -> String {
         let request = self.active_request_text().unwrap_or_default();
         let lower = request.to_ascii_lowercase();
         if request_explicitly_requests_script_execution(&request)

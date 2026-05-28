@@ -405,6 +405,41 @@ pub(super) fn plan_tool_followup_done_message() -> String {
     "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string()
 }
 
+pub(super) fn maybe_handle_answer_only_future_work_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if !args.requires_action
+        && agent.answer_only_mode_active()
+        && super::turn::reply_looks_like_future_work(args.final_reply)
+    {
+        *args.no_tool_retries += 1;
+        if *args.no_tool_retries >= 1 {
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose: agent.answer_only_fallback_response(),
+                exit_reason: ExitReason::Done,
+                error_text: String::new(),
+            });
+        }
+        super::turn::write_stdout_rendered(
+            &super::turn::format_iteration_status(
+                args.last_iter,
+                agent.config.max_iterations,
+                "Retry requested",
+                "The model answered with next-step prose in answer-only mode. Asked it to answer directly without more tools.",
+                agent.footer.current_cols(),
+            ),
+            true,
+        );
+        agent.push_system_note(
+            "[Answer-only Recovery] Answer the user's request now using only the context already inspected. Do not announce the next action, do not use tools, do not edit files, and do not ask the user to run anything."
+                .to_string(),
+        );
+        return Some(PostReplyRecoveryOutcome::Continue);
+    }
+    None
+}
+
 pub(super) fn handle_plan_progress_prose_only_fallback(
     agent: &mut Agent,
 ) -> ActorLoopNoToolReplyOutcome {
