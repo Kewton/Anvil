@@ -1,11 +1,35 @@
-//! Issue #681 (parent #680, Phase 1): actor loop control-flow data types
+//! Issue #681 (parent #680, Phase 1): actor loop control-flow data
+//! types **and** the thin free-function helpers that operate over them,
 //! extracted from `turn.rs`.
 //!
-//! Hosts `PostReplyRecovery*` / `ActorLoop*Args` / `ActorLoop*Outcome`
-//! struct/enum definitions consumed by the actor loop sub-flows
-//! (pre-reply / tool-preparation / no-tool / task-contract-reply /
-//! completion / post-tool / missing-repo-change / empty-reply /
-//! prose-only / plan-tool-followup).
+//! Hosts:
+//!
+//! * `PostReplyRecovery*` / `ActorLoop*Args` / `ActorLoop*Outcome`
+//!   struct/enum definitions consumed by the actor loop sub-flows
+//!   (pre-reply / tool-preparation / no-tool / task-contract-reply /
+//!   completion / post-tool / missing-repo-change / empty-reply /
+//!   prose-only / plan-tool-followup) — 27 `pub(super)` items.
+//! * 8 `pub(super) fn` helpers extracted from `impl Agent` /
+//!   free-function space in `turn.rs`:
+//!   * pure constructors (`repair_job_done_outcome`,
+//!     `missing_repo_edits_finalize_outcome`,
+//!     `missing_repo_change_budget_exhausted_outcome`,
+//!     `plan_tool_followup_done_message`),
+//!   * a pure predicate (`missing_repo_edit_recovery_allowed`),
+//!   * three `&mut Agent` veneers
+//!     (`handle_plan_progress_prose_only_fallback`,
+//!     `handle_non_progress_plan_edit_fallback`,
+//!     `finalize_missing_repo_edit_retry_exhausted`) that delegate
+//!     state mutation back to `Agent` methods exposed at
+//!     `pub(super)`.
+//!
+//! The `&mut Agent` veneer pattern is the **intentional transitional
+//! shape** for Phase 1 — they bridge `Agent` state with the
+//! `ActorLoop*Outcome` data flow so the actor-loop dispatcher can
+//! migrate out of `turn.rs` incrementally. Long-term they may stay
+//! (precedent: `pam_advisory::record_pam_advisory_decision`) or be
+//! inlined into pure functions once `Agent` state can be untangled
+//! per #680 Phase boundaries.
 //!
 //! DR3-001: `pub(super)` limited. `loop_run.rs` MUST NOT re-export via
 //! `pub use`. `turn.rs` is the only in-crate consumer.
@@ -27,6 +51,12 @@ use super::tool_policy::EffectiveToolPolicy;
 /// exhaustion break-points (NoTool / ProseOnly / cross-iteration flag) in
 /// `run_actor_loop`. Defined as a single constant so the three sites
 /// stay aligned and any future copy survives review.
+///
+/// Originally defined in `turn.rs` (#652); relocated here under
+/// `actor_loop_flow` for Issue #681 because the budget-exhausted
+/// `error_text` is consumed exclusively by actor-loop completion
+/// outcomes. Lineage: ownership remains Issue #652, location now
+/// follows the actor-loop responsibility boundary.
 pub(super) const ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT: &str =
     "artifact completion role-specific retry budget exhausted";
 

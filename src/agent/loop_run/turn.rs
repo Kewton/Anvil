@@ -3,6 +3,24 @@ use super::active_job_arbiter::{
     build_active_job_selected_payload, determine_loop_control_action,
     loop_control_action_requires_missing_verifier_setup,
 };
+use super::actor_loop_flow::{
+    ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
+    ActorLoopEmptyReplyArgs, ActorLoopMissingRepoChangeReplyArgs,
+    ActorLoopMissingRepoChangeReplyKind, ActorLoopMissingRepoChangeRetryExhaustedArgs,
+    ActorLoopMissingRepoChangeRetryPromptArgs, ActorLoopNoToolReplyArgs,
+    ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome,
+    ActorLoopPostToolCleanupArgs, ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
+    ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyControlState,
+    ActorLoopPreReplyOutcome, ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs,
+    ActorLoopTaskContractContinueArgs, ActorLoopTaskContractIncompleteArgs,
+    ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
+    ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
+    ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
+    TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
+    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
+    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
+    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
+};
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
     build_agent_verifier_external_import_rejected_payload, build_agent_verifier_invoked_payload,
@@ -1736,25 +1754,6 @@ fn reply_looks_like_future_work(reply: &str) -> bool {
         .iter()
         .any(|marker| normalized.contains(marker))
 }
-
-use super::actor_loop_flow::{
-    ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
-    ActorLoopEmptyReplyArgs, ActorLoopMissingRepoChangeReplyArgs,
-    ActorLoopMissingRepoChangeReplyKind, ActorLoopMissingRepoChangeRetryExhaustedArgs,
-    ActorLoopMissingRepoChangeRetryPromptArgs, ActorLoopNoToolReplyArgs,
-    ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome,
-    ActorLoopPostToolCleanupArgs, ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
-    ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyControlState,
-    ActorLoopPreReplyOutcome, ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs,
-    ActorLoopTaskContractContinueArgs, ActorLoopTaskContractIncompleteArgs,
-    ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
-    ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
-    ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
-    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
-    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
-    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
-};
 
 struct TaskContractVerifierFlowArgs<'a, 'b> {
     before_snapshot: &'a RepoSnapshot,
