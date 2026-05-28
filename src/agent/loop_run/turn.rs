@@ -6285,47 +6285,99 @@ impl Agent {
         args: &mut ActorLoopPreReplyArgs<'_, '_>,
         recovery_dispatch_gate: RecoveryDispatchGate,
     ) -> Option<ActorLoopPreReplyOutcome> {
-        if args.action_expectation == recovery::ActionExpectation::RepoChange
-            && recovery_dispatch_gate.allows_deterministic_fallback()
-            && *args.repo_edit_calls_made_this_turn == 0
-            && self.maybe_materialize_mode_deterministic_fallback(args.last_iter)
+        if self.maybe_continue_actor_loop_mode_deterministic_fallback(args, recovery_dispatch_gate)
         {
             return Some(ActorLoopPreReplyOutcome::Continue);
         }
-        if args.action_expectation == recovery::ActionExpectation::RepoChange
-            && recovery_dispatch_gate.allows_deterministic_fallback()
-            && *args.repo_edit_calls_made_this_turn == 0
-            && should_try_framework_app_fallback(
-                args.last_iter,
-                *args.framework_app_fallback_materialized,
-            )
-            && self.maybe_materialize_framework_game_fallback(args.last_iter)
-        {
-            *args.framework_app_fallback_materialized = true;
-            self.push_system_note(framework_app_fallback_continuation_note().to_string());
+        if self.maybe_continue_actor_loop_framework_fallback(args, recovery_dispatch_gate) {
             return Some(ActorLoopPreReplyOutcome::Continue);
         }
-        if *args.repo_edit_calls_made_this_turn == 0
-            && recovery_dispatch_gate.allows_deterministic_fallback()
-            && self.current_request_needs_playable_ui_quality_gate()
-            && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
+        if let Some(outcome) =
+            self.maybe_handle_actor_loop_playable_ui_fallback(args, recovery_dispatch_gate)
         {
-            return match self.handle_actor_loop_post_tool_polish_fallback(
-                args.last_iter,
-                &request,
-                &target_path,
-                args.repo_change_retries,
-            ) {
-                ActorLoopPostToolFallbackOutcome::Continue => {
-                    Some(ActorLoopPreReplyOutcome::Continue)
-                }
-                ActorLoopPostToolFallbackOutcome::Exit { reason, error_text } => {
-                    Some(ActorLoopPreReplyOutcome::Exit { reason, error_text })
-                }
-                ActorLoopPostToolFallbackOutcome::Proceed => None,
-            };
+            return Some(outcome);
         }
         None
+    }
+
+    fn actor_loop_pre_reply_deterministic_fallback_allowed(
+        repo_edit_calls_made_this_turn: usize,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+    ) -> bool {
+        repo_edit_calls_made_this_turn == 0
+            && recovery_dispatch_gate.allows_deterministic_fallback()
+    }
+
+    fn actor_loop_pre_reply_repo_change_fallback_allowed(
+        action_expectation: recovery::ActionExpectation,
+        repo_edit_calls_made_this_turn: usize,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+    ) -> bool {
+        action_expectation == recovery::ActionExpectation::RepoChange
+            && Self::actor_loop_pre_reply_deterministic_fallback_allowed(
+                repo_edit_calls_made_this_turn,
+                recovery_dispatch_gate,
+            )
+    }
+
+    fn maybe_continue_actor_loop_mode_deterministic_fallback(
+        &mut self,
+        args: &mut ActorLoopPreReplyArgs<'_, '_>,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+    ) -> bool {
+        Self::actor_loop_pre_reply_repo_change_fallback_allowed(
+            args.action_expectation,
+            *args.repo_edit_calls_made_this_turn,
+            recovery_dispatch_gate,
+        ) && self.maybe_materialize_mode_deterministic_fallback(args.last_iter)
+    }
+
+    fn maybe_continue_actor_loop_framework_fallback(
+        &mut self,
+        args: &mut ActorLoopPreReplyArgs<'_, '_>,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+    ) -> bool {
+        if !Self::actor_loop_pre_reply_repo_change_fallback_allowed(
+            args.action_expectation,
+            *args.repo_edit_calls_made_this_turn,
+            recovery_dispatch_gate,
+        ) || !should_try_framework_app_fallback(
+            args.last_iter,
+            *args.framework_app_fallback_materialized,
+        ) || !self.maybe_materialize_framework_game_fallback(args.last_iter)
+        {
+            return false;
+        }
+        *args.framework_app_fallback_materialized = true;
+        self.push_system_note(framework_app_fallback_continuation_note().to_string());
+        true
+    }
+
+    fn maybe_handle_actor_loop_playable_ui_fallback(
+        &mut self,
+        args: &mut ActorLoopPreReplyArgs<'_, '_>,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+    ) -> Option<ActorLoopPreReplyOutcome> {
+        if !Self::actor_loop_pre_reply_deterministic_fallback_allowed(
+            *args.repo_edit_calls_made_this_turn,
+            recovery_dispatch_gate,
+        ) || !self.current_request_needs_playable_ui_quality_gate()
+        {
+            return None;
+        }
+        let (request, target_path) = self.accepted_repo_change_polish_target()?;
+        match self.handle_actor_loop_post_tool_polish_fallback(
+            args.last_iter,
+            &request,
+            &target_path,
+            args.repo_change_retries,
+        ) {
+            ActorLoopPostToolFallbackOutcome::Continue => Some(ActorLoopPreReplyOutcome::Continue),
+            ActorLoopPostToolFallbackOutcome::Exit { reason, error_text } => {
+                Some(ActorLoopPreReplyOutcome::Exit { reason, error_text })
+            }
+            ActorLoopPostToolFallbackOutcome::Proceed => None,
+        }
     }
 
     fn request_actor_loop_pre_reply_model_turn(
@@ -32203,6 +32255,31 @@ export default function App() {
             }
             _ => panic!("unexpected outcome"),
         }
+    }
+
+    #[test]
+    fn actor_loop_pre_reply_fallback_gate_requires_deterministic_allowance() {
+        let allowed = super::RecoveryDispatchGate::from_owner(super::RecoveryOwner::None);
+        let blocked = super::RecoveryDispatchGate::from_owner(super::RecoveryOwner::RepairJob);
+
+        assert!(super::Agent::actor_loop_pre_reply_deterministic_fallback_allowed(0, allowed));
+        assert!(!super::Agent::actor_loop_pre_reply_deterministic_fallback_allowed(1, allowed));
+        assert!(!super::Agent::actor_loop_pre_reply_deterministic_fallback_allowed(0, blocked));
+
+        assert!(
+            super::Agent::actor_loop_pre_reply_repo_change_fallback_allowed(
+                super::recovery::ActionExpectation::RepoChange,
+                0,
+                allowed,
+            )
+        );
+        assert!(
+            !super::Agent::actor_loop_pre_reply_repo_change_fallback_allowed(
+                super::recovery::ActionExpectation::None,
+                0,
+                allowed,
+            )
+        );
     }
 
     #[test]
