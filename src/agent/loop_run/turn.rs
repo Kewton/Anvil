@@ -6,6 +6,8 @@ use super::active_job_arbiter::{
 use super::actor_loop_flow::missing_repo_edit_recovery_allowed;
 #[cfg(test)]
 use super::actor_loop_flow::missing_repo_edits_finalize_outcome;
+#[cfg(test)]
+use super::actor_loop_flow::plan_tool_followup_done_message;
 use super::actor_loop_flow::{
     ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
     ActorLoopEmptyReplyArgs, ActorLoopMissingRepoChangeReplyArgs,
@@ -17,10 +19,10 @@ use super::actor_loop_flow::{
     ActorLoopProseOnlyReplyArgs, ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopToolPreparationArgs, ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs,
     PostReplyRecoveryOutcome, TaskContractVerifierFlowOutcome, drive_actor_loop_pre_reply_phase,
-    drive_actor_loop_tool_preparation_phase, handle_actor_loop_task_contract_reply,
-    handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
+    drive_actor_loop_tool_preparation_phase, handle_actor_loop_plan_tool_followup,
+    handle_actor_loop_task_contract_reply, handle_plan_progress_prose_only_fallback,
     handle_post_reply_recovery, missing_repo_change_budget_exhausted_outcome,
-    plan_tool_followup_done_message, repair_job_done_outcome,
+    repair_job_done_outcome,
 };
 #[cfg(test)]
 use super::actor_loop_flow::{
@@ -2911,7 +2913,7 @@ fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
     raw_path.trim().replace('\\', "/")
 }
 
-fn log_plan_stall(
+pub(super) fn log_plan_stall(
     session_id: &str,
     iter: usize,
     reason: &str,
@@ -5970,131 +5972,6 @@ impl Agent {
         }
     }
 
-    fn handle_actor_loop_plan_tool_followup(
-        &mut self,
-        mut args: ActorLoopPlanToolFollowupArgs<'_>,
-    ) -> ActorLoopPlanToolFollowupOutcome {
-        if self.session.mode_state.mode != ExecutionMode::Plan {
-            return ActorLoopPlanToolFollowupOutcome::Proceed;
-        }
-        if args.plan_ready_after_tool {
-            return ActorLoopPlanToolFollowupOutcome::Done {
-                final_prose: plan_tool_followup_done_message(),
-            };
-        }
-        if let Some(outcome) = self.handle_plan_file_edit_followup(&mut args) {
-            return outcome;
-        }
-        if let Some(outcome) = self.handle_plan_exploration_followup(&mut args) {
-            return outcome;
-        }
-        ActorLoopPlanToolFollowupOutcome::Proceed
-    }
-
-    fn handle_plan_file_edit_followup(
-        &mut self,
-        args: &mut ActorLoopPlanToolFollowupArgs<'_>,
-    ) -> Option<ActorLoopPlanToolFollowupOutcome> {
-        if args.plan_file_edit_calls_this_turn == 0 {
-            return None;
-        }
-        let plan_contents = self
-            .current_plan_contents()
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
-        let missing_after = lifecycle::plan_missing_sections(&plan_contents);
-        let made_section_progress = args
-            .plan_missing_before_turn
-            .is_none_or(|before| missing_after.len() < before);
-        if made_section_progress {
-            *args.plan_progress_retries = 0;
-            *args.plan_exploration_only_turns = 0;
-            return Some(ActorLoopPlanToolFollowupOutcome::Proceed);
-        }
-        *args.plan_progress_retries += 1;
-        if *args.plan_progress_retries >= 2 {
-            return Some(handle_non_progress_plan_edit_fallback(self));
-        }
-        self.push_system_note(recovery::plan_progress_recovery_note(
-            self.session.mode_state.plan_stage,
-            &lifecycle::plan_next_stage_sections(&plan_contents),
-            &missing_after,
-            *args.plan_progress_retries,
-        ));
-        Some(ActorLoopPlanToolFollowupOutcome::Proceed)
-    }
-
-    fn handle_plan_exploration_followup(
-        &mut self,
-        args: &mut ActorLoopPlanToolFollowupArgs<'_>,
-    ) -> Option<ActorLoopPlanToolFollowupOutcome> {
-        if args.plan_exploration_calls_this_turn >= 2 {
-            return Some(
-                self.handle_actor_loop_plan_exploration_only_turn(
-                    args.last_iter,
-                    "exploration_only_turn",
-                    args.plan_progress_retries,
-                )
-                .unwrap_or(ActorLoopPlanToolFollowupOutcome::Proceed),
-            );
-        }
-        if args.plan_exploration_calls_this_turn == 0 {
-            return None;
-        }
-        *args.plan_exploration_only_turns += 1;
-        if *args.plan_exploration_only_turns >= 1 {
-            let outcome = self.handle_actor_loop_plan_exploration_only_turn(
-                args.last_iter,
-                "repeated_exploration_only_turns",
-                args.plan_progress_retries,
-            );
-            *args.plan_exploration_only_turns = 0;
-            return Some(outcome.unwrap_or(ActorLoopPlanToolFollowupOutcome::Proceed));
-        }
-        Some(ActorLoopPlanToolFollowupOutcome::Proceed)
-    }
-
-    fn handle_actor_loop_plan_exploration_only_turn(
-        &mut self,
-        last_iter: usize,
-        stall_reason: &'static str,
-        plan_progress_retries: &mut usize,
-    ) -> Option<ActorLoopPlanToolFollowupOutcome> {
-        match self.current_plan_contents() {
-            Ok(Some(contents)) => {
-                let current_stage = lifecycle::current_plan_stage(&contents);
-                let next_sections = lifecycle::plan_next_stage_sections(&contents);
-                let missing_sections = lifecycle::plan_missing_sections(&contents);
-                if !missing_sections.is_empty() {
-                    *plan_progress_retries += 1;
-                    log_plan_stall(
-                        self.session_store.session_id(),
-                        last_iter,
-                        stall_reason,
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        *plan_progress_retries,
-                    );
-                    self.push_system_note(recovery::plan_progress_recovery_note(
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        *plan_progress_retries,
-                    ));
-                }
-                Some(ActorLoopPlanToolFollowupOutcome::Proceed)
-            }
-            Ok(None) => Some(ActorLoopPlanToolFollowupOutcome::Proceed),
-            Err(err) => Some(ActorLoopPlanToolFollowupOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            }),
-        }
-    }
-
     fn handle_actor_loop_completion(
         &mut self,
         args: ActorLoopCompletionArgs<'_, '_>,
@@ -7514,15 +7391,18 @@ impl Agent {
                         break;
                     }
                 }
-                match self.handle_actor_loop_plan_tool_followup(ActorLoopPlanToolFollowupArgs {
-                    last_iter,
-                    plan_ready_after_tool,
-                    plan_file_edit_calls_this_turn,
-                    plan_exploration_calls_this_turn,
-                    plan_missing_before_turn,
-                    plan_progress_retries: &mut plan_progress_retries,
-                    plan_exploration_only_turns: &mut plan_exploration_only_turns,
-                }) {
+                match handle_actor_loop_plan_tool_followup(
+                    self,
+                    ActorLoopPlanToolFollowupArgs {
+                        last_iter,
+                        plan_ready_after_tool,
+                        plan_file_edit_calls_this_turn,
+                        plan_exploration_calls_this_turn,
+                        plan_missing_before_turn,
+                        plan_progress_retries: &mut plan_progress_retries,
+                        plan_exploration_only_turns: &mut plan_exploration_only_turns,
+                    },
+                ) {
                     ActorLoopPlanToolFollowupOutcome::Proceed => {}
                     ActorLoopPlanToolFollowupOutcome::Done { final_prose: prose } => {
                         final_prose = prose;

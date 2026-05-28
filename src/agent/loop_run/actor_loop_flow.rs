@@ -755,6 +755,133 @@ pub(super) fn actor_loop_pre_reply_flow_outcome(
     }
 }
 
+pub(super) fn handle_actor_loop_plan_tool_followup(
+    agent: &mut Agent,
+    mut args: ActorLoopPlanToolFollowupArgs<'_>,
+) -> ActorLoopPlanToolFollowupOutcome {
+    if agent.session.mode_state.mode != super::ExecutionMode::Plan {
+        return ActorLoopPlanToolFollowupOutcome::Proceed;
+    }
+    if args.plan_ready_after_tool {
+        return ActorLoopPlanToolFollowupOutcome::Done {
+            final_prose: plan_tool_followup_done_message(),
+        };
+    }
+    if let Some(outcome) = handle_plan_file_edit_followup(agent, &mut args) {
+        return outcome;
+    }
+    if let Some(outcome) = handle_plan_exploration_followup(agent, &mut args) {
+        return outcome;
+    }
+    ActorLoopPlanToolFollowupOutcome::Proceed
+}
+
+fn handle_plan_file_edit_followup(
+    agent: &mut Agent,
+    args: &mut ActorLoopPlanToolFollowupArgs<'_>,
+) -> Option<ActorLoopPlanToolFollowupOutcome> {
+    if args.plan_file_edit_calls_this_turn == 0 {
+        return None;
+    }
+    let plan_contents = agent
+        .current_plan_contents()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    agent.session.mode_state.plan_stage = super::lifecycle::current_plan_stage(&plan_contents);
+    let missing_after = super::lifecycle::plan_missing_sections(&plan_contents);
+    let made_section_progress = args
+        .plan_missing_before_turn
+        .is_none_or(|before| missing_after.len() < before);
+    if made_section_progress {
+        *args.plan_progress_retries = 0;
+        *args.plan_exploration_only_turns = 0;
+        return Some(ActorLoopPlanToolFollowupOutcome::Proceed);
+    }
+    *args.plan_progress_retries += 1;
+    if *args.plan_progress_retries >= 2 {
+        return Some(handle_non_progress_plan_edit_fallback(agent));
+    }
+    agent.push_system_note(recovery::plan_progress_recovery_note(
+        agent.session.mode_state.plan_stage,
+        &super::lifecycle::plan_next_stage_sections(&plan_contents),
+        &missing_after,
+        *args.plan_progress_retries,
+    ));
+    Some(ActorLoopPlanToolFollowupOutcome::Proceed)
+}
+
+fn handle_plan_exploration_followup(
+    agent: &mut Agent,
+    args: &mut ActorLoopPlanToolFollowupArgs<'_>,
+) -> Option<ActorLoopPlanToolFollowupOutcome> {
+    if args.plan_exploration_calls_this_turn >= 2 {
+        return Some(
+            handle_actor_loop_plan_exploration_only_turn(
+                agent,
+                args.last_iter,
+                "exploration_only_turn",
+                args.plan_progress_retries,
+            )
+            .unwrap_or(ActorLoopPlanToolFollowupOutcome::Proceed),
+        );
+    }
+    if args.plan_exploration_calls_this_turn == 0 {
+        return None;
+    }
+    *args.plan_exploration_only_turns += 1;
+    if *args.plan_exploration_only_turns >= 1 {
+        let outcome = handle_actor_loop_plan_exploration_only_turn(
+            agent,
+            args.last_iter,
+            "repeated_exploration_only_turns",
+            args.plan_progress_retries,
+        );
+        *args.plan_exploration_only_turns = 0;
+        return Some(outcome.unwrap_or(ActorLoopPlanToolFollowupOutcome::Proceed));
+    }
+    Some(ActorLoopPlanToolFollowupOutcome::Proceed)
+}
+
+fn handle_actor_loop_plan_exploration_only_turn(
+    agent: &mut Agent,
+    last_iter: usize,
+    stall_reason: &'static str,
+    plan_progress_retries: &mut usize,
+) -> Option<ActorLoopPlanToolFollowupOutcome> {
+    match agent.current_plan_contents() {
+        Ok(Some(contents)) => {
+            let current_stage = super::lifecycle::current_plan_stage(&contents);
+            let next_sections = super::lifecycle::plan_next_stage_sections(&contents);
+            let missing_sections = super::lifecycle::plan_missing_sections(&contents);
+            if !missing_sections.is_empty() {
+                *plan_progress_retries += 1;
+                super::turn::log_plan_stall(
+                    agent.session_store.session_id(),
+                    last_iter,
+                    stall_reason,
+                    current_stage,
+                    &next_sections,
+                    &missing_sections,
+                    *plan_progress_retries,
+                );
+                agent.push_system_note(recovery::plan_progress_recovery_note(
+                    current_stage,
+                    &next_sections,
+                    &missing_sections,
+                    *plan_progress_retries,
+                ));
+            }
+            Some(ActorLoopPlanToolFollowupOutcome::Proceed)
+        }
+        Ok(None) => Some(ActorLoopPlanToolFollowupOutcome::Proceed),
+        Err(err) => Some(ActorLoopPlanToolFollowupOutcome::Exit {
+            reason: ExitReason::TransportError,
+            error_text: err,
+        }),
+    }
+}
+
 pub(super) fn drive_actor_loop_tool_preparation_phase(
     agent: &mut Agent,
     args: ActorLoopToolPreparationArgs<'_, '_>,
