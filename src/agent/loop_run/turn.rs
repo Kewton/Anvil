@@ -73,9 +73,17 @@ use super::repair_patch_validation::{
     VerifierRepairIntent, build_verifier_repair_pass_ledger_outcome,
     validate_accepted_repair_plan_authorizes_target,
 };
+use super::repair_target_admission::RepairTargetAdmissionContext;
 #[cfg(test)]
-use super::repair_target_admission::admission_always_false;
-use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
+use super::repair_target_admission::{admission_always_false, admit_repair_target_hint};
+#[cfg(test)]
+use super::semantic_repair_planning::diagnostic_target_allowed_by_confidence;
+#[cfg(test)]
+use super::verifier_assessment_parser::ParsedVerifierRepairAssessment;
+#[cfg(test)]
+use super::verifier_repair_targeting::{
+    verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
+};
 
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
@@ -84,8 +92,7 @@ use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
     build_semantic_failure_report_from_legacy_assessment,
     build_semantic_repair_plan_from_report_with_authority_input,
-    build_spec_authority_input_for_active_request, diagnostic_target_allowed_by_confidence,
-    enrich_failure_clusters_with_admitted_targets, first_role_kind_compatible_diagnostic_target,
+    build_spec_authority_input_for_active_request, enrich_failure_clusters_with_admitted_targets,
     merge_legacy_targets_into_clusters,
 };
 #[cfg(test)]
@@ -128,9 +135,8 @@ use super::tool_policy::{
 #[cfg(test)]
 use super::verifier_assessment_parser::ParsedVerifierRepairTarget;
 use super::verifier_assessment_parser::{
-    ParsedVerifierRepairAssessment, apply_framework_findings_to_parsed_assessment,
-    parse_semantic_failure_report_from_reply, parse_verifier_repair_assessment_reply,
-    verifier_failure_type_for_diagnostic_kind,
+    apply_framework_findings_to_parsed_assessment, parse_semantic_failure_report_from_reply,
+    parse_verifier_repair_assessment_reply,
 };
 use super::verifier_diagnostic_attempt::{
     VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, verifier_diagnostic_attempt_spec,
@@ -157,15 +163,16 @@ use super::verifier_failure_signature::verifier_failure_count;
 use super::verifier_orchestration::{
     JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
     StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
-    VerifierRepairAttemptProgress, task_contract_verifier_failure_attempt_limit,
-    task_contract_verifier_repair_note, task_contract_verifier_targeted_edit_required_note,
-    verifier_diagnostic_file_excerpts, verifier_diagnostic_messages,
-    verifier_framework_signal_for_context, verifier_repair_context_diagnostics,
-    verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
-    verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
-    verifier_repair_policy_for_target_hint, verifier_repair_safe_stop_message,
-    verifier_repair_target_display, verifier_repair_transition_message,
-    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
+    VerifierRepairAttemptProgress, model_assessment_to_verifier_repair_assessment,
+    task_contract_verifier_failure_attempt_limit, task_contract_verifier_repair_note,
+    task_contract_verifier_targeted_edit_required_note, verifier_diagnostic_file_excerpts,
+    verifier_diagnostic_messages, verifier_framework_signal_for_context,
+    verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
+    verifier_repair_intent_limits, verifier_repair_pass_messages,
+    verifier_repair_pass_request_error_message, verifier_repair_policy_for_target_hint,
+    verifier_repair_safe_stop_message, verifier_repair_target_display,
+    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
+    verifier_setup_policy_message,
 };
 #[cfg(test)]
 use super::verifier_orchestration::{
@@ -175,11 +182,7 @@ use super::verifier_orchestration::{
 use super::verifier_repair_shadow::{
     build_verifier_repair_pipeline_shadow_payload, legacy_repair_brief_input_from_assessment,
 };
-use super::verifier_repair_targeting::{
-    changed_files_for_verifier, extract_path_like_tokens, recovery_target_hint_for_diagnostic_path,
-    verifier_repair_missing_local_module_provider, verifier_repair_preferred_local_import_source,
-    verifier_repair_stale_assertion_test_target,
-};
+use super::verifier_repair_targeting::{changed_files_for_verifier, extract_path_like_tokens};
 #[cfg(test)]
 use super::verifier_repair_targeting::{
     verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
@@ -18327,211 +18330,6 @@ fn validate_verifier_repair_intents_inner(
     ))
 }
 
-/// Boundary helper that converts a parsed diagnostic reply into the
-/// legacy `super::VerifierRepairAssessment` value used by the rest of the
-/// verifier-repair pipeline.
-///
-/// # Responsibility boundary (Issue #647 / S3-005 / SF3)
-///
-/// This function is **the** SSOT boundary for legacy-side assessment
-/// construction. The Issue #647 semantic-repair planning lives outside
-/// this boundary on purpose:
-///
-///   * **Legacy boundary (this function)**: builds
-///     `VerifierRepairAssessment { failure_kind, failure_type,
-///     probable_cause_role, needed_reads, repair_target_hint,
-///     repair_plan, summary, source }` only. The 7 existing
-///     `VerifierRepairAssessment` struct-literal callsites
-///     (turn.rs:15399 / 18785 / 19477 / 19553 / 20230 / 23108 / 23133)
-///     are unchanged by Issue #647 — none of them call into the
-///     semantic-repair helpers.
-///   * **Semantic boundary (outside this function, in
-///     [`run_verifier_diagnostic_pass`])**: after this function returns
-///     the legacy assessment, the caller separately runs:
-///       1. [`parse_semantic_failure_report_from_reply`] on the raw reply
-///       2. [`build_semantic_failure_report_from_legacy`] as a
-///          deterministic fallback (MF1) when (1) returns `None`
-///       3. [`build_semantic_repair_plan_from_report_with_authority_input`]
-///          to construct the `SemanticRepairPlan` and write it into
-///          `RepairJob.semantic_plan`
-///
-/// The two boundaries are intentionally kept separate so that:
-///   * existing tests pinning the legacy 7 struct-literal callsites
-///     remain unaffected (S3-005 unchanged-callsites invariant);
-///   * the semantic-repair pipeline can be evolved (new fallback paths,
-///     consensus detection, ...) without touching this function.
-fn model_assessment_to_verifier_repair_assessment(
-    work_root: &Path,
-    context: &super::repair_job::RepairJob,
-    parsed: ParsedVerifierRepairAssessment,
-    admission: &RepairTargetAdmissionContext<'_>,
-) -> super::VerifierRepairAssessment {
-    let failure_kind = parsed.failure_kind;
-    let failure_type =
-        verifier_failure_type_for_diagnostic_kind(failure_kind, context.failure_type);
-    let repair_candidates = parsed
-        .repair_targets
-        .iter()
-        .filter_map(|target| {
-            recovery_target_hint_for_diagnostic_path(
-                work_root,
-                &target.path,
-                &target.reason,
-                failure_kind,
-                admission,
-            )
-            .filter(|hint| {
-                diagnostic_target_allowed_by_confidence(
-                    hint,
-                    target.confidence,
-                    failure_kind,
-                    parsed.probable_cause_role,
-                    parsed.do_not_edit_tests_without_evidence,
-                )
-            })
-            .map(|hint| (hint, target.confidence))
-        })
-        .collect::<Vec<_>>();
-    let mut repair_plan = parsed
-        .repair_plan
-        .iter()
-        .filter_map(|target| {
-            recovery_target_hint_for_diagnostic_path(
-                work_root,
-                &target.path,
-                &target.reason,
-                failure_kind,
-                admission,
-            )
-            .filter(|hint| {
-                diagnostic_target_allowed_by_confidence(
-                    hint,
-                    target.confidence,
-                    failure_kind,
-                    parsed.probable_cause_role,
-                    parsed.do_not_edit_tests_without_evidence,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    if repair_plan.is_empty() {
-        repair_plan = repair_candidates
-            .iter()
-            .map(|(hint, _)| hint.clone())
-            .take(3)
-            .collect();
-    }
-    let has_admitted_diagnostic_target = !repair_plan.is_empty() || !repair_candidates.is_empty();
-    let secondary_repair_candidates = parsed
-        .secondary_targets
-        .iter()
-        .filter_map(|path| {
-            recovery_target_hint_for_diagnostic_path(
-                work_root,
-                path,
-                "diagnostic LLM suggested this secondary target",
-                failure_kind,
-                admission,
-            )
-        })
-        .collect::<Vec<_>>();
-    let changed_repair_candidates = context
-        .changed_file_hints
-        .iter()
-        .filter_map(|hint| admit_repair_target_hint(hint.clone(), admission))
-        .collect::<Vec<_>>();
-    // Issue #638 (設計判断 #3): pass assessment-derived failure_type to helpers so
-    // they gate on the diagnostic classification, not on context.failure_type
-    // (which is Unknown after the parser scope reduction).
-    if let Some(preferred) =
-        verifier_repair_missing_local_module_provider(context, failure_type, admission)
-    {
-        repair_plan.retain(|hint| hint.path != preferred.path);
-        repair_plan.insert(0, preferred);
-        repair_plan.truncate(3);
-    } else if let Some(preferred) =
-        verifier_repair_preferred_local_import_source(context, failure_type, admission)
-    {
-        repair_plan.retain(|hint| hint.path != preferred.path);
-        repair_plan.insert(0, preferred);
-        repair_plan.truncate(3);
-    }
-    let selected_path = repair_plan.first().map(|hint| hint.path.as_str());
-    if let Some(test_target) =
-        verifier_repair_stale_assertion_test_target(context, selected_path, failure_type, admission)
-    {
-        repair_plan.retain(|hint| hint.path != test_target.path);
-        repair_plan.insert(0, test_target);
-        repair_plan.truncate(3);
-    }
-    if has_admitted_diagnostic_target
-        && let Some(preferred) = first_role_kind_compatible_diagnostic_target(
-            &repair_plan,
-            &repair_candidates,
-            &secondary_repair_candidates,
-            &changed_repair_candidates,
-            failure_kind,
-        )
-    {
-        repair_plan.retain(|hint| hint.path != preferred.path);
-        repair_plan.insert(0, preferred);
-        repair_plan.truncate(3);
-    }
-    let needed_reads = repair_candidates
-        .iter()
-        .map(|(hint, _)| hint.clone())
-        .chain(repair_plan.iter().cloned())
-        .chain(secondary_repair_candidates.iter().cloned())
-        .take(3)
-        .collect::<Vec<_>>();
-    let repair_target_hint = repair_plan
-        .first()
-        .cloned()
-        .or_else(|| {
-            repair_candidates
-                .iter()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(hint, _)| hint.clone())
-        })
-        .or_else(|| {
-            // Issue #647 (§5.1): path 6 — `repair_target_hint` fallback from
-            // `probable_cause_role`. The candidates here come from
-            // `context.changed_file_hints` (path 3) and `needed_reads` (which
-            // were themselves already admitted via paths 1/4/5 above). Apply
-            // `admit_repair_target_hint` explicitly so the changed-file-hint
-            // branch is gated by the SSOT even when the inputs were copied
-            // straight off `RepairJob`.
-            parsed.probable_cause_role.and_then(|role| {
-                needed_reads
-                    .iter()
-                    .chain(context.changed_file_hints.iter())
-                    .find(|hint| {
-                        hint.role == role
-                            && (hint.role != super::task_contract::ArtifactRole::Setup
-                                || failure_kind.allows_setup_target())
-                    })
-                    .cloned()
-                    .and_then(|hint| admit_repair_target_hint(hint, admission))
-            })
-        });
-
-    super::VerifierRepairAssessment {
-        failure_kind,
-        failure_type,
-        probable_cause_role: parsed.probable_cause_role,
-        needed_reads,
-        repair_target_hint,
-        repair_plan,
-        summary: parsed.summary,
-        source: super::VerifierRepairAssessmentSource::DiagnosticPass,
-    }
-}
-
-/// Thin wrapper retained for in-file callers and existing tests. Delegates
-/// to `repair_job::verifier_repair_decision`. The legacy `pending: bool`
-/// argument is kept so the `Agent::task_contract_verifier_repair_pending`
-/// flag and the repair-job presence remain decoupled at the call sites
-/// (Issue #637: SSOT for the decision lives in `repair_job`).
 const PYTHON_REQUEST_PATTERNS: &[&str] = &["fastapi", "python", ".py"];
 const PYTHON_REQUEST_JA_PATTERNS: &[&str] = &["Pythonで", "FastAPIで"];
 const RUST_REQUEST_PATTERNS: &[&str] = &["rust", "cargo test", "cargo"];
@@ -32125,13 +31923,13 @@ export default function App() {
 
     #[test]
     fn sf3_model_assessment_doc_comment_pins_legacy_boundary() {
-        let src = include_str!("turn.rs");
+        let src = include_str!("verifier_orchestration.rs");
         // Doc comment on the legacy boundary helper must label its role
         // and explicitly state the unchanged-callsites invariant. We do
         // NOT pin specific line numbers (those drift with surrounding
         // edits); we pin the *contract* instead.
         let fn_pos = src
-            .find("\nfn model_assessment_to_verifier_repair_assessment(")
+            .find("\npub(super) fn model_assessment_to_verifier_repair_assessment(")
             .expect("function must exist");
         let doc_start = fn_pos.saturating_sub(3000);
         let doc = &src[doc_start..fn_pos];
@@ -32150,20 +31948,18 @@ export default function App() {
             "SF3: doc must declare the unchanged-callsites invariant"
         );
         // Sanity: the 7 legacy callsites must still exist as struct
-        // literals in the file (literal count, not line-number pinning).
-        let struct_literal_count = src.matches("super::VerifierRepairAssessment {").count()
-            + src.matches("VerifierRepairAssessment {").count()
-            - src.matches("super::VerifierRepairAssessment {").count();
-        // We expect at least 7 occurrences of `VerifierRepairAssessment {`
-        // (the exact number can be 7+ because tests may add new ones,
-        // but never less than 7 — the boundary contract).
-        let total_literals = src.matches("VerifierRepairAssessment {").count();
+        // literals across turn.rs + verifier_orchestration.rs (literal
+        // count, not line-number pinning). The boundary helper moved to
+        // verifier_orchestration.rs in Issue #682 Phase 2; the 6 remaining
+        // turn.rs test/production literals are unchanged.
+        let turn_src = include_str!("turn.rs");
+        let total_literals = src.matches("VerifierRepairAssessment {").count()
+            + turn_src.matches("VerifierRepairAssessment {").count();
         assert!(
             total_literals >= 7,
             "SF3: at least 7 VerifierRepairAssessment struct literals must \
              exist (legacy callsite invariant), found {total_literals}"
         );
-        let _ = struct_literal_count; // keep variable for future tightening
     }
 
     #[test]
