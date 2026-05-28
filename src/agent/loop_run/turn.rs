@@ -14,11 +14,10 @@ use super::actor_loop_flow::{
     ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome,
     ActorLoopPostToolCleanupArgs, ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
     ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyOutcome,
-    ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs, ActorLoopTaskContractReplyArgs,
-    ActorLoopTaskContractReplyOutcome, ActorLoopToolPreparationArgs,
-    ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, drive_actor_loop_pre_reply_phase,
-    handle_actor_loop_rejected_tool_batch, handle_actor_loop_task_contract_reply,
+    ActorLoopProseOnlyReplyArgs, ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
+    ActorLoopToolPreparationArgs, ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs,
+    PostReplyRecoveryOutcome, TaskContractVerifierFlowOutcome, drive_actor_loop_pre_reply_phase,
+    drive_actor_loop_tool_preparation_phase, handle_actor_loop_task_contract_reply,
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
     handle_post_reply_recovery, missing_repo_change_budget_exhausted_outcome,
     plan_tool_followup_done_message, repair_job_done_outcome,
@@ -125,10 +124,12 @@ use super::tool_history::{
 use super::tool_history::{
     has_successful_repo_edit, latest_truncated_tool_call_note_index, successful_repo_edit_count,
 };
+#[cfg(test)]
+use super::tool_policy::FocusedEditBatchAction;
 use super::tool_policy::{
-    EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditBatchAction, FocusedEditPolicy,
-    effective_tool_batch_action_with_scope, effective_tool_policy_error_for_call_with_scope,
-    focused_edit_policy_violation_feedback_note, workspace_relative_path_for_tool_arg,
+    EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditPolicy,
+    effective_tool_policy_error_for_call_with_scope, focused_edit_policy_violation_feedback_note,
+    workspace_relative_path_for_tool_arg,
 };
 #[cfg(test)]
 use super::tool_policy::{
@@ -5959,103 +5960,6 @@ impl Agent {
         task_contract
     }
 
-    fn drive_actor_loop_tool_preparation_phase(
-        &mut self,
-        args: ActorLoopToolPreparationArgs<'_, '_>,
-    ) -> ActorLoopToolPreparationOutcome {
-        let current_reply_tool_call_count = args.reply_tool_calls.len();
-        let mut prepared_tool_calls = args
-            .reply_tool_calls
-            .into_iter()
-            .map(|tool_call| self.prepare_tool_call(tool_call))
-            .collect::<Vec<_>>();
-        self.record_actor_loop_tool_call_summaries(&prepared_tool_calls, args.tool_call_summaries);
-
-        let effective_tool_policy = self.effective_tool_policy();
-        if effective_tool_policy
-            .allowed_tool_names_for_prompt()
-            .is_some()
-        {
-            let batch_scope = if self.missing_verifier_job.is_some() {
-                Some(self.current_workspace_scope())
-            } else {
-                None
-            };
-            match effective_tool_batch_action_with_scope(
-                &prepared_tool_calls,
-                &effective_tool_policy,
-                &self.work_root,
-                batch_scope.as_ref(),
-            ) {
-                FocusedEditBatchAction::Accept => {}
-                FocusedEditBatchAction::TruncateToFirst => {
-                    prepared_tool_calls.truncate(1);
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            args.last_iter,
-                            self.config.max_iterations,
-                            "Tool policy narrowed",
-                            "Ignored extra tool calls and kept only the first allowed action on the target file.",
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                }
-                FocusedEditBatchAction::Reject(err) => {
-                    return handle_actor_loop_rejected_tool_batch(
-                        self,
-                        ActorLoopRejectedToolBatchArgs {
-                            err,
-                            effective_tool_policy: &effective_tool_policy,
-                            task_contract: args.task_contract,
-                            contract_completion_role_retries: args.contract_completion_role_retries,
-                            focused_policy_retries: args.focused_policy_retries,
-                            missing_verifier_setup_turn: args.missing_verifier_setup_turn,
-                            recovery_dispatch_gate: args.recovery_dispatch_gate,
-                            recovery_owner: args.recovery_owner,
-                            last_iter: args.last_iter,
-                        },
-                    );
-                }
-            }
-        }
-
-        ActorLoopToolPreparationOutcome::Prepared {
-            current_reply_tool_call_count,
-            prepared_tool_calls,
-            effective_tool_policy,
-        }
-    }
-
-    fn record_actor_loop_tool_call_summaries(
-        &self,
-        prepared_tool_calls: &[ToolCall],
-        tool_call_summaries: &mut Vec<crate::session::eval_log::ToolCallSummary>,
-    ) {
-        use crate::session::eval_log::ToolCallSummary;
-        use crate::session::feedback::mask_secrets;
-
-        for tc in prepared_tool_calls {
-            let raw_args = tc.arguments.to_string();
-            let args_summary = {
-                let masked = mask_secrets(&raw_args);
-                if masked.len() > crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES {
-                    let mut end = crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES;
-                    while !masked.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}…", &masked[..end])
-                } else {
-                    masked
-                }
-            };
-            tool_call_summaries.push(ToolCallSummary {
-                name: tc.name.clone(),
-                args_summary,
-            });
-        }
-    }
-
     pub(super) fn tool_policy_violation_exit_reason(recovery_owner: RecoveryOwner) -> ExitReason {
         if recovery_owner == RecoveryOwner::MissingVerifierJob {
             ExitReason::MissingVerification
@@ -7117,17 +7021,20 @@ impl Agent {
             } = reply;
 
             let (current_reply_tool_call_count, prepared_tool_calls, effective_tool_policy) =
-                match self.drive_actor_loop_tool_preparation_phase(ActorLoopToolPreparationArgs {
-                    reply_tool_calls,
-                    task_contract: task_contract.as_ref(),
-                    tool_call_summaries: &mut tool_call_summaries,
-                    focused_policy_retries: &mut focused_policy_retries,
-                    contract_completion_role_retries: &mut contract_completion_role_retries,
-                    missing_verifier_setup_turn,
-                    recovery_dispatch_gate,
-                    recovery_owner,
-                    last_iter,
-                }) {
+                match drive_actor_loop_tool_preparation_phase(
+                    self,
+                    ActorLoopToolPreparationArgs {
+                        reply_tool_calls,
+                        task_contract: task_contract.as_ref(),
+                        tool_call_summaries: &mut tool_call_summaries,
+                        focused_policy_retries: &mut focused_policy_retries,
+                        contract_completion_role_retries: &mut contract_completion_role_retries,
+                        missing_verifier_setup_turn,
+                        recovery_dispatch_gate,
+                        recovery_owner,
+                        last_iter,
+                    },
+                ) {
                     ActorLoopToolPreparationOutcome::Continue => continue,
                     ActorLoopToolPreparationOutcome::Done { final_prose: prose } => {
                         final_prose = prose;
@@ -10750,7 +10657,7 @@ impl Agent {
             .map(|j| j.attempts().len())
     }
 
-    fn effective_tool_policy(&self) -> EffectiveToolPolicy {
+    pub(super) fn effective_tool_policy(&self) -> EffectiveToolPolicy {
         // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
         // in §4 of the design policy). The arbiter never sees it; we early-
         // return before constructing any selectable `JobCandidate`.
@@ -15920,7 +15827,7 @@ if __name__ == "__main__":
         message
     }
 
-    fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
+    pub(super) fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
         tool_call.arguments = normalize_tool_call_arguments(&tool_call.name, tool_call.arguments);
         if matches!(tool_call.name.as_str(), "Read" | "Write" | "Edit")
             && let Some(arguments) = tool_call.arguments.as_object_mut()

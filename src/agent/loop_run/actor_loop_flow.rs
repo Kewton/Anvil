@@ -755,6 +755,102 @@ pub(super) fn actor_loop_pre_reply_flow_outcome(
     }
 }
 
+pub(super) fn drive_actor_loop_tool_preparation_phase(
+    agent: &mut Agent,
+    args: ActorLoopToolPreparationArgs<'_, '_>,
+) -> ActorLoopToolPreparationOutcome {
+    let current_reply_tool_call_count = args.reply_tool_calls.len();
+    let mut prepared_tool_calls = args
+        .reply_tool_calls
+        .into_iter()
+        .map(|tool_call| agent.prepare_tool_call(tool_call))
+        .collect::<Vec<_>>();
+    record_actor_loop_tool_call_summaries(&prepared_tool_calls, args.tool_call_summaries);
+
+    let effective_tool_policy = agent.effective_tool_policy();
+    if effective_tool_policy
+        .allowed_tool_names_for_prompt()
+        .is_some()
+    {
+        let batch_scope = if agent.missing_verifier_job.is_some() {
+            Some(agent.current_workspace_scope())
+        } else {
+            None
+        };
+        match super::tool_policy::effective_tool_batch_action_with_scope(
+            &prepared_tool_calls,
+            &effective_tool_policy,
+            &agent.work_root,
+            batch_scope.as_ref(),
+        ) {
+            super::tool_policy::FocusedEditBatchAction::Accept => {}
+            super::tool_policy::FocusedEditBatchAction::TruncateToFirst => {
+                prepared_tool_calls.truncate(1);
+                super::turn::write_stdout_rendered(
+                    &super::turn::format_iteration_status(
+                        args.last_iter,
+                        agent.config.max_iterations,
+                        "Tool policy narrowed",
+                        "Ignored extra tool calls and kept only the first allowed action on the target file.",
+                        agent.footer.current_cols(),
+                    ),
+                    true,
+                );
+            }
+            super::tool_policy::FocusedEditBatchAction::Reject(err) => {
+                return handle_actor_loop_rejected_tool_batch(
+                    agent,
+                    ActorLoopRejectedToolBatchArgs {
+                        err,
+                        effective_tool_policy: &effective_tool_policy,
+                        task_contract: args.task_contract,
+                        contract_completion_role_retries: args.contract_completion_role_retries,
+                        focused_policy_retries: args.focused_policy_retries,
+                        missing_verifier_setup_turn: args.missing_verifier_setup_turn,
+                        recovery_dispatch_gate: args.recovery_dispatch_gate,
+                        recovery_owner: args.recovery_owner,
+                        last_iter: args.last_iter,
+                    },
+                );
+            }
+        }
+    }
+
+    ActorLoopToolPreparationOutcome::Prepared {
+        current_reply_tool_call_count,
+        prepared_tool_calls,
+        effective_tool_policy,
+    }
+}
+
+fn record_actor_loop_tool_call_summaries(
+    prepared_tool_calls: &[ToolCall],
+    tool_call_summaries: &mut Vec<crate::session::eval_log::ToolCallSummary>,
+) {
+    use crate::session::eval_log::ToolCallSummary;
+    use crate::session::feedback::mask_secrets;
+
+    for tc in prepared_tool_calls {
+        let raw_args = tc.arguments.to_string();
+        let args_summary = {
+            let masked = mask_secrets(&raw_args);
+            if masked.len() > crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES {
+                let mut end = crate::session::eval_log::MAX_EVAL_TOOL_ARG_BYTES;
+                while !masked.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &masked[..end])
+            } else {
+                masked
+            }
+        };
+        tool_call_summaries.push(ToolCallSummary {
+            name: tc.name.clone(),
+            args_summary,
+        });
+    }
+}
+
 pub(super) fn drive_actor_loop_pre_reply_phase(
     agent: &mut Agent,
     mut args: ActorLoopPreReplyArgs<'_, '_>,
