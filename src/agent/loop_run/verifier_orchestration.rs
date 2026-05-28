@@ -40,17 +40,35 @@ use std::path::Path;
 
 use super::auto_test::{AutoTestPlan, VerifierCommand};
 use super::repair_attempt_outcome::RepairAttemptOutcome;
-use super::repair_driver::VerifierRepairPassOutcome;
+use super::repair_driver::{
+    VERIFIER_REPAIR_PASS_MAX_EDITS, VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES,
+    VERIFIER_REPAIR_PASS_MAX_REASON_CHARS, VerifierRepairPassOutcome,
+};
 use super::repair_job::RepairJob;
+use super::repair_patch_validation::VerifierRepairIntentLimits;
 use super::repair_plan::AcceptedRepairPlan;
 use super::required_behavior::BehaviorContractProjection;
 use super::task_contract::TaskContract;
 use super::turn::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
+    missing_verifier_setup_hint_for_request,
 };
 use super::verifier_diagnostic_attempt::VerifierDiagnosticAttemptSpec;
 use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
 use crate::session::store::ConversationMessage;
+
+#[cfg(test)]
+use super::repair_job::VerifierRepairDecision;
+#[cfg(test)]
+use super::repair_patch_validation::{
+    RepairIntentEdit, VerifierRepairIntent, repair_intent_edits_fingerprint,
+};
+#[cfg(test)]
+use super::task_contract::RecoveryTargetHint;
+#[cfg(test)]
+use super::tool_policy::workspace_relative_path_for_tool_arg;
+#[cfg(test)]
+use super::turn::decision_target_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JobInstallOutcome {
@@ -171,11 +189,108 @@ pub(super) fn verifier_repair_target_display(target: &Path, work_root: &Path) ->
 }
 
 pub(super) fn task_contract_verifier_failure_attempt_limit(
-    previous_context: Option<&super::repair_job::RepairJob>,
+    previous_context: Option<&RepairJob>,
 ) -> usize {
     if previous_context.is_some() {
         TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT
     } else {
         TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
     }
+}
+
+pub(super) fn verifier_framework_signal_for_context(context: &RepairJob) -> String {
+    format!(
+        "{}\n{}\n{}",
+        context.failure_signature,
+        context.output_excerpt,
+        context.repair_error.as_deref().unwrap_or("")
+    )
+}
+
+pub(super) fn verifier_setup_policy_message(active_request: &str) -> String {
+    let hint = missing_verifier_setup_hint_for_request(active_request)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    format!(
+        "[Verifier Setup Policy] A runnable verifier is required but missing. Emit exactly one Write or Edit for project-local verifier metadata now.{hint} Do not call Bash, do not switch tasks, and do not answer in prose."
+    )
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_invalid_can_continue(
+    decision: &VerifierRepairDecision,
+    attempted_target_hint: Option<&RecoveryTargetHint>,
+    work_root: &Path,
+) -> bool {
+    match decision {
+        VerifierRepairDecision::NeedDiagnostic | VerifierRepairDecision::NeedTargetDiscovery => {
+            true
+        }
+        VerifierRepairDecision::NeedFreshRead(_)
+        | VerifierRepairDecision::NeedWrite(_)
+        | VerifierRepairDecision::NeedEdit(_) => attempted_target_hint
+            .is_none_or(|hint| !verifier_repair_decision_targets_hint(decision, hint, work_root)),
+        VerifierRepairDecision::ReadyToVerify
+        | VerifierRepairDecision::DiagnosticUnavailable
+        | VerifierRepairDecision::NoRepair => false,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_decision_targets_hint(
+    decision: &VerifierRepairDecision,
+    hint: &RecoveryTargetHint,
+    work_root: &Path,
+) -> bool {
+    let Some(decision_target) = decision_target_path(decision) else {
+        return false;
+    };
+    let decision_rel =
+        workspace_relative_path_for_tool_arg(work_root, &decision_target.to_string_lossy());
+    let hint_rel = workspace_relative_path_for_tool_arg(work_root, &hint.path);
+    matches!((decision_rel, hint_rel), (Some(a), Some(b)) if a == b)
+}
+
+pub(super) fn verifier_repair_intent_limits() -> VerifierRepairIntentLimits {
+    VerifierRepairIntentLimits {
+        max_output_bytes: VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES,
+        max_edits: VERIFIER_REPAIR_PASS_MAX_EDITS,
+        max_reason_chars: VERIFIER_REPAIR_PASS_MAX_REASON_CHARS,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn repair_intent_edit_payloads(
+    intents: &[VerifierRepairIntent],
+) -> Vec<RepairIntentEdit<'_>> {
+    intents
+        .iter()
+        .map(|intent| RepairIntentEdit {
+            old_string: &intent.old_string,
+            new_string: &intent.new_string,
+            replace_all: intent.replace_all,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_intent_fingerprint(
+    context: &RepairJob,
+    relative_path: &str,
+    intent: &VerifierRepairIntent,
+) -> String {
+    verifier_repair_intents_fingerprint(context, relative_path, std::slice::from_ref(intent))
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_intents_fingerprint(
+    context: &RepairJob,
+    relative_path: &str,
+    intents: &[VerifierRepairIntent],
+) -> String {
+    repair_intent_edits_fingerprint(
+        &context.failure_signature,
+        relative_path,
+        &repair_intent_edit_payloads(intents),
+    )
 }

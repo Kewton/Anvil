@@ -46,8 +46,7 @@ use super::repair_driver::VERIFIER_REPAIR_PASS_TIMEOUT_SECS;
 use super::repair_driver::{
     VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT, VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
     VERIFIER_REPAIR_PASS_MAX_EDITS, VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-    VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES, VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES,
-    VERIFIER_REPAIR_PASS_MAX_PREDICT, VERIFIER_REPAIR_PASS_MAX_REASON_CHARS,
+    VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES, VERIFIER_REPAIR_PASS_MAX_PREDICT,
     VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
     verifier_repair_pass_attempt_timeout_secs, verifier_repair_pass_retry_message,
     verifier_repair_pass_timeout_error,
@@ -162,9 +161,15 @@ use super::verifier_orchestration::{
     JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
     StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
     VerifierRepairAttemptProgress, task_contract_verifier_failure_attempt_limit,
+    verifier_framework_signal_for_context, verifier_repair_intent_limits,
     verifier_repair_pass_request_error_message, verifier_repair_safe_stop_message,
     verifier_repair_target_display, verifier_repair_transition_message,
-    verifier_repair_unsafe_target_message,
+    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
+};
+#[cfg(test)]
+use super::verifier_orchestration::{
+    verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
+    verifier_repair_invalid_can_continue,
 };
 use super::verifier_repair_shadow::{
     build_verifier_repair_pipeline_shadow_payload, legacy_repair_brief_input_from_assessment,
@@ -1767,15 +1772,6 @@ Only include paths present in changed_candidates or safe_file_excerpts. Treat `f
     ]
 }
 
-fn verifier_framework_signal_for_context(context: &super::repair_job::RepairJob) -> String {
-    format!(
-        "{}\n{}\n{}",
-        context.failure_signature,
-        context.output_excerpt,
-        context.repair_error.as_deref().unwrap_or("")
-    )
-}
-
 fn verifier_diagnostic_file_excerpts(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
@@ -3025,15 +3021,6 @@ impl ReminderCallContext {
 }
 
 type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
-
-fn verifier_setup_policy_message(active_request: &str) -> String {
-    let hint = missing_verifier_setup_hint_for_request(active_request)
-        .map(|hint| format!(" {hint}"))
-        .unwrap_or_default();
-    format!(
-        "[Verifier Setup Policy] A runnable verifier is required but missing. Emit exactly one Write or Edit for project-local verifier metadata now.{hint} Do not call Bash, do not switch tasks, and do not answer in prose."
-    )
-}
 
 fn verifier_repair_assessment_diagnostics(assessment: &super::VerifierRepairAssessment) -> String {
     let summary = assessment
@@ -18436,7 +18423,7 @@ fn existing_workspace_candidate_for_role(
 /// a path (NoRepair / NeedDiagnostic / NeedTargetDiscovery / ReadyToVerify /
 /// DiagnosticUnavailable).
 #[cfg(test)]
-fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
+pub(super) fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
     match decision {
         VerifierRepairDecision::NeedFreshRead(path)
         | VerifierRepairDecision::NeedWrite(path)
@@ -18455,41 +18442,7 @@ fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
 /// useful control-flow progress. Staying on the same target is still a retry
 /// against the outer terminal budget; otherwise malformed proposals can loop
 /// until `max_iterations`.
-#[cfg(test)]
-fn verifier_repair_invalid_can_continue(
-    decision: &VerifierRepairDecision,
-    attempted_target_hint: Option<&super::task_contract::RecoveryTargetHint>,
-    work_root: &Path,
-) -> bool {
-    match decision {
-        VerifierRepairDecision::NeedDiagnostic | VerifierRepairDecision::NeedTargetDiscovery => {
-            true
-        }
-        VerifierRepairDecision::NeedFreshRead(_)
-        | VerifierRepairDecision::NeedWrite(_)
-        | VerifierRepairDecision::NeedEdit(_) => attempted_target_hint
-            .is_none_or(|hint| !verifier_repair_decision_targets_hint(decision, hint, work_root)),
-        VerifierRepairDecision::ReadyToVerify
-        | VerifierRepairDecision::DiagnosticUnavailable
-        | VerifierRepairDecision::NoRepair => false,
-    }
-}
-
-#[cfg(test)]
-fn verifier_repair_decision_targets_hint(
-    decision: &VerifierRepairDecision,
-    hint: &super::task_contract::RecoveryTargetHint,
-    work_root: &Path,
-) -> bool {
-    let Some(decision_target) = decision_target_path(decision) else {
-        return false;
-    };
-    let decision_rel =
-        workspace_relative_path_for_tool_arg(work_root, &decision_target.to_string_lossy());
-    let hint_rel = workspace_relative_path_for_tool_arg(work_root, &hint.path);
-    matches!((decision_rel, hint_rel), (Some(a), Some(b)) if a == b)
-}
-
+///
 /// Issue #646: confirm that an absolute repair target lies inside the active
 /// workspace scope. The path is normalized against `work_root` and the
 /// resulting relative form is handed to [`TaskWorkspaceScope::contains`].
@@ -18591,14 +18544,6 @@ fn parse_verifier_repair_intent_reply(reply: &str) -> Result<VerifierRepairInten
 fn parse_verifier_repair_intents_reply(reply: &str) -> Result<Vec<VerifierRepairIntent>, String> {
     let proposal = parse_verifier_repair_patch_proposal_reply(reply)?;
     patch_proposal_to_verifier_repair_intents(proposal)
-}
-
-fn verifier_repair_intent_limits() -> super::repair_patch_validation::VerifierRepairIntentLimits {
-    super::repair_patch_validation::VerifierRepairIntentLimits {
-        max_output_bytes: VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES,
-        max_edits: VERIFIER_REPAIR_PASS_MAX_EDITS,
-        max_reason_chars: VERIFIER_REPAIR_PASS_MAX_REASON_CHARS,
-    }
 }
 
 #[cfg(test)]
@@ -19038,42 +18983,6 @@ fn validate_verifier_repair_intents_inner(
     ))
 }
 
-#[cfg(test)]
-fn repair_intent_edit_payloads(
-    intents: &[VerifierRepairIntent],
-) -> Vec<super::repair_patch_validation::RepairIntentEdit<'_>> {
-    intents
-        .iter()
-        .map(|intent| super::repair_patch_validation::RepairIntentEdit {
-            old_string: &intent.old_string,
-            new_string: &intent.new_string,
-            replace_all: intent.replace_all,
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn verifier_repair_intent_fingerprint(
-    context: &super::repair_job::RepairJob,
-    relative_path: &str,
-    intent: &VerifierRepairIntent,
-) -> String {
-    verifier_repair_intents_fingerprint(context, relative_path, std::slice::from_ref(intent))
-}
-
-#[cfg(test)]
-fn verifier_repair_intents_fingerprint(
-    context: &super::repair_job::RepairJob,
-    relative_path: &str,
-    intents: &[VerifierRepairIntent],
-) -> String {
-    super::repair_patch_validation::repair_intent_edits_fingerprint(
-        &context.failure_signature,
-        relative_path,
-        &repair_intent_edit_payloads(intents),
-    )
-}
-
 /// Boundary helper that converts a parsed diagnostic reply into the
 /// legacy `super::VerifierRepairAssessment` value used by the rest of the
 /// verifier-repair pipeline.
@@ -19475,7 +19384,7 @@ fn test_target_path_compatible_with_request(path: &str, request: &str) -> bool {
     expected_ext == actual_ext
 }
 
-fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&'static str> {
+pub(super) fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&'static str> {
     let lower = request.to_ascii_lowercase();
     if request_matches_family(
         &lower,
