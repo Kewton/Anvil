@@ -3674,6 +3674,64 @@ pub(super) fn effective_turn_index_for_stage(
     }
 }
 
+fn preflight_work_mode_skip_reason(
+    work_mode_confirm_called_this_turn: bool,
+    mode: ExecutionMode,
+    env_disabled: bool,
+) -> Option<work_mode_confirm::WorkModeSkipReason> {
+    if work_mode_confirm_called_this_turn {
+        Some(work_mode_confirm::WorkModeSkipReason::PerTurnCapConsumed)
+    } else if mode == ExecutionMode::Plan {
+        Some(work_mode_confirm::WorkModeSkipReason::PlanMode)
+    } else if env_disabled {
+        Some(work_mode_confirm::WorkModeSkipReason::EnvDisabled)
+    } else {
+        None
+    }
+}
+
+fn work_mode_confirm_parse_status(outcome: &WorkModeConfirmOutcome) -> WorkModeConfirmParseStatus {
+    match outcome {
+        WorkModeConfirmOutcome::Confirmed(_) => WorkModeConfirmParseStatus::Ok,
+        WorkModeConfirmOutcome::Skipped { .. } => WorkModeConfirmParseStatus::NotInvoked,
+        WorkModeConfirmOutcome::Fallback { reason, .. } => match reason {
+            work_mode_confirm::WorkModeFallbackReason::Timeout => {
+                WorkModeConfirmParseStatus::Timeout
+            }
+            work_mode_confirm::WorkModeFallbackReason::TransportError
+            | work_mode_confirm::WorkModeFallbackReason::SidecarUnavailable => {
+                WorkModeConfirmParseStatus::TransportError
+            }
+            work_mode_confirm::WorkModeFallbackReason::Empty => WorkModeConfirmParseStatus::Empty,
+            work_mode_confirm::WorkModeFallbackReason::Malformed
+            | work_mode_confirm::WorkModeFallbackReason::ResponseTooLarge
+            | work_mode_confirm::WorkModeFallbackReason::UnknownMode => {
+                WorkModeConfirmParseStatus::Malformed
+            }
+        },
+    }
+}
+
+fn log_work_mode_confirm_outcome(
+    outcome: &WorkModeConfirmOutcome,
+    session_id: &str,
+    sidecar_model: Option<&str>,
+    turn_index: usize,
+    first_pass: &ModeClassification,
+    latency_ms: Option<u64>,
+) {
+    let (event, payload) = build_work_mode_confirm_log_payload(
+        outcome,
+        session_id,
+        sidecar_model,
+        turn_index,
+        first_pass,
+        latency_ms,
+        work_mode_confirm_parse_status(outcome),
+    );
+    log_llm_event(event, payload);
+}
+
 /// Issue #580: SSoT memoization key for the Quality-gate second-pass adapter.
 /// Hashes `(request, full_content)` with `DefaultHasher` (per design judgement
 /// #5: full_content avoids stale reuse when only the middle of a large file
@@ -3777,59 +3835,22 @@ impl Agent {
     ) {
         let session_id = self.session_store.session_id().to_string();
         let sidecar_model = self.models.sidecar.clone();
-
-        // 1. per-turn cap.
-        if self.work_mode_confirm_called_this_turn {
-            let outcome = WorkModeConfirmOutcome::Skipped {
-                reason: work_mode_confirm::WorkModeSkipReason::PerTurnCapConsumed,
-            };
-            let (event, payload) = build_work_mode_confirm_log_payload(
+        let env_disabled =
+            work_mode_confirm::work_mode_confirm_disabled(|k: &str| std::env::var(k));
+        if let Some(reason) = preflight_work_mode_skip_reason(
+            self.work_mode_confirm_called_this_turn,
+            self.session.mode_state.mode,
+            env_disabled,
+        ) {
+            let outcome = WorkModeConfirmOutcome::Skipped { reason };
+            log_work_mode_confirm_outcome(
                 &outcome,
                 &session_id,
                 sidecar_model.as_deref(),
                 turn_index,
                 first_pass,
                 None,
-                WorkModeConfirmParseStatus::NotInvoked,
             );
-            log_llm_event(event, payload);
-            return;
-        }
-
-        // 2. Plan mode (caller is expected not to call us in Plan mode, but
-        // defend in depth).
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            let outcome = WorkModeConfirmOutcome::Skipped {
-                reason: work_mode_confirm::WorkModeSkipReason::PlanMode,
-            };
-            let (event, payload) = build_work_mode_confirm_log_payload(
-                &outcome,
-                &session_id,
-                sidecar_model.as_deref(),
-                turn_index,
-                first_pass,
-                None,
-                WorkModeConfirmParseStatus::NotInvoked,
-            );
-            log_llm_event(event, payload);
-            return;
-        }
-
-        // 3. env disable.
-        if work_mode_confirm::work_mode_confirm_disabled(|k: &str| std::env::var(k)) {
-            let outcome = WorkModeConfirmOutcome::Skipped {
-                reason: work_mode_confirm::WorkModeSkipReason::EnvDisabled,
-            };
-            let (event, payload) = build_work_mode_confirm_log_payload(
-                &outcome,
-                &session_id,
-                sidecar_model.as_deref(),
-                turn_index,
-                first_pass,
-                None,
-                WorkModeConfirmParseStatus::NotInvoked,
-            );
-            log_llm_event(event, payload);
             return;
         }
 
@@ -3844,12 +3865,33 @@ impl Agent {
         };
 
         let attempt_started = Instant::now();
-        let outcome = if sidecar_model.is_some() {
+        let outcome = self.run_work_mode_confirm_attempt(inputs, &sidecar_model);
+        let latency_ms = attempt_started.elapsed().as_millis() as u64;
+
+        if let WorkModeConfirmOutcome::Confirmed(c) = &outcome {
+            self.session.mode_state.work_mode = c.mode;
+        }
+
+        log_work_mode_confirm_outcome(
+            &outcome,
+            &session_id,
+            sidecar_model.as_deref(),
+            turn_index,
+            first_pass,
+            Some(latency_ms),
+        );
+    }
+
+    fn run_work_mode_confirm_attempt(
+        &mut self,
+        inputs: WorkModeConfirmInputs<'_>,
+        sidecar_model: &Option<String>,
+    ) -> WorkModeConfirmOutcome {
+        if let Some(sidecar_name) = sidecar_model.as_ref() {
             // We're about to dispatch — consume the per-turn cap regardless of
             // success/failure (DR4-004) so timeout/malformed/oversized cannot
             // re-trigger another dispatch in the same user-input.
             self.work_mode_confirm_called_this_turn = true;
-            let sidecar_name = sidecar_model.clone().expect("sidecar_model is Some here");
             let confirm_client = self
                 .client
                 .clone_with_overrides(WORK_MODE_CONFIRM_TIMEOUT_SECS, 384)
@@ -3857,7 +3899,7 @@ impl Agent {
             run_work_mode_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
                 Some(c) => c
                     .chat_text(
-                        &sidecar_name,
+                        sidecar_name,
                         &[ConversationMessage::user(prompt.to_string())],
                     )
                     .map(|reply| reply.content),
@@ -3869,47 +3911,7 @@ impl Agent {
             // because the user might transition into a state where the sidecar
             // becomes available later in this same turn (defensive design).
             run_work_mode_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
-        };
-        let latency_ms = attempt_started.elapsed().as_millis() as u64;
-
-        // Determine parse_status + write back the resolved work_mode where
-        // applicable (Confirmed path only — Fallback keeps first-pass).
-        let parse_status = match &outcome {
-            WorkModeConfirmOutcome::Confirmed(_) => WorkModeConfirmParseStatus::Ok,
-            WorkModeConfirmOutcome::Skipped { .. } => WorkModeConfirmParseStatus::NotInvoked,
-            WorkModeConfirmOutcome::Fallback { reason, .. } => match reason {
-                work_mode_confirm::WorkModeFallbackReason::Timeout => {
-                    WorkModeConfirmParseStatus::Timeout
-                }
-                work_mode_confirm::WorkModeFallbackReason::TransportError
-                | work_mode_confirm::WorkModeFallbackReason::SidecarUnavailable => {
-                    WorkModeConfirmParseStatus::TransportError
-                }
-                work_mode_confirm::WorkModeFallbackReason::Empty => {
-                    WorkModeConfirmParseStatus::Empty
-                }
-                work_mode_confirm::WorkModeFallbackReason::Malformed
-                | work_mode_confirm::WorkModeFallbackReason::ResponseTooLarge
-                | work_mode_confirm::WorkModeFallbackReason::UnknownMode => {
-                    WorkModeConfirmParseStatus::Malformed
-                }
-            },
-        };
-
-        if let WorkModeConfirmOutcome::Confirmed(c) = &outcome {
-            self.session.mode_state.work_mode = c.mode;
         }
-
-        let (event, payload) = build_work_mode_confirm_log_payload(
-            &outcome,
-            &session_id,
-            sidecar_model.as_deref(),
-            turn_index,
-            first_pass,
-            Some(latency_ms),
-            parse_status,
-        );
-        log_llm_event(event, payload);
     }
 
     /// Issue #579: FeedbackKind second-pass confirmation wrapper. Called from
@@ -18306,6 +18308,76 @@ mod tests {
         // Second call (e.g. turn_start after auto_plan_precheck confirmed):
         // cap already consumed → previously-resolved value must survive.
         assert!(!super::should_writeback_first_pass(true));
+    }
+
+    #[test]
+    fn wm_preflight_skip_reason_preserves_gate_priority() {
+        assert_eq!(
+            super::preflight_work_mode_skip_reason(true, ExecutionMode::Plan, true),
+            Some(super::work_mode_confirm::WorkModeSkipReason::PerTurnCapConsumed)
+        );
+        assert_eq!(
+            super::preflight_work_mode_skip_reason(false, ExecutionMode::Plan, true),
+            Some(super::work_mode_confirm::WorkModeSkipReason::PlanMode)
+        );
+        assert_eq!(
+            super::preflight_work_mode_skip_reason(false, ExecutionMode::Act, true),
+            Some(super::work_mode_confirm::WorkModeSkipReason::EnvDisabled)
+        );
+        assert_eq!(
+            super::preflight_work_mode_skip_reason(false, ExecutionMode::Act, false),
+            None
+        );
+    }
+
+    #[test]
+    fn wm_parse_status_maps_fallback_reasons_to_public_statuses() {
+        let confirmation = super::work_mode_confirm::WorkModeConfirmation {
+            mode: crate::modes::plan_act::WorkMode::GenericCode,
+            confidence: 0.25,
+            source: super::work_mode_confirm::WorkModeConfirmationSource::SecondPassFallback,
+            reason: None,
+        };
+        assert_eq!(
+            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Confirmed(
+                confirmation.clone()
+            )),
+            super::WorkModeConfirmParseStatus::Ok
+        );
+        assert_eq!(
+            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Skipped {
+                reason: super::work_mode_confirm::WorkModeSkipReason::EnvDisabled,
+            }),
+            super::WorkModeConfirmParseStatus::NotInvoked
+        );
+        assert_eq!(
+            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
+                reason: super::work_mode_confirm::WorkModeFallbackReason::Timeout,
+                confirmation: confirmation.clone(),
+            }),
+            super::WorkModeConfirmParseStatus::Timeout
+        );
+        assert_eq!(
+            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
+                reason: super::work_mode_confirm::WorkModeFallbackReason::TransportError,
+                confirmation: confirmation.clone(),
+            }),
+            super::WorkModeConfirmParseStatus::TransportError
+        );
+        assert_eq!(
+            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
+                reason: super::work_mode_confirm::WorkModeFallbackReason::Empty,
+                confirmation: confirmation.clone(),
+            }),
+            super::WorkModeConfirmParseStatus::Empty
+        );
+        assert_eq!(
+            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
+                reason: super::work_mode_confirm::WorkModeFallbackReason::UnknownMode,
+                confirmation,
+            }),
+            super::WorkModeConfirmParseStatus::Malformed
+        );
     }
 
     // -----------------------------------------------------------------------
