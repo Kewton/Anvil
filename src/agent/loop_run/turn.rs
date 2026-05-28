@@ -3796,6 +3796,79 @@ fn photon_context_pack_completion_status(
     }
 }
 
+fn verifier_repair_transition_message() -> String {
+    "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step.".to_string()
+}
+
+fn verifier_repair_safe_stop_message() -> String {
+    "[Verifier Repair Policy] Verifier repair cannot continue safely. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
+        .to_string()
+}
+
+fn verifier_repair_unsafe_target_message() -> String {
+    "[Verifier Repair Policy] Verifier repair target is unsafe or unavailable. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
+        .to_string()
+}
+
+fn verifier_setup_policy_message(active_request: &str) -> String {
+    let hint = missing_verifier_setup_hint_for_request(active_request)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    format!(
+        "[Verifier Setup Policy] A runnable verifier is required but missing. Emit exactly one Write or Edit for project-local verifier metadata now.{hint} Do not call Bash, do not switch tasks, and do not answer in prose."
+    )
+}
+
+fn verifier_repair_assessment_diagnostics(assessment: &super::VerifierRepairAssessment) -> String {
+    let summary = assessment
+        .summary
+        .as_ref()
+        .map(|summary| format!(" Summary: {summary}."))
+        .unwrap_or_default();
+    format!(
+        " Assessment source: {:?}. Failure kind: {}. Probable cause role: {}. Needed read candidates: {}.{summary}",
+        assessment.source,
+        assessment.failure_kind.as_str(),
+        assessment
+            .probable_cause_role
+            .map(|role| role.label())
+            .unwrap_or("unknown"),
+        assessment.needed_reads.len()
+    )
+}
+
+fn verifier_repair_context_diagnostics(context: Option<&super::repair_job::RepairJob>) -> String {
+    context
+        .map(|context| {
+            let repeated = if context.repair_attempt > 1 {
+                " The same failure signature is still present after a previous repair edit."
+            } else {
+                ""
+            };
+            let error_kind = context
+                .error_kind
+                .as_ref()
+                .map(|error| format!(" Error kind: {error}."))
+                .unwrap_or_default();
+            let assessment = context
+                .assessment
+                .as_ref()
+                .map(verifier_repair_assessment_diagnostics)
+                .unwrap_or_default();
+            let diagnostic_error = context
+                .diagnostic_error
+                .as_ref()
+                .map(|error| format!(" Diagnostic pass error: {error}."))
+                .unwrap_or_default();
+            format!(
+                "{repeated} Failure type: {}. Failure signature: {}.{error_kind}{assessment}{diagnostic_error}",
+                context.failure_type.as_str(),
+                context.failure_signature
+            )
+        })
+        .unwrap_or_else(|| " Failure signature: <unknown>.".to_string())
+}
+
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
     if yes_mode {
         tester::ApprovalMode::Auto
@@ -14250,128 +14323,70 @@ impl Agent {
     ) -> Option<String> {
         (effective_tool_policy.reason() == EffectiveToolPolicyReason::VerifierRepair).then(|| {
             let context = self.repair_job.as_ref();
-            let diagnostics = context
-                .map(|context| {
-                    let repeated = if context.repair_attempt > 1 {
-                        " The same failure signature is still present after a previous repair edit."
-                    } else {
-                        ""
-                    };
-                    let error_kind = context
-                        .error_kind
-                        .as_ref()
-                        .map(|error| format!(" Error kind: {error}."))
-                        .unwrap_or_default();
-                    let assessment = context
-                        .assessment
-                        .as_ref()
-                        .map(|assessment| {
-                            let summary = assessment
-                                .summary
-                                .as_ref()
-                                .map(|summary| format!(" Summary: {summary}."))
-                                .unwrap_or_default();
-                            format!(
-                                " Assessment source: {:?}. Failure kind: {}. Probable cause role: {}. Needed read candidates: {}.{summary}",
-                                assessment.source,
-                                assessment.failure_kind.as_str(),
-                                assessment
-                                    .probable_cause_role
-                                    .map(|role| role.label())
-                                    .unwrap_or("unknown"),
-                                assessment.needed_reads.len()
-                            )
-                        })
-                        .unwrap_or_default();
-                    let diagnostic_error = context
-                        .diagnostic_error
-                        .as_ref()
-                        .map(|error| format!(" Diagnostic pass error: {error}."))
-                        .unwrap_or_default();
-                    format!(
-                        "{repeated} Failure type: {}. Failure signature: {}.{error_kind}{assessment}{diagnostic_error}",
-                        context.failure_type.as_str(),
-                        context.failure_signature
-                    )
-                })
-                .unwrap_or_else(|| " Failure signature: <unknown>.".to_string());
+            let diagnostics = verifier_repair_context_diagnostics(context);
             match context.map(|context| context.next_action()) {
                 Some(
                     super::repair_job::RepairNextAction::RequestDiagnostic
                     | super::repair_job::RepairNextAction::Replan,
-                ) => {
-                    // Issue #665 Phase 5: caller-side projection (sidecar).
-                    let active_request = self.active_request_text().unwrap_or_default();
-                    let task_contract =
-                        super::task_contract::TaskContract::from_request(&active_request);
-                    let behavior_projection =
-                        super::required_behavior::project_behavior_contract(&task_contract);
-                    self.repair_job
-                        .as_ref()
-                        .map(|context| {
-                            verifier_repair_diagnostic_pending_note(
-                                context,
-                                behavior_projection.as_ref(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            "[Verifier Repair Policy] A verifier failure is pending. Output a compact diagnosis JSON object only; do not call tools.".to_string()
-                        })
-                }
+                ) => self.verifier_repair_diagnostic_policy_message(),
                 Some(super::repair_job::RepairNextAction::RequestPatch { target_hint }) => {
-                    let Some(relative) =
-                        super::repair_job::safe_relative_path_string(&target_hint.path)
-                    else {
-                        return "[Verifier Repair Policy] Verifier repair target is unsafe or unavailable. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
-                            .to_string();
-                    };
-                    let target = self.work_root.join(relative);
-                    let target = std::fs::canonicalize(&target).unwrap_or(target);
-                    let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    if !target.is_file() {
-                        format!(
-                            "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Missing target file: {target_display}. Next required action: exactly one Write on that target. Do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the write."
-                        )
-                    } else if focused_edit_target_already_read(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    ) {
-                        format!(
-                            "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one compact Edit on that target. Do not call Read again, Bash, switch files, or finish with prose. Anvil will rerun the verifier after the edit."
-                        )
-                    } else {
-                        format!(
-                            "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one Read on that target. Do not use Edit, Bash, switch files, or finish with prose."
-                        )
-                    }
+                    self.verifier_repair_request_patch_message(&diagnostics, &target_hint)
                 }
                 Some(super::repair_job::RepairNextAction::SafeStop { .. }) => {
-                    "[Verifier Repair Policy] Verifier repair cannot continue safely. Do not answer in prose; Anvil will stop this repair job with an explicit verifier failure."
-                        .to_string()
+                    verifier_repair_safe_stop_message()
                 }
                 Some(
                     super::repair_job::RepairNextAction::RerunVerifier
                     | super::repair_job::RepairNextAction::VerifiedDone,
-                ) => {
-                    "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step."
-                        .to_string()
-                }
+                ) => verifier_repair_transition_message(),
                 None if self.missing_verifier_job.is_some() => {
-                    let active_request = self.active_request_text().unwrap_or_default();
-                    let hint = missing_verifier_setup_hint_for_request(&active_request)
-                        .map(|hint| format!(" {hint}"))
-                        .unwrap_or_default();
-                    format!(
-                        "[Verifier Setup Policy] A runnable verifier is required but missing. Emit exactly one Write or Edit for project-local verifier metadata now.{hint} Do not call Bash, do not switch tasks, and do not answer in prose."
-                    )
+                    verifier_setup_policy_message(&self.active_request_text().unwrap_or_default())
                 }
-                None => {
-                    "[Verifier Repair Policy] A verifier repair transition is pending. Do not answer in prose; wait for Anvil to drive the next verifier step."
-                        .to_string()
-                }
+                None => verifier_repair_transition_message(),
             }
         })
+    }
+
+    fn verifier_repair_diagnostic_policy_message(&self) -> String {
+        let active_request = self.active_request_text().unwrap_or_default();
+        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+        let behavior_projection =
+            super::required_behavior::project_behavior_contract(&task_contract);
+        self.repair_job
+            .as_ref()
+            .map(|context| {
+                verifier_repair_diagnostic_pending_note(context, behavior_projection.as_ref())
+            })
+            .unwrap_or_else(|| {
+                "[Verifier Repair Policy] A verifier failure is pending. Output a compact diagnosis JSON object only; do not call tools.".to_string()
+            })
+    }
+
+    fn verifier_repair_request_patch_message(
+        &self,
+        diagnostics: &str,
+        target_hint: &super::task_contract::RecoveryTargetHint,
+    ) -> String {
+        let Some(relative) = super::repair_job::safe_relative_path_string(&target_hint.path) else {
+            return verifier_repair_unsafe_target_message();
+        };
+        let target = self.work_root.join(relative);
+        let target = std::fs::canonicalize(&target).unwrap_or(target);
+        let target_display = verifier_repair_target_display(&target, &self.work_root);
+        if !target.is_file() {
+            format!(
+                "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Missing target file: {target_display}. Next required action: exactly one Write on that target. Do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the write."
+            )
+        } else if focused_edit_target_already_read(&self.session.messages, &target, &self.work_root)
+        {
+            format!(
+                "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one compact Edit on that target. Do not call Read again, Bash, switch files, or finish with prose. Anvil will rerun the verifier after the edit."
+            )
+        } else {
+            format!(
+                "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Target file: {target_display}. Next required action: exactly one Read on that target. Do not use Edit, Bash, switch files, or finish with prose."
+            )
+        }
     }
 
     fn artifact_directed_policy_violation_message(
@@ -18498,6 +18513,20 @@ mod tests {
             super::tester_approval_mode(false, false),
             super::tester::ApprovalMode::Forbidden
         );
+    }
+
+    #[test]
+    fn verifier_repair_context_diagnostics_handles_missing_context() {
+        assert_eq!(
+            super::verifier_repair_context_diagnostics(None),
+            " Failure signature: <unknown>.".to_string()
+        );
+    }
+
+    #[test]
+    fn verifier_repair_transition_messages_are_stable() {
+        assert!(super::verifier_repair_transition_message().contains("transition is pending"));
+        assert!(super::verifier_repair_safe_stop_message().contains("cannot continue safely"));
     }
 
     #[test]
