@@ -447,6 +447,77 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
     None
 }
 
+pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if !(super::turn::should_apply_repo_change_quality_gate(
+        args.action_expectation,
+        agent.active_task_expects_repo_change(),
+        agent.session.mode_state.mode,
+    ) || agent.current_request_needs_playable_ui_quality_gate())
+        || !args.recovery_dispatch_gate.allows_deterministic_fallback()
+    {
+        return None;
+    }
+    let (request, target_path, issue) = agent.accepted_repo_change_quality_issue()?;
+    match agent.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
+        Ok(true) => {
+            super::turn::write_stdout_rendered(
+                &super::turn::format_iteration_status(
+                    args.last_iter,
+                    agent.config.max_iterations,
+                    "Quality fallback",
+                    &format!("Replaced scaffold placeholder output in {target_path}."),
+                    agent.footer.current_cols(),
+                ),
+                true,
+            );
+            agent.session.record_feedback_if_unset(
+                super::turn::build_feedback_for_deterministic_content_fallback(&agent.work_root),
+            );
+            agent.push_deterministic_ui_recovery_continuation_note(
+                &target_path,
+                (*args.repo_change_retries).saturating_add(1),
+            );
+            return Some(PostReplyRecoveryOutcome::Continue);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose: String::new(),
+                exit_reason: ExitReason::TransportError,
+                error_text: err,
+            });
+        }
+    }
+    *args.repo_change_retries += 1;
+    if *args.repo_change_retries >= 3 {
+        return Some(PostReplyRecoveryOutcome::Finalize {
+            final_prose: String::new(),
+            exit_reason: ExitReason::MissingRepoEdits,
+            error_text: issue,
+        });
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Quality gate",
+            &format!("Asked the model to replace placeholder output in {target_path}."),
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    agent.push_system_note(recovery::repo_change_quality_gate_note(
+        &request,
+        &target_path,
+        &issue,
+        *args.repo_change_retries,
+    ));
+    Some(PostReplyRecoveryOutcome::Continue)
+}
+
 pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
