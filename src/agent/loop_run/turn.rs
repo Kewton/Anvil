@@ -22,7 +22,7 @@ use super::actor_loop_flow::{
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
     maybe_continue_missing_repo_framework_fallback, maybe_continue_missing_repo_scaffold_fallback,
     maybe_handle_answer_only_future_work_recovery, maybe_handle_answer_only_inadequate_recovery,
-    maybe_handle_repo_change_partial_progress_recovery,
+    maybe_handle_python_test_artifact_recovery, maybe_handle_repo_change_partial_progress_recovery,
     missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
     plan_tool_followup_done_message, push_missing_repo_edit_retry_note, repair_job_done_outcome,
 };
@@ -5812,7 +5812,7 @@ impl Agent {
         if let Some(outcome) = self.maybe_handle_missing_repo_edit_recovery(&mut args) {
             return Some(outcome);
         }
-        if let Some(outcome) = self.maybe_handle_python_test_artifact_recovery(&mut args) {
+        if let Some(outcome) = maybe_handle_python_test_artifact_recovery(self, &mut args) {
             return Some(outcome);
         }
         if let Some(outcome) = maybe_handle_answer_only_inadequate_recovery(self, &mut args) {
@@ -5856,59 +5856,6 @@ impl Agent {
             true,
         );
         push_missing_repo_edit_retry_note(self, *args.repo_change_retries);
-        Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn maybe_handle_python_test_artifact_recovery(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if args.repo_edit_calls_made_this_turn == 0
-            || !self.active_python_request_requires_tests()
-            || self.python_test_artifact_exists()
-            || self.python_verifier_available_for_requested_tests()
-        {
-            return None;
-        }
-        *args.python_test_retries += 1;
-        if *args.python_test_retries >= 2 {
-            let (final_prose, exit_reason, error_text) = match self
-                .maybe_materialize_python_test_fallback()
-            {
-                Ok(Some(path)) => (
-                    format!(
-                        "Added the requested Python test artifact with deterministic fallback: {path}."
-                    ),
-                    ExitReason::Done,
-                    String::new(),
-                ),
-                Ok(None) => (
-                    String::new(),
-                    ExitReason::MissingRepoEdits,
-                    "assistant did not add the requested Python test artifact".to_string(),
-                ),
-                Err(err) => (String::new(), ExitReason::TransportError, err),
-            };
-            return Some(PostReplyRecoveryOutcome::Finalize {
-                final_prose,
-                exit_reason,
-                error_text,
-            });
-        }
-        write_stdout_rendered(
-            &format_iteration_status(
-                args.last_iter,
-                self.config.max_iterations,
-                "Quality gate",
-                "Asked the model to add the requested Python test file or self-test command.",
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        self.push_system_note(
-            "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
-                .to_string(),
-        );
         Some(PostReplyRecoveryOutcome::Continue)
     }
 
@@ -16340,7 +16287,7 @@ impl Agent {
             || workspace_has_unsupported_ui_framework(&self.work_root)
     }
 
-    fn active_python_request_requires_tests(&self) -> bool {
+    pub(super) fn active_python_request_requires_tests(&self) -> bool {
         self.session.mode_state.work_mode == WorkMode::Python
             && self
                 .active_request_text()
@@ -16348,12 +16295,12 @@ impl Agent {
                 .is_some_and(request_explicitly_requires_tests)
     }
 
-    fn python_verifier_available_for_requested_tests(&self) -> bool {
+    pub(super) fn python_verifier_available_for_requested_tests(&self) -> bool {
         AutoTestRunner::detect(&self.work_root, &self.session.working_memory.touched_files)
             .is_some_and(|plan| plan.auto_test_kind() == AutoTestKind::Test)
     }
 
-    fn python_test_artifact_exists(&self) -> bool {
+    pub(super) fn python_test_artifact_exists(&self) -> bool {
         let Ok(entries) = std::fs::read_dir(&self.work_root) else {
             return false;
         };
@@ -16371,7 +16318,9 @@ impl Agent {
         })
     }
 
-    fn maybe_materialize_python_test_fallback(&mut self) -> Result<Option<String>, String> {
+    pub(super) fn maybe_materialize_python_test_fallback(
+        &mut self,
+    ) -> Result<Option<String>, String> {
         // Issue #634: 特化 fallback (FizzBuzz test scaffold) は experimental flag
         // 配下に隔離。flag off の場合は早期 `Ok(None)` で抜け、呼出側の
         // `python_test_retries >= 2` ブランチは MissingRepoEdits で break する。
