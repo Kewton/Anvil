@@ -17,6 +17,7 @@ use crate::agent::recovery;
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
 
+use super::Agent;
 use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, RecoveryOwner};
 use super::interrupt::InterruptFlag;
 use super::summary::ExitReason;
@@ -368,6 +369,49 @@ pub(super) struct ActorLoopProseOnlyReplyArgs<'a, 'b> {
     pub(super) no_tool_retries: &'b mut usize,
     pub(super) framework_app_fallback_materialized: &'b mut bool,
     pub(super) final_reply: &'a str,
+}
+
+pub(super) fn plan_tool_followup_done_message() -> String {
+    "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string()
+}
+
+pub(super) fn handle_plan_progress_prose_only_fallback(
+    agent: &mut Agent,
+) -> ActorLoopNoToolReplyOutcome {
+    match agent.materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
+    {
+        Ok(true) => ActorLoopNoToolReplyOutcome::Done {
+            final_prose: plan_tool_followup_done_message(),
+        },
+        Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
+            reason: ExitReason::PlanIncomplete,
+            error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+        },
+        Err(err) => ActorLoopNoToolReplyOutcome::Exit {
+            reason: ExitReason::TransportError,
+            error_text: err,
+        },
+    }
+}
+
+pub(super) fn handle_non_progress_plan_edit_fallback(
+    agent: &mut Agent,
+) -> ActorLoopPlanToolFollowupOutcome {
+    match agent.materialize_deterministic_fallback_plan(
+        "agent.plan.non_progress_edit_fallback_materialized",
+    ) {
+        Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
+            final_prose: plan_tool_followup_done_message(),
+        },
+        Ok(false) => ActorLoopPlanToolFollowupOutcome::Exit {
+            reason: ExitReason::PlanIncomplete,
+            error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+        },
+        Err(err) => ActorLoopPlanToolFollowupOutcome::Exit {
+            reason: ExitReason::TransportError,
+            error_text: err,
+        },
+    }
 }
 
 pub(super) fn missing_repo_change_budget_exhausted_outcome() -> ActorLoopNoToolReplyOutcome {

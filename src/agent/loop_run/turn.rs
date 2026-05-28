@@ -1750,9 +1750,10 @@ use super::actor_loop_flow::{
     ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, missing_repo_change_budget_exhausted_outcome,
+    TaskContractVerifierFlowOutcome, handle_non_progress_plan_edit_fallback,
+    handle_plan_progress_prose_only_fallback, missing_repo_change_budget_exhausted_outcome,
     missing_repo_edit_recovery_allowed, missing_repo_edits_finalize_outcome,
-    repair_job_done_outcome,
+    plan_tool_followup_done_message, repair_job_done_outcome,
 };
 
 struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -3710,10 +3711,6 @@ fn task_contract_safe_stop_clear_tag(reason: super::task_contract::SafeStopReaso
             "task_contract_safe_stop_verifier_missing"
         }
     }
-}
-
-fn plan_tool_followup_done_message() -> String {
-    "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string()
 }
 
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
@@ -7259,7 +7256,7 @@ impl Agent {
         }
         *args.plan_progress_retries += 1;
         if *args.plan_progress_retries >= 2 {
-            return Some(self.handle_non_progress_plan_edit_fallback());
+            return Some(handle_non_progress_plan_edit_fallback(self));
         }
         self.push_system_note(recovery::plan_progress_recovery_note(
             self.session.mode_state.plan_stage,
@@ -7268,24 +7265,6 @@ impl Agent {
             *args.plan_progress_retries,
         ));
         Some(ActorLoopPlanToolFollowupOutcome::Proceed)
-    }
-
-    fn handle_non_progress_plan_edit_fallback(&mut self) -> ActorLoopPlanToolFollowupOutcome {
-        match self.materialize_deterministic_fallback_plan(
-            "agent.plan.non_progress_edit_fallback_materialized",
-        ) {
-            Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
-                final_prose: plan_tool_followup_done_message(),
-            },
-            Ok(false) => ActorLoopPlanToolFollowupOutcome::Exit {
-                reason: ExitReason::PlanIncomplete,
-                error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
-            },
-            Err(err) => ActorLoopPlanToolFollowupOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
     }
 
     fn handle_plan_exploration_followup(
@@ -8042,7 +8021,7 @@ impl Agent {
         let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
         *args.plan_progress_retries += 1;
         if *args.plan_progress_retries >= 2 {
-            return self.handle_plan_progress_prose_only_fallback();
+            return handle_plan_progress_prose_only_fallback(self);
         }
         write_stdout_rendered(
             &format_iteration_status(
@@ -8073,24 +8052,6 @@ impl Agent {
             *args.plan_progress_retries,
         ));
         ActorLoopNoToolReplyOutcome::Continue
-    }
-
-    fn handle_plan_progress_prose_only_fallback(&mut self) -> ActorLoopNoToolReplyOutcome {
-        match self
-            .materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
-        {
-            Ok(true) => ActorLoopNoToolReplyOutcome::Done {
-                final_prose: plan_tool_followup_done_message(),
-            },
-            Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
-                reason: ExitReason::PlanIncomplete,
-                error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
-            },
-            Err(err) => ActorLoopNoToolReplyOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
     }
 
     fn handle_generic_prose_only_retry(
@@ -11405,7 +11366,7 @@ impl Agent {
         }))
     }
 
-    fn materialize_deterministic_fallback_plan(
+    pub(super) fn materialize_deterministic_fallback_plan(
         &mut self,
         event_name: &str,
     ) -> Result<bool, String> {
