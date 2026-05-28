@@ -69,6 +69,12 @@ mod artifact_ledger_phase5_tests;
 // re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
 // `super::active_job_arbiter::*`.
 mod active_job_arbiter;
+// Issue #681 (parent #680, Phase 1): actor loop control-flow data types
+// (`PostReplyRecovery*` / `ActorLoop*Args` / `ActorLoop*Outcome`) +
+// 2 small Outcome constructor helpers extracted from `turn.rs`. Module
+// is intentionally *not* re-exported (DR3-001) — `turn.rs` is the only
+// in-crate consumer via `super::actor_loop_flow::*`.
+mod actor_loop_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
