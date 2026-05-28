@@ -12064,79 +12064,20 @@ impl Agent {
     fn build_arbiter_candidates(&self) -> Vec<super::active_job_arbiter::JobCandidate> {
         use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
 
-        let mut candidates: Vec<JobCandidate> = Vec::new();
-
-        // Priority 1: VerifierRepair / MissingVerifier. The arbiter no longer
-        // derives verifier progress from the legacy decision bridge;
-        // it projects the same `LoopControlAction` used by the top-level
-        // controller into a least-privilege policy.
-        match determine_loop_control_action(LoopControlInputs {
-            mode: self.session.mode_state.mode,
-            task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
-            repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
-            missing_verifier_next_action: self
-                .missing_verifier_job
-                .as_ref()
-                .map(|job| job.next_action()),
-            task_contract_action: None,
-        }) {
-            LoopControlAction::ContinueRepairJob { next_action } => {
-                let target_hint = match &next_action {
-                    super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
-                        Some(target_hint.clone())
-                    }
-                    _ => None,
-                };
-                let policy = self.verifier_repair_policy_for_next_action(&next_action);
-                candidates.push(JobCandidate {
-                    kind: ActiveJobKind::VerifierRepair,
-                    desired_action: DesiredAction::VerifierRepair {
-                        command: String::new(),
-                        target_hint,
-                    },
-                    policy,
-                    budget: Budget::Unbounded,
-                });
-                return candidates;
-            }
-            LoopControlAction::ContinueMissingVerifierJob { next_action } => {
-                if matches!(
-                    next_action,
-                    super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
-                ) && let Some(job) = self.missing_verifier_job.as_ref()
-                {
-                    candidates.push(JobCandidate {
-                        kind: ActiveJobKind::VerifierRepair,
-                        desired_action: DesiredAction::MissingVerifierCreate,
-                        policy: EffectiveToolPolicy::restricted(
-                            EffectiveToolPolicyReason::VerifierRepair,
-                            job.allowed_tool_names().to_vec(),
-                        ),
-                        budget: Budget::Unbounded,
-                    });
-                }
-                return candidates;
-            }
-            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {}
+        if let Some(candidates) = self.priority_one_arbiter_candidates() {
+            return candidates;
         }
+
+        let mut candidates: Vec<JobCandidate> = Vec::new();
 
         // Priority 2: ForcedSmallEditRecovery.
         if let Some(target) = self.forced_small_edit_recovery_target() {
-            let policy = self.focused_edit_policy_for_target(
-                target.clone(),
+            self.push_focused_edit_candidate(
+                &mut candidates,
+                target,
+                ActiveJobKind::ForcedSmallEditRecovery,
                 EffectiveToolPolicyReason::FocusedEditRecovery,
             );
-            let already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            candidates.push(JobCandidate {
-                kind: ActiveJobKind::ForcedSmallEditRecovery,
-                desired_action: DesiredAction::FocusedEdit {
-                    target,
-                    already_read,
-                },
-                policy,
-                budget: Budget::Unbounded,
-            });
         }
 
         // Priority 3: ArtifactRecovery.
@@ -12205,82 +12146,140 @@ impl Agent {
         //   where `verification_expectations = ["test"]` would otherwise
         //   trip step (2). Stage A live alone always passes step (2);
         //   `required_artifacts::Setup` is unaffected (step 1, no gate).
-        if matches!(
-            self.session.mode_state.work_mode,
-            WorkMode::Docs | WorkMode::AnswerOnly
-        ) {
-            // Documentation/read-only turns should not acquire the Bash-only
-            // setup bootstrap policy from words such as "install" or "test"
-            // inside requested documentation content. If a docs turn needs an
-            // artifact, ArtifactRecovery should own the README target instead.
-        } else if let Some(request) = self.active_request_text() {
-            let task_contract = super::task_contract::TaskContract::from_request(&request);
-            let behavior_projection =
-                super::required_behavior::project_behavior_contract(&task_contract);
-            // Stage A live observation (CB-001): read the per-turn flag
-            // set by `run_task_contract_verifier_once` when it observes
-            // `OwnedTestVerifierPlan::Missing`. The flag is reset at
-            // `handle_user_message` head.
-            let owned_test_verifier_missing = self.owned_test_verifier_missing_observed_this_turn;
-            let verifier_signal = super::task_contract::VerifierPrerequisiteSignal::from_sources(
-                owned_test_verifier_missing,
-                behavior_projection.as_ref(),
-            );
-            let ledger_overflowed = self.artifact_ledger.overflowed();
-            if super::active_job_arbiter::should_install_setup_bootstrap(
-                &task_contract,
-                behavior_projection.as_ref(),
-                &verifier_signal,
-                ledger_overflowed,
-            ) {
-                candidates.push(JobCandidate {
-                    kind: ActiveJobKind::SetupBootstrap,
-                    desired_action: DesiredAction::SetupBash,
-                    policy: EffectiveToolPolicy::setup_bootstrap(),
-                    budget: Budget::Unbounded,
-                });
-            }
+        if let Some(candidate) = self.setup_bootstrap_candidate() {
+            candidates.push(candidate);
         }
 
         // Priority 5: FocusedEditRecovery.
         if let Some(target) = self.focused_edit_recovery_target() {
-            let policy = self.focused_edit_policy_for_target(
-                target.clone(),
+            self.push_focused_edit_candidate(
+                &mut candidates,
+                target,
+                ActiveJobKind::FocusedEditRecovery,
                 EffectiveToolPolicyReason::FocusedEditRecovery,
             );
-            let already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            candidates.push(JobCandidate {
-                kind: ActiveJobKind::FocusedEditRecovery,
-                desired_action: DesiredAction::FocusedEdit {
-                    target,
-                    already_read,
-                },
-                policy,
-                budget: Budget::Unbounded,
-            });
         }
 
         // Priority 6: LocalLlmSmallEditAfterRead.
         if let Some(target) = self.local_llm_small_edit_target() {
-            let policy = self.focused_edit_policy_for_target(
-                target.clone(),
+            self.push_focused_edit_candidate(
+                &mut candidates,
+                target,
+                ActiveJobKind::LocalLlmSmallEditAfterRead,
                 EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
             );
-            let already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            candidates.push(JobCandidate {
-                kind: ActiveJobKind::LocalLlmSmallEditAfterRead,
-                desired_action: DesiredAction::FocusedEdit {
-                    target,
-                    already_read,
-                },
-                policy,
-                budget: Budget::Unbounded,
-            });
         }
 
         candidates
+    }
+
+    fn priority_one_arbiter_candidates(
+        &self,
+    ) -> Option<Vec<super::active_job_arbiter::JobCandidate>> {
+        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
+
+        match determine_loop_control_action(LoopControlInputs {
+            mode: self.session.mode_state.mode,
+            task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
+            repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
+            missing_verifier_next_action: self
+                .missing_verifier_job
+                .as_ref()
+                .map(|job| job.next_action()),
+            task_contract_action: None,
+        }) {
+            LoopControlAction::ContinueRepairJob { next_action } => {
+                let target_hint = match &next_action {
+                    super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
+                        Some(target_hint.clone())
+                    }
+                    _ => None,
+                };
+                Some(vec![JobCandidate {
+                    kind: ActiveJobKind::VerifierRepair,
+                    desired_action: DesiredAction::VerifierRepair {
+                        command: String::new(),
+                        target_hint,
+                    },
+                    policy: self.verifier_repair_policy_for_next_action(&next_action),
+                    budget: Budget::Unbounded,
+                }])
+            }
+            LoopControlAction::ContinueMissingVerifierJob { next_action } => {
+                if matches!(
+                    next_action,
+                    super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
+                ) && let Some(job) = self.missing_verifier_job.as_ref()
+                {
+                    return Some(vec![JobCandidate {
+                        kind: ActiveJobKind::VerifierRepair,
+                        desired_action: DesiredAction::MissingVerifierCreate,
+                        policy: EffectiveToolPolicy::restricted(
+                            EffectiveToolPolicyReason::VerifierRepair,
+                            job.allowed_tool_names().to_vec(),
+                        ),
+                        budget: Budget::Unbounded,
+                    }]);
+                }
+                Some(Vec::new())
+            }
+            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => None,
+        }
+    }
+
+    fn push_focused_edit_candidate(
+        &self,
+        candidates: &mut Vec<super::active_job_arbiter::JobCandidate>,
+        target: PathBuf,
+        kind: super::active_job_arbiter::ActiveJobKind,
+        reason: EffectiveToolPolicyReason,
+    ) {
+        use super::active_job_arbiter::{Budget, DesiredAction, JobCandidate};
+
+        let already_read =
+            focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+        candidates.push(JobCandidate {
+            kind,
+            desired_action: DesiredAction::FocusedEdit {
+                target: target.clone(),
+                already_read,
+            },
+            policy: self.focused_edit_policy_for_target(target, reason),
+            budget: Budget::Unbounded,
+        });
+    }
+
+    fn setup_bootstrap_candidate(&self) -> Option<super::active_job_arbiter::JobCandidate> {
+        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
+
+        if matches!(
+            self.session.mode_state.work_mode,
+            WorkMode::Docs | WorkMode::AnswerOnly
+        ) {
+            return None;
+        }
+        let request = self.active_request_text()?;
+        let task_contract = super::task_contract::TaskContract::from_request(&request);
+        let behavior_projection =
+            super::required_behavior::project_behavior_contract(&task_contract);
+        let verifier_signal = super::task_contract::VerifierPrerequisiteSignal::from_sources(
+            self.owned_test_verifier_missing_observed_this_turn,
+            behavior_projection.as_ref(),
+        );
+        if !super::active_job_arbiter::should_install_setup_bootstrap(
+            &task_contract,
+            behavior_projection.as_ref(),
+            &verifier_signal,
+            self.artifact_ledger.overflowed(),
+        ) {
+            return None;
+        }
+        Some(JobCandidate {
+            kind: ActiveJobKind::SetupBootstrap,
+            desired_action: DesiredAction::SetupBash,
+            policy: EffectiveToolPolicy::setup_bootstrap(),
+            budget: Budget::Unbounded,
+        })
     }
 
     /// Issue #660 (Phase C / DD-4): per-turn diff-based emit of
