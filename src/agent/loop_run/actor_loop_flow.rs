@@ -755,6 +755,411 @@ pub(super) fn actor_loop_pre_reply_flow_outcome(
     }
 }
 
+pub(super) fn handle_actor_loop_no_tool_reply(
+    agent: &mut Agent,
+    args: ActorLoopNoToolReplyArgs<'_, '_>,
+) -> ActorLoopNoToolReplyOutcome {
+    if args.final_reply.is_empty() {
+        return handle_actor_loop_empty_reply(
+            agent,
+            ActorLoopEmptyReplyArgs {
+                last_iter: args.last_iter,
+                action_expectation: args.action_expectation,
+                recovery_dispatch_gate: args.recovery_dispatch_gate,
+                requires_action: args.requires_action,
+                repo_change_retries: args.repo_change_retries,
+                plan_progress_retries: args.plan_progress_retries,
+                empty_retries: args.empty_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+            },
+        );
+    }
+
+    if args.requires_action && args.tool_calls_made_this_turn == 0 {
+        return handle_actor_loop_prose_only_reply(
+            agent,
+            ActorLoopProseOnlyReplyArgs {
+                last_iter: args.last_iter,
+                action_expectation: args.action_expectation,
+                recovery_dispatch_gate: args.recovery_dispatch_gate,
+                tool_calls_made_this_turn: args.tool_calls_made_this_turn,
+                repo_change_retries: args.repo_change_retries,
+                plan_progress_retries: args.plan_progress_retries,
+                no_tool_retries: args.no_tool_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+                final_reply: args.final_reply,
+            },
+        );
+    }
+
+    ActorLoopNoToolReplyOutcome::NotHandled
+}
+
+pub(super) fn handle_actor_loop_empty_reply(
+    agent: &mut Agent,
+    args: ActorLoopEmptyReplyArgs<'_>,
+) -> ActorLoopNoToolReplyOutcome {
+    if args.action_expectation == recovery::ActionExpectation::RepoChange
+        && args
+            .recovery_dispatch_gate
+            .allows_generic_repo_change_recovery()
+    {
+        return handle_actor_loop_missing_repo_change_reply(
+            agent,
+            ActorLoopMissingRepoChangeReplyArgs {
+                kind: ActorLoopMissingRepoChangeReplyKind::Empty,
+                last_iter: args.last_iter,
+                repo_change_retries: args.repo_change_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+            },
+        );
+    }
+    if args.action_expectation == recovery::ActionExpectation::PlanProgress {
+        let plan_contents = agent
+            .current_plan_contents()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let current_stage = super::lifecycle::current_plan_stage(&plan_contents);
+        let next_sections = super::lifecycle::plan_next_stage_sections(&plan_contents);
+        *args.plan_progress_retries += 1;
+        if *args.plan_progress_retries >= 2 {
+            return match agent.materialize_deterministic_fallback_plan(
+                "agent.plan.progress_fallback_materialized",
+            ) {
+                Ok(true) => ActorLoopNoToolReplyOutcome::Done {
+                    final_prose:
+                        "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                            .to_string(),
+                },
+                Ok(false) => ActorLoopNoToolReplyOutcome::Exit {
+                    reason: ExitReason::PlanIncomplete,
+                    error_text: ExitReason::PlanIncomplete.default_error_text().to_string(),
+                },
+                Err(err) => ActorLoopNoToolReplyOutcome::Exit {
+                    reason: ExitReason::TransportError,
+                    error_text: err,
+                },
+            };
+        }
+        super::turn::write_stdout_rendered(
+            &super::turn::format_iteration_status(
+                args.last_iter,
+                agent.config.max_iterations,
+                "Retry requested",
+                &format!(
+                    "The model returned an empty reply. Asked it to continue the plan by writing {}.",
+                    super::turn::join_sections_for_progress(&next_sections)
+                ),
+                agent.footer.current_cols(),
+            ),
+            true,
+        );
+        let missing_sections = super::lifecycle::plan_missing_sections(&plan_contents);
+        super::turn::log_plan_stall(
+            agent.session_store.session_id(),
+            args.last_iter,
+            "empty_reply",
+            current_stage,
+            &next_sections,
+            &missing_sections,
+            *args.plan_progress_retries,
+        );
+        agent.push_system_note(recovery::plan_progress_recovery_note(
+            current_stage,
+            &next_sections,
+            &missing_sections,
+            *args.plan_progress_retries,
+        ));
+        return ActorLoopNoToolReplyOutcome::Continue;
+    }
+
+    *args.empty_retries += 1;
+    if *args.empty_retries >= 3 {
+        return ActorLoopNoToolReplyOutcome::Exit {
+            reason: ExitReason::EmptyResponses,
+            error_text: ExitReason::EmptyResponses.default_error_text().to_string(),
+        };
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            "The model returned an empty reply. Asked it to continue with concrete tool actions.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    agent.push_system_note(recovery::empty_response_recovery_note(
+        *args.empty_retries,
+        args.requires_action,
+    ));
+    ActorLoopNoToolReplyOutcome::Continue
+}
+
+pub(super) fn handle_actor_loop_prose_only_reply(
+    agent: &mut Agent,
+    mut args: ActorLoopProseOnlyReplyArgs<'_, '_>,
+) -> ActorLoopNoToolReplyOutcome {
+    if args.tool_calls_made_this_turn != 0 {
+        return ActorLoopNoToolReplyOutcome::NotHandled;
+    }
+    if args.action_expectation == recovery::ActionExpectation::RepoChange
+        && args
+            .recovery_dispatch_gate
+            .allows_generic_repo_change_recovery()
+    {
+        return handle_actor_loop_missing_repo_change_reply(
+            agent,
+            ActorLoopMissingRepoChangeReplyArgs {
+                kind: ActorLoopMissingRepoChangeReplyKind::ProseOnly,
+                last_iter: args.last_iter,
+                repo_change_retries: args.repo_change_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+            },
+        );
+    }
+    if args.action_expectation == recovery::ActionExpectation::PlanProgress {
+        return handle_plan_progress_prose_only_reply(agent, &mut args);
+    }
+    handle_generic_prose_only_retry(agent, args.last_iter, args.no_tool_retries)
+}
+
+fn handle_plan_progress_prose_only_reply(
+    agent: &mut Agent,
+    args: &mut ActorLoopProseOnlyReplyArgs<'_, '_>,
+) -> ActorLoopNoToolReplyOutcome {
+    let plan_contents = agent
+        .current_plan_contents()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if agent.plan_is_substantive_with_fallback(&plan_contents) {
+        return ActorLoopNoToolReplyOutcome::Done {
+            final_prose: args.final_reply.to_string(),
+        };
+    }
+    let current_stage = super::lifecycle::current_plan_stage(&plan_contents);
+    let next_sections = super::lifecycle::plan_next_stage_sections(&plan_contents);
+    *args.plan_progress_retries += 1;
+    if *args.plan_progress_retries >= 2 {
+        return handle_plan_progress_prose_only_fallback(agent);
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            &format!(
+                "The model answered without tool calls. Asked it to update {} with Write or Edit.",
+                super::turn::join_sections_for_progress(&next_sections)
+            ),
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    let missing_sections = super::lifecycle::plan_missing_sections(&plan_contents);
+    super::turn::log_plan_stall(
+        agent.session_store.session_id(),
+        args.last_iter,
+        "no_tool_reply",
+        current_stage,
+        &next_sections,
+        &missing_sections,
+        *args.plan_progress_retries,
+    );
+    agent.push_system_note(recovery::plan_no_tool_recovery_note(
+        current_stage,
+        &next_sections,
+        *args.plan_progress_retries,
+    ));
+    ActorLoopNoToolReplyOutcome::Continue
+}
+
+fn handle_generic_prose_only_retry(
+    agent: &mut Agent,
+    last_iter: usize,
+    no_tool_retries: &mut usize,
+) -> ActorLoopNoToolReplyOutcome {
+    *no_tool_retries += 1;
+    if *no_tool_retries >= 3 {
+        agent
+            .session
+            .record_feedback_if_unset(super::turn::build_feedback_for_no_tool_call(
+                "no_tool_retries_exhausted",
+                &agent.work_root,
+            ));
+        return ActorLoopNoToolReplyOutcome::Exit {
+            reason: ExitReason::NoToolCalls,
+            error_text: ExitReason::NoToolCalls.default_error_text().to_string(),
+        };
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            "The model answered without tool calls. Asked it to continue with concrete actions.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    agent.push_system_note(recovery::no_tool_recovery_note(*no_tool_retries));
+    ActorLoopNoToolReplyOutcome::Continue
+}
+
+fn handle_actor_loop_missing_repo_change_reply(
+    agent: &mut Agent,
+    args: ActorLoopMissingRepoChangeReplyArgs<'_>,
+) -> ActorLoopNoToolReplyOutcome {
+    *args.repo_change_retries += 1;
+    if *args.repo_change_retries >= 2 {
+        return handle_actor_loop_missing_repo_change_retry_exhausted(
+            agent,
+            ActorLoopMissingRepoChangeRetryExhaustedArgs {
+                last_iter: args.last_iter,
+                repo_change_retries: *args.repo_change_retries,
+                framework_app_fallback_materialized: args.framework_app_fallback_materialized,
+            },
+        );
+    }
+    handle_actor_loop_missing_repo_change_retry_prompt(
+        agent,
+        ActorLoopMissingRepoChangeRetryPromptArgs {
+            kind: args.kind,
+            last_iter: args.last_iter,
+            repo_change_retries: *args.repo_change_retries,
+        },
+    )
+}
+
+fn handle_actor_loop_missing_repo_change_retry_prompt(
+    agent: &mut Agent,
+    args: ActorLoopMissingRepoChangeRetryPromptArgs,
+) -> ActorLoopNoToolReplyOutcome {
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            super::turn::missing_repo_change_retry_status_note(args.kind),
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+
+    match args.kind {
+        ActorLoopMissingRepoChangeReplyKind::Empty => {
+            handle_empty_missing_repo_change_retry(agent, args.repo_change_retries)
+        }
+        ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
+            handle_prose_only_missing_repo_change_retry(agent, args.repo_change_retries)
+        }
+    }
+}
+
+fn handle_empty_missing_repo_change_retry(
+    agent: &mut Agent,
+    repo_change_retries: usize,
+) -> ActorLoopNoToolReplyOutcome {
+    if !agent.push_artifact_directed_recovery_note(repo_change_retries)
+        && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
+    {
+        agent.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+    }
+    if agent.record_artifact_completion_attempt(
+        super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
+        Vec::new(),
+    ) {
+        return missing_repo_change_budget_exhausted_outcome();
+    }
+    ActorLoopNoToolReplyOutcome::Continue
+}
+
+fn handle_prose_only_missing_repo_change_retry(
+    agent: &mut Agent,
+    repo_change_retries: usize,
+) -> ActorLoopNoToolReplyOutcome {
+    if let Some(target) = agent.focused_edit_recovery_target() {
+        let target_already_read =
+            focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
+        let note = agent.focused_edit_no_tool_note_for_target(
+            &target,
+            target_already_read,
+            repo_change_retries,
+        );
+        agent.push_system_note(note);
+    } else if !agent.push_artifact_directed_recovery_note(repo_change_retries)
+        && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
+    {
+        agent.push_system_note(recovery::repo_change_no_tool_recovery_note(
+            repo_change_retries,
+        ));
+    }
+    if agent.record_artifact_completion_attempt(
+        super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
+        Vec::new(),
+    ) {
+        return missing_repo_change_budget_exhausted_outcome();
+    }
+    ActorLoopNoToolReplyOutcome::Continue
+}
+
+fn handle_actor_loop_missing_repo_change_retry_exhausted(
+    agent: &mut Agent,
+    args: ActorLoopMissingRepoChangeRetryExhaustedArgs<'_>,
+) -> ActorLoopNoToolReplyOutcome {
+    if args.repo_change_retries == 2
+        && (agent.push_artifact_directed_recovery_note(args.repo_change_retries)
+            || agent.push_repo_change_no_edit_recovery_note(args.repo_change_retries))
+    {
+        super::turn::write_stdout_rendered(
+            &super::turn::format_iteration_status(
+                args.last_iter,
+                agent.config.max_iterations,
+                "Retry requested",
+                "Asked the model to continue with one allowed repository edit on the target artifact.",
+                agent.footer.current_cols(),
+            ),
+            true,
+        );
+        return ActorLoopNoToolReplyOutcome::Continue;
+    }
+    let request = agent.active_request_text().unwrap_or_default();
+    let fallback = match agent.maybe_apply_local_llm_small_edit_fallback(&request) {
+        Ok(fallback) => fallback,
+        Err(err) => {
+            return ActorLoopNoToolReplyOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            };
+        }
+    };
+    if let Some(relative) = fallback {
+        return ActorLoopNoToolReplyOutcome::Done {
+            final_prose: format!(
+                "Applied a verified small edit fallback after the local model stopped before editing {relative}."
+            ),
+        };
+    }
+    if super::turn::should_try_framework_app_fallback(
+        args.last_iter,
+        *args.framework_app_fallback_materialized,
+    ) && agent.maybe_materialize_framework_game_fallback(args.last_iter)
+    {
+        *args.framework_app_fallback_materialized = true;
+        agent.push_system_note(super::turn::framework_app_fallback_continuation_note().to_string());
+        return ActorLoopNoToolReplyOutcome::Continue;
+    }
+    ActorLoopNoToolReplyOutcome::Exit {
+        reason: ExitReason::MissingRepoEdits,
+        error_text: ExitReason::MissingRepoEdits
+            .default_error_text()
+            .to_string(),
+    }
+}
+
 pub(super) fn handle_actor_loop_post_tool_cleanup(
     agent: &mut Agent,
     args: ActorLoopPostToolCleanupArgs<'_>,
