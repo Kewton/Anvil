@@ -3813,6 +3813,55 @@ struct PhotonEvaluateCompletedLog {
     outcome_detail_json: serde_json::Value,
 }
 
+struct ReminderCallContext {
+    session_id: String,
+    model: Option<String>,
+    kind: FeedbackKind,
+    frame: FeedbackFrame,
+    mode_label: &'static str,
+    active_precautions_summary: String,
+    touched_files: Vec<String>,
+    user_task: String,
+    workspace_root: PathBuf,
+    active_precautions_at_call_time: Vec<String>,
+    anvil_score: Option<crate::session::anvil_score::AnvilScore>,
+    anvil_score_from_current_turn: bool,
+}
+
+impl ReminderCallContext {
+    fn inputs(&self) -> ReminderInputs<'_> {
+        let anvil_score = self.anvil_score.as_ref().map(|score| {
+            if self.anvil_score_from_current_turn {
+                crate::session::anvil_score::AnvilScoreSnapshot::CurrentTurn(score)
+            } else {
+                crate::session::anvil_score::AnvilScoreSnapshot::PreviousTurn(score)
+            }
+        });
+        ReminderInputs {
+            user_task: &self.user_task,
+            mode_label: self.mode_label,
+            plan_summary: None,
+            active_precautions_summary: &self.active_precautions_summary,
+            frame: &self.frame,
+            working_memory_touched: &self.touched_files,
+            anvil_score,
+            active_precautions_at_call_time: &self.active_precautions_at_call_time,
+        }
+    }
+
+    fn log_outcome(&self, turn_index: usize, outcome: &ReminderOutcome, include_inputs: bool) {
+        let maybe_inputs = include_inputs.then(|| self.inputs());
+        let (event, payload) = build_reminder_log_payload(
+            outcome,
+            &self.session_id,
+            self.model.as_deref(),
+            turn_index,
+            maybe_inputs.as_ref(),
+        );
+        log_llm_event(event, payload);
+    }
+}
+
 type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
 
 fn verifier_repair_transition_message() -> String {
@@ -5323,173 +5372,168 @@ impl Agent {
     /// (`reminder_called_this_turn`) is consumed only by Completed / Failed
     /// — Skipped does not consume the cap (DR3-002).
     pub(super) fn maybe_invoke_reminder(&mut self, interrupt_flag: &InterruptFlag) {
-        let kind = match &self.session.last_feedback {
-            Some(f) if reminder::kind_eligible(&f.kind) => f.kind.clone(),
-            _ => return, // no failure-kind feedback to react to → silent
+        let Some(kind) = self.reminder_feedback_kind() else {
+            return;
         };
+        let Some(context) = self.prepare_reminder_context(kind, interrupt_flag) else {
+            return;
+        };
+        let sidecar_model = context
+            .model
+            .clone()
+            .expect("sidecar_available was checked by reminder gate");
+        let Some(reminder_client) = self.try_clone_reminder_client(&context) else {
+            return;
+        };
+        let outcome = self.run_reminder_sidecar(&context, &reminder_client, &sidecar_model);
+        self.reminder_called_this_turn = true;
+        context.log_outcome(self.current_turn_index, &outcome, true);
+    }
 
-        let gate = reminder::ReminderGate {
+    fn reminder_feedback_kind(&self) -> Option<FeedbackKind> {
+        match &self.session.last_feedback {
+            Some(frame) if reminder::kind_eligible(&frame.kind) => Some(frame.kind.clone()),
+            _ => None,
+        }
+    }
+
+    fn reminder_gate(&self, interrupt_flag: &InterruptFlag) -> reminder::ReminderGate {
+        reminder::ReminderGate {
             disabled_by_env: reminder::reminder_disabled(|key| std::env::var_os(key)),
             sidecar_available: self.models.sidecar.is_some(),
             kind_eligible: true,
             plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
             interrupted: interrupt_flag.is_set(),
             per_turn_already_called: self.reminder_called_this_turn,
-        };
+        }
+    }
 
+    fn prepare_reminder_context(
+        &self,
+        kind: FeedbackKind,
+        interrupt_flag: &InterruptFlag,
+    ) -> Option<ReminderCallContext> {
         let session_id = self.session_store.session_id().to_string();
         let model = self.models.sidecar.clone();
-
+        let gate = self.reminder_gate(interrupt_flag);
         if let Some(skip_reason) = gate.skip_reason() {
-            let outcome = ReminderOutcome::Skipped {
-                skip_reason,
-                feedback_kind: Some(kind),
-            };
-            // Issue #473: Skipped payload has no inputs context (we never built
-            // a prompt) — pass `inputs: None` so feedback_excerpt /
-            // task_at_call_time render as null and the schema stays well-formed.
-            let (event, payload) = build_reminder_log_payload(
-                &outcome,
-                &session_id,
-                model.as_deref(),
+            ReminderCallContext {
+                session_id,
+                model,
+                kind: kind.clone(),
+                frame: FeedbackFrame::default(),
+                mode_label: "act",
+                active_precautions_summary: String::new(),
+                touched_files: Vec::new(),
+                user_task: String::new(),
+                workspace_root: self.work_root.clone(),
+                active_precautions_at_call_time: Vec::new(),
+                anvil_score: None,
+                anvil_score_from_current_turn: false,
+            }
+            .log_outcome(
                 self.current_turn_index,
-                None,
+                &ReminderOutcome::Skipped {
+                    skip_reason,
+                    feedback_kind: Some(kind),
+                },
+                false,
             );
-            log_llm_event(event, payload);
-            return;
+            return None;
         }
-
-        let sidecar_model = model
-            .clone()
-            .expect("sidecar_available was checked by gate");
         let frame = self
             .session
             .last_feedback
             .clone()
             .expect("kind_eligible implies last_feedback is Some");
+        Some(ReminderCallContext {
+            session_id,
+            model,
+            kind,
+            frame,
+            mode_label: self.reminder_mode_label(),
+            active_precautions_summary: self
+                .session
+                .working_memory
+                .format_for_prompt()
+                .unwrap_or_else(|| "(none)".to_string()),
+            touched_files: self.session.working_memory.touched_files.clone(),
+            user_task: self
+                .session
+                .working_memory
+                .active_task
+                .clone()
+                .unwrap_or_default(),
+            workspace_root: self.work_root.clone(),
+            active_precautions_at_call_time: self.active_precautions_at_call_time(),
+            anvil_score: self.session.last_anvil_score.clone(),
+            anvil_score_from_current_turn: self.anvil_score_computed_this_turn,
+        })
+    }
 
-        let reminder_client = match self
-            .client
-            .clone_with_overrides(SIDECAR_SUMMARY_TIMEOUT_SECS, 384)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                self.reminder_called_this_turn = true;
-                let outcome = ReminderOutcome::Failed {
-                    reason: reminder::FailureReason::LlmCall(format!("clone_with_overrides: {e}")),
-                    latency_ms: 0,
-                    prompt_log: String::new(),
-                    response_raw_log: String::new(),
-                    feedback_kind: kind,
-                };
-                // Issue #473: clone_with_overrides failed before we had a
-                // chance to build the prompt context — pass `inputs: None`.
-                let (event, payload) = build_reminder_log_payload(
-                    &outcome,
-                    &session_id,
-                    model.as_deref(),
-                    self.current_turn_index,
-                    None,
-                );
-                log_llm_event(event, payload);
-                return;
-            }
-        };
-
-        let mode_label = match self.session.mode_state.mode {
+    fn reminder_mode_label(&self) -> &'static str {
+        match self.session.mode_state.mode {
             ExecutionMode::Act => "act",
             ExecutionMode::Plan => "plan",
-        };
-        let active_precautions_summary = self
-            .session
-            .working_memory
-            .format_for_prompt()
-            .unwrap_or_else(|| "(none)".to_string());
-        let touched_files = self.session.working_memory.touched_files.clone();
-        let user_task = self
-            .session
-            .working_memory
-            .active_task
-            .clone()
-            .unwrap_or_default();
-        let workspace_root = self.work_root.clone();
-        // Issue #473: collect canonical Active precaution texts at call time
-        // for the dataset export pipeline (`agent.reminder.completed` payload).
-        // Filtering by `status == Active` mirrors the prompt-side filter; the
-        // text is already mask_secrets-applied and truncated by
-        // `WorkingMemory::add_precaution`, so we forward it as-is.
-        let active_precautions_at_call_time: Vec<String> = self
-            .session
+        }
+    }
+
+    fn active_precautions_at_call_time(&self) -> Vec<String> {
+        self.session
             .working_memory
             .active_precautions
             .iter()
             .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
             .map(|p| p.text.clone())
-            .collect();
+            .collect()
+    }
 
-        // Issue #456 / DR1-006: pick the right snapshot variant based on
-        // whether AnvilScore has already been computed for this turn. The
-        // iteration-internal hook fires before compute, so it sees the
-        // previous turn's persisted value; the post-loop hook fires after
-        // compute, so it sees the just-computed value.
-        let anvil_score = self.session.last_anvil_score.as_ref().map(|s| {
-            if self.anvil_score_computed_this_turn {
-                crate::session::anvil_score::AnvilScoreSnapshot::CurrentTurn(s)
-            } else {
-                crate::session::anvil_score::AnvilScoreSnapshot::PreviousTurn(s)
+    fn try_clone_reminder_client(
+        &mut self,
+        context: &ReminderCallContext,
+    ) -> Option<crate::ollama::client::OllamaClient> {
+        match self
+            .client
+            .clone_with_overrides(SIDECAR_SUMMARY_TIMEOUT_SECS, 384)
+        {
+            Ok(client) => Some(client),
+            Err(err) => {
+                self.reminder_called_this_turn = true;
+                context.log_outcome(
+                    self.current_turn_index,
+                    &ReminderOutcome::Failed {
+                        reason: reminder::FailureReason::LlmCall(format!(
+                            "clone_with_overrides: {err}"
+                        )),
+                        latency_ms: 0,
+                        prompt_log: String::new(),
+                        response_raw_log: String::new(),
+                        feedback_kind: context.kind.clone(),
+                    },
+                    false,
+                );
+                None
             }
-        });
-        let inputs = ReminderInputs {
-            user_task: &user_task,
-            mode_label,
-            plan_summary: None,
-            active_precautions_summary: &active_precautions_summary,
-            frame: &frame,
-            working_memory_touched: &touched_files,
-            anvil_score,
-            active_precautions_at_call_time: &active_precautions_at_call_time,
-        };
+        }
+    }
 
-        let outcome = reminder::run_reminder_with_strategy(
-            inputs,
+    fn run_reminder_sidecar(
+        &mut self,
+        context: &ReminderCallContext,
+        reminder_client: &crate::ollama::client::OllamaClient,
+        sidecar_model: &str,
+    ) -> ReminderOutcome {
+        reminder::run_reminder_with_strategy(
+            context.inputs(),
             &mut self.session.working_memory,
-            &workspace_root,
+            &context.workspace_root,
             |prompt| {
                 reminder_client.chat_text(
-                    &sidecar_model,
+                    sidecar_model,
                     &[ConversationMessage::user(prompt.to_string())],
                 )
             },
-        );
-
-        // Per-turn cap consumed only when we actually attempted the call
-        // (Completed / Failed). Skipped never reaches this branch.
-        self.reminder_called_this_turn = true;
-        // Issue #473: rebuild a fresh `ReminderInputs` view for log payload
-        // construction. `run_reminder_with_strategy` consumed the original
-        // `inputs` by move; the underlying borrowed data (user_task, frame,
-        // active_precautions_at_call_time, …) still lives on this stack
-        // frame so we can rebuild a borrow-only view cheaply. This is the
-        // SSOT input for `task_at_call_time` / `precautions_at_call_time` /
-        // `feedback_excerpt` in the log payload.
-        let log_inputs = ReminderInputs {
-            user_task: &user_task,
-            mode_label,
-            plan_summary: None,
-            active_precautions_summary: &active_precautions_summary,
-            frame: &frame,
-            working_memory_touched: &touched_files,
-            anvil_score,
-            active_precautions_at_call_time: &active_precautions_at_call_time,
-        };
-        let (event, payload) = build_reminder_log_payload(
-            &outcome,
-            &session_id,
-            model.as_deref(),
-            self.current_turn_index,
-            Some(&log_inputs),
-        );
-        log_llm_event(event, payload);
+        )
     }
 
     /// Issue #557: call photon context_pack and store rendered response.
