@@ -3796,6 +3796,66 @@ fn photon_context_pack_completion_status(
     }
 }
 
+fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
+    if yes_mode {
+        tester::ApprovalMode::Auto
+    } else if stdin_is_terminal {
+        tester::ApprovalMode::Interactive
+    } else {
+        tester::ApprovalMode::Forbidden
+    }
+}
+
+fn run_tester_llm_call(
+    tester_client: &crate::ollama::client::OllamaClient,
+    tester_main_model: &str,
+    session_id_for_log: &str,
+    prompt: &tester::TesterPrompt,
+) -> Result<String, tester::TesterLlmError> {
+    log_llm_event(
+        "agent.tester.llm_call_started",
+        serde_json::json!({
+            "session_id": session_id_for_log,
+            "stack": prompt.stack_label(),
+            "model": tester_main_model,
+            "prompt_len": prompt.body().len(),
+        }),
+    );
+    let messages = vec![ConversationMessage::user(prompt.body().to_string())];
+    match tester_client.chat_text(tester_main_model, &messages) {
+        Ok(reply) => {
+            log_llm_event(
+                "agent.tester.llm_call_completed",
+                serde_json::json!({
+                    "session_id": session_id_for_log,
+                    "stack": prompt.stack_label(),
+                    "model": tester_main_model,
+                    "reply_len": reply.content.len(),
+                    "tool_calls": reply.tool_calls.len(),
+                }),
+            );
+            if !reply.tool_calls.is_empty() {
+                return Err(tester::TesterLlmError(
+                    "tester reply unexpectedly contained tool_calls".to_string(),
+                ));
+            }
+            Ok(reply.content)
+        }
+        Err(err) => {
+            log_llm_event(
+                "agent.tester.llm_call_failed",
+                serde_json::json!({
+                    "session_id": session_id_for_log,
+                    "stack": prompt.stack_label(),
+                    "model": tester_main_model,
+                    "error": tester::sanitize_tester_log(&err, tester::TESTER_LOG_CAP),
+                }),
+            );
+            Err(tester::TesterLlmError(err))
+        }
+    }
+}
+
 fn streaming_reply_needs_prefix(first_chunk: bool, stream_output: bool) -> bool {
     first_chunk && stream_output
 }
@@ -10704,40 +10764,18 @@ impl Agent {
     /// no_verifier) に集約し、log のみで識別する"). This is the boundary
     /// captured by the bool return.
     pub(super) fn try_invoke_tester(&mut self, changed_files: &[String]) -> bool {
-        // Per-turn cap → Plan mode → `ANVIL_NO_TESTER` early-out (DR1-004 /
-        // DR1-012 / DR2-017). The shared `check_invocation_gate` is the single
-        // source of truth so integration tests in `tests/tester_skill_smoke.rs`
-        // exercise the same ordering.
         if let Some(reason) = tester::check_invocation_gate(
             self.tester_called_this_turn,
             self.session.mode_state.mode == ExecutionMode::Plan,
             tester::tester_disabled(|key| std::env::var(key).ok()),
         ) {
-            self.log_tester_event(
-                "agent.tester.skipped",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "skip_reason": reason.as_str(),
-                }),
-            );
+            self.log_tester_skip(reason.as_str());
             return false;
         }
-        // Stack candidate detection (DR1-001 / DR3-001).
-        let candidate = match tester::TesterCandidate::detect(&self.work_root, changed_files) {
-            Some(c) => c,
-            None => {
-                self.log_tester_event(
-                    "agent.tester.skipped",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "skip_reason": tester::NotInvokedReason::NoCandidate.as_str(),
-                    }),
-                );
-                return false;
-            }
+        let candidate = match self.detect_tester_candidate(changed_files) {
+            Some(candidate) => candidate,
+            None => return false,
         };
-
-        // Build session-scoped artifact roots (DR1-009).
         let session_dir = self
             .session_store
             .state_root()
@@ -10745,26 +10783,10 @@ impl Agent {
             .join(self.session_store.session_id());
         let tmp_tests_root = session_dir.join("tmp-tests");
         let tester_runs_root = session_dir.join("tester-runs");
-        if let Err(err) = std::fs::create_dir_all(&tester_runs_root) {
-            self.log_tester_event(
-                "agent.tester.failed",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "failure_reason": format!("mkdir tester-runs: {err}"),
-                }),
-            );
+        if !self.ensure_tester_runs_root(&tester_runs_root) {
             return false;
         }
-
-        let approval_mode = if self.config.yes_mode {
-            tester::ApprovalMode::Auto
-        } else if io::stdin().is_terminal() {
-            tester::ApprovalMode::Interactive
-        } else {
-            tester::ApprovalMode::Forbidden
-        };
-
-        // Mark cap consumed BEFORE we dispatch — Aborted still counts (DR1-004).
+        let approval_mode = tester_approval_mode(self.config.yes_mode, io::stdin().is_terminal());
         self.tester_called_this_turn = true;
 
         let work_root = self.work_root.clone();
@@ -10780,64 +10802,16 @@ impl Agent {
         };
 
         let session_id_for_log = session_id.clone();
-        // Phase 2: wire the LLM call to the main model via `chat_text` so the
-        // Tester gets a real reply in production. Mirrors the Reminder Sidecar
-        // closure (line ~1227) but targets `self.models.main` instead of
-        // sidecar. The closure stays a `FnOnce(&TesterPrompt) -> Result<String,
-        // TesterLlmError>` so unit / integration tests keep injecting fakes.
         let tester_client = self.client.clone();
         let tester_main_model = self.models.main.clone();
         let llm_call =
             move |prompt: &tester::TesterPrompt| -> Result<String, tester::TesterLlmError> {
-                log_llm_event(
-                    "agent.tester.llm_call_started",
-                    serde_json::json!({
-                        "session_id": session_id_for_log,
-                        "stack": prompt.stack_label(),
-                        "model": tester_main_model,
-                        "prompt_len": prompt.body().len(),
-                    }),
-                );
-                let messages = vec![ConversationMessage::user(prompt.body().to_string())];
-                match tester_client.chat_text(&tester_main_model, &messages) {
-                    Ok(reply) => {
-                        log_llm_event(
-                            "agent.tester.llm_call_completed",
-                            serde_json::json!({
-                                "session_id": session_id_for_log,
-                                "stack": prompt.stack_label(),
-                                "model": tester_main_model,
-                                "reply_len": reply.content.len(),
-                                "tool_calls": reply.tool_calls.len(),
-                            }),
-                        );
-                        // tools=None on chat_text means the model should reply
-                        // JSON-only; defensively reject any tool-call payload
-                        // so we never try to interpret structured tool output
-                        // as a JSON test_files object (Reminder Sidecar parity).
-                        if !reply.tool_calls.is_empty() {
-                            return Err(tester::TesterLlmError(
-                                "tester reply unexpectedly contained tool_calls".to_string(),
-                            ));
-                        }
-                        Ok(reply.content)
-                    }
-                    Err(err) => {
-                        log_llm_event(
-                            "agent.tester.llm_call_failed",
-                            serde_json::json!({
-                                "session_id": session_id_for_log,
-                                "stack": prompt.stack_label(),
-                                "model": tester_main_model,
-                                "error": tester::sanitize_tester_log(
-                                    &err,
-                                    tester::TESTER_LOG_CAP,
-                                ),
-                            }),
-                        );
-                        Err(tester::TesterLlmError(err))
-                    }
-                }
+                run_tester_llm_call(
+                    &tester_client,
+                    &tester_main_model,
+                    &session_id_for_log,
+                    prompt,
+                )
             };
 
         let offline = self.config.offline;
@@ -10880,7 +10854,46 @@ impl Agent {
 
         let outcome =
             tester::run_tester_with_strategy(run, candidate, llm_call, run_bash, approver);
+        self.handle_tester_outcome(outcome, &session_id)
+    }
 
+    fn log_tester_event(&self, event: &'static str, payload: serde_json::Value) {
+        log_llm_event(event, payload);
+    }
+
+    fn log_tester_skip(&self, reason: &str) {
+        self.log_tester_event(
+            "agent.tester.skipped",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "skip_reason": reason,
+            }),
+        );
+    }
+
+    fn detect_tester_candidate(&self, changed_files: &[String]) -> Option<tester::TesterCandidate> {
+        let candidate = tester::TesterCandidate::detect(&self.work_root, changed_files);
+        if candidate.is_none() {
+            self.log_tester_skip(tester::NotInvokedReason::NoCandidate.as_str());
+        }
+        candidate
+    }
+
+    fn ensure_tester_runs_root(&self, tester_runs_root: &Path) -> bool {
+        if let Err(err) = std::fs::create_dir_all(tester_runs_root) {
+            self.log_tester_event(
+                "agent.tester.failed",
+                serde_json::json!({
+                    "session_id": self.session_store.session_id(),
+                    "failure_reason": format!("mkdir tester-runs: {err}"),
+                }),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn handle_tester_outcome(&mut self, outcome: tester::TesterOutcome, session_id: &str) -> bool {
         match outcome {
             tester::TesterOutcome::Recorded(frame) => {
                 let kind_value =
@@ -10896,13 +10909,7 @@ impl Agent {
                 true
             }
             tester::TesterOutcome::NotInvoked(reason) => {
-                self.log_tester_event(
-                    "agent.tester.skipped",
-                    serde_json::json!({
-                        "session_id": session_id,
-                        "skip_reason": reason.as_str(),
-                    }),
-                );
+                self.log_tester_skip(reason.as_str());
                 false
             }
             tester::TesterOutcome::Aborted(reason) => {
@@ -10917,10 +10924,6 @@ impl Agent {
                 false
             }
         }
-    }
-
-    fn log_tester_event(&self, event: &'static str, payload: serde_json::Value) {
-        log_llm_event(event, payload);
     }
 
     fn request_assistant_reply_with_retry(
@@ -18478,6 +18481,22 @@ mod tests {
         assert_eq!(
             super::photon_context_pack_completion_status(false, 0),
             super::PhotonContextPackStatus::NoInjection
+        );
+    }
+
+    #[test]
+    fn tester_approval_mode_prefers_yes_then_terminal_access() {
+        assert_eq!(
+            super::tester_approval_mode(true, false),
+            super::tester::ApprovalMode::Auto
+        );
+        assert_eq!(
+            super::tester_approval_mode(false, true),
+            super::tester::ApprovalMode::Interactive
+        );
+        assert_eq!(
+            super::tester_approval_mode(false, false),
+            super::tester::ApprovalMode::Forbidden
         );
     }
 
