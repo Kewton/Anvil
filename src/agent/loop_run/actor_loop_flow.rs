@@ -405,6 +405,47 @@ pub(super) fn plan_tool_followup_done_message() -> String {
     "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string()
 }
 
+pub(super) fn maybe_handle_answer_only_inadequate_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if !args.requires_action
+        && agent.answer_only_mode_active()
+        && super::turn::answer_only_reply_is_inadequate(args.final_reply)
+    {
+        *args.no_tool_retries += 1;
+        if *args.no_tool_retries >= 2 {
+            agent
+                .session
+                .record_feedback_if_unset(super::turn::build_feedback_for_no_tool_call(
+                    "answer_only_inadequate_reply",
+                    &agent.work_root,
+                ));
+            return Some(PostReplyRecoveryOutcome::Finalize {
+                final_prose: agent.answer_only_fallback_response(),
+                exit_reason: ExitReason::Done,
+                error_text: String::new(),
+            });
+        }
+        super::turn::write_stdout_rendered(
+            &super::turn::format_iteration_status(
+                args.last_iter,
+                agent.config.max_iterations,
+                "Retry requested",
+                "The model gave an underspecified answer in answer-only mode. Asked it to provide a concrete response.",
+                agent.footer.current_cols(),
+            ),
+            true,
+        );
+        agent.push_system_note(
+            "[Answer-only Recovery] Answer the user's request now with concrete findings from the available context. Do not output a tool call, do not edit files, and do not ask the user to run anything."
+                .to_string(),
+        );
+        return Some(PostReplyRecoveryOutcome::Continue);
+    }
+    None
+}
+
 pub(super) fn maybe_handle_answer_only_future_work_recovery(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,

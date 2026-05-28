@@ -18,9 +18,9 @@ use super::actor_loop_flow::{
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
     TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
-    maybe_handle_answer_only_future_work_recovery, missing_repo_change_budget_exhausted_outcome,
-    missing_repo_edit_recovery_allowed, missing_repo_edits_finalize_outcome,
-    plan_tool_followup_done_message, repair_job_done_outcome,
+    maybe_handle_answer_only_future_work_recovery, maybe_handle_answer_only_inadequate_recovery,
+    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
+    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -1577,7 +1577,10 @@ fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
 /// `reason` MUST be a `&'static str` classifier — never raw user/assistant
 /// prose (DR4-001). `build_feedback_frame` masks anyway, but caller-side
 /// discipline keeps the prompt-injection surface narrow.
-fn build_feedback_for_no_tool_call(reason: &'static str, workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_no_tool_call(
+    reason: &'static str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::NoToolCall,
         primary_error: Some(reason.to_string()),
@@ -2552,7 +2555,7 @@ fn test_artifact_path_family(path: &str) -> Option<&'static str> {
     None
 }
 
-fn answer_only_reply_is_inadequate(reply: &str) -> bool {
+pub(super) fn answer_only_reply_is_inadequate(reply: &str) -> bool {
     let trimmed = reply.trim();
     if trimmed.is_empty() {
         return true;
@@ -5808,7 +5811,7 @@ impl Agent {
         if let Some(outcome) = self.maybe_handle_python_test_artifact_recovery(&mut args) {
             return Some(outcome);
         }
-        if let Some(outcome) = self.maybe_handle_answer_only_inadequate_recovery(&mut args) {
+        if let Some(outcome) = maybe_handle_answer_only_inadequate_recovery(self, &mut args) {
             return Some(outcome);
         }
         if let Some(outcome) = self.maybe_handle_repo_change_partial_progress_recovery(&mut args) {
@@ -5958,46 +5961,6 @@ impl Agent {
                 .to_string(),
         );
         Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn maybe_handle_answer_only_inadequate_recovery(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if !args.requires_action
-            && self.answer_only_mode_active()
-            && answer_only_reply_is_inadequate(args.final_reply)
-        {
-            *args.no_tool_retries += 1;
-            if *args.no_tool_retries >= 2 {
-                self.session
-                    .record_feedback_if_unset(build_feedback_for_no_tool_call(
-                        "answer_only_inadequate_reply",
-                        &self.work_root,
-                    ));
-                return Some(PostReplyRecoveryOutcome::Finalize {
-                    final_prose: self.answer_only_fallback_response(),
-                    exit_reason: ExitReason::Done,
-                    error_text: String::new(),
-                });
-            }
-            write_stdout_rendered(
-                &format_iteration_status(
-                    args.last_iter,
-                    self.config.max_iterations,
-                    "Retry requested",
-                    "The model gave an underspecified answer in answer-only mode. Asked it to provide a concrete response.",
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            self.push_system_note(
-                "[Answer-only Recovery] Answer the user's request now with concrete findings from the available context. Do not output a tool call, do not edit files, and do not ask the user to run anything."
-                    .to_string(),
-            );
-            return Some(PostReplyRecoveryOutcome::Continue);
-        }
-        None
     }
 
     fn maybe_handle_repo_change_partial_progress_recovery(
