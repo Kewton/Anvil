@@ -97,7 +97,7 @@ use super::semantic_repair_planning::{
     sort_admitted_by_authority_role_priority,
 };
 use super::spinner::{Spinner, SpinnerStopSignal};
-use super::summary::{ExitReason, LoopResult, LoopStats};
+use super::summary::{ExitReason, LoopResult};
 use super::tester;
 use super::tool_execution::{
     failed_outcome_for_call, rejected_outcome_for_call, success_outcome_for_call,
@@ -3224,89 +3224,6 @@ fn sort_precautions_for_prompt<'a>(
         relevance_score(b, touched, suspected).cmp(&relevance_score(a, touched, suspected))
     });
     active
-}
-
-pub(super) fn build_stats(
-    accumulated: Vec<RepoVerification>,
-    final_verif: RepoVerification,
-    iter_used: usize,
-    iter_max: usize,
-    duration_secs: u64,
-) -> LoopStats {
-    let mut all_changed: HashSet<String> = HashSet::new();
-    let mut all_changed_full: HashSet<String> = HashSet::new();
-    let mut impl_changed = 0usize;
-    let mut test_changed = 0usize;
-    let mut setup_changed = 0usize;
-    let mut other_changed = 0usize;
-    let mut deleted_changed = 0usize;
-
-    for verif in accumulated.iter().chain(std::iter::once(&final_verif)) {
-        for f in &verif.changed_files {
-            if is_ignored_workspace_display_path(f) {
-                continue;
-            }
-            all_changed.insert(f.clone());
-        }
-        for f in &verif.all_changed_files {
-            if is_ignored_workspace_display_path(f) {
-                continue;
-            }
-            all_changed_full.insert(f.clone());
-        }
-        if verif
-            .all_changed_files
-            .iter()
-            .all(|f| !is_ignored_workspace_display_path(f))
-        {
-            impl_changed += verif.implementation_files_changed;
-            test_changed += verif.test_files_changed;
-            setup_changed += verif.setup_files_changed;
-            other_changed += verif.other_files_changed;
-            deleted_changed += verif.deleted_files_changed;
-        } else {
-            for f in &verif.all_changed_files {
-                if is_ignored_workspace_display_path(f) {
-                    continue;
-                }
-                let (path, deleted) = f
-                    .strip_suffix(" (deleted)")
-                    .map(|path| (path, true))
-                    .unwrap_or((f.as_str(), false));
-                if deleted {
-                    deleted_changed += 1;
-                } else if crate::util::file_classify::is_test_file(Path::new(path)) {
-                    test_changed += 1;
-                } else if crate::util::file_classify::is_setup_file(Path::new(path)) {
-                    setup_changed += 1;
-                } else if crate::util::file_classify::is_implementation_file(Path::new(path)) {
-                    impl_changed += 1;
-                } else {
-                    other_changed += 1;
-                }
-            }
-        }
-    }
-
-    let total_changed =
-        impl_changed + test_changed + setup_changed + other_changed + deleted_changed;
-    let mut changed_files: Vec<String> = all_changed.into_iter().collect();
-    changed_files.sort();
-    changed_files.truncate(16);
-    let mut all_changed_files: Vec<String> = all_changed_full.into_iter().collect();
-    all_changed_files.sort();
-
-    LoopStats {
-        iter_used,
-        iter_max,
-        duration_secs,
-        changed_files: changed_files.into_boxed_slice(),
-        all_changed_files: all_changed_files.into_boxed_slice(),
-        total_changed,
-        changed_impl_count: impl_changed,
-        changed_test_count: test_changed,
-        changed_setup_count: setup_changed,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
