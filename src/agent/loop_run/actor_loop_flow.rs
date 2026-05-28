@@ -1879,7 +1879,7 @@ pub(super) fn handle_actor_loop_pre_reply_control_action(
     args: &mut ActorLoopPreReplyArgs<'_, '_>,
     control_state: &ActorLoopPreReplyControlState,
 ) -> Option<ActorLoopPreReplyOutcome> {
-    let flow_args = super::turn::TaskContractVerifierFlowArgs {
+    let flow_args = super::verifier_orchestration::TaskContractVerifierFlowArgs {
         before_snapshot: args.before_snapshot,
         accumulated: args.accumulated,
         repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
@@ -2309,19 +2309,21 @@ pub(super) fn handle_actor_loop_task_contract_run_verifier(
     agent: &mut Agent,
     args: ActorLoopTaskContractReplyArgs<'_, '_>,
 ) -> ActorLoopTaskContractReplyOutcome {
-    match agent.drive_task_contract_verifier(super::turn::TaskContractVerifierFlowArgs {
-        before_snapshot: args.before_snapshot,
-        accumulated: args.accumulated,
-        repo_edit_calls_made_this_turn: args.repo_edit_calls_made_this_turn,
-        task_contract: args.task_contract,
-        contract_verification_retries: args.contract_verification_retries,
-        contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
-        repo_change_retries: args.repo_change_retries,
-        verifier_repair_retries: args.verifier_repair_retries,
-        task_contract_verify_commands_collected: args.task_contract_verify_commands_collected,
-        task_contract_verifier_passed_in_loop: args.task_contract_verifier_passed_in_loop,
-        last_iter: args.last_iter,
-    }) {
+    match agent.drive_task_contract_verifier(
+        super::verifier_orchestration::TaskContractVerifierFlowArgs {
+            before_snapshot: args.before_snapshot,
+            accumulated: args.accumulated,
+            repo_edit_calls_made_this_turn: args.repo_edit_calls_made_this_turn,
+            task_contract: args.task_contract,
+            contract_verification_retries: args.contract_verification_retries,
+            contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
+            repo_change_retries: args.repo_change_retries,
+            verifier_repair_retries: args.verifier_repair_retries,
+            task_contract_verify_commands_collected: args.task_contract_verify_commands_collected,
+            task_contract_verifier_passed_in_loop: args.task_contract_verifier_passed_in_loop,
+            last_iter: args.last_iter,
+        },
+    ) {
         TaskContractVerifierFlowOutcome::Continue => {
             *args.no_tool_retries = 0;
             ActorLoopTaskContractReplyOutcome::Continue
