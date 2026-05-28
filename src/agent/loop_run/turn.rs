@@ -22945,6 +22945,7 @@ const RUST_LIBRARY_REQUEST_PATTERNS: &[&str] = &["library", "crate"];
 const RUST_LIBRARY_REQUEST_JA_PATTERNS: &[&str] = &["ライブラリ", "クレート"];
 const TYPESCRIPT_REQUEST_PATTERNS: &[&str] = &["typescript", "type script", ".ts"];
 const JAVASCRIPT_REQUEST_PATTERNS: &[&str] = &["javascript", "node", "npm test"];
+const NODE_REQUEST_PATTERNS: &[&str] = &["node", "npm", "typescript", "javascript"];
 const PYTHON_TEST_REQUEST_PATTERNS: &[&str] =
     &["fastapi", "flask", "django", "python", "pytest", ".py"];
 
@@ -23039,30 +23040,25 @@ fn test_target_path_compatible_with_request(path: &str, request: &str) -> bool {
 
 fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&'static str> {
     let lower = request.to_ascii_lowercase();
-    if lower.contains("rust")
-        || lower.contains("cargo")
-        || request.contains("Rust")
-        || request.contains("cargo test")
-    {
+    if request_matches_family(
+        &lower,
+        request,
+        RUST_REQUEST_PATTERNS,
+        RUST_REQUEST_JA_PATTERNS,
+    ) {
         return Some("For Rust/Cargo workspaces, create or update Cargo.toml.");
     }
-    if lower.contains("python")
-        || lower.contains("pytest")
-        || lower.contains("fastapi")
-        || lower.contains("flask")
-        || lower.contains("django")
-        || request.contains("Python")
-        || request.contains("FastAPI")
-    {
+    if request_matches_family(
+        &lower,
+        request,
+        PYTHON_TEST_REQUEST_PATTERNS,
+        PYTHON_REQUEST_JA_PATTERNS,
+    ) {
         return Some(
             "For Python/pytest workspaces, create or update pyproject.toml, requirements.txt, or pytest configuration.",
         );
     }
-    if lower.contains("node")
-        || lower.contains("npm")
-        || lower.contains("typescript")
-        || lower.contains("javascript")
-    {
+    if lower_contains_any(&lower, NODE_REQUEST_PATTERNS) {
         return Some("For Node/npm workspaces, create or update package.json with a test script.");
     }
     None
@@ -24559,6 +24555,16 @@ mod truncate_tests {
             Some(
                 "For Python/pytest workspaces, create or update pyproject.toml, requirements.txt, or pytest configuration."
             )
+        );
+    }
+
+    #[test]
+    fn missing_verifier_setup_hint_points_node_requests_to_package_json() {
+        assert_eq!(
+            super::missing_verifier_setup_hint_for_request(
+                "TypeScript CLI を作成し、npm test で確認してください。"
+            ),
+            Some("For Node/npm workspaces, create or update package.json with a test script.")
         );
     }
 
