@@ -3966,6 +3966,19 @@ fn photon_outcome_json_value(outcome: Option<&'static str>) -> serde_json::Value
     }
 }
 
+fn missing_repo_change_retry_status_note(
+    kind: ActorLoopMissingRepoChangeReplyKind,
+) -> &'static str {
+    match kind {
+        ActorLoopMissingRepoChangeReplyKind::Empty => {
+            "The model replied without edits. Asked it to make the required repository changes."
+        }
+        ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
+            "The model answered with prose only. Asked it to emit exactly one tool call now and resume concrete repo work."
+        }
+    }
+}
+
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
     if yes_mode {
         tester::ApprovalMode::Auto
@@ -8049,20 +8062,12 @@ impl Agent {
         &mut self,
         args: ActorLoopMissingRepoChangeRetryPromptArgs,
     ) -> ActorLoopNoToolReplyOutcome {
-        let status_note = match args.kind {
-            ActorLoopMissingRepoChangeReplyKind::Empty => {
-                "The model replied without edits. Asked it to make the required repository changes."
-            }
-            ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
-                "The model answered with prose only. Asked it to emit exactly one tool call now and resume concrete repo work."
-            }
-        };
         write_stdout_rendered(
             &format_iteration_status(
                 args.last_iter,
                 self.config.max_iterations,
                 "Retry requested",
-                status_note,
+                missing_repo_change_retry_status_note(args.kind),
                 self.footer.current_cols(),
             ),
             true,
@@ -8070,54 +8075,64 @@ impl Agent {
 
         match args.kind {
             ActorLoopMissingRepoChangeReplyKind::Empty => {
-                if !self.push_artifact_directed_recovery_note(args.repo_change_retries)
-                    && !self.push_repo_change_no_edit_recovery_note(args.repo_change_retries)
-                {
-                    self.push_system_note(recovery::repo_change_recovery_note(
-                        args.repo_change_retries,
-                    ));
-                }
-                if self.record_artifact_completion_attempt(
-                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
-                    Vec::new(),
-                ) {
-                    return ActorLoopNoToolReplyOutcome::Exit {
-                        reason: ExitReason::MissingRepoEdits,
-                        error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
-                    };
-                }
+                self.handle_empty_missing_repo_change_retry(args.repo_change_retries)
             }
             ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
-                if let Some(target) = self.focused_edit_recovery_target() {
-                    let target_already_read = focused_edit_target_already_read(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    );
-                    self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                        &target,
-                        target_already_read,
-                        args.repo_change_retries,
-                    ));
-                } else if !self.push_artifact_directed_recovery_note(args.repo_change_retries)
-                    && !self.push_repo_change_no_edit_recovery_note(args.repo_change_retries)
-                {
-                    self.push_system_note(recovery::repo_change_no_tool_recovery_note(
-                        args.repo_change_retries,
-                    ));
-                }
-                if self.record_artifact_completion_attempt(
-                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
-                    Vec::new(),
-                ) {
-                    return ActorLoopNoToolReplyOutcome::Exit {
-                        reason: ExitReason::MissingRepoEdits,
-                        error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
-                    };
-                }
+                self.handle_prose_only_missing_repo_change_retry(args.repo_change_retries)
             }
         }
+    }
 
+    fn missing_repo_change_budget_exhausted_outcome(&self) -> ActorLoopNoToolReplyOutcome {
+        ActorLoopNoToolReplyOutcome::Exit {
+            reason: ExitReason::MissingRepoEdits,
+            error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
+        }
+    }
+
+    fn handle_empty_missing_repo_change_retry(
+        &mut self,
+        repo_change_retries: usize,
+    ) -> ActorLoopNoToolReplyOutcome {
+        if !self.push_artifact_directed_recovery_note(repo_change_retries)
+            && !self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+        {
+            self.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+        }
+        if self.record_artifact_completion_attempt(
+            super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
+            Vec::new(),
+        ) {
+            return self.missing_repo_change_budget_exhausted_outcome();
+        }
+        ActorLoopNoToolReplyOutcome::Continue
+    }
+
+    fn handle_prose_only_missing_repo_change_retry(
+        &mut self,
+        repo_change_retries: usize,
+    ) -> ActorLoopNoToolReplyOutcome {
+        if let Some(target) = self.focused_edit_recovery_target() {
+            let target_already_read =
+                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
+            self.push_system_note(self.focused_edit_no_tool_note_for_target(
+                &target,
+                target_already_read,
+                repo_change_retries,
+            ));
+        } else if !self.push_artifact_directed_recovery_note(repo_change_retries)
+            && !self.push_repo_change_no_edit_recovery_note(repo_change_retries)
+        {
+            self.push_system_note(recovery::repo_change_no_tool_recovery_note(
+                repo_change_retries,
+            ));
+        }
+        if self.record_artifact_completion_attempt(
+            super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
+            Vec::new(),
+        ) {
+            return self.missing_repo_change_budget_exhausted_outcome();
+        }
         ActorLoopNoToolReplyOutcome::Continue
     }
 
@@ -18697,6 +18712,22 @@ mod tests {
         );
         assert_eq!(super::photon_items_adopted_count(true, 7), 0);
         assert_eq!(super::photon_items_adopted_count(false, 7), 7);
+    }
+
+    #[test]
+    fn missing_repo_change_retry_status_note_matches_reply_kind() {
+        assert!(
+            super::missing_repo_change_retry_status_note(
+                super::ActorLoopMissingRepoChangeReplyKind::Empty
+            )
+            .contains("without edits")
+        );
+        assert!(
+            super::missing_repo_change_retry_status_note(
+                super::ActorLoopMissingRepoChangeReplyKind::ProseOnly
+            )
+            .contains("prose only")
+        );
     }
 
     #[test]
