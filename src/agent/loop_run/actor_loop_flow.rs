@@ -755,6 +755,86 @@ pub(super) fn actor_loop_pre_reply_flow_outcome(
     }
 }
 
+pub(super) fn maybe_continue_actor_loop_mode_deterministic_fallback(
+    agent: &mut Agent,
+    args: &mut ActorLoopPreReplyArgs<'_, '_>,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+) -> bool {
+    actor_loop_pre_reply_repo_change_fallback_allowed(
+        args.action_expectation,
+        *args.repo_edit_calls_made_this_turn,
+        recovery_dispatch_gate,
+    ) && agent.maybe_materialize_mode_deterministic_fallback(args.last_iter)
+}
+
+pub(super) fn maybe_continue_actor_loop_framework_fallback(
+    agent: &mut Agent,
+    args: &mut ActorLoopPreReplyArgs<'_, '_>,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+) -> bool {
+    if !actor_loop_pre_reply_repo_change_fallback_allowed(
+        args.action_expectation,
+        *args.repo_edit_calls_made_this_turn,
+        recovery_dispatch_gate,
+    ) || !super::turn::should_try_framework_app_fallback(
+        args.last_iter,
+        *args.framework_app_fallback_materialized,
+    ) || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
+    {
+        return false;
+    }
+    *args.framework_app_fallback_materialized = true;
+    agent.push_system_note(super::turn::framework_app_fallback_continuation_note().to_string());
+    true
+}
+
+pub(super) fn maybe_handle_actor_loop_playable_ui_fallback(
+    agent: &mut Agent,
+    args: &mut ActorLoopPreReplyArgs<'_, '_>,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+) -> Option<ActorLoopPreReplyOutcome> {
+    if !actor_loop_pre_reply_deterministic_fallback_allowed(
+        *args.repo_edit_calls_made_this_turn,
+        recovery_dispatch_gate,
+    ) || !agent.current_request_needs_playable_ui_quality_gate()
+    {
+        return None;
+    }
+    let (request, target_path) = agent.accepted_repo_change_polish_target()?;
+    match agent.handle_actor_loop_post_tool_polish_fallback(
+        args.last_iter,
+        &request,
+        &target_path,
+        args.repo_change_retries,
+    ) {
+        ActorLoopPostToolFallbackOutcome::Continue => Some(ActorLoopPreReplyOutcome::Continue),
+        ActorLoopPostToolFallbackOutcome::Exit { reason, error_text } => {
+            Some(ActorLoopPreReplyOutcome::Exit { reason, error_text })
+        }
+        ActorLoopPostToolFallbackOutcome::Proceed => None,
+    }
+}
+
+pub(super) fn request_actor_loop_pre_reply_model_turn(
+    agent: &mut Agent,
+    args: &ActorLoopPreReplyArgs<'_, '_>,
+    control_state: ActorLoopPreReplyControlState,
+) -> ActorLoopPreReplyOutcome {
+    match agent.request_assistant_reply_with_retry(
+        args.stream_output,
+        args.interrupt_flag,
+        control_state.recovery_dispatch_gate,
+    ) {
+        Ok(reply) => ActorLoopPreReplyOutcome::ReplyPrepared {
+            reply,
+            recovery_dispatch_gate: control_state.recovery_dispatch_gate,
+            missing_verifier_setup_turn: control_state.missing_verifier_setup_turn,
+            recovery_owner: control_state.recovery_owner,
+        },
+        Err(err) => actor_loop_pre_reply_request_error(agent, err),
+    }
+}
+
 pub(super) fn handle_actor_loop_rejected_tool_batch(
     agent: &mut Agent,
     args: ActorLoopRejectedToolBatchArgs<'_, '_>,
