@@ -3,6 +3,8 @@ use super::active_job_arbiter::{
     build_active_job_selected_payload, determine_loop_control_action,
     loop_control_action_requires_missing_verifier_setup,
 };
+#[cfg(test)]
+use super::actor_loop_flow::missing_repo_edits_finalize_outcome;
 use super::actor_loop_flow::{
     ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT, ActorLoopCompletionArgs, ActorLoopCompletionOutcome,
     ActorLoopEmptyReplyArgs, ActorLoopMissingRepoChangeReplyArgs,
@@ -18,10 +20,11 @@ use super::actor_loop_flow::{
     ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
     TaskContractVerifierFlowOutcome, finalize_missing_repo_edit_retry_exhausted,
     handle_non_progress_plan_edit_fallback, handle_plan_progress_prose_only_fallback,
+    maybe_continue_missing_repo_framework_fallback, maybe_continue_missing_repo_scaffold_fallback,
     maybe_handle_answer_only_future_work_recovery, maybe_handle_answer_only_inadequate_recovery,
     maybe_handle_repo_change_partial_progress_recovery,
     missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
-    missing_repo_edits_finalize_outcome, plan_tool_followup_done_message, repair_job_done_outcome,
+    plan_tool_followup_done_message, push_missing_repo_edit_retry_note, repair_job_done_outcome,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -3303,7 +3306,7 @@ fn build_stats(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScaffoldFallbackResult {
+pub(super) enum ScaffoldFallbackResult {
     NotApplicable,
     Applied,
     Failed,
@@ -5832,10 +5835,10 @@ impl Agent {
         if !missing_repo_edit_recovery_allowed(args) {
             return None;
         }
-        if self.maybe_continue_missing_repo_framework_fallback(args) {
+        if maybe_continue_missing_repo_framework_fallback(self, args) {
             return Some(PostReplyRecoveryOutcome::Continue);
         }
-        if let Some(outcome) = self.maybe_continue_missing_repo_scaffold_fallback(args) {
+        if let Some(outcome) = maybe_continue_missing_repo_scaffold_fallback(self, args) {
             return Some(outcome);
         }
         *args.repo_change_retries += 1;
@@ -5852,63 +5855,8 @@ impl Agent {
             ),
             true,
         );
-        self.push_missing_repo_edit_retry_note(*args.repo_change_retries);
+        push_missing_repo_edit_retry_note(self, *args.repo_change_retries);
         Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn maybe_continue_missing_repo_framework_fallback(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> bool {
-        if !should_try_framework_app_fallback(
-            args.last_iter,
-            *args.framework_app_fallback_materialized,
-        ) || !self.maybe_materialize_framework_game_fallback(args.last_iter)
-        {
-            return false;
-        }
-        *args.framework_app_fallback_materialized = true;
-        self.push_system_note(framework_app_fallback_continuation_note().to_string());
-        true
-    }
-
-    fn maybe_continue_missing_repo_scaffold_fallback(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        match self.maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag) {
-            ScaffoldFallbackResult::Applied => {
-                *args.repo_change_retries = 0;
-                Some(PostReplyRecoveryOutcome::Continue)
-            }
-            ScaffoldFallbackResult::Failed | ScaffoldFallbackResult::Skipped => {
-                *args.repo_change_retries += 1;
-                if *args.repo_change_retries >= 3 {
-                    return Some(missing_repo_edits_finalize_outcome());
-                }
-                self.push_system_note(recovery::repo_change_recovery_note(
-                    *args.repo_change_retries,
-                ));
-                Some(PostReplyRecoveryOutcome::Continue)
-            }
-            ScaffoldFallbackResult::NotApplicable => None,
-        }
-    }
-
-    fn push_missing_repo_edit_retry_note(&mut self, attempt: usize) {
-        if let Some(target) = self.focused_edit_recovery_target() {
-            let target_already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            self.push_system_note(self.focused_edit_no_tool_note_for_target(
-                &target,
-                target_already_read,
-                attempt,
-            ));
-            return;
-        }
-        if !self.push_artifact_directed_recovery_note(attempt) {
-            self.push_system_note(recovery::repo_change_recovery_note(attempt));
-        }
     }
 
     fn maybe_handle_python_test_artifact_recovery(
@@ -12378,7 +12326,7 @@ impl Agent {
         first_existing_impl_target(&self.work_root)
     }
 
-    fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
+    pub(super) fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
         self.forced_small_edit_recovery_target()
             .or_else(|| self.post_scaffold_edit_recovery_target())
             .or_else(|| self.post_scaffold_continuation_recovery_target())
@@ -13812,7 +13760,7 @@ impl Agent {
         self.maybe_emit_repair_exhausted_from_promotion(promotion_result);
     }
 
-    fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
+    pub(super) fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
         if self.focused_edit_recovery_target().is_some() {
             return false;
         }
@@ -13907,7 +13855,7 @@ impl Agent {
         }
     }
 
-    fn focused_edit_no_tool_note_for_target(
+    pub(super) fn focused_edit_no_tool_note_for_target(
         &self,
         target: &Path,
         target_already_read: bool,
@@ -16053,7 +16001,7 @@ impl Agent {
         )
     }
 
-    fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
+    pub(super) fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
         if !self.config.deterministic_fallback.allows_hint_only() {
             return false;
         }
@@ -16175,7 +16123,7 @@ impl Agent {
         true
     }
 
-    fn maybe_apply_deterministic_nextjs_scaffold(
+    pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
         &mut self,
         last_iter: usize,
         interrupt_flag: &InterruptFlag,
@@ -21980,11 +21928,14 @@ fn deterministic_framework_app_files_needed(
     deterministic::playable_ui_repair(request, &target, &current).is_some()
 }
 
-fn should_try_framework_app_fallback(last_iter: usize, already_materialized: bool) -> bool {
+pub(super) fn should_try_framework_app_fallback(
+    last_iter: usize,
+    already_materialized: bool,
+) -> bool {
     last_iter > 1 && !already_materialized
 }
 
-fn framework_app_fallback_continuation_note() -> &'static str {
+pub(super) fn framework_app_fallback_continuation_note() -> &'static str {
     "[Deterministic App Fallback] Treat the materialized framework files as a recovery scaffold only, not as task completion. Continue by reading and editing the real UI entry file with task-specific implementation details, then verify the app before final response."
 }
 
