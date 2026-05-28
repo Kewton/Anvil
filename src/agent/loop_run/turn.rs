@@ -19,7 +19,8 @@ use super::actor_loop_flow::{
     ActorLoopProseOnlyReplyArgs, ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
     ActorLoopToolPreparationArgs, ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs,
     PostReplyRecoveryOutcome, TaskContractVerifierFlowOutcome, drive_actor_loop_pre_reply_phase,
-    drive_actor_loop_tool_preparation_phase, handle_actor_loop_plan_tool_followup,
+    drive_actor_loop_tool_preparation_phase, handle_actor_loop_completion,
+    handle_actor_loop_plan_tool_followup, handle_actor_loop_post_tool_fallbacks,
     handle_actor_loop_task_contract_reply, handle_plan_progress_prose_only_fallback,
     handle_post_reply_recovery, missing_repo_change_budget_exhausted_outcome,
     repair_job_done_outcome,
@@ -5972,321 +5973,6 @@ impl Agent {
         }
     }
 
-    fn handle_actor_loop_completion(
-        &mut self,
-        args: ActorLoopCompletionArgs<'_, '_>,
-    ) -> ActorLoopCompletionOutcome {
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            let plan_contents = match self.current_plan_contents() {
-                Ok(contents) => contents.unwrap_or_default(),
-                Err(err) => {
-                    return ActorLoopCompletionOutcome::Exit {
-                        reason: ExitReason::TransportError,
-                        error_text: err,
-                    };
-                }
-            };
-            self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
-            if !self.plan_is_substantive_with_fallback(&plan_contents) {
-                let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
-                let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
-                let current_stage = lifecycle::current_plan_stage(&plan_contents);
-                *args.plan_progress_retries += 1;
-                if *args.plan_progress_retries >= 2 {
-                    return match self.materialize_deterministic_fallback_plan(
-                        "agent.plan.progress_fallback_materialized",
-                    ) {
-                        Ok(true) => ActorLoopCompletionOutcome::Done {
-                            final_prose:
-                                "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                                    .to_string(),
-                        },
-                        Ok(false) => ActorLoopCompletionOutcome::Exit {
-                            reason: ExitReason::PlanIncomplete,
-                            error_text: ExitReason::PlanIncomplete
-                                .default_error_text()
-                                .to_string(),
-                        },
-                        Err(err) => ActorLoopCompletionOutcome::Exit {
-                            reason: ExitReason::TransportError,
-                            error_text: err,
-                        },
-                    };
-                }
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Plan still incomplete",
-                        &format!(
-                            "Asked the model to finish {} before approval.",
-                            join_sections_for_progress(&missing_sections)
-                        ),
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                log_plan_stall(
-                    self.session_store.session_id(),
-                    args.last_iter,
-                    "plan_incomplete_after_reply",
-                    current_stage,
-                    &next_sections,
-                    &missing_sections,
-                    *args.plan_progress_retries,
-                );
-                self.push_system_note(recovery::plan_progress_recovery_note(
-                    current_stage,
-                    &next_sections,
-                    &missing_sections,
-                    *args.plan_progress_retries,
-                ));
-                return ActorLoopCompletionOutcome::Continue;
-            }
-        }
-        ActorLoopCompletionOutcome::Done {
-            final_prose: args.final_reply.to_string(),
-        }
-    }
-
-    fn handle_actor_loop_post_tool_fallbacks(
-        &mut self,
-        args: ActorLoopPostToolFallbackArgs<'_>,
-    ) -> ActorLoopPostToolFallbackOutcome {
-        self.record_actor_loop_post_tool_notes(
-            args.action_expectation,
-            args.emitted_bash_loop_note,
-            args.bash_only_tool_turn,
-            args.repo_edit_calls_made_this_turn,
-            args.logged_act_first_repo_edit,
-        );
-        match self.handle_actor_loop_post_tool_no_edit_fallbacks(
-            args.last_iter,
-            args.recovery_dispatch_gate,
-            args.repo_edit_calls_made_this_turn,
-            args.tool_calls_made_this_turn,
-            args.repo_change_retries,
-        ) {
-            ActorLoopPostToolFallbackOutcome::Proceed => {}
-            outcome => return outcome,
-        }
-        match self.handle_actor_loop_post_tool_repo_edit_quality_gate(
-            args.last_iter,
-            args.action_expectation,
-            args.recovery_dispatch_gate,
-            args.repo_edit_calls_made_this_turn,
-            args.repo_change_retries,
-        ) {
-            ActorLoopPostToolFallbackOutcome::Proceed => {}
-            outcome => return outcome,
-        }
-        ActorLoopPostToolFallbackOutcome::Proceed
-    }
-
-    fn record_actor_loop_post_tool_notes(
-        &mut self,
-        action_expectation: recovery::ActionExpectation,
-        emitted_bash_loop_note: bool,
-        bash_only_tool_turn: bool,
-        repo_edit_calls_made_this_turn: usize,
-        logged_act_first_repo_edit: bool,
-    ) {
-        if emitted_bash_loop_note {
-            self.push_system_note(recovery::install_loop_recovery_note());
-        } else if self.session.mode_state.mode == ExecutionMode::Act
-            && action_expectation == recovery::ActionExpectation::RepoChange
-            && bash_only_tool_turn
-            && repo_edit_calls_made_this_turn == 0
-            && !logged_act_first_repo_edit
-        {
-            self.push_system_note(recovery::repo_change_after_setup_note());
-        }
-    }
-
-    fn handle_actor_loop_post_tool_no_edit_fallbacks(
-        &mut self,
-        last_iter: usize,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-        repo_edit_calls_made_this_turn: usize,
-        tool_calls_made_this_turn: usize,
-        repo_change_retries: &mut usize,
-    ) -> ActorLoopPostToolFallbackOutcome {
-        if repo_edit_calls_made_this_turn != 0
-            || tool_calls_made_this_turn == 0
-            || !recovery_dispatch_gate.allows_deterministic_fallback()
-            || !self.current_request_needs_playable_ui_quality_gate()
-        {
-            return ActorLoopPostToolFallbackOutcome::Proceed;
-        }
-        if let Some((request, target_path)) = self.accepted_repo_change_polish_target() {
-            return self.handle_actor_loop_post_tool_polish_fallback(
-                last_iter,
-                &request,
-                &target_path,
-                repo_change_retries,
-            );
-        }
-        if let Some((request, target_path, _issue)) = self.accepted_repo_change_quality_issue() {
-            return self.handle_actor_loop_post_tool_quality_fallback(
-                last_iter,
-                &request,
-                &target_path,
-                repo_change_retries,
-            );
-        }
-        ActorLoopPostToolFallbackOutcome::Proceed
-    }
-
-    pub(super) fn handle_actor_loop_post_tool_polish_fallback(
-        &mut self,
-        last_iter: usize,
-        request: &str,
-        target_path: &str,
-        repo_change_retries: &mut usize,
-    ) -> ActorLoopPostToolFallbackOutcome {
-        match self.maybe_apply_deterministic_polish_fallback(request, target_path) {
-            Ok(true) => {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Polish fallback",
-                        &format!("Applied deterministic visual polish to {target_path}."),
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.session.record_feedback_if_unset(
-                    build_feedback_for_deterministic_content_fallback(&self.work_root),
-                );
-                self.push_deterministic_ui_recovery_continuation_note(
-                    target_path,
-                    (*repo_change_retries).saturating_add(1),
-                );
-                ActorLoopPostToolFallbackOutcome::Continue
-            }
-            Ok(false) => ActorLoopPostToolFallbackOutcome::Proceed,
-            Err(err) => ActorLoopPostToolFallbackOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
-    }
-
-    fn handle_actor_loop_post_tool_quality_fallback(
-        &mut self,
-        last_iter: usize,
-        request: &str,
-        target_path: &str,
-        repo_change_retries: &mut usize,
-    ) -> ActorLoopPostToolFallbackOutcome {
-        match self.maybe_apply_deterministic_quality_fallback(request, target_path) {
-            Ok(true) => {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Quality fallback",
-                        &format!("Replaced scaffold placeholder output in {target_path}."),
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.session.record_feedback_if_unset(
-                    build_feedback_for_deterministic_content_fallback(&self.work_root),
-                );
-                self.push_deterministic_ui_recovery_continuation_note(
-                    target_path,
-                    (*repo_change_retries).saturating_add(1),
-                );
-                ActorLoopPostToolFallbackOutcome::Continue
-            }
-            Ok(false) => ActorLoopPostToolFallbackOutcome::Proceed,
-            Err(err) => ActorLoopPostToolFallbackOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
-    }
-
-    fn handle_actor_loop_post_tool_repo_edit_quality_gate(
-        &mut self,
-        last_iter: usize,
-        action_expectation: recovery::ActionExpectation,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-        repo_edit_calls_made_this_turn: usize,
-        repo_change_retries: &mut usize,
-    ) -> ActorLoopPostToolFallbackOutcome {
-        if repo_edit_calls_made_this_turn == 0
-            || !recovery_dispatch_gate.allows_deterministic_fallback()
-            || !(should_apply_repo_change_quality_gate(
-                action_expectation,
-                self.active_task_expects_repo_change(),
-                self.session.mode_state.mode,
-            ) || self.current_request_needs_playable_ui_quality_gate())
-        {
-            return ActorLoopPostToolFallbackOutcome::Proceed;
-        }
-        let Some((request, target_path, issue)) = self.accepted_repo_change_quality_issue() else {
-            return ActorLoopPostToolFallbackOutcome::Proceed;
-        };
-        match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
-            Ok(true) => {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        last_iter,
-                        self.config.max_iterations,
-                        "Quality fallback",
-                        &format!("Replaced scaffold placeholder output in {target_path}."),
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.session.record_feedback_if_unset(
-                    build_feedback_for_deterministic_content_fallback(&self.work_root),
-                );
-                self.push_deterministic_ui_recovery_continuation_note(
-                    &target_path,
-                    (*repo_change_retries).saturating_add(1),
-                );
-                ActorLoopPostToolFallbackOutcome::Continue
-            }
-            Ok(false) => {
-                *repo_change_retries += 1;
-                if *repo_change_retries >= 3 {
-                    ActorLoopPostToolFallbackOutcome::Exit {
-                        reason: ExitReason::MissingRepoEdits,
-                        error_text: issue,
-                    }
-                } else {
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Quality gate",
-                            &format!(
-                                "Asked the model to replace placeholder output in {target_path}."
-                            ),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    self.push_system_note(recovery::repo_change_quality_gate_note(
-                        &request,
-                        &target_path,
-                        &issue,
-                        *repo_change_retries,
-                    ));
-                    ActorLoopPostToolFallbackOutcome::Proceed
-                }
-            }
-            Err(err) => ActorLoopPostToolFallbackOutcome::Exit {
-                reason: ExitReason::TransportError,
-                error_text: err,
-            },
-        }
-    }
-
     fn handle_actor_loop_post_tool_cleanup(
         &mut self,
         args: ActorLoopPostToolCleanupArgs<'_>,
@@ -7418,17 +7104,20 @@ impl Agent {
                         break 'outer;
                     }
                 }
-                match self.handle_actor_loop_post_tool_fallbacks(ActorLoopPostToolFallbackArgs {
-                    last_iter,
-                    action_expectation,
-                    recovery_dispatch_gate,
-                    emitted_bash_loop_note,
-                    bash_only_tool_turn,
-                    repo_edit_calls_made_this_turn,
-                    tool_calls_made_this_turn,
-                    logged_act_first_repo_edit,
-                    repo_change_retries: &mut repo_change_retries,
-                }) {
+                match handle_actor_loop_post_tool_fallbacks(
+                    self,
+                    ActorLoopPostToolFallbackArgs {
+                        last_iter,
+                        action_expectation,
+                        recovery_dispatch_gate,
+                        emitted_bash_loop_note,
+                        bash_only_tool_turn,
+                        repo_edit_calls_made_this_turn,
+                        tool_calls_made_this_turn,
+                        logged_act_first_repo_edit,
+                        repo_change_retries: &mut repo_change_retries,
+                    },
+                ) {
                     ActorLoopPostToolFallbackOutcome::Proceed => {}
                     ActorLoopPostToolFallbackOutcome::Continue => continue,
                     ActorLoopPostToolFallbackOutcome::Exit {
@@ -7590,11 +7279,14 @@ impl Agent {
                 }
             }
 
-            match self.handle_actor_loop_completion(ActorLoopCompletionArgs {
-                last_iter,
-                final_reply: &final_reply,
-                plan_progress_retries: &mut plan_progress_retries,
-            }) {
+            match handle_actor_loop_completion(
+                self,
+                ActorLoopCompletionArgs {
+                    last_iter,
+                    final_reply: &final_reply,
+                    plan_progress_retries: &mut plan_progress_retries,
+                },
+            ) {
                 ActorLoopCompletionOutcome::Continue => continue,
                 ActorLoopCompletionOutcome::Done {
                     final_prose: next_final_prose,
@@ -15408,7 +15100,7 @@ if __name__ == "__main__":
         Ok(())
     }
 
-    fn maybe_apply_deterministic_polish_fallback(
+    pub(super) fn maybe_apply_deterministic_polish_fallback(
         &self,
         request: &str,
         relative_target: &str,
@@ -20475,7 +20167,7 @@ fn progress_path_display(
     compact_progress_path(&sanitize_for_progress(&relative), max_chars)
 }
 
-fn join_sections_for_progress(sections: &[&str]) -> String {
+pub(super) fn join_sections_for_progress(sections: &[&str]) -> String {
     match sections {
         [] => String::new(),
         [one] => (*one).to_string(),
