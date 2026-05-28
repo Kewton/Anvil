@@ -447,6 +447,47 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
     None
 }
 
+pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if !super::turn::should_apply_repo_change_partial_progress_recovery(
+        args.action_expectation,
+        args.repo_edit_calls_made_this_turn,
+        args.final_reply,
+        args.task_contract_action,
+    ) || !args
+        .recovery_dispatch_gate
+        .allows_generic_repo_change_recovery()
+    {
+        return None;
+    }
+    *args.repo_change_retries += 1;
+    if *args.repo_change_retries >= 3 {
+        return Some(PostReplyRecoveryOutcome::Finalize {
+            final_prose: String::new(),
+            exit_reason: ExitReason::MissingRepoEdits,
+            error_text: ExitReason::MissingRepoEdits
+                .default_error_text()
+                .to_string(),
+        });
+    }
+    super::turn::write_stdout_rendered(
+        &super::turn::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Retry requested",
+            "A small edit landed, but the model answered with next-step prose instead of a completed result. Asked it to keep implementing with tools.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    agent.push_system_note(recovery::repo_change_partial_progress_note(
+        *args.repo_change_retries,
+    ));
+    Some(PostReplyRecoveryOutcome::Continue)
+}
+
 pub(super) fn maybe_continue_missing_repo_framework_fallback(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
