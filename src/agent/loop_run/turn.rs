@@ -1757,6 +1757,14 @@ enum ActorLoopPreReplyOutcome {
     },
 }
 
+#[derive(Clone)]
+struct ActorLoopPreReplyControlState {
+    loop_control_action: LoopControlAction,
+    recovery_owner: RecoveryOwner,
+    recovery_dispatch_gate: RecoveryDispatchGate,
+    missing_verifier_setup_turn: bool,
+}
+
 struct ActorLoopToolPreparationArgs<'a, 'b> {
     reply_tool_calls: Vec<ToolCall>,
     task_contract: Option<&'a super::task_contract::TaskContract>,
@@ -1902,6 +1910,23 @@ struct ActorLoopPlanToolFollowupArgs<'a> {
 
 enum ActorLoopPlanToolFollowupOutcome {
     Proceed,
+    Done {
+        final_prose: String,
+    },
+    Exit {
+        reason: ExitReason,
+        error_text: String,
+    },
+}
+
+struct ActorLoopCompletionArgs<'a, 'b> {
+    last_iter: usize,
+    final_reply: &'a str,
+    plan_progress_retries: &'b mut usize,
+}
+
+enum ActorLoopCompletionOutcome {
+    Continue,
     Done {
         final_prose: String,
     },
@@ -6051,7 +6076,7 @@ impl Agent {
 
     fn drive_actor_loop_pre_reply_phase(
         &mut self,
-        args: ActorLoopPreReplyArgs<'_, '_>,
+        mut args: ActorLoopPreReplyArgs<'_, '_>,
     ) -> ActorLoopPreReplyOutcome {
         if args.interrupt_flag.is_set() {
             return ActorLoopPreReplyOutcome::Exit {
@@ -6059,13 +6084,30 @@ impl Agent {
                 error_text: String::new(),
             };
         }
+        let control_state = self.build_actor_loop_pre_reply_control_state(&args);
+        if let Some(outcome) =
+            self.handle_actor_loop_pre_reply_control_action(&mut args, &control_state)
+        {
+            return outcome;
+        }
+        if let Some(outcome) = self
+            .handle_actor_loop_pre_reply_fallbacks(&mut args, control_state.recovery_dispatch_gate)
+        {
+            return outcome;
+        }
+        self.request_actor_loop_pre_reply_model_turn(&args, control_state)
+    }
 
+    fn build_actor_loop_pre_reply_control_state(
+        &mut self,
+        args: &ActorLoopPreReplyArgs<'_, '_>,
+    ) -> ActorLoopPreReplyControlState {
         let pre_model_task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan
             || (self.task_contract_verifier_repair_pending && self.repair_job.is_some())
         {
             None
         } else {
-            args.task_contract.as_ref().map(|contract| {
+            args.task_contract.map(|contract| {
                 self.task_contract_recovery_action(
                     contract,
                     *args.contract_verifier_repair_edit_count,
@@ -6087,84 +6129,62 @@ impl Agent {
             &loop_control_action,
             pre_model_task_contract_action.as_ref(),
         );
-        let recovery_dispatch_gate = RecoveryDispatchGate::from_owner(recovery_owner);
-        let missing_verifier_setup_turn =
-            loop_control_action_requires_missing_verifier_setup(&loop_control_action);
-        match loop_control_action {
-            LoopControlAction::ContinueRepairJob { next_action: _ } => {
-                let outcome = self.dispatch_repair_job_step(
-                    TaskContractVerifierFlowArgs {
-                        before_snapshot: args.before_snapshot,
-                        accumulated: args.accumulated,
-                        repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
-                        task_contract: args.task_contract,
-                        contract_verification_retries: args.contract_verification_retries,
-                        contract_verifier_repair_edit_count: args
-                            .contract_verifier_repair_edit_count,
-                        repo_change_retries: args.repo_change_retries,
-                        verifier_repair_retries: args.verifier_repair_retries,
-                        task_contract_verify_commands_collected: args
-                            .task_contract_verify_commands_collected,
-                        task_contract_verifier_passed_in_loop: args
-                            .task_contract_verifier_passed_in_loop,
-                        last_iter: args.last_iter,
-                    },
-                    args.repo_edit_calls_made_this_turn,
-                );
-                return Self::actor_loop_pre_reply_flow_outcome(outcome);
-            }
-            LoopControlAction::ContinueMissingVerifierJob { next_action } => {
-                if let Some(outcome) = self.dispatch_missing_verifier_job_step(
-                    TaskContractVerifierFlowArgs {
-                        before_snapshot: args.before_snapshot,
-                        accumulated: args.accumulated,
-                        repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
-                        task_contract: args.task_contract,
-                        contract_verification_retries: args.contract_verification_retries,
-                        contract_verifier_repair_edit_count: args
-                            .contract_verifier_repair_edit_count,
-                        repo_change_retries: args.repo_change_retries,
-                        verifier_repair_retries: args.verifier_repair_retries,
-                        task_contract_verify_commands_collected: args
-                            .task_contract_verify_commands_collected,
-                        task_contract_verifier_passed_in_loop: args
-                            .task_contract_verifier_passed_in_loop,
-                        last_iter: args.last_iter,
-                    },
-                    next_action,
-                ) {
-                    return Self::actor_loop_pre_reply_flow_outcome(outcome);
-                }
-            }
-            LoopControlAction::RunVerifier => {
-                let outcome = self.drive_task_contract_verifier(TaskContractVerifierFlowArgs {
-                    before_snapshot: args.before_snapshot,
-                    accumulated: args.accumulated,
-                    repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
-                    task_contract: args.task_contract,
-                    contract_verification_retries: args.contract_verification_retries,
-                    contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
-                    repo_change_retries: args.repo_change_retries,
-                    verifier_repair_retries: args.verifier_repair_retries,
-                    task_contract_verify_commands_collected: args
-                        .task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop: args
-                        .task_contract_verifier_passed_in_loop,
-                    last_iter: args.last_iter,
-                });
-                return Self::actor_loop_pre_reply_flow_outcome(outcome);
-            }
-            LoopControlAction::RequestModelTurn => {}
+        ActorLoopPreReplyControlState {
+            missing_verifier_setup_turn: loop_control_action_requires_missing_verifier_setup(
+                &loop_control_action,
+            ),
+            recovery_dispatch_gate: RecoveryDispatchGate::from_owner(recovery_owner),
+            recovery_owner,
+            loop_control_action,
         }
+    }
 
+    fn handle_actor_loop_pre_reply_control_action(
+        &mut self,
+        args: &mut ActorLoopPreReplyArgs<'_, '_>,
+        control_state: &ActorLoopPreReplyControlState,
+    ) -> Option<ActorLoopPreReplyOutcome> {
+        let flow_args = TaskContractVerifierFlowArgs {
+            before_snapshot: args.before_snapshot,
+            accumulated: args.accumulated,
+            repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
+            task_contract: args.task_contract,
+            contract_verification_retries: args.contract_verification_retries,
+            contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
+            repo_change_retries: args.repo_change_retries,
+            verifier_repair_retries: args.verifier_repair_retries,
+            task_contract_verify_commands_collected: args.task_contract_verify_commands_collected,
+            task_contract_verifier_passed_in_loop: args.task_contract_verifier_passed_in_loop,
+            last_iter: args.last_iter,
+        };
+        match control_state.loop_control_action.clone() {
+            LoopControlAction::ContinueRepairJob { .. } => {
+                let outcome =
+                    self.dispatch_repair_job_step(flow_args, args.repo_edit_calls_made_this_turn);
+                Some(Self::actor_loop_pre_reply_flow_outcome(outcome))
+            }
+            LoopControlAction::ContinueMissingVerifierJob { next_action } => self
+                .dispatch_missing_verifier_job_step(flow_args, next_action)
+                .map(Self::actor_loop_pre_reply_flow_outcome),
+            LoopControlAction::RunVerifier => Some(Self::actor_loop_pre_reply_flow_outcome(
+                self.drive_task_contract_verifier(flow_args),
+            )),
+            LoopControlAction::RequestModelTurn => None,
+        }
+    }
+
+    fn handle_actor_loop_pre_reply_fallbacks(
+        &mut self,
+        args: &mut ActorLoopPreReplyArgs<'_, '_>,
+        recovery_dispatch_gate: RecoveryDispatchGate,
+    ) -> Option<ActorLoopPreReplyOutcome> {
         if args.action_expectation == recovery::ActionExpectation::RepoChange
             && recovery_dispatch_gate.allows_deterministic_fallback()
             && *args.repo_edit_calls_made_this_turn == 0
             && self.maybe_materialize_mode_deterministic_fallback(args.last_iter)
         {
-            return ActorLoopPreReplyOutcome::Continue;
+            return Some(ActorLoopPreReplyOutcome::Continue);
         }
-
         if args.action_expectation == recovery::ActionExpectation::RepoChange
             && recovery_dispatch_gate.allows_deterministic_fallback()
             && *args.repo_edit_calls_made_this_turn == 0
@@ -6176,78 +6196,215 @@ impl Agent {
         {
             *args.framework_app_fallback_materialized = true;
             self.push_system_note(framework_app_fallback_continuation_note().to_string());
-            return ActorLoopPreReplyOutcome::Continue;
+            return Some(ActorLoopPreReplyOutcome::Continue);
         }
-
         if *args.repo_edit_calls_made_this_turn == 0
             && recovery_dispatch_gate.allows_deterministic_fallback()
             && self.current_request_needs_playable_ui_quality_gate()
             && let Some((request, target_path)) = self.accepted_repo_change_polish_target()
         {
-            match self.maybe_apply_deterministic_polish_fallback(&request, &target_path) {
-                Ok(true) => {
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            args.last_iter,
-                            self.config.max_iterations,
-                            "Polish fallback",
-                            &format!("Applied deterministic visual polish to {target_path}."),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    self.session.record_feedback_if_unset(
-                        build_feedback_for_deterministic_content_fallback(&self.work_root),
-                    );
-                    self.push_deterministic_ui_recovery_continuation_note(
-                        &target_path,
-                        (*args.repo_change_retries).saturating_add(1),
-                    );
-                    return ActorLoopPreReplyOutcome::Continue;
+            return match self.handle_actor_loop_post_tool_polish_fallback(
+                args.last_iter,
+                &request,
+                &target_path,
+                args.repo_change_retries,
+            ) {
+                ActorLoopPostToolFallbackOutcome::Continue => {
+                    Some(ActorLoopPreReplyOutcome::Continue)
                 }
-                Ok(false) => {}
-                Err(err) => {
-                    return ActorLoopPreReplyOutcome::Exit {
-                        reason: ExitReason::TransportError,
-                        error_text: err,
-                    };
+                ActorLoopPostToolFallbackOutcome::Exit { reason, error_text } => {
+                    Some(ActorLoopPreReplyOutcome::Exit { reason, error_text })
                 }
-            }
+                ActorLoopPostToolFallbackOutcome::Proceed => None,
+            };
         }
+        None
+    }
 
+    fn request_actor_loop_pre_reply_model_turn(
+        &mut self,
+        args: &ActorLoopPreReplyArgs<'_, '_>,
+        control_state: ActorLoopPreReplyControlState,
+    ) -> ActorLoopPreReplyOutcome {
         match self.request_assistant_reply_with_retry(
             args.stream_output,
             args.interrupt_flag,
-            recovery_dispatch_gate,
+            control_state.recovery_dispatch_gate,
         ) {
             Ok(reply) => ActorLoopPreReplyOutcome::ReplyPrepared {
                 reply,
-                recovery_dispatch_gate,
-                missing_verifier_setup_turn,
-                recovery_owner,
+                recovery_dispatch_gate: control_state.recovery_dispatch_gate,
+                missing_verifier_setup_turn: control_state.missing_verifier_setup_turn,
+                recovery_owner: control_state.recovery_owner,
             },
-            Err(err) => {
-                let reason = if err == USER_INTERRUPT_ERROR {
-                    ExitReason::Interrupted
-                } else if lifecycle::is_tool_call_format_error(&err) {
-                    ExitReason::ToolCallFormatError
-                } else {
-                    ExitReason::TransportError
-                };
-                if err != USER_INTERRUPT_ERROR
-                    && (lifecycle::is_native_tool_parser_failure(&err)
-                        || lifecycle::is_tool_call_format_error(&err)
-                        || lifecycle::is_native_tool_transport_failure(&err))
-                {
-                    let frame = build_feedback_for_tool_protocol_failure(&err, &self.work_root);
-                    self.session.record_feedback(frame);
-                }
-                ActorLoopPreReplyOutcome::Exit {
-                    reason,
-                    error_text: err,
-                }
+            Err(err) => self.actor_loop_pre_reply_request_error(err),
+        }
+    }
+
+    fn actor_loop_pre_reply_request_error(&mut self, err: String) -> ActorLoopPreReplyOutcome {
+        let reason = if err == USER_INTERRUPT_ERROR {
+            ExitReason::Interrupted
+        } else if lifecycle::is_tool_call_format_error(&err) {
+            ExitReason::ToolCallFormatError
+        } else {
+            ExitReason::TransportError
+        };
+        if err != USER_INTERRUPT_ERROR
+            && (lifecycle::is_native_tool_parser_failure(&err)
+                || lifecycle::is_tool_call_format_error(&err)
+                || lifecycle::is_native_tool_transport_failure(&err))
+        {
+            let frame = build_feedback_for_tool_protocol_failure(&err, &self.work_root);
+            self.session.record_feedback(frame);
+        }
+        ActorLoopPreReplyOutcome::Exit {
+            reason,
+            error_text: err,
+        }
+    }
+
+    fn prepare_actor_loop_turn_state(&mut self) -> Option<super::task_contract::TaskContract> {
+        // Issue #455 / D4 / CB-001: clear the in-snapshot turn-scoped flag
+        // so first-eligible-failure-wins starts fresh on this turn. The
+        // flag lives on `SessionSnapshot` itself (`#[serde(skip)]`), is set
+        // by every `record_feedback`/`record_feedback_if_unset` that writes
+        // an eligible-kind frame, and is consulted by
+        // `record_feedback_if_unset` to decide skip-vs-overwrite.
+        self.session.reset_eligible_feedback_recorded_this_turn();
+        // Issue #456 / DR2-003: reset the AnvilScore turn-local runtime
+        // fields. Inline assignment (no dedicated method) keeps SRP small.
+        // `consecutive_no_progress_turns` is session-cumulative and is
+        // intentionally NOT reset here.
+        self.session.unsafe_blocks_this_turn = 0;
+        self.session.repo_edit_succeeded_this_turn = false;
+        self.session.touched_files_at_turn_start =
+            self.session.working_memory.touched_files.clone();
+        // Issue #462: reset the per-turn CaseRecord extraction cap.
+        self.session.case_record_extracted_this_turn = false;
+        // Issue #579: reset the per-turn FeedbackKind second-pass cap. Mirror
+        // of `work_mode_confirm_called_this_turn` semantics — the flag flips
+        // to `true` only when the orchestrator actually dispatches to the
+        // sidecar (model.is_some()), so skipped / sidecar-unavailable paths
+        // never starve subsequent turns of a confirmation attempt.
+        self.feedback_kind_confirm_called_this_turn = false;
+        // Issue #580: reset the per-turn Quality-gate second-pass cap AND the
+        // per-turn memoization cache. See the field doc for why this adapter
+        // is the only one that carries an in-turn cache (5 callsites vs.
+        // 1-2 for #576/#579).
+        self.quality_confirm_called_this_turn = false;
+        self.last_quality_confirm_result = None;
+        // Issue #463: reset the per-turn case_retrieval cap.
+        self.session.case_retrieval_invoked_this_turn = false;
+        // Issue #471: reset the per-turn eval log case retrieval summary.
+        self.last_case_retrieval_summary = None;
+        // Issue #464: reset the per-turn anti-pattern caps.
+        self.session.anti_pattern_extracted_this_turn = false;
+        self.session.anti_pattern_retrieval_invoked_this_turn = false;
+        // Issue #558: reset photon eval summary (consumed by build_eval_record).
+        self.last_photon_eval_summary = None;
+        // Issue #604 Task 5.2: reset the per-turn auto-promote cap flag and
+        // outcome cache. Mirror of `case_record_extracted_this_turn` semantics.
+        self.session.auto_promote_called_this_turn = false;
+        self.last_auto_promote_outcome = None;
+        // Issue #651 Phase 6.1: reset the per-turn SafeStop telemetry cap
+        // so the next user turn can emit `agent.verifier.weak` /
+        // `agent.verifier.missing` again if the failure mode repeats.
+        self.session.verifier_safe_stop_emitted_this_turn = false;
+        // Issue #664 iteration-2 (CB-001): reset the per-turn Stage A
+        // observation flag. The flag is set when
+        // `run_task_contract_verifier_once` observes
+        // `OwnedTestVerifierPlan::Missing` (single producer); read by
+        // `build_arbiter_candidates` as the SetupBootstrap signal Stage A.
+        //
+        // Issue #664 iteration-3 (CB2-001): consume the cross-turn
+        // carryover **before** the per-turn reset clears it. The
+        // carryover is set on the previous turn's
+        // `OwnedTestVerifierPlan::Missing` arm (which immediately
+        // exits via `SafeStop`), so the **only** opportunity for the
+        // SetupBootstrap arbiter to see the signal is the head of the
+        // next user-message turn. Promote the carryover into
+        // `_this_turn`, then clear the carryover so it never
+        // accumulates across multiple SafeStop cycles.
+        //
+        // Issue #664 iteration-4 (CB3-001): the promotion is now
+        // request-bound. Compute the current turn's
+        // `RequestCarryoverKey` (16-hex digest of
+        // `mask_secrets(active_request_text)`) and compare to the
+        // stored key. Promote only on equality — a topic switch
+        // clears the carryover without promotion so the stale
+        // Stage A signal cannot grant the Bash-only
+        // `setup_bootstrap` policy to an unrelated request. The
+        // carryover field is always cleared so it is consumed
+        // exactly once (single-shot invariant preserved from
+        // iteration-3).
+        let promoted = match (
+            self.owned_test_verifier_missing_observed_carryover.take(),
+            self.active_request_text(),
+        ) {
+            (Some(stored), Some(current)) => {
+                let current_key = super::task_contract::RequestCarryoverKey::from_request(&current);
+                stored == current_key
+            }
+            // Missing stored key OR missing current request text → fail
+            // closed and do not promote (`active_request_text()` is
+            // `None` only when the session has no user-driving
+            // message, which can never match a key produced from a
+            // real request).
+            _ => false,
+        };
+        self.owned_test_verifier_missing_observed_this_turn = promoted;
+        // Issue #606 (T-1.8): reset the per-turn completion-evidence set so
+        // observations never bleed across turns. Push-only `EvidenceSet`
+        // populated by the Bash / Edit / Write hooks below; consumed by
+        // `success.rs::run_post_loop_success_verifier` via
+        // `ProtocolKind::evidence_set_satisfies`.
+        self.evidence_set_this_turn.clear();
+        self.task_contract_evidence_set_this_turn.clear();
+        // Issue #636: drop per-turn behavior-coverage excerpts so the
+        // current turn never observes a previous turn's edits.
+        self.task_contract_excerpts.clear();
+        self.current_artifact_recovery_target = None;
+        // Issue #652: per-turn reset of the artifact completion job state
+        // (DR3-003 / per-turn cap pattern). A job is only reconstructed
+        // through `set_artifact_recovery_target_from_hint`, so dropping it
+        // here cannot leak prior-turn budget into the new turn.
+        self.artifact_completion_job = None;
+        self.task_contract_verifier_repair_pending = false;
+        // Issue #647 (SF1 V3.2): mirror reset for the verifier-passed
+        // hint that backs `SpecAuthorityInput.has_verified_public_interface`.
+        // Lives at the same per-turn reset boundary as the
+        // `task_contract_verifier_repair_pending` flag so a previous turn's
+        // verifier success cannot leak into the current turn's
+        // SpecAuthority resolution.
+        self.task_contract_verifier_passed_this_actor_loop = false;
+        self.repair_job = None;
+        // Issue #637 (CB-001): reset the artifact-recovery retry counter at
+        // the same per-turn boundary as `repair_job` so a previous turn's
+        // `RepairArtifact` increments do not bleed into this turn and prematurely
+        // trip `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`. The legacy
+        // `verifier_repair_retries` was a `run_turn`-local `usize` and always
+        // started at 0; this restores that semantics for the Agent-field
+        // counter.
+        self.repair_job_artifact_attempts = 0;
+        // Issue #638 (Task 1.4): clear the turn-local failure snapshot at the
+        // same boundary as `repair_job` (design policy §5, A-only).
+        self.repair_failure_snapshot = None;
+        let task_contract = self
+            .active_request_text()
+            .map(|request| super::task_contract::TaskContract::from_request(&request));
+        if self.session.mode_state.mode != ExecutionMode::Plan
+            && let Some(contract) = task_contract.as_ref()
+        {
+            let initial_decision =
+                contract.evaluate(&super::completion_evidence::EvidenceSet::new());
+            if matches!(
+                initial_decision,
+                super::task_contract::CompletionDecision::Continue { .. }
+            ) {
+                self.set_artifact_recovery_target_for_decision(&initial_decision, 0);
             }
         }
+        task_contract
     }
 
     fn actor_loop_pre_reply_flow_outcome(
@@ -6986,6 +7143,83 @@ impl Agent {
         }
     }
 
+    fn handle_actor_loop_completion(
+        &mut self,
+        args: ActorLoopCompletionArgs<'_, '_>,
+    ) -> ActorLoopCompletionOutcome {
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            let plan_contents = match self.current_plan_contents() {
+                Ok(contents) => contents.unwrap_or_default(),
+                Err(err) => {
+                    return ActorLoopCompletionOutcome::Exit {
+                        reason: ExitReason::TransportError,
+                        error_text: err,
+                    };
+                }
+            };
+            self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
+            if !self.plan_is_substantive_with_fallback(&plan_contents) {
+                let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
+                let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
+                let current_stage = lifecycle::current_plan_stage(&plan_contents);
+                *args.plan_progress_retries += 1;
+                if *args.plan_progress_retries >= 2 {
+                    return match self.materialize_deterministic_fallback_plan(
+                        "agent.plan.progress_fallback_materialized",
+                    ) {
+                        Ok(true) => ActorLoopCompletionOutcome::Done {
+                            final_prose:
+                                "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+                                    .to_string(),
+                        },
+                        Ok(false) => ActorLoopCompletionOutcome::Exit {
+                            reason: ExitReason::PlanIncomplete,
+                            error_text: ExitReason::PlanIncomplete
+                                .default_error_text()
+                                .to_string(),
+                        },
+                        Err(err) => ActorLoopCompletionOutcome::Exit {
+                            reason: ExitReason::TransportError,
+                            error_text: err,
+                        },
+                    };
+                }
+                write_stdout_rendered(
+                    &format_iteration_status(
+                        args.last_iter,
+                        self.config.max_iterations,
+                        "Plan still incomplete",
+                        &format!(
+                            "Asked the model to finish {} before approval.",
+                            join_sections_for_progress(&missing_sections)
+                        ),
+                        self.footer.current_cols(),
+                    ),
+                    true,
+                );
+                log_plan_stall(
+                    self.session_store.session_id(),
+                    args.last_iter,
+                    "plan_incomplete_after_reply",
+                    current_stage,
+                    &next_sections,
+                    &missing_sections,
+                    *args.plan_progress_retries,
+                );
+                self.push_system_note(recovery::plan_progress_recovery_note(
+                    current_stage,
+                    &next_sections,
+                    &missing_sections,
+                    *args.plan_progress_retries,
+                ));
+                return ActorLoopCompletionOutcome::Continue;
+            }
+        }
+        ActorLoopCompletionOutcome::Done {
+            final_prose: args.final_reply.to_string(),
+        }
+    }
+
     fn handle_actor_loop_post_tool_fallbacks(
         &mut self,
         args: ActorLoopPostToolFallbackArgs<'_>,
@@ -7696,146 +7930,7 @@ impl Agent {
         let mut before_snapshot = capture_repo_snapshot(&self.work_root);
         let mut accumulated: Vec<RepoVerification> = Vec::new();
         let mut last_known_root = self.work_root.clone();
-        // Issue #455 / D4 / CB-001: clear the in-snapshot turn-scoped flag
-        // so first-eligible-failure-wins starts fresh on this turn. The
-        // flag lives on `SessionSnapshot` itself (`#[serde(skip)]`), is set
-        // by every `record_feedback`/`record_feedback_if_unset` that writes
-        // an eligible-kind frame, and is consulted by
-        // `record_feedback_if_unset` to decide skip-vs-overwrite.
-        self.session.reset_eligible_feedback_recorded_this_turn();
-        // Issue #456 / DR2-003: reset the AnvilScore turn-local runtime
-        // fields. Inline assignment (no dedicated method) keeps SRP small.
-        // `consecutive_no_progress_turns` is session-cumulative and is
-        // intentionally NOT reset here.
-        self.session.unsafe_blocks_this_turn = 0;
-        self.session.repo_edit_succeeded_this_turn = false;
-        self.session.touched_files_at_turn_start =
-            self.session.working_memory.touched_files.clone();
-        // Issue #462: reset the per-turn CaseRecord extraction cap.
-        self.session.case_record_extracted_this_turn = false;
-        // Issue #579: reset the per-turn FeedbackKind second-pass cap. Mirror
-        // of `work_mode_confirm_called_this_turn` semantics — the flag flips
-        // to `true` only when the orchestrator actually dispatches to the
-        // sidecar (model.is_some()), so skipped / sidecar-unavailable paths
-        // never starve subsequent turns of a confirmation attempt.
-        self.feedback_kind_confirm_called_this_turn = false;
-        // Issue #580: reset the per-turn Quality-gate second-pass cap AND the
-        // per-turn memoization cache. See the field doc for why this adapter
-        // is the only one that carries an in-turn cache (5 callsites vs.
-        // 1-2 for #576/#579).
-        self.quality_confirm_called_this_turn = false;
-        self.last_quality_confirm_result = None;
-        // Issue #463: reset the per-turn case_retrieval cap.
-        self.session.case_retrieval_invoked_this_turn = false;
-        // Issue #471: reset the per-turn eval log case retrieval summary.
-        self.last_case_retrieval_summary = None;
-        // Issue #464: reset the per-turn anti-pattern caps.
-        self.session.anti_pattern_extracted_this_turn = false;
-        self.session.anti_pattern_retrieval_invoked_this_turn = false;
-        // Issue #558: reset photon eval summary (consumed by build_eval_record).
-        self.last_photon_eval_summary = None;
-        // Issue #604 Task 5.2: reset the per-turn auto-promote cap flag and
-        // outcome cache. Mirror of `case_record_extracted_this_turn` semantics.
-        self.session.auto_promote_called_this_turn = false;
-        self.last_auto_promote_outcome = None;
-        // Issue #651 Phase 6.1: reset the per-turn SafeStop telemetry cap
-        // so the next user turn can emit `agent.verifier.weak` /
-        // `agent.verifier.missing` again if the failure mode repeats.
-        self.session.verifier_safe_stop_emitted_this_turn = false;
-        // Issue #664 iteration-2 (CB-001): reset the per-turn Stage A
-        // observation flag. The flag is set when
-        // `run_task_contract_verifier_once` observes
-        // `OwnedTestVerifierPlan::Missing` (single producer); read by
-        // `build_arbiter_candidates` as the SetupBootstrap signal Stage A.
-        //
-        // Issue #664 iteration-3 (CB2-001): consume the cross-turn
-        // carryover **before** the per-turn reset clears it. The
-        // carryover is set on the previous turn's
-        // `OwnedTestVerifierPlan::Missing` arm (which immediately
-        // exits via `SafeStop`), so the **only** opportunity for the
-        // SetupBootstrap arbiter to see the signal is the head of the
-        // next user-message turn. Promote the carryover into
-        // `_this_turn`, then clear the carryover so it never
-        // accumulates across multiple SafeStop cycles.
-        //
-        // Issue #664 iteration-4 (CB3-001): the promotion is now
-        // request-bound. Compute the current turn's
-        // `RequestCarryoverKey` (16-hex digest of
-        // `mask_secrets(active_request_text)`) and compare to the
-        // stored key. Promote only on equality — a topic switch
-        // clears the carryover without promotion so the stale
-        // Stage A signal cannot grant the Bash-only
-        // `setup_bootstrap` policy to an unrelated request. The
-        // carryover field is always cleared so it is consumed
-        // exactly once (single-shot invariant preserved from
-        // iteration-3).
-        let promoted = match (
-            self.owned_test_verifier_missing_observed_carryover.take(),
-            self.active_request_text(),
-        ) {
-            (Some(stored), Some(current)) => {
-                let current_key = super::task_contract::RequestCarryoverKey::from_request(&current);
-                stored == current_key
-            }
-            // Missing stored key OR missing current request text → fail
-            // closed and do not promote (`active_request_text()` is
-            // `None` only when the session has no user-driving
-            // message, which can never match a key produced from a
-            // real request).
-            _ => false,
-        };
-        self.owned_test_verifier_missing_observed_this_turn = promoted;
-        // Issue #606 (T-1.8): reset the per-turn completion-evidence set so
-        // observations never bleed across turns. Push-only `EvidenceSet`
-        // populated by the Bash / Edit / Write hooks below; consumed by
-        // `success.rs::run_post_loop_success_verifier` via
-        // `ProtocolKind::evidence_set_satisfies`.
-        self.evidence_set_this_turn.clear();
-        self.task_contract_evidence_set_this_turn.clear();
-        // Issue #636: drop per-turn behavior-coverage excerpts so the
-        // current turn never observes a previous turn's edits.
-        self.task_contract_excerpts.clear();
-        self.current_artifact_recovery_target = None;
-        // Issue #652: per-turn reset of the artifact completion job state
-        // (DR3-003 / per-turn cap pattern). A job is only reconstructed
-        // through `set_artifact_recovery_target_from_hint`, so dropping it
-        // here cannot leak prior-turn budget into the new turn.
-        self.artifact_completion_job = None;
-        self.task_contract_verifier_repair_pending = false;
-        // Issue #647 (SF1 V3.2): mirror reset for the verifier-passed
-        // hint that backs `SpecAuthorityInput.has_verified_public_interface`.
-        // Lives at the same per-turn reset boundary as the
-        // `task_contract_verifier_repair_pending` flag so a previous turn's
-        // verifier success cannot leak into the current turn's
-        // SpecAuthority resolution.
-        self.task_contract_verifier_passed_this_actor_loop = false;
-        self.repair_job = None;
-        // Issue #637 (CB-001): reset the artifact-recovery retry counter at
-        // the same per-turn boundary as `repair_job` so a previous turn's
-        // `RepairArtifact` increments do not bleed into this turn and prematurely
-        // trip `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`. The legacy
-        // `verifier_repair_retries` was a `run_turn`-local `usize` and always
-        // started at 0; this restores that semantics for the Agent-field
-        // counter.
-        self.repair_job_artifact_attempts = 0;
-        // Issue #638 (Task 1.4): clear the turn-local failure snapshot at the
-        // same boundary as `repair_job` (design policy §5, A-only).
-        self.repair_failure_snapshot = None;
-        let task_contract = self
-            .active_request_text()
-            .map(|request| super::task_contract::TaskContract::from_request(&request));
-        if self.session.mode_state.mode != ExecutionMode::Plan
-            && let Some(contract) = task_contract.as_ref()
-        {
-            let initial_decision =
-                contract.evaluate(&super::completion_evidence::EvidenceSet::new());
-            if matches!(
-                initial_decision,
-                super::task_contract::CompletionDecision::Continue { .. }
-            ) {
-                self.set_artifact_recovery_target_for_decision(&initial_decision, 0);
-            }
-        }
+        let task_contract = self.prepare_actor_loop_turn_state();
 
         let mut tool_calls_made_this_turn = 0usize;
         let mut repo_edit_calls_made_this_turn = 0usize;
@@ -8638,75 +8733,28 @@ impl Agent {
                 }
             }
 
-            // Done
-            if self.session.mode_state.mode == ExecutionMode::Plan {
-                let plan_contents = match self.current_plan_contents() {
-                    Ok(contents) => contents.unwrap_or_default(),
-                    Err(err) => {
-                        exit_reason = ExitReason::TransportError;
-                        error_text = err;
-                        break 'outer;
-                    }
-                };
-                self.session.mode_state.plan_stage = lifecycle::current_plan_stage(&plan_contents);
-                if !self.plan_is_substantive_with_fallback(&plan_contents) {
-                    let next_sections = lifecycle::plan_next_stage_sections(&plan_contents);
-                    let missing_sections = lifecycle::plan_missing_sections(&plan_contents);
-                    let current_stage = lifecycle::current_plan_stage(&plan_contents);
-                    plan_progress_retries += 1;
-                    if plan_progress_retries >= 2 {
-                        match self.materialize_deterministic_fallback_plan(
-                            "agent.plan.progress_fallback_materialized",
-                        ) {
-                            Ok(true) => {
-                                final_prose = "Plan complete. Reply yes to execute, no to revise, or provide feedback.".to_string();
-                                exit_reason = ExitReason::Done;
-                            }
-                            Ok(false) => {
-                                exit_reason = ExitReason::PlanIncomplete;
-                                error_text = exit_reason.default_error_text().to_string();
-                            }
-                            Err(err) => {
-                                exit_reason = ExitReason::TransportError;
-                                error_text = err;
-                            }
-                        }
-                        break 'outer;
-                    }
-                    write_stdout_rendered(
-                        &format_iteration_status(
-                            last_iter,
-                            self.config.max_iterations,
-                            "Plan still incomplete",
-                            &format!(
-                                "Asked the model to finish {} before approval.",
-                                join_sections_for_progress(&missing_sections)
-                            ),
-                            self.footer.current_cols(),
-                        ),
-                        true,
-                    );
-                    log_plan_stall(
-                        self.session_store.session_id(),
-                        last_iter,
-                        "plan_incomplete_after_reply",
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        plan_progress_retries,
-                    );
-                    self.push_system_note(recovery::plan_progress_recovery_note(
-                        current_stage,
-                        &next_sections,
-                        &missing_sections,
-                        plan_progress_retries,
-                    ));
-                    continue;
+            match self.handle_actor_loop_completion(ActorLoopCompletionArgs {
+                last_iter,
+                final_reply: &final_reply,
+                plan_progress_retries: &mut plan_progress_retries,
+            }) {
+                ActorLoopCompletionOutcome::Continue => continue,
+                ActorLoopCompletionOutcome::Done {
+                    final_prose: next_final_prose,
+                } => {
+                    final_prose = next_final_prose;
+                    exit_reason = ExitReason::Done;
+                    break 'outer;
+                }
+                ActorLoopCompletionOutcome::Exit {
+                    reason,
+                    error_text: next_error_text,
+                } => {
+                    exit_reason = reason;
+                    error_text = next_error_text;
+                    break 'outer;
                 }
             }
-            final_prose = final_reply;
-            exit_reason = ExitReason::Done;
-            break 'outer;
         }
 
         // Single exit point: compute stats and return LoopResult

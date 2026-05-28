@@ -30,17 +30,17 @@
       "rough_cc_ge_threshold": 0
     },
     {
-      "avg_rough_cc": 2.87,
-      "function_loc": 33397,
-      "functions": 1104,
-      "max_rough_cc": 128,
+      "avg_rough_cc": 2.86,
+      "function_loc": 33413,
+      "functions": 1111,
+      "max_rough_cc": 116,
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc_ge_high_threshold": 1,
       "rough_cc_ge_threshold": 24
     }
   ],
   "files_analyzed": 4,
-  "functions_analyzed": 1372,
+  "functions_analyzed": 1379,
   "high_threshold": 50,
   "root": "/Users/maenokota/share/work/github_kewton/Anvil-develop",
   "schema_version": 1,
@@ -48,18 +48,11 @@
   "threshold": 15,
   "top_functions": [
     {
-      "line": 7685,
-      "loc": 1332,
+      "line": 7919,
+      "loc": 1146,
       "name": "run_actor_loop",
       "path": "src/agent/loop_run/turn.rs",
-      "rough_cc": 128
-    },
-    {
-      "line": 6052,
-      "loc": 200,
-      "name": "drive_actor_loop_pre_reply_phase",
-      "path": "src/agent/loop_run/turn.rs",
-      "rough_cc": 37
+      "rough_cc": 116
     },
     {
       "line": 1211,
@@ -76,14 +69,14 @@
       "rough_cc": 26
     },
     {
-      "line": 2565,
+      "line": 2590,
       "loc": 68,
       "name": "verifier_file_excerpt_for_line",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 21
     },
     {
-      "line": 13238,
+      "line": 13286,
       "loc": 150,
       "name": "run_verifier_repair_pass_and_apply",
       "path": "src/agent/loop_run/turn.rs",
@@ -97,23 +90,30 @@
       "rough_cc": 20
     },
     {
-      "line": 4347,
+      "line": 4372,
       "loc": 161,
       "name": "maybe_extract_case_record",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 19
     },
     {
-      "line": 22774,
+      "line": 22822,
       "loc": 30,
       "name": "synthesized_missing_test_target_path_for_request",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 19
     },
     {
-      "line": 6363,
+      "line": 6520,
       "loc": 151,
       "name": "handle_actor_loop_rejected_tool_batch",
+      "path": "src/agent/loop_run/turn.rs",
+      "rough_cc": 18
+    },
+    {
+      "line": 3675,
+      "loc": 142,
+      "name": "maybe_invoke_work_mode_confirm",
       "path": "src/agent/loop_run/turn.rs",
       "rough_cc": 18
     }
