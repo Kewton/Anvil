@@ -45,7 +45,9 @@ use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{ExecutionMode, PlanStage};
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
-use crate::session::feedback::FeedbackKind;
+use crate::session::feedback::{
+    FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
+};
 use crate::session::store::ConversationMessage;
 
 use super::Agent;
@@ -64,11 +66,9 @@ use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
 use super::turn::{
     LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, PlanExplorationKey,
-    PlanWriteSummary, build_feedback_for_no_repo_progress, build_feedback_for_unsafe_block,
-    build_plan_write_section_delta, join_sections_for_progress, normalize_exploration_path,
-    plan_path_matches, plan_phase_from_sections, plan_section_excerpt,
-    plan_write_previous_contents, plan_write_status, should_record_no_repo_progress, tool_display,
-    write_stdout_rendered,
+    PlanWriteSummary, build_plan_write_section_delta, join_sections_for_progress,
+    normalize_exploration_path, plan_path_matches, plan_phase_from_sections, plan_section_excerpt,
+    plan_write_previous_contents, plan_write_status, tool_display, write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
@@ -447,7 +447,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
         if *args.no_tool_retries >= 2 {
             agent
                 .session
-                .record_feedback_if_unset(super::turn::build_feedback_for_no_tool_call(
+                .record_feedback_if_unset(build_feedback_for_no_tool_call(
                     "answer_only_inadequate_reply",
                     &agent.work_root,
                 ));
@@ -676,15 +676,13 @@ pub(super) fn maybe_continue_missing_repo_framework_fallback(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> bool {
-    if !super::turn::should_try_framework_app_fallback(
-        args.last_iter,
-        *args.framework_app_fallback_materialized,
-    ) || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
+    if !should_try_framework_app_fallback(args.last_iter, *args.framework_app_fallback_materialized)
+        || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
     {
         return false;
     }
     *args.framework_app_fallback_materialized = true;
-    agent.push_system_note(super::turn::framework_app_fallback_continuation_note().to_string());
+    agent.push_system_note(framework_app_fallback_continuation_note().to_string());
     true
 }
 
@@ -1015,7 +1013,7 @@ fn handle_generic_prose_only_retry(
     if *no_tool_retries >= 3 {
         agent
             .session
-            .record_feedback_if_unset(super::turn::build_feedback_for_no_tool_call(
+            .record_feedback_if_unset(build_feedback_for_no_tool_call(
                 "no_tool_retries_exhausted",
                 &agent.work_root,
             ));
@@ -1072,7 +1070,7 @@ fn handle_actor_loop_missing_repo_change_retry_prompt(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
-            super::turn::missing_repo_change_retry_status_note(args.kind),
+            missing_repo_change_retry_status_note(args.kind),
             agent.footer.current_cols(),
         ),
         true,
@@ -1172,13 +1170,11 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
             ),
         };
     }
-    if super::turn::should_try_framework_app_fallback(
-        args.last_iter,
-        *args.framework_app_fallback_materialized,
-    ) && agent.maybe_materialize_framework_game_fallback(args.last_iter)
+    if should_try_framework_app_fallback(args.last_iter, *args.framework_app_fallback_materialized)
+        && agent.maybe_materialize_framework_game_fallback(args.last_iter)
     {
         *args.framework_app_fallback_materialized = true;
-        agent.push_system_note(super::turn::framework_app_fallback_continuation_note().to_string());
+        agent.push_system_note(framework_app_fallback_continuation_note().to_string());
         return ActorLoopNoToolReplyOutcome::Continue;
     }
     ActorLoopNoToolReplyOutcome::Exit {
@@ -1234,9 +1230,7 @@ fn sync_post_tool_contract_recovery_target(
             agent.clear_artifact_recovery_target("contract_artifacts_satisfied");
         }
         super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
-            agent.clear_artifact_recovery_target(super::turn::task_contract_safe_stop_clear_tag(
-                reason,
-            ));
+            agent.clear_artifact_recovery_target(task_contract_safe_stop_clear_tag(reason));
         }
     }
 }
@@ -1952,7 +1946,7 @@ pub(super) fn maybe_continue_actor_loop_framework_fallback(
         args.action_expectation,
         *args.repo_edit_calls_made_this_turn,
         recovery_dispatch_gate,
-    ) || !super::turn::should_try_framework_app_fallback(
+    ) || !should_try_framework_app_fallback(
         args.last_iter,
         *args.framework_app_fallback_materialized,
     ) || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
@@ -1960,7 +1954,7 @@ pub(super) fn maybe_continue_actor_loop_framework_fallback(
         return false;
     }
     *args.framework_app_fallback_materialized = true;
-    agent.push_system_note(super::turn::framework_app_fallback_continuation_note().to_string());
+    agent.push_system_note(framework_app_fallback_continuation_note().to_string());
     true
 }
 
@@ -2305,7 +2299,7 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
     if !agent.push_verifier_repair_recovery_note(*verifier_repair_retries)
         && !agent.push_artifact_directed_recovery_note(*verifier_repair_retries)
     {
-        agent.push_system_note(super::turn::task_contract_verifier_edit_required_note(
+        agent.push_system_note(task_contract_verifier_edit_required_note(
             *verifier_repair_retries,
             super::turn::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
         ));
@@ -2402,17 +2396,13 @@ pub(super) fn handle_actor_loop_rejected_tool_batch(
     ) {
         return outcome;
     }
-    if super::turn::unrestricted_policy_retry_exhausted(
-        focused_retry.is_some(),
-        *args.focused_policy_retries,
-    ) {
+    if unrestricted_policy_retry_exhausted(focused_retry.is_some(), *args.focused_policy_retries) {
         return ActorLoopToolPreparationOutcome::Exit {
             reason: ExitReason::ToolCallFormatError,
             error_text: "assistant kept calling tools outside the current tool policy".to_string(),
         };
     }
-    let retry_status_note =
-        super::turn::rejected_tool_batch_retry_status_note(focused_retry.is_some());
+    let retry_status_note = rejected_tool_batch_retry_status_note(focused_retry.is_some());
     super::turn::write_stdout_rendered(
         &super::turn::format_iteration_status(
             args.last_iter,
@@ -2533,7 +2523,7 @@ pub(super) fn maybe_handle_rejected_tool_batch_focused_retry_exhausted(
     recovery_dispatch_gate: RecoveryDispatchGate,
     recovery_owner: RecoveryOwner,
 ) -> Option<ActorLoopToolPreparationOutcome> {
-    if !super::turn::focused_policy_retry_exhausted(focused_retry_present, focused_policy_retries) {
+    if !focused_policy_retry_exhausted(focused_retry_present, focused_policy_retries) {
         return None;
     }
     if !recovery_dispatch_gate.allows_focused_edit_recovery() {
@@ -4257,4 +4247,113 @@ pub(super) fn normalize_plan_exploration_key(
         tool_name: tool_name.to_string(),
         normalized_args,
     })
+}
+
+pub(super) fn build_feedback_for_unsafe_block(
+    command: &str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::UnsafeCommandBlocked,
+        command: Some(command.to_string()),
+        primary_error: Some(format!("unsafe command blocked: {command}")),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+pub(super) fn build_feedback_for_no_repo_progress(workspace_root: &Path) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::NoRepoProgress,
+        primary_error: Some("turn ended without modifying repository files".to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+pub(super) fn build_feedback_for_no_tool_call(
+    reason: &'static str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::NoToolCall,
+        primary_error: Some(reason.to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+pub(super) fn should_record_no_repo_progress(
+    repo_edit_calls_made_this_turn: usize,
+    final_made_any_progress: bool,
+    last_feedback_changed_this_turn: bool,
+) -> bool {
+    repo_edit_calls_made_this_turn > 0
+        && !final_made_any_progress
+        && !last_feedback_changed_this_turn
+}
+
+pub(super) fn task_contract_verifier_edit_required_note(
+    attempt: usize,
+    attempt_limit: usize,
+) -> String {
+    format!(
+        "[Task Contract Verification] The verifier already failed and no repository edit has been made since that diagnostic. Do not rerun verification and do not answer in prose. Inspect project files if needed, then emit a Write or Edit tool call that repairs the failing implementation, tests, or setup. task_contract_verify_edit_attempt={attempt}/{attempt_limit}"
+    )
+}
+
+pub(super) fn missing_repo_change_retry_status_note(
+    kind: ActorLoopMissingRepoChangeReplyKind,
+) -> &'static str {
+    match kind {
+        ActorLoopMissingRepoChangeReplyKind::Empty => {
+            "The model replied without edits. Asked it to make the required repository changes."
+        }
+        ActorLoopMissingRepoChangeReplyKind::ProseOnly => {
+            "The model answered with prose only. Asked it to emit exactly one tool call now and resume concrete repo work."
+        }
+    }
+}
+
+pub(super) fn task_contract_safe_stop_clear_tag(
+    reason: super::task_contract::SafeStopReason,
+) -> &'static str {
+    match reason {
+        super::task_contract::SafeStopReason::VerifierWeak => {
+            "task_contract_safe_stop_verifier_weak"
+        }
+        super::task_contract::SafeStopReason::VerifierMissing => {
+            "task_contract_safe_stop_verifier_missing"
+        }
+    }
+}
+
+pub(super) fn focused_policy_retry_exhausted(focused_retry_present: bool, retries: usize) -> bool {
+    focused_retry_present && retries >= 3
+}
+
+pub(super) fn unrestricted_policy_retry_exhausted(
+    focused_retry_present: bool,
+    retries: usize,
+) -> bool {
+    !focused_retry_present && retries >= 3
+}
+
+pub(super) fn rejected_tool_batch_retry_status_note(focused_retry_present: bool) -> &'static str {
+    if focused_retry_present {
+        "Focused edit recovery requires exactly one compact tool call on the target file. Asked the model to retry with a single action."
+    } else {
+        "The tool call violated the current tool policy. Asked the model to retry with an allowed tool."
+    }
+}
+
+pub(super) fn should_try_framework_app_fallback(
+    last_iter: usize,
+    already_materialized: bool,
+) -> bool {
+    last_iter > 1 && !already_materialized
+}
+
+pub(super) fn framework_app_fallback_continuation_note() -> &'static str {
+    "[Deterministic App Fallback] Treat the materialized framework files as a recovery scaffold only, not as task completion. Continue by reading and editing the real UI entry file with task-specific implementation details, then verify the app before final response."
 }
