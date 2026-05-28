@@ -3803,6 +3803,16 @@ struct DeterministicScaffoldSpec {
     files: Vec<(PathBuf, String)>,
 }
 
+struct PhotonEvaluateCompletedLog {
+    failed: bool,
+    duration_ms: u128,
+    summary_ids_adopted_count: usize,
+    adoption_status: &'static str,
+    truncated: bool,
+    outcome_json: serde_json::Value,
+    outcome_detail_json: serde_json::Value,
+}
+
 type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
 
 fn verifier_repair_transition_message() -> String {
@@ -3884,6 +3894,27 @@ fn anti_pattern_failed_action_summary(frame: &FeedbackFrame) -> String {
         .clone()
         .or_else(|| frame.command().map(|s| s.to_string()))
         .unwrap_or_else(|| format!("{:?}", frame.kind))
+}
+
+fn photon_evaluate_adoption_status(shadow_mode: bool, adopted_items: usize) -> &'static str {
+    if shadow_mode {
+        "shadow_not_injected"
+    } else if adopted_items > 0 {
+        "injected"
+    } else {
+        "not_injected"
+    }
+}
+
+fn photon_items_adopted_count(shadow_mode: bool, adopted_items: usize) -> usize {
+    if shadow_mode { 0 } else { adopted_items }
+}
+
+fn photon_outcome_json_value(outcome: Option<&'static str>) -> serde_json::Value {
+    match outcome {
+        Some(value) => serde_json::Value::String(value.to_string()),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
@@ -5788,16 +5819,8 @@ impl Agent {
         }
         let t0 = std::time::Instant::now();
         let shadow_mode = self.config.photon_shadow_mode;
-
-        // AN-5/AN-6: determine adoption_status and item counts from actual
-        // injection state rather than a hardcoded string.
-        let adoption_status = if shadow_mode {
-            "shadow_not_injected"
-        } else if self.last_photon_adopted_items > 0 {
-            "injected"
-        } else {
-            "not_injected"
-        };
+        let adoption_status =
+            photon_evaluate_adoption_status(shadow_mode, self.last_photon_adopted_items);
 
         // Issue #591 (DR4-NEW-001 / DR4-NEW-002): re-sanitize → drop → cap.
         //
@@ -5813,12 +5836,8 @@ impl Agent {
         let summary_ids_adopted = sanitized.list;
         let truncated = sanitized.truncated;
         let summary_ids_adopted_count = summary_ids_adopted.len();
-        // shadow_mode forces items_adopted_count=0 too (DR4-NEW-002).
-        let items_adopted_count = if shadow_mode {
-            0
-        } else {
-            self.last_photon_adopted_items
-        };
+        let items_adopted_count =
+            photon_items_adopted_count(shadow_mode, self.last_photon_adopted_items);
 
         // AS-04 / Issue #601: derive outcome + outcome_detail from the
         // same-turn FeedbackKind / AnvilScore / shadow flag / adopted count
@@ -5830,12 +5849,6 @@ impl Agent {
         // `CompletionEvidence::VerifierExitZero` push site in
         // `observe_evidence_from_bash_outcome` (same turn, same iteration
         // boundary as `evidence_set_this_turn.clear()` at run_actor_loop head).
-        let verifier_exit_zero_this_turn = self.evidence_set_this_turn.iter().any(|e| {
-            matches!(
-                e,
-                super::completion_evidence::CompletionEvidence::VerifierExitZero { .. }
-            )
-        });
         let inputs = PhotonOutcomeInputs {
             last_feedback_kind: self.session.last_feedback.as_ref().map(|ff| &ff.kind),
             eligible_feedback_recorded_this_turn: self.session.eligible_feedback_recorded_this_turn,
@@ -5850,43 +5863,25 @@ impl Agent {
             // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
             work_mode_is_answer_only: self.answer_only_mode_active(),
             // Issue #608 Phase α-2 (AP-10 / 設計判断 #2 + #3): Case E expansion.
-            verifier_exit_zero_this_turn,
+            verifier_exit_zero_this_turn: self.photon_verifier_exit_zero_this_turn(),
         };
         let PhotonFeedbackOutcome {
             outcome: outcome_static,
             outcome_detail: outcome_detail_static,
         } = derive_photon_feedback_outcome(&inputs);
-        let outcome_json: serde_json::Value = match outcome_static {
-            Some(s) => serde_json::Value::String(s.to_string()),
-            None => serde_json::Value::Null,
-        };
-        let outcome_detail_json: serde_json::Value = match outcome_detail_static {
-            Some(s) => serde_json::Value::String(s.to_string()),
-            None => serde_json::Value::Null,
-        };
+        let outcome_json = photon_outcome_json_value(outcome_static);
+        let outcome_detail_json = photon_outcome_json_value(outcome_detail_static);
 
         // Only include context_pack_event when we have a request_id; the sidecar
         // requires context_pack_request_id: str (non-null).
-        let context_pack_event = if let Some(ref cpack_id) = self.last_context_pack_id {
-            serde_json::json!({
-                "context_pack_request_id": cpack_id,
-                "adoption_status": adoption_status,
-                "evidence_expand_requested": false,
-                "evidence_ids_expanded": [],
-                "items_adopted_count": items_adopted_count,
-                "items_ignored_count": 0,
-                // Issue #591 (AS-03) — adoption signal carried back to photon.
-                "summary_ids_adopted": summary_ids_adopted,
-                "summary_ids_adopted_truncated": truncated,
-                "outcome": outcome_json.clone(),
-                // Issue #601: no-progress detail tag. Static-allowlist string
-                // or null. photon side `_FAILURE_DETAILS` allowlist consumes
-                // this in F-1 follow-up Issue.
-                "outcome_detail": outcome_detail_json.clone(),
-            })
-        } else {
-            serde_json::Value::Null
-        };
+        let context_pack_event = self.build_photon_context_pack_event(
+            adoption_status,
+            items_adopted_count,
+            summary_ids_adopted,
+            truncated,
+            &outcome_json,
+            &outcome_detail_json,
+        );
         let req = crate::photon::schema::EvaluateRequest(serde_json::json!({
             "schema_version": crate::photon::mapper::PHOTON_EVALUATE_SCHEMA_VERSION,
             "request_id": uuid::Uuid::now_v7().to_string(),
@@ -5899,53 +5894,102 @@ impl Agent {
         }));
         let result = self.photon.as_ref().unwrap().evaluate(&req);
         let duration_ms = t0.elapsed().as_millis();
-        // Issue #558 / AN-6: parse EvaluateResponse and store in last_photon_eval_summary.
-        if let Some(ref resp) = result {
-            let mut summary = crate::photon::eval::parse_evaluate_response(resp);
-            // Fallback: if the response lacks context_pack_id, use last_context_pack_id.
-            if summary.context_pack_id.is_none() {
-                summary.context_pack_id = self.last_context_pack_id.clone();
-            }
-            // AN-6: override prompt_adopted from actual injection state so
-            // eval.jsonl reflects whether Anvil injected the context, not just
-            // what the sidecar acknowledged.
-            if !shadow_mode {
-                summary.prompt_adopted = Some(self.last_photon_adopted_items > 0);
-            }
-            // Issue #591 (VR-08 / T4.6): populate the post-cap count into the
-            // session-layer summary so `build_eval_record` writes it into
-            // `eval.jsonl`. shadow_mode yields Some(0) — the field's purpose
-            // is to record what was actually sent (which is 0 in shadow).
-            summary.summary_ids_adopted_count = Some(summary_ids_adopted_count);
-            // Issue #601 (S5-003 / 設計判断 #1 (B)): persist the agent-side
-            // outcome + outcome_detail into eval.jsonl. Downstream fine-tuning
-            // / A-0 dataset can then identify no-progress turns mechanically.
-            // String::from(&'static str) — no free-text path, audit-safe.
-            summary.outcome_emitted = outcome_static.map(String::from);
-            summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
-            self.last_photon_eval_summary = Some(summary);
-        }
+        self.store_photon_eval_summary(
+            result.as_ref(),
+            shadow_mode,
+            summary_ids_adopted_count,
+            outcome_static,
+            outcome_detail_static,
+        );
         // Issue #591 (AS-06 / DR4-NEW-004) + Issue #601: event payload
         // 4 → 8 keys (#591) → 9 keys (#601 adds `outcome_detail`). The raw
         // `summary_ids_adopted` array is NOT included — only counts and
         // static-allowlist strings cross the audit boundary.
         // `mask_payload_inplace` in `log_llm_event` provides the final
         // defensive scrub.
+        self.log_photon_evaluate_completed(PhotonEvaluateCompletedLog {
+            failed: result.is_none(),
+            duration_ms,
+            summary_ids_adopted_count,
+            adoption_status,
+            truncated,
+            outcome_json,
+            outcome_detail_json,
+        });
+    }
+
+    fn photon_verifier_exit_zero_this_turn(&self) -> bool {
+        self.evidence_set_this_turn.iter().any(|e| {
+            matches!(
+                e,
+                super::completion_evidence::CompletionEvidence::VerifierExitZero { .. }
+            )
+        })
+    }
+
+    fn build_photon_context_pack_event(
+        &self,
+        adoption_status: &str,
+        items_adopted_count: usize,
+        summary_ids_adopted: Vec<String>,
+        truncated: bool,
+        outcome_json: &serde_json::Value,
+        outcome_detail_json: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(cpack_id) = self.last_context_pack_id.as_ref() else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            "context_pack_request_id": cpack_id,
+            "adoption_status": adoption_status,
+            "evidence_expand_requested": false,
+            "evidence_ids_expanded": [],
+            "items_adopted_count": items_adopted_count,
+            "items_ignored_count": 0,
+            "summary_ids_adopted": summary_ids_adopted,
+            "summary_ids_adopted_truncated": truncated,
+            "outcome": outcome_json.clone(),
+            "outcome_detail": outcome_detail_json.clone(),
+        })
+    }
+
+    fn store_photon_eval_summary(
+        &mut self,
+        result: Option<&crate::photon::schema::EvaluateResponse>,
+        shadow_mode: bool,
+        summary_ids_adopted_count: usize,
+        outcome_static: Option<&'static str>,
+        outcome_detail_static: Option<&'static str>,
+    ) {
+        let Some(resp) = result else {
+            return;
+        };
+        let mut summary = crate::photon::eval::parse_evaluate_response(resp);
+        if summary.context_pack_id.is_none() {
+            summary.context_pack_id = self.last_context_pack_id.clone();
+        }
+        if !shadow_mode {
+            summary.prompt_adopted = Some(self.last_photon_adopted_items > 0);
+        }
+        summary.summary_ids_adopted_count = Some(summary_ids_adopted_count);
+        summary.outcome_emitted = outcome_static.map(String::from);
+        summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
+        self.last_photon_eval_summary = Some(summary);
+    }
+
+    fn log_photon_evaluate_completed(&self, payload: PhotonEvaluateCompletedLog) {
         log_llm_event(
             "agent.photon_evaluate.completed",
             serde_json::json!({
                 "session_id": self.session_store.session_id(),
                 "turn_index": self.current_turn_index,
-                "failed": result.is_none(),
-                "duration_ms": duration_ms,
-                "summary_ids_adopted_count": summary_ids_adopted_count,
-                "outcome": outcome_json,
-                "adoption_status": adoption_status,
-                "summary_ids_adopted_truncated": truncated,
-                // Issue #601: no-progress detail tag (static-allowlist string
-                // or null). Mirrors the `context_pack_event.outcome_detail`
-                // key for cross-channel audit consistency.
-                "outcome_detail": outcome_detail_json,
+                "failed": payload.failed,
+                "duration_ms": payload.duration_ms,
+                "summary_ids_adopted_count": payload.summary_ids_adopted_count,
+                "outcome": payload.outcome_json,
+                "adoption_status": payload.adoption_status,
+                "summary_ids_adopted_truncated": payload.truncated,
+                "outcome_detail": payload.outcome_detail_json,
             }),
         );
     }
@@ -18594,6 +18638,21 @@ mod tests {
             super::anti_pattern_failed_action_summary(&with_kind),
             "TestFailure"
         );
+    }
+
+    #[test]
+    fn photon_evaluate_adoption_status_prefers_shadow_then_injected_then_not_injected() {
+        assert_eq!(
+            super::photon_evaluate_adoption_status(true, 3),
+            "shadow_not_injected"
+        );
+        assert_eq!(super::photon_evaluate_adoption_status(false, 1), "injected");
+        assert_eq!(
+            super::photon_evaluate_adoption_status(false, 0),
+            "not_injected"
+        );
+        assert_eq!(super::photon_items_adopted_count(true, 7), 0);
+        assert_eq!(super::photon_items_adopted_count(false, 7), 7);
     }
 
     #[test]
