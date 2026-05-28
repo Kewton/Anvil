@@ -60,6 +60,7 @@ use super::progress_text::{
 };
 use super::progress_text::{no_color_requested, unicode_supported};
 use super::spinner::Spinner;
+use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 use super::summary::{ExitReason, LoopResult, LoopStats};
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_history::is_plan_file_tool_call;
@@ -441,7 +442,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
 ) -> Option<PostReplyRecoveryOutcome> {
     if !args.requires_action
         && agent.answer_only_mode_active()
-        && super::turn::answer_only_reply_is_inadequate(args.final_reply)
+        && answer_only_reply_is_inadequate(args.final_reply)
     {
         *args.no_tool_retries += 1;
         if *args.no_tool_retries >= 2 {
@@ -458,7 +459,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
             });
         }
         super::turn::write_stdout_rendered(
-            &super::turn::format_iteration_status(
+            &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
                 "Retry requested",
@@ -480,7 +481,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
-    if !(super::turn::should_apply_repo_change_quality_gate(
+    if !(should_apply_repo_change_quality_gate(
         args.action_expectation,
         agent.active_task_expects_repo_change(),
         agent.session.mode_state.mode,
@@ -493,7 +494,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
     match agent.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
-                &super::turn::format_iteration_status(
+                &format_iteration_status(
                     args.last_iter,
                     agent.config.max_iterations,
                     "Quality fallback",
@@ -503,7 +504,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
                 true,
             );
             agent.session.record_feedback_if_unset(
-                super::turn::build_feedback_for_deterministic_content_fallback(&agent.work_root),
+                build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
             agent.push_deterministic_ui_recovery_continuation_note(
                 &target_path,
@@ -529,7 +530,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         });
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Quality gate",
@@ -551,7 +552,7 @@ pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
-    if !super::turn::should_apply_repo_change_partial_progress_recovery(
+    if !should_apply_repo_change_partial_progress_recovery(
         args.action_expectation,
         args.repo_edit_calls_made_this_turn,
         args.final_reply,
@@ -573,7 +574,7 @@ pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
         });
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -625,7 +626,7 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
         });
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Quality gate",
@@ -659,7 +660,7 @@ pub(super) fn maybe_handle_missing_repo_edit_recovery(
         return Some(finalize_missing_repo_edit_retry_exhausted(agent));
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -759,7 +760,7 @@ pub(super) fn actor_loop_pre_reply_request_error(
             || super::lifecycle::is_tool_call_format_error(&err)
             || super::lifecycle::is_native_tool_transport_failure(&err))
     {
-        let frame = super::turn::build_feedback_for_tool_protocol_failure(&err, &agent.work_root);
+        let frame = build_feedback_for_tool_protocol_failure(&err, &agent.work_root);
         agent.session.record_feedback(frame);
     }
     ActorLoopPreReplyOutcome::Exit {
@@ -870,7 +871,7 @@ pub(super) fn handle_actor_loop_empty_reply(
             };
         }
         super::turn::write_stdout_rendered(
-            &super::turn::format_iteration_status(
+            &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
                 "Retry requested",
@@ -909,7 +910,7 @@ pub(super) fn handle_actor_loop_empty_reply(
         };
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -974,7 +975,7 @@ fn handle_plan_progress_prose_only_reply(
         return handle_plan_progress_prose_only_fallback(agent);
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -1023,7 +1024,7 @@ fn handle_generic_prose_only_retry(
         };
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -1066,7 +1067,7 @@ fn handle_actor_loop_missing_repo_change_retry_prompt(
     args: ActorLoopMissingRepoChangeRetryPromptArgs,
 ) -> ActorLoopNoToolReplyOutcome {
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -1142,7 +1143,7 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
             || agent.push_repo_change_no_edit_recovery_note(args.repo_change_retries))
     {
         super::turn::write_stdout_rendered(
-            &super::turn::format_iteration_status(
+            &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
                 "Retry requested",
@@ -1302,7 +1303,7 @@ pub(super) fn handle_actor_loop_completion(
                 };
             }
             super::turn::write_stdout_rendered(
-                &super::turn::format_iteration_status(
+                &format_iteration_status(
                     args.last_iter,
                     agent.config.max_iterations,
                     "Plan still incomplete",
@@ -1440,7 +1441,7 @@ pub(super) fn handle_actor_loop_post_tool_polish_fallback(
     match agent.maybe_apply_deterministic_polish_fallback(request, target_path) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
-                &super::turn::format_iteration_status(
+                &format_iteration_status(
                     last_iter,
                     agent.config.max_iterations,
                     "Polish fallback",
@@ -1450,7 +1451,7 @@ pub(super) fn handle_actor_loop_post_tool_polish_fallback(
                 true,
             );
             agent.session.record_feedback_if_unset(
-                super::turn::build_feedback_for_deterministic_content_fallback(&agent.work_root),
+                build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
             agent.push_deterministic_ui_recovery_continuation_note(
                 target_path,
@@ -1476,7 +1477,7 @@ fn handle_actor_loop_post_tool_quality_fallback(
     match agent.maybe_apply_deterministic_quality_fallback(request, target_path) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
-                &super::turn::format_iteration_status(
+                &format_iteration_status(
                     last_iter,
                     agent.config.max_iterations,
                     "Quality fallback",
@@ -1486,7 +1487,7 @@ fn handle_actor_loop_post_tool_quality_fallback(
                 true,
             );
             agent.session.record_feedback_if_unset(
-                super::turn::build_feedback_for_deterministic_content_fallback(&agent.work_root),
+                build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
             agent.push_deterministic_ui_recovery_continuation_note(
                 target_path,
@@ -1512,7 +1513,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
 ) -> ActorLoopPostToolFallbackOutcome {
     if repo_edit_calls_made_this_turn == 0
         || !recovery_dispatch_gate.allows_deterministic_fallback()
-        || !(super::turn::should_apply_repo_change_quality_gate(
+        || !(should_apply_repo_change_quality_gate(
             action_expectation,
             agent.active_task_expects_repo_change(),
             agent.session.mode_state.mode,
@@ -1526,7 +1527,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
     match agent.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
-                &super::turn::format_iteration_status(
+                &format_iteration_status(
                     last_iter,
                     agent.config.max_iterations,
                     "Quality fallback",
@@ -1536,7 +1537,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
                 true,
             );
             agent.session.record_feedback_if_unset(
-                super::turn::build_feedback_for_deterministic_content_fallback(&agent.work_root),
+                build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
             agent.push_deterministic_ui_recovery_continuation_note(
                 &target_path,
@@ -1553,7 +1554,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
                 }
             } else {
                 super::turn::write_stdout_rendered(
-                    &super::turn::format_iteration_status(
+                    &format_iteration_status(
                         last_iter,
                         agent.config.max_iterations,
                         "Quality gate",
@@ -1737,7 +1738,7 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
             super::tool_policy::FocusedEditBatchAction::TruncateToFirst => {
                 prepared_tool_calls.truncate(1);
                 super::turn::write_stdout_rendered(
-                    &super::turn::format_iteration_status(
+                    &format_iteration_status(
                         args.last_iter,
                         agent.config.max_iterations,
                         "Tool policy narrowed",
@@ -2070,7 +2071,7 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
                 (*args.contract_completion_retries).saturating_add(1),
             )
         });
-    if super::turn::task_contract_continue_requires_tool_recovery(
+    if task_contract_continue_requires_tool_recovery(
         Some(args.action),
         args.current_reply_tool_call_count,
     ) {
@@ -2135,10 +2136,8 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
             error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
         };
     }
-    let artifact_attempt = super::turn::increment_artifact_completion_role_attempt(
-        args.contract_completion_role_retries,
-        role,
-    );
+    let artifact_attempt =
+        increment_artifact_completion_role_attempt(args.contract_completion_role_retries, role);
     let attempt_limit = args.contract.artifact_completion_attempt_limit();
     if artifact_attempt >= attempt_limit {
         let expected_target = args
@@ -2161,7 +2160,7 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
         };
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -2198,10 +2197,8 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
         .first()
         .copied()
         .unwrap_or(super::task_contract::ArtifactRole::Implementation);
-    let artifact_attempt = super::turn::increment_artifact_completion_role_attempt(
-        args.contract_completion_role_retries,
-        role,
-    );
+    let artifact_attempt =
+        increment_artifact_completion_role_attempt(args.contract_completion_role_retries, role);
     let attempt_limit = args.contract.artifact_completion_attempt_limit();
     if artifact_attempt >= attempt_limit {
         let expected_target = args
@@ -2224,7 +2221,7 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
         };
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Task contract",
@@ -2287,7 +2284,7 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
         };
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -2342,8 +2339,7 @@ pub(super) fn handle_actor_loop_task_contract_safe_stop(
     reason: super::task_contract::SafeStopReason,
     last_iter: usize,
 ) -> ActorLoopTaskContractReplyOutcome {
-    let (mapped_reason, log_outcome) =
-        super::turn::task_contract_verifier_safe_stop_mapping(reason);
+    let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
     crate::logging::log_llm_event(
         "agent.task_contract.safe_stop",
         serde_json::json!({
@@ -2404,7 +2400,7 @@ pub(super) fn handle_actor_loop_rejected_tool_batch(
     }
     let retry_status_note = rejected_tool_batch_retry_status_note(focused_retry.is_some());
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -2475,10 +2471,8 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
             ),
         });
     }
-    let artifact_attempt = super::turn::increment_artifact_completion_role_attempt(
-        contract_completion_role_retries,
-        role,
-    );
+    let artifact_attempt =
+        increment_artifact_completion_role_attempt(contract_completion_role_retries, role);
     let attempt_limit = task_contract
         .as_ref()
         .map(|contract| contract.artifact_completion_attempt_limit())
@@ -2498,7 +2492,7 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
         });
     }
     super::turn::write_stdout_rendered(
-        &super::turn::format_iteration_status(
+        &format_iteration_status(
             last_iter,
             agent.config.max_iterations,
             "Retry requested",
@@ -2591,7 +2585,7 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
 ) -> Option<PostReplyRecoveryOutcome> {
     if !args.requires_action
         && agent.answer_only_mode_active()
-        && super::turn::reply_looks_like_future_work(args.final_reply)
+        && reply_looks_like_future_work(args.final_reply)
     {
         *args.no_tool_retries += 1;
         if *args.no_tool_retries >= 1 {
@@ -2602,7 +2596,7 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
             });
         }
         super::turn::write_stdout_rendered(
-            &super::turn::format_iteration_status(
+            &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
                 "Retry requested",
@@ -4356,4 +4350,190 @@ pub(super) fn should_try_framework_app_fallback(
 
 pub(super) fn framework_app_fallback_continuation_note() -> &'static str {
     "[Deterministic App Fallback] Treat the materialized framework files as a recovery scaffold only, not as task completion. Continue by reading and editing the real UI entry file with task-specific implementation details, then verify the app before final response."
+}
+
+pub(super) fn build_feedback_for_tool_protocol_failure(
+    err: &str,
+    workspace_root: &Path,
+) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::ToolProtocolFailure,
+        primary_error: Some(err.to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+pub(super) fn build_feedback_for_deterministic_content_fallback(
+    workspace_root: &Path,
+) -> FeedbackFrame {
+    let draft = FeedbackFrameDraft {
+        kind: FeedbackKind::ToolProtocolFailure,
+        primary_error: Some(DETERMINISTIC_CONTENT_FALLBACK_TAG.to_string()),
+        ..Default::default()
+    };
+    build_feedback_frame(draft, workspace_root)
+}
+
+pub(super) fn reply_looks_like_future_work(reply: &str) -> bool {
+    let normalized = reply.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    let completion_markers = [
+        "done",
+        "completed",
+        "implemented",
+        "finished",
+        "ready",
+        "作成しました",
+        "実装しました",
+        "完了",
+        "できました",
+    ];
+    if completion_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    let future_markers = [
+        "now i'll",
+        "now i will",
+        "i'll ",
+        "i will ",
+        "let me ",
+        "you can run",
+        "please run",
+        "run this yourself",
+        "run it yourself",
+        "next,",
+        "next i",
+        "次に",
+        "これから",
+        "今から",
+        "次は",
+        "探してみます",
+        "確認します",
+        "調べます",
+        "見てみます",
+        "してみます",
+        "実行してください",
+        "確認してください",
+    ];
+    future_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+pub(super) fn task_contract_verifier_safe_stop_mapping(
+    reason: super::task_contract::SafeStopReason,
+) -> (ExitReason, &'static str) {
+    match reason {
+        super::task_contract::SafeStopReason::VerifierWeak => {
+            (ExitReason::SafeStopVerifierWeak, "safe_stop_verifier_weak")
+        }
+        super::task_contract::SafeStopReason::VerifierMissing => (
+            ExitReason::SafeStopVerifierMissing,
+            "safe_stop_verifier_missing",
+        ),
+    }
+}
+
+pub(super) fn task_contract_continue_requires_tool_recovery(
+    action: Option<&super::task_contract::ArtifactRecoveryAction>,
+    current_reply_tool_calls: usize,
+) -> bool {
+    matches!(
+        action,
+        Some(super::task_contract::ArtifactRecoveryAction::Continue { .. })
+    ) && current_reply_tool_calls == 0
+}
+
+pub(super) fn increment_artifact_completion_role_attempt(
+    attempts: &mut HashMap<super::task_contract::ArtifactRole, usize>,
+    role: super::task_contract::ArtifactRole,
+) -> usize {
+    let entry = attempts.entry(role).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
+}
+
+pub(super) fn should_apply_repo_change_partial_progress_recovery(
+    action_expectation: recovery::ActionExpectation,
+    repo_edit_calls_made_this_turn: usize,
+    final_reply: &str,
+    task_contract_action: Option<&super::task_contract::ArtifactRecoveryAction>,
+) -> bool {
+    let contract_allows_generic_recovery = match task_contract_action {
+        None | Some(super::task_contract::ArtifactRecoveryAction::Done) => true,
+        Some(
+            super::task_contract::ArtifactRecoveryAction::Continue { .. }
+            | super::task_contract::ArtifactRecoveryAction::RunVerifier
+            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
+        ) => false,
+        // Issue #651 Phase 4.2: SafeStop says the agent must stop without
+        // claiming completion. Generic repo-change partial-progress
+        // recovery (which would prompt the model to keep editing) is
+        // never appropriate in that mode — we are about to surface the
+        // safe stop to the user. `_ =>` fallback stays forbidden per
+        // design judgement #2 so a future SafeStopReason variant lights
+        // up this match site.
+        Some(super::task_contract::ArtifactRecoveryAction::SafeStop { .. }) => false,
+    };
+
+    action_expectation == recovery::ActionExpectation::RepoChange
+        && repo_edit_calls_made_this_turn > 0
+        && contract_allows_generic_recovery
+        && reply_looks_like_future_work(final_reply)
+}
+
+pub(super) fn answer_only_reply_is_inadequate(reply: &str) -> bool {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "read('readme.md')" | "read(\"readme.md\")" | "glob('**/*.md')" | "grep"
+    ) {
+        return true;
+    }
+    if (lower.starts_with("read(")
+        || lower.starts_with("glob(")
+        || lower.starts_with("grep(")
+        || lower.starts_with("bash("))
+        && trimmed.chars().count() < 120
+    {
+        return true;
+    }
+    // Issue #574: do not use length as a proxy for adequacy. Short factual
+    // answers (codename, single value, Yes/No, especially in Japanese) were
+    // being discarded and replaced with a canned fallback. Only empty and
+    // tool-call-like replies are inadequate.
+    false
+}
+
+pub(super) fn format_iteration_status(
+    iter_human: usize,
+    max_iterations: usize,
+    headline: &str,
+    note: &str,
+    cols: Option<u16>,
+) -> String {
+    let mut lines = vec![format!("[iter {iter_human}/{max_iterations}] {headline}")];
+    lines.push(format_progress_field("  note:   ", note, cols));
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+pub(super) fn should_apply_repo_change_quality_gate(
+    action_expectation: recovery::ActionExpectation,
+    active_task_expects_repo_change: bool,
+    mode: ExecutionMode,
+) -> bool {
+    mode == ExecutionMode::Act
+        && (action_expectation == recovery::ActionExpectation::RepoChange
+            || active_task_expects_repo_change)
 }

@@ -15,7 +15,9 @@ use super::actor_loop_flow::{
     actor_loop_pre_reply_repo_change_fallback_allowed,
 };
 use super::actor_loop_flow::{
-    TaskContractVerifierFlowOutcome, repair_job_done_outcome, run_actor_loop,
+    TaskContractVerifierFlowOutcome, build_feedback_for_deterministic_content_fallback,
+    format_iteration_status, repair_job_done_outcome, run_actor_loop,
+    task_contract_verifier_safe_stop_mapping,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -196,7 +198,7 @@ use crate::tools::registry::{BashErrorClass, ToolSpec, resolve_plan_mode_write_t
 use crate::util::file_classify::is_test_file;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -205,9 +207,9 @@ use super::deterministic;
 use super::deterministic::empty_framework_app_files as deterministic_empty_framework_app_files;
 #[cfg(test)]
 use super::deterministic::empty_framework_game_files as deterministic_empty_framework_game_files;
-use super::progress_text::{format_progress_field, sanitize_for_progress, truncate};
 #[cfg(test)]
 use super::progress_text::{is_utf8_locale, tool_color, tool_emoji};
+use super::progress_text::{sanitize_for_progress, truncate};
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, quality_first_pass_observation,
@@ -221,7 +223,6 @@ use super::quality_confirm::{
     QualityConfirmation, QualityConfirmationSource, build_quality_confirm_log_payload,
     run_quality_confirm_with_strategy,
 };
-use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
@@ -1503,21 +1504,6 @@ fn build_feedback_for_unsafe_block_reason(
     build_feedback_frame(draft, workspace_root)
 }
 
-/// CB-001: build a FeedbackFrame for a tool-protocol failure detected
-/// by `lifecycle::is_native_tool_parser_failure` /
-/// `is_tool_call_format_error` / `is_native_tool_transport_failure`.
-pub(super) fn build_feedback_for_tool_protocol_failure(
-    err: &str,
-    workspace_root: &Path,
-) -> FeedbackFrame {
-    let draft = FeedbackFrameDraft {
-        kind: FeedbackKind::ToolProtocolFailure,
-        primary_error: Some(err.to_string()),
-        ..Default::default()
-    };
-    build_feedback_frame(draft, workspace_root)
-}
-
 /// CB-001: build a FeedbackFrame for an Edit tool Err return. The
 /// command isn't a shell command so we use the raw error message as
 /// `primary_error` and stash the path token as `suspected_files`.
@@ -1531,27 +1517,6 @@ fn build_feedback_for_edit_failure(
         kind: FeedbackKind::EditFailure,
         primary_error: Some(err.to_string()),
         suspected_files: suspected,
-        ..Default::default()
-    };
-    build_feedback_frame(draft, workspace_root)
-}
-
-/// Issue #455 / D2 / DR1-002: subkind ("polish" / "quality" / ...) is
-/// intentionally NOT exposed via this helper because the AC regex
-/// (`(?i)deterministic|fallback|placeholder|scaffold|quality gate|repair|polish`)
-/// does not require it. Callers that need to distinguish in logs should
-/// use the surrounding `agent.*.fallback_applied` events.
-///
-/// Issue #455 / CB-001 / D2: FeedbackFrame for a successful deterministic
-/// content fallback (polish / quality / nextjs scaffold / playable UI repair
-/// / timeout-after wrappers). Uses fixed `primary_error` tag (DR1-002) — no
-/// subkind argument to avoid fan-out.
-pub(super) fn build_feedback_for_deterministic_content_fallback(
-    workspace_root: &Path,
-) -> FeedbackFrame {
-    let draft = FeedbackFrameDraft {
-        kind: FeedbackKind::ToolProtocolFailure,
-        primary_error: Some(DETERMINISTIC_CONTENT_FALLBACK_TAG.to_string()),
         ..Default::default()
     };
     build_feedback_frame(draft, workspace_root)
@@ -1639,57 +1604,6 @@ fn raw_mode_safe_text(text: &str) -> String {
     text.replace('\n', "\r\n")
 }
 
-pub(super) fn reply_looks_like_future_work(reply: &str) -> bool {
-    let normalized = reply.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
-    }
-    let completion_markers = [
-        "done",
-        "completed",
-        "implemented",
-        "finished",
-        "ready",
-        "作成しました",
-        "実装しました",
-        "完了",
-        "できました",
-    ];
-    if completion_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-    {
-        return false;
-    }
-    let future_markers = [
-        "now i'll",
-        "now i will",
-        "i'll ",
-        "i will ",
-        "let me ",
-        "you can run",
-        "please run",
-        "run this yourself",
-        "run it yourself",
-        "next,",
-        "next i",
-        "次に",
-        "これから",
-        "今から",
-        "次は",
-        "探してみます",
-        "確認します",
-        "調べます",
-        "見てみます",
-        "してみます",
-        "実行してください",
-        "確認してください",
-    ];
-    future_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-}
-
 pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
     pub(super) before_snapshot: &'a RepoSnapshot,
     pub(super) accumulated: &'a [RepoVerification],
@@ -1702,29 +1616,6 @@ pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
     pub(super) task_contract_verify_commands_collected: &'b mut Vec<String>,
     pub(super) task_contract_verifier_passed_in_loop: &'b mut bool,
     pub(super) last_iter: usize,
-}
-
-/// Issue #651 PR-002: pure mapping from
-/// `task_contract::SafeStopReason` to the surfacing pair
-/// `(ExitReason, "log_outcome" tag)` used by the task-contract verifier
-/// dispatch. Extracted from the inline match in
-/// `drive_task_contract_verifier` so unit tests can pin the mapping
-/// without spinning up an `Agent`.
-///
-/// `_ =>` fallback is forbidden so a future `SafeStopReason` variant
-/// lights up compile errors here (design judgement #2).
-pub(super) fn task_contract_verifier_safe_stop_mapping(
-    reason: super::task_contract::SafeStopReason,
-) -> (ExitReason, &'static str) {
-    match reason {
-        super::task_contract::SafeStopReason::VerifierWeak => {
-            (ExitReason::SafeStopVerifierWeak, "safe_stop_verifier_weak")
-        }
-        super::task_contract::SafeStopReason::VerifierMissing => (
-            ExitReason::SafeStopVerifierMissing,
-            "safe_stop_verifier_missing",
-        ),
-    }
 }
 
 fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) -> ExitReason {
@@ -1749,54 +1640,6 @@ fn task_contract_needs_verification(
             super::task_contract::CompletionDecision::Verify
         )
     })
-}
-
-pub(super) fn task_contract_continue_requires_tool_recovery(
-    action: Option<&super::task_contract::ArtifactRecoveryAction>,
-    current_reply_tool_calls: usize,
-) -> bool {
-    matches!(
-        action,
-        Some(super::task_contract::ArtifactRecoveryAction::Continue { .. })
-    ) && current_reply_tool_calls == 0
-}
-
-pub(super) fn increment_artifact_completion_role_attempt(
-    attempts: &mut HashMap<super::task_contract::ArtifactRole, usize>,
-    role: super::task_contract::ArtifactRole,
-) -> usize {
-    let entry = attempts.entry(role).or_insert(0);
-    *entry = entry.saturating_add(1);
-    *entry
-}
-
-pub(super) fn should_apply_repo_change_partial_progress_recovery(
-    action_expectation: recovery::ActionExpectation,
-    repo_edit_calls_made_this_turn: usize,
-    final_reply: &str,
-    task_contract_action: Option<&super::task_contract::ArtifactRecoveryAction>,
-) -> bool {
-    let contract_allows_generic_recovery = match task_contract_action {
-        None | Some(super::task_contract::ArtifactRecoveryAction::Done) => true,
-        Some(
-            super::task_contract::ArtifactRecoveryAction::Continue { .. }
-            | super::task_contract::ArtifactRecoveryAction::RunVerifier
-            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
-        ) => false,
-        // Issue #651 Phase 4.2: SafeStop says the agent must stop without
-        // claiming completion. Generic repo-change partial-progress
-        // recovery (which would prompt the model to keep editing) is
-        // never appropriate in that mode — we are about to surface the
-        // safe stop to the user. `_ =>` fallback stays forbidden per
-        // design judgement #2 so a future SafeStopReason variant lights
-        // up this match site.
-        Some(super::task_contract::ArtifactRecoveryAction::SafeStop { .. }) => false,
-    };
-
-    action_expectation == recovery::ActionExpectation::RepoChange
-        && repo_edit_calls_made_this_turn > 0
-        && contract_allows_generic_recovery
-        && reply_looks_like_future_work(final_reply)
 }
 
 fn task_contract_verifier_repair_note(
@@ -2480,33 +2323,6 @@ fn test_artifact_path_family(path: &str) -> Option<&'static str> {
     None
 }
 
-pub(super) fn answer_only_reply_is_inadequate(reply: &str) -> bool {
-    let trimmed = reply.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "read('readme.md')" | "read(\"readme.md\")" | "glob('**/*.md')" | "grep"
-    ) {
-        return true;
-    }
-    if (lower.starts_with("read(")
-        || lower.starts_with("glob(")
-        || lower.starts_with("grep(")
-        || lower.starts_with("bash("))
-        && trimmed.chars().count() < 120
-    {
-        return true;
-    }
-    // Issue #574: do not use length as a proxy for adequacy. Short factual
-    // answers (codename, single value, Yes/No, especially in Japanese) were
-    // being discarded and replaced with a canned fallback. Only empty and
-    // tool-call-like replies are inadequate.
-    false
-}
-
 fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
     text.split(|ch: char| {
         ch.is_whitespace()
@@ -2715,19 +2531,6 @@ fn deterministic_timeout_fallback_plan(
     format!(
         "# Plan\n\n## Goal\n- Build {request_label} as a {platform_label} inside `{worktree_name}`.\n- Ensure the result runs locally on {port} and feels intentionally polished rather than placeholder-quality.\n\n## Constraints\n- Keep all work inside the current repository root and use repository-relative paths.\n- If the repository is empty, scaffold only the minimum project structure needed before implementing the requested feature.\n- Keep the implementation incremental and avoid placeholder-only output.\n\n## First Action\n- Confirm or scaffold the base app, then make the first concrete implementation edit in a primary artifact such as `src/app/page.tsx`, `app/page.tsx`, or the equivalent entry file.\n- Anchor `package.json` scripts and local startup behavior to {port} before final verification.\n\n## Verification\n- Install dependencies when needed and confirm the app boots locally on {port}.\n- Exercise the main interaction or user-facing flow end-to-end, including success and failure states where applicable.\n- If verification cannot run because of sandbox, network, or host constraints, report that exact constraint instead of treating the work as verified.\n\n<!-- runtime fallback plan: generated after repeated planning model timeouts; focus on {execution_focus}. -->\n"
     )
-}
-
-pub(super) fn format_iteration_status(
-    iter_human: usize,
-    max_iterations: usize,
-    headline: &str,
-    note: &str,
-    cols: Option<u16>,
-) -> String {
-    let mut lines = vec![format!("[iter {iter_human}/{max_iterations}] {headline}")];
-    lines.push(format_progress_field("  note:   ", note, cols));
-    lines.push(String::new());
-    lines.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -13574,12 +13377,14 @@ fn build_task_contract_verifier_exit_zero_evidence_bound(
 
 #[cfg(test)]
 mod tests {
-    use super::super::actor_loop_flow::normalize_plan_exploration_key;
+    use super::super::actor_loop_flow::{
+        answer_only_reply_is_inadequate, normalize_plan_exploration_key,
+    };
     use super::ExitReason;
     use super::{
-        PlanExplorationKey, TaskContractVerifierOutcome, answer_only_reply_is_inadequate,
-        answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
-        assistant_model_for_mode, build_task_contract_verifier_exit_zero_evidence,
+        PlanExplorationKey, TaskContractVerifierOutcome, answer_only_script_command_allowed,
+        answer_only_script_execution_fallback_response, assistant_model_for_mode,
+        build_task_contract_verifier_exit_zero_evidence,
         build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
         classify_verifier_timeout, deterministic_timeout_fallback_plan,
         effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
@@ -14148,7 +13953,7 @@ mod tests {
     #[test]
     fn tool_protocol_failure_yields_tool_protocol_failure_frame() {
         let dir = tempdir().unwrap();
-        let frame = super::build_feedback_for_tool_protocol_failure(
+        let frame = super::super::actor_loop_flow::build_feedback_for_tool_protocol_failure(
             "native tool parser failed: unexpected end element",
             dir.path(),
         );
@@ -19906,16 +19711,6 @@ fn collect_meaningful_workspace_files(
     Ok(())
 }
 
-pub(super) fn should_apply_repo_change_quality_gate(
-    action_expectation: recovery::ActionExpectation,
-    active_task_expects_repo_change: bool,
-    mode: ExecutionMode,
-) -> bool {
-    mode == ExecutionMode::Act
-        && (action_expectation == recovery::ActionExpectation::RepoChange
-            || active_task_expects_repo_change)
-}
-
 fn is_page_component_target(relative: &str) -> bool {
     matches!(relative, "app/page.tsx" | "src/app/page.tsx")
         || relative.ends_with("/app/page.tsx")
@@ -20847,15 +20642,18 @@ fn compact_progress_path(path: &str, max_chars: usize) -> String {
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 mod truncate_tests {
+    use super::super::actor_loop_flow::{
+        reply_looks_like_future_work, should_apply_repo_change_partial_progress_recovery,
+        task_contract_continue_requires_tool_recovery,
+    };
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
     use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
         ScaffoldFramework, changed_files_for_verifier, deterministic_nextjs_scaffold_reply,
-        extract_filename_with_suffix, focused_edit_tool_policy_error, reply_looks_like_future_work,
+        extract_filename_with_suffix, focused_edit_tool_policy_error,
         repo_edit_satisfies_artifact_recovery_target, requested_scaffold_framework,
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_command_matches_framework,
-        scaffold_file_snapshot, should_apply_repo_change_partial_progress_recovery,
-        task_contract_continue_requires_tool_recovery, task_contract_needs_verification,
+        scaffold_file_snapshot, task_contract_needs_verification,
         task_contract_verifier_repair_note, task_or_plan_requires_nextjs_scaffold,
         task_requires_nextjs_scaffold, truncate,
     };
@@ -21455,8 +21253,8 @@ mod truncate_tests {
 mod progress_tests {
     use super::super::actor_loop_flow::{
         format_blocked_progress_line, format_progress_line,
-        framework_app_fallback_continuation_note, should_try_framework_app_fallback,
-        task_contract_verifier_edit_required_note,
+        framework_app_fallback_continuation_note, should_apply_repo_change_quality_gate,
+        should_try_framework_app_fallback, task_contract_verifier_edit_required_note,
     };
     use super::super::repair_job::{
         SNAPSHOT_FIELD_BYTE_CAP, sanitize_repair_job_text, truncate_for_snapshot,
@@ -21494,22 +21292,22 @@ mod progress_tests {
         recent_truncated_tool_call_attempt, render_deterministic_scaffold_continuation_note,
         repo_change_request_text, request_needs_playable_ui_quality_gate, sanitize_for_progress,
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_diff_status,
-        scaffold_file_snapshot, sha256_hex, should_apply_repo_change_quality_gate,
-        should_use_streaming_transport, strip_read_line_number_prefix,
-        successful_non_plan_repo_edit_count, successful_repo_edit_count,
-        sync_package_json_with_existing_lock, task_contract_verifier_target_discovery_note,
-        tool_color, tool_display, tool_emoji, unicode_supported,
-        validate_accepted_repair_plan_authorizes_target, validate_verifier_repair_intent,
-        validate_verifier_repair_intents, validate_verifier_repair_intents_with_accepted_plan,
-        verifier_diagnostic_attempt_spec, verifier_diagnostic_messages,
-        verifier_file_excerpt_for_line, verifier_repair_context_from_failure,
-        verifier_repair_decision, verifier_repair_effective_target_hint,
-        verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
-        verifier_repair_invalid_can_continue, verifier_repair_pass_messages,
-        verifier_repair_pass_retry_message, verifier_repair_policy_for_decision,
-        verifier_repair_policy_for_target_hint, verifier_repair_preferred_local_import_source,
-        verifier_repair_stale_assertion_test_target, verifier_repair_target_candidate_from_output,
-        verifier_repair_target_hint_from_output, workspace_appears_empty,
+        scaffold_file_snapshot, sha256_hex, should_use_streaming_transport,
+        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
+        successful_repo_edit_count, sync_package_json_with_existing_lock,
+        task_contract_verifier_target_discovery_note, tool_color, tool_display, tool_emoji,
+        unicode_supported, validate_accepted_repair_plan_authorizes_target,
+        validate_verifier_repair_intent, validate_verifier_repair_intents,
+        validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_attempt_spec,
+        verifier_diagnostic_messages, verifier_file_excerpt_for_line,
+        verifier_repair_context_from_failure, verifier_repair_decision,
+        verifier_repair_effective_target_hint, verifier_repair_intent_fingerprint,
+        verifier_repair_intents_fingerprint, verifier_repair_invalid_can_continue,
+        verifier_repair_pass_messages, verifier_repair_pass_retry_message,
+        verifier_repair_policy_for_decision, verifier_repair_policy_for_target_hint,
+        verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
+        verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
+        workspace_appears_empty,
     };
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
