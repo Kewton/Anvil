@@ -3979,6 +3979,17 @@ fn missing_repo_change_retry_status_note(
     }
 }
 
+fn task_contract_safe_stop_clear_tag(reason: super::task_contract::SafeStopReason) -> &'static str {
+    match reason {
+        super::task_contract::SafeStopReason::VerifierWeak => {
+            "task_contract_safe_stop_verifier_weak"
+        }
+        super::task_contract::SafeStopReason::VerifierMissing => {
+            "task_contract_safe_stop_verifier_missing"
+        }
+    }
+}
+
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
     if yes_mode {
         tester::ApprovalMode::Auto
@@ -7981,58 +7992,75 @@ impl Agent {
         &mut self,
         args: ActorLoopPostToolCleanupArgs<'_>,
     ) -> ActorLoopPostToolCleanupOutcome {
-        if self.session.mode_state.mode != ExecutionMode::Plan
-            && let Some(contract) = args.task_contract
-        {
-            let action = self.task_contract_recovery_action(
-                contract,
-                args.contract_verifier_repair_edit_count,
-                args.repo_edit_calls_made_this_turn,
-            );
-            match action {
-                super::task_contract::ArtifactRecoveryAction::Continue { .. }
-                | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-                    self.set_artifact_recovery_target_for_action(
-                        &action,
-                        args.contract_completion_retries.saturating_add(1),
-                    );
-                }
-                super::task_contract::ArtifactRecoveryAction::RunVerifier
-                | super::task_contract::ArtifactRecoveryAction::Done => {
-                    self.clear_artifact_recovery_target("contract_artifacts_satisfied");
-                }
-                super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
-                    let tag = match reason {
-                        super::task_contract::SafeStopReason::VerifierWeak => {
-                            "task_contract_safe_stop_verifier_weak"
-                        }
-                        super::task_contract::SafeStopReason::VerifierMissing => {
-                            "task_contract_safe_stop_verifier_missing"
-                        }
-                    };
-                    self.clear_artifact_recovery_target(tag);
-                }
-            }
-        }
+        self.sync_post_tool_contract_recovery_target(&args);
         self.maybe_invoke_reminder(args.interrupt_flag);
-        let compacted = if self.session.mode_state.mode == ExecutionMode::Plan {
-            false
-        } else {
-            self.maybe_compact_late_turn_session(
-                args.tool_calls_made_this_turn,
-                args.repo_edit_calls_made_this_turn,
-            )
-        };
-        if !compacted && self.session.mode_state.mode != ExecutionMode::Plan {
-            self.maybe_compact_session(DEFAULT_KEEP_TAIL);
-        }
-        if args.interrupt_flag.is_set() {
-            return ActorLoopPostToolCleanupOutcome::Exit {
-                reason: ExitReason::Interrupted,
-                error_text: String::new(),
-            };
+        self.run_post_tool_cleanup_compaction(
+            args.tool_calls_made_this_turn,
+            args.repo_edit_calls_made_this_turn,
+        );
+        if let Some(outcome) = Self::post_tool_cleanup_interrupt_outcome(args.interrupt_flag) {
+            return outcome;
         }
         ActorLoopPostToolCleanupOutcome::Continue
+    }
+
+    fn sync_post_tool_contract_recovery_target(&mut self, args: &ActorLoopPostToolCleanupArgs<'_>) {
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return;
+        }
+        let Some(contract) = args.task_contract else {
+            return;
+        };
+        let action = self.task_contract_recovery_action(
+            contract,
+            args.contract_verifier_repair_edit_count,
+            args.repo_edit_calls_made_this_turn,
+        );
+        match action {
+            super::task_contract::ArtifactRecoveryAction::Continue { .. }
+            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
+                self.set_artifact_recovery_target_for_action(
+                    &action,
+                    args.contract_completion_retries.saturating_add(1),
+                );
+            }
+            super::task_contract::ArtifactRecoveryAction::RunVerifier
+            | super::task_contract::ArtifactRecoveryAction::Done => {
+                self.clear_artifact_recovery_target("contract_artifacts_satisfied");
+            }
+            super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
+                self.clear_artifact_recovery_target(task_contract_safe_stop_clear_tag(reason));
+            }
+        }
+    }
+
+    fn run_post_tool_cleanup_compaction(
+        &mut self,
+        tool_calls_made_this_turn: usize,
+        repo_edit_calls_made_this_turn: usize,
+    ) {
+        if self.session.mode_state.mode == ExecutionMode::Plan {
+            return;
+        }
+        let compacted = self.maybe_compact_late_turn_session(
+            tool_calls_made_this_turn,
+            repo_edit_calls_made_this_turn,
+        );
+        if !compacted {
+            self.maybe_compact_session(DEFAULT_KEEP_TAIL);
+        }
+    }
+
+    fn post_tool_cleanup_interrupt_outcome(
+        interrupt_flag: &InterruptFlag,
+    ) -> Option<ActorLoopPostToolCleanupOutcome> {
+        if interrupt_flag.is_set() {
+            return Some(ActorLoopPostToolCleanupOutcome::Exit {
+                reason: ExitReason::Interrupted,
+                error_text: String::new(),
+            });
+        }
+        None
     }
 
     fn handle_actor_loop_missing_repo_change_reply(
@@ -18727,6 +18755,22 @@ mod tests {
                 super::ActorLoopMissingRepoChangeReplyKind::ProseOnly
             )
             .contains("prose only")
+        );
+    }
+
+    #[test]
+    fn task_contract_safe_stop_clear_tag_matches_reason() {
+        assert_eq!(
+            super::task_contract_safe_stop_clear_tag(
+                super::task_contract::SafeStopReason::VerifierWeak
+            ),
+            "task_contract_safe_stop_verifier_weak"
+        );
+        assert_eq!(
+            super::task_contract_safe_stop_clear_tag(
+                super::task_contract::SafeStopReason::VerifierMissing
+            ),
+            "task_contract_safe_stop_verifier_missing"
         );
     }
 
