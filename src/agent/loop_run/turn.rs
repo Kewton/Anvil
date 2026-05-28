@@ -23,8 +23,9 @@ use super::actor_loop_flow::{
     maybe_continue_missing_repo_framework_fallback, maybe_continue_missing_repo_scaffold_fallback,
     maybe_handle_answer_only_future_work_recovery, maybe_handle_answer_only_inadequate_recovery,
     maybe_handle_python_test_artifact_recovery, maybe_handle_repo_change_partial_progress_recovery,
-    missing_repo_change_budget_exhausted_outcome, missing_repo_edit_recovery_allowed,
-    plan_tool_followup_done_message, push_missing_repo_edit_retry_note, repair_job_done_outcome,
+    maybe_handle_repo_change_quality_gate_recovery, missing_repo_change_budget_exhausted_outcome,
+    missing_repo_edit_recovery_allowed, plan_tool_followup_done_message,
+    push_missing_repo_edit_retry_note, repair_job_done_outcome,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -1597,7 +1598,9 @@ pub(super) fn build_feedback_for_no_tool_call(
 /// content fallback (polish / quality / nextjs scaffold / playable UI repair
 /// / timeout-after wrappers). Uses fixed `primary_error` tag (DR1-002) — no
 /// subkind argument to avoid fan-out.
-fn build_feedback_for_deterministic_content_fallback(workspace_root: &Path) -> FeedbackFrame {
+pub(super) fn build_feedback_for_deterministic_content_fallback(
+    workspace_root: &Path,
+) -> FeedbackFrame {
     let draft = FeedbackFrameDraft {
         kind: FeedbackKind::ToolProtocolFailure,
         primary_error: Some(DETERMINISTIC_CONTENT_FALLBACK_TAG.to_string()),
@@ -5821,7 +5824,7 @@ impl Agent {
         if let Some(outcome) = maybe_handle_repo_change_partial_progress_recovery(self, &mut args) {
             return Some(outcome);
         }
-        if let Some(outcome) = self.maybe_handle_repo_change_quality_gate_recovery(&mut args) {
+        if let Some(outcome) = maybe_handle_repo_change_quality_gate_recovery(self, &mut args) {
             return Some(outcome);
         }
 
@@ -5856,77 +5859,6 @@ impl Agent {
             true,
         );
         push_missing_repo_edit_retry_note(self, *args.repo_change_retries);
-        Some(PostReplyRecoveryOutcome::Continue)
-    }
-
-    fn maybe_handle_repo_change_quality_gate_recovery(
-        &mut self,
-        args: &mut PostReplyRecoveryArgs<'_, '_>,
-    ) -> Option<PostReplyRecoveryOutcome> {
-        if !(should_apply_repo_change_quality_gate(
-            args.action_expectation,
-            self.active_task_expects_repo_change(),
-            self.session.mode_state.mode,
-        ) || self.current_request_needs_playable_ui_quality_gate())
-            || !args.recovery_dispatch_gate.allows_deterministic_fallback()
-        {
-            return None;
-        }
-        let (request, target_path, issue) = self.accepted_repo_change_quality_issue()?;
-        match self.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
-            Ok(true) => {
-                write_stdout_rendered(
-                    &format_iteration_status(
-                        args.last_iter,
-                        self.config.max_iterations,
-                        "Quality fallback",
-                        &format!("Replaced scaffold placeholder output in {target_path}."),
-                        self.footer.current_cols(),
-                    ),
-                    true,
-                );
-                self.session.record_feedback_if_unset(
-                    build_feedback_for_deterministic_content_fallback(&self.work_root),
-                );
-                self.push_deterministic_ui_recovery_continuation_note(
-                    &target_path,
-                    (*args.repo_change_retries).saturating_add(1),
-                );
-                return Some(PostReplyRecoveryOutcome::Continue);
-            }
-            Ok(false) => {}
-            Err(err) => {
-                return Some(PostReplyRecoveryOutcome::Finalize {
-                    final_prose: String::new(),
-                    exit_reason: ExitReason::TransportError,
-                    error_text: err,
-                });
-            }
-        }
-        *args.repo_change_retries += 1;
-        if *args.repo_change_retries >= 3 {
-            return Some(PostReplyRecoveryOutcome::Finalize {
-                final_prose: String::new(),
-                exit_reason: ExitReason::MissingRepoEdits,
-                error_text: issue,
-            });
-        }
-        write_stdout_rendered(
-            &format_iteration_status(
-                args.last_iter,
-                self.config.max_iterations,
-                "Quality gate",
-                &format!("Asked the model to replace placeholder output in {target_path}."),
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        self.push_system_note(recovery::repo_change_quality_gate_note(
-            &request,
-            &target_path,
-            &issue,
-            *args.repo_change_retries,
-        ));
         Some(PostReplyRecoveryOutcome::Continue)
     }
 
@@ -13981,7 +13913,7 @@ impl Agent {
         )
     }
 
-    fn push_deterministic_ui_recovery_continuation_note(
+    pub(super) fn push_deterministic_ui_recovery_continuation_note(
         &mut self,
         target_path: &str,
         attempt: usize,
@@ -16176,7 +16108,7 @@ impl Agent {
         workspace_appears_empty(&self.work_root)
     }
 
-    fn active_task_expects_repo_change(&self) -> bool {
+    pub(super) fn active_task_expects_repo_change(&self) -> bool {
         self.session.mode_state.mode == ExecutionMode::Act
             && self.session.mode_state.policy().repo_edit_required
             && self.active_request_text().as_deref().is_some_and(|task| {
@@ -16212,7 +16144,7 @@ impl Agent {
         )
     }
 
-    fn current_request_needs_playable_ui_quality_gate(&self) -> bool {
+    pub(super) fn current_request_needs_playable_ui_quality_gate(&self) -> bool {
         self.session.mode_state.mode == ExecutionMode::Act
             && self.session.mode_state.policy().quality_gate_enabled
             && !self.unsupported_ui_framework_context()
@@ -16222,7 +16154,9 @@ impl Agent {
                 .is_some_and(request_needs_playable_ui_quality_gate)
     }
 
-    fn accepted_repo_change_quality_issue(&mut self) -> Option<(String, String, String)> {
+    pub(super) fn accepted_repo_change_quality_issue(
+        &mut self,
+    ) -> Option<(String, String, String)> {
         if !self.session.mode_state.policy().quality_gate_enabled {
             return None;
         }
@@ -16432,7 +16366,7 @@ if __name__ == "__main__":
         Ok(Some(test_name))
     }
 
-    fn maybe_apply_deterministic_quality_fallback(
+    pub(super) fn maybe_apply_deterministic_quality_fallback(
         &self,
         request: &str,
         relative_target: &str,
@@ -23292,7 +23226,7 @@ fn collect_meaningful_workspace_files(
     Ok(())
 }
 
-fn should_apply_repo_change_quality_gate(
+pub(super) fn should_apply_repo_change_quality_gate(
     action_expectation: recovery::ActionExpectation,
     active_task_expects_repo_change: bool,
     mode: ExecutionMode,
