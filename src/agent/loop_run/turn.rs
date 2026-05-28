@@ -1,7 +1,6 @@
 use super::active_job_arbiter::{
     LoopControlAction, LoopControlInputs, RecoveryDispatchGate, RecoveryOwner,
     build_active_job_selected_payload, determine_loop_control_action,
-    loop_control_action_requires_missing_verifier_setup,
 };
 #[cfg(test)]
 use super::actor_loop_flow::missing_repo_edit_recovery_allowed;
@@ -14,20 +13,16 @@ use super::actor_loop_flow::{
     ActorLoopMissingRepoChangeRetryPromptArgs, ActorLoopNoToolReplyArgs,
     ActorLoopNoToolReplyOutcome, ActorLoopPlanToolFollowupArgs, ActorLoopPlanToolFollowupOutcome,
     ActorLoopPostToolCleanupArgs, ActorLoopPostToolCleanupOutcome, ActorLoopPostToolFallbackArgs,
-    ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyControlState,
-    ActorLoopPreReplyOutcome, ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs,
-    ActorLoopTaskContractContinueArgs, ActorLoopTaskContractIncompleteArgs,
-    ActorLoopTaskContractReplyArgs, ActorLoopTaskContractReplyOutcome,
-    ActorLoopTaskContractToolRecoveryArgs, ActorLoopToolPreparationArgs,
-    ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs, PostReplyRecoveryOutcome,
-    TaskContractVerifierFlowOutcome, actor_loop_pre_reply_flow_outcome,
+    ActorLoopPostToolFallbackOutcome, ActorLoopPreReplyArgs, ActorLoopPreReplyOutcome,
+    ActorLoopProseOnlyReplyArgs, ActorLoopRejectedToolBatchArgs, ActorLoopTaskContractContinueArgs,
+    ActorLoopTaskContractIncompleteArgs, ActorLoopTaskContractReplyArgs,
+    ActorLoopTaskContractReplyOutcome, ActorLoopTaskContractToolRecoveryArgs,
+    ActorLoopToolPreparationArgs, ActorLoopToolPreparationOutcome, PostReplyRecoveryArgs,
+    PostReplyRecoveryOutcome, TaskContractVerifierFlowOutcome, drive_actor_loop_pre_reply_phase,
     handle_actor_loop_rejected_tool_batch, handle_non_progress_plan_edit_fallback,
     handle_plan_progress_prose_only_fallback, handle_post_reply_recovery,
-    maybe_continue_actor_loop_framework_fallback,
-    maybe_continue_actor_loop_mode_deterministic_fallback,
-    maybe_handle_actor_loop_playable_ui_fallback, missing_repo_change_budget_exhausted_outcome,
-    plan_tool_followup_done_message, repair_job_done_outcome,
-    request_actor_loop_pre_reply_model_turn,
+    missing_repo_change_budget_exhausted_outcome, plan_tool_followup_done_message,
+    repair_job_done_outcome,
 };
 #[cfg(test)]
 use super::actor_loop_flow::{
@@ -432,7 +427,7 @@ mod v0421_repair_runner_contract_tests {
         let src = include_str!("turn.rs");
         let dispatch = function_body(
             src,
-            "\n    fn dispatch_repair_job_step(",
+            "\n    pub(super) fn dispatch_repair_job_step(",
             "\n    fn drive_repair_job_verifier(",
         );
 
@@ -1776,18 +1771,18 @@ pub(super) fn reply_looks_like_future_work(reply: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
-struct TaskContractVerifierFlowArgs<'a, 'b> {
-    before_snapshot: &'a RepoSnapshot,
-    accumulated: &'a [RepoVerification],
-    repo_edit_calls_made_this_turn: usize,
-    task_contract: Option<&'a super::task_contract::TaskContract>,
-    contract_verification_retries: &'b mut usize,
-    contract_verifier_repair_edit_count: &'b mut Option<usize>,
-    repo_change_retries: &'b mut usize,
-    verifier_repair_retries: &'b mut usize,
-    task_contract_verify_commands_collected: &'b mut Vec<String>,
-    task_contract_verifier_passed_in_loop: &'b mut bool,
-    last_iter: usize,
+pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
+    pub(super) before_snapshot: &'a RepoSnapshot,
+    pub(super) accumulated: &'a [RepoVerification],
+    pub(super) repo_edit_calls_made_this_turn: usize,
+    pub(super) task_contract: Option<&'a super::task_contract::TaskContract>,
+    pub(super) contract_verification_retries: &'b mut usize,
+    pub(super) contract_verifier_repair_edit_count: &'b mut Option<usize>,
+    pub(super) repo_change_retries: &'b mut usize,
+    pub(super) verifier_repair_retries: &'b mut usize,
+    pub(super) task_contract_verify_commands_collected: &'b mut Vec<String>,
+    pub(super) task_contract_verifier_passed_in_loop: &'b mut bool,
+    pub(super) last_iter: usize,
 }
 
 /// Issue #651 PR-002: pure mapping from
@@ -5818,125 +5813,6 @@ impl Agent {
         )
     }
 
-    fn drive_actor_loop_pre_reply_phase(
-        &mut self,
-        mut args: ActorLoopPreReplyArgs<'_, '_>,
-    ) -> ActorLoopPreReplyOutcome {
-        if args.interrupt_flag.is_set() {
-            return ActorLoopPreReplyOutcome::Exit {
-                reason: ExitReason::Interrupted,
-                error_text: String::new(),
-            };
-        }
-        let control_state = self.build_actor_loop_pre_reply_control_state(&args);
-        if let Some(outcome) =
-            self.handle_actor_loop_pre_reply_control_action(&mut args, &control_state)
-        {
-            return outcome;
-        }
-        if let Some(outcome) = self
-            .handle_actor_loop_pre_reply_fallbacks(&mut args, control_state.recovery_dispatch_gate)
-        {
-            return outcome;
-        }
-        request_actor_loop_pre_reply_model_turn(self, &args, control_state)
-    }
-
-    fn build_actor_loop_pre_reply_control_state(
-        &mut self,
-        args: &ActorLoopPreReplyArgs<'_, '_>,
-    ) -> ActorLoopPreReplyControlState {
-        let pre_model_task_contract_action = if self.session.mode_state.mode == ExecutionMode::Plan
-            || (self.task_contract_verifier_repair_pending && self.repair_job.is_some())
-        {
-            None
-        } else {
-            args.task_contract.map(|contract| {
-                self.task_contract_recovery_action(
-                    contract,
-                    *args.contract_verifier_repair_edit_count,
-                    *args.repo_edit_calls_made_this_turn,
-                )
-            })
-        };
-        let loop_control_action = determine_loop_control_action(LoopControlInputs {
-            mode: self.session.mode_state.mode,
-            task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
-            repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
-            missing_verifier_next_action: self
-                .missing_verifier_job
-                .as_ref()
-                .map(|job| job.next_action()),
-            task_contract_action: pre_model_task_contract_action.clone(),
-        });
-        let recovery_owner = RecoveryOwner::from_control_action(
-            &loop_control_action,
-            pre_model_task_contract_action.as_ref(),
-        );
-        ActorLoopPreReplyControlState {
-            missing_verifier_setup_turn: loop_control_action_requires_missing_verifier_setup(
-                &loop_control_action,
-            ),
-            recovery_dispatch_gate: RecoveryDispatchGate::from_owner(recovery_owner),
-            recovery_owner,
-            loop_control_action,
-        }
-    }
-
-    fn handle_actor_loop_pre_reply_control_action(
-        &mut self,
-        args: &mut ActorLoopPreReplyArgs<'_, '_>,
-        control_state: &ActorLoopPreReplyControlState,
-    ) -> Option<ActorLoopPreReplyOutcome> {
-        let flow_args = TaskContractVerifierFlowArgs {
-            before_snapshot: args.before_snapshot,
-            accumulated: args.accumulated,
-            repo_edit_calls_made_this_turn: *args.repo_edit_calls_made_this_turn,
-            task_contract: args.task_contract,
-            contract_verification_retries: args.contract_verification_retries,
-            contract_verifier_repair_edit_count: args.contract_verifier_repair_edit_count,
-            repo_change_retries: args.repo_change_retries,
-            verifier_repair_retries: args.verifier_repair_retries,
-            task_contract_verify_commands_collected: args.task_contract_verify_commands_collected,
-            task_contract_verifier_passed_in_loop: args.task_contract_verifier_passed_in_loop,
-            last_iter: args.last_iter,
-        };
-        match control_state.loop_control_action.clone() {
-            LoopControlAction::ContinueRepairJob { .. } => {
-                let outcome =
-                    self.dispatch_repair_job_step(flow_args, args.repo_edit_calls_made_this_turn);
-                Some(actor_loop_pre_reply_flow_outcome(outcome))
-            }
-            LoopControlAction::ContinueMissingVerifierJob { next_action } => self
-                .dispatch_missing_verifier_job_step(flow_args, next_action)
-                .map(actor_loop_pre_reply_flow_outcome),
-            LoopControlAction::RunVerifier => Some(actor_loop_pre_reply_flow_outcome(
-                self.drive_task_contract_verifier(flow_args),
-            )),
-            LoopControlAction::RequestModelTurn => None,
-        }
-    }
-
-    fn handle_actor_loop_pre_reply_fallbacks(
-        &mut self,
-        args: &mut ActorLoopPreReplyArgs<'_, '_>,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> Option<ActorLoopPreReplyOutcome> {
-        if maybe_continue_actor_loop_mode_deterministic_fallback(self, args, recovery_dispatch_gate)
-        {
-            return Some(ActorLoopPreReplyOutcome::Continue);
-        }
-        if maybe_continue_actor_loop_framework_fallback(self, args, recovery_dispatch_gate) {
-            return Some(ActorLoopPreReplyOutcome::Continue);
-        }
-        if let Some(outcome) =
-            maybe_handle_actor_loop_playable_ui_fallback(self, args, recovery_dispatch_gate)
-        {
-            return Some(outcome);
-        }
-        None
-    }
-
     fn prepare_actor_loop_turn_state(&mut self) -> Option<super::task_contract::TaskContract> {
         // Issue #455 / D4 / CB-001: clear the in-snapshot turn-scoped flag
         // so first-eligible-failure-wins starts fresh on this turn. The
@@ -7516,25 +7392,30 @@ impl Agent {
             self.emit_active_job_selected_if_changed(iter_count as u32);
 
             let (reply, recovery_dispatch_gate, missing_verifier_setup_turn, recovery_owner) =
-                match self.drive_actor_loop_pre_reply_phase(ActorLoopPreReplyArgs {
-                    before_snapshot: &before_snapshot,
-                    accumulated: &accumulated,
-                    task_contract: task_contract.as_ref(),
-                    repo_edit_calls_made_this_turn: &mut repo_edit_calls_made_this_turn,
-                    contract_verification_retries: &mut contract_verification_retries,
-                    contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
-                    repo_change_retries: &mut repo_change_retries,
-                    verifier_repair_retries: &mut verifier_repair_retries,
-                    task_contract_verify_commands_collected:
-                        &mut task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop:
-                        &mut task_contract_verifier_passed_in_loop,
-                    framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
-                    action_expectation,
-                    stream_output,
-                    last_iter,
-                    interrupt_flag: &interrupt_flag,
-                }) {
+                match drive_actor_loop_pre_reply_phase(
+                    self,
+                    ActorLoopPreReplyArgs {
+                        before_snapshot: &before_snapshot,
+                        accumulated: &accumulated,
+                        task_contract: task_contract.as_ref(),
+                        repo_edit_calls_made_this_turn: &mut repo_edit_calls_made_this_turn,
+                        contract_verification_retries: &mut contract_verification_retries,
+                        contract_verifier_repair_edit_count:
+                            &mut contract_verifier_repair_edit_count,
+                        repo_change_retries: &mut repo_change_retries,
+                        verifier_repair_retries: &mut verifier_repair_retries,
+                        task_contract_verify_commands_collected:
+                            &mut task_contract_verify_commands_collected,
+                        task_contract_verifier_passed_in_loop:
+                            &mut task_contract_verifier_passed_in_loop,
+                        framework_app_fallback_materialized:
+                            &mut framework_app_fallback_materialized,
+                        action_expectation,
+                        stream_output,
+                        last_iter,
+                        interrupt_flag: &interrupt_flag,
+                    },
+                ) {
                     ActorLoopPreReplyOutcome::Continue => continue,
                     ActorLoopPreReplyOutcome::Done { final_prose: prose } => {
                         final_prose = prose;
@@ -9397,7 +9278,7 @@ impl Agent {
         outcome
     }
 
-    fn drive_task_contract_verifier(
+    pub(super) fn drive_task_contract_verifier(
         &mut self,
         args: TaskContractVerifierFlowArgs<'_, '_>,
     ) -> TaskContractVerifierFlowOutcome {
@@ -9453,7 +9334,7 @@ impl Agent {
         }
     }
 
-    fn dispatch_repair_job_step(
+    pub(super) fn dispatch_repair_job_step(
         &mut self,
         args: TaskContractVerifierFlowArgs<'_, '_>,
         repo_edit_calls_made_this_turn: &mut usize,
@@ -9665,7 +9546,7 @@ impl Agent {
         }
     }
 
-    fn dispatch_missing_verifier_job_step(
+    pub(super) fn dispatch_missing_verifier_job_step(
         &mut self,
         args: TaskContractVerifierFlowArgs<'_, '_>,
         next_action: super::repair_job::VerifierBootstrapNextAction,
@@ -14661,7 +14542,7 @@ impl Agent {
         )
     }
 
-    fn task_contract_recovery_action(
+    pub(super) fn task_contract_recovery_action(
         &mut self,
         contract: &super::task_contract::TaskContract,
         repair_edit_count: Option<usize>,
