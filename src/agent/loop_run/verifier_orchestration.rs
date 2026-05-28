@@ -55,12 +55,14 @@ use super::repair_framework_findings::{
 };
 use super::repair_job::{
     RepairJob, mask_code_excerpt_preserving_patch_anchors, mask_secrets_headers_and_neutralize,
-    verifier_repair_effective_target_hint,
+    safe_relative_path_string, verifier_repair_effective_target_hint,
 };
 use super::repair_patch_validation::{VerifierRepairIntentLimits, is_repair_path_input_safe};
 use super::repair_plan::AcceptedRepairPlan;
 use super::required_behavior::{BehaviorContractProjection, behavior_contract_payload_value};
 use super::task_contract::{RecoveryTargetHint, TaskContract};
+use super::tool_history::focused_edit_target_already_read;
+use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
     missing_verifier_setup_hint_for_request,
@@ -970,4 +972,101 @@ pub(super) fn safe_verifier_repair_file_excerpt(
         VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES,
     );
     Some(mask_code_excerpt_preserving_patch_anchors(&excerpt))
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_decision(
+    pending: bool,
+    context: Option<&RepairJob>,
+    messages: &[ConversationMessage],
+    work_root: &Path,
+    repair_edit_count: Option<usize>,
+    repo_edit_calls_made_this_turn: usize,
+) -> VerifierRepairDecision {
+    super::repair_job::verifier_repair_decision(
+        pending,
+        context,
+        messages,
+        work_root,
+        repair_edit_count,
+        repo_edit_calls_made_this_turn,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn verifier_repair_policy_for_decision(
+    decision: VerifierRepairDecision,
+) -> EffectiveToolPolicy {
+    match decision {
+        VerifierRepairDecision::NeedDiagnostic => {
+            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
+        }
+        VerifierRepairDecision::DiagnosticUnavailable => {
+            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
+        }
+        VerifierRepairDecision::NeedFreshRead(target) => EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read"],
+            target,
+            false,
+        ),
+        VerifierRepairDecision::NeedWrite(target) => EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write"],
+            target,
+            false,
+        ),
+        VerifierRepairDecision::NeedEdit(target) => EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Edit"],
+            target,
+            true,
+        ),
+        VerifierRepairDecision::NeedTargetDiscovery => EffectiveToolPolicy::restricted(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read", "Glob", "Grep"],
+        ),
+        VerifierRepairDecision::NoRepair | VerifierRepairDecision::ReadyToVerify => {
+            EffectiveToolPolicy::restricted(EffectiveToolPolicyReason::VerifierRepair, Vec::new())
+        }
+    }
+}
+
+pub(super) fn verifier_repair_policy_for_target_hint(
+    target_hint: &RecoveryTargetHint,
+    messages: &[ConversationMessage],
+    work_root: &Path,
+) -> EffectiveToolPolicy {
+    let Some(relative) = safe_relative_path_string(&target_hint.path) else {
+        return EffectiveToolPolicy::restricted(
+            EffectiveToolPolicyReason::VerifierRepair,
+            Vec::new(),
+        );
+    };
+    let target = work_root.join(relative);
+    let target = std::fs::canonicalize(&target).unwrap_or(target);
+    if !target.is_file() {
+        return EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Write"],
+            target,
+            false,
+        );
+    }
+    let target_already_read = focused_edit_target_already_read(messages, &target, work_root);
+    if target_already_read {
+        EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Edit"],
+            target,
+            true,
+        )
+    } else {
+        EffectiveToolPolicy::focused_edit(
+            EffectiveToolPolicyReason::VerifierRepair,
+            vec!["Read"],
+            target,
+            false,
+        )
+    }
 }
