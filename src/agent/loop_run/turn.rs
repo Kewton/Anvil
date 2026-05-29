@@ -78,7 +78,7 @@ use super::verifier_repair_targeting::{
 
 use super::photon_feedback_derive::{
     PhotonFeedbackOutcome, PhotonOutcomeInputs, build_rerun_prompt_hint_if_eligible,
-    derive_photon_feedback_outcome,
+    derive_photon_feedback_outcome, prepare_adopted_ids_for_evaluate,
 };
 #[cfg(test)]
 use super::repair_patch_validation::VerifierRepairIntent;
@@ -478,71 +478,6 @@ mod v0421_repair_runner_contract_tests {
             );
         }
     }
-}
-
-/// Issue #556: max bytes to inject from context_pack into the prompt.
-pub const MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES: usize = 8192;
-
-/// Issue #556: apply UTF-8-safe byte truncation to a photon context_pack
-/// masked response. Returns `(truncated_string, was_truncated)`.
-/// Pure function — exposed for unit testing.
-pub fn truncate_photon_context_pack(s: String) -> (String, bool) {
-    if s.len() <= MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES {
-        return (s, false);
-    }
-    let truncate_at = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i < MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES)
-        .last()
-        .unwrap_or(0);
-    let mut out = s;
-    out.truncate(truncate_at);
-    out.push_str("\n[truncated]");
-    (out, true)
-}
-
-/// Issue #591 (DR4-NEW-001): result of re-sanitizing + capping an adopted-id
-/// list before sending it to photon `/v1/evaluate`. The struct is a pure
-/// transport for two return values (capped list + audit flag) and lives in
-/// the agent layer so the photon layer doesn't gain a dependency on
-/// `MAX_PHOTON_EVAL_ADOPTED_IDS` outside the SSOT.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SanitizedAdoptedIds {
-    /// Sanitized + capped list to send to photon.
-    pub list: Vec<String>,
-    /// `true` when the post-sanitize list length exceeded
-    /// `MAX_PHOTON_EVAL_ADOPTED_IDS` and was truncated.
-    pub truncated: bool,
-}
-
-/// Issue #591 (DR4-NEW-001 / DR4-NEW-002): pure helper that re-runs
-/// `sanitize_summary_id` on each raw id (drops `None`) and then truncates the
-/// result to `MAX_PHOTON_EVAL_ADOPTED_IDS`. Returns
-/// `SanitizedAdoptedIds { list, truncated }`. In `shadow_mode=true` the helper
-/// short-circuits to `(vec![], false)` regardless of input (the shadow guard).
-///
-/// Pure function — no I/O. Exposed at `pub(crate)` for module unit testing.
-pub(crate) fn prepare_adopted_ids_for_evaluate(
-    raw: &[String],
-    shadow_mode: bool,
-) -> SanitizedAdoptedIds {
-    if shadow_mode {
-        return SanitizedAdoptedIds {
-            list: Vec::new(),
-            truncated: false,
-        };
-    }
-    let sanitized: Vec<String> = raw
-        .iter()
-        .filter_map(|id| crate::photon::prompt::sanitize_summary_id(id))
-        .collect();
-    let truncated = sanitized.len() > crate::photon::MAX_PHOTON_EVAL_ADOPTED_IDS;
-    let list: Vec<String> = sanitized
-        .into_iter()
-        .take(crate::photon::MAX_PHOTON_EVAL_ADOPTED_IDS)
-        .collect();
-    SanitizedAdoptedIds { list, truncated }
 }
 
 /// Issue #608 Phase α-2 (AP-09): RFC3339 UTC timestamp for the current
@@ -29367,7 +29302,7 @@ mod rerun_hint_eligibility_tests {
 // ───────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod prepare_adopted_ids_for_evaluate_tests {
-    use super::prepare_adopted_ids_for_evaluate;
+    use super::super::photon_feedback_derive::prepare_adopted_ids_for_evaluate;
     use crate::photon::MAX_PHOTON_EVAL_ADOPTED_IDS;
 
     #[test]
