@@ -48,9 +48,10 @@ use super::progress_text::truncate;
 use super::repair_attempt_outcome::RepairAttemptOutcome;
 use super::repair_authority::AuthorityEvidence;
 use super::repair_driver::{
-    VERIFIER_REPAIR_PASS_MAX_EDITS, VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-    VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES, VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES,
-    VERIFIER_REPAIR_PASS_MAX_REASON_CHARS, VerifierRepairPassOutcome,
+    VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES, VERIFIER_REPAIR_PASS_MAX_EDITS,
+    VERIFIER_REPAIR_PASS_MAX_FILE_BYTES, VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES,
+    VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES, VERIFIER_REPAIR_PASS_MAX_REASON_CHARS,
+    VerifierRepairPassOutcome,
 };
 use super::repair_framework_findings::{
     VerifierDiagnosticFileExcerpt,
@@ -60,7 +61,11 @@ use super::repair_job::{
     RepairJob, mask_code_excerpt_preserving_patch_anchors, mask_secrets_headers_and_neutralize,
     safe_relative_path_string, verifier_repair_effective_target_hint,
 };
-use super::repair_patch_validation::{VerifierRepairIntentLimits, is_repair_path_input_safe};
+use super::repair_patch_validation::{
+    ValidatedVerifierRepairEdit, ValidationFailure, VerifierRepairIntent,
+    VerifierRepairIntentLimits, is_repair_path_input_safe,
+    validate_accepted_repair_plan_authorizes_target,
+};
 use super::repair_plan::AcceptedRepairPlan;
 use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
 use super::required_behavior::{BehaviorContractProjection, behavior_contract_payload_value};
@@ -92,14 +97,14 @@ use crate::safety::path_guard::resolve_user_path;
 use crate::session::feedback::mask_secrets;
 use crate::session::store::ConversationMessage;
 use crate::tools::bash::{BashCommandClass, BashExecutionOutcome};
+use crate::util::file_classify::is_test_file;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 #[cfg(test)]
 use super::repair_job::VerifierRepairDecision;
 #[cfg(test)]
-use super::repair_patch_validation::{
-    RepairIntentEdit, VerifierRepairIntent, repair_intent_edits_fingerprint,
-};
+use super::repair_patch_validation::{RepairIntentEdit, repair_intent_edits_fingerprint};
 #[cfg(test)]
 use super::tool_policy::workspace_relative_path_for_tool_arg;
 #[cfg(test)]
@@ -1377,4 +1382,343 @@ pub(super) fn build_task_contract_verifier_exit_zero_evidence_bound(
         command: masked,
         bound_test_artifacts_count: Some(bound_count),
     })
+}
+
+#[cfg(test)]
+pub(super) fn parse_verifier_repair_intent_reply(
+    reply: &str,
+) -> Result<VerifierRepairIntent, String> {
+    parse_verifier_repair_intents_reply(reply)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "repair reply did not contain any edits".to_string())
+}
+
+#[cfg(test)]
+pub(super) fn parse_verifier_repair_intents_reply(
+    reply: &str,
+) -> Result<Vec<VerifierRepairIntent>, String> {
+    let proposal = parse_verifier_repair_patch_proposal_reply(reply)?;
+    patch_proposal_to_verifier_repair_intents(proposal)
+}
+
+#[cfg(test)]
+pub(super) fn parse_verifier_repair_patch_proposal_reply(
+    reply: &str,
+) -> Result<super::patch_proposal::PatchProposal, String> {
+    super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
+        reply,
+        verifier_repair_intent_limits(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn patch_proposal_to_verifier_repair_intents(
+    proposal: super::patch_proposal::PatchProposal,
+) -> Result<Vec<VerifierRepairIntent>, String> {
+    super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
+        proposal,
+        verifier_repair_intent_limits(),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn validate_verifier_repair_intent(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    intent: VerifierRepairIntent,
+) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
+    validate_verifier_repair_intents(work_root, context, target_hint, vec![intent])
+}
+
+#[cfg(test)]
+pub(super) fn validate_verifier_repair_intents(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    intents: Vec<VerifierRepairIntent>,
+) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
+    validate_verifier_repair_intents_inner(work_root, context, target_hint, None, intents)
+}
+
+pub(super) fn validate_verifier_repair_intents_with_accepted_plan(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    accepted_plan: &super::repair_plan::AcceptedRepairPlan,
+    intents: Vec<VerifierRepairIntent>,
+) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
+    validate_verifier_repair_intents_inner(
+        work_root,
+        context,
+        target_hint,
+        Some(accepted_plan),
+        intents,
+    )
+}
+
+pub(super) struct RepairValidationTargetState {
+    canonical: PathBuf,
+    relative_path: String,
+    original_contents: String,
+}
+
+pub(super) struct PreparedRepairIntentEdits<'a> {
+    edit_payloads: Vec<super::repair_patch_validation::RepairIntentEdit<'a>>,
+    fingerprint: String,
+}
+
+pub(super) struct AppliedRepairCandidate {
+    contents: String,
+    used_whitespace_fallback: bool,
+}
+
+pub(super) fn load_repair_validation_target(
+    work_root: &Path,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    accepted_plan: Option<&super::repair_plan::AcceptedRepairPlan>,
+) -> Result<RepairValidationTargetState, ValidationFailure> {
+    let target_snapshot = super::repair_patch_validation::read_repair_target_snapshot(
+        work_root,
+        &target_hint.path,
+        VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+    )
+    .map_err(super::repair_patch_validation::RepairTargetReadError::into_validation_failure)?;
+    let canonical = target_snapshot.canonical_path;
+    let relative_path = target_snapshot.relative_path;
+    if let Some(accepted_plan) = accepted_plan {
+        validate_accepted_repair_plan_authorizes_target(
+            accepted_plan,
+            target_hint,
+            &relative_path,
+        )?;
+    }
+    Ok(RepairValidationTargetState {
+        canonical,
+        relative_path,
+        original_contents: target_snapshot.contents,
+    })
+}
+
+pub(super) fn prepare_verifier_repair_edit_payloads<'a>(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    canonical: &Path,
+    relative_path: &str,
+    intents: &'a [VerifierRepairIntent],
+) -> Result<PreparedRepairIntentEdits<'a>, ValidationFailure> {
+    let edit_payloads = super::repair_patch_validation::validate_repair_intents_and_build_edit_payloads(
+        work_root,
+        canonical,
+        relative_path,
+        intents,
+        VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairIntentPayloadValidationError::into_validation_failure,
+    )?;
+    let fingerprint = super::repair_patch_validation::repair_intent_edits_fingerprint(
+        &context.failure_signature,
+        relative_path,
+        &edit_payloads,
+    );
+    super::repair_patch_validation::validate_repair_intent_not_replayed(
+        &context.applied_repair_intents,
+        &fingerprint,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateDuplicateIntentError::into_validation_failure,
+    )?;
+    Ok(PreparedRepairIntentEdits {
+        edit_payloads,
+        fingerprint,
+    })
+}
+
+pub(super) fn apply_verifier_repair_edit_payloads(
+    original_contents: &str,
+    edit_payloads: &[super::repair_patch_validation::RepairIntentEdit<'_>],
+) -> Result<AppliedRepairCandidate, ValidationFailure> {
+    let apply_result =
+        super::repair_patch_validation::apply_repair_intent_edits(original_contents, edit_payloads)
+            .map_err(ValidationFailure::failed)?;
+    super::repair_patch_validation::validate_repair_candidate_changed(
+        original_contents,
+        &apply_result.updated_contents,
+    )
+    .map_err(super::repair_patch_validation::RepairCandidateNoopError::into_validation_failure)?;
+    Ok(AppliedRepairCandidate {
+        contents: apply_result.updated_contents,
+        used_whitespace_fallback: apply_result.used_whitespace_fallback,
+    })
+}
+
+pub(super) fn build_repair_test_import_contract_evidence(
+    work_root: &Path,
+    contents: &str,
+) -> super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
+    super::repair_patch_validation::RepairCandidateTestImportContractEvidence {
+        missing_modules: super::repair_python_import_evidence::missing_local_import_modules(
+            work_root,
+            contents,
+            VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+        ),
+        missing_imports: super::repair_python_import_evidence::missing_local_import_symbols(
+            work_root,
+            contents,
+            VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+        ),
+        scalar_attribute_assumptions:
+            super::repair_python_import_evidence::imported_scalar_attribute_assumptions(
+                work_root,
+                contents,
+                VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
+            ),
+    }
+}
+
+pub(super) fn validate_verifier_repair_test_constraints(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    accepted_plan_present: bool,
+    relative_path: &str,
+    contents: &str,
+) -> Result<(), ValidationFailure> {
+    let target_is_test_file = is_test_file(Path::new(relative_path));
+    super::repair_patch_validation::validate_test_edit_semantic_plan(
+        target_is_test_file,
+        accepted_plan_present,
+        context
+            .semantic_plan
+            .as_ref()
+            .map(|plan| plan.repair_hypothesis.as_str()),
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateTestEditPlanError::into_validation_failure,
+    )?;
+    if target_is_test_file {
+        super::repair_patch_validation::validate_test_import_contract_evidence(
+            build_repair_test_import_contract_evidence(work_root, contents),
+        )
+        .map_err(
+            super::repair_patch_validation::RepairCandidateTestImportContractError::into_validation_failure,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_verifier_repair_post_apply_candidate(
+    context: &super::repair_job::RepairJob,
+    relative_path: &str,
+    original_contents: &str,
+    contents: &str,
+    used_whitespace_fallback: bool,
+) -> Result<(), ValidationFailure> {
+    let weakening_detection =
+        super::repair_patch_validation::detect_repair_candidate_weakening_patterns(
+            relative_path,
+            original_contents,
+            contents,
+        );
+    let weakening = if weakening_detection.target_is_test_file {
+        super::repair_test_weakening_filter::filter_weakening_for_observed_assert_update(
+            weakening_detection.patterns,
+            context,
+            original_contents,
+            contents,
+        )
+    } else {
+        weakening_detection.patterns
+    };
+    super::repair_patch_validation::validate_repair_candidate_weakening_patterns(
+        weakening,
+        weakening_detection.rejection_kind,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateWeakeningError::into_validation_failure,
+    )?;
+    super::repair_patch_validation::validate_duplicate_binding_repair_candidate(
+        relative_path,
+        context,
+        original_contents,
+        contents,
+    )
+    .map_err(
+        super::repair_patch_validation::DuplicateBindingRepairError::into_validation_failure,
+    )?;
+    super::repair_patch_validation::validate_repair_candidate_contents(
+        relative_path,
+        contents,
+        used_whitespace_fallback,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
+    )?;
+    Ok(())
+}
+
+pub(super) fn validate_verifier_repair_intents_inner(
+    work_root: &Path,
+    context: &super::repair_job::RepairJob,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    accepted_plan: Option<&super::repair_plan::AcceptedRepairPlan>,
+    intents: Vec<VerifierRepairIntent>,
+) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
+    // Issue #639: every early-return path here represents a *Failed* cheap
+    // check (validation rejection). Only the patch-validation cheap content
+    // check can produce `CheapCheckOutcome::Unavailable`; this wrapper maps
+    // the typed module error back into the legacy outcome carrier.
+    super::repair_patch_validation::validate_repair_intent_list_bounds(
+        intents.len(),
+        VERIFIER_REPAIR_PASS_MAX_EDITS,
+    )
+    .map_err(
+        super::repair_patch_validation::RepairIntentListBoundsError::into_validation_failure,
+    )?;
+    let RepairValidationTargetState {
+        canonical,
+        relative_path,
+        original_contents,
+    } = load_repair_validation_target(work_root, target_hint, accepted_plan)?;
+    let PreparedRepairIntentEdits {
+        edit_payloads,
+        fingerprint,
+    } = prepare_verifier_repair_edit_payloads(
+        work_root,
+        context,
+        &canonical,
+        &relative_path,
+        &intents,
+    )?;
+    let AppliedRepairCandidate {
+        contents,
+        used_whitespace_fallback,
+    } = apply_verifier_repair_edit_payloads(&original_contents, &edit_payloads)?;
+    validate_verifier_repair_test_constraints(
+        work_root,
+        context,
+        accepted_plan.is_some(),
+        &relative_path,
+        &contents,
+    )?;
+    validate_verifier_repair_post_apply_candidate(
+        context,
+        &relative_path,
+        &original_contents,
+        &contents,
+        used_whitespace_fallback,
+    )?;
+
+    // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran
+    // **before** the in-memory apply above. The remaining branches here
+    // (weakening detector / candidate content check) cannot trigger a
+    // duplicate signal, so no further fingerprint comparison is needed.
+    Ok(ValidatedVerifierRepairEdit::new(
+        relative_path,
+        canonical,
+        &original_contents,
+        contents,
+        fingerprint,
+    ))
 }
