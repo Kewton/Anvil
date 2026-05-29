@@ -369,6 +369,13 @@ mod safe_stop_e2e_tests;
 // excludes this mod. No facade re-export (DR3-001).
 #[cfg(test)]
 mod repair_runner_contract_tests;
+// Photon-feedback derive unit tests extracted from `turn.rs` (parent
+// #680). Hosts `derive_photon_feedback_outcome_tests`,
+// `is_rerun_trigger_tests`, `rerun_hint_eligibility_tests`, and
+// `prepare_adopted_ids_for_evaluate_tests`. #[cfg(test)] only; production
+// binary excludes this mod. No facade re-export (DR3-001).
+#[cfg(test)]
+mod photon_feedback_derive_tests;
 // Issue #666: structured per-turn job reports
 // (ArtifactCompletion/Verification/Repair/Memory). Private mod, no
 // facade re-export (DR3-001). `turn.rs` is the only in-crate consumer
