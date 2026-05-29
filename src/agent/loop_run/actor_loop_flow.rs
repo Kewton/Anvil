@@ -608,23 +608,22 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
     }
     *args.python_test_retries += 1;
     if *args.python_test_retries >= 2 {
-        let (final_prose, exit_reason, error_text) = match agent
-            .maybe_materialize_python_test_fallback()
-        {
-            Ok(Some(path)) => (
-                format!(
-                    "Added the requested Python test artifact with deterministic fallback: {path}."
+        let (final_prose, exit_reason, error_text) =
+            match super::scaffold_pipeline::maybe_materialize_python_test_fallback(agent) {
+                Ok(Some(path)) => (
+                    format!(
+                        "Added the requested Python test artifact with deterministic fallback: {path}."
+                    ),
+                    ExitReason::Done,
+                    String::new(),
                 ),
-                ExitReason::Done,
-                String::new(),
-            ),
-            Ok(None) => (
-                String::new(),
-                ExitReason::MissingRepoEdits,
-                "assistant did not add the requested Python test artifact".to_string(),
-            ),
-            Err(err) => (String::new(), ExitReason::TransportError, err),
-        };
+                Ok(None) => (
+                    String::new(),
+                    ExitReason::MissingRepoEdits,
+                    "assistant did not add the requested Python test artifact".to_string(),
+                ),
+                Err(err) => (String::new(), ExitReason::TransportError, err),
+            };
         return Some(PostReplyRecoveryOutcome::Finalize {
             final_prose,
             exit_reason,
@@ -1169,7 +1168,9 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
         return ActorLoopNoToolReplyOutcome::Continue;
     }
     let request = agent.active_request_text().unwrap_or_default();
-    let fallback = match agent.maybe_apply_local_llm_small_edit_fallback(&request) {
+    let fallback = match super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
+        agent, &request,
+    ) {
         Ok(fallback) => fallback,
         Err(err) => {
             return ActorLoopNoToolReplyOutcome::Exit {
@@ -1964,7 +1965,10 @@ pub(super) fn maybe_continue_actor_loop_mode_deterministic_fallback(
         args.action_expectation,
         *args.repo_edit_calls_made_this_turn,
         recovery_dispatch_gate,
-    ) && agent.maybe_materialize_mode_deterministic_fallback(args.last_iter)
+    ) && super::scaffold_pipeline::maybe_materialize_mode_deterministic_fallback(
+        agent,
+        args.last_iter,
+    )
 }
 
 pub(super) fn maybe_continue_actor_loop_framework_fallback(
@@ -2121,7 +2125,11 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         );
     }
     if !*args.contract_deterministic_fallback_materialized
-        && agent.maybe_materialize_task_contract_fallback(&decision, args.last_iter)
+        && super::scaffold_pipeline::maybe_materialize_task_contract_fallback(
+            agent,
+            &decision,
+            args.last_iter,
+        )
     {
         *args.contract_deterministic_fallback_materialized = true;
         agent.set_artifact_recovery_target_for_decision(
@@ -2563,7 +2571,9 @@ pub(super) fn maybe_handle_rejected_tool_batch_focused_retry_exhausted(
         });
     }
     let request = agent.active_request_text().unwrap_or_default();
-    let fallback = match agent.maybe_apply_local_llm_small_edit_fallback(&request) {
+    let fallback = match super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
+        agent, &request,
+    ) {
         Ok(fallback) => fallback,
         Err(err) => {
             return Some(ActorLoopToolPreparationOutcome::Exit {
@@ -2717,7 +2727,7 @@ pub(super) fn finalize_missing_repo_edit_retry_exhausted(
     agent: &mut Agent,
 ) -> PostReplyRecoveryOutcome {
     let request = agent.active_request_text().unwrap_or_default();
-    match agent.maybe_apply_local_llm_small_edit_fallback(&request) {
+    match super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(agent, &request) {
         Ok(Some(relative)) => PostReplyRecoveryOutcome::Finalize {
             final_prose: format!(
                 "Applied a verified small edit fallback after the local model stopped before editing {relative}."
