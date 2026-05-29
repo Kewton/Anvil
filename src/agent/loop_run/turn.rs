@@ -44,10 +44,10 @@ use super::reminder::{
 #[cfg(test)]
 use super::repair_driver::VERIFIER_REPAIR_PASS_TIMEOUT_SECS;
 use super::repair_driver::{
-    VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT, VERIFIER_REPAIR_PASS_MAX_FILE_BYTES,
-    VERIFIER_REPAIR_PASS_MAX_PREDICT, VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-    VerifierRepairPassOutcome, verifier_repair_pass_attempt_timeout_secs,
-    verifier_repair_pass_retry_message, verifier_repair_pass_timeout_error,
+    VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT, VERIFIER_REPAIR_PASS_MAX_PREDICT,
+    VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
+    verifier_repair_pass_attempt_timeout_secs, verifier_repair_pass_retry_message,
+    verifier_repair_pass_timeout_error,
 };
 use super::repair_framework_findings::findings_for_diagnostic as verifier_framework_findings_for_diagnostic;
 #[cfg(test)]
@@ -165,9 +165,12 @@ use super::verifier_orchestration::{
     StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
     VerifierRepairAttemptProgress, build_task_contract_verifier_exit_zero_evidence,
     build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
-    model_assessment_to_verifier_repair_assessment, task_contract_needs_verification,
-    task_contract_no_verifier_note, task_contract_verifier_failure_attempt_limit,
-    task_contract_verifier_repair_note, task_contract_verifier_targeted_edit_required_note,
+    emit_patch_proposal_legacy_validation_comparison_event,
+    emit_patch_proposal_shadow_validation_event, emit_repair_progress_classified_event,
+    model_assessment_to_verifier_repair_assessment, repair_terminal_exit_reason,
+    task_contract_needs_verification, task_contract_no_verifier_note,
+    task_contract_verifier_failure_attempt_limit, task_contract_verifier_repair_note,
+    task_contract_verifier_targeted_edit_required_note,
     validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_file_excerpts,
     verifier_diagnostic_messages, verifier_framework_signal_for_context,
     verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
@@ -293,6 +296,7 @@ impl AssistantReplyRetryState {
 
 #[cfg(test)]
 mod repair_lifecycle_event_tests {
+    use super::super::verifier_orchestration::PatchProposalShadowValidation;
     use super::*;
 
     #[test]
@@ -488,31 +492,6 @@ mod v0421_repair_runner_contract_tests {
                 "{label} must not call the legacy verifier_repair_decision bridge"
             );
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PatchProposalShadowValidation {
-    status: &'static str,
-    reason: &'static str,
-}
-
-impl PatchProposalShadowValidation {
-    fn is_decisive(self) -> bool {
-        match (self.status, self.reason) {
-            ("accepted", _) => true,
-            // The production validator supports a bounded whitespace-normalized
-            // apply path, while the patch-provider admission shadow currently
-            // checks only exact substrings. Do not let the shadow preempt the
-            // real validator for this recoverable anchor mismatch.
-            ("rejected", "old_string_not_found") => false,
-            ("rejected", _) => true,
-            _ => false,
-        }
-    }
-
-    fn accepted(self) -> bool {
-        self.status == "accepted"
     }
 }
 
@@ -1538,14 +1517,6 @@ fn extract_current_request_paths(agent: &Agent, work_root: &std::path::Path) -> 
 
 fn raw_mode_safe_text(text: &str) -> String {
     text.replace('\n', "\r\n")
-}
-
-fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) -> ExitReason {
-    match reason.safe_stop_reason() {
-        Some(super::repair_job::StopReason::RepairExhausted) => ExitReason::RepairExhausted,
-        Some(_) => ExitReason::RepairSafeStop,
-        None => ExitReason::VerifierFailed,
-    }
 }
 
 fn repo_edit_satisfies_artifact_recovery_target(
@@ -17712,161 +17683,6 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
     candidates
         .first()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
-}
-
-fn emit_repair_progress_classified_event(
-    session_id: &str,
-    previous_context: Option<&super::repair_job::RepairJob>,
-    current_context: Option<&super::repair_job::RepairJob>,
-    verifier_passed: bool,
-) {
-    let Some(previous) = previous_context else {
-        return;
-    };
-    let patch_applied = !previous.applied_repair_intents.is_empty();
-    if !patch_applied {
-        return;
-    }
-    let current_signature = current_context.map(|context| context.failure_signature.as_str());
-    let current_failure_count = current_context.and_then(|context| context.failure_count);
-    let progress = super::repair_progress::classify_repair_progress(
-        &previous.failure_signature,
-        previous.failure_count,
-        current_signature,
-        current_failure_count,
-        patch_applied,
-        verifier_passed,
-    );
-    log_llm_event(
-        "agent.verifier_repair.progress_classified",
-        serde_json::json!({
-            "session_id": session_id,
-            "verdict": progress.verdict.as_str(),
-            "failure_signature_changed": progress.failure_signature_changed,
-            "failed_case_count_delta": progress.failed_case_count_delta,
-            "new_failure_introduced": progress.new_failure_introduced,
-            "previous_failure_signature_hash": stable_path_hash(&previous.failure_signature),
-            "current_failure_signature_hash": current_signature.map(stable_path_hash),
-            "previous_failure_count": previous.failure_count,
-            "current_failure_count": current_failure_count,
-        }),
-    );
-}
-
-fn emit_patch_proposal_shadow_validation_event(
-    session_id: &str,
-    model: &str,
-    attempt: usize,
-    work_root: &Path,
-    accepted_plan: &super::repair_plan::AcceptedRepairPlan,
-    proposal: &super::patch_proposal::PatchProposal,
-) -> PatchProposalShadowValidation {
-    let target_contents =
-        patch_proposal_target_contents_for_shadow(work_root, &proposal.target_path);
-    let validation = match target_contents.as_deref() {
-        Some(contents) => {
-            let request = super::patch_provider::PatchProviderRequest {
-                accepted_plan,
-                target_contents: contents,
-            };
-            let output = super::patch_provider::PatchProviderOutput {
-                provider_kind: super::patch_provider::PatchProviderKind::DiagnosticLlmAssisted,
-                proposal,
-            };
-            match super::patch_provider::admit_patch_provider_output(request, output) {
-                Ok(_) => PatchProposalShadowValidation {
-                    status: "accepted",
-                    reason: "ok",
-                },
-                Err(err) => PatchProposalShadowValidation {
-                    status: "rejected",
-                    reason: err.as_str(),
-                },
-            }
-        }
-        None => PatchProposalShadowValidation {
-            status: "unavailable",
-            reason: "target_unavailable",
-        },
-    };
-    let replace_all_count = proposal
-        .edits
-        .iter()
-        .filter(|edit| edit.replace_all)
-        .count();
-    log_llm_event(
-        "agent.verifier_patch_proposal.shadow_validation",
-        serde_json::json!({
-            "session_id": session_id,
-            "model": model,
-            "attempt": attempt,
-            "status": validation.status,
-            "reason": validation.reason,
-            "target_path_hash": stable_path_hash(&proposal.target_path),
-            "edit_count": proposal.edits.len(),
-            "replace_all_count": replace_all_count,
-        }),
-    );
-    validation
-}
-
-fn emit_patch_proposal_legacy_validation_comparison_event(
-    session_id: &str,
-    model: &str,
-    attempt: usize,
-    proposal: &super::patch_proposal::PatchProposal,
-    shadow_validation: PatchProposalShadowValidation,
-    legacy_validation: &Result<ValidatedVerifierRepairEdit, ValidationFailure>,
-) {
-    let legacy_status = if legacy_validation.is_ok() {
-        "accepted"
-    } else {
-        "rejected"
-    };
-    let legacy_reason = legacy_validation
-        .as_ref()
-        .err()
-        .map(ValidationFailure::reason_label)
-        .unwrap_or("ok");
-    let agreement = if shadow_validation.is_decisive() {
-        Some(shadow_validation.accepted() == legacy_validation.is_ok())
-    } else {
-        None
-    };
-    log_llm_event(
-        "agent.verifier_patch_proposal.validation_comparison",
-        serde_json::json!({
-            "session_id": session_id,
-            "model": model,
-            "attempt": attempt,
-            "target_path_hash": stable_path_hash(&proposal.target_path),
-            "edit_count": proposal.edits.len(),
-            "shadow_status": shadow_validation.status,
-            "shadow_reason": shadow_validation.reason,
-            "legacy_status": legacy_status,
-            "legacy_reason": legacy_reason,
-            "decisive_agreement": agreement,
-        }),
-    );
-}
-
-fn patch_proposal_target_contents_for_shadow(
-    work_root: &Path,
-    relative_path: &str,
-) -> Option<String> {
-    if !super::repair_patch_validation::is_repair_path_input_safe(relative_path) {
-        return None;
-    }
-    let root = std::fs::canonicalize(work_root).ok()?;
-    let target = resolve_user_path(work_root, relative_path).ok()?;
-    let canonical = std::fs::canonicalize(target).ok()?;
-    if canonical.strip_prefix(root).is_err() || !canonical.is_file() {
-        return None;
-    }
-    if std::fs::metadata(&canonical).ok()?.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(canonical).ok()
 }
 
 const PYTHON_REQUEST_PATTERNS: &[&str] = &["fastapi", "python", ".py"];
