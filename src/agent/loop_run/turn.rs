@@ -46,6 +46,7 @@ use super::repair_driver::{
     VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
     verifier_repair_pass_timeout_error,
 };
+#[cfg(test)]
 use super::repair_framework_findings::findings_for_diagnostic as verifier_framework_findings_for_diagnostic;
 #[cfg(test)]
 use super::repair_framework_findings::{
@@ -65,6 +66,7 @@ use super::repair_patch_validation::{
     CheapCheckOutcome, RepairRejectionSignal, ValidationFailure,
     build_verifier_repair_pass_ledger_outcome, validate_accepted_repair_plan_authorizes_target,
 };
+#[cfg(test)]
 use super::repair_target_admission::RepairTargetAdmissionContext;
 #[cfg(test)]
 use super::repair_target_admission::{admission_always_false, admit_repair_target_hint};
@@ -82,6 +84,7 @@ use super::repair_patch_validation::VerifierRepairIntent;
 #[cfg(test)]
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
+#[cfg(test)]
 use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
     build_semantic_failure_report_from_legacy_assessment,
@@ -128,6 +131,7 @@ use super::tool_policy::{
 };
 #[cfg(test)]
 use super::verifier_assessment_parser::ParsedVerifierRepairTarget;
+#[cfg(test)]
 use super::verifier_assessment_parser::{
     apply_framework_findings_to_parsed_assessment, parse_semantic_failure_report_from_reply,
     parse_verifier_repair_assessment_reply,
@@ -153,14 +157,12 @@ use super::verifier_orchestration::{
     build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
     emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event, emit_repair_progress_classified_event,
-    model_assessment_to_verifier_repair_assessment, repair_terminal_exit_reason,
-    synthesized_missing_implementation_target_path_for_request,
+    repair_terminal_exit_reason, synthesized_missing_implementation_target_path_for_request,
     synthesized_missing_test_target_path_for_request, task_contract_needs_verification,
     task_contract_no_verifier_note, task_contract_verifier_failure_attempt_limit,
     task_contract_verifier_repair_note, task_contract_verifier_targeted_edit_required_note,
     test_target_path_compatible_with_request, validate_verifier_repair_intents_with_accepted_plan,
-    verifier_diagnostic_file_excerpts, verifier_diagnostic_messages,
-    verifier_framework_signal_for_context, verifier_repair_context_diagnostics,
+    verifier_diagnostic_messages, verifier_repair_context_diagnostics,
     verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
     verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
     verifier_repair_policy_for_target_hint, verifier_repair_safe_stop_message,
@@ -169,12 +171,10 @@ use super::verifier_orchestration::{
 };
 #[cfg(test)]
 use super::verifier_orchestration::{
-    verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
-    verifier_repair_invalid_can_continue,
+    model_assessment_to_verifier_repair_assessment, verifier_repair_intent_fingerprint,
+    verifier_repair_intents_fingerprint, verifier_repair_invalid_can_continue,
 };
-use super::verifier_repair_shadow::{
-    build_verifier_repair_pipeline_shadow_payload, legacy_repair_brief_input_from_assessment,
-};
+use super::verifier_repair_shadow::legacy_repair_brief_input_from_assessment;
 use super::verifier_repair_targeting::{changed_files_for_verifier, extract_path_like_tokens};
 #[cfg(test)]
 use super::verifier_repair_targeting::{
@@ -4882,7 +4882,7 @@ impl Agent {
             "Verifier diagnostic",
             "Running short-lived diagnostic LLM pass outside the main session.",
         );
-        match self.run_verifier_diagnostic_pass() {
+        match super::verifier_orchestration::run_verifier_diagnostic_pass(self) {
             VerifierDiagnosticPassOutcome::Accepted => {
                 self.write_repair_job_step_status(
                     args.last_iter,
@@ -7343,247 +7343,7 @@ impl Agent {
         }
     }
 
-    fn run_verifier_diagnostic_pass(&mut self) -> VerifierDiagnosticPassOutcome {
-        let prepared = match self.prepare_verifier_diagnostic_pass() {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
-        };
-        let reply_content = match self.request_verifier_diagnostic_reply(&prepared) {
-            Ok(reply_content) => reply_content,
-            Err(outcome) => return outcome,
-        };
-        let Some(mut parsed) = parse_verifier_repair_assessment_reply(&reply_content) else {
-            return self.handle_verifier_diagnostic_failure(
-                "diagnostic reply was malformed".to_string(),
-                prepared.attempt_spec.role,
-            );
-        };
-        let framework_findings = verifier_framework_findings_for_diagnostic(
-            &self.work_root,
-            &prepared.context.command,
-            &verifier_framework_signal_for_context(&prepared.context),
-            &verifier_diagnostic_file_excerpts(&self.work_root, &prepared.context),
-        );
-        let framework_override =
-            apply_framework_findings_to_parsed_assessment(&mut parsed, &framework_findings);
-        // Issue #647 (Phase D / D.1 / DR3-005): independently parse the
-        // semantic-failure report from the *same* reply. When the LLM omits
-        // the extended SemanticFailureReport fields (MF1: production LLMs
-        // historically returned only the legacy schema), we deterministically
-        // synthesize a SemanticFailureReport from the legacy parsed result so
-        // semantic repair planning fires on every diagnostic pass — not only
-        // when the LLM volunteered the extended schema. The legacy
-        // `ParsedVerifierRepairAssessment` / `VerifierRepairAssessment` flow
-        // below is **not** disturbed.
-        //
-        // -------- BEGIN semantic-boundary (Issue #647 / S3-005 / SF3) --------
-        // Everything between this marker and END semantic-boundary is
-        // *outside* the legacy assessment pipeline. The legacy struct-literal
-        // callsites for `super::VerifierRepairAssessment`
-        // (turn.rs:15399 / 18785 / 19477 / 19553 / 20230 / 23108 / 23133)
-        // remain unchanged by Issue #647. See the doc comment on
-        // `model_assessment_to_verifier_repair_assessment` for the full
-        // responsibility split.
-        let semantic_report = if framework_override {
-            build_semantic_failure_report_from_legacy(&parsed, &prepared.context)
-        } else {
-            parse_semantic_failure_report_from_reply(&reply_content)
-                .or_else(|| build_semantic_failure_report_from_legacy(&parsed, &prepared.context))
-        };
-        // Issue #647 (SF1 / V3): build the `SpecAuthorityInput` from the
-        // four real detectors wired in V3:
-        //   * BehaviorContract — from `TaskContract::from_request`.
-        //   * UserRequest match — from the explicit-spec keyword detector.
-        //   * VerifiedPublicInterface — from the turn-local
-        //     `task_contract_verifier_passed_this_actor_loop` flag
-        //     (S5-005: real-but-bounded detector).
-        //   * Consensus — from the V3.3 contract-conflict heuristic over
-        //     the just-parsed `SemanticFailureReport`.
-        // `is_newly_generated_task` stays `true` per the SF1 acceptance.
-        let agent_history_hint = super::spec_authority::AgentHistoryHint {
-            verifier_passed_in_loop: self.task_contract_verifier_passed_this_actor_loop,
-        };
-        let authority_input = build_spec_authority_input_for_active_request(
-            self.active_request_text().as_deref(),
-            semantic_report.as_ref(),
-            agent_history_hint,
-        );
-        // Issue #647 / CB-017 A''' (Commit 3): build the path-local admission
-        // context **before** semantic enrich so `enrich_failure_clusters_with_admitted_targets`
-        // can route every LLM-supplied target_path through the SSOT
-        // `recovery_target_hint_for_diagnostic_path` (syntactic safety +
-        // Owned admission). This is the same admission context used by the
-        // legacy `model_assessment_to_verifier_repair_assessment` below.
-        let scope = self.current_workspace_scope();
-        let turn_edited = self.turn_edited_relative_paths.clone();
-        let edited_predicate = |path: &str| turn_edited.contains(path);
-        let scaffold_predicate = |path: &str| self.repo_edit_has_post_scaffold_delta(path);
-        let admission = RepairTargetAdmissionContext {
-            work_root: &self.work_root,
-            scope: &scope,
-            edited_this_session_for: &edited_predicate,
-            scaffold_changed_for: &scaffold_predicate,
-        };
-        // CB-017 A''' (Commit 3): merge + enrich each report so every cluster
-        // carries `admitted_cluster_targets` derived from the SSOT admission
-        // gate. If every cluster ends up targetless, drop the semantic report
-        // so the legacy assessment path is used unchanged.
-        let semantic_report = semantic_report.and_then(|mut report| {
-            merge_legacy_targets_into_clusters(&mut report, &parsed);
-            let spec_authority = super::spec_authority::resolve(&authority_input);
-            enrich_failure_clusters_with_admitted_targets(
-                &mut report,
-                &self.work_root,
-                &admission,
-                spec_authority,
-            );
-            if report
-                .failure_clusters
-                .iter()
-                .all(|c| c.admitted_cluster_targets.is_empty())
-            {
-                None
-            } else {
-                Some(report)
-            }
-        });
-        // Issue #647 (CB-015): the new plan's generation snapshot uses the
-        // **pre-bump** `assessment_generation`. The live `RepairJob.assessment_generation`
-        // is incremented below in lock-step with the new assessment landing
-        // in the slot, so after the bump:
-        //   plan.assessment_generation_at_creation == pre_bump_gen
-        //   job.assessment_generation              == pre_bump_gen + 1
-        // → `plan.gen < job.gen` → `semantic_plan_is_stale` returns `false`
-        // (fresh). This is the SSOT signal that the assessment in the slot
-        // is the one this plan was built against — the controller can route
-        // to NeedFreshRead/NeedEdit instead of looping back to
-        // NeedDiagnostic on the same cluster.
-        let pre_bump_assessment_generation = prepared.context.assessment_generation;
-        let mut semantic_plan = semantic_report.and_then(|report| {
-            build_semantic_repair_plan_from_report_with_authority_input(
-                report,
-                authority_input.clone(),
-                pre_bump_assessment_generation,
-            )
-        });
-        // -------- END semantic-boundary (Issue #647 / S3-005 / SF3) --------
-        // Re-entering the legacy assessment pipeline: the call below builds
-        // `super::VerifierRepairAssessment` only. `semantic_plan` lives on
-        // the `RepairJob` it never touches.
-        let assessment = model_assessment_to_verifier_repair_assessment(
-            &self.work_root,
-            &prepared.context,
-            parsed.clone(),
-            &admission,
-        );
-        let has_target = assessment.repair_target_hint.is_some();
-        if !has_target {
-            return self.handle_verifier_diagnostic_failure(
-                "diagnostic did not identify a safe repair target".to_string(),
-                prepared.attempt_spec.role,
-            );
-        }
-        log_llm_event(
-            "agent.verifier_repair_pipeline.shadow",
-            build_verifier_repair_pipeline_shadow_payload(
-                self.session_store.session_id(),
-                &prepared.attempt_spec.model,
-                prepared.attempt_spec.role,
-                &prepared.context,
-                &parsed,
-                &assessment,
-            ),
-        );
-        if semantic_plan.is_none() {
-            semantic_plan = build_semantic_failure_report_from_legacy_assessment(
-                &assessment,
-                &prepared.context,
-            )
-            .and_then(|report| {
-                build_semantic_repair_plan_from_report_with_authority_input(
-                    report,
-                    authority_input.clone(),
-                    pre_bump_assessment_generation,
-                )
-            });
-        }
-        if let Some(current) = self.repair_job.as_mut() {
-            current.failure_type = assessment.failure_type;
-            current.repair_target_hint = assessment.repair_target_hint.clone();
-            current.diagnostic_error = None;
-            current.diagnostic_unavailable = false;
-            current.assessment = Some(assessment);
-            // Issue #647 (CB-015): bump `assessment_generation` in lock-step
-            // with the new assessment landing in the slot. Combined with the
-            // pre-bump generation threaded into the semantic plan above:
-            //   * stale (post-advance, pre-re-diagnostic):
-            //     `plan.assessment_generation_at_creation ==
-            //     job.assessment_generation` AND `exhausted_attempts`
-            //     non-empty → `semantic_plan_is_stale` = true →
-            //     CB-007/CB-012/CB-014 force re-diagnostic.
-            //   * fresh (post-re-diagnostic, ready to repair the new cluster):
-            //     `plan.assessment_generation_at_creation <
-            //     job.assessment_generation` →
-            //     `semantic_plan_is_stale` = false → controller routes to
-            //     NeedFreshRead/NeedEdit on the current cluster (closing the
-            //     liveness gap where the stale predicate kept looping back
-            //     to NeedDiagnostic after a cluster advance).
-            current.assessment_generation = pre_bump_assessment_generation.saturating_add(1);
-            // Issue #647 (Phase D / D.2 / DR3-005): write the
-            // SemanticRepairPlan slot. `None` is the legacy-compatible
-            // value when semantic parse failed or dispatch routed to
-            // setup repair (D.3).
-            //
-            // Issue #647 (MF2 V3.1): route the assignment through the
-            // exhausted-aware helper so re-diagnostic cannot revive a
-            // cluster that the previous turn already pushed onto
-            // `exhausted_attempts`. Without this, every fresh diagnostic
-            // would blindly overwrite the slot with whatever cluster the
-            // LLM picked first — discarding the dispatch helper's progress
-            // (`apply_semantic_repair_dispatch_after_rerun` in
-            // `drive_task_contract_verifier`) and forcing the same doomed
-            // cluster to be re-attacked. The new helper skips ahead to the
-            // next unexhausted cluster of the embedded report (or clears
-            // the slot for legacy fallback when none remain).
-            let new_report = semantic_plan
-                .as_ref()
-                .map(|plan| plan.semantic_report.clone());
-            super::repair_job::assign_semantic_plan_preserving_exhausted(
-                current,
-                semantic_plan,
-                new_report.as_ref(),
-            );
-            // CB-017 A''': immediately rebind the freshly-landed legacy
-            // assessment to the current semantic-plan cluster so the
-            // controller routes to the new cluster's admitted targets —
-            // not the previous cluster's stale paths surfaced by
-            // `needed_reads` / `repair_plan`. The rebind helper is a no-op
-            // when `semantic_plan = None` (legacy fallback) or when the
-            // current cluster is targetless (caller already skipped it via
-            // `first_repairable_cluster` / `next_repairable_cluster`).
-            //
-            // Path-coverage: this is the `DiagnosticSkip` callsite when
-            // `assign_semantic_plan_preserving_exhausted` walked past an
-            // already-exhausted cluster; for the "new bind" path it
-            // realigns the assessment to the freshly-elected first
-            // cluster. Either way `applied_repair_intents` only clears
-            // on actual cluster-id transition.
-            super::repair_job::rebind_legacy_assessment_to_current_cluster(current);
-            current.apply_event(super::repair_job::RepairJobEvent::PlanAccepted);
-        }
-        log_llm_event(
-            "agent.verifier_diagnostic.completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "model": prepared.attempt_spec.model,
-                "role": prepared.attempt_spec.role,
-                "accepted": has_target,
-            }),
-        );
-        VerifierDiagnosticPassOutcome::Accepted
-    }
-
-    fn prepare_verifier_diagnostic_pass(
+    pub(super) fn prepare_verifier_diagnostic_pass(
         &mut self,
     ) -> Result<PreparedVerifierDiagnosticPass, VerifierDiagnosticPassOutcome> {
         self.reset_verifier_diagnostic_state_if_needed();
@@ -7645,7 +7405,7 @@ impl Agent {
         }
     }
 
-    fn request_verifier_diagnostic_reply(
+    pub(super) fn request_verifier_diagnostic_reply(
         &mut self,
         prepared: &PreparedVerifierDiagnosticPass,
     ) -> Result<String, VerifierDiagnosticPassOutcome> {
@@ -7686,7 +7446,7 @@ impl Agent {
         Ok(reply.content)
     }
 
-    fn handle_verifier_diagnostic_failure(
+    pub(super) fn handle_verifier_diagnostic_failure(
         &mut self,
         error: String,
         model_role: &'static str,
@@ -9362,7 +9122,7 @@ impl Agent {
         )
     }
 
-    fn repo_edit_has_post_scaffold_delta(&self, relative_path: &str) -> bool {
+    pub(super) fn repo_edit_has_post_scaffold_delta(&self, relative_path: &str) -> bool {
         match scaffold_diff_status(
             &self.session.scaffold_artifact_snapshots,
             relative_path,
@@ -21561,7 +21321,8 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
             "CB-013 fixture must satisfy the stale-state predicate"
         );
 
-        let outcome = agent.run_verifier_diagnostic_pass();
+        let outcome =
+            super::super::verifier_orchestration::run_verifier_diagnostic_pass(&mut agent);
         assert!(
             !matches!(outcome, super::VerifierDiagnosticPassOutcome::Skipped),
             "CB-013: diagnostic must NOT short-circuit to Skipped when the \
@@ -21612,7 +21373,8 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
             "CB-013 must not fire for legacy / no-semantic-plan state"
         );
 
-        let outcome = agent.run_verifier_diagnostic_pass();
+        let outcome =
+            super::super::verifier_orchestration::run_verifier_diagnostic_pass(&mut agent);
         assert!(
             matches!(outcome, super::VerifierDiagnosticPassOutcome::Skipped),
             "CB-013 regression: legacy `assessment.is_some()` Skipped \
@@ -30260,7 +30022,7 @@ export default function App() {
 
     #[test]
     fn sf3_run_verifier_diagnostic_pass_uses_explicit_semantic_boundary_markers() {
-        let src = include_str!("turn.rs");
+        let src = include_str!("verifier_orchestration.rs");
         // Both BEGIN and END markers must exist *inside*
         // `run_verifier_diagnostic_pass` so a reader can scan the function
         // body and immediately see which lines are legacy vs. semantic.
