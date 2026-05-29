@@ -143,23 +143,18 @@ use super::verifier_diagnostic_attempt::{
 use super::verifier_diagnostic_attempt::{
     VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS, VERIFIER_DIAGNOSTIC_SIDECAR_TIMEOUT_SECS,
 };
+use super::verifier_driver::TaskContractVerifierOutcome;
 #[cfg(test)]
 use super::verifier_driver::classify_verifier_timeout;
 #[cfg(test)]
 use super::verifier_driver::task_contract_structured_missing_outcome;
-use super::verifier_driver::{
-    TaskContractVerifierOutcome, detect_verifier_external_import_contamination,
-    run_structured_task_contract_verifier, structured_verifier_invocation_report,
-    task_contract_auto_test_result_to_outcome, task_contract_verifier_outcome_label,
-    task_contract_verifier_transport_error_to_outcome,
-};
 use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
 use super::verifier_failure_signature::verifier_failure_count;
 use super::verifier_orchestration::{
     JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
-    StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
-    VerifierRepairAttemptProgress, build_task_contract_verifier_exit_zero_evidence,
+    TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome, VerifierRepairAttemptProgress,
+    build_task_contract_verifier_exit_zero_evidence,
     build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
     emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event, emit_repair_progress_classified_event,
@@ -4614,127 +4609,7 @@ impl Agent {
         }
     }
 
-    pub(super) fn handle_structured_task_contract_verifier_selection(
-        &mut self,
-        changed_files: &[String],
-        workspace_scope: Option<&super::task_workspace_scope::TaskWorkspaceScope>,
-        selection: StructuredTaskContractVerifierRun,
-    ) -> TaskContractVerifierOutcome {
-        let Some(workspace_scope) = workspace_scope else {
-            return TaskContractVerifierOutcome::NoVerifier;
-        };
-        if selection.command.runner() == "python3" {
-            self.materialize_python_package_markers_for_owned_test_imports(
-                &selection.bound_test_artifacts_paths,
-            );
-        }
-        let invocation_report =
-            structured_verifier_invocation_report(&self.work_root, &selection.command);
-        if let Some(snapshot) = invocation_report.snapshot.as_ref() {
-            self.emit_agent_verifier_invoked_if_new(snapshot);
-        }
-        if let Some(hash) = invocation_report.rejected_pythonpath_hash.as_deref() {
-            self.emit_agent_verifier_external_import_rejected_if_first(
-                selection.command.runner(),
-                "external_pythonpath_rejected",
-                &[(hash, "pythonpath")],
-                1,
-                false,
-            );
-        }
-        let result = {
-            let _sp = Spinner::start("running verifier...".to_string());
-            run_structured_task_contract_verifier(
-                &self.work_root,
-                workspace_scope,
-                &selection.command,
-                &selection.display_command,
-            )
-        };
-        match result {
-            Ok(result) => self.finish_structured_task_contract_verifier_selection(
-                changed_files,
-                workspace_scope,
-                selection,
-                result,
-            ),
-            Err(error) => {
-                let command = crate::session::feedback::redact_verifier_command_for_storage(
-                    &selection.display_command,
-                );
-                let outcome = task_contract_verifier_transport_error_to_outcome(command, error);
-                let outcome_label = task_contract_verifier_outcome_label(&outcome);
-                log_llm_event(
-                    "agent.task_contract.verifier.completed",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "outcome": outcome_label,
-                        "command": crate::session::feedback::redact_verifier_command_for_storage(&selection.display_command),
-                    }),
-                );
-                outcome
-            }
-        }
-    }
-
-    fn finish_structured_task_contract_verifier_selection(
-        &mut self,
-        changed_files: &[String],
-        workspace_scope: &super::task_workspace_scope::TaskWorkspaceScope,
-        selection: StructuredTaskContractVerifierRun,
-        result: AutoTestResult,
-    ) -> TaskContractVerifierOutcome {
-        log_llm_event(
-            "agent.autotest.completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "command": &result.command,
-                "passed": result.passed,
-                "reason": &selection.plan.reason,
-            }),
-        );
-        if let Some(contamination) =
-            detect_verifier_external_import_contamination(&self.work_root, &result)
-        {
-            let created_markers = self.materialize_python_package_markers_for_external_import(
-                &result.stdout,
-                &result.stderr,
-            );
-            let borrowed = contamination.borrowed_hashes();
-            self.emit_agent_verifier_external_import_rejected_if_first(
-                selection.command.runner(),
-                "external_import_detected",
-                &borrowed,
-                contamination.detected_count,
-                contamination.truncated,
-            );
-            return contamination.to_failure_outcome(result, &created_markers);
-        }
-        let frame =
-            build_feedback_for_auto_test(&selection.plan, &result, &self.work_root, changed_files);
-        self.session.record_feedback_if_unset(frame);
-        self.record_task_contract_verifier_invocation(&result.command, result.exit_code);
-        let last_outcome = if result.passed {
-            super::artifact_ledger::VerifierOutcome::Pass
-        } else {
-            super::artifact_ledger::VerifierOutcome::Fail
-        };
-        let scope_for_seed = workspace_scope.clone();
-        self.seed_artifact_ledger_verifier_observation(
-            &selection.bound_test_artifacts_paths,
-            last_outcome,
-            &scope_for_seed,
-        );
-        if result.passed {
-            self.observe_task_contract_verifier_exit_zero_bound(
-                &result.command,
-                selection.bound_test_artifacts_count,
-            );
-        }
-        task_contract_auto_test_result_to_outcome(result)
-    }
-
-    fn materialize_python_package_markers_for_external_import(
+    pub(super) fn materialize_python_package_markers_for_external_import(
         &mut self,
         stdout: &str,
         stderr: &str,
@@ -4747,7 +4622,7 @@ impl Agent {
         self.materialize_python_package_marker_candidates(candidates)
     }
 
-    fn materialize_python_package_markers_for_owned_test_imports(
+    pub(super) fn materialize_python_package_markers_for_owned_test_imports(
         &mut self,
         owned_test_artifacts: &[String],
     ) -> Vec<String> {
@@ -4793,96 +4668,6 @@ impl Agent {
             created.push(relative_path);
         }
         created
-    }
-
-    pub(super) fn handle_task_contract_verifier_failure(
-        &mut self,
-        args: TaskContractVerifierFlowArgs<'_, '_>,
-        previous_repair_context: Option<super::repair_job::RepairJob>,
-        changed_files: &[String],
-        command: String,
-        output: String,
-    ) -> TaskContractVerifierFlowOutcome {
-        *args.contract_verification_retries += 1;
-        let mut repair_context = verifier_repair_context_from_failure(
-            &self.work_root,
-            &command,
-            &output,
-            changed_files,
-            *args.contract_verification_retries,
-            previous_repair_context.as_ref(),
-        );
-        let attempt_limit =
-            task_contract_verifier_failure_attempt_limit(previous_repair_context.as_ref());
-        if *args.contract_verification_retries >= attempt_limit {
-            self.repair_job = Some(repair_context);
-            let (reason, prefix) = if previous_repair_context.is_some() {
-                self.emit_safe_stop_report_for_repair_exhausted();
-                (
-                    ExitReason::RepairExhausted,
-                    "verifier repair budget exhausted",
-                )
-            } else {
-                self.emit_safe_stop_report_for_verifier_failed_safe_stop();
-                (ExitReason::VerifierFailed, "required verifier failed")
-            };
-            return TaskContractVerifierFlowOutcome::Exit {
-                reason,
-                error_text: format!(
-                    "{prefix}: {}\n{}",
-                    crate::session::feedback::mask_secrets(&command),
-                    crate::session::feedback::mask_secrets(&output)
-                ),
-            };
-        }
-        let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
-            &mut repair_context,
-            previous_repair_context.as_ref(),
-        );
-        *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
-        self.task_contract_verifier_repair_pending = true;
-        if let Some(outcome) = repair_context.rerun_outcome {
-            log_llm_event(
-                "agent.verifier_repair.rerun_classified",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "outcome": outcome.as_str(),
-                    "previous_failure_signature": repair_context.previous_failure_signature.as_deref(),
-                    "current_failure_signature": repair_context.failure_signature.as_str(),
-                    "previous_failure_count": repair_context.previous_failure_count,
-                    "current_failure_count": repair_context.failure_count,
-                }),
-            );
-        }
-        emit_repair_progress_classified_event(
-            self.session_store.session_id(),
-            previous_repair_context.as_ref(),
-            Some(&repair_context),
-            false,
-        );
-        self.repair_job = Some(repair_context);
-        self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
-        *args.repo_change_retries = 0;
-        *args.verifier_repair_retries = 0;
-        self.repair_job_artifact_attempts = 0;
-        write_stdout_rendered(
-            &format_iteration_status(
-                args.last_iter,
-                self.config.max_iterations,
-                "Verification failed",
-                "Asked the model to repair the repository using verifier diagnostics.",
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        self.push_system_note(task_contract_verifier_repair_note(
-            &command,
-            &output,
-            *args.contract_verification_retries,
-            attempt_limit,
-            self.repair_job.as_ref(),
-        ));
-        TaskContractVerifierFlowOutcome::Continue
     }
 
     fn handle_repair_job_verifier_pass(
@@ -5444,7 +5229,7 @@ impl Agent {
     /// Returns `true` if the event was emitted, `false` if suppressed by
     /// dedup (used by unit tests; production callers ignore the return
     /// value).
-    fn emit_agent_verifier_invoked_if_new(
+    pub(super) fn emit_agent_verifier_invoked_if_new(
         &mut self,
         snapshot: &super::auto_test::VerifierInvokedSnapshot,
     ) -> bool {
@@ -5478,7 +5263,7 @@ impl Agent {
     /// Caller (`run_task_contract_verifier_once`) wires both pre-execution
     /// (PYTHONPATH) and post-execution (stdout/stderr) detection through
     /// this single SSOT.
-    fn emit_agent_verifier_external_import_rejected_if_first(
+    pub(super) fn emit_agent_verifier_external_import_rejected_if_first(
         &mut self,
         runner: &str,
         reason: &'static str,
@@ -5545,7 +5330,7 @@ impl Agent {
     /// list. The recorded `bound_test_artifacts_count` is the only proof
     /// `TaskContract::evaluate_with_owned_test_artifacts` accepts to
     /// satisfy `test_execution_required = true`.
-    fn observe_task_contract_verifier_exit_zero_bound(
+    pub(super) fn observe_task_contract_verifier_exit_zero_bound(
         &mut self,
         command: &str,
         bound_count: usize,
@@ -11971,13 +11756,13 @@ mod tests {
         repair_terminal_exit_reason, request_explicitly_requests_script_execution,
         should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
-        task_contract_structured_missing_outcome,
-        task_contract_verifier_transport_error_to_outcome, verifier_repair_context_from_failure,
+        task_contract_structured_missing_outcome, verifier_repair_context_from_failure,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
     use crate::agent::loop_run::failure_packet::FailurePacketTimeoutKind;
     use crate::agent::loop_run::repair_job::RepairTerminalReason;
     use crate::agent::loop_run::task_contract::SafeStopReason;
+    use crate::agent::loop_run::verifier_driver::task_contract_verifier_transport_error_to_outcome;
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use crate::session::store::ConversationMessage;
     use crate::tools::bash::{BashCommandClass, BashExecutionOutcome};
