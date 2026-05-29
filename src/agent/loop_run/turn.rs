@@ -168,17 +168,18 @@ use super::verifier_orchestration::{
     emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event, emit_repair_progress_classified_event,
     model_assessment_to_verifier_repair_assessment, repair_terminal_exit_reason,
-    task_contract_needs_verification, task_contract_no_verifier_note,
-    task_contract_verifier_failure_attempt_limit, task_contract_verifier_repair_note,
-    task_contract_verifier_targeted_edit_required_note,
-    validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_file_excerpts,
-    verifier_diagnostic_messages, verifier_framework_signal_for_context,
-    verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
-    verifier_repair_intent_limits, verifier_repair_pass_messages,
-    verifier_repair_pass_request_error_message, verifier_repair_policy_for_target_hint,
-    verifier_repair_safe_stop_message, verifier_repair_target_display,
-    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
-    verifier_setup_policy_message,
+    synthesized_missing_implementation_target_path_for_request,
+    synthesized_missing_test_target_path_for_request, task_contract_needs_verification,
+    task_contract_no_verifier_note, task_contract_verifier_failure_attempt_limit,
+    task_contract_verifier_repair_note, task_contract_verifier_targeted_edit_required_note,
+    test_target_path_compatible_with_request, validate_verifier_repair_intents_with_accepted_plan,
+    verifier_diagnostic_file_excerpts, verifier_diagnostic_messages,
+    verifier_framework_signal_for_context, verifier_repair_context_diagnostics,
+    verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
+    verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
+    verifier_repair_policy_for_target_hint, verifier_repair_safe_stop_message,
+    verifier_repair_target_display, verifier_repair_transition_message,
+    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
 };
 #[cfg(test)]
 use super::verifier_orchestration::{
@@ -17609,25 +17610,6 @@ fn existing_workspace_candidate_for_role(
         .map(|path| path.to_string_lossy().replace('\\', "/"))
 }
 
-/// Issue #646: project the workspace-target half of a [`VerifierRepairDecision`]
-/// so the MissingVerifierJob safeguard can re-validate the scope when no real
-/// [`RepairJob`] is attached. Returns `None` for decisions that do not carry
-/// a path (NoRepair / NeedDiagnostic / NeedTargetDiscovery / ReadyToVerify /
-/// DiagnosticUnavailable).
-#[cfg(test)]
-pub(super) fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
-    match decision {
-        VerifierRepairDecision::NeedFreshRead(path)
-        | VerifierRepairDecision::NeedWrite(path)
-        | VerifierRepairDecision::NeedEdit(path) => Some(path.as_path()),
-        VerifierRepairDecision::NoRepair
-        | VerifierRepairDecision::NeedDiagnostic
-        | VerifierRepairDecision::NeedTargetDiscovery
-        | VerifierRepairDecision::DiagnosticUnavailable
-        | VerifierRepairDecision::ReadyToVerify => None,
-    }
-}
-
 /// v0.4.11: after an invalid controller repair proposal is recorded in the
 /// repair ledger, the next policy decision may have advanced to a fresh
 /// diagnostic or a different concrete target. Only those transitions count as
@@ -17683,133 +17665,6 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
     candidates
         .first()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
-}
-
-const PYTHON_REQUEST_PATTERNS: &[&str] = &["fastapi", "python", ".py"];
-const PYTHON_REQUEST_JA_PATTERNS: &[&str] = &["Pythonで", "FastAPIで"];
-const RUST_REQUEST_PATTERNS: &[&str] = &["rust", "cargo test", "cargo"];
-const RUST_REQUEST_JA_PATTERNS: &[&str] = &["Rustで", "Rust"];
-const RUST_LIBRARY_REQUEST_PATTERNS: &[&str] = &["library", "crate"];
-const RUST_LIBRARY_REQUEST_JA_PATTERNS: &[&str] = &["ライブラリ", "クレート"];
-const TYPESCRIPT_REQUEST_PATTERNS: &[&str] = &["typescript", "type script", ".ts"];
-const JAVASCRIPT_REQUEST_PATTERNS: &[&str] = &["javascript", "node", "npm test"];
-const NODE_REQUEST_PATTERNS: &[&str] = &["node", "npm", "typescript", "javascript"];
-const PYTHON_TEST_REQUEST_PATTERNS: &[&str] =
-    &["fastapi", "flask", "django", "python", "pytest", ".py"];
-
-fn lower_contains_any(lower: &str, patterns: &[&str]) -> bool {
-    patterns.iter().any(|pattern| lower.contains(pattern))
-}
-
-fn request_contains_any(request: &str, patterns: &[&str]) -> bool {
-    patterns.iter().any(|pattern| request.contains(pattern))
-}
-
-fn request_matches_family(
-    lower: &str,
-    request: &str,
-    lower_patterns: &[&str],
-    request_patterns: &[&str],
-) -> bool {
-    lower_contains_any(lower, lower_patterns) || request_contains_any(request, request_patterns)
-}
-
-fn synthesized_missing_implementation_target_path_for_request(
-    role: super::task_contract::ArtifactRole,
-    request: &str,
-) -> Option<String> {
-    if role != super::task_contract::ArtifactRole::Implementation {
-        return None;
-    }
-    let lower = request.to_ascii_lowercase();
-    if request_matches_family(
-        &lower,
-        request,
-        PYTHON_REQUEST_PATTERNS,
-        PYTHON_REQUEST_JA_PATTERNS,
-    ) {
-        return Some("main.py".to_string());
-    }
-    if request_matches_family(
-        &lower,
-        request,
-        RUST_REQUEST_PATTERNS,
-        RUST_REQUEST_JA_PATTERNS,
-    ) {
-        if request_matches_family(
-            &lower,
-            request,
-            RUST_LIBRARY_REQUEST_PATTERNS,
-            RUST_LIBRARY_REQUEST_JA_PATTERNS,
-        ) {
-            return Some("src/lib.rs".to_string());
-        }
-        return Some("src/main.rs".to_string());
-    }
-    None
-}
-
-fn synthesized_missing_test_target_path_for_request(
-    request: &str,
-) -> Option<(&'static str, &'static str)> {
-    let lower = request.to_ascii_lowercase();
-    if request_matches_family(&lower, request, RUST_REQUEST_PATTERNS, &["Rustで"]) {
-        return Some(("tests/main.rs", "rust"));
-    }
-    if lower_contains_any(&lower, TYPESCRIPT_REQUEST_PATTERNS) {
-        return Some(("tests/main.test.ts", "typescript"));
-    }
-    if lower_contains_any(&lower, JAVASCRIPT_REQUEST_PATTERNS) {
-        return Some(("tests/main.test.js", "javascript"));
-    }
-    if request_matches_family(
-        &lower,
-        request,
-        PYTHON_TEST_REQUEST_PATTERNS,
-        PYTHON_REQUEST_JA_PATTERNS,
-    ) {
-        return Some(("tests/test_main.py", "python"));
-    }
-    None
-}
-
-fn test_target_path_compatible_with_request(path: &str, request: &str) -> bool {
-    let Some((target_path, _)) = synthesized_missing_test_target_path_for_request(request) else {
-        return true;
-    };
-    let expected_ext = std::path::Path::new(target_path)
-        .extension()
-        .and_then(|ext| ext.to_str());
-    let actual_ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str());
-    expected_ext == actual_ext
-}
-
-pub(super) fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&'static str> {
-    let lower = request.to_ascii_lowercase();
-    if request_matches_family(
-        &lower,
-        request,
-        RUST_REQUEST_PATTERNS,
-        RUST_REQUEST_JA_PATTERNS,
-    ) {
-        return Some("For Rust/Cargo workspaces, create or update Cargo.toml.");
-    }
-    if request_matches_family(
-        &lower,
-        request,
-        PYTHON_TEST_REQUEST_PATTERNS,
-        PYTHON_REQUEST_JA_PATTERNS,
-    ) {
-        return Some(
-            "For Python/pytest workspaces, create or update pyproject.toml, requirements.txt, or pytest configuration.",
-        );
-    }
-    if lower_contains_any(&lower, NODE_REQUEST_PATTERNS) {
-        return Some("For Node/npm workspaces, create or update package.json with a test script.");
-    }
-    None
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -19069,7 +18924,7 @@ mod truncate_tests {
     #[test]
     fn missing_verifier_setup_hint_points_rust_requests_to_cargo_manifest() {
         assert_eq!(
-            super::missing_verifier_setup_hint_for_request(
+            super::super::verifier_orchestration::missing_verifier_setup_hint_for_request(
                 "Rustライブラリを作成し、cargo testで動くテストも実装してください。"
             ),
             Some("For Rust/Cargo workspaces, create or update Cargo.toml.")
@@ -19091,7 +18946,7 @@ mod truncate_tests {
     #[test]
     fn missing_verifier_setup_hint_points_python_requests_to_python_metadata() {
         assert_eq!(
-            super::missing_verifier_setup_hint_for_request(
+            super::super::verifier_orchestration::missing_verifier_setup_hint_for_request(
                 "FastAPIでCRUD APIを作り、pytestでテストしてください。"
             ),
             Some(
@@ -19103,7 +18958,7 @@ mod truncate_tests {
     #[test]
     fn missing_verifier_setup_hint_points_node_requests_to_package_json() {
         assert_eq!(
-            super::missing_verifier_setup_hint_for_request(
+            super::super::verifier_orchestration::missing_verifier_setup_hint_for_request(
                 "TypeScript CLI を作成し、npm test で確認してください。"
             ),
             Some("For Node/npm workspaces, create or update package.json with a test script.")
