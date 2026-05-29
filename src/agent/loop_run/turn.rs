@@ -383,7 +383,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    pub(super) fn record_controller_verifier_repair_edit(",
+            "\n    fn verifier_repair_pass_client(",
         );
 
         assert!(body.contains("target_hint:"));
@@ -400,7 +400,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    pub(super) fn record_controller_verifier_repair_edit(",
+            "\n    fn verifier_repair_pass_client(",
         );
 
         assert!(
@@ -427,7 +427,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    pub(super) fn record_controller_verifier_repair_edit(",
+            "\n    fn verifier_repair_pass_client(",
         );
         let orchestration = include_str!("verifier_orchestration.rs");
         let prompt = function_body(
@@ -1891,7 +1891,7 @@ fn extract_plan_constraints(contents: &str) -> Vec<String> {
     lines
 }
 
-fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String {
+pub(super) fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String {
     let path = Path::new(raw_path);
     if let Ok(resolved) = resolve_user_path(work_root, raw_path)
         && let Ok(relative) = resolved.strip_prefix(work_root)
@@ -9143,39 +9143,6 @@ impl Agent {
         }
     }
 
-    pub(super) fn record_controller_verifier_repair_edit(
-        &mut self,
-        relative_path: &str,
-        fingerprint: &str,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-    ) {
-        self.session.repo_edit_succeeded_this_turn = true;
-        self.session
-            .working_memory
-            .note_touched_file(normalize_memory_path(relative_path, &self.work_root));
-        self.observe_evidence_from_repo_edit(relative_path);
-        if let Some(context) = self.repair_job.as_mut() {
-            if !context
-                .applied_repair_intents
-                .iter()
-                .any(|existing| existing == fingerprint)
-            {
-                context.applied_repair_intents.push(fingerprint.to_string());
-                context.repair_error = None;
-            }
-            let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
-            context.apply_event(super::repair_job::RepairJobEvent::PatchApplied { key });
-        }
-        log_llm_event(
-            "agent.verifier_repair_pass.repo_edit_recorded",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "path": relative_path,
-                "role": target_hint.role.label(),
-            }),
-        );
-    }
-
     fn record_controller_verifier_repair_invalid(
         &mut self,
         error: &str,
@@ -9841,7 +9808,7 @@ impl Agent {
     /// `classify_repo_edit_path` which uses the SSOT in `util::file_classify`
     /// and applies the DR1-001 ordering rule (`.mdx → Docs` even though
     /// `is_implementation_file` would otherwise claim it).
-    fn observe_evidence_from_repo_edit(&mut self, path: &str) {
+    pub(super) fn observe_evidence_from_repo_edit(&mut self, path: &str) {
         let Some(relative_path) = workspace_relative_path_for_tool_arg(&self.work_root, path)
         else {
             return;

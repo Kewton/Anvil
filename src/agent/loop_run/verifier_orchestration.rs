@@ -84,6 +84,7 @@ use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
+    normalize_memory_path,
 };
 use super::verifier_assessment_parser::{
     ParsedVerifierRepairAssessment, verifier_failure_type_for_diagnostic_kind,
@@ -2084,7 +2085,8 @@ pub(super) fn apply_verifier_repair_pass_edit(
             edit.relative_path
         )));
     }
-    agent.record_controller_verifier_repair_edit(
+    record_controller_verifier_repair_edit(
+        agent,
         &edit.relative_path,
         &edit.fingerprint,
         target_hint,
@@ -2103,4 +2105,38 @@ pub(super) fn apply_verifier_repair_pass_edit(
     Ok(VerifierRepairPassOutcome::Applied {
         relative_path: edit.relative_path,
     })
+}
+
+pub(super) fn record_controller_verifier_repair_edit(
+    agent: &mut Agent,
+    relative_path: &str,
+    fingerprint: &str,
+    target_hint: &RecoveryTargetHint,
+) {
+    agent.session.repo_edit_succeeded_this_turn = true;
+    agent
+        .session
+        .working_memory
+        .note_touched_file(normalize_memory_path(relative_path, &agent.work_root));
+    agent.observe_evidence_from_repo_edit(relative_path);
+    if let Some(context) = agent.repair_job.as_mut() {
+        if !context
+            .applied_repair_intents
+            .iter()
+            .any(|existing| existing == fingerprint)
+        {
+            context.applied_repair_intents.push(fingerprint.to_string());
+            context.repair_error = None;
+        }
+        let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
+        context.apply_event(super::repair_job::RepairJobEvent::PatchApplied { key });
+    }
+    log_llm_event(
+        "agent.verifier_repair_pass.repo_edit_recorded",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "path": relative_path,
+            "role": target_hint.role.label(),
+        }),
+    );
 }
