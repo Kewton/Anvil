@@ -2925,7 +2925,7 @@ impl Agent {
     /// Issue #557: call photon context_pack and store rendered response.
     /// Canary gate runs BEFORE the HTTP fetch (DR3-002).
     fn invoke_photon_context_pack(&mut self) {
-        self.clear_photon_context_pack_injection_tracking();
+        super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
 
         // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
         if self.photon.is_none() {
@@ -2934,7 +2934,8 @@ impl Agent {
 
         // Issue #557: shadow mode disables prompt injection entirely.
         if self.config.photon_shadow_mode {
-            self.skip_photon_context_pack(
+            super::photon_feedback_derive::skip_photon_context_pack(
+                self,
                 crate::agent::loop_run::PhotonContextPackStatus::ShadowMode,
                 "shadow_mode",
             );
@@ -2950,7 +2951,8 @@ impl Agent {
             turn_idx: self.current_turn_index,
         };
         if !crate::photon::mapper::should_send_context_pack(&gate) {
-            self.skip_photon_context_pack(
+            super::photon_feedback_derive::skip_photon_context_pack(
+                self,
                 crate::agent::loop_run::PhotonContextPackStatus::CanarySkipped,
                 "canary_gate",
             );
@@ -2969,7 +2971,7 @@ impl Agent {
         let (items_blocked, truncated) = match result {
             Some(resp) => self.process_photon_context_pack_response(resp, warning_filter_enabled),
             None => {
-                self.clear_photon_context_pack_injection_tracking();
+                super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
                 (0, false)
             }
         };
@@ -2982,28 +2984,6 @@ impl Agent {
             warning_filter_enabled,
             items_blocked,
         );
-    }
-
-    fn clear_photon_context_pack_injection_tracking(&mut self) {
-        self.last_injected_summary_ids.clear();
-        self.last_injected_summary_turn_index = None;
-    }
-
-    fn skip_photon_context_pack(
-        &mut self,
-        status: crate::agent::loop_run::PhotonContextPackStatus,
-        reason: &str,
-    ) {
-        self.last_photon_context_pack_status = status;
-        log_llm_event(
-            "agent.photon_context_pack.skipped",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "reason": reason,
-            }),
-        );
-        self.clear_photon_context_pack_injection_tracking();
     }
 
     fn build_pre_turn_photon_context_pack_request(
@@ -3176,7 +3156,7 @@ impl Agent {
             self.last_injected_summary_turn_index = Some(self.current_turn_index);
             trunc
         } else {
-            self.clear_photon_context_pack_injection_tracking();
+            super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
             false
         }
     }
@@ -3293,7 +3273,8 @@ impl Agent {
             // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
             work_mode_is_answer_only: self.answer_only_mode_active(),
             // Issue #608 Phase α-2 (AP-10 / 設計判断 #2 + #3): Case E expansion.
-            verifier_exit_zero_this_turn: self.photon_verifier_exit_zero_this_turn(),
+            verifier_exit_zero_this_turn:
+                super::photon_feedback_derive::photon_verifier_exit_zero_this_turn(self),
         };
         let PhotonFeedbackOutcome {
             outcome: outcome_static,
@@ -3337,24 +3318,18 @@ impl Agent {
         // static-allowlist strings cross the audit boundary.
         // `mask_payload_inplace` in `log_llm_event` provides the final
         // defensive scrub.
-        self.log_photon_evaluate_completed(PhotonEvaluateCompletedLog {
-            failed: result.is_none(),
-            duration_ms,
-            summary_ids_adopted_count,
-            adoption_status,
-            truncated,
-            outcome_json,
-            outcome_detail_json,
-        });
-    }
-
-    fn photon_verifier_exit_zero_this_turn(&self) -> bool {
-        self.evidence_set_this_turn.iter().any(|e| {
-            matches!(
-                e,
-                super::completion_evidence::CompletionEvidence::VerifierExitZero { .. }
-            )
-        })
+        super::photon_feedback_derive::log_photon_evaluate_completed(
+            self,
+            PhotonEvaluateCompletedLog {
+                failed: result.is_none(),
+                duration_ms,
+                summary_ids_adopted_count,
+                adoption_status,
+                truncated,
+                outcome_json,
+                outcome_detail_json,
+            },
+        );
     }
 
     fn build_photon_context_pack_event(
@@ -3405,31 +3380,6 @@ impl Agent {
         summary.outcome_emitted = outcome_static.map(String::from);
         summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
         self.last_photon_eval_summary = Some(summary);
-    }
-
-    fn log_photon_evaluate_completed(&self, payload: PhotonEvaluateCompletedLog) {
-        log_llm_event(
-            "agent.photon_evaluate.completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "failed": payload.failed,
-                "duration_ms": payload.duration_ms,
-                "summary_ids_adopted_count": payload.summary_ids_adopted_count,
-                "outcome": payload.outcome_json,
-                "adoption_status": payload.adoption_status,
-                "summary_ids_adopted_truncated": payload.truncated,
-                "outcome_detail": payload.outcome_detail_json,
-            }),
-        );
-    }
-
-    /// Issue #556: build the system message to inject context_pack into the prompt.
-    fn photon_context_pack_injection_message(&self) -> Option<ConversationMessage> {
-        build_photon_injection_message(
-            self.photon_context_pack_response.as_deref(),
-            self.config.photon_shadow_mode,
-        )
     }
 
     fn run_turn(
@@ -5124,7 +5074,9 @@ impl Agent {
         protocol: prompting::ToolProtocol,
         effective_tool_policy: &EffectiveToolPolicy,
     ) {
-        if let Some(ctx) = self.photon_context_pack_injection_message() {
+        if let Some(ctx) =
+            super::photon_feedback_derive::photon_context_pack_injection_message(self)
+        {
             messages.push(ctx);
         }
         if self.config.offline {
