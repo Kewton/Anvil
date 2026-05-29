@@ -84,7 +84,6 @@ use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
-    missing_verifier_setup_hint_for_request,
 };
 use super::verifier_assessment_parser::{
     ParsedVerifierRepairAssessment, verifier_failure_type_for_diagnostic_kind,
@@ -115,8 +114,6 @@ use super::repair_job::VerifierRepairDecision;
 use super::repair_patch_validation::{RepairIntentEdit, repair_intent_edits_fingerprint};
 #[cfg(test)]
 use super::tool_policy::workspace_relative_path_for_tool_arg;
-#[cfg(test)]
-use super::turn::decision_target_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JobInstallOutcome {
@@ -1917,4 +1914,150 @@ pub(super) fn patch_proposal_target_contents_for_shadow(
         return None;
     }
     std::fs::read_to_string(canonical).ok()
+}
+
+/// Issue #646: project the workspace-target half of a [`VerifierRepairDecision`]
+/// so the MissingVerifierJob safeguard can re-validate the scope when no real
+/// [`RepairJob`] is attached. Returns `None` for decisions that do not carry
+/// a path (NoRepair / NeedDiagnostic / NeedTargetDiscovery / ReadyToVerify /
+/// DiagnosticUnavailable).
+#[cfg(test)]
+pub(super) fn decision_target_path(decision: &VerifierRepairDecision) -> Option<&Path> {
+    match decision {
+        VerifierRepairDecision::NeedFreshRead(path)
+        | VerifierRepairDecision::NeedWrite(path)
+        | VerifierRepairDecision::NeedEdit(path) => Some(path.as_path()),
+        VerifierRepairDecision::NoRepair
+        | VerifierRepairDecision::NeedDiagnostic
+        | VerifierRepairDecision::NeedTargetDiscovery
+        | VerifierRepairDecision::DiagnosticUnavailable
+        | VerifierRepairDecision::ReadyToVerify => None,
+    }
+}
+
+pub(super) const PYTHON_REQUEST_PATTERNS: &[&str] = &["fastapi", "python", ".py"];
+pub(super) const PYTHON_REQUEST_JA_PATTERNS: &[&str] = &["Pythonで", "FastAPIで"];
+pub(super) const RUST_REQUEST_PATTERNS: &[&str] = &["rust", "cargo test", "cargo"];
+pub(super) const RUST_REQUEST_JA_PATTERNS: &[&str] = &["Rustで", "Rust"];
+pub(super) const RUST_LIBRARY_REQUEST_PATTERNS: &[&str] = &["library", "crate"];
+pub(super) const RUST_LIBRARY_REQUEST_JA_PATTERNS: &[&str] = &["ライブラリ", "クレート"];
+pub(super) const TYPESCRIPT_REQUEST_PATTERNS: &[&str] = &["typescript", "type script", ".ts"];
+pub(super) const JAVASCRIPT_REQUEST_PATTERNS: &[&str] = &["javascript", "node", "npm test"];
+pub(super) const NODE_REQUEST_PATTERNS: &[&str] = &["node", "npm", "typescript", "javascript"];
+pub(super) const PYTHON_TEST_REQUEST_PATTERNS: &[&str] =
+    &["fastapi", "flask", "django", "python", "pytest", ".py"];
+
+pub(super) fn lower_contains_any(lower: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+pub(super) fn request_contains_any(request: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| request.contains(pattern))
+}
+
+pub(super) fn request_matches_family(
+    lower: &str,
+    request: &str,
+    lower_patterns: &[&str],
+    request_patterns: &[&str],
+) -> bool {
+    lower_contains_any(lower, lower_patterns) || request_contains_any(request, request_patterns)
+}
+
+pub(super) fn synthesized_missing_implementation_target_path_for_request(
+    role: ArtifactRole,
+    request: &str,
+) -> Option<String> {
+    if role != ArtifactRole::Implementation {
+        return None;
+    }
+    let lower = request.to_ascii_lowercase();
+    if request_matches_family(
+        &lower,
+        request,
+        PYTHON_REQUEST_PATTERNS,
+        PYTHON_REQUEST_JA_PATTERNS,
+    ) {
+        return Some("main.py".to_string());
+    }
+    if request_matches_family(
+        &lower,
+        request,
+        RUST_REQUEST_PATTERNS,
+        RUST_REQUEST_JA_PATTERNS,
+    ) {
+        if request_matches_family(
+            &lower,
+            request,
+            RUST_LIBRARY_REQUEST_PATTERNS,
+            RUST_LIBRARY_REQUEST_JA_PATTERNS,
+        ) {
+            return Some("src/lib.rs".to_string());
+        }
+        return Some("src/main.rs".to_string());
+    }
+    None
+}
+
+pub(super) fn synthesized_missing_test_target_path_for_request(
+    request: &str,
+) -> Option<(&'static str, &'static str)> {
+    let lower = request.to_ascii_lowercase();
+    if request_matches_family(&lower, request, RUST_REQUEST_PATTERNS, &["Rustで"]) {
+        return Some(("tests/main.rs", "rust"));
+    }
+    if lower_contains_any(&lower, TYPESCRIPT_REQUEST_PATTERNS) {
+        return Some(("tests/main.test.ts", "typescript"));
+    }
+    if lower_contains_any(&lower, JAVASCRIPT_REQUEST_PATTERNS) {
+        return Some(("tests/main.test.js", "javascript"));
+    }
+    if request_matches_family(
+        &lower,
+        request,
+        PYTHON_TEST_REQUEST_PATTERNS,
+        PYTHON_REQUEST_JA_PATTERNS,
+    ) {
+        return Some(("tests/test_main.py", "python"));
+    }
+    None
+}
+
+pub(super) fn test_target_path_compatible_with_request(path: &str, request: &str) -> bool {
+    let Some((target_path, _)) = synthesized_missing_test_target_path_for_request(request) else {
+        return true;
+    };
+    let expected_ext = std::path::Path::new(target_path)
+        .extension()
+        .and_then(|ext| ext.to_str());
+    let actual_ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str());
+    expected_ext == actual_ext
+}
+
+pub(super) fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&'static str> {
+    let lower = request.to_ascii_lowercase();
+    if request_matches_family(
+        &lower,
+        request,
+        RUST_REQUEST_PATTERNS,
+        RUST_REQUEST_JA_PATTERNS,
+    ) {
+        return Some("For Rust/Cargo workspaces, create or update Cargo.toml.");
+    }
+    if request_matches_family(
+        &lower,
+        request,
+        PYTHON_TEST_REQUEST_PATTERNS,
+        PYTHON_REQUEST_JA_PATTERNS,
+    ) {
+        return Some(
+            "For Python/pytest workspaces, create or update pyproject.toml, requirements.txt, or pytest configuration.",
+        );
+    }
+    if lower_contains_any(&lower, NODE_REQUEST_PATTERNS) {
+        return Some("For Node/npm workspaces, create or update package.json with a test script.");
+    }
+    None
 }
