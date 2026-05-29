@@ -63,9 +63,9 @@ use super::tool_history::{
 };
 use super::turn::{
     WrittenScaffoldArtifacts, extract_filename_with_suffix, last_read_tool_path,
-    latest_turn_preferred_read_edit_target, meaningful_workspace_files, tool_result_failed,
-    workspace_appears_empty, write_stdout_rendered,
+    latest_turn_preferred_read_edit_target, tool_result_failed, write_stdout_rendered,
 };
+use super::workspace_walk::{meaningful_workspace_files, workspace_appears_empty};
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::logging::log_llm_event;
