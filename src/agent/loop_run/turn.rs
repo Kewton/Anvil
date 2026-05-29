@@ -91,8 +91,7 @@ use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
 #[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
-    EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT, ScaffoldFallbackResult, ScaffoldFramework,
-    scaffold_candidate_priority,
+    ScaffoldFallbackResult, ScaffoldFramework, scaffold_candidate_priority,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
@@ -5837,142 +5836,25 @@ impl Agent {
         &mut self,
         err: &str,
     ) -> Result<Option<AssistantReply>, String> {
-        // Issue #634: edit 系特化 fallback (固定 arithmetic patch) は experimental
-        // flag のみで gate (template 系と異なり `FullTemplate` 制約は不要)。
-        // 既存 capability gate (`deterministic_edit_after_format_error`) も維持。
-        if !self.config.specialized_fallback_enabled() {
-            return Ok(None);
-        }
-        if !lifecycle::is_tool_call_format_error(err)
-            || !model_capabilities(&self.current_assistant_model())
-                .deterministic_edit_after_format_error
-            || has_successful_non_plan_repo_edit(
-                &self.session.messages,
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-            )
-        {
-            return Ok(None);
-        }
-        let Some(path) = last_read_tool_path(&self.session.messages) else {
-            return Ok(None);
-        };
-        let Ok(target) = resolve_user_path(&self.work_root, &path) else {
-            return Ok(None);
-        };
-        if !target.is_file() {
-            return Ok(None);
-        }
-        let current = std::fs::read_to_string(&target)
-            .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
-        let replacement = if current.contains("pub fn multiply") && current.contains("left + right")
-        {
-            current.replacen("left + right", "left * right", 1)
-        } else if current.contains("pub fn add") && current.contains("left - right") {
-            current.replacen("left - right", "left + right", 1)
-        } else {
-            return Ok(None);
-        };
-        std::fs::write(&target, replacement)
-            .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
-        let relative = target
-            .strip_prefix(&self.work_root)
-            .unwrap_or(&target)
-            .to_string_lossy()
-            .replace('\\', "/");
-        self.session
-            .working_memory
-            .note_touched_file(relative.clone());
-        log_llm_event(
-            EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "work_root": self.work_root.display().to_string(),
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "minimal_patch",
-                "target": &relative,
-            }),
-        );
-        Ok(Some(AssistantReply {
-            content: format!(
-                "Applied a deterministic small-edit fallback after malformed tool calls in {relative}."
-            ),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(self, err)
     }
 
     fn maybe_fallback_plan_model_after_timeout(&mut self, err: &str) -> bool {
-        let Some(sidecar) = self
-            .models
-            .sidecar
-            .as_ref()
-            .filter(|model| !model.trim().is_empty())
-        else {
-            return false;
-        };
-        if !should_fallback_plan_model_after_timeout(
-            self.session.mode_state.mode,
-            self.plan_model_override.as_deref(),
-            err,
-            sidecar,
-        ) {
-            return false;
-        }
-
-        self.plan_model_override = Some(sidecar.clone());
-        self.push_system_note(format!(
-            "Main planning model timed out. Retry the plan step with sidecar model {sidecar}."
-        ));
-        true
+        super::scaffold_pipeline::maybe_fallback_plan_model_after_timeout(self, err)
     }
 
     fn maybe_materialize_plan_after_timeout(
         &mut self,
         err: &str,
     ) -> Result<Option<AssistantReply>, String> {
-        if !should_materialize_plan_after_timeout(
-            self.session.mode_state.mode,
-            self.plan_model_override.as_deref(),
-            err,
-        ) {
-            return Ok(None);
-        }
-        if !self
-            .materialize_deterministic_fallback_plan("agent.plan.timeout_fallback_materialized")?
-        {
-            return Ok(None);
-        }
-        Ok(Some(AssistantReply {
-            content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                .to_string(),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        super::scaffold_pipeline::maybe_materialize_plan_after_timeout(self, err)
     }
 
     fn maybe_materialize_plan_after_tool_call_format_error(
         &mut self,
         err: &str,
     ) -> Result<Option<AssistantReply>, String> {
-        if !should_materialize_plan_after_tool_call_format_error(self.session.mode_state.mode, err)
-        {
-            return Ok(None);
-        }
-        if !self.materialize_deterministic_fallback_plan(
-            "agent.plan.tool_call_format_fallback_materialized",
-        )? {
-            return Ok(None);
-        }
-        Ok(Some(AssistantReply {
-            content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
-                .to_string(),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        }))
+        super::scaffold_pipeline::maybe_materialize_plan_after_tool_call_format_error(self, err)
     }
 
     pub(super) fn materialize_deterministic_fallback_plan(
@@ -14840,7 +14722,7 @@ pub(super) fn join_sections_for_progress(sections: &[&str]) -> String {
     }
 }
 
-fn should_materialize_plan_after_timeout(
+pub(super) fn should_materialize_plan_after_timeout(
     mode: ExecutionMode,
     plan_model_override: Option<&str>,
     err: &str,
@@ -14849,7 +14731,10 @@ fn should_materialize_plan_after_timeout(
     mode == ExecutionMode::Plan && err.to_ascii_lowercase().contains("timed out")
 }
 
-fn should_materialize_plan_after_tool_call_format_error(mode: ExecutionMode, err: &str) -> bool {
+pub(super) fn should_materialize_plan_after_tool_call_format_error(
+    mode: ExecutionMode,
+    err: &str,
+) -> bool {
     mode == ExecutionMode::Plan && lifecycle::is_tool_call_format_error(err)
 }
 
@@ -14866,7 +14751,7 @@ fn assistant_model_for_mode(
     main_model.to_string()
 }
 
-fn should_fallback_plan_model_after_timeout(
+pub(super) fn should_fallback_plan_model_after_timeout(
     mode: ExecutionMode,
     plan_model_override: Option<&str>,
     err: &str,

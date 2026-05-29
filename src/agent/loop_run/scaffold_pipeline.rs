@@ -57,8 +57,10 @@ use super::turn::{
     WrittenScaffoldArtifacts, current_file_hash_for_relative_path,
     deterministic_timeout_fallback_plan, extract_filename_with_suffix, last_read_tool_path,
     latest_turn_preferred_read_edit_target, meaningful_workspace_files, normalize_memory_path,
-    progress_path_display, sha256_hex, sync_package_json_with_existing_lock, tool_result_failed,
-    workspace_appears_empty, write_stdout_rendered,
+    progress_path_display, sha256_hex, should_fallback_plan_model_after_timeout,
+    should_materialize_plan_after_timeout, should_materialize_plan_after_tool_call_format_error,
+    sync_package_json_with_existing_lock, tool_result_failed, workspace_appears_empty,
+    write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::agent::recovery;
@@ -1609,4 +1611,142 @@ pub(super) fn maybe_apply_deterministic_polish_fallback_after_timeout(
         return None;
     }
     None
+}
+
+pub(super) fn maybe_apply_deterministic_edit_after_format_error(
+    agent: &mut Agent,
+    err: &str,
+) -> Result<Option<AssistantReply>, String> {
+    if !agent.config.specialized_fallback_enabled() {
+        return Ok(None);
+    }
+    if !lifecycle::is_tool_call_format_error(err)
+        || !model_capabilities(&agent.current_assistant_model())
+            .deterministic_edit_after_format_error
+        || has_successful_non_plan_repo_edit(
+            &agent.session.messages,
+            &agent.work_root,
+            agent.session.mode_state.active_plan_path.as_deref(),
+        )
+    {
+        return Ok(None);
+    }
+    let Some(path) = last_read_tool_path(&agent.session.messages) else {
+        return Ok(None);
+    };
+    let Ok(target) = resolve_user_path(&agent.work_root, &path) else {
+        return Ok(None);
+    };
+    if !target.is_file() {
+        return Ok(None);
+    }
+    let current = std::fs::read_to_string(&target)
+        .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
+    let replacement = if current.contains("pub fn multiply") && current.contains("left + right") {
+        current.replacen("left + right", "left * right", 1)
+    } else if current.contains("pub fn add") && current.contains("left - right") {
+        current.replacen("left - right", "left + right", 1)
+    } else {
+        return Ok(None);
+    };
+    std::fs::write(&target, replacement)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    let relative = target
+        .strip_prefix(&agent.work_root)
+        .unwrap_or(&target)
+        .to_string_lossy()
+        .replace('\\', "/");
+    agent
+        .session
+        .working_memory
+        .note_touched_file(relative.clone());
+    log_llm_event(
+        EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "minimal_patch",
+            "target": &relative,
+        }),
+    );
+    Ok(Some(AssistantReply {
+        content: format!(
+            "Applied a deterministic small-edit fallback after malformed tool calls in {relative}."
+        ),
+        tool_calls: Vec::new(),
+        prompt_tokens: None,
+        completion_tokens: None,
+    }))
+}
+
+pub(super) fn maybe_fallback_plan_model_after_timeout(agent: &mut Agent, err: &str) -> bool {
+    let Some(sidecar) = agent
+        .models
+        .sidecar
+        .as_ref()
+        .filter(|model| !model.trim().is_empty())
+    else {
+        return false;
+    };
+    if !should_fallback_plan_model_after_timeout(
+        agent.session.mode_state.mode,
+        agent.plan_model_override.as_deref(),
+        err,
+        sidecar,
+    ) {
+        return false;
+    }
+
+    agent.plan_model_override = Some(sidecar.clone());
+    agent.push_system_note(format!(
+        "Main planning model timed out. Retry the plan step with sidecar model {sidecar}."
+    ));
+    true
+}
+
+pub(super) fn maybe_materialize_plan_after_timeout(
+    agent: &mut Agent,
+    err: &str,
+) -> Result<Option<AssistantReply>, String> {
+    if !should_materialize_plan_after_timeout(
+        agent.session.mode_state.mode,
+        agent.plan_model_override.as_deref(),
+        err,
+    ) {
+        return Ok(None);
+    }
+    if !materialize_deterministic_fallback_plan(agent, "agent.plan.timeout_fallback_materialized")?
+    {
+        return Ok(None);
+    }
+    Ok(Some(AssistantReply {
+        content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+            .to_string(),
+        tool_calls: Vec::new(),
+        prompt_tokens: None,
+        completion_tokens: None,
+    }))
+}
+
+pub(super) fn maybe_materialize_plan_after_tool_call_format_error(
+    agent: &mut Agent,
+    err: &str,
+) -> Result<Option<AssistantReply>, String> {
+    if !should_materialize_plan_after_tool_call_format_error(agent.session.mode_state.mode, err) {
+        return Ok(None);
+    }
+    if !materialize_deterministic_fallback_plan(
+        agent,
+        "agent.plan.tool_call_format_fallback_materialized",
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(AssistantReply {
+        content: "Plan complete. Reply yes to execute, no to revise, or provide feedback."
+            .to_string(),
+        tool_calls: Vec::new(),
+        prompt_tokens: None,
+        completion_tokens: None,
+    }))
 }
