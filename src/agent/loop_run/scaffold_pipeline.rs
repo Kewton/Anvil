@@ -43,6 +43,7 @@ use super::actor_loop_flow::{
 };
 use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
+use super::deterministic_fallback_plan::deterministic_timeout_fallback_plan;
 use super::interrupt::InterruptFlag;
 use super::lifecycle;
 use super::quality::{
@@ -54,13 +55,12 @@ use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
 use super::turn::{
-    WrittenScaffoldArtifacts, current_file_hash_for_relative_path,
-    deterministic_timeout_fallback_plan, extract_filename_with_suffix, last_read_tool_path,
-    latest_turn_preferred_read_edit_target, meaningful_workspace_files, normalize_memory_path,
-    progress_path_display, sha256_hex, should_fallback_plan_model_after_timeout,
-    should_materialize_plan_after_timeout, should_materialize_plan_after_tool_call_format_error,
-    sync_package_json_with_existing_lock, tool_result_failed, workspace_appears_empty,
-    write_stdout_rendered,
+    WrittenScaffoldArtifacts, current_file_hash_for_relative_path, extract_filename_with_suffix,
+    last_read_tool_path, latest_turn_preferred_read_edit_target, meaningful_workspace_files,
+    normalize_memory_path, progress_path_display, sha256_hex,
+    should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
+    should_materialize_plan_after_tool_call_format_error, sync_package_json_with_existing_lock,
+    tool_result_failed, workspace_appears_empty, write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::agent::recovery;

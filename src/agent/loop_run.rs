@@ -279,6 +279,14 @@ mod precaution_relevance;
 // `log_*_confirm_outcome`, `override_feedback_kind_from_outcome`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod confirmation_flow;
+// Deterministic fallback-plan generator extracted from `turn.rs`
+// (parent #680). Used by `scaffold_pipeline.rs::maybe_materialize_plan_after_timeout`
+// when the main planning model fails to produce a usable plan.
+// Hosts `deterministic_timeout_fallback_plan` + 3 supporting helpers
+// (`extract_requested_port`, `fallback_plan_request_label`,
+// `fallback_plan_platform_label`). `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod deterministic_fallback_plan;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
