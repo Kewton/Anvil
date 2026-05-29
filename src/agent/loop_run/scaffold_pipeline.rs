@@ -46,10 +46,11 @@ use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
 use super::turn::{
-    current_file_hash_for_relative_path, last_read_tool_path,
+    current_file_hash_for_relative_path, extract_filename_with_suffix, last_read_tool_path,
     latest_turn_preferred_read_edit_target, meaningful_workspace_files, progress_path_display,
-    sha256_hex,
+    sha256_hex, workspace_appears_empty,
 };
+use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::AssistantReply;
@@ -65,6 +66,28 @@ pub(super) enum ScaffoldFramework {
     Next,
     React,
     Nuxt,
+}
+
+impl ScaffoldFramework {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Next => "Next.js",
+            Self::React => "React.js",
+            Self::Nuxt => "Nuxt.js",
+        }
+    }
+
+    pub(super) fn scaffold_hint(self) -> &'static str {
+        match self {
+            Self::Next => "Use create-next-app for the scaffold.",
+            Self::React => {
+                "Use a Vite React scaffold, for example: npm create vite@latest . -- --template react-ts."
+            }
+            Self::Nuxt => {
+                "Use a Nuxt scaffold, for example: npx nuxi@latest init . --packageManager npm."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -621,4 +644,88 @@ pub(super) fn deterministic_nextjs_scaffold_skip_reason(agent: &Agent) -> Option
         return Some("network scaffolding requires yes mode or an interactive approval prompt");
     }
     None
+}
+
+pub(super) fn empty_workspace_scaffold_policy_error(
+    agent: &Agent,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let requested_framework = active_task_requested_scaffold_framework(agent)?;
+    if !workspace_appears_empty(&agent.work_root)
+        || has_successful_non_plan_repo_edit(
+            &agent.session.messages,
+            &agent.work_root,
+            agent.session.mode_state.active_plan_path.as_deref(),
+        )
+    {
+        return None;
+    }
+    let label = requested_framework.label();
+    if name != "Bash" {
+        return Some(format!(
+            "Error: empty workspace {label} tasks require one scaffold Bash command first. Do not write package.json or placeholder files by hand."
+        ));
+    }
+    let command = arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    #[allow(deprecated)]
+    let scaffold_ok = recovery::is_scaffold_command(command);
+    if !scaffold_ok {
+        return Some(format!(
+            "Error: empty workspace {label} tasks require one scaffold Bash command first. Do not use cd, ls, manual bootstrap commands, or deprecated scaffolds. {}",
+            requested_framework.scaffold_hint()
+        ));
+    }
+    if !scaffold_command_matches_framework(requested_framework, command) {
+        return Some(format!(
+            "Error: the user requested {label}. Use a {label} scaffold command, not a different framework scaffold. {}",
+            requested_framework.scaffold_hint()
+        ));
+    }
+    None
+}
+
+pub(super) fn record_scaffold_artifact_snapshot(
+    agent: &mut Agent,
+    request: &str,
+    files: Vec<ScaffoldArtifactFileSnapshot>,
+) {
+    if files.is_empty() {
+        return;
+    }
+    agent
+        .session
+        .scaffold_artifact_snapshots
+        .push(ScaffoldArtifactSnapshot {
+            created_turn_index: agent.current_turn_index,
+            request_hash: sha256_hex(request.as_bytes()),
+            files,
+        });
+    const MAX_SCAFFOLD_SNAPSHOTS: usize = 4;
+    while agent.session.scaffold_artifact_snapshots.len() > MAX_SCAFFOLD_SNAPSHOTS {
+        agent.session.scaffold_artifact_snapshots.remove(0);
+    }
+}
+
+pub(super) fn python_csv_names_from_request_and_anvil(
+    agent: &Agent,
+    request: &str,
+) -> (Option<String>, Option<String>) {
+    let request_script = extract_filename_with_suffix(request, ".py");
+    let request_sample = extract_filename_with_suffix(request, ".csv");
+    let instructions = prompting::load_project_instructions(&agent.config.cwd, &agent.work_root);
+    let instruction_text = instructions
+        .as_ref()
+        .map(|value| value.global_content.as_str());
+    let instruction_script =
+        instruction_text.and_then(|text| extract_filename_with_suffix(text, ".py"));
+    let instruction_sample =
+        instruction_text.and_then(|text| extract_filename_with_suffix(text, ".csv"));
+    (
+        request_script.or(instruction_script),
+        request_sample.or(instruction_sample),
+    )
 }
