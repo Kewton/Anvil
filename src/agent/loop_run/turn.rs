@@ -68,7 +68,7 @@ use super::repair_job::{
 #[cfg(test)]
 use super::repair_patch_validation::ValidationWeakening;
 use super::repair_patch_validation::{
-    CheapCheckOutcome, RepairRejectionSignal, ValidatedVerifierRepairEdit, ValidationFailure,
+    CheapCheckOutcome, RepairRejectionSignal, ValidationFailure,
     build_verifier_repair_pass_ledger_outcome, validate_accepted_repair_plan_authorizes_target,
 };
 use super::repair_target_admission::RepairTargetAdmissionContext;
@@ -383,7 +383,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn record_controller_verifier_repair_edit(",
+            "\n    pub(super) fn record_controller_verifier_repair_edit(",
         );
 
         assert!(body.contains("target_hint:"));
@@ -400,7 +400,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn record_controller_verifier_repair_edit(",
+            "\n    pub(super) fn record_controller_verifier_repair_edit(",
         );
 
         assert!(
@@ -427,7 +427,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn record_controller_verifier_repair_edit(",
+            "\n    pub(super) fn record_controller_verifier_repair_edit(",
         );
         let orchestration = include_str!("verifier_orchestration.rs");
         let prompt = function_body(
@@ -9132,55 +9132,18 @@ impl Agent {
                 validation
             });
         match validation {
-            Ok(edit) => self.apply_verifier_repair_pass_edit(prepared, target_hint, attempt, edit),
+            Ok(edit) => super::verifier_orchestration::apply_verifier_repair_pass_edit(
+                self,
+                prepared,
+                target_hint,
+                attempt,
+                edit,
+            ),
             Err(error) => Err(error),
         }
     }
 
-    fn apply_verifier_repair_pass_edit(
-        &mut self,
-        prepared: &PreparedVerifierRepairPass,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-        attempt: usize,
-        edit: ValidatedVerifierRepairEdit,
-    ) -> Result<VerifierRepairPassOutcome, ValidationFailure> {
-        if prepared
-            .context
-            .applied_repair_intents
-            .contains(&edit.fingerprint)
-        {
-            return Err(ValidationFailure::failed(
-                "duplicate repair edit intent for the same failure".to_string(),
-            ));
-        }
-        if let Err(err) = super::repair_patch_executor::apply_validated_repair_edit(&edit) {
-            return Err(ValidationFailure::failed(format!(
-                "failed to apply {}: {err}",
-                edit.relative_path
-            )));
-        }
-        self.record_controller_verifier_repair_edit(
-            &edit.relative_path,
-            &edit.fingerprint,
-            target_hint,
-        );
-        log_llm_event(
-            "agent.verifier_repair_pass.applied",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "model": &prepared.model,
-                "path": edit.relative_path,
-                "preimage_hash": edit.preimage_hash,
-                "postimage_hash": edit.postimage_hash,
-                "attempt": attempt,
-            }),
-        );
-        Ok(VerifierRepairPassOutcome::Applied {
-            relative_path: edit.relative_path,
-        })
-    }
-
-    fn record_controller_verifier_repair_edit(
+    pub(super) fn record_controller_verifier_repair_edit(
         &mut self,
         relative_path: &str,
         fingerprint: &str,

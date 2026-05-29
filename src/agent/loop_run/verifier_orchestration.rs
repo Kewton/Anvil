@@ -96,7 +96,7 @@ use super::verifier_repair_targeting::{
     verifier_diagnostic_path_input_is_safe, verifier_repair_missing_local_module_provider,
     verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
-use super::{VerifierRepairAssessment, VerifierRepairAssessmentSource};
+use super::{Agent, VerifierRepairAssessment, VerifierRepairAssessmentSource};
 use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::modes::plan_act::ExecutionMode;
@@ -2060,4 +2060,47 @@ pub(super) fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&
         return Some("For Node/npm workspaces, create or update package.json with a test script.");
     }
     None
+}
+
+pub(super) fn apply_verifier_repair_pass_edit(
+    agent: &mut Agent,
+    prepared: &PreparedVerifierRepairPass,
+    target_hint: &RecoveryTargetHint,
+    attempt: usize,
+    edit: ValidatedVerifierRepairEdit,
+) -> Result<VerifierRepairPassOutcome, ValidationFailure> {
+    if prepared
+        .context
+        .applied_repair_intents
+        .contains(&edit.fingerprint)
+    {
+        return Err(ValidationFailure::failed(
+            "duplicate repair edit intent for the same failure".to_string(),
+        ));
+    }
+    if let Err(err) = super::repair_patch_executor::apply_validated_repair_edit(&edit) {
+        return Err(ValidationFailure::failed(format!(
+            "failed to apply {}: {err}",
+            edit.relative_path
+        )));
+    }
+    agent.record_controller_verifier_repair_edit(
+        &edit.relative_path,
+        &edit.fingerprint,
+        target_hint,
+    );
+    log_llm_event(
+        "agent.verifier_repair_pass.applied",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "model": &prepared.model,
+            "path": edit.relative_path,
+            "preimage_hash": edit.preimage_hash,
+            "postimage_hash": edit.postimage_hash,
+            "attempt": attempt,
+        }),
+    );
+    Ok(VerifierRepairPassOutcome::Applied {
+        relative_path: edit.relative_path,
+    })
 }
