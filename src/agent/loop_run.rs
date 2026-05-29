@@ -75,6 +75,12 @@ mod active_job_arbiter;
 // is intentionally *not* re-exported (DR3-001) — `turn.rs` is the only
 // in-crate consumer via `super::actor_loop_flow::*`.
 mod actor_loop_flow;
+// Anti-pattern extraction + retrieval flow extracted from `turn.rs`
+// (parent #680). Hosts `maybe_extract_anti_pattern` and
+// `try_inject_anti_pattern_message` (free fns over `&mut Agent`) plus
+// their private logging / feedback helpers. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod anti_pattern_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

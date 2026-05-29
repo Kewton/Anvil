@@ -3718,7 +3718,7 @@ pub(super) fn run_actor_loop(
     // Issue #464: AntiPatternRecord extraction (post-loop, after CaseRecord).
     // Triggered by the latest eligible failure feedback. Pure upsert; no
     // sidecar / LLM calls.
-    agent.maybe_extract_anti_pattern();
+    super::anti_pattern_flow::maybe_extract_anti_pattern(agent);
 
     // [Issue #556] post-loop photon evaluate hook — must run before
     // build_eval_record so last_photon_eval_summary is populated.
