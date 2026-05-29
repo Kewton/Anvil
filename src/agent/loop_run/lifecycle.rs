@@ -650,6 +650,33 @@ impl Agent {
     }
 }
 
+/// Extract bullet items under the `## Constraints` section of a plan
+/// markdown document. Trims leading `- ` markers and skips empty
+/// placeholders. Used by `refresh_working_memory` to keep the
+/// per-prompt constraint list in sync with the live plan.
+pub(super) fn extract_plan_constraints(contents: &str) -> Vec<String> {
+    let mut in_constraints = false;
+    let mut lines = Vec::new();
+    for raw_line in contents.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_constraints = heading.trim() == "Constraints";
+            continue;
+        }
+        if !in_constraints {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed == "-" {
+            continue;
+        }
+        let cleaned = trimmed.trim_start_matches("- ").trim().to_string();
+        if !cleaned.is_empty() {
+            lines.push(cleaned);
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

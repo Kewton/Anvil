@@ -682,29 +682,6 @@ pub(super) fn sync_package_json_with_existing_lock(
         .unwrap_or(package_content)
 }
 
-fn extract_plan_constraints(contents: &str) -> Vec<String> {
-    let mut in_constraints = false;
-    let mut lines = Vec::new();
-    for raw_line in contents.lines() {
-        let trimmed = raw_line.trim();
-        if let Some(heading) = trimmed.strip_prefix("## ") {
-            in_constraints = heading.trim() == "Constraints";
-            continue;
-        }
-        if !in_constraints {
-            continue;
-        }
-        if trimmed.is_empty() || trimmed == "-" {
-            continue;
-        }
-        let cleaned = trimmed.trim_start_matches("- ").trim().to_string();
-        if !cleaned.is_empty() {
-            lines.push(cleaned);
-        }
-    }
-    lines
-}
-
 pub(super) fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String {
     let path = Path::new(raw_path);
     if let Ok(resolved) = resolve_user_path(work_root, raw_path)
@@ -743,66 +720,6 @@ fn anti_pattern_failed_action_summary(frame: &FeedbackFrame) -> String {
         .clone()
         .or_else(|| frame.command().map(|s| s.to_string()))
         .unwrap_or_else(|| format!("{:?}", frame.kind))
-}
-
-fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
-    if yes_mode {
-        tester::ApprovalMode::Auto
-    } else if stdin_is_terminal {
-        tester::ApprovalMode::Interactive
-    } else {
-        tester::ApprovalMode::Forbidden
-    }
-}
-
-fn run_tester_llm_call(
-    tester_client: &crate::ollama::client::OllamaClient,
-    tester_main_model: &str,
-    session_id_for_log: &str,
-    prompt: &tester::TesterPrompt,
-) -> Result<String, tester::TesterLlmError> {
-    log_llm_event(
-        "agent.tester.llm_call_started",
-        serde_json::json!({
-            "session_id": session_id_for_log,
-            "stack": prompt.stack_label(),
-            "model": tester_main_model,
-            "prompt_len": prompt.body().len(),
-        }),
-    );
-    let messages = vec![ConversationMessage::user(prompt.body().to_string())];
-    match tester_client.chat_text(tester_main_model, &messages) {
-        Ok(reply) => {
-            log_llm_event(
-                "agent.tester.llm_call_completed",
-                serde_json::json!({
-                    "session_id": session_id_for_log,
-                    "stack": prompt.stack_label(),
-                    "model": tester_main_model,
-                    "reply_len": reply.content.len(),
-                    "tool_calls": reply.tool_calls.len(),
-                }),
-            );
-            if !reply.tool_calls.is_empty() {
-                return Err(tester::TesterLlmError(
-                    "tester reply unexpectedly contained tool_calls".to_string(),
-                ));
-            }
-            Ok(reply.content)
-        }
-        Err(err) => {
-            log_llm_event(
-                "agent.tester.llm_call_failed",
-                serde_json::json!({
-                    "session_id": session_id_for_log,
-                    "stack": prompt.stack_label(),
-                    "model": tester_main_model,
-                    "error": tester::sanitize_tester_log(&err, tester::TESTER_LOG_CAP),
-                }),
-            );
-            Err(tester::TesterLlmError(err))
-        }
-    }
 }
 
 /// Issue #580: SSoT memoization key for the Quality-gate second-pass adapter.
@@ -3045,7 +2962,8 @@ impl Agent {
         if !self.ensure_tester_runs_root(&tester_runs_root) {
             return false;
         }
-        let approval_mode = tester_approval_mode(self.config.yes_mode, io::stdin().is_terminal());
+        let approval_mode =
+            tester::tester_approval_mode(self.config.yes_mode, io::stdin().is_terminal());
         self.tester_called_this_turn = true;
 
         let work_root = self.work_root.clone();
@@ -3065,7 +2983,7 @@ impl Agent {
         let tester_main_model = self.models.main.clone();
         let llm_call =
             move |prompt: &tester::TesterPrompt| -> Result<String, tester::TesterLlmError> {
-                run_tester_llm_call(
+                tester::run_tester_llm_call(
                     &tester_client,
                     &tester_main_model,
                     &session_id_for_log,
@@ -7503,7 +7421,7 @@ impl Agent {
             .current_plan_contents()
             .ok()
             .flatten()
-            .map(|contents| extract_plan_constraints(&contents))
+            .map(|contents| lifecycle::extract_plan_constraints(&contents))
             .unwrap_or_default();
         self.session.working_memory.replace_constraints(constraints);
     }
@@ -8794,15 +8712,15 @@ mod tests {
     #[test]
     fn tester_approval_mode_prefers_yes_then_terminal_access() {
         assert_eq!(
-            super::tester_approval_mode(true, false),
+            super::super::tester::tester_approval_mode(true, false),
             super::tester::ApprovalMode::Auto
         );
         assert_eq!(
-            super::tester_approval_mode(false, true),
+            super::super::tester::tester_approval_mode(false, true),
             super::tester::ApprovalMode::Interactive
         );
         assert_eq!(
-            super::tester_approval_mode(false, false),
+            super::super::tester::tester_approval_mode(false, false),
             super::tester::ApprovalMode::Forbidden
         );
     }
