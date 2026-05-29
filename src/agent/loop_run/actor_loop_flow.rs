@@ -61,6 +61,7 @@ use super::progress_text::{
     tool_emoji, truncate,
 };
 use super::progress_text::{no_color_requested, unicode_supported};
+use super::scaffold_pipeline::PlanExplorationKey;
 use super::spinner::Spinner;
 use super::success::DETERMINISTIC_CONTENT_FALLBACK_TAG;
 use super::summary::{ExitReason, LoopResult, LoopStats};
@@ -68,9 +69,9 @@ use super::tool_history::focused_edit_target_already_read;
 use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
 use super::turn::{
-    LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, PlanExplorationKey,
-    join_sections_for_progress, normalize_exploration_path, plan_section_body_for_progress,
-    plan_sections_with_content, tool_display, write_stdout_rendered,
+    LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, join_sections_for_progress,
+    normalize_exploration_path, plan_section_body_for_progress, plan_sections_with_content,
+    tool_display, write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
@@ -693,12 +694,12 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
     match agent.maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag) {
-        super::turn::ScaffoldFallbackResult::Applied => {
+        super::scaffold_pipeline::ScaffoldFallbackResult::Applied => {
             *args.repo_change_retries = 0;
             Some(PostReplyRecoveryOutcome::Continue)
         }
-        super::turn::ScaffoldFallbackResult::Failed
-        | super::turn::ScaffoldFallbackResult::Skipped => {
+        super::scaffold_pipeline::ScaffoldFallbackResult::Failed
+        | super::scaffold_pipeline::ScaffoldFallbackResult::Skipped => {
             *args.repo_change_retries += 1;
             if *args.repo_change_retries >= 3 {
                 return Some(missing_repo_edits_finalize_outcome());
@@ -708,7 +709,7 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
             ));
             Some(PostReplyRecoveryOutcome::Continue)
         }
-        super::turn::ScaffoldFallbackResult::NotApplicable => None,
+        super::scaffold_pipeline::ScaffoldFallbackResult::NotApplicable => None,
     }
 }
 
