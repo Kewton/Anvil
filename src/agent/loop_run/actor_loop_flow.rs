@@ -1926,13 +1926,21 @@ pub(super) fn handle_actor_loop_pre_reply_control_action(
     };
     match control_state.loop_control_action.clone() {
         LoopControlAction::ContinueRepairJob { .. } => {
-            let outcome =
-                agent.dispatch_repair_job_step(flow_args, args.repo_edit_calls_made_this_turn);
+            let outcome = super::repair_job_dispatch::dispatch_repair_job_step(
+                agent,
+                flow_args,
+                args.repo_edit_calls_made_this_turn,
+            );
             Some(actor_loop_pre_reply_flow_outcome(outcome))
         }
-        LoopControlAction::ContinueMissingVerifierJob { next_action } => agent
-            .dispatch_missing_verifier_job_step(flow_args, next_action)
-            .map(actor_loop_pre_reply_flow_outcome),
+        LoopControlAction::ContinueMissingVerifierJob { next_action } => {
+            super::repair_job_dispatch::dispatch_missing_verifier_job_step(
+                agent,
+                flow_args,
+                next_action,
+            )
+            .map(actor_loop_pre_reply_flow_outcome)
+        }
         LoopControlAction::RunVerifier => Some(actor_loop_pre_reply_flow_outcome(
             super::verifier_orchestration::drive_task_contract_verifier(agent, flow_args),
         )),

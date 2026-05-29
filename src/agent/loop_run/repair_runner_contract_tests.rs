@@ -87,18 +87,23 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn repair_job_run_verifier_dispatch_uses_job_preserving_path() {
-        let src = include_str!("turn.rs");
+        // After parent #680 vertical-slice extraction, the dispatch lives
+        // in `repair_job_dispatch.rs` as a free fn. The job-preserving
+        // path is `drive_repair_job_verifier(agent, args)`; the legacy
+        // re-entry path through verifier_orchestration's session-rebuild
+        // must stay absent.
+        let src = include_str!("repair_job_dispatch.rs");
         let dispatch = function_body(
             src,
-            "\n    pub(super) fn dispatch_repair_job_step(",
-            "\n    fn drive_repair_job_verifier(",
+            "\npub(super) fn dispatch_repair_job_step(",
+            "\nfn drive_repair_job_verifier(",
         );
 
         assert!(dispatch.contains("RepairStep::RunVerifier"));
-        assert!(dispatch.contains("self.drive_repair_job_verifier(args)"));
+        assert!(dispatch.contains("drive_repair_job_verifier(agent, args)"));
         assert!(
             !dispatch.contains(
-                "super::verifier_orchestration::drive_task_contract_verifier(self, args)"
+                "super::verifier_orchestration::drive_task_contract_verifier(agent, args)"
             ),
             "repair job verifier rerun must not re-enter the job-rebuilding verifier flow"
         );

@@ -2399,7 +2399,7 @@ mod tests {
 
     #[test]
     fn repair_rejection_next_action_explains_role_mismatch() {
-        let action = super::Agent::repair_rejection_next_action(
+        let action = super::super::repair_job_dispatch::repair_rejection_next_action(
             "verifier_repair_pass_invalid: repair plan rejected: role_mismatch",
         );
 

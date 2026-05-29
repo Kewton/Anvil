@@ -120,6 +120,12 @@ mod verifier_observation;
 // stays on Agent (5+ external call sites). `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod reply_retry;
+// Repair-job dispatch flow extracted from `turn.rs` (parent #680). Hosts
+// `dispatch_repair_job_step`, `dispatch_missing_verifier_job_step`,
+// `repair_rejection_next_action` (pub(super)) + 11 private branch
+// handlers as free fns over `&mut Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod repair_job_dispatch;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
