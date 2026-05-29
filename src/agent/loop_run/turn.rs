@@ -19,9 +19,8 @@ use super::actor_loop_flow::{
     format_iteration_status, repair_job_done_outcome, run_actor_loop,
 };
 use super::auto_test::{
-    AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner,
-    build_agent_verifier_external_import_rejected_payload, build_agent_verifier_invoked_payload,
-    classify_auto_test,
+    AutoTestKind, AutoTestRunner, build_agent_verifier_external_import_rejected_payload,
+    build_agent_verifier_invoked_payload,
 };
 use super::completion_evidence::is_repo_edit_no_op;
 use super::feedback_kind_confirm::{
@@ -86,7 +85,6 @@ use super::case_record_extract::{
 use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
     build_feedback_for_unsafe_block_reason, extract_current_request_paths,
-    extract_suspected_files_from_text,
 };
 use super::photon_feedback_derive::{
     build_rerun_prompt_hint_if_eligible, request_explicitly_requests_script_execution,
@@ -212,9 +210,9 @@ use crate::modes::plan_act::{
     ModeClassification, PlanStage, TaskProfile, WorkMode, classify_work_mode_json,
 };
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
-use crate::session::feedback::{
-    FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
-};
+use crate::session::feedback::{FeedbackFrame, FeedbackKind};
+#[cfg(test)]
+use crate::session::feedback::{FeedbackFrameDraft, build_feedback_frame};
 use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
 use crate::session::store::{ScaffoldArtifactFileSnapshot, WorkingMemory};
 use crate::tools::registry::{BashErrorClass, ToolSpec};
@@ -543,115 +541,8 @@ fn latest_tool_result_since_last_user<'a>(
     None
 }
 
-// --- Issue #450 FeedbackFrame builders --------------------------------
-//
-// Each helper builds a `FeedbackFrameDraft`, then funnels it through
-// `crate::session::feedback::build_feedback_frame` for truncation,
-// secret masking, and path normalization. Per design 5.4, no helper
-// performs those steps itself.
-
-pub(super) fn build_feedback_for_auto_test(
-    plan: &AutoTestPlan,
-    result: &AutoTestResult,
-    workspace_root: &Path,
-    changed_files: &[String],
-) -> FeedbackFrame {
-    let kind = classify_auto_test(plan, result);
-    let primary_error = if !result.passed {
-        // First non-empty trimmed line is a reasonable summary.
-        result
-            .stderr
-            .lines()
-            .chain(result.stdout.lines())
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
-    let suspected_files: Vec<PathBuf> = if !result.passed {
-        extract_suspected_files_from_text(&result.stdout, &result.stderr)
-    } else {
-        Vec::new()
-    };
-    let changed_files: Vec<PathBuf> = changed_files.iter().map(PathBuf::from).collect();
-    let draft = FeedbackFrameDraft {
-        command: Some(plan.command.clone()),
-        exit_code: result.exit_code,
-        kind,
-        stdout: result.stdout.clone(),
-        stderr: result.stderr.clone(),
-        primary_error,
-        suspected_files,
-        changed_files,
-    };
-    build_feedback_frame(draft, workspace_root)
-}
-
-/// Issue #457: convert an `AutoTestResult` into the `AnvilTestSummary` view
-/// consumed by `compute_anvil_score`. This is the orchestration boundary
-/// that prevents the session layer (`anvil_score.rs`) from learning about
-/// the agent-internal `AutoTestResult` type (DR3-002 in the design policy
-/// document — DR numbers in this file refer to its DR space, not CLAUDE.md's).
-///
-/// The match table follows AutoTestKind × passed dimensions strictly:
-///
-/// | (kind, passed)  | build_passed | tests_passed | compile_error_count | test_failure_count |
-/// |-----------------|--------------|--------------|---------------------|--------------------|
-/// | (Build, true)   | Some(true)   | None         | Some(0)             | None               |
-/// | (Build, false)  | Some(false)  | None         | count_compile_errors| None               |
-/// | (Test, true)    | None         | Some(true)   | None                | Some(0)            |
-/// | (Test, false)   | None         | Some(false)  | count_compile_errors| count_test_failures|
 fn raw_mode_safe_text(text: &str) -> String {
     text.replace('\n', "\r\n")
-}
-
-fn repo_edit_satisfies_artifact_recovery_target(
-    category: super::completion_evidence::RepoEditCategory,
-    relative_path: &str,
-    target: Option<&super::task_contract::RecoveryTarget>,
-) -> bool {
-    let Some(target) = target else {
-        return true;
-    };
-    let Some(role) = super::task_contract::role_from_repo_edit(category) else {
-        return false;
-    };
-    let target_path = target.path.replace('\\', "/");
-    if role != target.role {
-        return false;
-    }
-    if relative_path == target_path {
-        return true;
-    }
-    target.role == super::task_contract::ArtifactRole::Test
-        && test_artifact_path_family(relative_path)
-            .zip(test_artifact_path_family(&target_path))
-            .is_some_and(|(actual, expected)| actual == expected)
-}
-
-fn test_artifact_path_family(path: &str) -> Option<&'static str> {
-    let normalized = path.replace('\\', "/");
-    let name = std::path::Path::new(&normalized)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if normalized.starts_with("tests/") && normalized.ends_with(".rs") {
-        return Some("rust-integration");
-    }
-    if normalized.starts_with("tests/")
-        && normalized.ends_with(".py")
-        && (name.starts_with("test_") || name.ends_with("_test.py"))
-    {
-        return Some("pytest");
-    }
-    if normalized.ends_with(".test.ts") || normalized.ends_with(".spec.ts") {
-        return Some("typescript-test");
-    }
-    if normalized.ends_with(".test.js") || normalized.ends_with(".spec.js") {
-        return Some("javascript-test");
-    }
-    None
 }
 
 pub(super) fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
@@ -6975,7 +6866,7 @@ impl Agent {
         category: super::completion_evidence::RepoEditCategory,
         relative_path: &str,
     ) -> bool {
-        repo_edit_satisfies_artifact_recovery_target(
+        super::task_contract::repo_edit_satisfies_artifact_recovery_target(
             category,
             relative_path,
             self.current_artifact_recovery_target.as_ref(),
@@ -8922,7 +8813,12 @@ mod tests {
             stdout: String::new(),
             stderr: "AKIAIOSFODNN7EXAMPLE in stderr\nactual error\n".to_string(),
         };
-        let frame = super::build_feedback_for_auto_test(&plan, &result, dir.path(), &[]);
+        let frame = super::super::feedback_builders::build_feedback_for_auto_test(
+            &plan,
+            &result,
+            dir.path(),
+            &[],
+        );
         let pe = frame.primary_error.expect("primary_error");
         assert!(!pe.contains("AKIAIOSFODNN7EXAMPLE"), "leaked: {pe:?}");
     }
@@ -14001,11 +13897,14 @@ mod truncate_tests {
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_command_matches_framework,
         scaffold_file_snapshot, task_or_plan_requires_nextjs_scaffold,
     };
-    use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
+    use super::super::task_contract::{
+        ArtifactRecoveryAction, ArtifactRole, TaskContract,
+        repo_edit_satisfies_artifact_recovery_target,
+    };
     use super::{
         changed_files_for_verifier, extract_filename_with_suffix, focused_edit_tool_policy_error,
-        repo_edit_satisfies_artifact_recovery_target, task_contract_needs_verification,
-        task_contract_verifier_repair_note, task_requires_nextjs_scaffold, truncate,
+        task_contract_needs_verification, task_contract_verifier_repair_note,
+        task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
