@@ -91,6 +91,7 @@ use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
     build_feedback_for_unsafe_block_reason, extract_current_request_paths,
 };
+use super::path_helpers::normalize_memory_path;
 use super::photon_feedback_derive::{
     build_rerun_prompt_hint_if_eligible, request_explicitly_requests_script_execution,
 };
@@ -597,111 +598,6 @@ fn user_interrupt_result() -> String {
 
 pub(super) fn tool_result_failed(result: &str) -> bool {
     result.starts_with("Error:") || result.contains("\ninterrupted=true\n")
-}
-
-pub(super) fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
-    let input = Path::new(raw_path);
-    if input.is_relative() {
-        let cleaned = input
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if !cleaned.is_empty() {
-            return cleaned.join("/");
-        }
-    }
-
-    if let Ok(resolved) = resolve_user_path(work_root, raw_path) {
-        let canonical_root = std::fs::canonicalize(work_root).ok();
-        let canonical_resolved = std::fs::canonicalize(&resolved).ok();
-        if let (Some(root), Some(resolved_path)) = (canonical_root, canonical_resolved)
-            && let Ok(relative) = resolved_path.strip_prefix(root)
-        {
-            return relative.to_string_lossy().replace('\\', "/");
-        }
-        if let Ok(relative) = resolved.strip_prefix(work_root) {
-            return relative.to_string_lossy().replace('\\', "/");
-        }
-        return resolved.to_string_lossy().replace('\\', "/");
-    }
-
-    raw_path.trim().replace('\\', "/")
-}
-
-pub(super) fn sync_package_json_with_existing_lock(
-    work_root: &Path,
-    relative: &Path,
-    package_content: String,
-) -> String {
-    if relative != Path::new("package.json") {
-        return package_content;
-    }
-    let Ok(lock_content) = std::fs::read_to_string(work_root.join("package-lock.json")) else {
-        return package_content;
-    };
-    let Ok(mut package) = serde_json::from_str::<serde_json::Value>(&package_content) else {
-        return package_content;
-    };
-    let Ok(lock) = serde_json::from_str::<serde_json::Value>(&lock_content) else {
-        return package_content;
-    };
-    let Some(root_package) = lock
-        .get("packages")
-        .and_then(|packages| packages.get(""))
-        .and_then(serde_json::Value::as_object)
-    else {
-        return package_content;
-    };
-    let Some(package_object) = package.as_object_mut() else {
-        return package_content;
-    };
-
-    let mut replaced_any = false;
-    for section in [
-        "dependencies",
-        "devDependencies",
-        "optionalDependencies",
-        "peerDependencies",
-    ] {
-        if let Some(lock_section) = root_package.get(section) {
-            package_object.insert(section.to_string(), lock_section.clone());
-            replaced_any = true;
-        } else {
-            package_object.remove(section);
-        }
-    }
-    if !replaced_any {
-        return package_content;
-    }
-
-    serde_json::to_string_pretty(&package)
-        .map(|json| format!("{json}\n"))
-        .unwrap_or(package_content)
-}
-
-pub(super) fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String {
-    let path = Path::new(raw_path);
-    if let Ok(resolved) = resolve_user_path(work_root, raw_path)
-        && let Ok(relative) = resolved.strip_prefix(work_root)
-    {
-        return relative.to_string_lossy().replace('\\', "/");
-    }
-    let canonical_root = std::fs::canonicalize(work_root).ok();
-    let canonical_path = std::fs::canonicalize(path)
-        .ok()
-        .or_else(|| resolve_user_path(work_root, raw_path).ok());
-    if let (Some(root), Some(candidate)) = (canonical_root, canonical_path)
-        && let Ok(relative) = candidate.strip_prefix(root)
-    {
-        return relative.to_string_lossy().replace('\\', "/");
-    }
-    if let Ok(relative) = path.strip_prefix(work_root) {
-        return relative.to_string_lossy().replace('\\', "/");
-    }
-    raw_path.replace('\\', "/")
 }
 
 /// Issue #555: carries a retrieval message and the IDs of the selected
@@ -7607,8 +7503,8 @@ mod tests {
         build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
         classify_verifier_timeout, effective_non_streaming_timeout_secs,
         latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
-        normalize_exploration_path, repair_terminal_exit_reason,
-        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
+        repair_terminal_exit_reason, should_fallback_plan_model_after_timeout,
+        should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_structured_missing_outcome, verifier_repair_context_from_failure,
     };
@@ -7795,7 +7691,8 @@ mod tests {
     #[test]
     fn normalizes_relative_path_without_touching_missing_file() {
         let temp = tempdir().unwrap();
-        let normalized = normalize_exploration_path("docs/plan.md", temp.path());
+        let normalized =
+            super::super::path_helpers::normalize_exploration_path("docs/plan.md", temp.path());
         assert_eq!(normalized, "docs/plan.md");
     }
 
@@ -14073,9 +13970,8 @@ mod progress_tests {
         recent_truncated_tool_call_attempt, repo_change_request_text,
         request_needs_playable_ui_quality_gate, sanitize_for_progress, sha256_hex,
         should_use_streaming_transport, strip_read_line_number_prefix,
-        successful_non_plan_repo_edit_count, successful_repo_edit_count,
-        sync_package_json_with_existing_lock, tool_color, tool_display, tool_emoji,
-        unicode_supported, validate_accepted_repair_plan_authorizes_target,
+        successful_non_plan_repo_edit_count, successful_repo_edit_count, tool_color, tool_display,
+        tool_emoji, unicode_supported, validate_accepted_repair_plan_authorizes_target,
         verifier_diagnostic_attempt_spec, verifier_repair_context_from_failure,
         verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
         verifier_repair_invalid_can_continue, verifier_repair_preferred_local_import_source,
@@ -14150,7 +14046,7 @@ mod progress_tests {
 }
 "#;
 
-        let synced = sync_package_json_with_existing_lock(
+        let synced = super::super::path_helpers::sync_package_json_with_existing_lock(
             work_root,
             Path::new("package.json"),
             generated.to_string(),

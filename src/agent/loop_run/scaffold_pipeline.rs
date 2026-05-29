@@ -46,6 +46,7 @@ use super::deterministic;
 use super::deterministic_fallback_plan::deterministic_timeout_fallback_plan;
 use super::interrupt::InterruptFlag;
 use super::lifecycle;
+use super::path_helpers::{normalize_memory_path, sync_package_json_with_existing_lock};
 use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, react_dev_wrapper_for_requested_port,
@@ -57,9 +58,8 @@ use super::tool_history::{
 use super::turn::{
     WrittenScaffoldArtifacts, current_file_hash_for_relative_path, extract_filename_with_suffix,
     last_read_tool_path, latest_turn_preferred_read_edit_target, meaningful_workspace_files,
-    normalize_memory_path, progress_path_display, sha256_hex,
-    should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
-    should_materialize_plan_after_tool_call_format_error, sync_package_json_with_existing_lock,
+    progress_path_display, sha256_hex, should_fallback_plan_model_after_timeout,
+    should_materialize_plan_after_timeout, should_materialize_plan_after_tool_call_format_error,
     tool_result_failed, workspace_appears_empty, write_stdout_rendered,
 };
 use crate::agent::prompting;

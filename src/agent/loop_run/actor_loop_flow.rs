@@ -56,6 +56,7 @@ use super::Agent;
 use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, RecoveryOwner};
 use super::interrupt::{InterruptFlag, InterruptMonitor};
 use super::lifecycle;
+use super::path_helpers::normalize_exploration_path;
 use super::progress_text::{
     format_progress_field, paint, progress_available_width, sanitize_for_progress, tool_color,
     tool_emoji, truncate,
@@ -70,8 +71,8 @@ use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
 use super::turn::{
     LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, join_sections_for_progress,
-    normalize_exploration_path, plan_section_body_for_progress, plan_sections_with_content,
-    tool_display, write_stdout_rendered,
+    plan_section_body_for_progress, plan_sections_with_content, tool_display,
+    write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;

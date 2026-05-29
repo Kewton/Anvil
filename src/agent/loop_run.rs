@@ -287,6 +287,12 @@ mod confirmation_flow;
 // `fallback_plan_platform_label`). `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod deterministic_fallback_plan;
+// Workspace-relative path normalization + package.json/lock sync
+// helpers extracted from `turn.rs` (parent #680). Hosts
+// `normalize_memory_path`, `normalize_exploration_path`,
+// `sync_package_json_with_existing_lock`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod path_helpers;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
