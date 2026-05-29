@@ -60,6 +60,7 @@ use super::turn::{
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::logging::log_llm_event;
+use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{ExecutionMode, ModePolicy, PlanStage};
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
@@ -1361,6 +1362,114 @@ if __name__ == "__main__":
         }),
     );
     Ok(Some(test_name))
+}
+
+pub(super) fn maybe_apply_deterministic_polish_fallback(
+    agent: &Agent,
+    request: &str,
+    relative_target: &str,
+) -> Result<bool, String> {
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_template_completion()
+    {
+        return Ok(false);
+    }
+    let target = agent.work_root.join(relative_target);
+    let current = std::fs::read_to_string(&target)
+        .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
+    let Some(replacement) = deterministic::playable_ui_polish(request, &target, &current) else {
+        return Ok(false);
+    };
+    std::fs::write(&target, replacement)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    agent.maybe_apply_requested_port_script(request)?;
+    log_llm_event(
+        "agent.deterministic_ui_polish",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "full_template",
+            "target": relative_target,
+        }),
+    );
+    Ok(true)
+}
+
+pub(super) fn maybe_apply_local_llm_small_edit_fallback(
+    agent: &mut Agent,
+    request: &str,
+) -> Result<Option<String>, String> {
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_template_completion()
+    {
+        return Ok(None);
+    }
+    if !model_capabilities(&agent.current_assistant_model()).read_after_small_edit_protocol {
+        return Ok(None);
+    }
+    let Some(target) = local_llm_small_edit_fallback_target(agent) else {
+        return Ok(None);
+    };
+    let current = std::fs::read_to_string(&target)
+        .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
+    let polish_request = if super::quality::request_needs_playable_ui_quality_gate(request) {
+        "ゲームUIの品質を上げてください。".to_string()
+    } else {
+        format!("{request}\n品質を上げてください。")
+    };
+    let Some(replacement) = deterministic::playable_ui_polish(&polish_request, &target, &current)
+    else {
+        return Ok(None);
+    };
+    std::fs::write(&target, replacement)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    agent
+        .session
+        .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+            &agent.work_root,
+        ));
+    let relative = target
+        .strip_prefix(&agent.work_root)
+        .unwrap_or(target.as_path())
+        .to_string_lossy()
+        .replace('\\', "/");
+    log_llm_event(
+        "agent.deterministic_local_llm_small_edit",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "full_template",
+            "target": &relative,
+        }),
+    );
+    Ok(Some(relative))
+}
+
+pub(super) fn local_llm_small_edit_fallback_target(agent: &Agent) -> Option<PathBuf> {
+    if agent.session.mode_state.mode != ExecutionMode::Act
+        || !agent.session.mode_state.policy().repo_edit_required
+        || !agent.active_task_expects_repo_change()
+    {
+        return None;
+    }
+    if let Some(candidate) =
+        latest_turn_preferred_read_edit_target(&agent.session.messages, &agent.work_root)
+    {
+        return Some(candidate);
+    }
+    if let Some(path) = last_read_tool_path(&agent.session.messages)
+        && let Ok(candidate) = resolve_user_path(&agent.work_root, &path)
+        && candidate.is_file()
+    {
+        return Some(candidate);
+    }
+    first_existing_impl_target(&agent.work_root)
 }
 
 pub(super) fn maybe_apply_deterministic_quality_fallback(
