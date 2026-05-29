@@ -108,6 +108,12 @@ mod python_markers;
 // per-turn cap). Both apply `mask_payload_inplace` as final defence.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod emit_verifier_events;
+// Task-contract verifier observation hooks extracted from `turn.rs`
+// (parent #680). Hosts `record_task_contract_verifier_invocation`,
+// `observe_task_contract_verifier_exit_zero`, and
+// `observe_task_contract_verifier_exit_zero_bound` — all free fns over
+// `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod verifier_observation;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

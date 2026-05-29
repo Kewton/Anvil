@@ -2359,9 +2359,16 @@ pub(super) fn handle_legacy_task_contract_verifier_selection(
         changed_files,
     );
     agent.session.record_feedback_if_unset(frame);
-    agent.record_task_contract_verifier_invocation(&result.command, result.exit_code);
+    super::verifier_observation::record_task_contract_verifier_invocation(
+        agent,
+        &result.command,
+        result.exit_code,
+    );
     if result.passed {
-        agent.observe_task_contract_verifier_exit_zero(&result.command);
+        super::verifier_observation::observe_task_contract_verifier_exit_zero(
+            agent,
+            &result.command,
+        );
     }
     super::verifier_driver::task_contract_auto_test_result_to_outcome(result)
 }
@@ -2708,7 +2715,11 @@ pub(super) fn finish_structured_task_contract_verifier_selection(
         changed_files,
     );
     agent.session.record_feedback_if_unset(frame);
-    agent.record_task_contract_verifier_invocation(&result.command, result.exit_code);
+    super::verifier_observation::record_task_contract_verifier_invocation(
+        agent,
+        &result.command,
+        result.exit_code,
+    );
     let last_outcome = if result.passed {
         super::artifact_ledger::VerifierOutcome::Pass
     } else {
@@ -2721,7 +2732,8 @@ pub(super) fn finish_structured_task_contract_verifier_selection(
         &scope_for_seed,
     );
     if result.passed {
-        agent.observe_task_contract_verifier_exit_zero_bound(
+        super::verifier_observation::observe_task_contract_verifier_exit_zero_bound(
+            agent,
             &result.command,
             selection.bound_test_artifacts_count,
         );
