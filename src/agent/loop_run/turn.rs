@@ -44,10 +44,9 @@ use super::reminder::{
 #[cfg(test)]
 use super::repair_driver::VERIFIER_REPAIR_PASS_TIMEOUT_SECS;
 use super::repair_driver::{
-    VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT, VERIFIER_REPAIR_PASS_MAX_PREDICT,
-    VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
-    verifier_repair_pass_attempt_timeout_secs, verifier_repair_pass_retry_message,
-    verifier_repair_pass_timeout_error,
+    VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT, VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
+    VerifierRepairPassOutcome, verifier_repair_pass_attempt_timeout_secs,
+    verifier_repair_pass_retry_message, verifier_repair_pass_timeout_error,
 };
 use super::repair_framework_findings::findings_for_diagnostic as verifier_framework_findings_for_diagnostic;
 #[cfg(test)]
@@ -383,7 +382,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn verifier_repair_pass_client(",
+            "\n    fn verifier_repair_pass_wall_clock_timeout_error(",
         );
 
         assert!(body.contains("target_hint:"));
@@ -400,7 +399,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn verifier_repair_pass_client(",
+            "\n    fn verifier_repair_pass_wall_clock_timeout_error(",
         );
 
         assert!(
@@ -427,7 +426,7 @@ mod v0421_repair_runner_contract_tests {
         let body = function_body(
             src,
             "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn verifier_repair_pass_client(",
+            "\n    fn verifier_repair_pass_wall_clock_timeout_error(",
         );
         let orchestration = include_str!("verifier_orchestration.rs");
         let prompt = function_body(
@@ -4661,7 +4660,8 @@ impl Agent {
             TaskContractVerifierSelection::StructuredMissing {
                 outcome,
                 owned_test_artifacts_count,
-            } => self.handle_missing_task_contract_verifier_selection(
+            } => super::verifier_orchestration::handle_missing_task_contract_verifier_selection(
+                self,
                 outcome,
                 owned_test_artifacts_count,
             ),
@@ -4674,7 +4674,7 @@ impl Agent {
                 command_for_log,
             ),
             TaskContractVerifierSelection::Missing => {
-                self.handle_absent_task_contract_verifier_selection()
+                super::verifier_orchestration::handle_absent_task_contract_verifier_selection(self)
             }
         }
     }
@@ -4689,7 +4689,7 @@ impl Agent {
         let recent_successful_bash_commands =
             super::success::recent_successful_bash_commands_since_last_user(&self.session.messages);
         let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
-            self.task_contract_verifier_test_binding();
+            super::verifier_orchestration::task_contract_verifier_test_binding(self);
         let active_request = self.active_request_text();
         let task_contract_project_unit = select_task_contract_project_unit(
             &self.work_root,
@@ -4867,47 +4867,6 @@ impl Agent {
         }
     }
 
-    fn handle_missing_task_contract_verifier_selection(
-        &mut self,
-        outcome: TaskContractVerifierOutcome,
-        owned_test_artifacts_count: usize,
-    ) -> TaskContractVerifierOutcome {
-        self.owned_test_verifier_missing_observed_this_turn = true;
-        self.owned_test_verifier_missing_observed_carryover = self
-            .active_request_text()
-            .as_deref()
-            .map(super::task_contract::RequestCarryoverKey::from_request);
-        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-        self.session.record_feedback_if_unset(frame);
-        if matches!(outcome, TaskContractVerifierOutcome::NoVerifier) {
-            log_llm_event(
-                "agent.task_contract.verifier.completed",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "outcome": "no_structured_verifier",
-                    "owned_test_artifacts_count": owned_test_artifacts_count,
-                    "test_execution_required": true,
-                }),
-            );
-            return TaskContractVerifierOutcome::NoVerifier;
-        }
-        if !self.session.verifier_safe_stop_emitted_this_turn {
-            self.session.verifier_safe_stop_emitted_this_turn = true;
-            log_llm_event(
-                "agent.verifier.missing",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "iter_index": self.session.iter_count_this_turn,
-                    "owned_test_artifacts_count": owned_test_artifacts_count,
-                    "auto_test_detected": false,
-                    "test_execution_required": true,
-                }),
-            );
-        }
-        outcome
-    }
-
     fn handle_legacy_task_contract_verifier_selection(
         &mut self,
         changed_files: &[String],
@@ -4950,19 +4909,6 @@ impl Agent {
             self.observe_task_contract_verifier_exit_zero(&result.command);
         }
         task_contract_auto_test_result_to_outcome(result)
-    }
-
-    fn handle_absent_task_contract_verifier_selection(&mut self) -> TaskContractVerifierOutcome {
-        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-        self.session.record_feedback_if_unset(frame);
-        log_llm_event(
-            "agent.task_contract.verifier.completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "outcome": "no_verifier",
-            }),
-        );
-        TaskContractVerifierOutcome::NoVerifier
     }
 
     fn materialize_python_package_markers_for_external_import(
@@ -5024,29 +4970,6 @@ impl Agent {
             created.push(relative_path);
         }
         created
-    }
-
-    /// Issue #651 Phase 5.2: SSOT producer for the structured verifier
-    /// path's `(owned_test_artifacts, test_execution_required, scope)`
-    /// tuple. Builds a one-shot `TaskContract` from
-    /// `active_request_text()` so the request-derived signals stay
-    /// aligned with `success.rs::success_verifier_test_binding`.
-    /// Returns `(vec![], false, None)` when there is no active request.
-    fn task_contract_verifier_test_binding(
-        &mut self,
-    ) -> (
-        Vec<String>,
-        bool,
-        Option<super::task_workspace_scope::TaskWorkspaceScope>,
-    ) {
-        let Some(request) = self.active_request_text() else {
-            return (Vec::new(), false, None);
-        };
-        let contract = super::task_contract::TaskContract::from_request(&request);
-        let test_execution_required = contract.required_behavior.test_execution_required;
-        let owned_test_artifacts = self.owned_test_artifacts_for_verifier(&contract);
-        let scope = self.current_workspace_scope();
-        (owned_test_artifacts, test_execution_required, Some(scope))
     }
 
     fn handle_task_contract_verifier_pass(
@@ -8818,7 +8741,10 @@ impl Agent {
                 );
                 break;
             };
-            let repair_client = match self.verifier_repair_pass_client(attempt_timeout_secs) {
+            let repair_client = match super::verifier_orchestration::verifier_repair_pass_client(
+                self,
+                attempt_timeout_secs,
+            ) {
                 Ok(client) => client,
                 Err(err) => {
                     last_error = err;
@@ -8871,15 +8797,6 @@ impl Agent {
             error,
             repair_attempt_outcome: last_invalid_outcome,
         }
-    }
-
-    fn verifier_repair_pass_client(
-        &self,
-        attempt_timeout_secs: u64,
-    ) -> Result<OllamaClient, String> {
-        self.client
-            .clone_with_overrides(attempt_timeout_secs, VERIFIER_REPAIR_PASS_MAX_PREDICT)
-            .map_err(|err| format!("verifier_repair_pass_invalid: client clone failed: {err}"))
     }
 
     fn verifier_repair_pass_wall_clock_timeout_error(

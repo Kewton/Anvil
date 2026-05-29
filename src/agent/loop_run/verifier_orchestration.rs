@@ -54,8 +54,8 @@ use super::repair_authority::AuthorityEvidence;
 use super::repair_driver::{
     VERIFIER_REPAIR_PASS_MAX_EDIT_BYTES, VERIFIER_REPAIR_PASS_MAX_EDITS,
     VERIFIER_REPAIR_PASS_MAX_FILE_BYTES, VERIFIER_REPAIR_PASS_MAX_FILE_EXCERPT_BYTES,
-    VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES, VERIFIER_REPAIR_PASS_MAX_REASON_CHARS,
-    VerifierRepairPassOutcome,
+    VERIFIER_REPAIR_PASS_MAX_OUTPUT_BYTES, VERIFIER_REPAIR_PASS_MAX_PREDICT,
+    VERIFIER_REPAIR_PASS_MAX_REASON_CHARS, VerifierRepairPassOutcome,
 };
 use super::repair_framework_findings::{
     VerifierDiagnosticFileExcerpt,
@@ -79,7 +79,10 @@ use super::semantic_repair_planning::{
     diagnostic_target_allowed_by_confidence, first_role_kind_compatible_diagnostic_target,
 };
 use super::summary::ExitReason;
-use super::task_contract::{ArtifactRole, CompletionDecision, RecoveryTargetHint, TaskContract};
+use super::task_contract::{
+    ArtifactRole, CompletionDecision, RecoveryTargetHint, RequestCarryoverKey, TaskContract,
+};
+use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn::{
@@ -90,6 +93,7 @@ use super::verifier_assessment_parser::{
     ParsedVerifierRepairAssessment, verifier_failure_type_for_diagnostic_kind,
 };
 use super::verifier_diagnostic_attempt::VerifierDiagnosticAttemptSpec;
+use super::verifier_driver::TaskContractVerifierOutcome;
 use super::verifier_failure_signature::compact_verifier_failure_text;
 use super::verifier_repair_shadow::verifier_repair_action_payload_for_context;
 use super::verifier_repair_targeting::{
@@ -101,6 +105,7 @@ use super::{Agent, VerifierRepairAssessment, VerifierRepairAssessmentSource};
 use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::modes::plan_act::ExecutionMode;
+use crate::ollama::client::OllamaClient;
 use crate::safety::path_guard::resolve_user_path;
 use crate::session::feedback::mask_secrets;
 use crate::session::store::ConversationMessage;
@@ -2139,4 +2144,83 @@ pub(super) fn record_controller_verifier_repair_edit(
             "role": target_hint.role.label(),
         }),
     );
+}
+
+pub(super) fn verifier_repair_pass_client(
+    agent: &Agent,
+    attempt_timeout_secs: u64,
+) -> Result<OllamaClient, String> {
+    agent
+        .client
+        .clone_with_overrides(attempt_timeout_secs, VERIFIER_REPAIR_PASS_MAX_PREDICT)
+        .map_err(|err| format!("verifier_repair_pass_invalid: client clone failed: {err}"))
+}
+
+pub(super) fn task_contract_verifier_test_binding(
+    agent: &mut Agent,
+) -> (Vec<String>, bool, Option<TaskWorkspaceScope>) {
+    let Some(request) = agent.active_request_text() else {
+        return (Vec::new(), false, None);
+    };
+    let contract = TaskContract::from_request(&request);
+    let test_execution_required = contract.required_behavior.test_execution_required;
+    let owned_test_artifacts = agent.owned_test_artifacts_for_verifier(&contract);
+    let scope = agent.current_workspace_scope();
+    (owned_test_artifacts, test_execution_required, Some(scope))
+}
+
+pub(super) fn handle_absent_task_contract_verifier_selection(
+    agent: &mut Agent,
+) -> TaskContractVerifierOutcome {
+    let frame = super::success::build_feedback_for_no_verifier(&agent.work_root);
+    agent.session.record_feedback_if_unset(frame);
+    log_llm_event(
+        "agent.task_contract.verifier.completed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "outcome": "no_verifier",
+        }),
+    );
+    TaskContractVerifierOutcome::NoVerifier
+}
+
+pub(super) fn handle_missing_task_contract_verifier_selection(
+    agent: &mut Agent,
+    outcome: TaskContractVerifierOutcome,
+    owned_test_artifacts_count: usize,
+) -> TaskContractVerifierOutcome {
+    agent.owned_test_verifier_missing_observed_this_turn = true;
+    agent.owned_test_verifier_missing_observed_carryover = agent
+        .active_request_text()
+        .as_deref()
+        .map(RequestCarryoverKey::from_request);
+    let frame = super::success::build_feedback_for_no_verifier(&agent.work_root);
+    agent.session.record_feedback_if_unset(frame);
+    if matches!(outcome, TaskContractVerifierOutcome::NoVerifier) {
+        log_llm_event(
+            "agent.task_contract.verifier.completed",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "outcome": "no_structured_verifier",
+                "owned_test_artifacts_count": owned_test_artifacts_count,
+                "test_execution_required": true,
+            }),
+        );
+        return TaskContractVerifierOutcome::NoVerifier;
+    }
+    if !agent.session.verifier_safe_stop_emitted_this_turn {
+        agent.session.verifier_safe_stop_emitted_this_turn = true;
+        log_llm_event(
+            "agent.verifier.missing",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "turn_index": agent.current_turn_index,
+                "iter_index": agent.session.iter_count_this_turn,
+                "owned_test_artifacts_count": owned_test_artifacts_count,
+                "auto_test_detected": false,
+                "test_execution_required": true,
+            }),
+        );
+    }
+    outcome
 }
