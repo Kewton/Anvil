@@ -77,9 +77,10 @@ use super::verifier_repair_targeting::{
 };
 
 use super::photon_feedback_derive::{
-    PhotonFeedbackOutcome, PhotonOutcomeInputs, build_rerun_prompt_hint_if_eligible,
-    derive_photon_feedback_outcome, photon_evaluate_adoption_status, photon_items_adopted_count,
-    photon_outcome_json_value, prepare_adopted_ids_for_evaluate,
+    PhotonEvaluateCompletedLog, PhotonFeedbackOutcome, PhotonOutcomeInputs,
+    build_rerun_prompt_hint_if_eligible, derive_photon_feedback_outcome,
+    photon_context_pack_completion_status, photon_evaluate_adoption_status,
+    photon_items_adopted_count, photon_outcome_json_value, prepare_adopted_ids_for_evaluate,
 };
 #[cfg(test)]
 use super::repair_patch_validation::VerifierRepairIntent;
@@ -1612,29 +1613,6 @@ fn log_quality_confirm_outcome(
         latency_ms,
     );
     log_llm_event(event, payload);
-}
-
-fn photon_context_pack_completion_status(
-    failed: bool,
-    adopted_items: usize,
-) -> crate::agent::loop_run::PhotonContextPackStatus {
-    if failed {
-        crate::agent::loop_run::PhotonContextPackStatus::Failed
-    } else if adopted_items > 0 {
-        crate::agent::loop_run::PhotonContextPackStatus::Injected
-    } else {
-        crate::agent::loop_run::PhotonContextPackStatus::NoInjection
-    }
-}
-
-struct PhotonEvaluateCompletedLog {
-    failed: bool,
-    duration_ms: u128,
-    summary_ids_adopted_count: usize,
-    adoption_status: &'static str,
-    truncated: bool,
-    outcome_json: serde_json::Value,
-    outcome_detail_json: serde_json::Value,
 }
 
 pub(super) type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
@@ -10180,16 +10158,17 @@ mod tests {
 
     #[test]
     fn photon_context_pack_completion_status_prefers_failure_then_adoption() {
+        use super::super::photon_feedback_derive::photon_context_pack_completion_status;
         assert_eq!(
-            super::photon_context_pack_completion_status(true, 3),
+            photon_context_pack_completion_status(true, 3),
             super::PhotonContextPackStatus::Failed
         );
         assert_eq!(
-            super::photon_context_pack_completion_status(false, 2),
+            photon_context_pack_completion_status(false, 2),
             super::PhotonContextPackStatus::Injected
         );
         assert_eq!(
-            super::photon_context_pack_completion_status(false, 0),
+            photon_context_pack_completion_status(false, 0),
             super::PhotonContextPackStatus::NoInjection
         );
     }

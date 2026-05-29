@@ -587,3 +587,35 @@ pub(super) fn photon_outcome_json_value(outcome: Option<&'static str>) -> serde_
         None => serde_json::Value::Null,
     }
 }
+
+/// Issue #591: 3-branch projection of (`failed`, `adopted_items`) to the
+/// status enum used by the `MemoryReport.photon_context_pack` linkage and
+/// the per-turn diagnostic event payload. Failed > injected > no-injection
+/// priority. Lives in the agent layer so the loop_run facade can keep
+/// the enum private to the crate.
+pub(super) fn photon_context_pack_completion_status(
+    failed: bool,
+    adopted_items: usize,
+) -> super::PhotonContextPackStatus {
+    if failed {
+        super::PhotonContextPackStatus::Failed
+    } else if adopted_items > 0 {
+        super::PhotonContextPackStatus::Injected
+    } else {
+        super::PhotonContextPackStatus::NoInjection
+    }
+}
+
+/// Issue #591: bounded payload struct passed from `invoke_photon_evaluate`
+/// to `log_photon_evaluate_completed`. All fields are pre-projected via the
+/// `photon_*` static-allowlist helpers so the consumer cannot leak runtime
+/// data into the `agent.photon_evaluate.completed` log event.
+pub(super) struct PhotonEvaluateCompletedLog {
+    pub(super) failed: bool,
+    pub(super) duration_ms: u128,
+    pub(super) summary_ids_adopted_count: usize,
+    pub(super) adoption_status: &'static str,
+    pub(super) truncated: bool,
+    pub(super) outcome_json: serde_json::Value,
+    pub(super) outcome_detail_json: serde_json::Value,
+}
