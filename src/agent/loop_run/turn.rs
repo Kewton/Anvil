@@ -76,7 +76,9 @@ use super::verifier_repair_targeting::{
     verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
 
-use super::photon_feedback_derive::build_rerun_prompt_hint_if_eligible;
+use super::photon_feedback_derive::{
+    build_rerun_prompt_hint_if_eligible, request_explicitly_requests_script_execution,
+};
 #[cfg(test)]
 use super::repair_patch_validation::VerifierRepairIntent;
 #[cfg(test)]
@@ -512,33 +514,6 @@ where
         out.push(format!("{:016x}", hasher.finish()));
     }
     out
-}
-
-fn request_explicitly_requests_script_execution(request: &str) -> bool {
-    let lower = request.to_ascii_lowercase();
-    let mentions_script = [
-        "script",
-        ".sh",
-        ".py",
-        ".js",
-        "スクリプト",
-        "シェル",
-        "コマンド",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let asks_execution = [
-        "run",
-        "execute",
-        "実行",
-        "起動",
-        "結果",
-        "要約",
-        "summarize",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    mentions_script && asks_execution
 }
 
 fn latest_tool_result_since_last_user<'a>(
@@ -8555,6 +8530,7 @@ mod tests {
         answer_only_reply_is_inadequate, normalize_plan_exploration_key,
         task_contract_verifier_safe_stop_mapping,
     };
+    use super::super::photon_feedback_derive::request_explicitly_requests_script_execution;
     use super::ExitReason;
     use super::{
         PlanExplorationKey, TaskContractVerifierOutcome, answer_only_script_command_allowed,
@@ -8564,8 +8540,8 @@ mod tests {
         classify_verifier_timeout, deterministic_timeout_fallback_plan,
         effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
         non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
-        repair_terminal_exit_reason, request_explicitly_requests_script_execution,
-        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
+        repair_terminal_exit_reason, should_fallback_plan_model_after_timeout,
+        should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_structured_missing_outcome, verifier_repair_context_from_failure,
     };

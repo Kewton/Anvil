@@ -163,6 +163,35 @@ pub(crate) fn case_f_condition_met(inputs: &PhotonOutcomeInputs<'_>) -> bool {
 /// `src/agent/loop_run.rs`.
 pub const PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT: &str = "no_progress_despite_inject";
 
+/// Issue #574: answer-only mode helper. Detects whether the user's
+/// request explicitly asks Anvil to execute a script. Pure / no I/O.
+pub(super) fn request_explicitly_requests_script_execution(request: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    let mentions_script = [
+        "script",
+        ".sh",
+        ".py",
+        ".js",
+        "スクリプト",
+        "シェル",
+        "コマンド",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let asks_execution = [
+        "run",
+        "execute",
+        "実行",
+        "起動",
+        "結果",
+        "要約",
+        "summarize",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    mentions_script && asks_execution
+}
+
 /// Issue #556: max bytes to inject from context_pack into the prompt.
 pub const MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES: usize = 8192;
 
