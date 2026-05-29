@@ -2224,3 +2224,140 @@ pub(super) fn handle_missing_task_contract_verifier_selection(
     }
     outcome
 }
+
+pub(super) fn handle_weak_task_contract_verifier_selection(
+    agent: &mut Agent,
+    detected_source: &'static str,
+    owned_test_artifacts_count: usize,
+) -> TaskContractVerifierOutcome {
+    if !agent.session.verifier_safe_stop_emitted_this_turn {
+        agent.session.verifier_safe_stop_emitted_this_turn = true;
+        log_llm_event(
+            "agent.verifier.weak",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "turn_index": agent.current_turn_index,
+                "iter_index": agent.session.iter_count_this_turn,
+                "owned_test_artifacts_count": owned_test_artifacts_count,
+                "command_runner": detected_source,
+                "auto_test_detected": true,
+                "test_execution_required": true,
+            }),
+        );
+    }
+    let frame = super::success::build_feedback_for_no_verifier(&agent.work_root);
+    agent.session.record_feedback_if_unset(frame);
+    TaskContractVerifierOutcome::SafeStop {
+        reason: super::task_contract::SafeStopReason::VerifierWeak,
+    }
+}
+
+pub(super) fn handle_task_contract_verifier_safe_stop(
+    agent: &mut Agent,
+    last_iter: usize,
+    reason: super::task_contract::SafeStopReason,
+    source: &'static str,
+) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    let (mapped_reason, log_outcome) =
+        super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
+    log_llm_event(
+        "agent.task_contract.safe_stop",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "iter": last_iter,
+            "outcome": log_outcome,
+            "source": source,
+        }),
+    );
+    super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+        reason: mapped_reason,
+        error_text: mapped_reason.default_error_text().to_string(),
+    }
+}
+
+pub(super) fn select_task_contract_verifier_once(
+    agent: &mut Agent,
+    changed_files: &[String],
+) -> (
+    super::verifier_driver::TaskContractVerifierSelection,
+    Option<TaskWorkspaceScope>,
+) {
+    let recent_successful_bash_commands =
+        super::success::recent_successful_bash_commands_since_last_user(&agent.session.messages);
+    let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
+        task_contract_verifier_test_binding(agent);
+    let active_request = agent.active_request_text();
+    let task_contract_project_unit = super::verifier_driver::select_task_contract_project_unit(
+        &agent.work_root,
+        active_request.as_deref(),
+        workspace_scope_opt.as_ref(),
+        &agent.turn_edited_relative_paths,
+    );
+    if let Some(project_unit) = task_contract_project_unit.as_ref() {
+        log_llm_event(
+            "agent.project_unit.verifier_selection",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "summary": project_unit.summary(),
+            }),
+        );
+    }
+    (
+        super::verifier_driver::select_task_contract_verifier(
+            &agent.work_root,
+            changed_files,
+            &recent_successful_bash_commands,
+            &owned_test_artifacts,
+            test_execution_required,
+            workspace_scope_opt.as_ref(),
+            task_contract_project_unit.as_ref(),
+        ),
+        workspace_scope_opt,
+    )
+}
+
+pub(super) fn handle_legacy_task_contract_verifier_selection(
+    agent: &mut Agent,
+    changed_files: &[String],
+    plan: AutoTestPlan,
+    command_for_log: String,
+) -> TaskContractVerifierOutcome {
+    let result = {
+        let _sp = super::spinner::Spinner::start("running verifier...".to_string());
+        super::verifier_driver::run_legacy_task_contract_verifier(&agent.work_root, &plan)
+    };
+    let Ok(result) = result else {
+        let outcome = super::verifier_driver::task_contract_verifier_transport_error_to_outcome(
+            command_for_log.clone(),
+            result.err().unwrap_or_default(),
+        );
+        let outcome_label = super::verifier_driver::task_contract_verifier_outcome_label(&outcome);
+        log_llm_event(
+            "agent.task_contract.verifier.completed",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "outcome": outcome_label,
+                "command": command_for_log,
+            }),
+        );
+        return outcome;
+    };
+    log_llm_event(
+        "agent.autotest.completed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "command": command_for_log,
+            "passed": result.passed,
+            "reason": &plan.reason,
+        }),
+    );
+    let frame =
+        super::turn::build_feedback_for_auto_test(&plan, &result, &agent.work_root, changed_files);
+    agent.session.record_feedback_if_unset(frame);
+    agent.record_task_contract_verifier_invocation(&result.command, result.exit_code);
+    if result.passed {
+        agent.observe_task_contract_verifier_exit_zero(&result.command);
+    }
+    super::verifier_driver::task_contract_auto_test_result_to_outcome(result)
+}

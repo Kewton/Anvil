@@ -17,7 +17,6 @@ use super::actor_loop_flow::{
 use super::actor_loop_flow::{
     TaskContractVerifierFlowOutcome, build_feedback_for_deterministic_content_fallback,
     format_iteration_status, repair_job_done_outcome, run_actor_loop,
-    task_contract_verifier_safe_stop_mapping,
 };
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner, auto_test_disabled,
@@ -150,11 +149,9 @@ use super::verifier_driver::classify_verifier_timeout;
 use super::verifier_driver::task_contract_structured_missing_outcome;
 use super::verifier_driver::{
     TaskContractVerifierOutcome, TaskContractVerifierSelection,
-    detect_verifier_external_import_contamination, run_legacy_task_contract_verifier,
-    run_structured_task_contract_verifier, select_task_contract_project_unit,
-    select_task_contract_verifier, structured_verifier_invocation_report,
-    task_contract_auto_test_result_to_outcome, task_contract_verifier_outcome_label,
-    task_contract_verifier_transport_error_to_outcome,
+    detect_verifier_external_import_contamination, run_structured_task_contract_verifier,
+    structured_verifier_invocation_report, task_contract_auto_test_result_to_outcome,
+    task_contract_verifier_outcome_label, task_contract_verifier_transport_error_to_outcome,
 };
 use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
@@ -4631,7 +4628,7 @@ impl Agent {
         }
 
         let (verifier_selection, workspace_scope_opt) =
-            self.select_task_contract_verifier_once(changed_files);
+            super::verifier_orchestration::select_task_contract_verifier_once(self, changed_files);
         match verifier_selection {
             TaskContractVerifierSelection::StructuredRunnable {
                 plan,
@@ -4653,7 +4650,8 @@ impl Agent {
             TaskContractVerifierSelection::StructuredWeak {
                 detected_source,
                 owned_test_artifacts_count,
-            } => self.handle_weak_task_contract_verifier_selection(
+            } => super::verifier_orchestration::handle_weak_task_contract_verifier_selection(
+                self,
                 detected_source,
                 owned_test_artifacts_count,
             ),
@@ -4668,7 +4666,8 @@ impl Agent {
             TaskContractVerifierSelection::LegacyRunnable {
                 plan,
                 command_for_log,
-            } => self.handle_legacy_task_contract_verifier_selection(
+            } => super::verifier_orchestration::handle_legacy_task_contract_verifier_selection(
+                self,
                 changed_files,
                 plan,
                 command_for_log,
@@ -4677,47 +4676,6 @@ impl Agent {
                 super::verifier_orchestration::handle_absent_task_contract_verifier_selection(self)
             }
         }
-    }
-
-    fn select_task_contract_verifier_once(
-        &mut self,
-        changed_files: &[String],
-    ) -> (
-        TaskContractVerifierSelection,
-        Option<super::task_workspace_scope::TaskWorkspaceScope>,
-    ) {
-        let recent_successful_bash_commands =
-            super::success::recent_successful_bash_commands_since_last_user(&self.session.messages);
-        let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
-            super::verifier_orchestration::task_contract_verifier_test_binding(self);
-        let active_request = self.active_request_text();
-        let task_contract_project_unit = select_task_contract_project_unit(
-            &self.work_root,
-            active_request.as_deref(),
-            workspace_scope_opt.as_ref(),
-            &self.turn_edited_relative_paths,
-        );
-        if let Some(project_unit) = task_contract_project_unit.as_ref() {
-            log_llm_event(
-                "agent.project_unit.verifier_selection",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "summary": project_unit.summary(),
-                }),
-            );
-        }
-        (
-            select_task_contract_verifier(
-                &self.work_root,
-                changed_files,
-                &recent_successful_bash_commands,
-                &owned_test_artifacts,
-                test_execution_required,
-                workspace_scope_opt.as_ref(),
-                task_contract_project_unit.as_ref(),
-            ),
-            workspace_scope_opt,
-        )
     }
 
     fn handle_structured_task_contract_verifier_selection(
@@ -4836,77 +4794,6 @@ impl Agent {
                 &result.command,
                 selection.bound_test_artifacts_count,
             );
-        }
-        task_contract_auto_test_result_to_outcome(result)
-    }
-
-    fn handle_weak_task_contract_verifier_selection(
-        &mut self,
-        detected_source: &'static str,
-        owned_test_artifacts_count: usize,
-    ) -> TaskContractVerifierOutcome {
-        if !self.session.verifier_safe_stop_emitted_this_turn {
-            self.session.verifier_safe_stop_emitted_this_turn = true;
-            log_llm_event(
-                "agent.verifier.weak",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "iter_index": self.session.iter_count_this_turn,
-                    "owned_test_artifacts_count": owned_test_artifacts_count,
-                    "command_runner": detected_source,
-                    "auto_test_detected": true,
-                    "test_execution_required": true,
-                }),
-            );
-        }
-        let frame = super::success::build_feedback_for_no_verifier(&self.work_root);
-        self.session.record_feedback_if_unset(frame);
-        TaskContractVerifierOutcome::SafeStop {
-            reason: super::task_contract::SafeStopReason::VerifierWeak,
-        }
-    }
-
-    fn handle_legacy_task_contract_verifier_selection(
-        &mut self,
-        changed_files: &[String],
-        plan: AutoTestPlan,
-        command_for_log: String,
-    ) -> TaskContractVerifierOutcome {
-        let result = {
-            let _sp = Spinner::start("running verifier...".to_string());
-            run_legacy_task_contract_verifier(&self.work_root, &plan)
-        };
-        let Ok(result) = result else {
-            let outcome = task_contract_verifier_transport_error_to_outcome(
-                command_for_log.clone(),
-                result.err().unwrap_or_default(),
-            );
-            let outcome_label = task_contract_verifier_outcome_label(&outcome);
-            log_llm_event(
-                "agent.task_contract.verifier.completed",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "outcome": outcome_label,
-                    "command": command_for_log,
-                }),
-            );
-            return outcome;
-        };
-        log_llm_event(
-            "agent.autotest.completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "command": command_for_log,
-                "passed": result.passed,
-                "reason": &plan.reason,
-            }),
-        );
-        let frame = build_feedback_for_auto_test(&plan, &result, &self.work_root, changed_files);
-        self.session.record_feedback_if_unset(frame);
-        self.record_task_contract_verifier_invocation(&result.command, result.exit_code);
-        if result.passed {
-            self.observe_task_contract_verifier_exit_zero(&result.command);
         }
         task_contract_auto_test_result_to_outcome(result)
     }
@@ -5156,29 +5043,6 @@ impl Agent {
         TaskContractVerifierFlowOutcome::Continue
     }
 
-    fn handle_task_contract_verifier_safe_stop(
-        &mut self,
-        last_iter: usize,
-        reason: super::task_contract::SafeStopReason,
-        source: &'static str,
-    ) -> TaskContractVerifierFlowOutcome {
-        let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
-        log_llm_event(
-            "agent.task_contract.safe_stop",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "iter": last_iter,
-                "outcome": log_outcome,
-                "source": source,
-            }),
-        );
-        TaskContractVerifierFlowOutcome::Exit {
-            reason: mapped_reason,
-            error_text: mapped_reason.default_error_text().to_string(),
-        }
-    }
-
     fn handle_repair_job_verifier_pass(
         &mut self,
         args: TaskContractVerifierFlowArgs<'_, '_>,
@@ -5338,8 +5202,12 @@ impl Agent {
         last_iter: usize,
         reason: super::task_contract::SafeStopReason,
     ) -> TaskContractVerifierFlowOutcome {
-        let outcome =
-            self.handle_task_contract_verifier_safe_stop(last_iter, reason, "repair_job_verifier");
+        let outcome = super::verifier_orchestration::handle_task_contract_verifier_safe_stop(
+            self,
+            last_iter,
+            reason,
+            "repair_job_verifier",
+        );
         if let Some(job) = self.repair_job.as_mut() {
             job.apply_event(super::repair_job::RepairJobEvent::VerifierObserved {
                 delta: super::repair_job::VerifierDelta::VerifierUnavailable,
@@ -5395,12 +5263,14 @@ impl Agent {
                     error_text: error,
                 }
             }
-            TaskContractVerifierOutcome::SafeStop { reason } => self
-                .handle_task_contract_verifier_safe_stop(
+            TaskContractVerifierOutcome::SafeStop { reason } => {
+                super::verifier_orchestration::handle_task_contract_verifier_safe_stop(
+                    self,
                     args.last_iter,
                     reason,
                     "task_contract_verifier",
-                ),
+                )
+            }
         }
     }
 
@@ -5850,7 +5720,11 @@ impl Agent {
         true
     }
 
-    fn record_task_contract_verifier_invocation(&mut self, command: &str, exit_code: Option<i32>) {
+    pub(super) fn record_task_contract_verifier_invocation(
+        &mut self,
+        command: &str,
+        exit_code: Option<i32>,
+    ) {
         let redacted = crate::session::feedback::redact_verifier_command_for_storage(command);
         if redacted.trim().is_empty() {
             return;
@@ -5864,7 +5738,7 @@ impl Agent {
             });
     }
 
-    fn observe_task_contract_verifier_exit_zero(&mut self, command: &str) {
+    pub(super) fn observe_task_contract_verifier_exit_zero(&mut self, command: &str) {
         if let Some(evidence) = build_task_contract_verifier_exit_zero_evidence(command) {
             self.evidence_set_this_turn.push(evidence.clone());
             self.task_contract_evidence_set_this_turn.push(evidence);
@@ -12299,6 +12173,7 @@ if __name__ == "__main__":
 mod tests {
     use super::super::actor_loop_flow::{
         answer_only_reply_is_inadequate, normalize_plan_exploration_key,
+        task_contract_verifier_safe_stop_mapping,
     };
     use super::ExitReason;
     use super::{
@@ -12312,7 +12187,7 @@ mod tests {
         repair_terminal_exit_reason, request_explicitly_requests_script_execution,
         should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
-        task_contract_structured_missing_outcome, task_contract_verifier_safe_stop_mapping,
+        task_contract_structured_missing_outcome,
         task_contract_verifier_transport_error_to_outcome, verifier_repair_context_from_failure,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
