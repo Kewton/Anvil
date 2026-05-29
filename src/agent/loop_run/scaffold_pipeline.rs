@@ -36,11 +36,20 @@
 
 use std::path::{Path, PathBuf};
 
+use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
+use super::deterministic;
+use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
+use super::task_contract::ArtifactRole;
 use super::tool_history::latest_user_turn_slice;
+use super::turn::{current_file_hash_for_relative_path, meaningful_workspace_files, sha256_hex};
 use crate::agent::recovery;
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
-use crate::session::store::ConversationMessage;
+use crate::safety::path_guard::resolve_user_path;
+use crate::session::store::{
+    ConversationMessage, ScaffoldArtifactFileSnapshot, ScaffoldArtifactRole,
+    ScaffoldArtifactSnapshot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScaffoldFramework {
@@ -260,4 +269,205 @@ pub(super) fn render_deterministic_scaffold_continuation_note(
         "[Deterministic Scaffold] The generated files are bootstrap scaffold only and do not satisfy the task by themselves. request_json={request_json}. Read and edit the scaffold to implement the user's specific requirements, including domain-specific implementation, tests, and usage documentation. Existing scaffold files: {}. Do not give a final answer until the implementation, tests, and docs match request_json and verification has run.",
         written_paths.join(", ")
     )
+}
+
+pub(super) fn deterministic_framework_game_files_needed(
+    work_root: &Path,
+    files: &[(PathBuf, String)],
+) -> bool {
+    let impl_paths = files
+        .iter()
+        .map(|(path, _)| path)
+        .filter(|path| deterministic_framework_game_impl_path(path))
+        .collect::<Vec<_>>();
+    if impl_paths.is_empty() || impl_paths.iter().any(|path| work_root.join(path).is_file()) {
+        return false;
+    }
+
+    let Some(existing_files) = meaningful_workspace_files(work_root, 32) else {
+        return false;
+    };
+    if existing_files.is_empty() {
+        return true;
+    }
+
+    existing_files.iter().all(|existing| {
+        files
+            .iter()
+            .filter(|(path, _)| !deterministic_framework_game_impl_path(path))
+            .any(|(path, _)| path == existing)
+    })
+}
+
+pub(super) fn deterministic_framework_app_files_needed(
+    work_root: &Path,
+    files: &[(PathBuf, String)],
+    request: &str,
+) -> bool {
+    if deterministic_framework_game_files_needed(work_root, files) {
+        return true;
+    }
+
+    let Some(target) = first_existing_impl_target(work_root) else {
+        return false;
+    };
+    let Ok(current) = std::fs::read_to_string(&target) else {
+        return false;
+    };
+    if implementation_quality_issue_for_request(request, &current).is_none() {
+        return false;
+    }
+    deterministic::playable_ui_repair(request, &target, &current).is_some()
+}
+
+pub(super) fn scaffold_file_snapshot(path: &str, content: &[u8]) -> ScaffoldArtifactFileSnapshot {
+    ScaffoldArtifactFileSnapshot {
+        path: path.to_string(),
+        content_hash: sha256_hex(content),
+        roles: vec![scaffold_role_for_path(Path::new(path))],
+        bootstrap_only: true,
+    }
+}
+
+pub(super) fn scaffold_role_for_path(path: &Path) -> ScaffoldArtifactRole {
+    match classify_repo_edit_path(path) {
+        RepoEditCategory::Impl => ScaffoldArtifactRole::Implementation,
+        RepoEditCategory::Test => ScaffoldArtifactRole::Test,
+        RepoEditCategory::Docs => ScaffoldArtifactRole::UsageDocs,
+        RepoEditCategory::Setup => ScaffoldArtifactRole::Setup,
+        RepoEditCategory::Other => ScaffoldArtifactRole::Other,
+    }
+}
+
+pub(super) fn scaffold_role_matches_artifact_role(
+    candidate: ScaffoldArtifactRole,
+    role: ArtifactRole,
+) -> bool {
+    matches!(
+        (candidate, role),
+        (
+            ScaffoldArtifactRole::Implementation,
+            ArtifactRole::Implementation
+        ) | (ScaffoldArtifactRole::Test, ArtifactRole::Test)
+            | (ScaffoldArtifactRole::UsageDocs, ArtifactRole::UsageDocs)
+            | (ScaffoldArtifactRole::Setup, ArtifactRole::Setup)
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScaffoldDiffStatus {
+    NotScaffold,
+    Changed,
+    UnchangedOrMissing,
+}
+
+pub(super) fn scaffold_diff_status(
+    snapshots: &[ScaffoldArtifactSnapshot],
+    relative_path: &str,
+    current_hash: Option<&str>,
+) -> ScaffoldDiffStatus {
+    let Some(file) = snapshots
+        .iter()
+        .rev()
+        .flat_map(|snapshot| snapshot.files.iter())
+        .find(|file| file.bootstrap_only && file.path == relative_path)
+    else {
+        return ScaffoldDiffStatus::NotScaffold;
+    };
+    match current_hash {
+        Some(hash) if hash != file.content_hash => ScaffoldDiffStatus::Changed,
+        _ => ScaffoldDiffStatus::UnchangedOrMissing,
+    }
+}
+
+pub(super) fn scaffold_candidate_for_missing_role_from_snapshots(
+    snapshots: &[ScaffoldArtifactSnapshot],
+    work_root: &Path,
+    role: ArtifactRole,
+) -> Option<String> {
+    let mut candidates = snapshots
+        .iter()
+        .rev()
+        .flat_map(|snapshot| snapshot.files.iter())
+        .filter(|file| {
+            file.bootstrap_only
+                && file
+                    .roles
+                    .iter()
+                    .any(|candidate| scaffold_role_matches_artifact_role(*candidate, role))
+                && matches!(
+                    scaffold_diff_status(
+                        snapshots,
+                        &file.path,
+                        current_file_hash_for_relative_path(work_root, &file.path).as_deref(),
+                    ),
+                    ScaffoldDiffStatus::UnchangedOrMissing
+                )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|file| scaffold_candidate_priority(work_root, role, &file.path));
+    candidates.first().map(|file| file.path.clone())
+}
+
+pub(super) fn scaffold_candidate_priority(
+    work_root: &Path,
+    role: ArtifactRole,
+    relative_path: &str,
+) -> u8 {
+    if role != ArtifactRole::Implementation {
+        return 0;
+    }
+    let path = Path::new(relative_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let len = resolve_user_path(work_root, relative_path)
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    if len == 0 {
+        return 40;
+    }
+    if matches!(file_name, "__init__.py" | "mod.rs") && len <= 128 {
+        return 30;
+    }
+    if matches!(
+        file_name,
+        "main.py"
+            | "main.rs"
+            | "main.ts"
+            | "main.tsx"
+            | "app.py"
+            | "server.py"
+            | "server.ts"
+            | "lib.rs"
+            | "index.ts"
+            | "index.tsx"
+    ) {
+        return 0;
+    }
+    10
+}
+
+pub(super) fn deterministic_framework_game_impl_path(path: &Path) -> bool {
+    matches!(
+        path.to_string_lossy().as_ref(),
+        "app.vue" | "src/App.tsx" | "src/app/page.tsx" | "app/page.tsx" | "src/routes/+page.svelte"
+    )
+}
+
+pub(super) fn deterministic_support_target_relative(work_root: &Path, relative: &Path) -> PathBuf {
+    if let Ok(rest) = relative.strip_prefix("src/app")
+        && work_root.join("app").is_dir()
+    {
+        return PathBuf::from("app").join(rest);
+    }
+    if let Ok(rest) = relative.strip_prefix("app")
+        && work_root.join("src/app").is_dir()
+    {
+        return PathBuf::from("src/app").join(rest);
+    }
+    relative.to_path_buf()
 }
