@@ -98,7 +98,7 @@ use super::scaffold_pipeline::{
     deterministic_framework_game_impl_path, deterministic_nextjs_scaffold_reply,
     deterministic_support_target_relative, recent_scaffold_command_seen,
     render_deterministic_scaffold_continuation_note, scaffold_candidate_priority,
-    scaffold_command_matches_framework, scaffold_file_snapshot,
+    scaffold_file_snapshot,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
@@ -214,9 +214,7 @@ use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
 use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
-use crate::session::store::{
-    ScaffoldArtifactFileSnapshot, ScaffoldArtifactSnapshot, WorkingMemory,
-};
+use crate::session::store::{ScaffoldArtifactFileSnapshot, WorkingMemory};
 use crate::tools::registry::{BashErrorClass, ToolSpec};
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use sha2::{Digest, Sha256};
@@ -1564,7 +1562,7 @@ fn test_artifact_path_family(path: &str) -> Option<&'static str> {
     None
 }
 
-fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
+pub(super) fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
     text.split(|ch: char| {
         ch.is_whitespace()
             || matches!(
@@ -1635,28 +1633,6 @@ fn extract_requested_port(task: &str) -> Option<String> {
         }
     }
     None
-}
-
-impl ScaffoldFramework {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Next => "Next.js",
-            Self::React => "React.js",
-            Self::Nuxt => "Nuxt.js",
-        }
-    }
-
-    fn scaffold_hint(self) -> &'static str {
-        match self {
-            Self::Next => "Use create-next-app for the scaffold.",
-            Self::React => {
-                "Use a Vite React scaffold, for example: npm create vite@latest . -- --template react-ts."
-            }
-            Self::Nuxt => {
-                "Use a Nuxt scaffold, for example: npx nuxi@latest init . --packageManager npm."
-            }
-        }
-    }
 }
 
 fn fallback_plan_request_label(task: &str) -> String {
@@ -9889,43 +9865,7 @@ impl Agent {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Option<String> {
-        let requested_framework = self.active_task_requested_scaffold_framework()?;
-        if !self.workspace_appears_empty()
-            || has_successful_non_plan_repo_edit(
-                &self.session.messages,
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-            )
-        {
-            return None;
-        }
-        let label = requested_framework.label();
-        if name != "Bash" {
-            return Some(format!(
-                "Error: empty workspace {label} tasks require one scaffold Bash command first. Do not write package.json or placeholder files by hand."
-            ));
-        }
-        let command = arguments
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        // Issue #664: legacy recovery-side scaffold detector.
-        // SetupBootstrap policy projection uses `bash::is_setup_command`.
-        #[allow(deprecated)]
-        let scaffold_ok = recovery::is_scaffold_command(command);
-        if !scaffold_ok {
-            return Some(format!(
-                "Error: empty workspace {label} tasks require one scaffold Bash command first. Do not use cd, ls, manual bootstrap commands, or deprecated scaffolds. {}",
-                requested_framework.scaffold_hint()
-            ));
-        }
-        if !scaffold_command_matches_framework(requested_framework, command) {
-            return Some(format!(
-                "Error: the user requested {label}. Use a {label} scaffold command, not a different framework scaffold. {}",
-                requested_framework.scaffold_hint()
-            ));
-        }
-        None
+        super::scaffold_pipeline::empty_workspace_scaffold_policy_error(self, name, arguments)
     }
 
     fn deterministic_nextjs_scaffold_skip_reason(&self) -> Option<&'static str> {
@@ -10172,40 +10112,14 @@ impl Agent {
         request: &str,
         files: Vec<ScaffoldArtifactFileSnapshot>,
     ) {
-        if files.is_empty() {
-            return;
-        }
-        self.session
-            .scaffold_artifact_snapshots
-            .push(ScaffoldArtifactSnapshot {
-                created_turn_index: self.current_turn_index,
-                request_hash: sha256_hex(request.as_bytes()),
-                files,
-            });
-        const MAX_SCAFFOLD_SNAPSHOTS: usize = 4;
-        while self.session.scaffold_artifact_snapshots.len() > MAX_SCAFFOLD_SNAPSHOTS {
-            self.session.scaffold_artifact_snapshots.remove(0);
-        }
+        super::scaffold_pipeline::record_scaffold_artifact_snapshot(self, request, files)
     }
 
     fn python_csv_names_from_request_and_anvil(
         &self,
         request: &str,
     ) -> (Option<String>, Option<String>) {
-        let request_script = extract_filename_with_suffix(request, ".py");
-        let request_sample = extract_filename_with_suffix(request, ".csv");
-        let instructions = prompting::load_project_instructions(&self.config.cwd, &self.work_root);
-        let instruction_text = instructions
-            .as_ref()
-            .map(|value| value.global_content.as_str());
-        let instruction_script =
-            instruction_text.and_then(|text| extract_filename_with_suffix(text, ".py"));
-        let instruction_sample =
-            instruction_text.and_then(|text| extract_filename_with_suffix(text, ".csv"));
-        (
-            request_script.or(instruction_script),
-            request_sample.or(instruction_sample),
-        )
+        super::scaffold_pipeline::python_csv_names_from_request_and_anvil(self, request)
     }
 
     pub(super) fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
@@ -15855,7 +15769,7 @@ pub(super) fn latest_turn_preferred_read_edit_target(
     latest_existing
 }
 
-fn workspace_appears_empty(work_root: &Path) -> bool {
+pub(super) fn workspace_appears_empty(work_root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(work_root) else {
         return false;
     };
@@ -16866,15 +16780,15 @@ mod truncate_tests {
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
     use super::super::scaffold_pipeline::{
         requested_scaffold_framework, scaffold_candidate_for_missing_role_from_snapshots,
-        task_or_plan_requires_nextjs_scaffold,
+        scaffold_command_matches_framework, task_or_plan_requires_nextjs_scaffold,
     };
     use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
         ScaffoldFramework, changed_files_for_verifier, deterministic_nextjs_scaffold_reply,
         extract_filename_with_suffix, focused_edit_tool_policy_error,
-        repo_edit_satisfies_artifact_recovery_target, scaffold_command_matches_framework,
-        scaffold_file_snapshot, task_contract_needs_verification,
-        task_contract_verifier_repair_note, task_requires_nextjs_scaffold, truncate,
+        repo_edit_satisfies_artifact_recovery_target, scaffold_file_snapshot,
+        task_contract_needs_verification, task_contract_verifier_repair_note,
+        task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
