@@ -26,12 +26,19 @@ use std::collections::HashSet;
 
 use super::Agent;
 use super::completion_evidence::{self, CompletionEvidence};
+use super::tool_history::build_recent_tool_summary;
 use crate::logging::log_llm_event;
 use crate::photon;
 use crate::photon::eval::parse_evaluate_response;
-use crate::photon::prompt::{BlockedIdsStats, extract_blocked_summary_ids, sanitize_summary_id};
-use crate::photon::schema::{ContextPackResponse, EvaluateResponse};
-use crate::session::feedback::{FeedbackKind, MAX_VERIFIER_COMMAND_BYTES};
+use crate::photon::mapper::{ContextPackInputs, build_context_pack_request};
+use crate::photon::prompt::{
+    AdmittedItemView, BlockedIdsStats, RenderCandidate, RenderStats, build_section_with_stats,
+    enumerate_admitted_items_with_provenance, extract_blocked_summary_ids, sanitize_summary_id,
+};
+use crate::photon::schema::{ContextPackRequest, ContextPackResponse, EvaluateResponse};
+use crate::session::eval_log::MAX_PHOTON_EVAL_FIELD_BYTES;
+use crate::session::feedback::{FeedbackKind, MAX_VERIFIER_COMMAND_BYTES, mask_secrets};
+use crate::session::precaution::PrecautionStatus;
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::tools::bash::{BashCommandClass, classify_command};
 
@@ -850,4 +857,143 @@ pub(super) fn store_photon_eval_summary(
     summary.outcome_emitted = outcome_static.map(String::from);
     summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
     agent.last_photon_eval_summary = Some(summary);
+}
+
+/// Issue #557: build the pre-turn `ContextPackRequest` sent to photon
+/// `/v1/context_pack`. Uses per-turn Agent state (working memory text,
+/// active precaution ids, touched files) plus the recent tool summary
+/// projection.
+pub(super) fn build_pre_turn_photon_context_pack_request(agent: &Agent) -> ContextPackRequest {
+    let working_memory_text = agent.session.working_memory.format_for_prompt();
+    let selected_precaution_ids: Vec<String> = agent
+        .session
+        .working_memory
+        .active_precautions
+        .iter()
+        .filter(|p| p.status == PrecautionStatus::Active)
+        .map(|p| p.id.clone())
+        .collect();
+    let recent_tool_summary = build_recent_tool_summary(&agent.session.messages);
+    build_context_pack_request(&ContextPackInputs {
+        task: agent.session.working_memory.active_task.as_deref(),
+        repo_path: &agent.work_root,
+        branch: None,
+        commit: None,
+        working_memory_text: working_memory_text.as_deref(),
+        touched_files: &agent.session.working_memory.touched_files,
+        recent_tool_summary: &recent_tool_summary,
+        selected_case_ids: &[],
+        selected_anti_pattern_ids: &[],
+        selected_precaution_ids: &selected_precaution_ids,
+    })
+}
+
+/// Issue #591: persist the context_pack `request_id` (or fallback) into
+/// `Agent.last_context_pack_id`, applying the
+/// `MAX_PHOTON_EVAL_FIELD_BYTES` cap with a char-boundary-safe ellipsis.
+pub(super) fn update_last_context_pack_id(
+    agent: &mut Agent,
+    response: Option<&ContextPackResponse>,
+    fallback_req_id: Option<String>,
+) {
+    let from_resp = response
+        .and_then(|resp| resp.0.get("request_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let masked = mask_secrets(s);
+            if masked.len() <= MAX_PHOTON_EVAL_FIELD_BYTES {
+                masked
+            } else {
+                let mut end = MAX_PHOTON_EVAL_FIELD_BYTES;
+                while !masked.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &masked[..end])
+            }
+        });
+    agent.last_context_pack_id = from_resp.or(fallback_req_id);
+}
+
+/// Issue #557: process the photon `/v1/context_pack` response. Returns
+/// `(items_blocked, truncated)` so the caller can wire the completion
+/// log + injection-tracking reset.
+pub(super) fn process_photon_context_pack_response(
+    agent: &mut Agent,
+    resp: ContextPackResponse,
+    warning_filter_enabled: bool,
+) -> (usize, bool) {
+    let (blocked_ids, blocked_stats) =
+        photon_context_pack_blocked_ids(&resp, warning_filter_enabled);
+    log_photon_context_pack_warning_blocked(agent, &blocked_ids, &blocked_stats);
+    let (admitted_views, render_stats) =
+        collect_photon_context_pack_views(agent, &resp, &blocked_ids);
+    let items_blocked = render_stats.items_blocked;
+    let truncated = update_photon_context_pack_render(agent, admitted_views, render_stats);
+    (items_blocked, truncated)
+}
+
+/// Issue #557: enumerate admitted photon items (post-block, post-PAM
+/// advisory). Returns `(admitted_views, render_stats)`. Drives the
+/// `record_pam_advisory_decision` Agent shell which may filter views in
+/// `Live` mode.
+pub(super) fn collect_photon_context_pack_views(
+    agent: &mut Agent,
+    resp: &ContextPackResponse,
+    blocked_ids: &HashSet<String>,
+) -> (Vec<AdmittedItemView>, RenderStats) {
+    let (admitted_views, mut render_stats) =
+        enumerate_admitted_items_with_provenance(resp, blocked_ids);
+    let advisory_outcome = agent.record_pam_advisory_decision(resp, blocked_ids, false);
+    let admitted_views = match advisory_outcome.as_ref() {
+        Some(outcome) => {
+            let filtered = outcome.live_admitted_views.clone();
+            render_stats.items_adopted = filtered.len();
+            filtered
+        }
+        None => admitted_views,
+    };
+    (admitted_views, render_stats)
+}
+
+/// Issue #557: render the admitted photon views into the per-turn
+/// injection state. Updates the per-turn tracker fields (adopted ids,
+/// items, provenance summary) and applies the
+/// `MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES` cap. Returns whether the
+/// rendered output was truncated.
+pub(super) fn update_photon_context_pack_render(
+    agent: &mut Agent,
+    admitted_views: Vec<AdmittedItemView>,
+    mut render_stats: RenderStats,
+) -> bool {
+    let render_candidates: Vec<RenderCandidate> = admitted_views
+        .iter()
+        .map(|v| RenderCandidate {
+            text: v.render_text.clone(),
+            summary_id: v.provenance.summary_id.clone(),
+        })
+        .collect();
+    let (rendered_opt, _, _, dedup_adopted_ids) = build_section_with_stats(&render_candidates);
+    render_stats.adopted_summary_ids = dedup_adopted_ids;
+    agent.last_injected_seed_provenance = admitted_views
+        .into_iter()
+        .map(|view| view.provenance)
+        .collect();
+    debug_assert_eq!(
+        agent.last_injected_seed_provenance.len(),
+        render_stats.items_adopted,
+        "Invariant: injected_seed_provenance_summary.len() == items_adopted"
+    );
+    if let Some(rendered) = rendered_opt {
+        agent.last_photon_adopted_items = render_stats.items_adopted;
+        agent.last_adopted_summary_ids = render_stats.adopted_summary_ids.clone();
+        let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
+        agent.photon_context_pack_response = Some(truncated_rendered);
+        agent.last_injected_summary_ids = render_stats.adopted_summary_ids;
+        agent.last_injected_summary_turn_index = Some(agent.current_turn_index);
+        trunc
+    } else {
+        clear_photon_context_pack_injection_tracking(agent);
+        false
+    }
 }
