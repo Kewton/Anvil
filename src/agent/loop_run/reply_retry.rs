@@ -182,7 +182,7 @@ fn maybe_handle_assistant_reply_format_error(
 
 fn push_tool_call_format_retry_note(agent: &mut Agent, err: &str, retry_count: usize) {
     let lower_err = err.to_ascii_lowercase();
-    let effective_tool_policy = agent.effective_tool_policy();
+    let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(agent);
     if let Some(policy) = effective_tool_policy.focused_edit_policy() {
         let target = &policy.target;
         let target_already_read = policy.target_already_read;
@@ -241,7 +241,9 @@ fn maybe_handle_assistant_reply_timeout_error(
             ));
         return Some(AssistantReplyRetryDecision::ReturnReply(reply));
     }
-    let timeout_focused_policy = agent.effective_tool_policy().focused_edit_policy().cloned();
+    let timeout_focused_policy = super::effective_tool_policy_flow::effective_tool_policy(agent)
+        .focused_edit_policy()
+        .cloned();
     if let Some(policy) = timeout_focused_policy {
         if recovery_dispatch_gate.allows_deterministic_fallback()
             && let Some(reply) =
@@ -318,7 +320,7 @@ fn request_assistant_reply(
 ) -> Result<AssistantReply, String> {
     let protocol = prompting::ToolProtocol::from_native_tools_enabled(agent.native_tools_enabled);
     let native_tools_enabled = protocol.native_tools_enabled();
-    let effective_tool_policy = agent.effective_tool_policy();
+    let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(agent);
     let focused_edit_target = effective_tool_policy
         .focused_edit_policy()
         .map(|policy| policy.target.as_path());

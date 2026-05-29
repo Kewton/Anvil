@@ -1,7 +1,4 @@
-use super::active_job_arbiter::{
-    LoopControlAction, LoopControlInputs, RecoveryOwner, build_active_job_selected_payload,
-    determine_loop_control_action,
-};
+use super::active_job_arbiter::{RecoveryOwner, build_active_job_selected_payload};
 use super::actor_loop_flow::{format_iteration_status, run_actor_loop};
 use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
@@ -69,10 +66,9 @@ use super::verifier_orchestration::{
     validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_messages,
     verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
     verifier_repair_intent_limits, verifier_repair_pass_messages,
-    verifier_repair_pass_request_error_message, verifier_repair_policy_for_target_hint,
-    verifier_repair_safe_stop_message, verifier_repair_target_display,
-    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
-    verifier_setup_policy_message,
+    verifier_repair_pass_request_error_message, verifier_repair_safe_stop_message,
+    verifier_repair_target_display, verifier_repair_transition_message,
+    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
 };
 use super::verifier_repair_shadow::legacy_repair_brief_input_from_assessment;
 use super::workspace_candidates::existing_workspace_candidate_for_role_in_scope;
@@ -681,7 +677,7 @@ impl Agent {
     /// before crossing the `pub(crate)` boundary.
     #[cfg(test)]
     pub(super) fn effective_tool_policy_pub_for_test(&self) -> EffectiveToolPolicy {
-        self.effective_tool_policy()
+        super::effective_tool_policy_flow::effective_tool_policy(self)
     }
 
     /// Issue #664 test seam: `pub(super)` wrapper over the private
@@ -694,7 +690,7 @@ impl Agent {
     pub(super) fn build_arbiter_candidates_pub_for_test(
         &self,
     ) -> Vec<super::active_job_arbiter::JobCandidate> {
-        self.build_arbiter_candidates()
+        super::effective_tool_policy_flow::build_arbiter_candidates(self)
     }
 
     /// Issue #664 iteration-3 (CB2-003) test seam: drive the
@@ -816,292 +812,6 @@ impl Agent {
             .as_ref()
             .map(|j| j.attempts().len())
     }
-
-    pub(super) fn effective_tool_policy(&self) -> EffectiveToolPolicy {
-        // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
-        // in §4 of the design policy). The arbiter never sees it; we early-
-        // return before constructing any selectable `JobCandidate`.
-        if self.answer_only_mode_active() {
-            if self.workspace_appears_empty() {
-                return EffectiveToolPolicy::restricted(
-                    EffectiveToolPolicyReason::AnswerOnly,
-                    Vec::new(),
-                );
-            }
-            if self.script_execution_requested() {
-                return EffectiveToolPolicy::restricted(
-                    EffectiveToolPolicyReason::AnswerOnly,
-                    vec!["Read", "Glob", "Grep", "Bash"],
-                );
-            } else {
-                return EffectiveToolPolicy::restricted(
-                    EffectiveToolPolicyReason::AnswerOnly,
-                    vec!["Read", "Glob", "Grep"],
-                );
-            }
-        }
-
-        // Issue #660 (Codex CB-001 / §4 design table): `PlanModeGate` is also
-        // a pre-arbitration gate, not a selectable arbitration kind. The
-        // Plan-file Write/Edit exception is the authority of
-        // `src/tools/registry.rs::resolve_plan_mode_write_target` /
-        // `enforce_plan_stage_scope`; the arbiter must not pre-empt that
-        // decision with stale `task_contract_verifier_repair_pending` or
-        // other selectable state. Returning `unrestricted()` keeps the
-        // tool-spec surface and recovery-target gating out of the arbiter
-        // while the registry-layer PAM gate enforces actual write target.
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            return EffectiveToolPolicy::unrestricted();
-        }
-
-        // Issue #660 (Phase E): arbiter is the **sole authority** for write
-        // owner selection. The legacy if-elif chain, the
-        // `#[cfg(debug_assertions)]` dual-source assertion, and the
-        // `agent.active_job.divergence_detected` event emit that lived here
-        // during Phase A+B-D have all been removed. `effective_tool_policy`
-        // is now a thin shell over `build_arbiter_candidates` +
-        // `select_active_job` + `project_policy`.
-        //
-        // The `agent.active_job.selected` event is emitted by
-        // `emit_active_job_selected_if_changed` from the agent loop driver
-        // (see L5352 `run_actor_loop` site) — `effective_tool_policy` stays
-        // a pure read so it can be called freely without log-emit side
-        // effects.
-        let candidates = self.build_arbiter_candidates();
-        let selection = super::active_job_arbiter::select_active_job(&candidates);
-        super::active_job_arbiter::project_policy(&selection)
-    }
-
-    /// Issue #660: build the arbiter candidate list from the same source
-    /// signals the legacy chain reads. Per DR1-004 only candidates with a
-    /// determined `desired_action` are pushed — there is no
-    /// `RejectionReason::NoDesiredAction`.
-    ///
-    /// Each branch mirrors a single legacy `if let Some(target) = ...`
-    /// arm. The policy attached to the candidate is the exact value the
-    /// legacy chain would have returned, so `project_policy(selection)`
-    /// is value-equal to the legacy result.
-    fn build_arbiter_candidates(&self) -> Vec<super::active_job_arbiter::JobCandidate> {
-        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
-
-        if let Some(candidates) = self.priority_one_arbiter_candidates() {
-            return candidates;
-        }
-
-        let mut candidates: Vec<JobCandidate> = Vec::new();
-
-        // Priority 2: ForcedSmallEditRecovery.
-        if let Some(target) = self.forced_small_edit_recovery_target() {
-            self.push_focused_edit_candidate(
-                &mut candidates,
-                target,
-                ActiveJobKind::ForcedSmallEditRecovery,
-                EffectiveToolPolicyReason::FocusedEditRecovery,
-            );
-        }
-
-        // Priority 3: ArtifactRecovery.
-        // Issue #663 (Phase C / AD5 / DR1-006 / CB-001 fix): ArtifactRecovery
-        // candidate is generated ONLY when an `ArtifactCompletionJob` is
-        // installed. The job is the single source of truth for
-        // `AllowedWriteActions` / `AllowedReadScope` / role-specific budget,
-        // and the policy is always built via `artifact_directed_from_job`.
-        // The previous fallback to the generic write-capable
-        // `artifact_directed` policy (when target was set but job was None)
-        // bypassed target validation and role-specific budget, so it is
-        // removed: a bare `current_artifact_recovery_target` without a job
-        // produces no write-capable candidate.
-        if let (Some(target), Some(job)) = (
-            self.artifact_recovery_target_path(),
-            self.artifact_completion_job.as_ref(),
-        ) {
-            let target_already_read =
-                focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-            let policy = EffectiveToolPolicy::artifact_directed_from_job(
-                target.clone(),
-                target_already_read,
-                job.allowed_write_actions(),
-                job.allowed_read_scope(),
-            );
-            let write_actions = job.allowed_write_actions().clone();
-            let read_scope = job.allowed_read_scope().clone();
-            candidates.push(JobCandidate {
-                kind: ActiveJobKind::ArtifactRecovery,
-                desired_action: DesiredAction::ArtifactDirected {
-                    target,
-                    already_read: target_already_read,
-                    write_actions,
-                    read_scope,
-                },
-                policy,
-                budget: Budget::Unbounded,
-            });
-        }
-
-        // Issue #664 (Priority 4 / AD22): SetupBootstrap candidate. Built
-        // pure from `TaskContract` + behavior projection + verifier
-        // prerequisite signal + ledger overflow. `should_install_setup_bootstrap`
-        // is the SSOT decision tree (pure-fn; arbiter does not observe
-        // Agent state).
-        //
-        // **Issue #664 iteration-2 (CB-001) — Stage A + Stage B both wired**:
-        //
-        // - **Stage A live observation**: `OwnedTestVerifierPlan::Missing`
-        //   is observed in `run_task_contract_verifier_once` and recorded
-        //   into the per-turn flag `owned_test_verifier_missing_observed_this_turn`
-        //   (single producer). Reading the flag from `&self` is O(1) so the
-        //   pure-`&self` candidate builder can consume the live signal at
-        //   every `effective_tool_policy()` evaluation without traversing
-        //   the workspace. Reset at `handle_user_message` head (per-turn
-        //   rule).
-        //
-        // - **Stage B (BehaviorContractProjection verifier capability label)**:
-        //   the behavior projection is passed to
-        //   `VerifierPrerequisiteSignal::from_sources(stage_a, Some(&p))`.
-        //   `should_install_setup_bootstrap` refines the OR-composed
-        //   signal so Stage B alone (label-only) is insufficient — it
-        //   only fires via the Setup-label fallback (step 4) when the
-        //   projection also carries an explicit setup keyword. This
-        //   suppresses the false positive on plain "add tests" requests
-        //   where `verification_expectations = ["test"]` would otherwise
-        //   trip step (2). Stage A live alone always passes step (2);
-        //   `required_artifacts::Setup` is unaffected (step 1, no gate).
-        if let Some(candidate) = self.setup_bootstrap_candidate() {
-            candidates.push(candidate);
-        }
-
-        // Priority 5: FocusedEditRecovery.
-        if let Some(target) = self.focused_edit_recovery_target() {
-            self.push_focused_edit_candidate(
-                &mut candidates,
-                target,
-                ActiveJobKind::FocusedEditRecovery,
-                EffectiveToolPolicyReason::FocusedEditRecovery,
-            );
-        }
-
-        // Priority 6: LocalLlmSmallEditAfterRead.
-        if let Some(target) = self.local_llm_small_edit_target() {
-            self.push_focused_edit_candidate(
-                &mut candidates,
-                target,
-                ActiveJobKind::LocalLlmSmallEditAfterRead,
-                EffectiveToolPolicyReason::LocalLlmSmallEditAfterRead,
-            );
-        }
-
-        candidates
-    }
-
-    fn priority_one_arbiter_candidates(
-        &self,
-    ) -> Option<Vec<super::active_job_arbiter::JobCandidate>> {
-        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
-
-        match determine_loop_control_action(LoopControlInputs {
-            mode: self.session.mode_state.mode,
-            task_contract_verifier_repair_pending: self.task_contract_verifier_repair_pending,
-            repair_next_action: self.repair_job.as_ref().map(|job| job.next_action()),
-            missing_verifier_next_action: self
-                .missing_verifier_job
-                .as_ref()
-                .map(|job| job.next_action()),
-            task_contract_action: None,
-        }) {
-            LoopControlAction::ContinueRepairJob { next_action } => {
-                let target_hint = match &next_action {
-                    super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
-                        Some(target_hint.clone())
-                    }
-                    _ => None,
-                };
-                Some(vec![JobCandidate {
-                    kind: ActiveJobKind::VerifierRepair,
-                    desired_action: DesiredAction::VerifierRepair {
-                        command: String::new(),
-                        target_hint,
-                    },
-                    policy: self.verifier_repair_policy_for_next_action(&next_action),
-                    budget: Budget::Unbounded,
-                }])
-            }
-            LoopControlAction::ContinueMissingVerifierJob { next_action } => {
-                if matches!(
-                    next_action,
-                    super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
-                ) && let Some(job) = self.missing_verifier_job.as_ref()
-                {
-                    return Some(vec![JobCandidate {
-                        kind: ActiveJobKind::VerifierRepair,
-                        desired_action: DesiredAction::MissingVerifierCreate,
-                        policy: EffectiveToolPolicy::restricted(
-                            EffectiveToolPolicyReason::VerifierRepair,
-                            job.allowed_tool_names().to_vec(),
-                        ),
-                        budget: Budget::Unbounded,
-                    }]);
-                }
-                Some(Vec::new())
-            }
-            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => None,
-        }
-    }
-
-    fn push_focused_edit_candidate(
-        &self,
-        candidates: &mut Vec<super::active_job_arbiter::JobCandidate>,
-        target: PathBuf,
-        kind: super::active_job_arbiter::ActiveJobKind,
-        reason: EffectiveToolPolicyReason,
-    ) {
-        use super::active_job_arbiter::{Budget, DesiredAction, JobCandidate};
-
-        let already_read =
-            focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-        candidates.push(JobCandidate {
-            kind,
-            desired_action: DesiredAction::FocusedEdit {
-                target: target.clone(),
-                already_read,
-            },
-            policy: self.focused_edit_policy_for_target(target, reason),
-            budget: Budget::Unbounded,
-        });
-    }
-
-    fn setup_bootstrap_candidate(&self) -> Option<super::active_job_arbiter::JobCandidate> {
-        use super::active_job_arbiter::{ActiveJobKind, Budget, DesiredAction, JobCandidate};
-
-        if matches!(
-            self.session.mode_state.work_mode,
-            WorkMode::Docs | WorkMode::AnswerOnly
-        ) {
-            return None;
-        }
-        let request = self.active_request_text()?;
-        let task_contract = super::task_contract::TaskContract::from_request(&request);
-        let behavior_projection =
-            super::required_behavior::project_behavior_contract(&task_contract);
-        let verifier_signal = super::task_contract::VerifierPrerequisiteSignal::from_sources(
-            self.owned_test_verifier_missing_observed_this_turn,
-            behavior_projection.as_ref(),
-        );
-        if !super::active_job_arbiter::should_install_setup_bootstrap(
-            &task_contract,
-            behavior_projection.as_ref(),
-            &verifier_signal,
-            self.artifact_ledger.overflowed(),
-        ) {
-            return None;
-        }
-        Some(JobCandidate {
-            kind: ActiveJobKind::SetupBootstrap,
-            desired_action: DesiredAction::SetupBash,
-            policy: EffectiveToolPolicy::setup_bootstrap(),
-            budget: Budget::Unbounded,
-        })
-    }
-
     /// Issue #660 (Phase C / DD-4): per-turn diff-based emit of
     /// `agent.active_job.selected`. Computes the current
     /// `ActiveJobSelection`, compares it with the previous emission stored
@@ -1214,54 +924,9 @@ impl Agent {
                 rejected: Vec::new(),
             };
         }
-        let candidates = self.build_arbiter_candidates();
+        let candidates = super::effective_tool_policy_flow::build_arbiter_candidates(self);
         super::active_job_arbiter::select_active_job(&candidates)
     }
-
-    fn verifier_repair_policy_for_next_action(
-        &self,
-        action: &super::repair_job::RepairNextAction,
-    ) -> EffectiveToolPolicy {
-        match action {
-            super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
-                verifier_repair_policy_for_target_hint(
-                    target_hint,
-                    &self.session.messages,
-                    &self.work_root,
-                )
-            }
-            super::repair_job::RepairNextAction::RequestDiagnostic
-            | super::repair_job::RepairNextAction::Replan
-            | super::repair_job::RepairNextAction::RerunVerifier
-            | super::repair_job::RepairNextAction::SafeStop { .. }
-            | super::repair_job::RepairNextAction::VerifiedDone => EffectiveToolPolicy::restricted(
-                EffectiveToolPolicyReason::VerifierRepair,
-                Vec::new(),
-            ),
-        }
-    }
-
-    fn focused_edit_policy_for_target(
-        &self,
-        target: PathBuf,
-        reason: EffectiveToolPolicyReason,
-    ) -> EffectiveToolPolicy {
-        let target_already_read =
-            focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
-        if !target.is_file() {
-            EffectiveToolPolicy::focused_edit(reason, vec!["Write"], target, target_already_read)
-        } else if target_already_read {
-            EffectiveToolPolicy::focused_edit(reason, vec!["Edit"], target, target_already_read)
-        } else {
-            EffectiveToolPolicy::focused_edit(
-                reason,
-                vec!["Read", "Edit"],
-                target,
-                target_already_read,
-            )
-        }
-    }
-
     pub(super) fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
         if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt() {
@@ -1270,7 +935,7 @@ impl Agent {
         specs
     }
 
-    fn local_llm_small_edit_target(&self) -> Option<PathBuf> {
+    pub(super) fn local_llm_small_edit_target(&self) -> Option<PathBuf> {
         if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
             return None;
         }
@@ -4085,7 +3750,7 @@ impl Agent {
         true
     }
 
-    fn artifact_recovery_target_path(&self) -> Option<PathBuf> {
+    pub(super) fn artifact_recovery_target_path(&self) -> Option<PathBuf> {
         // Issue #652 PR-001 SSOT: when an `ArtifactCompletionJob` is
         // active, read the target straight from the job — that is the
         // single source of truth for the in-flight artifact-completion
@@ -4140,7 +3805,7 @@ impl Agent {
         self.session.mode_state.work_mode == WorkMode::AnswerOnly
     }
 
-    fn script_execution_requested(&self) -> bool {
+    pub(super) fn script_execution_requested(&self) -> bool {
         self.active_request_text()
             .as_deref()
             .is_some_and(request_explicitly_requests_script_execution)
@@ -4151,7 +3816,7 @@ impl Agent {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Option<String> {
-        let effective_tool_policy = self.effective_tool_policy();
+        let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(self);
         let scope = if self.missing_verifier_job.is_some() {
             Some(self.current_workspace_scope())
         } else {
@@ -4436,7 +4101,7 @@ impl Agent {
             && let Ok(resolved) = resolve_user_path(&self.work_root, raw_path)
         {
             let resolved = if tool_call.name == "Read" {
-                self.effective_tool_policy()
+                super::effective_tool_policy_flow::effective_tool_policy(self)
                     .focused_edit_policy()
                     .and_then(|policy| {
                         focused_read_target_for_directory(&resolved, &policy.target)

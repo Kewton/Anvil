@@ -3363,7 +3363,7 @@ mod tests {
         agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
 
         // (1) Arbiter must surface a VerifierRepair-derived policy.
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::VerifierRepair,
@@ -3479,7 +3479,7 @@ mod tests {
         });
 
         // (1) Arbiter must surface an artifact-directed-recovery policy.
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::ArtifactDirectedRecovery,
@@ -3531,7 +3531,7 @@ mod tests {
         // Intentionally do NOT install an ArtifactCompletionJob.
         assert!(agent.artifact_completion_job.is_none());
 
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_ne!(
             policy.reason(),
             super::EffectiveToolPolicyReason::ArtifactDirectedRecovery,
@@ -3571,7 +3571,7 @@ mod tests {
             "docs-only README work must not be captured by Bash-only setup bootstrap"
         );
         assert_eq!(
-            agent.effective_tool_policy().reason(),
+            super::super::effective_tool_policy_flow::effective_tool_policy(&agent).reason(),
             super::EffectiveToolPolicyReason::Unrestricted,
             "with no artifact job installed yet, docs-only turns should stay open for the task contract to select README.md"
         );
@@ -3694,7 +3694,7 @@ mod tests {
 
         // (1) Arbiter must surface a focused-edit-recovery policy
         //     (ForcedSmallEditRecovery uses the FocusedEditRecovery reason).
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::FocusedEditRecovery,
@@ -3757,7 +3757,7 @@ mod tests {
 
         // No verifier_repair, no recovery_target, no truncated-tool-call,
         // no focused / local-llm target -> no selectable active job.
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::Unrestricted,
@@ -3807,7 +3807,7 @@ mod tests {
         agent.task_contract_verifier_repair_pending = true;
         agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
 
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::VerifierRepair,
@@ -3851,7 +3851,7 @@ mod tests {
 
         // Sanity: VerifierRepair owns the turn.
         assert_eq!(
-            agent.effective_tool_policy().reason(),
+            super::super::effective_tool_policy_flow::effective_tool_policy(&agent).reason(),
             super::EffectiveToolPolicyReason::VerifierRepair,
         );
 
@@ -3916,7 +3916,7 @@ mod tests {
         // tool-spec surface and recovery-target gating stay out of the
         // arbiter while the registry-layer PAM gate enforces the actual
         // write target.
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::Unrestricted,
@@ -3944,7 +3944,7 @@ mod tests {
         agent.session.mode_state.mode = ExecutionMode::Plan;
         agent.task_contract_verifier_repair_pending = true;
 
-        let policy = agent.effective_tool_policy();
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
         assert_eq!(
             policy.reason(),
             super::EffectiveToolPolicyReason::Unrestricted,

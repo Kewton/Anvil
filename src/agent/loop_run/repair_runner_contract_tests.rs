@@ -199,17 +199,19 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn production_repair_dispatch_does_not_call_legacy_decision_bridge() {
-        let turn_src = include_str!("turn.rs");
         let actor_loop_flow_src = include_str!("actor_loop_flow.rs");
+        // After parent #680: `build_arbiter_candidates` lives in
+        // `effective_tool_policy_flow.rs` as a `pub(super)` free fn.
+        let arbiter_src = include_str!("effective_tool_policy_flow.rs");
         let run_actor_loop = function_body(
             actor_loop_flow_src,
             "\npub(super) fn run_actor_loop(",
             "\n    let mut last_iter = 0usize;\n",
         );
         let arbiter_candidates = function_body(
-            turn_src,
-            "\n    fn build_arbiter_candidates(",
-            "\n    pub(super) fn current_workspace_scope(",
+            arbiter_src,
+            "\npub(super) fn build_arbiter_candidates(",
+            "\nfn priority_one_arbiter_candidates(",
         );
 
         for (label, body) in [
