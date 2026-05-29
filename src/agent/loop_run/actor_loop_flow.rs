@@ -3722,7 +3722,7 @@ pub(super) fn run_actor_loop(
     // Clear per-turn context_pack_response here (no longer needed).
     agent.photon_context_pack_response = None;
     if agent.session.mode_state.mode != ExecutionMode::Plan {
-        agent.invoke_photon_evaluate();
+        super::photon_feedback_derive::invoke_photon_evaluate(agent);
     } else if agent.photon.is_some() {
         log_llm_event(
             "agent.photon_evaluate.skipped",

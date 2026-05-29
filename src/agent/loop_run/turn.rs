@@ -76,12 +76,7 @@ use super::verifier_repair_targeting::{
     verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
 
-use super::photon_feedback_derive::{
-    PhotonEvaluateCompletedLog, PhotonFeedbackOutcome, PhotonOutcomeInputs,
-    build_rerun_prompt_hint_if_eligible, derive_photon_feedback_outcome,
-    photon_context_pack_completion_status, photon_evaluate_adoption_status,
-    photon_items_adopted_count, photon_outcome_json_value, prepare_adopted_ids_for_evaluate,
-};
+use super::photon_feedback_derive::build_rerun_prompt_hint_if_eligible;
 #[cfg(test)]
 use super::repair_patch_validation::VerifierRepairIntent;
 #[cfg(test)]
@@ -2922,208 +2917,6 @@ impl Agent {
         }
     }
 
-    /// Issue #557: call photon context_pack and store rendered response.
-    /// Canary gate runs BEFORE the HTTP fetch (DR3-002).
-    fn invoke_photon_context_pack(&mut self) {
-        super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
-
-        // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
-        if self.photon.is_none() {
-            return;
-        }
-
-        // Issue #557: shadow mode disables prompt injection entirely.
-        if self.config.photon_shadow_mode {
-            super::photon_feedback_derive::skip_photon_context_pack(
-                self,
-                crate::agent::loop_run::PhotonContextPackStatus::ShadowMode,
-                "shadow_mode",
-            );
-            return;
-        }
-
-        // Issue #557: canary gate BEFORE the HTTP fetch (SSOT: should_send_context_pack).
-        let gate = crate::photon::mapper::PhotonGateInputs {
-            photon_present: true,
-            shadow_mode: false,
-            canary: self.config.photon_canary,
-            session_id: self.session_store.session_id(),
-            turn_idx: self.current_turn_index,
-        };
-        if !crate::photon::mapper::should_send_context_pack(&gate) {
-            super::photon_feedback_derive::skip_photon_context_pack(
-                self,
-                crate::agent::loop_run::PhotonContextPackStatus::CanarySkipped,
-                "canary_gate",
-            );
-            return;
-        }
-
-        let t0 = std::time::Instant::now();
-        let req = super::photon_feedback_derive::build_pre_turn_photon_context_pack_request(self);
-        let req_id = req.0["request_id"].as_str().map(|s| s.to_string());
-        let result = self.photon.as_ref().unwrap().context_pack(&req);
-        let duration_ms = t0.elapsed().as_millis();
-        let failed = result.is_none();
-        self.session.context_pack_sent_this_turn = true;
-        let warning_filter_enabled = self.config.photon_respect_warnings;
-        super::photon_feedback_derive::update_last_context_pack_id(self, result.as_ref(), req_id);
-        let (items_blocked, truncated) = match result {
-            Some(resp) => super::photon_feedback_derive::process_photon_context_pack_response(
-                self,
-                resp,
-                warning_filter_enabled,
-            ),
-            None => {
-                super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
-                (0, false)
-            }
-        };
-        self.last_photon_context_pack_status =
-            photon_context_pack_completion_status(failed, self.last_photon_adopted_items);
-        super::photon_feedback_derive::log_photon_context_pack_completed(
-            self,
-            failed,
-            truncated,
-            duration_ms,
-            warning_filter_enabled,
-            items_blocked,
-        );
-    }
-
-    /// Issue #556: call photon evaluate (post-turn).
-    ///
-    /// Issue #591 (AS-03 / AS-06 / DR4-NEW-001 / DR4-NEW-002):
-    /// - Re-sanitizes `Agent.last_adopted_summary_ids` via
-    ///   `crate::photon::prompt::sanitize_summary_id` (DR4-NEW-001 evaluate-side
-    ///   pass; the injection side runs the same SSOT inside `render_context_pack`).
-    /// - Drops `None` results, then applies the `MAX_PHOTON_EVAL_ADOPTED_IDS=32`
-    ///   cap. `summary_ids_adopted_truncated=true` is emitted when the
-    ///   sanitized list length exceeded the cap *before* truncation (audit
-    ///   signal even though `MAX_PROMPT_ITEMS=5` makes this rare).
-    /// - In `config.photon_shadow_mode=true`, the function forces the
-    ///   `summary_ids_adopted=[]` / `summary_ids_adopted_count=0` /
-    ///   `summary_ids_adopted_truncated=false` / `outcome=null` /
-    ///   `items_adopted_count=0` invariants regardless of Agent state
-    ///   (DR4-NEW-002 final guard, complements the upstream "shadow path skips
-    ///   render" rule).
-    /// - `agent.photon_evaluate.completed` event is expanded 4 → 8 keys:
-    ///   the new keys are `summary_ids_adopted_count` / `outcome` /
-    ///   `adoption_status` / `summary_ids_adopted_truncated`. The raw
-    ///   `summary_ids_adopted` array is NOT emitted in the event payload
-    ///   (DR4-NEW-004 — only counts and static-allowlist strings cross the
-    ///   audit boundary).
-    pub(super) fn invoke_photon_evaluate(&mut self) {
-        if self.photon.is_none() {
-            return;
-        }
-        let t0 = std::time::Instant::now();
-        let shadow_mode = self.config.photon_shadow_mode;
-        let adoption_status =
-            photon_evaluate_adoption_status(shadow_mode, self.last_photon_adopted_items);
-
-        // Issue #591 (DR4-NEW-001 / DR4-NEW-002): re-sanitize → drop → cap.
-        //
-        // Even though the injection side already runs `sanitize_summary_id`,
-        // we re-run it on the evaluate side as defense-in-depth: any future
-        // refactor that introduces a write path into `last_adopted_summary_ids`
-        // bypassing the injection sanitizer must still pass this barrier
-        // before talking to photon. `prepare_adopted_ids_for_evaluate` is a
-        // pure helper so the sanitize/cap/shadow logic can be unit-tested
-        // without going through the agent loop.
-        let sanitized =
-            prepare_adopted_ids_for_evaluate(&self.last_adopted_summary_ids, shadow_mode);
-        let summary_ids_adopted = sanitized.list;
-        let truncated = sanitized.truncated;
-        let summary_ids_adopted_count = summary_ids_adopted.len();
-        let items_adopted_count =
-            photon_items_adopted_count(shadow_mode, self.last_photon_adopted_items);
-
-        // AS-04 / Issue #601: derive outcome + outcome_detail from the
-        // same-turn FeedbackKind / AnvilScore / shadow flag / adopted count
-        // / per-turn counters / WorkMode. Returns a PhotonFeedbackOutcome
-        // whose fields are `Option<&'static str>` allowlist values.
-        // Issue #608 Phase α-2 (AP-10 / 設計判断 #3): derive the same-turn
-        // verifier_exit_zero signal from `evidence_set_this_turn` so we don't
-        // need a separate SessionSnapshot flag. Matches the
-        // `CompletionEvidence::VerifierExitZero` push site in
-        // `observe_evidence_from_bash_outcome` (same turn, same iteration
-        // boundary as `evidence_set_this_turn.clear()` at run_actor_loop head).
-        let inputs = PhotonOutcomeInputs {
-            last_feedback_kind: self.session.last_feedback.as_ref().map(|ff| &ff.kind),
-            eligible_feedback_recorded_this_turn: self.session.eligible_feedback_recorded_this_turn,
-            anvil_score: self.session.last_anvil_score.as_ref(),
-            adopted_id_count: summary_ids_adopted_count,
-            shadow_mode,
-            // Issue #601 NEW (4 fields):
-            iter_count_this_turn: self.session.iter_count_this_turn,
-            tool_calls_this_turn: self.session.tool_calls_this_turn,
-            repo_edit_succeeded_this_turn: self.session.repo_edit_succeeded_this_turn,
-            // DR3-001 SSOT: AnswerOnly check goes through the helper, never
-            // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
-            work_mode_is_answer_only: self.answer_only_mode_active(),
-            // Issue #608 Phase α-2 (AP-10 / 設計判断 #2 + #3): Case E expansion.
-            verifier_exit_zero_this_turn:
-                super::photon_feedback_derive::photon_verifier_exit_zero_this_turn(self),
-        };
-        let PhotonFeedbackOutcome {
-            outcome: outcome_static,
-            outcome_detail: outcome_detail_static,
-        } = derive_photon_feedback_outcome(&inputs);
-        let outcome_json = photon_outcome_json_value(outcome_static);
-        let outcome_detail_json = photon_outcome_json_value(outcome_detail_static);
-
-        // Only include context_pack_event when we have a request_id; the sidecar
-        // requires context_pack_request_id: str (non-null).
-        let context_pack_event = super::photon_feedback_derive::build_photon_context_pack_event(
-            self,
-            adoption_status,
-            items_adopted_count,
-            summary_ids_adopted,
-            truncated,
-            &outcome_json,
-            &outcome_detail_json,
-        );
-        let req = crate::photon::schema::EvaluateRequest(serde_json::json!({
-            "schema_version": crate::photon::mapper::PHOTON_EVALUATE_SCHEMA_VERSION,
-            "request_id": uuid::Uuid::now_v7().to_string(),
-            "session_id": self.session_store.session_id(),
-            "agent": {
-                "name": crate::photon::mapper::PHOTON_AGENT_NAME,
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "context_pack_event": context_pack_event,
-        }));
-        let result = self.photon.as_ref().unwrap().evaluate(&req);
-        let duration_ms = t0.elapsed().as_millis();
-        super::photon_feedback_derive::store_photon_eval_summary(
-            self,
-            result.as_ref(),
-            shadow_mode,
-            summary_ids_adopted_count,
-            outcome_static,
-            outcome_detail_static,
-        );
-        // Issue #591 (AS-06 / DR4-NEW-004) + Issue #601: event payload
-        // 4 → 8 keys (#591) → 9 keys (#601 adds `outcome_detail`). The raw
-        // `summary_ids_adopted` array is NOT included — only counts and
-        // static-allowlist strings cross the audit boundary.
-        // `mask_payload_inplace` in `log_llm_event` provides the final
-        // defensive scrub.
-        super::photon_feedback_derive::log_photon_evaluate_completed(
-            self,
-            PhotonEvaluateCompletedLog {
-                failed: result.is_none(),
-                duration_ms,
-                summary_ids_adopted_count,
-                adoption_status,
-                truncated,
-                outcome_json,
-                outcome_detail_json,
-            },
-        );
-    }
-
     fn run_turn(
         &mut self,
         input: &str,
@@ -3152,7 +2945,7 @@ impl Agent {
 
         // [Issue #556] pre-turn photon context_pack hook
         if self.session.mode_state.mode != ExecutionMode::Plan {
-            self.invoke_photon_context_pack();
+            super::photon_feedback_derive::invoke_photon_context_pack(self);
         } else if self.photon.is_some() {
             // Issue #594: surface plan-mode skip via /photon-why.
             self.last_photon_context_pack_status =
@@ -9959,16 +9752,25 @@ mod tests {
     #[test]
     fn photon_evaluate_adoption_status_prefers_shadow_then_injected_then_not_injected() {
         assert_eq!(
-            super::photon_evaluate_adoption_status(true, 3),
+            super::super::photon_feedback_derive::photon_evaluate_adoption_status(true, 3),
             "shadow_not_injected"
         );
-        assert_eq!(super::photon_evaluate_adoption_status(false, 1), "injected");
         assert_eq!(
-            super::photon_evaluate_adoption_status(false, 0),
+            super::super::photon_feedback_derive::photon_evaluate_adoption_status(false, 1),
+            "injected"
+        );
+        assert_eq!(
+            super::super::photon_feedback_derive::photon_evaluate_adoption_status(false, 0),
             "not_injected"
         );
-        assert_eq!(super::photon_items_adopted_count(true, 7), 0);
-        assert_eq!(super::photon_items_adopted_count(false, 7), 7);
+        assert_eq!(
+            super::super::photon_feedback_derive::photon_items_adopted_count(true, 7),
+            0
+        );
+        assert_eq!(
+            super::super::photon_feedback_derive::photon_items_adopted_count(false, 7),
+            7
+        );
     }
 
     #[test]

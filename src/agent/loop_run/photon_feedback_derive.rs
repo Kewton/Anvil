@@ -30,12 +30,17 @@ use super::tool_history::build_recent_tool_summary;
 use crate::logging::log_llm_event;
 use crate::photon;
 use crate::photon::eval::parse_evaluate_response;
-use crate::photon::mapper::{ContextPackInputs, build_context_pack_request};
+use crate::photon::mapper::{
+    ContextPackInputs, PHOTON_AGENT_NAME, PHOTON_EVALUATE_SCHEMA_VERSION, PhotonGateInputs,
+    build_context_pack_request, should_send_context_pack,
+};
 use crate::photon::prompt::{
     AdmittedItemView, BlockedIdsStats, RenderCandidate, RenderStats, build_section_with_stats,
     enumerate_admitted_items_with_provenance, extract_blocked_summary_ids, sanitize_summary_id,
 };
-use crate::photon::schema::{ContextPackRequest, ContextPackResponse, EvaluateResponse};
+use crate::photon::schema::{
+    ContextPackRequest, ContextPackResponse, EvaluateRequest, EvaluateResponse,
+};
 use crate::session::eval_log::MAX_PHOTON_EVAL_FIELD_BYTES;
 use crate::session::feedback::{FeedbackKind, MAX_VERIFIER_COMMAND_BYTES, mask_secrets};
 use crate::session::precaution::PrecautionStatus;
@@ -996,4 +1001,162 @@ pub(super) fn update_photon_context_pack_render(
         clear_photon_context_pack_injection_tracking(agent);
         false
     }
+}
+
+/// Issue #557: pre-turn photon context_pack dispatch entry point.
+/// Canary gate runs BEFORE the HTTP fetch (DR3-002). Shadow mode
+/// disables injection entirely. On success, updates the per-turn
+/// completion status + emits the `agent.photon_context_pack.completed`
+/// log event.
+pub(super) fn invoke_photon_context_pack(agent: &mut Agent) {
+    clear_photon_context_pack_injection_tracking(agent);
+
+    // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
+    if agent.photon.is_none() {
+        return;
+    }
+
+    // Issue #557: shadow mode disables prompt injection entirely.
+    if agent.config.photon_shadow_mode {
+        skip_photon_context_pack(
+            agent,
+            super::PhotonContextPackStatus::ShadowMode,
+            "shadow_mode",
+        );
+        return;
+    }
+
+    // Issue #557: canary gate BEFORE the HTTP fetch (SSOT: should_send_context_pack).
+    let gate = PhotonGateInputs {
+        photon_present: true,
+        shadow_mode: false,
+        canary: agent.config.photon_canary,
+        session_id: agent.session_store.session_id(),
+        turn_idx: agent.current_turn_index,
+    };
+    if !should_send_context_pack(&gate) {
+        skip_photon_context_pack(
+            agent,
+            super::PhotonContextPackStatus::CanarySkipped,
+            "canary_gate",
+        );
+        return;
+    }
+
+    let t0 = std::time::Instant::now();
+    let req = build_pre_turn_photon_context_pack_request(agent);
+    let req_id = req.0["request_id"].as_str().map(|s| s.to_string());
+    let result = agent.photon.as_ref().unwrap().context_pack(&req);
+    let duration_ms = t0.elapsed().as_millis();
+    let failed = result.is_none();
+    agent.session.context_pack_sent_this_turn = true;
+    let warning_filter_enabled = agent.config.photon_respect_warnings;
+    update_last_context_pack_id(agent, result.as_ref(), req_id);
+    let (items_blocked, truncated) = match result {
+        Some(resp) => process_photon_context_pack_response(agent, resp, warning_filter_enabled),
+        None => {
+            clear_photon_context_pack_injection_tracking(agent);
+            (0, false)
+        }
+    };
+    agent.last_photon_context_pack_status =
+        photon_context_pack_completion_status(failed, agent.last_photon_adopted_items);
+    log_photon_context_pack_completed(
+        agent,
+        failed,
+        truncated,
+        duration_ms,
+        warning_filter_enabled,
+        items_blocked,
+    );
+}
+
+/// Issue #556: post-turn photon evaluate dispatch entry point.
+///
+/// Issue #591 (AS-03 / AS-06 / DR4-NEW-001 / DR4-NEW-002):
+/// re-sanitizes `Agent.last_adopted_summary_ids` via
+/// `sanitize_summary_id` (defense-in-depth, evaluate-side pass),
+/// drops `None`s, applies `MAX_PHOTON_EVAL_ADOPTED_IDS=32` cap. In
+/// `config.photon_shadow_mode=true` it forces the
+/// `summary_ids_adopted=[]` / `summary_ids_adopted_count=0` /
+/// `summary_ids_adopted_truncated=false` / `outcome=null` /
+/// `items_adopted_count=0` invariants.
+pub(super) fn invoke_photon_evaluate(agent: &mut Agent) {
+    if agent.photon.is_none() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let shadow_mode = agent.config.photon_shadow_mode;
+    let adoption_status =
+        photon_evaluate_adoption_status(shadow_mode, agent.last_photon_adopted_items);
+
+    let sanitized = prepare_adopted_ids_for_evaluate(&agent.last_adopted_summary_ids, shadow_mode);
+    let summary_ids_adopted = sanitized.list;
+    let truncated = sanitized.truncated;
+    let summary_ids_adopted_count = summary_ids_adopted.len();
+    let items_adopted_count =
+        photon_items_adopted_count(shadow_mode, agent.last_photon_adopted_items);
+
+    let inputs = PhotonOutcomeInputs {
+        last_feedback_kind: agent.session.last_feedback.as_ref().map(|ff| &ff.kind),
+        eligible_feedback_recorded_this_turn: agent.session.eligible_feedback_recorded_this_turn,
+        anvil_score: agent.session.last_anvil_score.as_ref(),
+        adopted_id_count: summary_ids_adopted_count,
+        shadow_mode,
+        iter_count_this_turn: agent.session.iter_count_this_turn,
+        tool_calls_this_turn: agent.session.tool_calls_this_turn,
+        repo_edit_succeeded_this_turn: agent.session.repo_edit_succeeded_this_turn,
+        // DR3-001 SSOT: AnswerOnly check goes through the helper, never
+        // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
+        work_mode_is_answer_only: agent.answer_only_mode_active(),
+        verifier_exit_zero_this_turn: photon_verifier_exit_zero_this_turn(agent),
+    };
+    let PhotonFeedbackOutcome {
+        outcome: outcome_static,
+        outcome_detail: outcome_detail_static,
+    } = derive_photon_feedback_outcome(&inputs);
+    let outcome_json = photon_outcome_json_value(outcome_static);
+    let outcome_detail_json = photon_outcome_json_value(outcome_detail_static);
+
+    let context_pack_event = build_photon_context_pack_event(
+        agent,
+        adoption_status,
+        items_adopted_count,
+        summary_ids_adopted,
+        truncated,
+        &outcome_json,
+        &outcome_detail_json,
+    );
+    let req = EvaluateRequest(serde_json::json!({
+        "schema_version": PHOTON_EVALUATE_SCHEMA_VERSION,
+        "request_id": uuid::Uuid::now_v7().to_string(),
+        "session_id": agent.session_store.session_id(),
+        "agent": {
+            "name": PHOTON_AGENT_NAME,
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "context_pack_event": context_pack_event,
+    }));
+    let result = agent.photon.as_ref().unwrap().evaluate(&req);
+    let duration_ms = t0.elapsed().as_millis();
+    store_photon_eval_summary(
+        agent,
+        result.as_ref(),
+        shadow_mode,
+        summary_ids_adopted_count,
+        outcome_static,
+        outcome_detail_static,
+    );
+    log_photon_evaluate_completed(
+        agent,
+        PhotonEvaluateCompletedLog {
+            failed: result.is_none(),
+            duration_ms,
+            summary_ids_adopted_count,
+            adoption_status,
+            truncated,
+            outcome_json,
+            outcome_detail_json,
+        },
+    );
 }
