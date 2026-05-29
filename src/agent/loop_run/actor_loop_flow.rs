@@ -1902,7 +1902,7 @@ pub(super) fn handle_actor_loop_pre_reply_control_action(
             .dispatch_missing_verifier_job_step(flow_args, next_action)
             .map(actor_loop_pre_reply_flow_outcome),
         LoopControlAction::RunVerifier => Some(actor_loop_pre_reply_flow_outcome(
-            agent.drive_task_contract_verifier(flow_args),
+            super::verifier_orchestration::drive_task_contract_verifier(agent, flow_args),
         )),
         LoopControlAction::RequestModelTurn => None,
     }
@@ -2309,7 +2309,8 @@ pub(super) fn handle_actor_loop_task_contract_run_verifier(
     agent: &mut Agent,
     args: ActorLoopTaskContractReplyArgs<'_, '_>,
 ) -> ActorLoopTaskContractReplyOutcome {
-    match agent.drive_task_contract_verifier(
+    match super::verifier_orchestration::drive_task_contract_verifier(
+        agent,
         super::verifier_orchestration::TaskContractVerifierFlowArgs {
             before_snapshot: args.before_snapshot,
             accumulated: args.accumulated,
