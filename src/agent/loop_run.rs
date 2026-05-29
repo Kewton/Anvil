@@ -233,6 +233,14 @@ mod reminder_pipeline;
 // stream. `pub(super)` limited / no facade re-export (DR3-001) —
 // `turn.rs` is the only in-crate consumer.
 mod streaming_reply;
+// Issue #688 (parent #680, Phase 8): photon feedback derive core
+// (`PhotonOutcomeInputs` / `PhotonFeedbackOutcome` / `case_f_condition_met`
+// + the static-allowlist `PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT`
+// const) extracted from `turn.rs`. `pub(super)` for the types (turn.rs
+// internal); the const stays `pub` via the existing `pub use` re-export
+// below so `tests/photon_evaluate_signal_smoke.rs` keeps working without
+// path changes.
+mod photon_feedback_derive;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
@@ -575,7 +583,7 @@ pub use turn::{
 // `tests/photon_evaluate_signal_smoke.rs` can grep / assert against the same
 // SSOT used by production. `mod turn;` is private, so a `pub const` alone is
 // not reachable from integration tests; this re-export widens visibility.
-pub use turn::PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT;
+pub use photon_feedback_derive::PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT;
 
 // Issue #594: expose the /photon-why message builder so
 // `tests/photon_provenance_smoke.rs` can verify the 7 status branches and the
