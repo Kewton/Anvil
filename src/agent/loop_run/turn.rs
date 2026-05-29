@@ -2960,16 +2960,20 @@ impl Agent {
         }
 
         let t0 = std::time::Instant::now();
-        let req = self.build_pre_turn_photon_context_pack_request();
+        let req = super::photon_feedback_derive::build_pre_turn_photon_context_pack_request(self);
         let req_id = req.0["request_id"].as_str().map(|s| s.to_string());
         let result = self.photon.as_ref().unwrap().context_pack(&req);
         let duration_ms = t0.elapsed().as_millis();
         let failed = result.is_none();
         self.session.context_pack_sent_this_turn = true;
         let warning_filter_enabled = self.config.photon_respect_warnings;
-        self.update_last_context_pack_id(result.as_ref(), req_id);
+        super::photon_feedback_derive::update_last_context_pack_id(self, result.as_ref(), req_id);
         let (items_blocked, truncated) = match result {
-            Some(resp) => self.process_photon_context_pack_response(resp, warning_filter_enabled),
+            Some(resp) => super::photon_feedback_derive::process_photon_context_pack_response(
+                self,
+                resp,
+                warning_filter_enabled,
+            ),
             None => {
                 super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
                 (0, false)
@@ -2985,144 +2989,6 @@ impl Agent {
             warning_filter_enabled,
             items_blocked,
         );
-    }
-
-    fn build_pre_turn_photon_context_pack_request(
-        &self,
-    ) -> crate::photon::schema::ContextPackRequest {
-        let working_memory_text = self.session.working_memory.format_for_prompt();
-        let selected_precaution_ids: Vec<String> = self
-            .session
-            .working_memory
-            .active_precautions
-            .iter()
-            .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
-            .map(|p| p.id.clone())
-            .collect();
-        let recent_tool_summary = build_recent_tool_summary(&self.session.messages);
-        crate::photon::mapper::build_context_pack_request(
-            &crate::photon::mapper::ContextPackInputs {
-                task: self.session.working_memory.active_task.as_deref(),
-                repo_path: &self.work_root,
-                branch: None,
-                commit: None,
-                working_memory_text: working_memory_text.as_deref(),
-                touched_files: &self.session.working_memory.touched_files,
-                recent_tool_summary: &recent_tool_summary,
-                selected_case_ids: &[],
-                selected_anti_pattern_ids: &[],
-                selected_precaution_ids: &selected_precaution_ids,
-            },
-        )
-    }
-
-    fn update_last_context_pack_id(
-        &mut self,
-        response: Option<&crate::photon::schema::ContextPackResponse>,
-        fallback_req_id: Option<String>,
-    ) {
-        use crate::session::eval_log::MAX_PHOTON_EVAL_FIELD_BYTES;
-        use crate::session::feedback::mask_secrets;
-
-        let from_resp = response
-            .and_then(|resp| resp.0.get("request_id"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let masked = mask_secrets(s);
-                if masked.len() <= MAX_PHOTON_EVAL_FIELD_BYTES {
-                    masked
-                } else {
-                    let mut end = MAX_PHOTON_EVAL_FIELD_BYTES;
-                    while !masked.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}…", &masked[..end])
-                }
-            });
-        self.last_context_pack_id = from_resp.or(fallback_req_id);
-    }
-
-    fn process_photon_context_pack_response(
-        &mut self,
-        resp: crate::photon::schema::ContextPackResponse,
-        warning_filter_enabled: bool,
-    ) -> (usize, bool) {
-        let (blocked_ids, blocked_stats) =
-            super::photon_feedback_derive::photon_context_pack_blocked_ids(
-                &resp,
-                warning_filter_enabled,
-            );
-        super::photon_feedback_derive::log_photon_context_pack_warning_blocked(
-            self,
-            &blocked_ids,
-            &blocked_stats,
-        );
-        let (admitted_views, render_stats) =
-            self.collect_photon_context_pack_views(&resp, &blocked_ids);
-        let items_blocked = render_stats.items_blocked;
-        let truncated = self.update_photon_context_pack_render(admitted_views, render_stats);
-        (items_blocked, truncated)
-    }
-
-    fn collect_photon_context_pack_views(
-        &mut self,
-        resp: &crate::photon::schema::ContextPackResponse,
-        blocked_ids: &std::collections::HashSet<String>,
-    ) -> (
-        Vec<crate::photon::prompt::AdmittedItemView>,
-        crate::photon::prompt::RenderStats,
-    ) {
-        let (admitted_views, mut render_stats) =
-            crate::photon::prompt::enumerate_admitted_items_with_provenance(resp, blocked_ids);
-        let advisory_outcome = self.record_pam_advisory_decision(resp, blocked_ids, false);
-        let admitted_views = match advisory_outcome.as_ref() {
-            Some(outcome) => {
-                let filtered = outcome.live_admitted_views.clone();
-                render_stats.items_adopted = filtered.len();
-                filtered
-            }
-            None => admitted_views,
-        };
-        (admitted_views, render_stats)
-    }
-
-    fn update_photon_context_pack_render(
-        &mut self,
-        admitted_views: Vec<crate::photon::prompt::AdmittedItemView>,
-        mut render_stats: crate::photon::prompt::RenderStats,
-    ) -> bool {
-        let render_candidates: Vec<crate::photon::prompt::RenderCandidate> = admitted_views
-            .iter()
-            .map(|v| crate::photon::prompt::RenderCandidate {
-                text: v.render_text.clone(),
-                summary_id: v.provenance.summary_id.clone(),
-            })
-            .collect();
-        let (rendered_opt, _, _, dedup_adopted_ids) =
-            crate::photon::prompt::build_section_with_stats(&render_candidates);
-        render_stats.adopted_summary_ids = dedup_adopted_ids;
-        self.last_injected_seed_provenance = admitted_views
-            .into_iter()
-            .map(|view| view.provenance)
-            .collect();
-        debug_assert_eq!(
-            self.last_injected_seed_provenance.len(),
-            render_stats.items_adopted,
-            "Invariant: injected_seed_provenance_summary.len() == items_adopted"
-        );
-        if let Some(rendered) = rendered_opt {
-            self.last_photon_adopted_items = render_stats.items_adopted;
-            self.last_adopted_summary_ids = render_stats.adopted_summary_ids.clone();
-            let (truncated_rendered, trunc) = truncate_photon_context_pack(rendered);
-            self.photon_context_pack_response = Some(truncated_rendered);
-            self.last_injected_summary_ids = render_stats.adopted_summary_ids;
-            self.last_injected_summary_turn_index = Some(self.current_turn_index);
-            trunc
-        } else {
-            super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
-            false
-        }
     }
 
     /// Issue #556: call photon evaluate (post-turn).
