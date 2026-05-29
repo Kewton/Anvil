@@ -75,9 +75,7 @@ use super::verifier_driver::TaskContractVerifierOutcome;
 use super::verifier_orchestration::{
     JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
     TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome, VerifierRepairAttemptProgress,
-    build_task_contract_verifier_exit_zero_evidence,
-    build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
-    emit_patch_proposal_legacy_validation_comparison_event,
+    build_verifier_exit_zero_evidence, emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event, emit_repair_progress_classified_event,
     repair_terminal_exit_reason, synthesized_missing_implementation_target_path_for_request,
     synthesized_missing_test_target_path_for_request, task_contract_needs_verification,
@@ -1190,69 +1188,6 @@ impl Agent {
         self.emit_repair_safe_stop_report(stop_reason);
     }
 
-    pub(super) fn record_task_contract_verifier_invocation(
-        &mut self,
-        command: &str,
-        exit_code: Option<i32>,
-    ) {
-        let redacted = crate::session::feedback::redact_verifier_command_for_storage(command);
-        if redacted.trim().is_empty() {
-            return;
-        }
-        self.session.last_verifier_command = Some(redacted.clone());
-        self.session.last_verifier_invocation =
-            Some(crate::session::store::VerifierInvocationRecord {
-                command: redacted,
-                exit_code: exit_code.unwrap_or(-1),
-                recorded_at: rfc3339_now_utc(),
-            });
-    }
-
-    pub(super) fn observe_task_contract_verifier_exit_zero(&mut self, command: &str) {
-        if let Some(evidence) = build_task_contract_verifier_exit_zero_evidence(command) {
-            self.evidence_set_this_turn.push(evidence.clone());
-            self.task_contract_evidence_set_this_turn.push(evidence);
-            crate::logging::log_completion_evidence_observed(
-                self.current_turn_index,
-                0,
-                "verifier_exit_zero",
-                serde_json::json!({
-                    "command_class": "build_test",
-                    "source": "task_contract_verifier",
-                }),
-            );
-        }
-    }
-
-    /// Issue #651 PR-001: structured-runner variant of
-    /// `observe_task_contract_verifier_exit_zero`. Records a verifier
-    /// success that came through `AutoTestRunner::run_structured`, i.e.
-    /// the runner's argv was validated against the owned test artifact
-    /// list. The recorded `bound_test_artifacts_count` is the only proof
-    /// `TaskContract::evaluate_with_owned_test_artifacts` accepts to
-    /// satisfy `test_execution_required = true`.
-    pub(super) fn observe_task_contract_verifier_exit_zero_bound(
-        &mut self,
-        command: &str,
-        bound_count: usize,
-    ) {
-        if let Some(evidence) =
-            build_task_contract_verifier_exit_zero_evidence_bound(command, bound_count)
-        {
-            self.evidence_set_this_turn.push(evidence.clone());
-            self.task_contract_evidence_set_this_turn.push(evidence);
-            crate::logging::log_completion_evidence_observed(
-                self.current_turn_index,
-                0,
-                "verifier_exit_zero",
-                serde_json::json!({
-                    "command_class": "build_test",
-                    "source": "task_contract_verifier_structured",
-                    "bound_test_artifacts_count": bound_count,
-                }),
-            );
-        }
-    }
     pub(super) fn request_assistant_reply_with_retry(
         &mut self,
         stream_output: bool,
