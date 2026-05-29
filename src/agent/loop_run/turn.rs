@@ -644,67 +644,6 @@ impl Agent {
         }
     }
 
-    pub(super) fn materialize_python_package_markers_for_external_import(
-        &mut self,
-        stdout: &str,
-        stderr: &str,
-    ) -> Vec<String> {
-        let candidates = super::auto_test::python_package_marker_candidates_for_external_import(
-            &self.work_root,
-            stdout,
-            stderr,
-        );
-        self.materialize_python_package_marker_candidates(candidates)
-    }
-
-    pub(super) fn materialize_python_package_markers_for_owned_test_imports(
-        &mut self,
-        owned_test_artifacts: &[String],
-    ) -> Vec<String> {
-        let candidates = super::auto_test::python_package_marker_candidates_for_owned_test_imports(
-            &self.work_root,
-            owned_test_artifacts,
-        );
-        self.materialize_python_package_marker_candidates(candidates)
-    }
-
-    fn materialize_python_package_marker_candidates(
-        &mut self,
-        candidates: Vec<String>,
-    ) -> Vec<String> {
-        let mut created = Vec::new();
-        for relative_path in candidates {
-            let full_path = self.work_root.join(&relative_path);
-            let Some(parent) = full_path.parent() else {
-                continue;
-            };
-            if !parent.is_dir() {
-                continue;
-            }
-            if std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&full_path)
-                .is_err()
-            {
-                continue;
-            }
-            self.observe_evidence_from_repo_edit(&relative_path);
-            log_llm_event(
-                "agent.verifier.python_package_marker.created",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "path_hash": stable_path_hash(
-                        &crate::session::feedback::mask_secrets(&relative_path)
-                    ),
-                }),
-            );
-            created.push(relative_path);
-        }
-        created
-    }
-
     fn handle_repair_job_verifier_pass(
         &mut self,
         args: TaskContractVerifierFlowArgs<'_, '_>,
