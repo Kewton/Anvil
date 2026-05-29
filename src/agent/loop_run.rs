@@ -362,6 +362,13 @@ mod tool_execution;
 // has been migrated here to keep the seams unreachable from release builds.
 #[cfg(test)]
 mod safe_stop_e2e_tests;
+// Repair-runner contract tests extracted from `turn.rs` (parent #680).
+// Hosts `repair_lifecycle_event_tests` (pure-fn timeout / shadow validation)
+// and `v0421_repair_runner_contract_tests` (source-string grep assertions
+// pinning production invariants). #[cfg(test)] only; production binary
+// excludes this mod. No facade re-export (DR3-001).
+#[cfg(test)]
+mod repair_runner_contract_tests;
 // Issue #666: structured per-turn job reports
 // (ArtifactCompletion/Verification/Repair/Memory). Private mod, no
 // facade re-export (DR3-001). `turn.rs` is the only in-crate consumer
