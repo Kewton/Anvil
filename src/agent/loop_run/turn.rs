@@ -2270,38 +2270,6 @@ fn run_tester_llm_call(
     }
 }
 
-fn streaming_reply_needs_prefix(first_chunk: bool, stream_output: bool) -> bool {
-    first_chunk && stream_output
-}
-
-fn streaming_reply_needs_trailing_newline(first_chunk: bool, stream_output: bool) -> bool {
-    stream_output && !first_chunk
-}
-
-struct StreamingReplyRenderState {
-    first_chunk: bool,
-    renderer: Option<crate::tui::markdown::MarkdownRenderer>,
-}
-
-impl StreamingReplyRenderState {
-    fn new() -> Self {
-        let markdown_disabled = crate::tui::markdown::markdown_fully_disabled();
-        let color = crate::tui::markdown::color_enabled_for_markdown();
-        let utf8 = crate::tui::markdown::markdown_unicode_enabled();
-        tracing::debug!(
-            disabled = markdown_disabled,
-            color,
-            utf8,
-            "markdown renderer state for this stream"
-        );
-        Self {
-            first_chunk: true,
-            renderer: (!markdown_disabled)
-                .then(|| crate::tui::markdown::MarkdownRenderer::new(color, utf8)),
-        }
-    }
-}
-
 /// Issue #580: SSoT memoization key for the Quality-gate second-pass adapter.
 /// Hashes `(request, full_content)` with `DefaultHasher` (per design judgement
 /// #5: full_content avoids stale reuse when only the middle of a large file
@@ -5510,14 +5478,14 @@ impl Agent {
         interrupt_flag: &InterruptFlag,
     ) -> Result<AssistantReply, String> {
         let assistant_model = self.current_assistant_model();
-        let mut render_state = StreamingReplyRenderState::new();
+        let mut render_state = super::streaming_reply::StreamingReplyRenderState::new();
         let reply = self.client.chat_streaming_with_mode(
             assistant_model.as_str(),
             messages,
             tool_specs,
             native_tools_enabled,
             |chunk| {
-                Self::handle_streaming_assistant_chunk(
+                super::streaming_reply::handle_streaming_assistant_chunk(
                     &mut render_state,
                     chunk,
                     stream_output,
@@ -5526,56 +5494,8 @@ impl Agent {
                 )
             },
         )?;
-        Self::finish_streaming_assistant_reply(&mut render_state, stream_output);
+        super::streaming_reply::finish_streaming_assistant_reply(&mut render_state, stream_output);
         Ok(reply)
-    }
-
-    fn handle_streaming_assistant_chunk(
-        render_state: &mut StreamingReplyRenderState,
-        chunk: &str,
-        stream_output: bool,
-        stop_signal: Option<&SpinnerStopSignal>,
-        interrupt_flag: &InterruptFlag,
-    ) -> Result<(), String> {
-        if interrupt_flag.is_set() {
-            if let Some(sig) = stop_signal {
-                sig.trigger();
-            }
-            return Err(USER_INTERRUPT_ERROR.to_string());
-        }
-        if render_state.first_chunk {
-            if streaming_reply_needs_prefix(render_state.first_chunk, stream_output) {
-                if let Some(sig) = stop_signal {
-                    sig.trigger();
-                }
-                write_stdout_rendered("assistant> ", false);
-            }
-            render_state.first_chunk = false;
-        }
-        if let Some(renderer) = render_state.renderer.as_mut() {
-            let out = renderer.push_chunk(chunk);
-            if !out.is_empty() && stream_output {
-                write_stdout_rendered(&out, false);
-            }
-        } else if stream_output {
-            write_stdout_rendered(chunk, false);
-        }
-        Ok(())
-    }
-
-    fn finish_streaming_assistant_reply(
-        render_state: &mut StreamingReplyRenderState,
-        stream_output: bool,
-    ) {
-        if let Some(renderer) = render_state.renderer.as_mut() {
-            let tail = renderer.flush();
-            if !tail.is_empty() && stream_output {
-                write_stdout_rendered(&tail, false);
-            }
-        }
-        if streaming_reply_needs_trailing_newline(render_state.first_chunk, stream_output) {
-            write_stdout_rendered("", true);
-        }
     }
 
     pub(super) fn current_assistant_model(&self) -> String {
@@ -11093,13 +11013,17 @@ mod tests {
 
     #[test]
     fn streaming_reply_prefix_and_trailing_newline_follow_output_state() {
-        assert!(super::streaming_reply_needs_prefix(true, true));
-        assert!(!super::streaming_reply_needs_prefix(true, false));
-        assert!(!super::streaming_reply_needs_prefix(false, true));
+        assert!(super::super::streaming_reply::streaming_reply_needs_prefix(
+            true, true
+        ));
+        assert!(!super::super::streaming_reply::streaming_reply_needs_prefix(true, false));
+        assert!(!super::super::streaming_reply::streaming_reply_needs_prefix(false, true));
 
-        assert!(super::streaming_reply_needs_trailing_newline(false, true));
-        assert!(!super::streaming_reply_needs_trailing_newline(true, true));
-        assert!(!super::streaming_reply_needs_trailing_newline(false, false));
+        assert!(super::super::streaming_reply::streaming_reply_needs_trailing_newline(false, true));
+        assert!(!super::super::streaming_reply::streaming_reply_needs_trailing_newline(true, true));
+        assert!(
+            !super::super::streaming_reply::streaming_reply_needs_trailing_newline(false, false)
+        );
     }
 
     #[test]

@@ -224,6 +224,15 @@ mod scaffold_pipeline;
 // context lives here. `pub(super)` limited / no facade re-export (DR3-001) —
 // `turn.rs` is the only in-crate consumer.
 mod reminder_pipeline;
+// Issue #685 (parent #680, Phase 5): streaming reply render state + chunk-
+// handling flow extracted from `turn.rs`. Hosts
+// `StreamingReplyRenderState` + `handle_streaming_assistant_chunk` /
+// `finish_streaming_assistant_reply` + the prefix/trailing-newline
+// predicates. The renderer is `None` when markdown is fully disabled;
+// otherwise a fresh `tui::markdown::MarkdownRenderer` is built per
+// stream. `pub(super)` limited / no facade re-export (DR3-001) —
+// `turn.rs` is the only in-crate consumer.
+mod streaming_reply;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
