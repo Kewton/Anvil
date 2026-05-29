@@ -249,6 +249,13 @@ mod photon_feedback_derive;
 // limited / no facade re-export (DR3-001) — `turn.rs` is the only
 // in-crate consumer.
 mod answer_only_mode;
+// `FeedbackFrame` builder helpers + path-extraction utilities used by
+// the bash / edit failure pipelines, extracted from `turn.rs` (parent
+// #680). Hosts `build_feedback_for_{bash,unsafe_block_reason,edit_failure}`
+// + `bash_outcome_primary_error` + `extract_{suspected_files,path_tokens,current_request}_*`.
+// `pub(super)` limited / no facade re-export (DR3-001) — `turn.rs` is
+// the only in-crate consumer.
+mod feedback_builders;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
