@@ -493,7 +493,11 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         return None;
     }
     let (request, target_path, issue) = agent.accepted_repo_change_quality_issue()?;
-    match agent.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
+    match super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback(
+        agent,
+        &request,
+        &target_path,
+    ) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
                 &format_iteration_status(
@@ -680,7 +684,10 @@ pub(super) fn maybe_continue_missing_repo_framework_fallback(
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> bool {
     if !should_try_framework_app_fallback(args.last_iter, *args.framework_app_fallback_materialized)
-        || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
+        || !super::scaffold_pipeline::maybe_materialize_framework_game_fallback(
+            agent,
+            args.last_iter,
+        )
     {
         return false;
     }
@@ -693,7 +700,11 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
     agent: &mut Agent,
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
-    match agent.maybe_apply_deterministic_nextjs_scaffold(args.last_iter, args.interrupt_flag) {
+    match super::scaffold_pipeline::maybe_apply_deterministic_nextjs_scaffold(
+        agent,
+        args.last_iter,
+        args.interrupt_flag,
+    ) {
         super::scaffold_pipeline::ScaffoldFallbackResult::Applied => {
             *args.repo_change_retries = 0;
             Some(PostReplyRecoveryOutcome::Continue)
@@ -854,7 +865,8 @@ pub(super) fn handle_actor_loop_empty_reply(
         let next_sections = super::lifecycle::plan_next_stage_sections(&plan_contents);
         *args.plan_progress_retries += 1;
         if *args.plan_progress_retries >= 2 {
-            return match agent.materialize_deterministic_fallback_plan(
+            return match super::scaffold_pipeline::materialize_deterministic_fallback_plan(
+                agent,
                 "agent.plan.progress_fallback_materialized",
             ) {
                 Ok(true) => ActorLoopNoToolReplyOutcome::Done {
@@ -1174,7 +1186,10 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
         };
     }
     if should_try_framework_app_fallback(args.last_iter, *args.framework_app_fallback_materialized)
-        && agent.maybe_materialize_framework_game_fallback(args.last_iter)
+        && super::scaffold_pipeline::maybe_materialize_framework_game_fallback(
+            agent,
+            args.last_iter,
+        )
     {
         *args.framework_app_fallback_materialized = true;
         agent.push_system_note(framework_app_fallback_continuation_note().to_string());
@@ -1286,7 +1301,7 @@ pub(super) fn handle_actor_loop_completion(
             let current_stage = super::lifecycle::current_plan_stage(&plan_contents);
             *args.plan_progress_retries += 1;
             if *args.plan_progress_retries >= 2 {
-                return match agent.materialize_deterministic_fallback_plan(
+                return match super::scaffold_pipeline::materialize_deterministic_fallback_plan(agent,
                     "agent.plan.progress_fallback_materialized",
                 ) {
                     Ok(true) => ActorLoopCompletionOutcome::Done {
@@ -1440,7 +1455,11 @@ pub(super) fn handle_actor_loop_post_tool_polish_fallback(
     target_path: &str,
     repo_change_retries: &mut usize,
 ) -> ActorLoopPostToolFallbackOutcome {
-    match agent.maybe_apply_deterministic_polish_fallback(request, target_path) {
+    match super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback(
+        agent,
+        request,
+        target_path,
+    ) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
                 &format_iteration_status(
@@ -1476,7 +1495,11 @@ fn handle_actor_loop_post_tool_quality_fallback(
     target_path: &str,
     repo_change_retries: &mut usize,
 ) -> ActorLoopPostToolFallbackOutcome {
-    match agent.maybe_apply_deterministic_quality_fallback(request, target_path) {
+    match super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback(
+        agent,
+        request,
+        target_path,
+    ) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
                 &format_iteration_status(
@@ -1526,7 +1549,11 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
     let Some((request, target_path, issue)) = agent.accepted_repo_change_quality_issue() else {
         return ActorLoopPostToolFallbackOutcome::Proceed;
     };
-    match agent.maybe_apply_deterministic_quality_fallback(&request, &target_path) {
+    match super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback(
+        agent,
+        &request,
+        &target_path,
+    ) {
         Ok(true) => {
             super::turn::write_stdout_rendered(
                 &format_iteration_status(
@@ -1952,8 +1979,10 @@ pub(super) fn maybe_continue_actor_loop_framework_fallback(
     ) || !should_try_framework_app_fallback(
         args.last_iter,
         *args.framework_app_fallback_materialized,
-    ) || !agent.maybe_materialize_framework_game_fallback(args.last_iter)
-    {
+    ) || !super::scaffold_pipeline::maybe_materialize_framework_game_fallback(
+        agent,
+        args.last_iter,
+    ) {
         return false;
     }
     *args.framework_app_fallback_materialized = true;
@@ -2622,8 +2651,10 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
 pub(super) fn handle_plan_progress_prose_only_fallback(
     agent: &mut Agent,
 ) -> ActorLoopNoToolReplyOutcome {
-    match agent.materialize_deterministic_fallback_plan("agent.plan.progress_fallback_materialized")
-    {
+    match super::scaffold_pipeline::materialize_deterministic_fallback_plan(
+        agent,
+        "agent.plan.progress_fallback_materialized",
+    ) {
         Ok(true) => ActorLoopNoToolReplyOutcome::Done {
             final_prose: plan_tool_followup_done_message(),
         },
@@ -2641,7 +2672,8 @@ pub(super) fn handle_plan_progress_prose_only_fallback(
 pub(super) fn handle_non_progress_plan_edit_fallback(
     agent: &mut Agent,
 ) -> ActorLoopPlanToolFollowupOutcome {
-    match agent.materialize_deterministic_fallback_plan(
+    match super::scaffold_pipeline::materialize_deterministic_fallback_plan(
+        agent,
         "agent.plan.non_progress_edit_fallback_materialized",
     ) {
         Ok(true) => ActorLoopPlanToolFollowupOutcome::Done {
