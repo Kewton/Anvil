@@ -41,6 +41,7 @@ use super::Agent;
 use super::actor_loop_flow::format_iteration_status;
 use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
+use super::interrupt::InterruptFlag;
 use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
 use super::task_contract::ArtifactRole;
 use super::tool_history::{
@@ -49,8 +50,8 @@ use super::tool_history::{
 use super::turn::{
     WrittenScaffoldArtifacts, current_file_hash_for_relative_path, extract_filename_with_suffix,
     last_read_tool_path, latest_turn_preferred_read_edit_target, meaningful_workspace_files,
-    normalize_memory_path, progress_path_display, sha256_hex, workspace_appears_empty,
-    write_stdout_rendered,
+    normalize_memory_path, progress_path_display, sha256_hex, tool_result_failed,
+    workspace_appears_empty, write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::agent::recovery;
@@ -865,4 +866,110 @@ pub(super) fn finalize_deterministic_scaffold_materialization(
         request,
         &written_paths,
     ));
+}
+
+pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
+    agent: &mut Agent,
+    last_iter: usize,
+    interrupt_flag: &InterruptFlag,
+) -> ScaffoldFallbackResult {
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_support_recovery()
+    {
+        return ScaffoldFallbackResult::NotApplicable;
+    }
+    if !active_task_requires_nextjs_scaffold(agent)
+        || !workspace_appears_empty(&agent.work_root)
+        || recent_scaffold_command_seen(&agent.session.messages)
+    {
+        return ScaffoldFallbackResult::NotApplicable;
+    }
+
+    if let Some(reason) = deterministic_nextjs_scaffold_skip_reason(agent) {
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                agent.config.max_iterations,
+                "Scaffold fallback skipped",
+                reason,
+                agent.footer.current_cols(),
+            ),
+            true,
+        );
+        log_llm_event(
+            "agent.empty_workspace.deterministic_nextjs_scaffold_skipped",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "work_root": agent.work_root.display().to_string(),
+                "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
+                "reason": reason,
+            }),
+        );
+        return ScaffoldFallbackResult::Skipped;
+    }
+
+    let fallback_reply = deterministic_nextjs_scaffold_reply();
+    let fallback_tool_calls = fallback_reply
+        .tool_calls
+        .iter()
+        .cloned()
+        .map(|tool_call| agent.prepare_tool_call(tool_call))
+        .collect::<Vec<_>>();
+    agent.session.messages.push(ConversationMessage::assistant(
+        fallback_reply.content,
+        fallback_tool_calls.clone(),
+    ));
+    write_stdout_rendered(
+        &format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            "Scaffold fallback",
+            "Empty Next.js workspace stalled on exploration; running pinned deterministic scaffold command.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+
+    let mut fallback_failed = false;
+    for tool_call in fallback_tool_calls {
+        let raw_result = agent.execute_tool_call(
+            &tool_call.name,
+            &tool_call.arguments,
+            None,
+            Some(interrupt_flag.flag.clone()),
+        );
+        if tool_result_failed(&raw_result) {
+            fallback_failed = true;
+        }
+        let compact_result = prompting::compact_tool_result(&tool_call.name, raw_result);
+        agent.session.messages.push(ConversationMessage::tool(
+            tool_call.name.clone(),
+            compact_result,
+        ));
+    }
+
+    let event = if fallback_failed {
+        "agent.empty_workspace.deterministic_nextjs_scaffold_failed"
+    } else {
+        "agent.empty_workspace.deterministic_nextjs_scaffold"
+    };
+    log_llm_event(
+        event,
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "minimal_patch",
+            "create_next_app_version": CREATE_NEXT_APP_PACKAGE_VERSION,
+        }),
+    );
+
+    if fallback_failed {
+        ScaffoldFallbackResult::Failed
+    } else {
+        ScaffoldFallbackResult::Applied
+    }
 }
