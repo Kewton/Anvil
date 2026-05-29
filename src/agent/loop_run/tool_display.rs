@@ -15,8 +15,8 @@ use crate::modes::plan_act::PlanStage;
 use crate::safety::path_guard::resolve_user_path;
 
 use super::lifecycle;
+use super::plan_sections::join_sections_for_progress;
 use super::progress_text::{sanitize_for_progress, truncate};
-use super::turn::join_sections_for_progress;
 
 /// Returns `(display_str, extra)` for the progress line. `display_str` is the
 /// main single-line description (path / command / pattern); `extra` is an
