@@ -92,13 +92,11 @@ use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
     CREATE_NEXT_APP_PACKAGE_VERSION, DeterministicScaffoldSpec,
-    EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
-    EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
+    EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
     ScaffoldFallbackResult, ScaffoldFramework, deterministic_framework_app_files_needed,
     deterministic_framework_game_impl_path, deterministic_nextjs_scaffold_reply,
     deterministic_support_target_relative, recent_scaffold_command_seen,
-    render_deterministic_scaffold_continuation_note, scaffold_candidate_priority,
-    scaffold_file_snapshot,
+    scaffold_candidate_priority,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
@@ -2242,7 +2240,7 @@ impl ReminderCallContext {
     }
 }
 
-type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
+pub(super) type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
 
 fn anti_pattern_failed_action_summary(frame: &FeedbackFrame) -> String {
     frame
@@ -9877,42 +9875,7 @@ impl Agent {
         request: &str,
         policy: &crate::modes::plan_act::ModePolicy,
     ) -> Option<DeterministicScaffoldSpec> {
-        // Issue #634: Python ブランチのみ experimental flag 経由で隔離。
-        // Docs ブランチ (`agent.empty_workspace.deterministic_docs`) は本 Issue で
-        // touch せず、既存 `policy.allow_docs_deterministic_fallback` 経路を維持。
-        if super::policy_allows_python_specialized_fallback(policy, &self.config) {
-            if let Some(files) = deterministic::fastapi_scaffold_files(request) {
-                return Some(DeterministicScaffoldSpec {
-                    label: "FastAPI scaffold",
-                    event: EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
-                    scaffold_kind: "FastAPI",
-                    files,
-                });
-            }
-            let (script_name, sample_name) = self.python_csv_names_from_request_and_anvil(request);
-            let files = deterministic::empty_python_cli_files_with_names(
-                request,
-                script_name.as_deref(),
-                sample_name.as_deref(),
-            )?;
-            return Some(DeterministicScaffoldSpec {
-                label: "Python scaffold",
-                event: EVENT_DETERMINISTIC_PYTHON_CLI,
-                scaffold_kind: "Python",
-                files,
-            });
-        }
-        if policy.allow_docs_deterministic_fallback {
-            return deterministic::empty_docs_files(request).map(|files| {
-                DeterministicScaffoldSpec {
-                    label: "Docs scaffold",
-                    event: "agent.empty_workspace.deterministic_docs",
-                    scaffold_kind: "Docs",
-                    files,
-                }
-            });
-        }
-        None
+        super::scaffold_pipeline::mode_deterministic_scaffold_spec(self, request, policy)
     }
 
     fn write_deterministic_scaffold_files(
@@ -9921,40 +9884,12 @@ impl Agent {
         error_prefix: &str,
         skip_existing: bool,
     ) -> Option<WrittenScaffoldArtifacts> {
-        let mut written = Vec::<PathBuf>::new();
-        let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
-        for (relative, content) in files {
-            let target = self.work_root.join(&relative);
-            if skip_existing && target.exists() {
-                continue;
-            }
-            if let Some(parent) = target.parent()
-                && let Err(err) = std::fs::create_dir_all(parent)
-            {
-                self.session.working_memory.note_error(format!(
-                    "{error_prefix}: failed to create {}: {err}",
-                    parent.display()
-                ));
-                return None;
-            }
-            if let Err(err) = std::fs::write(&target, content.as_bytes()) {
-                self.session.working_memory.note_error(format!(
-                    "{error_prefix}: failed to write {}: {err}",
-                    target.display()
-                ));
-                return None;
-            }
-            let relative_display = relative.to_string_lossy().to_string();
-            snapshot_files.push(scaffold_file_snapshot(
-                &relative_display.replace('\\', "/"),
-                content.as_bytes(),
-            ));
-            self.session
-                .working_memory
-                .note_touched_file(normalize_memory_path(&relative_display, &self.work_root));
-            written.push(relative);
-        }
-        Some((written, snapshot_files))
+        super::scaffold_pipeline::write_deterministic_scaffold_files(
+            self,
+            files,
+            error_prefix,
+            skip_existing,
+        )
     }
 
     fn finalize_deterministic_scaffold_materialization(
@@ -9966,48 +9901,15 @@ impl Agent {
         written: Vec<PathBuf>,
         snapshot_files: Vec<ScaffoldArtifactFileSnapshot>,
     ) {
-        let written_paths = written
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        write_stdout_rendered(
-            &format_iteration_status(
-                last_iter,
-                self.config.max_iterations,
-                spec.label,
-                &format!(
-                    "Materialized deterministic scaffold files: {}.",
-                    written_paths.join(", ")
-                ),
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        log_llm_event(
-            spec.event,
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "work_root": self.work_root.display().to_string(),
-                "work_mode": self.session.mode_state.work_mode.as_str(),
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "bootstrap_scaffold",
-                "completion_evidence": false,
-                "files": written_paths,
-            }),
-        );
-        self.record_scaffold_artifact_snapshot(request, snapshot_files);
-        self.session.messages.push(ConversationMessage::assistant(
-            format!(
-                "Created deterministic {} scaffold files as {assistant_context}: {}. This is not task completion.",
-                spec.scaffold_kind,
-                written_paths.join(", ")
-            ),
-            Vec::new(),
-        ));
-        self.push_system_note(render_deterministic_scaffold_continuation_note(
+        super::scaffold_pipeline::finalize_deterministic_scaffold_materialization(
+            self,
             request,
-            &written_paths,
-        ));
+            last_iter,
+            spec,
+            assistant_context,
+            written,
+            snapshot_files,
+        )
     }
 
     pub(super) fn maybe_materialize_mode_deterministic_fallback(
@@ -10105,21 +10007,6 @@ impl Agent {
             snapshot_files,
         );
         true
-    }
-
-    fn record_scaffold_artifact_snapshot(
-        &mut self,
-        request: &str,
-        files: Vec<ScaffoldArtifactFileSnapshot>,
-    ) {
-        super::scaffold_pipeline::record_scaffold_artifact_snapshot(self, request, files)
-    }
-
-    fn python_csv_names_from_request_and_anvil(
-        &self,
-        request: &str,
-    ) -> (Option<String>, Option<String>) {
-        super::scaffold_pipeline::python_csv_names_from_request_and_anvil(self, request)
     }
 
     pub(super) fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
@@ -16780,15 +16667,15 @@ mod truncate_tests {
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
     use super::super::scaffold_pipeline::{
         requested_scaffold_framework, scaffold_candidate_for_missing_role_from_snapshots,
-        scaffold_command_matches_framework, task_or_plan_requires_nextjs_scaffold,
+        scaffold_command_matches_framework, scaffold_file_snapshot,
+        task_or_plan_requires_nextjs_scaffold,
     };
     use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
         ScaffoldFramework, changed_files_for_verifier, deterministic_nextjs_scaffold_reply,
         extract_filename_with_suffix, focused_edit_tool_policy_error,
-        repo_edit_satisfies_artifact_recovery_target, scaffold_file_snapshot,
-        task_contract_needs_verification, task_contract_verifier_repair_note,
-        task_requires_nextjs_scaffold, truncate,
+        repo_edit_satisfies_artifact_recovery_target, task_contract_needs_verification,
+        task_contract_verifier_repair_note, task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
@@ -17397,6 +17284,7 @@ mod progress_tests {
         ScaffoldDiffStatus, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         post_scaffold_continuation_active, post_scaffold_recovery_active,
+        render_deterministic_scaffold_continuation_note,
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_diff_status,
         scaffold_file_snapshot,
     };
@@ -17433,8 +17321,7 @@ mod progress_tests {
         latest_page_copy_block_from_read, latest_truncated_tool_call_note_index,
         latest_turn_preferred_read_edit_target, parse_verifier_repair_assessment_reply,
         prune_plan_mode_messages, recent_deterministic_framework_app_fallback_seen,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
-        render_deterministic_scaffold_continuation_note, repo_change_request_text,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
         request_needs_playable_ui_quality_gate, sanitize_for_progress, sha256_hex,
         should_use_streaming_transport, strip_read_line_number_prefix,
         successful_non_plan_repo_edit_count, successful_repo_edit_count,
