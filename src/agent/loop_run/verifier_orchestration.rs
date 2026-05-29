@@ -48,6 +48,7 @@ use super::patch_proposal::PatchProposal;
 use super::patch_provider::{
     PatchProviderKind, PatchProviderOutput, PatchProviderRequest, admit_patch_provider_output,
 };
+use super::path_helpers::normalize_memory_path;
 use super::progress_text::truncate;
 use super::repair_attempt_outcome::RepairAttemptOutcome;
 use super::repair_authority::AuthorityEvidence;
@@ -87,7 +88,6 @@ use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
-    normalize_memory_path,
 };
 use super::verifier_assessment_parser::{
     ParsedVerifierRepairAssessment, verifier_failure_type_for_diagnostic_kind,
