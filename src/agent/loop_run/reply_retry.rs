@@ -322,7 +322,11 @@ fn request_assistant_reply(
     let focused_edit_target = effective_tool_policy
         .focused_edit_policy()
         .map(|policy| policy.target.as_path());
-    let messages = agent.build_request_messages(protocol, &effective_tool_policy);
+    let messages = super::build_request_messages::build_request_messages(
+        agent,
+        protocol,
+        &effective_tool_policy,
+    );
     let assistant_model = agent.current_assistant_model();
     let request_plan = build_assistant_request_plan(
         assistant_model.as_str(),

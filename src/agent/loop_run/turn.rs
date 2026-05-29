@@ -20,23 +20,17 @@ use super::answer_only_mode::{
 };
 use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
-    build_feedback_for_unsafe_block_reason, extract_current_request_paths,
+    build_feedback_for_unsafe_block_reason,
 };
 use super::file_excerpt::{
     current_file_hash_for_relative_path, open_excerpt_file_nofollow, truncate_on_char_boundary,
     utf8_prefix_respecting_cap,
 };
-use super::focused_edit_recovery::{
-    focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
-    focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-    focused_edit_first_slice_note, focused_edit_guidance_note_for_policy, focused_edit_history,
-    focused_edit_second_slice_note,
-};
 use super::path_helpers::normalize_memory_path;
 use super::photon_feedback_derive::{
     build_rerun_prompt_hint_if_eligible, request_explicitly_requests_script_execution,
 };
-use super::plan_mode_helpers::{assistant_model_for_mode, plan_file_alias};
+use super::plan_mode_helpers::assistant_model_for_mode;
 use super::precaution_relevance::select_precautions_for_prompt;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
 #[cfg(debug_assertions)]
@@ -50,12 +44,11 @@ use super::tool_execution::{
     failed_outcome_for_call, rejected_outcome_for_call, success_outcome_for_call,
 };
 use super::tool_history::{
-    build_recent_tool_summary, focused_edit_target_already_read, focused_read_target_for_directory,
+    focused_edit_target_already_read, focused_read_target_for_directory,
     has_successful_non_plan_repo_edit,
     has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
     is_preferred_read_edit_target, latest_successful_read_existing_path, latest_user_turn_slice,
     latest_verifier_repair_note_index, recent_truncated_tool_call_attempt,
-    successful_non_plan_repo_edit_count,
 };
 use super::tool_policy::{
     EffectiveToolPolicy, EffectiveToolPolicyReason, FocusedEditPolicy,
@@ -677,324 +670,6 @@ impl Agent {
             &self.models.main,
             self.plan_model_override.as_deref(),
         )
-    }
-    pub(super) fn build_request_messages(
-        &mut self,
-        protocol: prompting::ToolProtocol,
-        effective_tool_policy: &EffectiveToolPolicy,
-    ) -> Vec<ConversationMessage> {
-        let mut messages = Vec::new();
-        let focused_edit_policy = effective_tool_policy.focused_edit_policy().cloned();
-        let focused_edit_target = focused_edit_policy
-            .as_ref()
-            .map(|policy| policy.target.clone());
-        let successful_repo_edits = successful_non_plan_repo_edit_count(
-            &self.session.messages,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        );
-        let focused_edit_target_already_read = focused_edit_policy
-            .as_ref()
-            .is_some_and(|policy| policy.target_already_read);
-        let plan_contents = if self.session.mode_state.mode == ExecutionMode::Plan {
-            self.current_plan_contents().ok().flatten()
-        } else {
-            None
-        };
-        let plan_stage = plan_contents
-            .as_deref()
-            .map(lifecycle::current_plan_stage)
-            .or_else(|| {
-                (self.session.mode_state.mode == ExecutionMode::Plan)
-                    .then_some(self.session.mode_state.plan_stage)
-            });
-        let next_sections = plan_contents
-            .as_deref()
-            .map(lifecycle::plan_next_stage_sections)
-            .unwrap_or_default();
-
-        messages.push(ConversationMessage::system(build_system_prompt(
-            self.session.mode_state.mode,
-            self.session.mode_state.active_plan_path.as_deref(),
-            self.session.mode_state.task_profile,
-            protocol,
-            plan_stage,
-            &next_sections,
-            effective_tool_policy.allowed_tool_names_for_prompt(),
-        )));
-        if let Some(message) = self.mode_policy_message() {
-            messages.push(message);
-        }
-        if focused_edit_target.is_none() {
-            self.append_general_request_context_messages(&mut messages);
-        }
-        self.append_common_request_messages(&mut messages, protocol, effective_tool_policy);
-        if let Some(target) = focused_edit_target {
-            self.append_focused_edit_request_messages(
-                &mut messages,
-                effective_tool_policy,
-                &target,
-                focused_edit_target_already_read,
-                successful_repo_edits,
-            );
-        } else {
-            messages.extend(self.session.messages.clone());
-        }
-        messages
-    }
-
-    fn append_general_request_context_messages(&mut self, messages: &mut Vec<ConversationMessage>) {
-        if self.active_task_expects_repo_change() && self.workspace_appears_empty() {
-            if let Some(framework) =
-                super::scaffold_pipeline::active_task_requested_scaffold_framework(self)
-            {
-                messages.push(ConversationMessage::system(
-                    recovery::framework_scaffold_now_note(framework.label()),
-                ));
-            }
-            messages.push(ConversationMessage::system(
-                recovery::empty_workspace_scaffold_note(),
-            ));
-        }
-        if let Some(memory_message) = self.working_memory_message() {
-            messages.push(memory_message);
-        }
-        let case_injection = super::case_record_flow::try_inject_case_retrieval_message(self);
-        if let Some(ref inj) = case_injection {
-            messages.push(inj.message.clone());
-        }
-        let anti_injection = super::anti_pattern_flow::try_inject_anti_pattern_message(self);
-        if let Some(ref inj) = anti_injection {
-            messages.push(inj.message.clone());
-        }
-        self.maybe_send_request_context_pack(&case_injection, &anti_injection);
-        if let Some(repo_context_message) = self.repo_context_message() {
-            messages.push(repo_context_message);
-        }
-    }
-
-    fn maybe_send_request_context_pack(
-        &mut self,
-        case_injection: &Option<RetrievalInjection>,
-        anti_injection: &Option<RetrievalInjection>,
-    ) {
-        if self.session.context_pack_sent_this_turn {
-            return;
-        }
-        let selected_case_ids: Vec<String> = case_injection
-            .as_ref()
-            .map(|inj| inj.selected_ids.clone())
-            .unwrap_or_default();
-        let selected_anti_ids: Vec<String> = anti_injection
-            .as_ref()
-            .map(|inj| inj.selected_ids.clone())
-            .unwrap_or_default();
-        let selected_precaution_ids: Vec<String> = self
-            .session
-            .working_memory
-            .active_precautions
-            .iter()
-            .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
-            .map(|p| p.id.clone())
-            .collect();
-        let recent_tool_summary = build_recent_tool_summary(&self.session.messages);
-        let gate = crate::photon::mapper::PhotonGateInputs {
-            photon_present: self.photon.is_some(),
-            shadow_mode: self.config.photon_shadow_mode,
-            canary: self.config.photon_canary,
-            session_id: self.session_store.session_id(),
-            turn_idx: self.current_turn_index,
-        };
-        if !crate::photon::mapper::should_send_context_pack(&gate) {
-            return;
-        }
-        let resp_opt = match &self.photon {
-            Some(photon) => {
-                let working_memory_text = self.session.working_memory.format_for_prompt();
-                let inputs = crate::photon::mapper::ContextPackInputs {
-                    task: self.session.working_memory.active_task.as_deref(),
-                    repo_path: &self.work_root,
-                    branch: None,
-                    commit: None,
-                    working_memory_text: working_memory_text.as_deref(),
-                    touched_files: &self.session.working_memory.touched_files,
-                    recent_tool_summary: &recent_tool_summary,
-                    selected_case_ids: &selected_case_ids,
-                    selected_anti_pattern_ids: &selected_anti_ids,
-                    selected_precaution_ids: &selected_precaution_ids,
-                };
-                let req = crate::photon::mapper::build_context_pack_request(&inputs);
-                let rid = req.0["request_id"].as_str().map(|s| s.to_string());
-                let resp = photon.context_pack(&req);
-                if self.last_context_pack_id.is_none() {
-                    self.last_context_pack_id = rid;
-                }
-                resp
-            }
-            None => None,
-        };
-        if let Some(resp) = resp_opt.as_ref() {
-            let blocked_ids: std::collections::HashSet<String> =
-                if self.config.photon_respect_warnings {
-                    let (ids, _stats) = crate::photon::prompt::extract_blocked_summary_ids(resp);
-                    ids
-                } else {
-                    std::collections::HashSet::new()
-                };
-            let shadow_input = self.config.photon_shadow_mode;
-            let _ = self.record_pam_advisory_decision(resp, &blocked_ids, shadow_input);
-        }
-        self.session.context_pack_sent_this_turn = true;
-    }
-
-    fn append_common_request_messages(
-        &mut self,
-        messages: &mut Vec<ConversationMessage>,
-        protocol: prompting::ToolProtocol,
-        effective_tool_policy: &EffectiveToolPolicy,
-    ) {
-        if let Some(ctx) =
-            super::photon_feedback_derive::photon_context_pack_injection_message(self)
-        {
-            messages.push(ctx);
-        }
-        if self.config.offline {
-            messages.push(ConversationMessage::system(
-                "[Runtime Policy] Offline mode is enabled. Do not use network access, package installs, or general-purpose shell commands. If shell is necessary, keep it read-only or build-test only."
-                    .to_string(),
-            ));
-        }
-        if self.session.mode_state.mode == ExecutionMode::Plan
-            && let Some(plan_path) = self.session.mode_state.active_plan_path.as_deref()
-        {
-            messages.push(ConversationMessage::system(format!(
-                "[Plan File Alias] The active plan file may live outside the project root, but it is still accessible. Treat these two paths as the same file: {} and {}. Do not loop on Read because of the outside-workspace path; continue updating the same active plan file.",
-                plan_path.display(),
-                plan_file_alias(plan_path)
-            )));
-        }
-        if let Some(note) = self.forced_small_edit_recovery_message() {
-            messages.push(ConversationMessage::system(note));
-        }
-        if let Some(note) = super::scaffold_pipeline::post_scaffold_edit_recovery_message(self) {
-            messages.push(ConversationMessage::system(note));
-        }
-        if let Some(note) =
-            super::scaffold_pipeline::post_scaffold_continuation_recovery_message(self)
-        {
-            messages.push(ConversationMessage::system(note));
-        }
-        if let Some(note) = self.verifier_repair_policy_message(effective_tool_policy) {
-            messages.push(ConversationMessage::system(note));
-        }
-        if let Some(note) = self.artifact_directed_policy_violation_message(effective_tool_policy) {
-            messages.push(ConversationMessage::system(note));
-        }
-        if let Some(note) = self.artifact_directed_recovery_message(effective_tool_policy) {
-            messages.push(ConversationMessage::system(note));
-        }
-        let current_request_paths = extract_current_request_paths(self, &self.work_root);
-        let last_suspected = self
-            .session
-            .last_feedback
-            .as_ref()
-            .map(|f| f.suspected_files.as_slice());
-        messages.extend(prompting::runtime_context_messages(
-            &self.config.cwd,
-            &self.work_root,
-            protocol,
-            &self.session.working_memory.touched_files,
-            last_suspected,
-            &current_request_paths,
-        ));
-    }
-
-    fn append_focused_edit_request_messages(
-        &self,
-        messages: &mut Vec<ConversationMessage>,
-        effective_tool_policy: &EffectiveToolPolicy,
-        target: &Path,
-        focused_edit_target_already_read: bool,
-        successful_repo_edits: usize,
-    ) {
-        let recovery_anchor = focused_edit_exact_recovery_anchor(
-            &self.session.messages,
-            target,
-            &self.work_root,
-            focused_edit_target_already_read,
-            successful_repo_edits,
-        );
-        let compact_anchor = (recovery_anchor.is_none()
-            && focused_edit_target_already_read
-            && recent_truncated_tool_call_attempt(&self.session.messages) > 0)
-            .then(|| {
-                focused_edit_compact_recovery_anchor(
-                    &self.session.messages,
-                    target,
-                    &self.work_root,
-                )
-            })
-            .flatten();
-        let exact_anchor = recovery_anchor.or_else(|| compact_anchor.clone());
-        let target_display = target
-            .strip_prefix(&self.work_root)
-            .unwrap_or(target)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if let Some(note) = focused_edit_policy_violation_feedback_note(
-            &self.session.working_memory.unresolved_errors,
-            effective_tool_policy.allowed_tool_names_for_prompt(),
-            Some(&target_display),
-        ) {
-            messages.push(ConversationMessage::system(note));
-        }
-        messages.push(ConversationMessage::system(
-            focused_edit_guidance_note_for_policy(
-                effective_tool_policy,
-                target,
-                &self.work_root,
-                focused_edit_target_already_read,
-            ),
-        ));
-        if compact_anchor.is_some() {
-            messages.push(ConversationMessage::system(
-                focused_edit_compact_anchor_note(target, &self.work_root),
-            ));
-        }
-        if successful_repo_edits == 0
-            && let Some(note) = focused_edit_first_slice_note(
-                &self.session.messages,
-                target,
-                &self.work_root,
-                focused_edit_target_already_read,
-            )
-        {
-            messages.push(ConversationMessage::system(note));
-        }
-        if successful_repo_edits == 1
-            && let Some(note) = focused_edit_second_slice_note(
-                &self.session.messages,
-                target,
-                &self.work_root,
-                focused_edit_target_already_read,
-            )
-        {
-            messages.push(ConversationMessage::system(note));
-        }
-        if let Some(anchor) = exact_anchor {
-            messages.extend(focused_edit_exact_anchor_history(
-                &self.session.messages,
-                target,
-                &self.work_root,
-                &anchor,
-            ));
-        } else {
-            messages.extend(focused_edit_history(
-                &self.session.messages,
-                target,
-                &self.work_root,
-            ));
-        }
     }
 
     /// Issue #664 test seam: `pub(super)` wrapper over the private
@@ -1626,7 +1301,7 @@ impl Agent {
             .then_some(target)
     }
 
-    fn mode_policy_message(&self) -> Option<ConversationMessage> {
+    pub(super) fn mode_policy_message(&self) -> Option<ConversationMessage> {
         let work_mode = self.session.mode_state.work_mode;
         let text = match work_mode {
             WorkMode::Auto => return None,
@@ -1649,7 +1324,7 @@ impl Agent {
         Some(ConversationMessage::system(text.to_string()))
     }
 
-    fn forced_small_edit_recovery_message(&self) -> Option<String> {
+    pub(super) fn forced_small_edit_recovery_message(&self) -> Option<String> {
         let path = self.forced_small_edit_recovery_target()?;
         let attempt = recent_truncated_tool_call_attempt(&self.session.messages).max(1);
         Some(recovery::forced_small_edit_recovery_note(
@@ -2748,7 +2423,7 @@ impl Agent {
         )
     }
 
-    fn artifact_directed_recovery_message(
+    pub(super) fn artifact_directed_recovery_message(
         &self,
         effective_tool_policy: &EffectiveToolPolicy,
     ) -> Option<String> {
@@ -2775,7 +2450,7 @@ impl Agent {
         ))
     }
 
-    fn verifier_repair_policy_message(
+    pub(super) fn verifier_repair_policy_message(
         &self,
         effective_tool_policy: &EffectiveToolPolicy,
     ) -> Option<String> {
@@ -2847,7 +2522,7 @@ impl Agent {
         }
     }
 
-    fn artifact_directed_policy_violation_message(
+    pub(super) fn artifact_directed_policy_violation_message(
         &self,
         effective_tool_policy: &EffectiveToolPolicy,
     ) -> Option<String> {
@@ -4491,7 +4166,7 @@ impl Agent {
         )
     }
 
-    fn workspace_appears_empty(&self) -> bool {
+    pub(super) fn workspace_appears_empty(&self) -> bool {
         workspace_appears_empty(&self.work_root)
     }
 
@@ -4632,7 +4307,7 @@ impl Agent {
         self.session.working_memory.replace_constraints(constraints);
     }
 
-    fn working_memory_message(&mut self) -> Option<ConversationMessage> {
+    pub(super) fn working_memory_message(&mut self) -> Option<ConversationMessage> {
         if !self.session.mode_state.policy().include_working_memory {
             return None;
         }
@@ -4692,7 +4367,7 @@ impl Agent {
         "ファイルは変更せず、読み取り専用の回答として整理します。目的、前提、推奨構成、検証方法、残リスクを分け、実装や編集が必要な場合だけ次のターンで明示的に依頼してください。".to_string()
     }
 
-    fn repo_context_message(&mut self) -> Option<ConversationMessage> {
+    pub(super) fn repo_context_message(&mut self) -> Option<ConversationMessage> {
         if !self.session.mode_state.policy().allow_repo_context {
             return None;
         }

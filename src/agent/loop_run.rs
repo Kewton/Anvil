@@ -21,7 +21,6 @@ use crate::session::compact::{
 };
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 use crate::stdin_prompt;
-use crate::system_prompt::build_system_prompt;
 use crate::tools::registry::{ToolContext, ToolRegistry};
 
 // Issue #646: artifact ownership classification. Module is intentionally
@@ -126,6 +125,12 @@ mod reply_retry;
 // handlers as free fns over `&mut Agent`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod repair_job_dispatch;
+// Request-message assembly extracted from `turn.rs` (parent #680).
+// Hosts `build_request_messages` (pub(super) entry point) + 4 private
+// helpers (general context / context-pack / common / focused-edit
+// message appenders). All free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod build_request_messages;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
