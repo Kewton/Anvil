@@ -91,12 +91,10 @@ use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
 #[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
-    CREATE_NEXT_APP_PACKAGE_VERSION, DeterministicScaffoldSpec,
-    EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
-    ScaffoldFallbackResult, ScaffoldFramework, deterministic_framework_app_files_needed,
-    deterministic_framework_game_impl_path, deterministic_nextjs_scaffold_reply,
-    deterministic_support_target_relative, recent_scaffold_command_seen,
-    scaffold_candidate_priority,
+    DeterministicScaffoldSpec, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
+    EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK, ScaffoldFallbackResult, ScaffoldFramework,
+    deterministic_framework_app_files_needed, deterministic_framework_game_impl_path,
+    deterministic_support_target_relative, scaffold_candidate_priority,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
@@ -1609,7 +1607,7 @@ fn user_interrupt_result() -> String {
     "exit_code=-1\ninterrupted=true\ninterrupt requested by user".to_string()
 }
 
-fn tool_result_failed(result: &str) -> bool {
+pub(super) fn tool_result_failed(result: &str) -> bool {
     result.starts_with("Error:") || result.contains("\ninterrupted=true\n")
 }
 
@@ -9866,10 +9864,6 @@ impl Agent {
         super::scaffold_pipeline::empty_workspace_scaffold_policy_error(self, name, arguments)
     }
 
-    fn deterministic_nextjs_scaffold_skip_reason(&self) -> Option<&'static str> {
-        super::scaffold_pipeline::deterministic_nextjs_scaffold_skip_reason(self)
-    }
-
     fn mode_deterministic_scaffold_spec(
         &self,
         request: &str,
@@ -10136,101 +10130,11 @@ impl Agent {
         last_iter: usize,
         interrupt_flag: &InterruptFlag,
     ) -> ScaffoldFallbackResult {
-        if !self.config.deterministic_fallback.allows_support_recovery() {
-            return ScaffoldFallbackResult::NotApplicable;
-        }
-        if !self.active_task_requires_nextjs_scaffold()
-            || !self.workspace_appears_empty()
-            || recent_scaffold_command_seen(&self.session.messages)
-        {
-            return ScaffoldFallbackResult::NotApplicable;
-        }
-
-        if let Some(reason) = self.deterministic_nextjs_scaffold_skip_reason() {
-            write_stdout_rendered(
-                &format_iteration_status(
-                    last_iter,
-                    self.config.max_iterations,
-                    "Scaffold fallback skipped",
-                    reason,
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            log_llm_event(
-                "agent.empty_workspace.deterministic_nextjs_scaffold_skipped",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "work_root": self.work_root.display().to_string(),
-                    "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                    "fallback_action": "minimal_patch",
-                    "reason": reason,
-                }),
-            );
-            return ScaffoldFallbackResult::Skipped;
-        }
-
-        let fallback_reply = deterministic_nextjs_scaffold_reply();
-        let fallback_tool_calls = fallback_reply
-            .tool_calls
-            .iter()
-            .cloned()
-            .map(|tool_call| self.prepare_tool_call(tool_call))
-            .collect::<Vec<_>>();
-        self.session.messages.push(ConversationMessage::assistant(
-            fallback_reply.content,
-            fallback_tool_calls.clone(),
-        ));
-        write_stdout_rendered(
-            &format_iteration_status(
-                last_iter,
-                self.config.max_iterations,
-                "Scaffold fallback",
-                "Empty Next.js workspace stalled on exploration; running pinned deterministic scaffold command.",
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-
-        let mut fallback_failed = false;
-        for tool_call in fallback_tool_calls {
-            let raw_result = self.execute_tool_call(
-                &tool_call.name,
-                &tool_call.arguments,
-                None,
-                Some(interrupt_flag.flag.clone()),
-            );
-            if tool_result_failed(&raw_result) {
-                fallback_failed = true;
-            }
-            let compact_result = prompting::compact_tool_result(&tool_call.name, raw_result);
-            self.session.messages.push(ConversationMessage::tool(
-                tool_call.name.clone(),
-                compact_result,
-            ));
-        }
-
-        let event = if fallback_failed {
-            "agent.empty_workspace.deterministic_nextjs_scaffold_failed"
-        } else {
-            "agent.empty_workspace.deterministic_nextjs_scaffold"
-        };
-        log_llm_event(
-            event,
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "work_root": self.work_root.display().to_string(),
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "minimal_patch",
-                "create_next_app_version": CREATE_NEXT_APP_PACKAGE_VERSION,
-            }),
-        );
-
-        if fallback_failed {
-            ScaffoldFallbackResult::Failed
-        } else {
-            ScaffoldFallbackResult::Applied
-        }
+        super::scaffold_pipeline::maybe_apply_deterministic_nextjs_scaffold(
+            self,
+            last_iter,
+            interrupt_flag,
+        )
     }
 
     fn workspace_appears_empty(&self) -> bool {
@@ -10244,10 +10148,6 @@ impl Agent {
                 recovery::classify_action_expectation(task, self.session.mode_state.mode)
                     == recovery::ActionExpectation::RepoChange
             })
-    }
-
-    fn active_task_requires_nextjs_scaffold(&self) -> bool {
-        super::scaffold_pipeline::active_task_requires_nextjs_scaffold(self)
     }
 
     fn active_task_requested_scaffold_framework(&self) -> Option<ScaffoldFramework> {
@@ -16666,16 +16566,16 @@ mod truncate_tests {
     };
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
     use super::super::scaffold_pipeline::{
-        requested_scaffold_framework, scaffold_candidate_for_missing_role_from_snapshots,
-        scaffold_command_matches_framework, scaffold_file_snapshot,
-        task_or_plan_requires_nextjs_scaffold,
+        deterministic_nextjs_scaffold_reply, requested_scaffold_framework,
+        scaffold_candidate_for_missing_role_from_snapshots, scaffold_command_matches_framework,
+        scaffold_file_snapshot, task_or_plan_requires_nextjs_scaffold,
     };
     use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
-        ScaffoldFramework, changed_files_for_verifier, deterministic_nextjs_scaffold_reply,
-        extract_filename_with_suffix, focused_edit_tool_policy_error,
-        repo_edit_satisfies_artifact_recovery_target, task_contract_needs_verification,
-        task_contract_verifier_repair_note, task_requires_nextjs_scaffold, truncate,
+        ScaffoldFramework, changed_files_for_verifier, extract_filename_with_suffix,
+        focused_edit_tool_policy_error, repo_edit_satisfies_artifact_recovery_target,
+        task_contract_needs_verification, task_contract_verifier_repair_note,
+        task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
@@ -17284,7 +17184,7 @@ mod progress_tests {
         ScaffoldDiffStatus, deterministic_framework_app_files_needed,
         deterministic_framework_game_files_needed, deterministic_support_target_relative,
         post_scaffold_continuation_active, post_scaffold_recovery_active,
-        render_deterministic_scaffold_continuation_note,
+        recent_scaffold_command_seen, render_deterministic_scaffold_continuation_note,
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_diff_status,
         scaffold_file_snapshot,
     };
@@ -17321,7 +17221,7 @@ mod progress_tests {
         latest_page_copy_block_from_read, latest_truncated_tool_call_note_index,
         latest_turn_preferred_read_edit_target, parse_verifier_repair_assessment_reply,
         prune_plan_mode_messages, recent_deterministic_framework_app_fallback_seen,
-        recent_scaffold_command_seen, recent_truncated_tool_call_attempt, repo_change_request_text,
+        recent_truncated_tool_call_attempt, repo_change_request_text,
         request_needs_playable_ui_quality_gate, sanitize_for_progress, sha256_hex,
         should_use_streaming_transport, strip_read_line_number_prefix,
         successful_non_plan_repo_edit_count, successful_repo_edit_count,
