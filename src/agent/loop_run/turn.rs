@@ -211,9 +211,7 @@ use super::*;
 use crate::agent::orchestration::verify_repo_progress;
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::model_capabilities::model_capabilities;
-use crate::modes::plan_act::{
-    ModeClassification, PlanStage, TaskProfile, WorkMode, classify_work_mode_json,
-};
+use crate::modes::plan_act::{ModeClassification, PlanStage, WorkMode, classify_work_mode_json};
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{FeedbackFrame, FeedbackKind};
 #[cfg(test)]
@@ -599,71 +597,6 @@ fn user_interrupt_result() -> String {
 
 pub(super) fn tool_result_failed(result: &str) -> bool {
     result.starts_with("Error:") || result.contains("\ninterrupted=true\n")
-}
-
-fn extract_requested_port(task: &str) -> Option<String> {
-    let bytes = task.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if !bytes[i].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        let candidate = &task[start..i];
-        if (2..=5).contains(&candidate.len()) {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-fn fallback_plan_request_label(task: &str) -> String {
-    let lower = task.to_ascii_lowercase();
-    if lower.contains("next.js") {
-        "the requested Next.js app".to_string()
-    } else {
-        "the requested deliverable".to_string()
-    }
-}
-
-fn fallback_plan_platform_label(task: &str) -> &'static str {
-    if task.to_ascii_lowercase().contains("next.js") {
-        "Next.js app"
-    } else {
-        "local app"
-    }
-}
-
-pub(super) fn deterministic_timeout_fallback_plan(
-    task: &str,
-    task_profile: TaskProfile,
-    work_root: &Path,
-) -> String {
-    let request_label = fallback_plan_request_label(task);
-    let platform_label = fallback_plan_platform_label(task);
-    let port = extract_requested_port(task)
-        .map(|port| format!("port {port}"))
-        .unwrap_or_else(|| "the requested port".to_string());
-    let worktree_name = work_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("the current repo");
-    let execution_focus = match task_profile {
-        TaskProfile::Ui => "strong visual identity, motion, and interaction polish",
-        TaskProfile::Content => "clear reader-facing output and quality copy",
-        TaskProfile::Research => "structured investigation and evidence capture",
-        TaskProfile::Coding | TaskProfile::Generic => {
-            "a playable vertical slice first, then layered polish"
-        }
-    };
-
-    format!(
-        "# Plan\n\n## Goal\n- Build {request_label} as a {platform_label} inside `{worktree_name}`.\n- Ensure the result runs locally on {port} and feels intentionally polished rather than placeholder-quality.\n\n## Constraints\n- Keep all work inside the current repository root and use repository-relative paths.\n- If the repository is empty, scaffold only the minimum project structure needed before implementing the requested feature.\n- Keep the implementation incremental and avoid placeholder-only output.\n\n## First Action\n- Confirm or scaffold the base app, then make the first concrete implementation edit in a primary artifact such as `src/app/page.tsx`, `app/page.tsx`, or the equivalent entry file.\n- Anchor `package.json` scripts and local startup behavior to {port} before final verification.\n\n## Verification\n- Install dependencies when needed and confirm the app boots locally on {port}.\n- Exercise the main interaction or user-facing flow end-to-end, including success and failure states where applicable.\n- If verification cannot run because of sandbox, network, or host constraints, report that exact constraint instead of treating the work as verified.\n\n<!-- runtime fallback plan: generated after repeated planning model timeouts; focus on {execution_focus}. -->\n"
-    )
 }
 
 pub(super) fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
@@ -7754,11 +7687,10 @@ mod tests {
         answer_only_script_execution_fallback_response, assistant_model_for_mode,
         build_task_contract_verifier_exit_zero_evidence,
         build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
-        classify_verifier_timeout, deterministic_timeout_fallback_plan,
-        effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
-        non_streaming_assistant_reply_timeout_secs, normalize_exploration_path,
-        repair_terminal_exit_reason, should_fallback_plan_model_after_timeout,
-        should_materialize_plan_after_timeout,
+        classify_verifier_timeout, effective_non_streaming_timeout_secs,
+        latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
+        normalize_exploration_path, repair_terminal_exit_reason,
+        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_structured_missing_outcome, verifier_repair_context_from_failure,
     };
@@ -8202,6 +8134,7 @@ mod tests {
 
     #[test]
     fn deterministic_timeout_fallback_plan_mentions_requested_port() {
+        use super::super::deterministic_fallback_plan::deterministic_timeout_fallback_plan;
         let temp = tempdir().unwrap();
         let plan = deterministic_timeout_fallback_plan(
             "ブラウザゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
