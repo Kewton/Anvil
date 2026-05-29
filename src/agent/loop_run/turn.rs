@@ -25,8 +25,7 @@ use super::auto_test::{
 use super::completion_evidence::is_repo_edit_no_op;
 use super::feedback_kind_confirm::{
     self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
-    FeedbackKindConfirmOutcome, build_feedback_kind_confirm_log_payload,
-    run_feedback_kind_confirm_with_strategy,
+    FeedbackKindConfirmOutcome, run_feedback_kind_confirm_with_strategy,
 };
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::model_request::{build_assistant_request_plan, request_non_streaming_assistant_reply};
@@ -81,6 +80,12 @@ use super::answer_only_mode::{
 use super::case_record_extract::{
     case_record_auto_test_active, case_record_extraction_succeeded, case_record_initial_feedback,
     derive_language_stack,
+};
+use super::confirmation_flow::{
+    effective_turn_index_for_stage, log_feedback_kind_confirm_outcome, log_quality_confirm_outcome,
+    log_work_mode_confirm_outcome, override_feedback_kind_from_outcome,
+    preflight_feedback_kind_skip_reason, preflight_quality_confirm_skip_reason,
+    preflight_work_mode_skip_reason, quality_confirm_cached_result, should_writeback_first_pass,
 };
 use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
@@ -199,8 +204,7 @@ use super::verifier_repair_targeting::{
     verifier_repair_target_candidate_from_output, verifier_repair_target_hint_from_output,
 };
 use super::work_mode_confirm::{
-    self, ParseStatus as WorkModeConfirmParseStatus, WORK_MODE_CONFIRM_TIMEOUT_SECS,
-    WorkModeConfirmInputs, WorkModeConfirmOutcome, build_work_mode_confirm_log_payload,
+    self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
     run_work_mode_confirm_with_strategy,
 };
 use super::*;
@@ -238,8 +242,7 @@ use super::quality::{
 };
 use super::quality_confirm::{
     self, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmInputs, QualityConfirmOutcome,
-    QualityConfirmation, QualityConfirmationSource, build_quality_confirm_log_payload,
-    run_quality_confirm_with_strategy,
+    QualityConfirmation, QualityConfirmationSource, run_quality_confirm_with_strategy,
 };
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
@@ -797,198 +800,6 @@ pub(super) fn normalize_memory_path(raw_path: &str, work_root: &Path) -> String 
 pub(super) struct RetrievalInjection {
     pub message: ConversationMessage,
     pub selected_ids: Vec<String>,
-}
-
-/// CB-001 (Issue #576 follow-up): pure predicate that decides whether
-/// `classify_with_confirmation` should overwrite `session.mode_state.work_mode`
-/// with the freshly-computed first-pass result.
-///
-/// Returns `true` only when the per-turn confirmation cap has NOT yet been
-/// consumed for this user input. When the cap is already consumed (i.e. a
-/// prior call within the same `process_line` has already driven the
-/// second-pass), the previously-resolved value lives in
-/// `session.mode_state.work_mode` and must survive a subsequent first-pass
-/// re-classification (otherwise `auto_plan_precheck`'s LLM correction is lost
-/// when `turn_start` reclassifies the same input).
-pub(super) fn should_writeback_first_pass(work_mode_confirm_called_this_turn: bool) -> bool {
-    !work_mode_confirm_called_this_turn
-}
-
-/// CB-004 (Issue #576 follow-up): pure helper that maps a classification
-/// `stage_label` and the current value of `Agent.current_turn_index` to the
-/// `turn_index` to record in `agent.work_mode.{classified,confirmed,skipped,fallback}`
-/// events.
-///
-/// `auto_plan_precheck` runs in `process_line` BEFORE
-/// `handle_user_message` increments `current_turn_index`, so its raw counter
-/// value is one less than what `turn_start` (called inside `run_turn` after
-/// the increment) will see. The helper compensates by returning
-/// `current_turn_index + 1` for the precheck stage and the raw value for
-/// every other stage, so events sharing a user input also share the join
-/// key `(session_id, turn_index)`.
-pub(super) fn effective_turn_index_for_stage(
-    stage_label: &str,
-    current_turn_index: usize,
-) -> usize {
-    if stage_label == "auto_plan_precheck" {
-        current_turn_index.saturating_add(1)
-    } else {
-        current_turn_index
-    }
-}
-
-fn preflight_work_mode_skip_reason(
-    work_mode_confirm_called_this_turn: bool,
-    mode: ExecutionMode,
-    env_disabled: bool,
-) -> Option<work_mode_confirm::WorkModeSkipReason> {
-    if work_mode_confirm_called_this_turn {
-        Some(work_mode_confirm::WorkModeSkipReason::PerTurnCapConsumed)
-    } else if mode == ExecutionMode::Plan {
-        Some(work_mode_confirm::WorkModeSkipReason::PlanMode)
-    } else if env_disabled {
-        Some(work_mode_confirm::WorkModeSkipReason::EnvDisabled)
-    } else {
-        None
-    }
-}
-
-fn preflight_feedback_kind_skip_reason(
-    feedback_kind_confirm_called_this_turn: bool,
-    mode: ExecutionMode,
-    env_disabled: bool,
-) -> Option<feedback_kind_confirm::FeedbackKindSkipReason> {
-    if mode == ExecutionMode::Plan {
-        Some(feedback_kind_confirm::FeedbackKindSkipReason::PlanMode)
-    } else if env_disabled {
-        Some(feedback_kind_confirm::FeedbackKindSkipReason::EnvDisabled)
-    } else if feedback_kind_confirm_called_this_turn {
-        Some(feedback_kind_confirm::FeedbackKindSkipReason::PerTurnCapConsumed)
-    } else {
-        None
-    }
-}
-
-fn preflight_quality_confirm_skip_reason(
-    mode: ExecutionMode,
-    env_disabled: bool,
-    quality_confirm_called_this_turn: bool,
-) -> Option<quality_confirm::QualityConfirmSkipReason> {
-    if mode == ExecutionMode::Plan {
-        Some(quality_confirm::QualityConfirmSkipReason::PlanMode)
-    } else if env_disabled {
-        Some(quality_confirm::QualityConfirmSkipReason::EnvDisabled)
-    } else if quality_confirm_called_this_turn {
-        Some(quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed)
-    } else {
-        None
-    }
-}
-
-fn quality_confirm_cached_result(
-    last_quality_confirm_result: Option<&(u64, QualityConfirmation)>,
-    content_hash: u64,
-) -> Option<QualityConfirmation> {
-    last_quality_confirm_result
-        .and_then(|(hash, cached)| (*hash == content_hash).then(|| cached.clone()))
-}
-
-fn work_mode_confirm_parse_status(outcome: &WorkModeConfirmOutcome) -> WorkModeConfirmParseStatus {
-    match outcome {
-        WorkModeConfirmOutcome::Confirmed(_) => WorkModeConfirmParseStatus::Ok,
-        WorkModeConfirmOutcome::Skipped { .. } => WorkModeConfirmParseStatus::NotInvoked,
-        WorkModeConfirmOutcome::Fallback { reason, .. } => match reason {
-            work_mode_confirm::WorkModeFallbackReason::Timeout => {
-                WorkModeConfirmParseStatus::Timeout
-            }
-            work_mode_confirm::WorkModeFallbackReason::TransportError
-            | work_mode_confirm::WorkModeFallbackReason::SidecarUnavailable => {
-                WorkModeConfirmParseStatus::TransportError
-            }
-            work_mode_confirm::WorkModeFallbackReason::Empty => WorkModeConfirmParseStatus::Empty,
-            work_mode_confirm::WorkModeFallbackReason::Malformed
-            | work_mode_confirm::WorkModeFallbackReason::ResponseTooLarge
-            | work_mode_confirm::WorkModeFallbackReason::UnknownMode => {
-                WorkModeConfirmParseStatus::Malformed
-            }
-        },
-    }
-}
-
-fn log_work_mode_confirm_outcome(
-    outcome: &WorkModeConfirmOutcome,
-    session_id: &str,
-    sidecar_model: Option<&str>,
-    turn_index: usize,
-    first_pass: &ModeClassification,
-    latency_ms: Option<u64>,
-) {
-    let (event, payload) = build_work_mode_confirm_log_payload(
-        outcome,
-        session_id,
-        sidecar_model,
-        turn_index,
-        first_pass,
-        latency_ms,
-        work_mode_confirm_parse_status(outcome),
-    );
-    log_llm_event(event, payload);
-}
-
-fn log_feedback_kind_confirm_outcome(
-    outcome: &FeedbackKindConfirmOutcome,
-    session_id: &str,
-    turn_index: usize,
-    first_pass: &FeedbackKind,
-    sidecar_model: Option<&str>,
-    combined_bytes: usize,
-    latency_ms: Option<u64>,
-) {
-    let (event, payload) = build_feedback_kind_confirm_log_payload(
-        outcome,
-        session_id,
-        turn_index,
-        first_pass,
-        sidecar_model,
-        combined_bytes,
-        latency_ms,
-    );
-    log_llm_event(event, payload);
-}
-
-fn override_feedback_kind_from_outcome(
-    outcome: &FeedbackKindConfirmOutcome,
-    first_pass: &FeedbackKind,
-) -> Option<FeedbackKind> {
-    match outcome {
-        FeedbackKindConfirmOutcome::Confirmed(c)
-            if c.source
-                == feedback_kind_confirm::FeedbackKindConfirmationSource::SecondPassOverridden
-                && &c.kind != first_pass =>
-        {
-            Some(c.kind.clone())
-        }
-        _ => None,
-    }
-}
-
-fn log_quality_confirm_outcome(
-    outcome: &QualityConfirmOutcome,
-    session_id: &str,
-    sidecar_model: Option<&str>,
-    turn_index: usize,
-    observation: &super::quality::QualityFirstPassObservation,
-    latency_ms: Option<u64>,
-) {
-    let (event, payload) = build_quality_confirm_log_payload(
-        outcome,
-        session_id,
-        turn_index,
-        sidecar_model,
-        observation,
-        latency_ms,
-    );
-    log_llm_event(event, payload);
 }
 
 pub(super) type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
@@ -9269,43 +9080,53 @@ mod tests {
             reason: None,
         };
         assert_eq!(
-            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Confirmed(
-                confirmation.clone()
-            )),
+            super::super::confirmation_flow::work_mode_confirm_parse_status(
+                &super::WorkModeConfirmOutcome::Confirmed(confirmation.clone())
+            ),
             super::WorkModeConfirmParseStatus::Ok
         );
         assert_eq!(
-            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Skipped {
-                reason: super::work_mode_confirm::WorkModeSkipReason::EnvDisabled,
-            }),
+            super::super::confirmation_flow::work_mode_confirm_parse_status(
+                &super::WorkModeConfirmOutcome::Skipped {
+                    reason: super::work_mode_confirm::WorkModeSkipReason::EnvDisabled,
+                }
+            ),
             super::WorkModeConfirmParseStatus::NotInvoked
         );
         assert_eq!(
-            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
-                reason: super::work_mode_confirm::WorkModeFallbackReason::Timeout,
-                confirmation: confirmation.clone(),
-            }),
+            super::super::confirmation_flow::work_mode_confirm_parse_status(
+                &super::WorkModeConfirmOutcome::Fallback {
+                    reason: super::work_mode_confirm::WorkModeFallbackReason::Timeout,
+                    confirmation: confirmation.clone(),
+                }
+            ),
             super::WorkModeConfirmParseStatus::Timeout
         );
         assert_eq!(
-            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
-                reason: super::work_mode_confirm::WorkModeFallbackReason::TransportError,
-                confirmation: confirmation.clone(),
-            }),
+            super::super::confirmation_flow::work_mode_confirm_parse_status(
+                &super::WorkModeConfirmOutcome::Fallback {
+                    reason: super::work_mode_confirm::WorkModeFallbackReason::TransportError,
+                    confirmation: confirmation.clone(),
+                }
+            ),
             super::WorkModeConfirmParseStatus::TransportError
         );
         assert_eq!(
-            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
-                reason: super::work_mode_confirm::WorkModeFallbackReason::Empty,
-                confirmation: confirmation.clone(),
-            }),
+            super::super::confirmation_flow::work_mode_confirm_parse_status(
+                &super::WorkModeConfirmOutcome::Fallback {
+                    reason: super::work_mode_confirm::WorkModeFallbackReason::Empty,
+                    confirmation: confirmation.clone(),
+                }
+            ),
             super::WorkModeConfirmParseStatus::Empty
         );
         assert_eq!(
-            super::work_mode_confirm_parse_status(&super::WorkModeConfirmOutcome::Fallback {
-                reason: super::work_mode_confirm::WorkModeFallbackReason::UnknownMode,
-                confirmation,
-            }),
+            super::super::confirmation_flow::work_mode_confirm_parse_status(
+                &super::WorkModeConfirmOutcome::Fallback {
+                    reason: super::work_mode_confirm::WorkModeFallbackReason::UnknownMode,
+                    confirmation,
+                }
+            ),
             super::WorkModeConfirmParseStatus::Malformed
         );
     }

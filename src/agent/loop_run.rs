@@ -272,6 +272,13 @@ mod case_record_extract;
 // below via `pub use` (pre-existing surface), the rest is `pub(super)`
 // (DR3-001).
 mod precaution_relevance;
+// Issue #576 / #579 / #580 confirmation-flow plumbing extracted from
+// `turn.rs` (parent #680). Hosts `should_writeback_first_pass`,
+// `effective_turn_index_for_stage`, `preflight_*_skip_reason`,
+// `quality_confirm_cached_result`, `work_mode_confirm_parse_status`,
+// `log_*_confirm_outcome`, `override_feedback_kind_from_outcome`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod confirmation_flow;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
