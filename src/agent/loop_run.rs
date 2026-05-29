@@ -762,7 +762,7 @@ pub(crate) fn emit_safe_stop_report_repair_exhausted_for_test(agent: &mut Agent)
     if agent.repair_job.is_none() {
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_repair_exhausted();
+    verifier_orchestration::emit_safe_stop_report_for_repair_exhausted(agent);
 }
 
 /// Issue #662 (Codex CB-002): production-path test seam that drives the
@@ -891,7 +891,7 @@ pub(crate) fn drive_record_repair_attempt_outcomes_for_test(
             .repair_job
             .as_mut()
             .map(|job| job.record_repair_attempt_outcome(outcome));
-        agent.maybe_emit_repair_exhausted_from_promotion(promotion);
+        verifier_orchestration::maybe_emit_repair_exhausted_from_promotion(agent, promotion);
     }
 }
 
