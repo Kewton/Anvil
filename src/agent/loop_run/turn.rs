@@ -78,7 +78,8 @@ use super::verifier_repair_targeting::{
 
 use super::photon_feedback_derive::{
     PhotonFeedbackOutcome, PhotonOutcomeInputs, build_rerun_prompt_hint_if_eligible,
-    derive_photon_feedback_outcome, prepare_adopted_ids_for_evaluate,
+    derive_photon_feedback_outcome, photon_evaluate_adoption_status, photon_items_adopted_count,
+    photon_outcome_json_value, prepare_adopted_ids_for_evaluate,
 };
 #[cfg(test)]
 use super::repair_patch_validation::VerifierRepairIntent;
@@ -1644,27 +1645,6 @@ fn anti_pattern_failed_action_summary(frame: &FeedbackFrame) -> String {
         .clone()
         .or_else(|| frame.command().map(|s| s.to_string()))
         .unwrap_or_else(|| format!("{:?}", frame.kind))
-}
-
-fn photon_evaluate_adoption_status(shadow_mode: bool, adopted_items: usize) -> &'static str {
-    if shadow_mode {
-        "shadow_not_injected"
-    } else if adopted_items > 0 {
-        "injected"
-    } else {
-        "not_injected"
-    }
-}
-
-fn photon_items_adopted_count(shadow_mode: bool, adopted_items: usize) -> usize {
-    if shadow_mode { 0 } else { adopted_items }
-}
-
-fn photon_outcome_json_value(outcome: Option<&'static str>) -> serde_json::Value {
-    match outcome {
-        Some(value) => serde_json::Value::String(value.to_string()),
-        None => serde_json::Value::Null,
-    }
 }
 
 fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> tester::ApprovalMode {
