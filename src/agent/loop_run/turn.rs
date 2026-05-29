@@ -11,10 +11,6 @@ use super::auto_test::{
     build_agent_verifier_invoked_payload,
 };
 use super::completion_evidence::is_repo_edit_no_op;
-use super::feedback_kind_confirm::{
-    self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
-    FeedbackKindConfirmOutcome, run_feedback_kind_confirm_with_strategy,
-};
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::model_request::{build_assistant_request_plan, request_non_streaming_assistant_reply};
 use super::repair_driver::{
@@ -29,12 +25,6 @@ use super::repair_patch_validation::{
 
 use super::answer_only_mode::{
     answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
-};
-use super::confirmation_flow::{
-    effective_turn_index_for_stage, log_feedback_kind_confirm_outcome, log_quality_confirm_outcome,
-    log_work_mode_confirm_outcome, override_feedback_kind_from_outcome,
-    preflight_feedback_kind_skip_reason, preflight_quality_confirm_skip_reason,
-    preflight_work_mode_skip_reason, quality_confirm_cached_result, should_writeback_first_pass,
 };
 use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
@@ -107,35 +97,25 @@ use super::verifier_orchestration::{
 };
 use super::verifier_repair_shadow::legacy_repair_brief_input_from_assessment;
 use super::verifier_repair_targeting::changed_files_for_verifier;
-use super::work_mode_confirm::{
-    self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
-    run_work_mode_confirm_with_strategy,
-};
 use super::workspace_candidates::existing_workspace_candidate_for_role_in_scope;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
 use crate::agent::orchestration::verify_repo_progress;
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::model_capabilities::model_capabilities;
-use crate::modes::plan_act::{ModeClassification, WorkMode, classify_work_mode_json};
+use crate::modes::plan_act::WorkMode;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
-use crate::session::feedback::FeedbackKind;
 use crate::session::store::ScaffoldArtifactFileSnapshot;
 use crate::tools::registry::{BashErrorClass, ToolSpec};
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::deterministic;
 use super::quality::{
-    first_existing_impl_target, quality_first_pass_observation, repo_change_request_text,
-    request_allows_fast_polish_fallback, request_explicitly_requires_tests,
-    request_mentions_unsupported_ui_framework, request_needs_playable_ui_quality_gate,
-    workspace_has_unsupported_ui_framework,
-};
-use super::quality_confirm::{
-    self, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmInputs, QualityConfirmOutcome,
-    QualityConfirmation, QualityConfirmationSource, run_quality_confirm_with_strategy,
+    first_existing_impl_target, repo_change_request_text, request_allows_fast_polish_fallback,
+    request_explicitly_requires_tests, request_mentions_unsupported_ui_framework,
+    request_needs_playable_ui_quality_gate, workspace_has_unsupported_ui_framework,
 };
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
@@ -255,424 +235,6 @@ pub(super) fn quality_confirm_cache_key(request: &str, content: &str) -> u64 {
 }
 
 impl Agent {
-    /// Issue #576: SSoT wrapper that classifies user input with
-    /// `classify_work_mode_json`, emits the existing
-    /// `agent.work_mode.classified` event (now with `turn_index`), then drives
-    /// the LLM second-pass confirmation via `maybe_invoke_work_mode_confirm`.
-    /// Returns the first-pass classification — the final (possibly LLM-
-    /// corrected) work_mode is written into `self.session.mode_state.work_mode`
-    /// by the wrapper before this function returns, so the caller can read
-    /// `self.session.mode_state.work_mode` immediately afterwards.
-    ///
-    /// CB-001 (Issue #576 follow-up): when the per-turn confirmation cap has
-    /// already been consumed for this user input (e.g. `auto_plan_precheck`
-    /// invoked the second-pass first), do NOT overwrite the previously-resolved
-    /// `session.mode_state.work_mode` with the new first-pass result.
-    /// `maybe_invoke_work_mode_confirm` will then early-return as
-    /// `Skipped(PerTurnCapConsumed)` and the confirmed value survives. The
-    /// `agent.work_mode.classified` event is still emitted so downstream
-    /// observers can see the second classification attempt.
-    ///
-    /// CB-004 (Issue #576 follow-up): `auto_plan_precheck` runs in
-    /// `process_line` BEFORE `handle_user_message` increments
-    /// `current_turn_index`, so logging the raw counter would emit a stale value
-    /// for the precheck event. The wrapper compensates by logging
-    /// `current_turn_index + 1` for that specific stage so the precheck event
-    /// shares the same `(session_id, turn_index)` join key as the matching
-    /// `turn_start` event and the post-loop AnvilScore event.
-    pub(super) fn classify_with_confirmation(
-        &mut self,
-        input: &str,
-        stage_label: &'static str,
-    ) -> ModeClassification {
-        let classification = classify_work_mode_json(input);
-        // CB-001: only write back the first-pass result when the per-turn cap
-        // has NOT yet been consumed. Otherwise the previous call already
-        // resolved the final mode and we must keep it.
-        if should_writeback_first_pass(self.work_mode_confirm_called_this_turn) {
-            self.session.mode_state.work_mode = classification.work_mode;
-        }
-        // CB-004: align `turn_index` with the upcoming `handle_user_message`
-        // turn for the pre-`handle_user_message` precheck event.
-        let event_turn_index = effective_turn_index_for_stage(stage_label, self.current_turn_index);
-        log_llm_event(
-            "agent.work_mode.classified",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": event_turn_index,
-                "input": input,
-                "stage": stage_label,
-                "work_mode": classification.work_mode.as_str(),
-                "intent": classification.intent,
-                "confidence": classification.confidence,
-                "ambiguity": classification.ambiguity,
-                "alternative_gap": classification.alternative_gap,
-                "allows_file_edits": classification.allows_file_edits,
-                "requires_tests": classification.requires_tests,
-                "reason": classification.reason,
-                "evidence": &classification.evidence,
-                "alternatives": &classification.alternatives,
-            }),
-        );
-        self.maybe_invoke_work_mode_confirm(&classification, input, event_turn_index);
-        classification
-    }
-
-    /// Issue #576: gate + dispatch the WorkMode second-pass confirmation. Skip
-    /// order (DR2-004):
-    ///   1. `work_mode_confirm_called_this_turn` (per-turn cap)
-    ///   2. Plan mode (caller-decided)
-    ///   3. `ANVIL_NO_MODE_CONFIRM` env
-    ///   4. `first_pass_has_explicit_no_edit_signal` — handled by the
-    ///      orchestrator as `Skipped(ExplicitReadOnly)`.
-    ///   5. `should_request_confirmation == false` — handled by the
-    ///      orchestrator as `Skipped(HighConfidence)`.
-    ///
-    /// Sidecar unavailable / timeout / transport / malformed responses map to
-    /// `Fallback` (consumes per-turn cap; first-pass work_mode kept).
-    ///
-    /// CB-004 (Issue #576 follow-up): `turn_index` is passed in by the caller
-    /// rather than read from `self.current_turn_index`, so events emitted by
-    /// the pre-`handle_user_message` `auto_plan_precheck` stage share the
-    /// upcoming-turn join key with the matching `turn_start` events.
-    pub(super) fn maybe_invoke_work_mode_confirm(
-        &mut self,
-        first_pass: &ModeClassification,
-        raw_input: &str,
-        turn_index: usize,
-    ) {
-        let session_id = self.session_store.session_id().to_string();
-        let sidecar_model = self.models.sidecar.clone();
-        let env_disabled =
-            work_mode_confirm::work_mode_confirm_disabled(|k: &str| std::env::var(k));
-        if let Some(reason) = preflight_work_mode_skip_reason(
-            self.work_mode_confirm_called_this_turn,
-            self.session.mode_state.mode,
-            env_disabled,
-        ) {
-            let outcome = WorkModeConfirmOutcome::Skipped { reason };
-            log_work_mode_confirm_outcome(
-                &outcome,
-                &session_id,
-                sidecar_model.as_deref(),
-                turn_index,
-                first_pass,
-                None,
-            );
-            return;
-        }
-
-        // Build inputs + invoke orchestrator. The orchestrator handles the
-        // remaining skip / fallback branches.
-        let inputs = WorkModeConfirmInputs {
-            first_pass,
-            raw_input,
-            session_id: &session_id,
-            turn_index,
-            model: sidecar_model.as_deref(),
-        };
-
-        let attempt_started = Instant::now();
-        let outcome = self.run_work_mode_confirm_attempt(inputs, &sidecar_model);
-        let latency_ms = attempt_started.elapsed().as_millis() as u64;
-
-        if let WorkModeConfirmOutcome::Confirmed(c) = &outcome {
-            self.session.mode_state.work_mode = c.mode;
-        }
-
-        log_work_mode_confirm_outcome(
-            &outcome,
-            &session_id,
-            sidecar_model.as_deref(),
-            turn_index,
-            first_pass,
-            Some(latency_ms),
-        );
-    }
-
-    fn run_work_mode_confirm_attempt(
-        &mut self,
-        inputs: WorkModeConfirmInputs<'_>,
-        sidecar_model: &Option<String>,
-    ) -> WorkModeConfirmOutcome {
-        if let Some(sidecar_name) = sidecar_model.as_ref() {
-            // We're about to dispatch — consume the per-turn cap regardless of
-            // success/failure (DR4-004) so timeout/malformed/oversized cannot
-            // re-trigger another dispatch in the same user-input.
-            self.work_mode_confirm_called_this_turn = true;
-            let confirm_client = self
-                .client
-                .clone_with_overrides(WORK_MODE_CONFIRM_TIMEOUT_SECS, 384)
-                .ok();
-            run_work_mode_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
-                Some(c) => c
-                    .chat_text(
-                        sidecar_name,
-                        &[ConversationMessage::user(prompt.to_string())],
-                    )
-                    .map(|reply| reply.content),
-                None => Err("client clone_with_overrides failed".to_string()),
-            })
-        } else {
-            // sidecar_model is None — orchestrator returns Fallback(SidecarUnavailable)
-            // without invoking the closure. We do not consume the per-turn cap
-            // because the user might transition into a state where the sidecar
-            // becomes available later in this same turn (defensive design).
-            run_work_mode_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
-        }
-    }
-
-    /// Issue #579: FeedbackKind second-pass confirmation wrapper. Called from
-    /// `success.rs` facade immediately before `record_feedback_if_unset(fb)`
-    /// when `VerifierOutcome::AutoTestRan { feedback: Some(_), .. }` is in
-    /// hand. Returns `Some(corrected_kind)` only when the orchestrator
-    /// resolved `Confirmed(SecondPassOverridden)` AND the LLM-chosen kind
-    /// actually differs from the first-pass kind; otherwise returns `None`
-    /// and the caller keeps `fb.kind` unchanged.
-    ///
-    /// Gate evaluation order (DR1-003 / DR2-005):
-    ///   1. Plan mode                              → Skip(PlanMode), cap intact
-    ///   2. `ANVIL_NO_FEEDBACK_KIND_CONFIRM` env   → Skip(EnvDisabled), cap intact
-    ///   3. per-turn cap already consumed          → Skip(PerTurnCapConsumed), cap intact
-    ///   4. Otherwise → orchestrator
-    ///
-    /// Per-turn cap (`feedback_kind_confirm_called_this_turn`) is consumed
-    /// here — not inside the orchestrator — because the orchestrator is a
-    /// pure function that does not hold `&mut Agent`. The cap is set only
-    /// when `model.is_some()` so `Fallback(SidecarUnavailable)` (model None)
-    /// remains retryable on a later turn.
-    pub(super) fn classify_with_feedback_confirm(
-        &mut self,
-        first_pass: &FeedbackKind,
-        combined_output: &str,
-    ) -> Option<FeedbackKind> {
-        let session_id = self.session_store.session_id().to_string();
-        let sidecar_model = self.models.sidecar.clone();
-        let turn_index = self.current_turn_index;
-        let combined_bytes = combined_output.len();
-        let env_disabled =
-            feedback_kind_confirm::feedback_kind_confirm_disabled(|k: &str| std::env::var(k));
-        if let Some(reason) = preflight_feedback_kind_skip_reason(
-            self.feedback_kind_confirm_called_this_turn,
-            self.session.mode_state.mode,
-            env_disabled,
-        ) {
-            let outcome = FeedbackKindConfirmOutcome::Skipped { reason };
-            log_feedback_kind_confirm_outcome(
-                &outcome,
-                &session_id,
-                turn_index,
-                first_pass,
-                sidecar_model.as_deref(),
-                combined_bytes,
-                None,
-            );
-            return None;
-        }
-        let inputs = FeedbackKindConfirmInputs {
-            first_pass,
-            combined_output,
-            session_id: &session_id,
-            turn_index,
-            model: sidecar_model.as_deref(),
-        };
-        let attempt_started = Instant::now();
-        let outcome = self.run_feedback_kind_confirm_attempt(inputs, &sidecar_model);
-        let latency_ms = attempt_started.elapsed().as_millis() as u64;
-        let override_kind = override_feedback_kind_from_outcome(&outcome, first_pass);
-        log_feedback_kind_confirm_outcome(
-            &outcome,
-            &session_id,
-            turn_index,
-            first_pass,
-            sidecar_model.as_deref(),
-            combined_bytes,
-            Some(latency_ms),
-        );
-        override_kind
-    }
-
-    fn run_feedback_kind_confirm_attempt(
-        &mut self,
-        inputs: FeedbackKindConfirmInputs<'_>,
-        sidecar_model: &Option<String>,
-    ) -> FeedbackKindConfirmOutcome {
-        if let Some(sidecar_name) = sidecar_model.as_ref() {
-            self.feedback_kind_confirm_called_this_turn = true;
-            let confirm_client = self
-                .client
-                .clone_with_overrides(FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, 384)
-                .ok();
-            run_feedback_kind_confirm_with_strategy(inputs, |prompt| {
-                match confirm_client.as_ref() {
-                    Some(c) => c
-                        .chat_text(
-                            sidecar_name,
-                            &[ConversationMessage::user(prompt.to_string())],
-                        )
-                        .map(|reply| reply.content),
-                    None => Err("client clone_with_overrides failed".to_string()),
-                }
-            })
-        } else {
-            run_feedback_kind_confirm_with_strategy(inputs, |_| {
-                Err("sidecar unavailable".to_string())
-            })
-        }
-    }
-
-    /// Issue #580: Quality-gate second-pass confirmation wrapper. Replaces
-    /// direct `implementation_quality_issue_for_request(request, content)`
-    /// calls in `accepted_repo_change_quality_issue` /
-    /// `accepted_repo_change_polish_target`. Signature mirrors the SSoT
-    /// wrapper so callsites stay one-line drop-in replacements.
-    ///
-    /// Gate evaluation order (Skip → Fallback → Confirmed):
-    ///   1. Plan mode (caller-host check + defensive 2nd check here)
-    ///   2. `ANVIL_NO_QUALITY_CONFIRM` env disabled
-    ///   3. per-turn cap consumed AND no cache hit
-    ///   4. per-turn cap consumed AND cache hit → return cached `issue`
-    ///   5. early fail / all_zero / all_strong / no sidecar / etc. handled
-    ///      by `run_quality_confirm_with_strategy` (orchestrator)
-    ///
-    /// Returns the final `issue` (None = pass, Some = quality gate fail).
-    pub(super) fn implementation_quality_issue_with_confirm(
-        &mut self,
-        request: &str,
-        content: &str,
-    ) -> Option<String> {
-        // SSoT first-pass observation. The wrapper signature `Option<String>`
-        // is preserved for the deterministic / non-confirmable paths.
-        let observation = quality_first_pass_observation(request, content);
-
-        let session_id = self.session_store.session_id().to_string();
-        let sidecar_model = self.models.sidecar.clone();
-        let turn_index = self.current_turn_index;
-        let content_hash = quality_confirm_cache_key(request, content);
-        if let Some(skip_reason) = preflight_quality_confirm_skip_reason(
-            self.session.mode_state.mode,
-            quality_confirm::quality_confirm_disabled(|k: &str| std::env::var(k)),
-            self.quality_confirm_called_this_turn,
-        ) {
-            if skip_reason == quality_confirm::QualityConfirmSkipReason::PerTurnCapConsumed
-                && let Some(cached) = quality_confirm_cached_result(
-                    self.last_quality_confirm_result.as_ref(),
-                    content_hash,
-                )
-            {
-                let outcome = QualityConfirmOutcome::Confirmed(cached.clone());
-                log_quality_confirm_outcome(
-                    &outcome,
-                    &session_id,
-                    sidecar_model.as_deref(),
-                    turn_index,
-                    &observation,
-                    None,
-                );
-                return cached.issue;
-            }
-            let outcome = QualityConfirmOutcome::Skipped {
-                reason: skip_reason,
-            };
-            log_quality_confirm_outcome(
-                &outcome,
-                &session_id,
-                sidecar_model.as_deref(),
-                turn_index,
-                &observation,
-                None,
-            );
-            return observation.issue;
-        }
-
-        let will_dispatch =
-            sidecar_model.is_some() && should_request_quality_confirmation(&observation);
-        let inputs = QualityConfirmInputs {
-            observation: &observation,
-            request,
-            content,
-            session_id: &session_id,
-            turn_index,
-            model: sidecar_model.as_deref(),
-        };
-        let attempt_started = Instant::now();
-        let outcome =
-            self.run_quality_confirm_attempt(inputs, sidecar_model.as_deref(), will_dispatch);
-        let latency_ms = attempt_started.elapsed().as_millis() as u64;
-        let final_issue = self.resolve_quality_confirm_issue(&outcome, content_hash, &observation);
-        log_quality_confirm_outcome(
-            &outcome,
-            &session_id,
-            sidecar_model.as_deref(),
-            turn_index,
-            &observation,
-            Some(latency_ms),
-        );
-
-        final_issue
-    }
-
-    fn run_quality_confirm_attempt(
-        &mut self,
-        inputs: QualityConfirmInputs<'_>,
-        sidecar_model: Option<&str>,
-        will_dispatch: bool,
-    ) -> QualityConfirmOutcome {
-        if let Some(sidecar_name) = sidecar_model {
-            if will_dispatch {
-                self.quality_confirm_called_this_turn = true;
-            }
-            let confirm_client = self
-                .client
-                .clone_with_overrides(QUALITY_CONFIRM_TIMEOUT_SECS, 384)
-                .ok();
-            run_quality_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
-                Some(c) => c
-                    .chat_text(
-                        sidecar_name,
-                        &[ConversationMessage::user(prompt.to_string())],
-                    )
-                    .and_then(|reply| {
-                        if !reply.tool_calls.is_empty() {
-                            Err("sidecar reply contained unexpected tool_calls".to_string())
-                        } else {
-                            Ok(reply.content)
-                        }
-                    }),
-                None => Err("client clone_with_overrides failed".to_string()),
-            })
-        } else {
-            run_quality_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
-        }
-    }
-
-    fn resolve_quality_confirm_issue(
-        &mut self,
-        outcome: &QualityConfirmOutcome,
-        content_hash: u64,
-        observation: &super::quality::QualityFirstPassObservation,
-    ) -> Option<String> {
-        match outcome {
-            QualityConfirmOutcome::Confirmed(c) => {
-                self.last_quality_confirm_result = Some((content_hash, c.clone()));
-                c.issue.clone()
-            }
-            QualityConfirmOutcome::Skipped { .. } | QualityConfirmOutcome::Fallback { .. } => {
-                if self.quality_confirm_called_this_turn {
-                    self.last_quality_confirm_result = Some((
-                        content_hash,
-                        QualityConfirmation {
-                            issue: observation.issue.clone(),
-                            reason: None,
-                            source: QualityConfirmationSource::FirstPass,
-                        },
-                    ));
-                }
-                observation.issue.clone()
-            }
-        }
-    }
-
     pub(super) fn handle_user_message(&mut self, input: &str, stream_output: bool) -> LoopResult {
         // Start the ESC interrupt monitor for the duration of this turn only —
         // rustyline owns raw mode during the REPL line-edit, so the monitor
@@ -882,7 +444,8 @@ impl Agent {
             // (now with `turn_index`) and drives the LLM second-pass via
             // `maybe_invoke_work_mode_confirm`. Final (LLM-corrected when
             // applicable) work_mode lives in `self.session.mode_state.work_mode`.
-            let _ = self.classify_with_confirmation(input, "turn_start");
+            let _ =
+                super::classify_confirm_flow::classify_with_confirmation(self, input, "turn_start");
             self.maybe_compact_session(DEFAULT_KEEP_TAIL);
         }
         let _ = self.refresh_plan_stage();
@@ -6247,7 +5810,9 @@ impl Agent {
         let content = std::fs::read_to_string(&target).ok()?;
         // Issue #580: route through the second-pass adapter so borderline UI
         // verdicts can be confirmed/overridden by the sidecar LLM.
-        let issue = self.implementation_quality_issue_with_confirm(&request, &content)?;
+        let issue = super::classify_confirm_flow::implementation_quality_issue_with_confirm(
+            self, &request, &content,
+        )?;
         let relative = target
             .strip_prefix(&self.work_root)
             .unwrap_or(&target)
@@ -6274,9 +5839,10 @@ impl Agent {
         // as `Some(...)` which correctly suppresses the polish action
         // (treating the file as a quality issue rather than polishing static
         // code).
-        if self
-            .implementation_quality_issue_with_confirm(&request, &content)
-            .is_some()
+        if super::classify_confirm_flow::implementation_quality_issue_with_confirm(
+            self, &request, &content,
+        )
+        .is_some()
         {
             return None;
         }

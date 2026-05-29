@@ -912,7 +912,11 @@ impl Agent {
         // `maybe_invoke_work_mode_confirm`. After it returns, the final
         // work_mode (LLM-corrected when applicable) lives in
         // `self.session.mode_state.work_mode`.
-        let _classification = self.classify_with_confirmation(input, "auto_plan_precheck");
+        let _classification = super::classify_confirm_flow::classify_with_confirmation(
+            self,
+            input,
+            "auto_plan_precheck",
+        );
         let work_mode = self.session.mode_state.work_mode;
         let policy = work_mode.policy();
         if !policy.repo_edit_required {

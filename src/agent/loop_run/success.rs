@@ -461,7 +461,11 @@ impl Agent {
                     let mut fb = fb.clone();
                     let combined_output = auto_test_combined_output.as_str();
                     if let Some(confirmed_kind) =
-                        self.classify_with_feedback_confirm(&fb.kind, combined_output)
+                        super::classify_confirm_flow::classify_with_feedback_confirm(
+                            self,
+                            &fb.kind,
+                            combined_output,
+                        )
                     {
                         fb.kind = confirmed_kind;
                     }
