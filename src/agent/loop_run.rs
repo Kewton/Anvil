@@ -293,6 +293,12 @@ mod deterministic_fallback_plan;
 // `sync_package_json_with_existing_lock`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod path_helpers;
+// Small standalone helpers extracted from `turn.rs` (parent #680). Hosts
+// `rfc3339_now_utc`, `masked_path_hash_bounded_list`,
+// `latest_tool_result_since_last_user`, `raw_mode_safe_text`,
+// `user_interrupt_result`, `anti_pattern_failed_action_summary`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod small_helpers;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
