@@ -298,6 +298,12 @@ mod deterministic_fallback_plan;
 // `sync_package_json_with_existing_lock`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod path_helpers;
+// Plan-section progress helpers extracted from `turn.rs` (parent #680).
+// Hosts `join_sections_for_progress`, `plan_sections_with_content`,
+// `plan_section_body_for_progress` + the private heading normalization
+// SSOT (`plan_section_has_content`, `normalize_plan_heading_for_progress`).
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod plan_sections;
 // Small standalone helpers extracted from `turn.rs` (parent #680). Hosts
 // `rfc3339_now_utc`, `masked_path_hash_bounded_list`,
 // `latest_tool_result_since_last_user`, `raw_mode_safe_text`,
