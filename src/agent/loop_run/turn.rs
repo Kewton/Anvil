@@ -76,6 +76,9 @@ use super::verifier_repair_targeting::{
     verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
 
+use super::answer_only_mode::{
+    answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
+};
 use super::photon_feedback_derive::{
     build_rerun_prompt_hint_if_eligible, request_explicitly_requests_script_execution,
 };
@@ -529,84 +532,6 @@ fn latest_tool_result_since_last_user<'a>(
         }
     }
     None
-}
-
-fn truncate_for_answer(text: &str, max_chars: usize) -> String {
-    let total = text.chars().count();
-    if total <= max_chars {
-        return text.to_string();
-    }
-    let keep = max_chars.saturating_sub(32);
-    let truncated = text.chars().take(keep).collect::<String>();
-    format!(
-        "{truncated}\n...[truncated {} chars]",
-        total.saturating_sub(keep)
-    )
-}
-
-fn answer_only_script_execution_fallback_response(output: &str) -> String {
-    let excerpt = truncate_for_answer(output.trim(), 1_600);
-    let status = output
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("exit_code="))
-        .map(|code| {
-            if code == "0" {
-                "コマンドは exit_code=0 で正常終了しています。".to_string()
-            } else {
-                format!("コマンドは exit_code={code} で終了しています。")
-            }
-        })
-        .unwrap_or_else(|| "コマンドの出力を確認しました。".to_string());
-
-    format!(
-        "ファイルは変更せず、指定されたコマンド/スクリプトの実行結果を確認しました。\n\n実行結果:\n```text\n{excerpt}\n```\n\n要約:\n- {status}\n- 上記の stdout/stderr が今回確認できた実行結果です。"
-    )
-}
-
-const ANSWER_ONLY_SCRIPT_ALLOWED_PREFIXES: &[&str] =
-    &["bash ", "sh ", "./", "python ", "python3 ", "node "];
-const ANSWER_ONLY_SCRIPT_BLOCKED_CONTAINS: &[&str] = &[
-    " >", ">>", " 2>", " | ", " && ", " || ", ";", " rm ", " mv ", " cp ", " touch ", " mkdir ",
-    " tee ", "sed -i", "perl -pi",
-];
-const ANSWER_ONLY_SCRIPT_BLOCKED_PREFIXES: &[&str] =
-    &["rm ", "mv ", "cp ", "touch ", "mkdir ", "tee "];
-
-fn answer_only_script_contains_any(command: &str, patterns: &[&str]) -> bool {
-    patterns.iter().any(|pattern| command.contains(pattern))
-}
-
-fn answer_only_script_starts_with_any(command: &str, prefixes: &[&str]) -> bool {
-    prefixes.iter().any(|prefix| command.starts_with(prefix))
-}
-
-fn answer_only_cd_segment_allowed(segment: &str) -> bool {
-    segment.starts_with("cd ") && !answer_only_script_contains_any(segment, &[";", "|", ">"])
-}
-
-fn answer_only_cd_chained_script_tail(command: &str) -> Option<&str> {
-    let (cd_segment, rest) = command.split_once(" && ")?;
-    answer_only_cd_segment_allowed(cd_segment).then_some(rest)
-}
-
-fn answer_only_script_has_blocked_operation(command: &str) -> bool {
-    answer_only_script_contains_any(command, ANSWER_ONLY_SCRIPT_BLOCKED_CONTAINS)
-        || answer_only_script_starts_with_any(command, ANSWER_ONLY_SCRIPT_BLOCKED_PREFIXES)
-}
-
-fn answer_only_script_command_allowed(command: &str) -> bool {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if let Some(rest) = answer_only_cd_chained_script_tail(&lower) {
-        return answer_only_script_command_allowed(rest);
-    }
-    if answer_only_script_has_blocked_operation(&lower) {
-        return false;
-    }
-    answer_only_script_starts_with_any(&lower, ANSWER_ONLY_SCRIPT_ALLOWED_PREFIXES)
 }
 
 fn case_record_auto_test_active(score: &crate::session::anvil_score::AnvilScore) -> bool {
