@@ -601,7 +601,7 @@ pub fn acquire_footer_with_terminal_flag_for_test(
 pub fn build_verifier_exit_zero_evidence_for_test(
     outcome: &crate::tools::bash::BashExecutionOutcome,
 ) -> Option<(String, &'static str)> {
-    let evidence = turn::build_verifier_exit_zero_evidence(outcome)?;
+    let evidence = verifier_orchestration::build_verifier_exit_zero_evidence(outcome)?;
     match evidence {
         completion_evidence::CompletionEvidence::VerifierExitZero { class, command, .. } => {
             Some((command, class.as_str()))
