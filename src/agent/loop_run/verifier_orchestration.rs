@@ -44,6 +44,10 @@ use super::completion_evidence::{
     redact_verifier_command_for_storage,
 };
 use super::failure_packet::FailurePacket;
+use super::patch_proposal::PatchProposal;
+use super::patch_provider::{
+    PatchProviderKind, PatchProviderOutput, PatchProviderRequest, admit_patch_provider_output,
+};
 use super::progress_text::truncate;
 use super::repair_attempt_outcome::RepairAttemptOutcome;
 use super::repair_authority::AuthorityEvidence;
@@ -58,8 +62,9 @@ use super::repair_framework_findings::{
     findings_for_diagnostic as verifier_framework_findings_for_diagnostic,
 };
 use super::repair_job::{
-    RepairJob, mask_code_excerpt_preserving_patch_anchors, mask_secrets_headers_and_neutralize,
-    safe_relative_path_string, verifier_repair_effective_target_hint,
+    RepairJob, RepairTerminalReason, StopReason, mask_code_excerpt_preserving_patch_anchors,
+    mask_secrets_headers_and_neutralize, safe_relative_path_string,
+    verifier_repair_effective_target_hint,
 };
 use super::repair_patch_validation::{
     ValidatedVerifierRepairEdit, ValidationFailure, VerifierRepairIntent,
@@ -67,11 +72,13 @@ use super::repair_patch_validation::{
     validate_accepted_repair_plan_authorizes_target,
 };
 use super::repair_plan::AcceptedRepairPlan;
+use super::repair_progress::classify_repair_progress;
 use super::repair_target_admission::{RepairTargetAdmissionContext, admit_repair_target_hint};
 use super::required_behavior::{BehaviorContractProjection, behavior_contract_payload_value};
 use super::semantic_repair_planning::{
     diagnostic_target_allowed_by_confidence, first_role_kind_compatible_diagnostic_target,
 };
+use super::summary::ExitReason;
 use super::task_contract::{ArtifactRole, CompletionDecision, RecoveryTargetHint, TaskContract};
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
@@ -92,6 +99,7 @@ use super::verifier_repair_targeting::{
 };
 use super::{VerifierRepairAssessment, VerifierRepairAssessmentSource};
 use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
+use crate::logging::{log_llm_event, stable_path_hash};
 use crate::modes::plan_act::ExecutionMode;
 use crate::safety::path_guard::resolve_user_path;
 use crate::session::feedback::mask_secrets;
@@ -1405,7 +1413,7 @@ pub(super) fn parse_verifier_repair_intents_reply(
 #[cfg(test)]
 pub(super) fn parse_verifier_repair_patch_proposal_reply(
     reply: &str,
-) -> Result<super::patch_proposal::PatchProposal, String> {
+) -> Result<PatchProposal, String> {
     super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
         reply,
         verifier_repair_intent_limits(),
@@ -1414,7 +1422,7 @@ pub(super) fn parse_verifier_repair_patch_proposal_reply(
 
 #[cfg(test)]
 pub(super) fn patch_proposal_to_verifier_repair_intents(
-    proposal: super::patch_proposal::PatchProposal,
+    proposal: PatchProposal,
 ) -> Result<Vec<VerifierRepairIntent>, String> {
     super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
         proposal,
@@ -1721,4 +1729,192 @@ pub(super) fn validate_verifier_repair_intents_inner(
         contents,
         fingerprint,
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PatchProposalShadowValidation {
+    pub(super) status: &'static str,
+    pub(super) reason: &'static str,
+}
+
+impl PatchProposalShadowValidation {
+    pub(super) fn is_decisive(self) -> bool {
+        match (self.status, self.reason) {
+            ("accepted", _) => true,
+            // The production validator supports a bounded whitespace-normalized
+            // apply path, while the patch-provider admission shadow currently
+            // checks only exact substrings. Do not let the shadow preempt the
+            // real validator for this recoverable anchor mismatch.
+            ("rejected", "old_string_not_found") => false,
+            ("rejected", _) => true,
+            _ => false,
+        }
+    }
+
+    pub(super) fn accepted(self) -> bool {
+        self.status == "accepted"
+    }
+}
+
+pub(super) fn repair_terminal_exit_reason(reason: RepairTerminalReason) -> ExitReason {
+    match reason.safe_stop_reason() {
+        Some(StopReason::RepairExhausted) => ExitReason::RepairExhausted,
+        Some(_) => ExitReason::RepairSafeStop,
+        None => ExitReason::VerifierFailed,
+    }
+}
+
+pub(super) fn emit_repair_progress_classified_event(
+    session_id: &str,
+    previous_context: Option<&super::repair_job::RepairJob>,
+    current_context: Option<&super::repair_job::RepairJob>,
+    verifier_passed: bool,
+) {
+    let Some(previous) = previous_context else {
+        return;
+    };
+    let patch_applied = !previous.applied_repair_intents.is_empty();
+    if !patch_applied {
+        return;
+    }
+    let current_signature = current_context.map(|context| context.failure_signature.as_str());
+    let current_failure_count = current_context.and_then(|context| context.failure_count);
+    let progress = classify_repair_progress(
+        &previous.failure_signature,
+        previous.failure_count,
+        current_signature,
+        current_failure_count,
+        patch_applied,
+        verifier_passed,
+    );
+    log_llm_event(
+        "agent.verifier_repair.progress_classified",
+        serde_json::json!({
+            "session_id": session_id,
+            "verdict": progress.verdict.as_str(),
+            "failure_signature_changed": progress.failure_signature_changed,
+            "failed_case_count_delta": progress.failed_case_count_delta,
+            "new_failure_introduced": progress.new_failure_introduced,
+            "previous_failure_signature_hash": stable_path_hash(&previous.failure_signature),
+            "current_failure_signature_hash": current_signature.map(stable_path_hash),
+            "previous_failure_count": previous.failure_count,
+            "current_failure_count": current_failure_count,
+        }),
+    );
+}
+
+pub(super) fn emit_patch_proposal_shadow_validation_event(
+    session_id: &str,
+    model: &str,
+    attempt: usize,
+    work_root: &Path,
+    accepted_plan: &super::repair_plan::AcceptedRepairPlan,
+    proposal: &PatchProposal,
+) -> PatchProposalShadowValidation {
+    let target_contents =
+        patch_proposal_target_contents_for_shadow(work_root, &proposal.target_path);
+    let validation = match target_contents.as_deref() {
+        Some(contents) => {
+            let request = PatchProviderRequest {
+                accepted_plan,
+                target_contents: contents,
+            };
+            let output = PatchProviderOutput {
+                provider_kind: PatchProviderKind::DiagnosticLlmAssisted,
+                proposal,
+            };
+            match admit_patch_provider_output(request, output) {
+                Ok(_) => PatchProposalShadowValidation {
+                    status: "accepted",
+                    reason: "ok",
+                },
+                Err(err) => PatchProposalShadowValidation {
+                    status: "rejected",
+                    reason: err.as_str(),
+                },
+            }
+        }
+        None => PatchProposalShadowValidation {
+            status: "unavailable",
+            reason: "target_unavailable",
+        },
+    };
+    let replace_all_count = proposal
+        .edits
+        .iter()
+        .filter(|edit| edit.replace_all)
+        .count();
+    log_llm_event(
+        "agent.verifier_patch_proposal.shadow_validation",
+        serde_json::json!({
+            "session_id": session_id,
+            "model": model,
+            "attempt": attempt,
+            "status": validation.status,
+            "reason": validation.reason,
+            "target_path_hash": stable_path_hash(&proposal.target_path),
+            "edit_count": proposal.edits.len(),
+            "replace_all_count": replace_all_count,
+        }),
+    );
+    validation
+}
+
+pub(super) fn emit_patch_proposal_legacy_validation_comparison_event(
+    session_id: &str,
+    model: &str,
+    attempt: usize,
+    proposal: &PatchProposal,
+    shadow_validation: PatchProposalShadowValidation,
+    legacy_validation: &Result<ValidatedVerifierRepairEdit, ValidationFailure>,
+) {
+    let legacy_status = if legacy_validation.is_ok() {
+        "accepted"
+    } else {
+        "rejected"
+    };
+    let legacy_reason = legacy_validation
+        .as_ref()
+        .err()
+        .map(ValidationFailure::reason_label)
+        .unwrap_or("ok");
+    let agreement = if shadow_validation.is_decisive() {
+        Some(shadow_validation.accepted() == legacy_validation.is_ok())
+    } else {
+        None
+    };
+    log_llm_event(
+        "agent.verifier_patch_proposal.validation_comparison",
+        serde_json::json!({
+            "session_id": session_id,
+            "model": model,
+            "attempt": attempt,
+            "target_path_hash": stable_path_hash(&proposal.target_path),
+            "edit_count": proposal.edits.len(),
+            "shadow_status": shadow_validation.status,
+            "shadow_reason": shadow_validation.reason,
+            "legacy_status": legacy_status,
+            "legacy_reason": legacy_reason,
+            "decisive_agreement": agreement,
+        }),
+    );
+}
+
+pub(super) fn patch_proposal_target_contents_for_shadow(
+    work_root: &Path,
+    relative_path: &str,
+) -> Option<String> {
+    if !super::repair_patch_validation::is_repair_path_input_safe(relative_path) {
+        return None;
+    }
+    let root = std::fs::canonicalize(work_root).ok()?;
+    let target = resolve_user_path(work_root, relative_path).ok()?;
+    let canonical = std::fs::canonicalize(target).ok()?;
+    if canonical.strip_prefix(root).is_err() || !canonical.is_file() {
+        return None;
+    }
+    if std::fs::metadata(&canonical).ok()?.len() > VERIFIER_REPAIR_PASS_MAX_FILE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(canonical).ok()
 }
