@@ -90,9 +90,7 @@ use super::scaffold_pipeline::PlanExplorationKey;
 use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
 #[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
-use super::scaffold_pipeline::{
-    ScaffoldFallbackResult, ScaffoldFramework, scaffold_candidate_priority,
-};
+use super::scaffold_pipeline::{ScaffoldFallbackResult, scaffold_candidate_priority};
 #[cfg(test)]
 use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
@@ -5510,7 +5508,11 @@ impl Agent {
         recovery_dispatch_gate: RecoveryDispatchGate,
         retry_state: &mut AssistantReplyRetryState,
     ) -> Result<Option<AssistantReplyRetryDecision>, String> {
-        if let Some(reply) = self.maybe_materialize_plan_after_tool_call_format_error(err)? {
+        if let Some(reply) =
+            super::scaffold_pipeline::maybe_materialize_plan_after_tool_call_format_error(
+                self, err,
+            )?
+        {
             return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
         }
         // Issue #634: Format-error 経路の制御フロー不変条件 (SSOT)
@@ -5637,10 +5639,12 @@ impl Agent {
         if !lifecycle::is_transport_error(err) || retry_state.extra_transport_retries == 0 {
             return Ok(None);
         }
-        if let Some(reply) = self.maybe_materialize_plan_after_timeout(err)? {
+        if let Some(reply) =
+            super::scaffold_pipeline::maybe_materialize_plan_after_timeout(self, err)?
+        {
             return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
         }
-        if self.maybe_fallback_plan_model_after_timeout(err) {
+        if super::scaffold_pipeline::maybe_fallback_plan_model_after_timeout(self, err) {
             return Ok(Some(AssistantReplyRetryDecision::Retry));
         }
         retry_state.transport_retry_count += 1;
@@ -5839,24 +5843,6 @@ impl Agent {
         super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(self, err)
     }
 
-    fn maybe_fallback_plan_model_after_timeout(&mut self, err: &str) -> bool {
-        super::scaffold_pipeline::maybe_fallback_plan_model_after_timeout(self, err)
-    }
-
-    fn maybe_materialize_plan_after_timeout(
-        &mut self,
-        err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
-        super::scaffold_pipeline::maybe_materialize_plan_after_timeout(self, err)
-    }
-
-    fn maybe_materialize_plan_after_tool_call_format_error(
-        &mut self,
-        err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
-        super::scaffold_pipeline::maybe_materialize_plan_after_tool_call_format_error(self, err)
-    }
-
     pub(super) fn materialize_deterministic_fallback_plan(
         &mut self,
         event_name: &str,
@@ -5931,7 +5917,9 @@ impl Agent {
 
     fn append_general_request_context_messages(&mut self, messages: &mut Vec<ConversationMessage>) {
         if self.active_task_expects_repo_change() && self.workspace_appears_empty() {
-            if let Some(framework) = self.active_task_requested_scaffold_framework() {
+            if let Some(framework) =
+                super::scaffold_pipeline::active_task_requested_scaffold_framework(self)
+            {
                 messages.push(ConversationMessage::system(
                     recovery::framework_scaffold_now_note(framework.label()),
                 ));
@@ -6058,10 +6046,12 @@ impl Agent {
         if let Some(note) = self.forced_small_edit_recovery_message() {
             messages.push(ConversationMessage::system(note));
         }
-        if let Some(note) = self.post_scaffold_edit_recovery_message() {
+        if let Some(note) = super::scaffold_pipeline::post_scaffold_edit_recovery_message(self) {
             messages.push(ConversationMessage::system(note));
         }
-        if let Some(note) = self.post_scaffold_continuation_recovery_message() {
+        if let Some(note) =
+            super::scaffold_pipeline::post_scaffold_continuation_recovery_message(self)
+        {
             messages.push(ConversationMessage::system(note));
         }
         if let Some(note) = self.verifier_repair_policy_message(effective_tool_policy) {
@@ -6864,26 +6854,10 @@ impl Agent {
         )
     }
 
-    fn post_scaffold_edit_recovery_message(&self) -> Option<String> {
-        super::scaffold_pipeline::post_scaffold_edit_recovery_message(self)
-    }
-
-    fn post_scaffold_continuation_recovery_message(&self) -> Option<String> {
-        super::scaffold_pipeline::post_scaffold_continuation_recovery_message(self)
-    }
-
-    fn post_scaffold_edit_recovery_target(&self) -> Option<PathBuf> {
-        super::scaffold_pipeline::post_scaffold_edit_recovery_target(self)
-    }
-
-    fn post_scaffold_continuation_recovery_target(&self) -> Option<PathBuf> {
-        super::scaffold_pipeline::post_scaffold_continuation_recovery_target(self)
-    }
-
     pub(super) fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
         self.forced_small_edit_recovery_target()
-            .or_else(|| self.post_scaffold_edit_recovery_target())
-            .or_else(|| self.post_scaffold_continuation_recovery_target())
+            .or_else(|| super::scaffold_pipeline::post_scaffold_edit_recovery_target(self))
+            .or_else(|| super::scaffold_pipeline::post_scaffold_continuation_recovery_target(self))
     }
 
     fn repo_change_no_edit_recovery_target(&self) -> Option<PathBuf> {
@@ -8080,7 +8054,9 @@ impl Agent {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
         }
-        if let Some(err) = self.empty_workspace_scaffold_policy_error(name, arguments) {
+        if let Some(err) =
+            super::scaffold_pipeline::empty_workspace_scaffold_policy_error(self, name, arguments)
+        {
             self.session.working_memory.note_error(err.clone());
             return lifecycle::format_tool_error(&err);
         }
@@ -9687,14 +9663,6 @@ impl Agent {
         )
     }
 
-    fn empty_workspace_scaffold_policy_error(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) -> Option<String> {
-        super::scaffold_pipeline::empty_workspace_scaffold_policy_error(self, name, arguments)
-    }
-
     pub(super) fn maybe_materialize_mode_deterministic_fallback(
         &mut self,
         last_iter: usize,
@@ -9739,10 +9707,6 @@ impl Agent {
                 recovery::classify_action_expectation(task, self.session.mode_state.mode)
                     == recovery::ActionExpectation::RepoChange
             })
-    }
-
-    fn active_task_requested_scaffold_framework(&self) -> Option<ScaffoldFramework> {
-        super::scaffold_pipeline::active_task_requested_scaffold_framework(self)
     }
 
     pub(super) fn active_request_text(&self) -> Option<String> {
@@ -15858,16 +15822,15 @@ mod truncate_tests {
     };
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
     use super::super::scaffold_pipeline::{
-        deterministic_nextjs_scaffold_reply, requested_scaffold_framework,
+        ScaffoldFramework, deterministic_nextjs_scaffold_reply, requested_scaffold_framework,
         scaffold_candidate_for_missing_role_from_snapshots, scaffold_command_matches_framework,
         scaffold_file_snapshot, task_or_plan_requires_nextjs_scaffold,
     };
     use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
-        ScaffoldFramework, changed_files_for_verifier, extract_filename_with_suffix,
-        focused_edit_tool_policy_error, repo_edit_satisfies_artifact_recovery_target,
-        task_contract_needs_verification, task_contract_verifier_repair_note,
-        task_requires_nextjs_scaffold, truncate,
+        changed_files_for_verifier, extract_filename_with_suffix, focused_edit_tool_policy_error,
+        repo_edit_satisfies_artifact_recovery_target, task_contract_needs_verification,
+        task_contract_verifier_repair_note, task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
