@@ -816,7 +816,7 @@ impl Agent {
             return Err("plan file is not ready for approval yet".to_string());
         }
         self.session.mode_state.approve();
-        super::turn::prune_plan_mode_messages(&mut self.session.messages);
+        super::plan_mode_helpers::prune_plan_mode_messages(&mut self.session.messages);
         self.push_system_note(format!(
             "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
             self.session.mode_state.task_profile.as_str(),
