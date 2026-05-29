@@ -1209,7 +1209,7 @@ pub(super) fn handle_actor_loop_post_tool_cleanup(
     args: ActorLoopPostToolCleanupArgs<'_>,
 ) -> ActorLoopPostToolCleanupOutcome {
     sync_post_tool_contract_recovery_target(agent, &args);
-    agent.maybe_invoke_reminder(args.interrupt_flag);
+    super::reminder_pipeline::maybe_invoke_reminder(agent, args.interrupt_flag);
     run_post_tool_cleanup_compaction(
         agent,
         args.tool_calls_made_this_turn,
@@ -3703,7 +3703,7 @@ pub(super) fn run_actor_loop(
     // NoRepoProgress / auto_test / NoVerifierAvailable frames recorded
     // after the actor loop exited. Per-turn cap means this no-ops if the
     // iteration-internal hook already ran.
-    agent.maybe_invoke_reminder(&interrupt_flag);
+    super::reminder_pipeline::maybe_invoke_reminder(agent, &interrupt_flag);
     // Issue #462: CaseRecord extraction (post-loop, after Reminder, before
     // turn_completed event). Pure success-condition + scrub + persist; no
     // sidecar / LLM calls. Failures are logged and never propagate.

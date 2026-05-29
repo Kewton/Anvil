@@ -3539,15 +3539,6 @@ impl Agent {
         }
     }
 
-    /// Issue #452: post-actor-loop hook for the Reminder Sidecar. Called from
-    /// `run_actor_loop` (iteration-internal before compaction, and post-loop
-    /// for NoRepoProgress / auto_test / NoVerifierAvailable). Per-turn cap
-    /// (`reminder_called_this_turn`) is consumed only by Completed / Failed
-    /// — Skipped does not consume the cap (DR3-002).
-    pub(super) fn maybe_invoke_reminder(&mut self, interrupt_flag: &InterruptFlag) {
-        super::reminder_pipeline::maybe_invoke_reminder(self, interrupt_flag)
-    }
-
     /// Issue #557: call photon context_pack and store rendered response.
     /// Canary gate runs BEFORE the HTTP fetch (DR3-002).
     fn invoke_photon_context_pack(&mut self) {
