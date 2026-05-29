@@ -102,7 +102,7 @@ use super::verifier_repair_targeting::{
     verifier_repair_preferred_local_import_source, verifier_repair_stale_assertion_test_target,
 };
 use super::{Agent, VerifierRepairAssessment, VerifierRepairAssessmentSource};
-use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
+use crate::agent::orchestration::{RepoSnapshot, RepoVerification, verify_repo_progress};
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::OllamaClient;
@@ -2360,4 +2360,226 @@ pub(super) fn handle_legacy_task_contract_verifier_selection(
         agent.observe_task_contract_verifier_exit_zero(&result.command);
     }
     super::verifier_driver::task_contract_auto_test_result_to_outcome(result)
+}
+
+pub(super) fn handle_task_contract_verifier_pass(
+    agent: &mut Agent,
+    args: TaskContractVerifierFlowArgs<'_, '_>,
+    previous_repair_context: Option<RepairJob>,
+    command: String,
+) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    if task_contract_needs_verification(
+        agent.session.mode_state.mode,
+        args.task_contract,
+        &agent.task_contract_evidence_set_this_turn,
+    ) {
+        return super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+            reason: ExitReason::MissingVerification,
+            error_text: "verifier passed but verifier evidence could not be recorded".to_string(),
+        };
+    }
+    let safe_command = crate::session::feedback::mask_secrets(&command).replace('`', "\\`");
+    if let Some(sanitized) =
+        super::verifier_skill::sanitize_verify_command_for_case_record(&command)
+    {
+        args.task_contract_verify_commands_collected.push(sanitized);
+    }
+    emit_repair_progress_classified_event(
+        agent.session_store.session_id(),
+        previous_repair_context.as_ref(),
+        None,
+        true,
+    );
+    agent.repair_job = None;
+    agent.missing_verifier_job = None;
+    *args.verifier_repair_retries = 0;
+    agent.repair_job_artifact_attempts = 0;
+    *args.task_contract_verifier_passed_in_loop = true;
+    agent.task_contract_verifier_passed_this_actor_loop = true;
+    super::actor_loop_flow::TaskContractVerifierFlowOutcome::Done {
+        final_prose: format!(
+            "Completed requested repository changes and verified them with `{safe_command}`."
+        ),
+    }
+}
+
+pub(super) fn handle_task_contract_verifier_no_verifier(
+    agent: &mut Agent,
+    args: TaskContractVerifierFlowArgs<'_, '_>,
+) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    if agent.missing_verifier_job.is_none() {
+        agent.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
+            TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
+            args.repo_edit_calls_made_this_turn,
+        ));
+    }
+    let budget_exhausted = agent
+        .missing_verifier_job
+        .as_mut()
+        .is_some_and(|job| !job.record_retry());
+    if budget_exhausted {
+        agent.emit_safe_stop_report_for_verifier_missing();
+        return super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+            reason: ExitReason::MissingVerification,
+            error_text:
+                "task contract requires verification, but the MissingVerifierJob retry budget is exhausted"
+                    .to_string(),
+        };
+    }
+    *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
+    agent.task_contract_verifier_repair_pending = true;
+    agent.repair_job = None;
+    *args.repo_change_retries = 0;
+    *args.verifier_repair_retries = 0;
+    agent.repair_job_artifact_attempts = 0;
+    super::turn::write_stdout_rendered(
+        &super::actor_loop_flow::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Verification missing",
+            "Asked the model to add or fix a runnable verifier path.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    let job_attempt = agent
+        .missing_verifier_job
+        .as_ref()
+        .map(|job| job.retries_used as usize)
+        .unwrap_or(0);
+    agent.push_system_note(task_contract_no_verifier_note(
+        job_attempt,
+        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+        agent.active_request_text().unwrap_or_default().as_str(),
+    ));
+    super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue
+}
+
+pub(super) fn run_task_contract_verifier_once(
+    agent: &mut Agent,
+    changed_files: &[String],
+) -> TaskContractVerifierOutcome {
+    if super::auto_test::auto_test_disabled(|key| std::env::var(key)) {
+        log_llm_event(
+            "agent.task_contract.verifier.completed",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "outcome": "disabled",
+            }),
+        );
+        return TaskContractVerifierOutcome::Disabled;
+    }
+
+    let (verifier_selection, workspace_scope_opt) =
+        select_task_contract_verifier_once(agent, changed_files);
+    match verifier_selection {
+        super::verifier_driver::TaskContractVerifierSelection::StructuredRunnable {
+            plan,
+            command,
+            display_command,
+            bound_test_artifacts_count,
+            bound_test_artifacts_paths,
+        } => agent.handle_structured_task_contract_verifier_selection(
+            changed_files,
+            workspace_scope_opt.as_ref(),
+            StructuredTaskContractVerifierRun {
+                plan,
+                command,
+                display_command,
+                bound_test_artifacts_count,
+                bound_test_artifacts_paths,
+            },
+        ),
+        super::verifier_driver::TaskContractVerifierSelection::StructuredWeak {
+            detected_source,
+            owned_test_artifacts_count,
+        } => handle_weak_task_contract_verifier_selection(
+            agent,
+            detected_source,
+            owned_test_artifacts_count,
+        ),
+        super::verifier_driver::TaskContractVerifierSelection::StructuredMissing {
+            outcome,
+            owned_test_artifacts_count,
+        } => handle_missing_task_contract_verifier_selection(
+            agent,
+            outcome,
+            owned_test_artifacts_count,
+        ),
+        super::verifier_driver::TaskContractVerifierSelection::LegacyRunnable {
+            plan,
+            command_for_log,
+        } => handle_legacy_task_contract_verifier_selection(
+            agent,
+            changed_files,
+            plan,
+            command_for_log,
+        ),
+        super::verifier_driver::TaskContractVerifierSelection::Missing => {
+            handle_absent_task_contract_verifier_selection(agent)
+        }
+    }
+}
+
+pub(super) fn drive_task_contract_verifier(
+    agent: &mut Agent,
+    args: TaskContractVerifierFlowArgs<'_, '_>,
+) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    *args.contract_verifier_repair_edit_count = None;
+    agent.task_contract_verifier_repair_pending = false;
+    agent.clear_artifact_recovery_target("artifact_controller_verify_pending");
+    let previous_repair_context = agent.repair_job.clone();
+    agent.repair_job = None;
+    let current_verif = verify_repo_progress(args.before_snapshot, &agent.work_root);
+    let changed_files = super::verifier_repair_targeting::changed_files_for_verifier(
+        args.accumulated,
+        &current_verif,
+    );
+    super::turn::write_stdout_rendered(
+        &super::actor_loop_flow::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Task contract",
+            "Running verifier for completed required artifacts.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    match run_task_contract_verifier_once(agent, &changed_files) {
+        TaskContractVerifierOutcome::Passed { command } => {
+            handle_task_contract_verifier_pass(agent, args, previous_repair_context, command)
+        }
+        TaskContractVerifierOutcome::Failed { command, output } => agent
+            .handle_task_contract_verifier_failure(
+                args,
+                previous_repair_context,
+                &changed_files,
+                command,
+                output,
+            ),
+        TaskContractVerifierOutcome::NoVerifier => {
+            handle_task_contract_verifier_no_verifier(agent, args)
+        }
+        TaskContractVerifierOutcome::Disabled => {
+            super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::MissingVerification,
+                error_text: "task contract requires verification, but ANVIL_NO_AUTO_TEST is set"
+                    .to_string(),
+            }
+        }
+        TaskContractVerifierOutcome::TransportError { error } => {
+            super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: error,
+            }
+        }
+        TaskContractVerifierOutcome::SafeStop { reason } => {
+            handle_task_contract_verifier_safe_stop(
+                agent,
+                args.last_iter,
+                reason,
+                "task_contract_verifier",
+            )
+        }
+    }
 }
