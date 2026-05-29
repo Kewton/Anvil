@@ -6,10 +6,7 @@ use super::actor_loop_flow::{
     TaskContractVerifierFlowOutcome, build_feedback_for_deterministic_content_fallback,
     format_iteration_status, repair_job_done_outcome, run_actor_loop,
 };
-use super::auto_test::{
-    AutoTestKind, AutoTestRunner, build_agent_verifier_external_import_rejected_payload,
-    build_agent_verifier_invoked_payload,
-};
+use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
 use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
 use super::model_request::{build_assistant_request_plan, request_non_streaming_assistant_reply};
@@ -1191,85 +1188,6 @@ impl Agent {
             return;
         };
         self.emit_repair_safe_stop_report(stop_reason);
-    }
-
-    /// Issue #661 iteration-4 Task 5.2 / DR1-005 emit ownership: pre-spawn
-    /// `agent.verifier.invoked` event emit + per-turn dedup. The payload
-    /// schema matches design Section 8-1 exactly. See
-    /// [`build_agent_verifier_invoked_payload`] for the pure-fn builder
-    /// (testable without an Agent instance) and the field-by-field schema.
-    ///
-    /// Emit ownership rules (DR1-005 / DR1-004):
-    /// - Caller MUST have built the snapshot at pre-spawn (before
-    ///   `run_structured` spawns `Command::new`)
-    /// - `mask_payload_inplace` is the final defence line — applied here
-    ///   BEFORE the digest computation so the dedup key matches the
-    ///   post-mask representation log consumers see
-    /// - Per-turn dedup: same digest as `last_verifier_invoked_payload_digest`
-    ///   suppresses re-emit; a different digest emits and replaces the
-    ///   field. Reset at `handle_user_message` head clears the digest.
-    ///
-    /// Returns `true` if the event was emitted, `false` if suppressed by
-    /// dedup (used by unit tests; production callers ignore the return
-    /// value).
-    pub(super) fn emit_agent_verifier_invoked_if_new(
-        &mut self,
-        snapshot: &super::auto_test::VerifierInvokedSnapshot,
-    ) -> bool {
-        let mut payload = build_agent_verifier_invoked_payload(
-            self.session_store.session_id(),
-            self.current_turn_index,
-            self.session.iter_count_this_turn,
-            snapshot,
-        );
-        // DR1-004 step 1: apply mask_payload_inplace BEFORE digest so the
-        // dedup key matches the post-mask representation log consumers see.
-        crate::logging::mask_payload_inplace(&mut payload);
-        let digest = crate::logging::compute_payload_digest(&payload);
-        if self.last_verifier_invoked_payload_digest == Some(digest) {
-            return false;
-        }
-        self.last_verifier_invoked_payload_digest = Some(digest);
-        // log_llm_event masks again — idempotent for already-masked
-        // payloads (final defence line invariant).
-        log_llm_event("agent.verifier.invoked", payload);
-        true
-    }
-
-    /// Issue #661 iteration-5 Task 7.3: emit
-    /// `agent.verifier.external_import_rejected` event subject to per-turn
-    /// cap (`external_import_rejected_emitted_this_turn`). Caller passes the
-    /// already-hashed module hashes + their static source labels so raw paths
-    /// never reach the payload (DR4-005).
-    ///
-    /// Returns `true` if emitted, `false` if suppressed by the per-turn cap.
-    /// Caller (`run_task_contract_verifier_once`) wires both pre-execution
-    /// (PYTHONPATH) and post-execution (stdout/stderr) detection through
-    /// this single SSOT.
-    pub(super) fn emit_agent_verifier_external_import_rejected_if_first(
-        &mut self,
-        runner: &str,
-        reason: &'static str,
-        detected_hashes: &[(&str, &'static str)],
-        detected_count: usize,
-        detected_truncated: bool,
-    ) -> bool {
-        if self.external_import_rejected_emitted_this_turn {
-            return false;
-        }
-        self.external_import_rejected_emitted_this_turn = true;
-        let mut payload = build_agent_verifier_external_import_rejected_payload(
-            self.session_store.session_id(),
-            self.current_turn_index,
-            runner,
-            reason,
-            detected_hashes,
-            detected_count,
-            detected_truncated,
-        );
-        crate::logging::mask_payload_inplace(&mut payload);
-        log_llm_event("agent.verifier.external_import_rejected", payload);
-        true
     }
 
     pub(super) fn record_task_contract_verifier_invocation(
