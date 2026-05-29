@@ -376,6 +376,13 @@ mod repair_runner_contract_tests;
 // binary excludes this mod. No facade re-export (DR3-001).
 #[cfg(test)]
 mod photon_feedback_derive_tests;
+// turn.rs `mod tests` extracted to a sibling file (parent #680).
+// Inner mod accesses turn.rs items via `super::X` (resolved through
+// `use super::turn::*;` at the wrapper file scope) and sibling modules
+// / loop_run items via `super::super::X` (depth preserved).
+// #[cfg(test)] only. No facade re-export (DR3-001).
+#[cfg(test)]
+mod turn_tests;
 // Issue #666: structured per-turn job reports
 // (ArtifactCompletion/Verification/Repair/Memory). Private mod, no
 // facade re-export (DR3-001). `turn.rs` is the only in-crate consumer
