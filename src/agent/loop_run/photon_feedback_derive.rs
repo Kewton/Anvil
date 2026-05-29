@@ -550,3 +550,40 @@ pub fn build_photon_injection_message(
          [End Photon External Memory]"
     )))
 }
+
+/// Issue #591 (DR4-NEW-004 audit boundary): static-allowlist projection
+/// of (`shadow_mode`, `adopted_items`) to one of three `&'static str`
+/// values used by the `agent.photon_evaluate.completed` log event and
+/// the `context_pack_event` request body. Lives in the agent layer so
+/// the photon layer doesn't gain a dependency on the literal strings.
+pub(super) fn photon_evaluate_adoption_status(
+    shadow_mode: bool,
+    adopted_items: usize,
+) -> &'static str {
+    if shadow_mode {
+        "shadow_not_injected"
+    } else if adopted_items > 0 {
+        "injected"
+    } else {
+        "not_injected"
+    }
+}
+
+/// Issue #591: shadow_mode short-circuit for the `items_adopted` count
+/// shipped to photon. On shadow turns Anvil must not stamp a positive
+/// adoption count even when the local renderer accepted items.
+pub(super) fn photon_items_adopted_count(shadow_mode: bool, adopted_items: usize) -> usize {
+    if shadow_mode { 0 } else { adopted_items }
+}
+
+/// Issue #591 (DR4-NEW-004 audit boundary): static-allowlist projection
+/// for the `outcome` JSON field. `Some(value)` → `JSON::String(value)`,
+/// `None` → `JSON::Null`. Pure function — the helper cannot leak
+/// runtime data into the outbound payload because the input is already
+/// `Option<&'static str>`.
+pub(super) fn photon_outcome_json_value(outcome: Option<&'static str>) -> serde_json::Value {
+    match outcome {
+        Some(value) => serde_json::Value::String(value.to_string()),
+        None => serde_json::Value::Null,
+    }
+}
