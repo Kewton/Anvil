@@ -22,11 +22,15 @@
 //! pre-existing `pub use` of the const). `turn.rs` is the only in-crate
 //! consumer for the `PhotonOutcomeInputs` / `PhotonFeedbackOutcome` types.
 
+use std::collections::HashSet;
+
 use super::Agent;
 use super::completion_evidence::{self, CompletionEvidence};
 use crate::logging::log_llm_event;
 use crate::photon;
-use crate::photon::prompt::sanitize_summary_id;
+use crate::photon::eval::parse_evaluate_response;
+use crate::photon::prompt::{BlockedIdsStats, extract_blocked_summary_ids, sanitize_summary_id};
+use crate::photon::schema::{ContextPackResponse, EvaluateResponse};
 use crate::session::feedback::{FeedbackKind, MAX_VERIFIER_COMMAND_BYTES};
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::tools::bash::{BashCommandClass, classify_command};
@@ -693,4 +697,157 @@ pub(super) fn photon_context_pack_injection_message(agent: &Agent) -> Option<Con
         agent.photon_context_pack_response.as_deref(),
         agent.config.photon_shadow_mode,
     )
+}
+
+/// Issue #591: extract the photon-side "warning-blocked" summary ids
+/// from a context_pack response. When `warning_filter_enabled` is
+/// false the function returns empty / default values so the caller can
+/// stay branch-free.
+pub(super) fn photon_context_pack_blocked_ids(
+    resp: &ContextPackResponse,
+    warning_filter_enabled: bool,
+) -> (HashSet<String>, BlockedIdsStats) {
+    if warning_filter_enabled {
+        extract_blocked_summary_ids(resp)
+    } else {
+        (HashSet::new(), BlockedIdsStats::default())
+    }
+}
+
+/// Issue #591: emit the `agent.photon_context_pack.warning_blocked`
+/// log event. Early-return when both the blocked-id list is empty AND
+/// the `respected_by_admission_reason` counter is zero (no signal to
+/// surface). The blocked id list is sorted before emit so the log
+/// payload is deterministic.
+pub(super) fn log_photon_context_pack_warning_blocked(
+    agent: &Agent,
+    blocked_ids: &HashSet<String>,
+    blocked_stats: &BlockedIdsStats,
+) {
+    if blocked_ids.is_empty() && blocked_stats.respected_by_admission_reason == 0 {
+        return;
+    }
+    let mut id_list: Vec<String> = blocked_ids.iter().cloned().collect();
+    id_list.sort();
+    log_llm_event(
+        "agent.photon_context_pack.warning_blocked",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "blocked_summary_ids": id_list,
+            "total_warnings": blocked_stats.total_warnings,
+            "total_blocked": blocked_ids.len(),
+            "truncated_scan": blocked_stats.truncated_scan,
+            "truncated_unique": blocked_stats.truncated_unique,
+            "respected_by_admission_reason": blocked_stats.respected_by_admission_reason,
+            "still_blocked": blocked_stats.still_blocked,
+        }),
+    );
+}
+
+/// Issue #591: project the per-turn injected-seed provenance summary
+/// into the JSON payload shape consumed by the
+/// `agent.photon_context_pack.completed` log event. 4 audit-bounded
+/// fields per entry — no free-text leaks.
+pub(super) fn photon_context_pack_provenance_payload(agent: &Agent) -> Vec<serde_json::Value> {
+    agent
+        .last_injected_seed_provenance
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "summary_id": s.summary_id,
+                "source": s.source,
+                "trust_tier": s.trust_tier,
+                "provenance_status": s.provenance_status,
+            })
+        })
+        .collect()
+}
+
+/// Issue #591: emit the `agent.photon_context_pack.completed` log event.
+/// All payload fields derive from per-turn Agent state plus the bounded
+/// `(failed, truncated, duration_ms, warning_filter_enabled, items_blocked)`
+/// argument tuple. The provenance summary is projected via
+/// `photon_context_pack_provenance_payload` so secrets cannot leak.
+pub(super) fn log_photon_context_pack_completed(
+    agent: &Agent,
+    failed: bool,
+    truncated: bool,
+    duration_ms: u128,
+    warning_filter_enabled: bool,
+    items_blocked: usize,
+) {
+    log_llm_event(
+        "agent.photon_context_pack.completed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "shadow_mode": false,
+            "failed": failed,
+            "truncated": truncated,
+            "items_adopted": agent.last_photon_adopted_items,
+            "injected_bytes": agent.photon_context_pack_response.as_deref().map(|s| s.len()).unwrap_or(0),
+            "duration_ms": duration_ms,
+            "warning_filter_enabled": warning_filter_enabled,
+            "items_blocked": items_blocked,
+            "injected_seed_provenance_summary": photon_context_pack_provenance_payload(agent),
+        }),
+    );
+}
+
+/// Issue #591: build the `context_pack_event` JSON payload sent to
+/// photon `/v1/evaluate`. Returns `JSON::Null` when no
+/// `last_context_pack_id` is set (no context_pack was sent this turn).
+pub(super) fn build_photon_context_pack_event(
+    agent: &Agent,
+    adoption_status: &str,
+    items_adopted_count: usize,
+    summary_ids_adopted: Vec<String>,
+    truncated: bool,
+    outcome_json: &serde_json::Value,
+    outcome_detail_json: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(cpack_id) = agent.last_context_pack_id.as_ref() else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "context_pack_request_id": cpack_id,
+        "adoption_status": adoption_status,
+        "evidence_expand_requested": false,
+        "evidence_ids_expanded": [],
+        "items_adopted_count": items_adopted_count,
+        "items_ignored_count": 0,
+        "summary_ids_adopted": summary_ids_adopted,
+        "summary_ids_adopted_truncated": truncated,
+        "outcome": outcome_json.clone(),
+        "outcome_detail": outcome_detail_json.clone(),
+    })
+}
+
+/// Issue #591: parse the photon evaluate response and persist a
+/// summary into `Agent.last_photon_eval_summary`. Early-return when
+/// `result.is_none()`. In `shadow_mode=true` the `prompt_adopted` field
+/// is left at its default (shadow turns must not stamp adoption).
+pub(super) fn store_photon_eval_summary(
+    agent: &mut Agent,
+    result: Option<&EvaluateResponse>,
+    shadow_mode: bool,
+    summary_ids_adopted_count: usize,
+    outcome_static: Option<&'static str>,
+    outcome_detail_static: Option<&'static str>,
+) {
+    let Some(resp) = result else {
+        return;
+    };
+    let mut summary = parse_evaluate_response(resp);
+    if summary.context_pack_id.is_none() {
+        summary.context_pack_id = agent.last_context_pack_id.clone();
+    }
+    if !shadow_mode {
+        summary.prompt_adopted = Some(agent.last_photon_adopted_items > 0);
+    }
+    summary.summary_ids_adopted_count = Some(summary_ids_adopted_count);
+    summary.outcome_emitted = outcome_static.map(String::from);
+    summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
+    agent.last_photon_eval_summary = Some(summary);
 }

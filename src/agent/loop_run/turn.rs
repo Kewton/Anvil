@@ -2977,7 +2977,8 @@ impl Agent {
         };
         self.last_photon_context_pack_status =
             photon_context_pack_completion_status(failed, self.last_photon_adopted_items);
-        self.log_photon_context_pack_completed(
+        super::photon_feedback_derive::log_photon_context_pack_completed(
+            self,
             failed,
             truncated,
             duration_ms,
@@ -3048,57 +3049,20 @@ impl Agent {
         warning_filter_enabled: bool,
     ) -> (usize, bool) {
         let (blocked_ids, blocked_stats) =
-            self.photon_context_pack_blocked_ids(&resp, warning_filter_enabled);
-        self.log_photon_context_pack_warning_blocked(&blocked_ids, &blocked_stats);
+            super::photon_feedback_derive::photon_context_pack_blocked_ids(
+                &resp,
+                warning_filter_enabled,
+            );
+        super::photon_feedback_derive::log_photon_context_pack_warning_blocked(
+            self,
+            &blocked_ids,
+            &blocked_stats,
+        );
         let (admitted_views, render_stats) =
             self.collect_photon_context_pack_views(&resp, &blocked_ids);
         let items_blocked = render_stats.items_blocked;
         let truncated = self.update_photon_context_pack_render(admitted_views, render_stats);
         (items_blocked, truncated)
-    }
-
-    fn photon_context_pack_blocked_ids(
-        &self,
-        resp: &crate::photon::schema::ContextPackResponse,
-        warning_filter_enabled: bool,
-    ) -> (
-        std::collections::HashSet<String>,
-        crate::photon::prompt::BlockedIdsStats,
-    ) {
-        if warning_filter_enabled {
-            crate::photon::prompt::extract_blocked_summary_ids(resp)
-        } else {
-            (
-                std::collections::HashSet::new(),
-                crate::photon::prompt::BlockedIdsStats::default(),
-            )
-        }
-    }
-
-    fn log_photon_context_pack_warning_blocked(
-        &self,
-        blocked_ids: &std::collections::HashSet<String>,
-        blocked_stats: &crate::photon::prompt::BlockedIdsStats,
-    ) {
-        if blocked_ids.is_empty() && blocked_stats.respected_by_admission_reason == 0 {
-            return;
-        }
-        let mut id_list: Vec<String> = blocked_ids.iter().cloned().collect();
-        id_list.sort();
-        log_llm_event(
-            "agent.photon_context_pack.warning_blocked",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "blocked_summary_ids": id_list,
-                "total_warnings": blocked_stats.total_warnings,
-                "total_blocked": blocked_ids.len(),
-                "truncated_scan": blocked_stats.truncated_scan,
-                "truncated_unique": blocked_stats.truncated_unique,
-                "respected_by_admission_reason": blocked_stats.respected_by_admission_reason,
-                "still_blocked": blocked_stats.still_blocked,
-            }),
-        );
     }
 
     fn collect_photon_context_pack_views(
@@ -3159,46 +3123,6 @@ impl Agent {
             super::photon_feedback_derive::clear_photon_context_pack_injection_tracking(self);
             false
         }
-    }
-
-    fn photon_context_pack_provenance_payload(&self) -> Vec<serde_json::Value> {
-        self.last_injected_seed_provenance
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "summary_id": s.summary_id,
-                    "source": s.source,
-                    "trust_tier": s.trust_tier,
-                    "provenance_status": s.provenance_status,
-                })
-            })
-            .collect()
-    }
-
-    fn log_photon_context_pack_completed(
-        &self,
-        failed: bool,
-        truncated: bool,
-        duration_ms: u128,
-        warning_filter_enabled: bool,
-        items_blocked: usize,
-    ) {
-        log_llm_event(
-            "agent.photon_context_pack.completed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "shadow_mode": false,
-                "failed": failed,
-                "truncated": truncated,
-                "items_adopted": self.last_photon_adopted_items,
-                "injected_bytes": self.photon_context_pack_response.as_deref().map(|s| s.len()).unwrap_or(0),
-                "duration_ms": duration_ms,
-                "warning_filter_enabled": warning_filter_enabled,
-                "items_blocked": items_blocked,
-                "injected_seed_provenance_summary": self.photon_context_pack_provenance_payload(),
-            }),
-        );
     }
 
     /// Issue #556: call photon evaluate (post-turn).
@@ -3285,7 +3209,8 @@ impl Agent {
 
         // Only include context_pack_event when we have a request_id; the sidecar
         // requires context_pack_request_id: str (non-null).
-        let context_pack_event = self.build_photon_context_pack_event(
+        let context_pack_event = super::photon_feedback_derive::build_photon_context_pack_event(
+            self,
             adoption_status,
             items_adopted_count,
             summary_ids_adopted,
@@ -3305,7 +3230,8 @@ impl Agent {
         }));
         let result = self.photon.as_ref().unwrap().evaluate(&req);
         let duration_ms = t0.elapsed().as_millis();
-        self.store_photon_eval_summary(
+        super::photon_feedback_derive::store_photon_eval_summary(
+            self,
             result.as_ref(),
             shadow_mode,
             summary_ids_adopted_count,
@@ -3330,56 +3256,6 @@ impl Agent {
                 outcome_detail_json,
             },
         );
-    }
-
-    fn build_photon_context_pack_event(
-        &self,
-        adoption_status: &str,
-        items_adopted_count: usize,
-        summary_ids_adopted: Vec<String>,
-        truncated: bool,
-        outcome_json: &serde_json::Value,
-        outcome_detail_json: &serde_json::Value,
-    ) -> serde_json::Value {
-        let Some(cpack_id) = self.last_context_pack_id.as_ref() else {
-            return serde_json::Value::Null;
-        };
-        serde_json::json!({
-            "context_pack_request_id": cpack_id,
-            "adoption_status": adoption_status,
-            "evidence_expand_requested": false,
-            "evidence_ids_expanded": [],
-            "items_adopted_count": items_adopted_count,
-            "items_ignored_count": 0,
-            "summary_ids_adopted": summary_ids_adopted,
-            "summary_ids_adopted_truncated": truncated,
-            "outcome": outcome_json.clone(),
-            "outcome_detail": outcome_detail_json.clone(),
-        })
-    }
-
-    fn store_photon_eval_summary(
-        &mut self,
-        result: Option<&crate::photon::schema::EvaluateResponse>,
-        shadow_mode: bool,
-        summary_ids_adopted_count: usize,
-        outcome_static: Option<&'static str>,
-        outcome_detail_static: Option<&'static str>,
-    ) {
-        let Some(resp) = result else {
-            return;
-        };
-        let mut summary = crate::photon::eval::parse_evaluate_response(resp);
-        if summary.context_pack_id.is_none() {
-            summary.context_pack_id = self.last_context_pack_id.clone();
-        }
-        if !shadow_mode {
-            summary.prompt_adopted = Some(self.last_photon_adopted_items > 0);
-        }
-        summary.summary_ids_adopted_count = Some(summary_ids_adopted_count);
-        summary.outcome_emitted = outcome_static.map(String::from);
-        summary.outcome_detail_emitted = outcome_detail_static.map(String::from);
-        self.last_photon_eval_summary = Some(summary);
     }
 
     fn run_turn(
