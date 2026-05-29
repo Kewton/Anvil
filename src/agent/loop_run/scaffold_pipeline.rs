@@ -34,15 +34,24 @@
 //! `pub(super)` limited / no facade re-export (DR3-001).
 //! `turn.rs` is the only in-crate consumer.
 
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
+use super::Agent;
 use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
 use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
 use super::task_contract::ArtifactRole;
-use super::tool_history::latest_user_turn_slice;
-use super::turn::{current_file_hash_for_relative_path, meaningful_workspace_files, sha256_hex};
+use super::tool_history::{
+    focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
+};
+use super::turn::{
+    current_file_hash_for_relative_path, last_read_tool_path,
+    latest_turn_preferred_read_edit_target, meaningful_workspace_files, progress_path_display,
+    sha256_hex,
+};
 use crate::agent::recovery;
+use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::safety::path_guard::resolve_user_path;
@@ -470,4 +479,146 @@ pub(super) fn deterministic_support_target_relative(work_root: &Path, relative: 
         return PathBuf::from("src/app").join(rest);
     }
     relative.to_path_buf()
+}
+
+pub(super) fn post_scaffold_edit_recovery_message(agent: &Agent) -> Option<String> {
+    let path = post_scaffold_edit_recovery_target(agent)?;
+    let attempt = recent_post_scaffold_edit_attempt(&agent.session.messages).max(1);
+    let already_read =
+        focused_edit_target_already_read(&agent.session.messages, &path, &agent.work_root);
+    Some(recovery::post_scaffold_edit_recovery_note(
+        &progress_path_display(
+            &path.display().to_string(),
+            &agent.work_root,
+            agent.session.mode_state.active_plan_path.as_deref(),
+            120,
+        ),
+        already_read,
+        attempt,
+    ))
+}
+
+pub(super) fn post_scaffold_continuation_recovery_message(agent: &Agent) -> Option<String> {
+    let path = post_scaffold_continuation_recovery_target(agent)?;
+    let attempt = recent_post_scaffold_continue_attempt(&agent.session.messages).max(1);
+    Some(recovery::post_scaffold_continuation_note(
+        &progress_path_display(
+            &path.display().to_string(),
+            &agent.work_root,
+            agent.session.mode_state.active_plan_path.as_deref(),
+            120,
+        ),
+        attempt,
+    ))
+}
+
+pub(super) fn post_scaffold_edit_recovery_target(agent: &Agent) -> Option<PathBuf> {
+    if agent.session.mode_state.mode != ExecutionMode::Act {
+        return None;
+    }
+    if has_successful_non_plan_repo_edit(
+        &agent.session.messages,
+        &agent.work_root,
+        agent.session.mode_state.active_plan_path.as_deref(),
+    ) || !post_scaffold_recovery_active(
+        &agent.session.messages,
+        agent.session.active_root.as_deref(),
+        &agent.config.cwd,
+    ) {
+        return None;
+    }
+    if let Some(candidate) = first_existing_impl_target(&agent.work_root) {
+        return Some(candidate);
+    }
+    if let Some(candidate) =
+        latest_turn_preferred_read_edit_target(&agent.session.messages, &agent.work_root)
+    {
+        return Some(candidate);
+    }
+    if let Some(path) = last_read_tool_path(&agent.session.messages)
+        && let Ok(candidate) = resolve_user_path(&agent.work_root, &path)
+        && candidate.is_file()
+    {
+        return Some(candidate);
+    }
+    first_existing_impl_target(&agent.work_root)
+}
+
+pub(super) fn post_scaffold_continuation_recovery_target(agent: &Agent) -> Option<PathBuf> {
+    if agent.session.mode_state.mode != ExecutionMode::Act {
+        return None;
+    }
+    if !post_scaffold_continuation_active(
+        &agent.session.messages,
+        agent.session.active_root.as_deref(),
+        &agent.config.cwd,
+        &agent.work_root,
+        agent.session.mode_state.active_plan_path.as_deref(),
+    ) {
+        return None;
+    }
+    if let Some(candidate) = first_existing_impl_target(&agent.work_root) {
+        return Some(candidate);
+    }
+    if let Some(path) = last_read_tool_path(&agent.session.messages)
+        && let Ok(candidate) = resolve_user_path(&agent.work_root, &path)
+        && candidate.is_file()
+    {
+        return Some(candidate);
+    }
+    first_existing_impl_target(&agent.work_root)
+}
+
+pub(super) fn active_task_requires_nextjs_scaffold(agent: &Agent) -> bool {
+    if agent.session.mode_state.mode != ExecutionMode::Act {
+        return false;
+    }
+    let plan_contents = agent.current_plan_contents().ok().flatten();
+    task_or_plan_requires_nextjs_scaffold(
+        agent.active_request_text().as_deref(),
+        plan_contents.as_deref(),
+    )
+}
+
+pub(super) fn active_task_requested_scaffold_framework(agent: &Agent) -> Option<ScaffoldFramework> {
+    if agent.session.mode_state.mode != ExecutionMode::Act {
+        return None;
+    }
+    agent
+        .active_request_text()
+        .as_deref()
+        .and_then(requested_scaffold_framework)
+}
+
+pub(super) fn scaffold_candidate_for_missing_role(
+    agent: &Agent,
+    role: ArtifactRole,
+) -> Option<String> {
+    scaffold_candidate_for_missing_role_from_snapshots(
+        &agent.session.scaffold_artifact_snapshots,
+        &agent.work_root,
+        role,
+    )
+}
+
+pub(super) fn repo_edit_has_post_scaffold_delta(agent: &Agent, relative_path: &str) -> bool {
+    match scaffold_diff_status(
+        &agent.session.scaffold_artifact_snapshots,
+        relative_path,
+        current_file_hash_for_relative_path(&agent.work_root, relative_path).as_deref(),
+    ) {
+        ScaffoldDiffStatus::NotScaffold => true,
+        ScaffoldDiffStatus::Changed => true,
+        ScaffoldDiffStatus::UnchangedOrMissing => false,
+    }
+}
+
+pub(super) fn deterministic_nextjs_scaffold_skip_reason(agent: &Agent) -> Option<&'static str> {
+    if agent.config.offline {
+        return Some("offline mode blocks network scaffolding");
+    }
+    if !agent.config.yes_mode && !io::stdin().is_terminal() {
+        return Some("network scaffolding requires yes mode or an interactive approval prompt");
+    }
+    None
 }

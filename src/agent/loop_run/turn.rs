@@ -93,16 +93,12 @@ use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
     CREATE_NEXT_APP_PACKAGE_VERSION, DeterministicScaffoldSpec,
     EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
-    EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK, ScaffoldDiffStatus,
+    EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
     ScaffoldFallbackResult, ScaffoldFramework, deterministic_framework_app_files_needed,
     deterministic_framework_game_impl_path, deterministic_nextjs_scaffold_reply,
-    deterministic_support_target_relative, post_scaffold_continuation_active,
-    post_scaffold_recovery_active, recent_post_scaffold_continue_attempt,
-    recent_post_scaffold_edit_attempt, recent_scaffold_command_seen,
-    render_deterministic_scaffold_continuation_note, requested_scaffold_framework,
-    scaffold_candidate_for_missing_role_from_snapshots, scaffold_candidate_priority,
-    scaffold_command_matches_framework, scaffold_diff_status, scaffold_file_snapshot,
-    task_or_plan_requires_nextjs_scaffold,
+    deterministic_support_target_relative, recent_scaffold_command_seen,
+    render_deterministic_scaffold_continuation_note, scaffold_candidate_priority,
+    scaffold_command_matches_framework, scaffold_file_snapshot,
 };
 #[cfg(test)]
 use super::semantic_repair_planning::{
@@ -7066,91 +7062,19 @@ impl Agent {
     }
 
     fn post_scaffold_edit_recovery_message(&self) -> Option<String> {
-        let path = self.post_scaffold_edit_recovery_target()?;
-        let attempt = recent_post_scaffold_edit_attempt(&self.session.messages).max(1);
-        let already_read =
-            focused_edit_target_already_read(&self.session.messages, &path, &self.work_root);
-        Some(recovery::post_scaffold_edit_recovery_note(
-            &progress_path_display(
-                &path.display().to_string(),
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-                120,
-            ),
-            already_read,
-            attempt,
-        ))
+        super::scaffold_pipeline::post_scaffold_edit_recovery_message(self)
     }
 
     fn post_scaffold_continuation_recovery_message(&self) -> Option<String> {
-        let path = self.post_scaffold_continuation_recovery_target()?;
-        let attempt = recent_post_scaffold_continue_attempt(&self.session.messages).max(1);
-        Some(recovery::post_scaffold_continuation_note(
-            &progress_path_display(
-                &path.display().to_string(),
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-                120,
-            ),
-            attempt,
-        ))
+        super::scaffold_pipeline::post_scaffold_continuation_recovery_message(self)
     }
 
     fn post_scaffold_edit_recovery_target(&self) -> Option<PathBuf> {
-        if self.session.mode_state.mode != ExecutionMode::Act {
-            return None;
-        }
-        if has_successful_non_plan_repo_edit(
-            &self.session.messages,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        ) || !post_scaffold_recovery_active(
-            &self.session.messages,
-            self.session.active_root.as_deref(),
-            &self.config.cwd,
-        ) {
-            return None;
-        }
-        if let Some(candidate) = first_existing_impl_target(&self.work_root) {
-            return Some(candidate);
-        }
-        if let Some(candidate) =
-            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)
-        {
-            return Some(candidate);
-        }
-        if let Some(path) = last_read_tool_path(&self.session.messages)
-            && let Ok(candidate) = resolve_user_path(&self.work_root, &path)
-            && candidate.is_file()
-        {
-            return Some(candidate);
-        }
-        first_existing_impl_target(&self.work_root)
+        super::scaffold_pipeline::post_scaffold_edit_recovery_target(self)
     }
 
     fn post_scaffold_continuation_recovery_target(&self) -> Option<PathBuf> {
-        if self.session.mode_state.mode != ExecutionMode::Act {
-            return None;
-        }
-        if !post_scaffold_continuation_active(
-            &self.session.messages,
-            self.session.active_root.as_deref(),
-            &self.config.cwd,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        ) {
-            return None;
-        }
-        if let Some(candidate) = first_existing_impl_target(&self.work_root) {
-            return Some(candidate);
-        }
-        if let Some(path) = last_read_tool_path(&self.session.messages)
-            && let Ok(candidate) = resolve_user_path(&self.work_root, &path)
-            && candidate.is_file()
-        {
-            return Some(candidate);
-        }
-        first_existing_impl_target(&self.work_root)
+        super::scaffold_pipeline::post_scaffold_continuation_recovery_target(self)
     }
 
     pub(super) fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
@@ -9042,15 +8966,7 @@ impl Agent {
     }
 
     pub(super) fn repo_edit_has_post_scaffold_delta(&self, relative_path: &str) -> bool {
-        match scaffold_diff_status(
-            &self.session.scaffold_artifact_snapshots,
-            relative_path,
-            current_file_hash_for_relative_path(&self.work_root, relative_path).as_deref(),
-        ) {
-            ScaffoldDiffStatus::NotScaffold => true,
-            ScaffoldDiffStatus::Changed => true,
-            ScaffoldDiffStatus::UnchangedOrMissing => false,
-        }
+        super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, relative_path)
     }
 
     /// Issue #636: read a workspace-confined, cap-bounded excerpt of
@@ -9905,11 +9821,7 @@ impl Agent {
         &self,
         role: super::task_contract::ArtifactRole,
     ) -> Option<String> {
-        scaffold_candidate_for_missing_role_from_snapshots(
-            &self.session.scaffold_artifact_snapshots,
-            &self.work_root,
-            role,
-        )
+        super::scaffold_pipeline::scaffold_candidate_for_missing_role(self, role)
     }
 
     fn answer_only_policy_error(
@@ -10017,13 +9929,7 @@ impl Agent {
     }
 
     fn deterministic_nextjs_scaffold_skip_reason(&self) -> Option<&'static str> {
-        if self.config.offline {
-            return Some("offline mode blocks network scaffolding");
-        }
-        if !self.config.yes_mode && !io::stdin().is_terminal() {
-            return Some("network scaffolding requires yes mode or an interactive approval prompt");
-        }
-        None
+        super::scaffold_pipeline::deterministic_nextjs_scaffold_skip_reason(self)
     }
 
     fn mode_deterministic_scaffold_spec(
@@ -10540,23 +10446,11 @@ impl Agent {
     }
 
     fn active_task_requires_nextjs_scaffold(&self) -> bool {
-        if self.session.mode_state.mode != ExecutionMode::Act {
-            return false;
-        }
-        let plan_contents = self.current_plan_contents().ok().flatten();
-        task_or_plan_requires_nextjs_scaffold(
-            self.active_request_text().as_deref(),
-            plan_contents.as_deref(),
-        )
+        super::scaffold_pipeline::active_task_requires_nextjs_scaffold(self)
     }
 
     fn active_task_requested_scaffold_framework(&self) -> Option<ScaffoldFramework> {
-        if self.session.mode_state.mode != ExecutionMode::Act {
-            return None;
-        }
-        self.active_request_text()
-            .as_deref()
-            .and_then(requested_scaffold_framework)
+        super::scaffold_pipeline::active_task_requested_scaffold_framework(self)
     }
 
     pub(super) fn active_request_text(&self) -> Option<String> {
@@ -15800,7 +15694,7 @@ pub(super) struct ProgressDisplay {
     pub(super) status: Option<String>,
 }
 
-fn progress_path_display(
+pub(super) fn progress_path_display(
     raw_path: &str,
     work_root: &Path,
     plan_path: Option<&Path>,
@@ -15908,7 +15802,7 @@ fn is_plan_mode_only_system_note(note: &str) -> bool {
         || trimmed.starts_with("You are still in Plan mode")
 }
 
-fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
+pub(super) fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
     messages.iter().rev().find_map(|message| {
         if message.role != "assistant" {
             return None;
@@ -15926,7 +15820,7 @@ fn last_read_tool_path(messages: &[ConversationMessage]) -> Option<String> {
     })
 }
 
-fn latest_turn_preferred_read_edit_target(
+pub(super) fn latest_turn_preferred_read_edit_target(
     messages: &[ConversationMessage],
     work_root: &Path,
 ) -> Option<PathBuf> {
@@ -16970,15 +16864,17 @@ mod truncate_tests {
         task_contract_continue_requires_tool_recovery,
     };
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
+    use super::super::scaffold_pipeline::{
+        requested_scaffold_framework, scaffold_candidate_for_missing_role_from_snapshots,
+        task_or_plan_requires_nextjs_scaffold,
+    };
     use super::super::task_contract::{ArtifactRecoveryAction, ArtifactRole, TaskContract};
     use super::{
         ScaffoldFramework, changed_files_for_verifier, deterministic_nextjs_scaffold_reply,
         extract_filename_with_suffix, focused_edit_tool_policy_error,
-        repo_edit_satisfies_artifact_recovery_target, requested_scaffold_framework,
-        scaffold_candidate_for_missing_role_from_snapshots, scaffold_command_matches_framework,
+        repo_edit_satisfies_artifact_recovery_target, scaffold_command_matches_framework,
         scaffold_file_snapshot, task_contract_needs_verification,
-        task_contract_verifier_repair_note, task_or_plan_requires_nextjs_scaffold,
-        task_requires_nextjs_scaffold, truncate,
+        task_contract_verifier_repair_note, task_requires_nextjs_scaffold, truncate,
     };
     use crate::agent::orchestration::RepoVerification;
     use crate::agent::recovery::ActionExpectation;
@@ -17584,9 +17480,11 @@ mod progress_tests {
         SNAPSHOT_FIELD_BYTE_CAP, sanitize_repair_job_text, truncate_for_snapshot,
     };
     use super::super::scaffold_pipeline::{
-        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
-        deterministic_support_target_relative, scaffold_candidate_for_missing_role_from_snapshots,
-        scaffold_diff_status, scaffold_file_snapshot,
+        ScaffoldDiffStatus, deterministic_framework_app_files_needed,
+        deterministic_framework_game_files_needed, deterministic_support_target_relative,
+        post_scaffold_continuation_active, post_scaffold_recovery_active,
+        scaffold_candidate_for_missing_role_from_snapshots, scaffold_diff_status,
+        scaffold_file_snapshot,
     };
     use super::super::verifier_orchestration::{
         parse_verifier_repair_intent_reply, parse_verifier_repair_intents_reply,
@@ -17620,11 +17518,11 @@ mod progress_tests {
         has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
         latest_page_copy_block_from_read, latest_truncated_tool_call_note_index,
         latest_turn_preferred_read_edit_target, parse_verifier_repair_assessment_reply,
-        post_scaffold_continuation_active, post_scaffold_recovery_active, prune_plan_mode_messages,
-        recent_deterministic_framework_app_fallback_seen, recent_scaffold_command_seen,
-        recent_truncated_tool_call_attempt, render_deterministic_scaffold_continuation_note,
-        repo_change_request_text, request_needs_playable_ui_quality_gate, sanitize_for_progress,
-        sha256_hex, should_use_streaming_transport, strip_read_line_number_prefix,
+        prune_plan_mode_messages, recent_deterministic_framework_app_fallback_seen,
+        recent_scaffold_command_seen, recent_truncated_tool_call_attempt,
+        render_deterministic_scaffold_continuation_note, repo_change_request_text,
+        request_needs_playable_ui_quality_gate, sanitize_for_progress, sha256_hex,
+        should_use_streaming_transport, strip_read_line_number_prefix,
         successful_non_plan_repo_edit_count, successful_repo_edit_count,
         sync_package_json_with_existing_lock, tool_color, tool_display, tool_emoji,
         unicode_supported, validate_accepted_repair_plan_authorizes_target,
@@ -24736,7 +24634,7 @@ E   assert [{'id': 1}] == []\n";
                 "README.md",
                 Some(&file.content_hash),
             ),
-            super::ScaffoldDiffStatus::UnchangedOrMissing
+            ScaffoldDiffStatus::UnchangedOrMissing
         );
         assert_eq!(
             scaffold_diff_status(
@@ -24744,11 +24642,11 @@ E   assert [{'id': 1}] == []\n";
                 "README.md",
                 Some(&sha256_hex(b"# ToDo API\n")),
             ),
-            super::ScaffoldDiffStatus::Changed
+            ScaffoldDiffStatus::Changed
         );
         assert_eq!(
             scaffold_diff_status(&[snapshot], "docs/usage.md", Some("anything")),
-            super::ScaffoldDiffStatus::NotScaffold
+            ScaffoldDiffStatus::NotScaffold
         );
     }
 
