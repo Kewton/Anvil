@@ -319,6 +319,12 @@ pub mod slash_commands;
 mod spec_authority;
 mod spinner;
 mod success;
+// Per-iteration progress line rendering extracted from `turn.rs` (parent
+// #680). Hosts `ProgressDisplay`, `progress_path_display`, `tool_display`
+// (entry point) and the per-tool projection helpers (write/edit/read/bash/
+// search/default plus plan_read/workspace_read shells). `pub(super)` limited
+// / no facade re-export (DR3-001).
+mod tool_display;
 // v0.4.25: tool-call history projection helpers. Keeps conversation evidence
 // lookup out of both the actor loop dispatcher and RepairJob state machine.
 mod tool_history;
