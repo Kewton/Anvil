@@ -22,7 +22,9 @@
 //! pre-existing `pub use` of the const). `turn.rs` is the only in-crate
 //! consumer for the `PhotonOutcomeInputs` / `PhotonFeedbackOutcome` types.
 
-use super::completion_evidence;
+use super::Agent;
+use super::completion_evidence::{self, CompletionEvidence};
+use crate::logging::log_llm_event;
 use crate::photon;
 use crate::photon::prompt::sanitize_summary_id;
 use crate::session::feedback::{FeedbackKind, MAX_VERIFIER_COMMAND_BYTES};
@@ -618,4 +620,77 @@ pub(super) struct PhotonEvaluateCompletedLog {
     pub(super) truncated: bool,
     pub(super) outcome_json: serde_json::Value,
     pub(super) outcome_detail_json: serde_json::Value,
+}
+
+/// Issue #557: clear the per-turn tracker fields that record which photon
+/// context_pack summary ids were injected this turn. Called when the photon
+/// pipeline skips / fails / completes-with-zero-adoptions.
+pub(super) fn clear_photon_context_pack_injection_tracking(agent: &mut Agent) {
+    agent.last_injected_summary_ids.clear();
+    agent.last_injected_summary_turn_index = None;
+}
+
+/// Issue #557: short-circuit the photon context_pack pipeline with a status
+/// + reason. Emits the `agent.photon_context_pack.skipped` log event and
+///   resets the per-turn injection-tracking fields.
+pub(super) fn skip_photon_context_pack(
+    agent: &mut Agent,
+    status: super::PhotonContextPackStatus,
+    reason: &str,
+) {
+    agent.last_photon_context_pack_status = status;
+    log_llm_event(
+        "agent.photon_context_pack.skipped",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "reason": reason,
+        }),
+    );
+    clear_photon_context_pack_injection_tracking(agent);
+}
+
+/// Issue #608 Phase α-2 (AP-10 / 設計判断 #2 + #3): derive the same-turn
+/// `verifier_exit_zero_this_turn` flag fed into
+/// `derive_photon_feedback_outcome`'s Case E OR-merge. Returns `true` iff
+/// the current-turn evidence set contains at least one
+/// `CompletionEvidence::VerifierExitZero` entry.
+pub(super) fn photon_verifier_exit_zero_this_turn(agent: &Agent) -> bool {
+    agent
+        .evidence_set_this_turn
+        .iter()
+        .any(|e| matches!(e, CompletionEvidence::VerifierExitZero { .. }))
+}
+
+/// Issue #591: emit the `agent.photon_evaluate.completed` log event from
+/// the pre-projected `PhotonEvaluateCompletedLog` payload. All payload
+/// fields are already audit-bounded (`outcome_json` /
+/// `outcome_detail_json` come from `photon_outcome_json_value` /
+/// `adoption_status` from `photon_evaluate_adoption_status`) so this
+/// function cannot leak runtime data into the outbound event.
+pub(super) fn log_photon_evaluate_completed(agent: &Agent, payload: PhotonEvaluateCompletedLog) {
+    log_llm_event(
+        "agent.photon_evaluate.completed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "failed": payload.failed,
+            "duration_ms": payload.duration_ms,
+            "summary_ids_adopted_count": payload.summary_ids_adopted_count,
+            "outcome": payload.outcome_json,
+            "adoption_status": payload.adoption_status,
+            "summary_ids_adopted_truncated": payload.truncated,
+            "outcome_detail": payload.outcome_detail_json,
+        }),
+    );
+}
+
+/// Issue #556: build the per-turn photon injection system message from
+/// the cached `photon_context_pack_response`. Returns `None` when the
+/// response is absent or the photon shadow_mode flag is set.
+pub(super) fn photon_context_pack_injection_message(agent: &Agent) -> Option<ConversationMessage> {
+    build_photon_injection_message(
+        agent.photon_context_pack_response.as_deref(),
+        agent.config.photon_shadow_mode,
+    )
 }
