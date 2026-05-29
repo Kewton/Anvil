@@ -87,6 +87,11 @@ mod anti_pattern_flow;
 // `persist_case_record` / `finish_case_record_extraction` private
 // helpers. `pub(super)` limited / no facade re-export (DR3-001).
 mod case_record_flow;
+// Work-mode / feedback-kind / quality second-pass confirmation flow
+// extracted from `turn.rs` (parent #680). Hosts 4 production entry
+// points + 4 private attempt/resolution helpers, all free fns over
+// `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod classify_confirm_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
