@@ -2030,7 +2030,8 @@ pub(super) fn request_actor_loop_pre_reply_model_turn(
     args: &ActorLoopPreReplyArgs<'_, '_>,
     control_state: ActorLoopPreReplyControlState,
 ) -> ActorLoopPreReplyOutcome {
-    match agent.request_assistant_reply_with_retry(
+    match super::reply_retry::request_assistant_reply_with_retry(
+        agent,
         args.stream_output,
         args.interrupt_flag,
         control_state.recovery_dispatch_gate,

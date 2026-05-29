@@ -1,15 +1,14 @@
 use super::active_job_arbiter::{
-    LoopControlAction, LoopControlInputs, RecoveryDispatchGate, RecoveryOwner,
-    build_active_job_selected_payload, determine_loop_control_action,
+    LoopControlAction, LoopControlInputs, RecoveryOwner, build_active_job_selected_payload,
+    determine_loop_control_action,
 };
 use super::actor_loop_flow::{
-    TaskContractVerifierFlowOutcome, build_feedback_for_deterministic_content_fallback,
-    format_iteration_status, repair_job_done_outcome, run_actor_loop,
+    TaskContractVerifierFlowOutcome, format_iteration_status, repair_job_done_outcome,
+    run_actor_loop,
 };
 use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
-use super::interrupt::{InterruptEnv, InterruptFlag, InterruptMonitor};
-use super::model_request::{build_assistant_request_plan, request_non_streaming_assistant_reply};
+use super::interrupt::{InterruptEnv, InterruptMonitor};
 use super::repair_driver::{
     VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
     verifier_repair_pass_timeout_error,
@@ -49,7 +48,6 @@ use super::small_helpers::masked_path_hash_bounded_list;
 use super::small_helpers::{
     latest_tool_result_since_last_user, raw_mode_safe_text, rfc3339_now_utc, user_interrupt_result,
 };
-use super::spinner::{Spinner, SpinnerStopSignal};
 use super::summary::{ExitReason, LoopResult};
 use super::tool_display::progress_path_display;
 use super::tool_execution::{
@@ -125,24 +123,24 @@ const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
 pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 
 #[derive(Debug, Clone, Copy)]
-struct AssistantReplyRetryState {
-    downgraded_native_tools: bool,
-    retries_remaining: usize,
-    tool_call_format_retries_remaining: usize,
-    extra_transport_retries: usize,
-    transport_retry_count: usize,
-    focused_edit_timeout_retry_count: usize,
-    tool_call_format_retry_count: usize,
+pub(super) struct AssistantReplyRetryState {
+    pub(super) downgraded_native_tools: bool,
+    pub(super) retries_remaining: usize,
+    pub(super) tool_call_format_retries_remaining: usize,
+    pub(super) extra_transport_retries: usize,
+    pub(super) transport_retry_count: usize,
+    pub(super) focused_edit_timeout_retry_count: usize,
+    pub(super) tool_call_format_retry_count: usize,
 }
 
-enum AssistantReplyRetryDecision {
+pub(super) enum AssistantReplyRetryDecision {
     Retry,
     ReturnReply(AssistantReply),
     Fail(String),
 }
 
 impl AssistantReplyRetryState {
-    fn new(chat_retries: usize, message_count: usize) -> Self {
+    pub(super) fn new(chat_retries: usize, message_count: usize) -> Self {
         Self {
             downgraded_native_tools: false,
             retries_remaining: chat_retries,
@@ -1187,345 +1185,6 @@ impl Agent {
         };
         self.emit_repair_safe_stop_report(stop_reason);
     }
-
-    pub(super) fn request_assistant_reply_with_retry(
-        &mut self,
-        stream_output: bool,
-        interrupt_flag: &InterruptFlag,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-    ) -> Result<AssistantReply, String> {
-        // Issue #430 Phase D: freeze the footer for the entire LLM call (the
-        // thinking spinner writes to stderr, but stream chunks land on stdout
-        // and would otherwise race the footer rewrite). Guard drops on
-        // function exit alongside the spinner, restoring redraws.
-        let _footer_freeze = self.footer.freeze_for_inference();
-        // Start spinner once at function entry; retries share the same
-        // animation (no flicker between attempts). Dropped automatically on
-        // function exit (Ok / Err / early-return), clearing the line.
-        let sp = Spinner::start(format!("thinking... ({})", self.current_assistant_model()));
-        let mut retry_state =
-            AssistantReplyRetryState::new(self.config.chat_retries, self.session.messages.len());
-        loop {
-            // Only streaming paths need first-chunk stop; oneshot blocks until
-            // the whole reply is assembled so Drop is sufficient.
-            let stop_signal = sp.stop_signal();
-            match self.request_assistant_reply(stream_output, stop_signal, interrupt_flag) {
-                Ok(reply) => return Ok(reply),
-                Err(err) => match self.handle_assistant_reply_retry_error(
-                    err,
-                    recovery_dispatch_gate,
-                    &mut retry_state,
-                )? {
-                    AssistantReplyRetryDecision::Retry => continue,
-                    AssistantReplyRetryDecision::ReturnReply(reply) => return Ok(reply),
-                    AssistantReplyRetryDecision::Fail(err) => return Err(err),
-                },
-            }
-        }
-    }
-
-    fn handle_assistant_reply_retry_error(
-        &mut self,
-        err: String,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-        retry_state: &mut AssistantReplyRetryState,
-    ) -> Result<AssistantReplyRetryDecision, String> {
-        if err == USER_INTERRUPT_ERROR {
-            return Ok(AssistantReplyRetryDecision::Fail(err));
-        }
-        if self.maybe_disable_native_tools_after_request_error(&err, retry_state) {
-            return Ok(AssistantReplyRetryDecision::Retry);
-        }
-        if let Some(decision) = self.maybe_handle_assistant_reply_format_error(
-            &err,
-            recovery_dispatch_gate,
-            retry_state,
-        )? {
-            return Ok(decision);
-        }
-        if let Some(decision) = self.maybe_handle_assistant_reply_timeout_error(
-            &err,
-            recovery_dispatch_gate,
-            retry_state,
-        ) {
-            return Ok(decision);
-        }
-        if let Some(decision) =
-            self.maybe_handle_assistant_reply_transport_error(&err, retry_state)?
-        {
-            return Ok(decision);
-        }
-        Ok(self.finish_assistant_reply_retry(err, retry_state))
-    }
-
-    fn maybe_disable_native_tools_after_request_error(
-        &mut self,
-        err: &str,
-        retry_state: &mut AssistantReplyRetryState,
-    ) -> bool {
-        if self.native_tools_enabled
-            && !retry_state.downgraded_native_tools
-            && (lifecycle::is_native_tool_parser_failure(err)
-                || lifecycle::is_native_tool_transport_failure(err))
-        {
-            retry_state.downgraded_native_tools = true;
-            self.disable_native_tools_for_session();
-            return true;
-        }
-        false
-    }
-
-    fn maybe_handle_assistant_reply_format_error(
-        &mut self,
-        err: &str,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-        retry_state: &mut AssistantReplyRetryState,
-    ) -> Result<Option<AssistantReplyRetryDecision>, String> {
-        if let Some(reply) =
-            super::scaffold_pipeline::maybe_materialize_plan_after_tool_call_format_error(
-                self, err,
-            )?
-        {
-            return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
-        }
-        // Issue #634: Format-error 経路の制御フロー不変条件 (SSOT)
-        //   (1) 評価順序固定: `maybe_apply_*` → `maybe_finish_*` の順で呼ぶ
-        //       (順序を変えると edit-then-finish の意味が崩れる)。
-        //   (2) flag off で apply は no-op (`Ok(None)`)。loop は次の
-        //       handler (`maybe_finish_*`) にフォールスルー。
-        //   (3) `maybe_finish_*` は capability gate (`finish_after_edit_format_error`)
-        //       のみで動く汎用 path (experimental flag 非依存)。
-        //       qwen3.5 ユーザーの format-error 後 finish は flag off
-        //       でも維持される。
-        if recovery_dispatch_gate.allows_deterministic_fallback()
-            && let Some(reply) =
-                super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(
-                    self, err,
-                )?
-        {
-            return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
-        }
-        if recovery_dispatch_gate.allows_generic_repo_change_recovery()
-            && let Some(reply) = self.maybe_finish_after_edit_format_error(err)
-        {
-            return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
-        }
-        if lifecycle::is_tool_call_format_error(err)
-            && retry_state.tool_call_format_retries_remaining > 0
-        {
-            retry_state.tool_call_format_retry_count += 1;
-            retry_state.tool_call_format_retries_remaining -= 1;
-            self.push_tool_call_format_retry_note(err, retry_state.tool_call_format_retry_count);
-            return Ok(Some(AssistantReplyRetryDecision::Retry));
-        }
-        Ok(None)
-    }
-
-    fn push_tool_call_format_retry_note(&mut self, err: &str, retry_count: usize) {
-        let lower_err = err.to_ascii_lowercase();
-        let effective_tool_policy = self.effective_tool_policy();
-        if let Some(policy) = effective_tool_policy.focused_edit_policy() {
-            let target = &policy.target;
-            let target_already_read = policy.target_already_read;
-            let target_display = progress_path_display(
-                &target.display().to_string(),
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-                120,
-            );
-            if !target.is_file() {
-                self.push_system_note(recovery::focused_edit_missing_target_recovery_note(
-                    &target_display,
-                    retry_count,
-                ));
-                return;
-            }
-            if lower_err.contains("truncated tool call") {
-                self.push_system_note(recovery::focused_edit_truncated_tool_call_note(
-                    &target_display,
-                    target_already_read,
-                    retry_count,
-                ));
-                return;
-            }
-            if lower_err.contains("unterminated <anvil_tool_call> block") {
-                self.push_system_note(recovery::focused_edit_unterminated_tool_call_note(
-                    &target_display,
-                    target_already_read,
-                    retry_count,
-                ));
-                return;
-            }
-        }
-        self.push_system_note(recovery::tool_call_format_recovery_note(err, retry_count));
-    }
-
-    fn maybe_handle_assistant_reply_timeout_error(
-        &mut self,
-        err: &str,
-        recovery_dispatch_gate: RecoveryDispatchGate,
-        retry_state: &mut AssistantReplyRetryState,
-    ) -> Option<AssistantReplyRetryDecision> {
-        if !err.to_ascii_lowercase().contains("timed out") {
-            return None;
-        }
-        if recovery_dispatch_gate.allows_deterministic_fallback()
-            && let Some(reply) =
-                super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback_after_timeout(
-                    self, err,
-                )
-        {
-            self.session.record_feedback_if_unset(
-                build_feedback_for_deterministic_content_fallback(&self.work_root),
-            );
-            return Some(AssistantReplyRetryDecision::ReturnReply(reply));
-        }
-        let timeout_focused_policy = self.effective_tool_policy().focused_edit_policy().cloned();
-        if let Some(policy) = timeout_focused_policy {
-            if recovery_dispatch_gate.allows_deterministic_fallback()
-                && let Some(reply) =
-                    super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback_after_timeout(self, err)
-            {
-                self.session.record_feedback_if_unset(
-                    build_feedback_for_deterministic_content_fallback(&self.work_root),
-                );
-                return Some(AssistantReplyRetryDecision::ReturnReply(reply));
-            }
-            retry_state.focused_edit_timeout_retry_count += 1;
-            if retry_state.focused_edit_timeout_retry_count >= 2 {
-                return Some(AssistantReplyRetryDecision::Fail(err.to_string()));
-            }
-            self.push_system_note(recovery::focused_edit_timeout_recovery_note(
-                &progress_path_display(
-                    &policy.target.display().to_string(),
-                    &self.work_root,
-                    self.session.mode_state.active_plan_path.as_deref(),
-                    120,
-                ),
-                policy.target_already_read,
-                retry_state.focused_edit_timeout_retry_count,
-            ));
-            return Some(AssistantReplyRetryDecision::Retry);
-        }
-        None
-    }
-
-    fn maybe_handle_assistant_reply_transport_error(
-        &mut self,
-        err: &str,
-        retry_state: &mut AssistantReplyRetryState,
-    ) -> Result<Option<AssistantReplyRetryDecision>, String> {
-        if !lifecycle::is_transport_error(err) || retry_state.extra_transport_retries == 0 {
-            return Ok(None);
-        }
-        if let Some(reply) =
-            super::scaffold_pipeline::maybe_materialize_plan_after_timeout(self, err)?
-        {
-            return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
-        }
-        if super::scaffold_pipeline::maybe_fallback_plan_model_after_timeout(self, err) {
-            return Ok(Some(AssistantReplyRetryDecision::Retry));
-        }
-        retry_state.transport_retry_count += 1;
-        retry_state.extra_transport_retries -= 1;
-        thread::sleep(Duration::from_secs(
-            (retry_state.transport_retry_count as u64) * 4,
-        ));
-        Ok(Some(AssistantReplyRetryDecision::Retry))
-    }
-
-    fn finish_assistant_reply_retry(
-        &self,
-        err: String,
-        retry_state: &mut AssistantReplyRetryState,
-    ) -> AssistantReplyRetryDecision {
-        if retry_state.retries_remaining == 0 {
-            return AssistantReplyRetryDecision::Fail(err);
-        }
-        let sleep_secs = (self.config.chat_retries - retry_state.retries_remaining + 1) as u64 * 2;
-        retry_state.retries_remaining -= 1;
-        thread::sleep(Duration::from_secs(sleep_secs));
-        AssistantReplyRetryDecision::Retry
-    }
-
-    fn request_assistant_reply(
-        &mut self,
-        stream_output: bool,
-        stop_signal: Option<SpinnerStopSignal>,
-        interrupt_flag: &InterruptFlag,
-    ) -> Result<AssistantReply, String> {
-        let protocol =
-            prompting::ToolProtocol::from_native_tools_enabled(self.native_tools_enabled);
-        let native_tools_enabled = protocol.native_tools_enabled();
-        let effective_tool_policy = self.effective_tool_policy();
-        let focused_edit_target = effective_tool_policy
-            .focused_edit_policy()
-            .map(|policy| policy.target.as_path());
-        let messages = self.build_request_messages(protocol, &effective_tool_policy);
-        let assistant_model = self.current_assistant_model();
-        let request_plan = build_assistant_request_plan(
-            assistant_model.as_str(),
-            native_tools_enabled,
-            stream_output,
-            io::stdin().is_terminal(),
-            &self.session.messages,
-            focused_edit_target,
-            &self.work_root,
-        );
-        let tool_specs = self.tool_specs_for_policy(&effective_tool_policy);
-
-        if request_plan.use_streaming_transport {
-            self.request_streaming_assistant_reply(
-                &messages,
-                &tool_specs,
-                native_tools_enabled,
-                stream_output,
-                stop_signal,
-                interrupt_flag,
-            )
-        } else {
-            request_non_streaming_assistant_reply(
-                &self.client,
-                assistant_model.as_str(),
-                &messages,
-                &tool_specs,
-                native_tools_enabled,
-                request_plan.focused_edit_timeout_override,
-                request_plan.focused_edit_max_predict_override,
-            )
-        }
-    }
-
-    fn request_streaming_assistant_reply(
-        &self,
-        messages: &[ConversationMessage],
-        tool_specs: &[ToolSpec],
-        native_tools_enabled: bool,
-        stream_output: bool,
-        stop_signal: Option<SpinnerStopSignal>,
-        interrupt_flag: &InterruptFlag,
-    ) -> Result<AssistantReply, String> {
-        let assistant_model = self.current_assistant_model();
-        let mut render_state = super::streaming_reply::StreamingReplyRenderState::new();
-        let reply = self.client.chat_streaming_with_mode(
-            assistant_model.as_str(),
-            messages,
-            tool_specs,
-            native_tools_enabled,
-            |chunk| {
-                super::streaming_reply::handle_streaming_assistant_chunk(
-                    &mut render_state,
-                    chunk,
-                    stream_output,
-                    stop_signal.as_ref(),
-                    interrupt_flag,
-                )
-            },
-        )?;
-        super::streaming_reply::finish_streaming_assistant_reply(&mut render_state, stream_output);
-        Ok(reply)
-    }
-
     pub(super) fn current_assistant_model(&self) -> String {
         assistant_model_for_mode(
             self.session.mode_state.mode,
@@ -1533,36 +1192,7 @@ impl Agent {
             self.plan_model_override.as_deref(),
         )
     }
-
-    /// Issue #634: 旧名 `maybe_finish_after_qwen35_edit_format_error`。
-    /// 「format error でも edit success なら finish」というモデル非依存の汎用
-    /// 挙動を担う。`finish_after_edit_format_error` capability のみで gate される
-    /// (experimental flag 非依存)。
-    fn maybe_finish_after_edit_format_error(&self, err: &str) -> Option<AssistantReply> {
-        if !lifecycle::is_tool_call_format_error(err)
-            || !model_capabilities(&self.current_assistant_model()).finish_after_edit_format_error
-            || self.session.mode_state.mode != ExecutionMode::Act
-        {
-            return None;
-        }
-        if self.active_python_request_requires_tests() && !self.python_test_artifact_exists() {
-            return None;
-        }
-        let edits = successful_non_plan_repo_edit_count(
-            &self.session.messages,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        );
-        (edits > 0).then(|| AssistantReply {
-            content: "Applied the focused edit; stopping after a malformed follow-up tool call."
-                .to_string(),
-            tool_calls: Vec::new(),
-            prompt_tokens: None,
-            completion_tokens: None,
-        })
-    }
-
-    fn build_request_messages(
+    pub(super) fn build_request_messages(
         &mut self,
         protocol: prompting::ToolProtocol,
         effective_tool_policy: &EffectiveToolPolicy,
@@ -2471,7 +2101,7 @@ impl Agent {
         }
     }
 
-    fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
+    pub(super) fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
         if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt() {
             specs.retain(|spec| allowed_tools.contains(&spec.function.name.as_str()));
