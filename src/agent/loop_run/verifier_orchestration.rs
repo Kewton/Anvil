@@ -39,6 +39,10 @@
 use std::path::Path;
 
 use super::auto_test::{AutoTestPlan, VerifierCommand};
+use super::completion_evidence::{
+    CompletionEvidence, EvidenceSet, is_completion_verifier_command,
+    redact_verifier_command_for_storage,
+};
 use super::failure_packet::FailurePacket;
 use super::progress_text::truncate;
 use super::repair_attempt_outcome::RepairAttemptOutcome;
@@ -63,7 +67,7 @@ use super::required_behavior::{BehaviorContractProjection, behavior_contract_pay
 use super::semantic_repair_planning::{
     diagnostic_target_allowed_by_confidence, first_role_kind_compatible_diagnostic_target,
 };
-use super::task_contract::{ArtifactRole, RecoveryTargetHint, TaskContract};
+use super::task_contract::{ArtifactRole, CompletionDecision, RecoveryTargetHint, TaskContract};
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn::{
@@ -83,9 +87,11 @@ use super::verifier_repair_targeting::{
 };
 use super::{VerifierRepairAssessment, VerifierRepairAssessmentSource};
 use crate::agent::orchestration::{RepoSnapshot, RepoVerification};
+use crate::modes::plan_act::ExecutionMode;
 use crate::safety::path_guard::resolve_user_path;
 use crate::session::feedback::mask_secrets;
 use crate::session::store::ConversationMessage;
+use crate::tools::bash::{BashCommandClass, BashExecutionOutcome};
 use std::collections::HashSet;
 
 #[cfg(test)]
@@ -1277,4 +1283,98 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
         summary: parsed.summary,
         source: VerifierRepairAssessmentSource::DiagnosticPass,
     }
+}
+
+pub(super) fn task_contract_needs_verification(
+    mode: ExecutionMode,
+    contract: Option<&TaskContract>,
+    evidence: &EvidenceSet,
+) -> bool {
+    if mode == ExecutionMode::Plan {
+        return false;
+    }
+    contract
+        .is_some_and(|contract| matches!(contract.evaluate(evidence), CompletionDecision::Verify))
+}
+
+pub(super) fn task_contract_no_verifier_note(
+    attempt: usize,
+    attempt_limit: usize,
+    active_request: &str,
+) -> String {
+    let hint = missing_verifier_setup_hint_for_request(active_request)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    format!(
+        "[Task Contract Verification] Required artifacts are present, but no runnable verifier was detected for this workspace. Emit exactly one Write or Edit now for project-local verifier metadata, then Anvil will rerun verification.{hint} Do not call Bash, do not switch tasks, and do not answer in prose. task_contract_verify_attempt={attempt}/{attempt_limit}"
+    )
+}
+
+pub(super) fn build_verifier_exit_zero_evidence(
+    outcome: &BashExecutionOutcome,
+) -> Option<CompletionEvidence> {
+    use BashCommandClass;
+    if outcome.exit_code != Some(0) {
+        return None;
+    }
+    if !matches!(
+        outcome.class,
+        BashCommandClass::BuildTest | BashCommandClass::EnvSetup
+    ) {
+        return None;
+    }
+    if !is_completion_verifier_command(&outcome.command) {
+        return None;
+    }
+    let masked = redact_verifier_command_for_storage(&outcome.command);
+    // PR-001: bash-hook / legacy path — `bound_test_artifacts_count: None`
+    // because we cannot prove the runner's argv contained any owned test
+    // path. `TaskContract::evaluate_with_owned_test_artifacts` treats this
+    // as unbound and refuses to promote to Done under
+    // `test_execution_required = true` (Issue #651 PR-001).
+    Some(CompletionEvidence::VerifierExitZero {
+        class: outcome.class,
+        command: masked,
+        bound_test_artifacts_count: None,
+    })
+}
+
+pub(super) fn build_task_contract_verifier_exit_zero_evidence(
+    command: &str,
+) -> Option<CompletionEvidence> {
+    // This path is reached only after AutoTestRunner itself executed the
+    // controller-selected verifier and observed exit code 0. Unlike arbitrary
+    // Bash tool output, the command may include an internal setup segment
+    // (`pip install ... && pytest`), so the shell-control evidence gate is not
+    // the right trust boundary here.
+    //
+    // PR-001: this overload covers the **legacy** `AutoTestRunner::run`
+    // (shell-based) path which has no structural binding to owned test
+    // paths. It records `bound_test_artifacts_count: None`. The structured
+    // `AutoTestRunner::run_structured` path goes through
+    // `build_task_contract_verifier_exit_zero_evidence_bound(command, n)`.
+    let masked = redact_verifier_command_for_storage(command);
+    if masked.trim().is_empty() {
+        return None;
+    }
+    Some(CompletionEvidence::VerifierExitZero {
+        class: BashCommandClass::BuildTest,
+        command: masked,
+        bound_test_artifacts_count: None,
+    })
+}
+
+pub(super) fn build_task_contract_verifier_exit_zero_evidence_bound(
+    command: &str,
+    bound_count: usize,
+) -> Option<CompletionEvidence> {
+    let masked = redact_verifier_command_for_storage(command);
+    if masked.trim().is_empty() {
+        return None;
+    }
+    Some(CompletionEvidence::VerifierExitZero {
+        class: BashCommandClass::BuildTest,
+        command: masked,
+        bound_test_artifacts_count: Some(bound_count),
+    })
 }

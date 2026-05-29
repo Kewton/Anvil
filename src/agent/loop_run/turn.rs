@@ -163,16 +163,18 @@ use super::verifier_failure_signature::verifier_failure_count;
 use super::verifier_orchestration::{
     JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
     StructuredTaskContractVerifierRun, TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,
-    VerifierRepairAttemptProgress, model_assessment_to_verifier_repair_assessment,
-    task_contract_verifier_failure_attempt_limit, task_contract_verifier_repair_note,
-    task_contract_verifier_targeted_edit_required_note, verifier_diagnostic_file_excerpts,
-    verifier_diagnostic_messages, verifier_framework_signal_for_context,
-    verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
-    verifier_repair_intent_limits, verifier_repair_pass_messages,
-    verifier_repair_pass_request_error_message, verifier_repair_policy_for_target_hint,
-    verifier_repair_safe_stop_message, verifier_repair_target_display,
-    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
-    verifier_setup_policy_message,
+    VerifierRepairAttemptProgress, build_task_contract_verifier_exit_zero_evidence,
+    build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
+    model_assessment_to_verifier_repair_assessment, task_contract_needs_verification,
+    task_contract_no_verifier_note, task_contract_verifier_failure_attempt_limit,
+    task_contract_verifier_repair_note, task_contract_verifier_targeted_edit_required_note,
+    verifier_diagnostic_file_excerpts, verifier_diagnostic_messages,
+    verifier_framework_signal_for_context, verifier_repair_context_diagnostics,
+    verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
+    verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
+    verifier_repair_policy_for_target_hint, verifier_repair_safe_stop_message,
+    verifier_repair_target_display, verifier_repair_transition_message,
+    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
 };
 #[cfg(test)]
 use super::verifier_orchestration::{
@@ -1544,35 +1546,6 @@ fn repair_terminal_exit_reason(reason: super::repair_job::RepairTerminalReason) 
         Some(_) => ExitReason::RepairSafeStop,
         None => ExitReason::VerifierFailed,
     }
-}
-
-fn task_contract_needs_verification(
-    mode: ExecutionMode,
-    contract: Option<&super::task_contract::TaskContract>,
-    evidence: &super::completion_evidence::EvidenceSet,
-) -> bool {
-    if mode == ExecutionMode::Plan {
-        return false;
-    }
-    contract.is_some_and(|contract| {
-        matches!(
-            contract.evaluate(evidence),
-            super::task_contract::CompletionDecision::Verify
-        )
-    })
-}
-
-fn task_contract_no_verifier_note(
-    attempt: usize,
-    attempt_limit: usize,
-    active_request: &str,
-) -> String {
-    let hint = missing_verifier_setup_hint_for_request(active_request)
-        .map(|hint| format!(" {hint}"))
-        .unwrap_or_default();
-    format!(
-        "[Task Contract Verification] Required artifacts are present, but no runnable verifier was detected for this workspace. Emit exactly one Write or Edit now for project-local verifier metadata, then Anvil will rerun verification.{hint} Do not call Bash, do not switch tasks, and do not answer in prose. task_contract_verify_attempt={attempt}/{attempt_limit}"
-    )
 }
 
 fn repo_edit_satisfies_artifact_recovery_target(
@@ -12501,105 +12474,6 @@ if __name__ == "__main__":
             .messages
             .push(ConversationMessage::user(content));
     }
-}
-
-/// Issue #606 T-1.6 / Issue #607: pure projection from a Bash outcome to an
-/// optional `VerifierExitZero` completion-evidence record. Gates:
-///
-/// 1. `exit_code == Some(0)` — non-zero / timeout / interrupted is failure.
-/// 2. `class ∈ { BuildTest, EnvSetup }` — read-only / network / mutating /
-///    dangerous classes never produce verifier evidence.
-/// 3. `is_completion_verifier_command` — rejects shell-control-laundered
-///    exit codes (DR4-002, e.g. `cargo test || true`).
-///
-/// The returned command field is run through
-/// `redact_verifier_command_for_storage` so secret tokens never reach the
-/// in-process EvidenceSet (Issue #607 SEC4-003).
-pub(super) fn build_verifier_exit_zero_evidence(
-    outcome: &crate::tools::bash::BashExecutionOutcome,
-) -> Option<super::completion_evidence::CompletionEvidence> {
-    use crate::tools::bash::BashCommandClass;
-    if outcome.exit_code != Some(0) {
-        return None;
-    }
-    if !matches!(
-        outcome.class,
-        BashCommandClass::BuildTest | BashCommandClass::EnvSetup
-    ) {
-        return None;
-    }
-    if !super::completion_evidence::is_completion_verifier_command(&outcome.command) {
-        return None;
-    }
-    let masked = super::completion_evidence::redact_verifier_command_for_storage(&outcome.command);
-    // PR-001: bash-hook / legacy path — `bound_test_artifacts_count: None`
-    // because we cannot prove the runner's argv contained any owned test
-    // path. `TaskContract::evaluate_with_owned_test_artifacts` treats this
-    // as unbound and refuses to promote to Done under
-    // `test_execution_required = true` (Issue #651 PR-001).
-    Some(
-        super::completion_evidence::CompletionEvidence::VerifierExitZero {
-            class: outcome.class,
-            command: masked,
-            bound_test_artifacts_count: None,
-        },
-    )
-}
-
-fn build_task_contract_verifier_exit_zero_evidence(
-    command: &str,
-) -> Option<super::completion_evidence::CompletionEvidence> {
-    // This path is reached only after AutoTestRunner itself executed the
-    // controller-selected verifier and observed exit code 0. Unlike arbitrary
-    // Bash tool output, the command may include an internal setup segment
-    // (`pip install ... && pytest`), so the shell-control evidence gate is not
-    // the right trust boundary here.
-    //
-    // PR-001: this overload covers the **legacy** `AutoTestRunner::run`
-    // (shell-based) path which has no structural binding to owned test
-    // paths. It records `bound_test_artifacts_count: None`. The structured
-    // `AutoTestRunner::run_structured` path goes through
-    // `build_task_contract_verifier_exit_zero_evidence_bound(command, n)`.
-    let masked = super::completion_evidence::redact_verifier_command_for_storage(command);
-    if masked.trim().is_empty() {
-        return None;
-    }
-    Some(
-        super::completion_evidence::CompletionEvidence::VerifierExitZero {
-            class: crate::tools::bash::BashCommandClass::BuildTest,
-            command: masked,
-            bound_test_artifacts_count: None,
-        },
-    )
-}
-
-/// Issue #651 PR-001: build a **bound** `VerifierExitZero` evidence
-/// entry for the structured-runner path. The `bound_count` parameter is
-/// the size of `VerifierCommand::bound_test_artifacts()` at the time
-/// `AutoTestRunner::run_structured` succeeded — i.e. the number of
-/// scope-validated owned test paths that appeared in the child process's
-/// argv.
-///
-/// This entry is the only proof
-/// `TaskContract::evaluate_with_owned_test_artifacts` accepts as
-/// satisfying `test_execution_required = true`. Storing the count (not
-/// the path list) keeps the evidence payload bounded and avoids leaking
-/// path strings into the in-process EvidenceSet.
-fn build_task_contract_verifier_exit_zero_evidence_bound(
-    command: &str,
-    bound_count: usize,
-) -> Option<super::completion_evidence::CompletionEvidence> {
-    let masked = super::completion_evidence::redact_verifier_command_for_storage(command);
-    if masked.trim().is_empty() {
-        return None;
-    }
-    Some(
-        super::completion_evidence::CompletionEvidence::VerifierExitZero {
-            class: crate::tools::bash::BashCommandClass::BuildTest,
-            command: masked,
-            bound_test_artifacts_count: Some(bound_count),
-        },
-    )
 }
 
 #[cfg(test)]
