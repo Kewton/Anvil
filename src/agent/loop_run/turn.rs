@@ -129,7 +129,6 @@ use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_la
 use super::scaffold_pipeline::PlanExplorationKey;
 #[cfg(test)]
 use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
-use super::scaffold_pipeline::scaffold_candidate_priority;
 #[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 #[cfg(test)]
@@ -240,7 +239,10 @@ use super::work_mode_confirm::{
     self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
     run_work_mode_confirm_with_strategy,
 };
-use super::workspace_walk::{meaningful_workspace_files, workspace_appears_empty};
+use super::workspace_candidates::existing_workspace_candidate_for_role_in_scope;
+#[cfg(test)]
+use super::workspace_candidates::{existing_workspace_candidate_for_role, target_path_in_scope};
+use super::workspace_walk::workspace_appears_empty;
 use super::*;
 use crate::agent::orchestration::verify_repo_progress;
 use crate::logging::{log_llm_event, stable_path_hash};
@@ -12126,90 +12128,6 @@ pub(super) fn latest_turn_preferred_read_edit_target(
         }
     }
     latest_existing
-}
-
-/// Legacy un-scoped lookup kept for unit-test fixtures that exercise the
-/// `scaffold_candidate_priority` ordering independently of scope detection.
-/// Production code MUST use [`existing_workspace_candidate_for_role_in_scope`]
-/// so out-of-scope nested-subtree files cannot leak into completion evidence
-/// (Issue #646).
-#[cfg(test)]
-fn existing_workspace_candidate_for_role(
-    work_root: &Path,
-    role: super::task_contract::ArtifactRole,
-) -> Option<String> {
-    let mut candidates = meaningful_workspace_files(work_root, 64)?
-        .into_iter()
-        .filter(|path| {
-            super::task_contract::role_from_repo_edit(
-                super::completion_evidence::classify_repo_edit_path(path),
-            )
-            .is_some_and(|candidate| candidate == role)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|path| {
-        scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
-    });
-    candidates
-        .first()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-}
-
-/// v0.4.11: after an invalid controller repair proposal is recorded in the
-/// repair ledger, the next policy decision may have advanced to a fresh
-/// diagnostic or a different concrete target. Only those transitions count as
-/// useful control-flow progress. Staying on the same target is still a retry
-/// against the outer terminal budget; otherwise malformed proposals can loop
-/// until `max_iterations`.
-///
-/// Issue #646: confirm that an absolute repair target lies inside the active
-/// workspace scope. The path is normalized against `work_root` and the
-/// resulting relative form is handed to [`TaskWorkspaceScope::contains`].
-/// Targets that fail to strip the prefix (escape via canonical/symlink) are
-/// treated as out-of-scope.
-#[cfg(test)]
-fn target_path_in_scope(
-    target: &Path,
-    work_root: &Path,
-    scope: &super::task_workspace_scope::TaskWorkspaceScope,
-) -> bool {
-    let root_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
-    let target_canon = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-    let Ok(relative) = target_canon.strip_prefix(&root_canon) else {
-        return false;
-    };
-    scope.contains(&relative.to_string_lossy().replace('\\', "/"))
-}
-
-/// Issue #646: scope-aware variant of [`existing_workspace_candidate_for_role`].
-///
-/// Filters workspace files through `scope.contains(...)` before priority
-/// sorting so candidates inside out-of-scope nested subtrees (the
-/// fresh-session-parent-directory bug case) are never surfaced. Used by
-/// `task_contract_artifact_states` and `task_contract_recovery_target`;
-/// the legacy un-scoped function is preserved for unit-test fixtures that
-/// exercise the priority logic independently.
-pub(super) fn existing_workspace_candidate_for_role_in_scope(
-    work_root: &Path,
-    role: super::task_contract::ArtifactRole,
-    scope: &super::task_workspace_scope::TaskWorkspaceScope,
-) -> Option<String> {
-    let mut candidates = meaningful_workspace_files(work_root, 64)?
-        .into_iter()
-        .filter(|path| {
-            super::task_contract::role_from_repo_edit(
-                super::completion_evidence::classify_repo_edit_path(path),
-            )
-            .is_some_and(|candidate| candidate == role)
-        })
-        .filter(|path| scope.contains(&path.to_string_lossy().replace('\\', "/")))
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|path| {
-        scaffold_candidate_priority(work_root, role, &path.to_string_lossy().replace('\\', "/"))
-    });
-    candidates
-        .first()
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
 }
 
 /// Format a single-line per-iteration progress line. ANSI color is only

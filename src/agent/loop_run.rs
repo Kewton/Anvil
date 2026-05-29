@@ -648,6 +648,13 @@ mod turn;
 pub(crate) mod verifier_skill;
 pub(crate) mod work_mode_confirm;
 mod workspace_walk;
+// Workspace candidate lookup helpers extracted from `turn.rs` (parent
+// #680). Hosts `existing_workspace_candidate_for_role_in_scope` (the
+// scope-aware lookup used by `task_contract_artifact_states` /
+// `task_contract_recovery_target`) plus the test-only legacy un-scoped
+// variant and `target_path_in_scope`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod workspace_candidates;
 
 // Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
