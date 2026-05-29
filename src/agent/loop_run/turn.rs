@@ -92,7 +92,6 @@ use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
     EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT, ScaffoldFallbackResult, ScaffoldFramework,
-    deterministic_framework_game_impl_path, deterministic_support_target_relative,
     scaffold_candidate_priority,
 };
 #[cfg(test)]
@@ -226,8 +225,7 @@ use super::deterministic::empty_framework_game_files as deterministic_empty_fram
 use super::progress_text::{is_utf8_locale, tool_color, tool_emoji};
 use super::progress_text::{sanitize_for_progress, truncate};
 use super::quality::{
-    first_existing_impl_target, package_json_with_requested_port, quality_first_pass_observation,
-    react_dev_wrapper_for_requested_port, repo_change_request_text,
+    first_existing_impl_target, quality_first_pass_observation, repo_change_request_text,
     request_allows_fast_polish_fallback, request_explicitly_requires_tests,
     request_mentions_unsupported_ui_framework, request_needs_playable_ui_quality_gate,
     workspace_has_unsupported_ui_framework,
@@ -1707,7 +1705,7 @@ pub(super) fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> St
     raw_path.trim().replace('\\', "/")
 }
 
-fn sync_package_json_with_existing_lock(
+pub(super) fn sync_package_json_with_existing_lock(
     work_root: &Path,
     relative: &Path,
     package_content: String,
@@ -9998,47 +9996,6 @@ impl Agent {
         )
     }
 
-    pub(super) fn maybe_apply_deterministic_framework_support_files(
-        &self,
-        request: &str,
-    ) -> Result<(), String> {
-        if !self.config.deterministic_fallback.allows_support_recovery() {
-            return Ok(());
-        }
-        let Some(files) = deterministic::empty_framework_app_files(request) else {
-            return Ok(());
-        };
-        let mut written_paths = Vec::<String>::new();
-        for (relative, content) in files {
-            if deterministic_framework_game_impl_path(&relative) {
-                continue;
-            }
-            let content = sync_package_json_with_existing_lock(&self.work_root, &relative, content);
-            let target_relative = deterministic_support_target_relative(&self.work_root, &relative);
-            let target = self.work_root.join(&target_relative);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
-            }
-            std::fs::write(&target, content)
-                .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
-            written_paths.push(target_relative.to_string_lossy().replace('\\', "/"));
-        }
-        if !written_paths.is_empty() {
-            log_llm_event(
-                "agent.deterministic_framework_support_files",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "work_root": self.work_root.display().to_string(),
-                    "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                    "fallback_action": "minimal_patch",
-                    "files": written_paths,
-                }),
-            );
-        }
-        Ok(())
-    }
-
     pub(super) fn maybe_apply_deterministic_polish_fallback(
         &self,
         request: &str,
@@ -10059,62 +10016,23 @@ impl Agent {
     }
 
     pub(super) fn maybe_apply_requested_port_script(&self, request: &str) -> Result<(), String> {
-        let package_path = self.work_root.join("package.json");
-        let Ok(current) = std::fs::read_to_string(&package_path) else {
-            return Ok(());
-        };
-        let react_dev_wrapper = react_dev_wrapper_for_requested_port(request, &current);
-        let Some(updated) = package_json_with_requested_port(request, &current) else {
-            if let Some(wrapper) = react_dev_wrapper {
-                self.write_react_dev_wrapper(wrapper)?;
-            }
-            return Ok(());
-        };
-        std::fs::write(&package_path, updated)
-            .map_err(|err| format!("failed to write {}: {err}", package_path.display()))?;
-        if let Some(wrapper) = react_dev_wrapper {
-            self.write_react_dev_wrapper(wrapper)?;
-        }
-        Ok(())
-    }
-
-    fn write_react_dev_wrapper(&self, wrapper: String) -> Result<(), String> {
-        let scripts_dir = self.work_root.join("scripts");
-        std::fs::create_dir_all(&scripts_dir)
-            .map_err(|err| format!("failed to create {}: {err}", scripts_dir.display()))?;
-        let wrapper_path = scripts_dir.join("dev.mjs");
-        std::fs::write(&wrapper_path, wrapper)
-            .map_err(|err| format!("failed to write {}: {err}", wrapper_path.display()))
+        super::scaffold_pipeline::maybe_apply_requested_port_script(self, request)
     }
 
     fn maybe_apply_deterministic_quality_fallback_after_timeout(
         &self,
         err: &str,
     ) -> Option<AssistantReply> {
-        if !err.to_ascii_lowercase().contains("timed out")
-            || !self.current_request_needs_playable_ui_quality_gate()
-        {
-            return None;
-        }
-        // Creative/playable UI timeout recovery must not synthesize a
-        // completion reply. Let the focused-edit recovery path continue so the
-        // next successful completion is model-produced or verifier-backed.
-        None
+        super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback_after_timeout(
+            self, err,
+        )
     }
 
     fn maybe_apply_deterministic_polish_fallback_after_timeout(
         &self,
         err: &str,
     ) -> Option<AssistantReply> {
-        if !err.to_ascii_lowercase().contains("timed out")
-            || !self.current_request_needs_playable_ui_quality_gate()
-        {
-            return None;
-        }
-        // Same boundary as quality fallback above: deterministic polish can be
-        // a recovery aid during normal loop iterations, but timeout handling
-        // must not turn it into an assistant completion.
-        None
+        super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback_after_timeout(self, err)
     }
 
     fn refresh_working_memory(&mut self) {
