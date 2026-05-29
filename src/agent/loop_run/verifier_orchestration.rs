@@ -2352,8 +2352,12 @@ pub(super) fn handle_legacy_task_contract_verifier_selection(
             "reason": &plan.reason,
         }),
     );
-    let frame =
-        super::turn::build_feedback_for_auto_test(&plan, &result, &agent.work_root, changed_files);
+    let frame = super::feedback_builders::build_feedback_for_auto_test(
+        &plan,
+        &result,
+        &agent.work_root,
+        changed_files,
+    );
     agent.session.record_feedback_if_unset(frame);
     agent.record_task_contract_verifier_invocation(&result.command, result.exit_code);
     if result.passed {
@@ -2690,7 +2694,7 @@ pub(super) fn finish_structured_task_contract_verifier_selection(
         );
         return contamination.to_failure_outcome(result, &created_markers);
     }
-    let frame = super::turn::build_feedback_for_auto_test(
+    let frame = super::feedback_builders::build_feedback_for_auto_test(
         &selection.plan,
         &result,
         &agent.work_root,

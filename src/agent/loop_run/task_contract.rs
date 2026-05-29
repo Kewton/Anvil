@@ -1519,6 +1519,62 @@ pub(super) fn role_from_repo_edit(category: RepoEditCategory) -> Option<Artifact
     }
 }
 
+/// Does a repo edit of `category` at `relative_path` satisfy the
+/// active `RecoveryTarget` (if any)? `None` target means
+/// unconstrained → accept. Otherwise the role must match and the path
+/// must either be identical or live in the same test-artifact family
+/// (rust-integration / pytest / typescript-test / javascript-test).
+pub(super) fn repo_edit_satisfies_artifact_recovery_target(
+    category: RepoEditCategory,
+    relative_path: &str,
+    target: Option<&RecoveryTarget>,
+) -> bool {
+    let Some(target) = target else {
+        return true;
+    };
+    let Some(role) = role_from_repo_edit(category) else {
+        return false;
+    };
+    let target_path = target.path.replace('\\', "/");
+    if role != target.role {
+        return false;
+    }
+    if relative_path == target_path {
+        return true;
+    }
+    target.role == ArtifactRole::Test
+        && test_artifact_path_family(relative_path)
+            .zip(test_artifact_path_family(&target_path))
+            .is_some_and(|(actual, expected)| actual == expected)
+}
+
+/// Classify a path into a known test-artifact family
+/// (rust-integration / pytest / typescript-test / javascript-test).
+/// Returns `None` when the path doesn't match any recognised family.
+fn test_artifact_path_family(path: &str) -> Option<&'static str> {
+    let normalized = path.replace('\\', "/");
+    let name = std::path::Path::new(&normalized)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if normalized.starts_with("tests/") && normalized.ends_with(".rs") {
+        return Some("rust-integration");
+    }
+    if normalized.starts_with("tests/")
+        && normalized.ends_with(".py")
+        && (name.starts_with("test_") || name.ends_with("_test.py"))
+    {
+        return Some("pytest");
+    }
+    if normalized.ends_with(".test.ts") || normalized.ends_with(".spec.ts") {
+        return Some("typescript-test");
+    }
+    if normalized.ends_with(".test.js") || normalized.ends_with(".spec.js") {
+        return Some("javascript-test");
+    }
+    None
+}
+
 fn has_build_test_verifier(evidence: &EvidenceSet) -> bool {
     evidence.iter().any(|item| {
         matches!(

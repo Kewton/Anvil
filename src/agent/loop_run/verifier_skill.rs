@@ -274,12 +274,13 @@ impl AgentSkill for VerifierSkill {
                                 Some(&summary),
                             );
                             let combined_output = combined_output_for_classify(&result);
-                            let feedback = Some(super::turn::build_feedback_for_auto_test(
-                                &plan,
-                                &result,
-                                inputs.workspace_root,
-                                inputs.changed_files,
-                            ));
+                            let feedback =
+                                Some(super::feedback_builders::build_feedback_for_auto_test(
+                                    &plan,
+                                    &result,
+                                    inputs.workspace_root,
+                                    inputs.changed_files,
+                                ));
                             return Ok(wrap_skill_output(VerifierOutcome::AutoTestRan {
                                 score,
                                 auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),
@@ -358,12 +359,13 @@ impl AgentSkill for VerifierSkill {
                         // `classify_auto_test` (via `build_feedback_for_auto_test`)
                         // and the second-pass confirmation in `success.rs`.
                         let combined_output = combined_output_for_classify(&result);
-                        let feedback = Some(super::turn::build_feedback_for_auto_test(
-                            &plan,
-                            &result,
-                            inputs.workspace_root,
-                            inputs.changed_files,
-                        ));
+                        let feedback =
+                            Some(super::feedback_builders::build_feedback_for_auto_test(
+                                &plan,
+                                &result,
+                                inputs.workspace_root,
+                                inputs.changed_files,
+                            ));
                         Ok(wrap_skill_output(VerifierOutcome::AutoTestRan {
                             score,
                             auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),
@@ -575,12 +577,13 @@ impl VerifierSkill {
                             Some(&summary),
                         );
                         let combined_output = combined_output_for_classify(&result);
-                        let feedback = Some(super::turn::build_feedback_for_auto_test(
-                            &plan,
-                            &result,
-                            inputs.workspace_root,
-                            inputs.changed_files,
-                        ));
+                        let feedback =
+                            Some(super::feedback_builders::build_feedback_for_auto_test(
+                                &plan,
+                                &result,
+                                inputs.workspace_root,
+                                inputs.changed_files,
+                            ));
                         VerifierOutcome::AutoTestRan {
                             score,
                             auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),
@@ -772,12 +775,13 @@ impl VerifierSkill {
                             Some(&summary),
                         );
                         let combined_output = combined_output_for_classify(&result);
-                        let feedback = Some(super::turn::build_feedback_for_auto_test(
-                            &plan,
-                            &result,
-                            inputs.workspace_root,
-                            inputs.changed_files,
-                        ));
+                        let feedback =
+                            Some(super::feedback_builders::build_feedback_for_auto_test(
+                                &plan,
+                                &result,
+                                inputs.workspace_root,
+                                inputs.changed_files,
+                            ));
                         VerifierOutcome::AutoTestRan {
                             score,
                             auto_test_kind: AutoTestKindView::from(plan.auto_test_kind()),

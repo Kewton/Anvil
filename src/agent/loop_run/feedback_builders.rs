@@ -26,6 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use super::Agent;
+use super::auto_test::{AutoTestPlan, AutoTestResult, classify_auto_test};
 use super::verifier_repair_targeting::extract_path_like_tokens;
 use crate::agent::prompting;
 use crate::safety::path_guard::resolve_user_path;
@@ -33,6 +34,51 @@ use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
 };
 use crate::tools::bash::{BashExecutionOutcome, classify_bash_outcome};
+
+/// Issue #450: build a FeedbackFrame from an `AutoTestPlan` /
+/// `AutoTestResult` pair. Calls `classify_auto_test` to pick the
+/// `FeedbackKind`, picks the first non-empty stderr/stdout line for
+/// `primary_error` on failure, and runs the resulting draft through
+/// `build_feedback_frame` for truncation / secret masking / path
+/// normalization (per design 5.4: no helper performs those steps
+/// itself). Used by `verifier_skill.rs` / `verifier_orchestration.rs`
+/// callers in addition to turn-internal sites.
+pub(super) fn build_feedback_for_auto_test(
+    plan: &AutoTestPlan,
+    result: &AutoTestResult,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> FeedbackFrame {
+    let kind = classify_auto_test(plan, result);
+    let primary_error = if !result.passed {
+        result
+            .stderr
+            .lines()
+            .chain(result.stdout.lines())
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+    let suspected_files: Vec<PathBuf> = if !result.passed {
+        extract_suspected_files_from_text(&result.stdout, &result.stderr)
+    } else {
+        Vec::new()
+    };
+    let changed_files: Vec<PathBuf> = changed_files.iter().map(PathBuf::from).collect();
+    let draft = FeedbackFrameDraft {
+        command: Some(plan.command.clone()),
+        exit_code: result.exit_code,
+        kind,
+        stdout: result.stdout.clone(),
+        stderr: result.stderr.clone(),
+        primary_error,
+        suspected_files,
+        changed_files,
+    };
+    build_feedback_frame(draft, workspace_root)
+}
 
 /// CB-001: build a FeedbackFrame from a `BashExecutionOutcome`. Uses the
 /// pure `classify_bash_outcome` helper (Timeout / UnsafeCommandBlocked /
