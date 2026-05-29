@@ -241,6 +241,14 @@ mod streaming_reply;
 // below so `tests/photon_evaluate_signal_smoke.rs` keeps working without
 // path changes.
 mod photon_feedback_derive;
+// Answer-only mode shell-command allowlist + script-execution fallback
+// response builder extracted from `turn.rs` (parent #680). Hosts
+// `answer_only_script_command_allowed` + the prefix / blocked-contains
+// / blocked-prefix const lists + `truncate_for_answer` +
+// `answer_only_script_execution_fallback_response`. `pub(super)`
+// limited / no facade re-export (DR3-001) — `turn.rs` is the only
+// in-crate consumer.
+mod answer_only_mode;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
