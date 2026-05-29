@@ -100,6 +100,11 @@ mod footer;
 // conversation history shapers used by the focused-edit recovery flow.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod focused_edit_recovery;
+// File excerpt + content-hash helpers extracted from `turn.rs` (parent
+// #680). Hosts `open_excerpt_file_nofollow`, `utf8_prefix_respecting_cap`,
+// `truncate_on_char_boundary`, `current_file_hash_for_relative_path`,
+// `sha256_hex`. `pub(super)` limited / no facade re-export (DR3-001).
+mod file_excerpt;
 // v0.4.13 Phase 1: bounded verifier-failure packet used as the shared
 // controller/LLM input for the new repair pipeline. Private module; no facade
 // re-export (DR3-001 pattern).

@@ -92,6 +92,12 @@ use super::feedback_builders::{
     build_feedback_for_unsafe_block_reason, extract_current_request_paths,
 };
 #[cfg(test)]
+use super::file_excerpt::sha256_hex;
+use super::file_excerpt::{
+    current_file_hash_for_relative_path, open_excerpt_file_nofollow, truncate_on_char_boundary,
+    utf8_prefix_respecting_cap,
+};
+#[cfg(test)]
 use super::focused_edit_recovery::{
     extract_page_copy_block_from_numbered_read, focused_edit_first_slice_uses_exact_anchor,
     focused_edit_guidance_note, focused_edit_minimal_history, latest_page_copy_block_from_read,
@@ -247,7 +253,6 @@ use crate::session::precaution::PrecautionStatus;
 use crate::session::store::ScaffoldArtifactFileSnapshot;
 use crate::tools::registry::{BashErrorClass, ToolSpec};
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12140,78 +12145,6 @@ pub(super) fn workspace_appears_empty(work_root: &Path) -> bool {
 /// preserving the leading UTF-8 char boundary. Used by
 /// `bounded_post_edit_excerpt` to re-cap a post-masking string when
 /// redaction expanded it past `MAX_ARTIFACT_EXCERPT_BYTES`.
-fn truncate_on_char_boundary(s: String, cap: usize) -> String {
-    if s.len() <= cap {
-        return s;
-    }
-    let mut end = cap;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
-}
-
-/// Issue #636 (CB-001): return the longest valid UTF-8 prefix of `buf`
-/// up to `cap` bytes. If the bytes inside `[0, cap)` are a valid UTF-8
-/// prefix but the cap+1 read tail straddles a multi-byte char, we shrink
-/// to `valid_up_to()` instead of rejecting the whole excerpt. Truly
-/// invalid UTF-8 (`error_len().is_some()`) still returns `None`.
-fn utf8_prefix_respecting_cap(buf: &[u8], cap: usize) -> Option<&str> {
-    let end = buf.len().min(cap);
-    let slice = &buf[..end];
-    match std::str::from_utf8(slice) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            if e.error_len().is_some() {
-                return None;
-            }
-            // Tail of `slice` is a partial multi-byte char — safe to clip.
-            let valid = e.valid_up_to();
-            std::str::from_utf8(&slice[..valid]).ok()
-        }
-    }
-}
-
-/// Issue #636 (CB-002): open `target` for read with `O_NOFOLLOW` on Unix
-/// so a symlink swap between the workspace-confinement check and the
-/// open call cannot redirect us outside the workspace. On non-Unix we
-/// fall back to plain `File::open` and rely on the pre-open path checks.
-fn open_excerpt_file_nofollow(target: &Path) -> Option<std::fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(target)
-            .ok()?;
-        // Re-check post-open: O_NOFOLLOW guards the final component, and
-        // `metadata()` (vs `symlink_metadata`) reflects the opened inode.
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        Some(file)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::File::open(target).ok()
-    }
-}
-
-pub(super) fn current_file_hash_for_relative_path(
-    work_root: &Path,
-    relative_path: &str,
-) -> Option<String> {
-    let target = resolve_user_path(work_root, relative_path).ok()?;
-    let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
-    if target.strip_prefix(root).is_err() || !target.is_file() {
-        return None;
-    }
-    std::fs::read(target)
-        .ok()
-        .map(|bytes| sha256_hex(bytes.as_slice()))
-}
-
 /// Legacy un-scoped lookup kept for unit-test fixtures that exercise the
 /// `scaffold_candidate_priority` ordering independently of scope detection.
 /// Production code MUST use [`existing_workspace_candidate_for_role_in_scope`]
@@ -12294,10 +12227,6 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
     candidates
         .first()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
-}
-
-pub(super) fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(super) fn meaningful_workspace_files(work_root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
