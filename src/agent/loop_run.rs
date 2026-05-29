@@ -574,8 +574,10 @@ pub use turn::select_precautions_for_prompt;
 // Issue #556: expose pure helper functions so `tests/photon_turn_hook_smoke.rs`
 // can verify truncation and injection-message building without constructing
 // a full Agent (Ollama-free).
-pub use photon_feedback_derive::build_photon_injection_message;
-pub use turn::{MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES, truncate_photon_context_pack};
+pub use photon_feedback_derive::{
+    MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES, build_photon_injection_message,
+    truncate_photon_context_pack,
+};
 
 // Issue #601: expose the Case F `outcome_detail` static-allowlist literal so
 // `tests/photon_evaluate_signal_smoke.rs` can grep / assert against the same
