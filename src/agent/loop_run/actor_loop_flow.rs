@@ -3714,7 +3714,11 @@ pub(super) fn run_actor_loop(
     // DR2-008 (Issue #604): now returns `Option<CaseRecord>` so the
     // post-loop auto-promote hook can consume the freshly-extracted record
     // without re-reading from disk.
-    let extracted_case = agent.maybe_extract_case_record(&stats, &verify_commands_collected);
+    let extracted_case = super::case_record_flow::maybe_extract_case_record(
+        agent,
+        &stats,
+        &verify_commands_collected,
+    );
     // Issue #464: AntiPatternRecord extraction (post-loop, after CaseRecord).
     // Triggered by the latest eligible failure feedback. Pure upsert; no
     // sidecar / LLM calls.

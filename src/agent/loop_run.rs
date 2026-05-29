@@ -81,6 +81,12 @@ mod actor_loop_flow;
 // their private logging / feedback helpers. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod anti_pattern_flow;
+// Case-record extraction + retrieval flow extracted from `turn.rs`
+// (parent #680). Hosts `maybe_extract_case_record` and
+// `try_inject_case_retrieval_message` (free fns over `&mut Agent`) plus
+// `persist_case_record` / `finish_case_record_extraction` private
+// helpers. `pub(super)` limited / no facade re-export (DR3-001).
+mod case_record_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
