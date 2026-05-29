@@ -22,7 +22,10 @@
 //! pre-existing `pub use` of the const). `turn.rs` is the only in-crate
 //! consumer for the `PhotonOutcomeInputs` / `PhotonFeedbackOutcome` types.
 
-use crate::session::feedback::FeedbackKind;
+use super::completion_evidence;
+use crate::session::feedback::{FeedbackKind, MAX_VERIFIER_COMMAND_BYTES};
+use crate::session::store::SessionSnapshot;
+use crate::tools::bash::{BashCommandClass, classify_command};
 
 /// Issue #591 (AS-04 / 設計判断 #3): inputs to the
 /// `derive_photon_feedback_outcome` pure helper. Bundles only the data
@@ -139,3 +142,169 @@ pub(crate) fn case_f_condition_met(inputs: &PhotonOutcomeInputs<'_>) -> bool {
 /// import the symbol via the `pub use` re-export added in
 /// `src/agent/loop_run.rs`.
 pub const PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT: &str = "no_progress_despite_inject";
+
+// ---------------------------------------------------------------------------
+// Issue #608 Phase α-2 (AP-09): rerun-trigger keyword detection (pure helper).
+// ---------------------------------------------------------------------------
+
+/// Issue #608 Phase α-2 (AP-09 / 設計判断 #5): detect whether a user message
+/// is a "re-run the verifier" trigger. Five fixed keywords (design 設計判断
+/// #5 / A): `再実行`, `もう一度`, `もう 1 回`, `やり直して`, `rerun`.
+///
+/// Normalization (design 設計判断 #5):
+///   * Fullwidth ASCII letters / digits (`Ａ`-`Ｚ` / `ａ`-`ｚ` / `０`-`９`) and
+///     fullwidth space (`U+3000`) are mapped to their halfwidth ASCII
+///     counterparts.
+///   * Result is lowercased (ASCII case-folded).
+///   * Japanese keywords use a "space-collapsed" view (whitespace stripped)
+///     for `contains` matching so `もう 1 回` matches `もう1回`.
+///   * `rerun` ASCII keyword adds a word-boundary check on the
+///     **non-space-stripped** normalized string (the surrounding chars
+///     must NOT be ASCII alphanumeric) so `interrupt`, `prerun`,
+///     `current-run`, `rerunning` are negative while `please rerun the
+///     tests` is positive.
+///   * Japanese negative phrasings such as `再実行不要` / `やり直さない` still
+///     match (受容方針 — false positives are preferred to false negatives,
+///     per design 設計判断 #5).
+///
+/// Pure / safe to call on any UTF-8 string. No external regex dependency.
+pub(crate) fn is_rerun_trigger(msg: &str) -> bool {
+    let normalized = normalize_rerun_trigger_input(msg);
+    // ASCII keyword `rerun`: check word-boundary on the normalized
+    // (whitespace-preserving) form. Whitespace between letters now acts as a
+    // boundary so `please rerun ...` matches.
+    if contains_rerun_with_word_boundary(&normalized) {
+        return true;
+    }
+    // Japanese keywords: collapse ASCII whitespace + fullwidth space so
+    // `もう 1 回` matches `もう1回`. Japanese keywords don't need
+    // word-boundaries (contains-based per design 設計判断 #5).
+    let collapsed: String = normalized.chars().filter(|c| !c.is_whitespace()).collect();
+    const JA_KEYWORDS: &[&str] = &[
+        "再実行",
+        "もう一度",
+        "もう1回",
+        "もう一回",
+        "やり直して",
+        "やり直さ",
+    ];
+    JA_KEYWORDS.iter().any(|kw| collapsed.contains(kw))
+}
+
+/// AP-09 normalize: fullwidth ASCII → halfwidth ASCII (incl. fullwidth space
+/// `U+3000` → ASCII space), lowercase.
+fn normalize_rerun_trigger_input(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for c in msg.chars() {
+        match c {
+            // Fullwidth uppercase Ａ..Ｚ → halfwidth A..Z (then lowercased below).
+            'Ａ'..='Ｚ' => out.push((c as u32 - 'Ａ' as u32 + 'A' as u32) as u8 as char),
+            // Fullwidth lowercase ａ..ｚ → halfwidth a..z.
+            'ａ'..='ｚ' => out.push((c as u32 - 'ａ' as u32 + 'a' as u32) as u8 as char),
+            // Fullwidth digits ０..９ → halfwidth 0..9.
+            '０'..='９' => out.push((c as u32 - '０' as u32 + '0' as u32) as u8 as char),
+            // Fullwidth space → ASCII space (preserved as a boundary).
+            '\u{3000}' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    out.to_lowercase()
+}
+
+/// AP-09 word-boundary check for the `rerun` keyword. Returns true iff
+/// `s.contains("rerun")` AND the surrounding char on each side (if any) is
+/// NOT ASCII alphanumeric. Pure / no allocation.
+fn contains_rerun_with_word_boundary(s: &str) -> bool {
+    let kw = "rerun";
+    let mut search_start = 0;
+    while let Some(idx) = s[search_start..].find(kw) {
+        let abs = search_start + idx;
+        let before_ok = abs == 0
+            || !s[..abs]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        let end = abs + kw.len();
+        let after_ok = end == s.len()
+            || !s[end..]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphanumeric())
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        search_start = abs + 1;
+    }
+    false
+}
+
+/// Issue #608 Phase α-2 (AP-09 / VR-14 / DR4-001): build a prompt hint that
+/// re-presents the previous turn's verifier command when the user message is
+/// a rerun trigger AND the persisted command passes the runnable eligibility
+/// guard.
+///
+/// Returns `None` when:
+///   * the user message is not a rerun trigger;
+///   * the session has no persisted `last_verifier_command`;
+///   * the runnable eligibility guard rejects the command (empty / NUL /
+///     control char / 4096-byte cap hit / shell-control operator / not
+///     BuildTest classified).
+///
+/// The hint is a system message — it informs the model that the user wants
+/// to rerun and surfaces the command as guidance, but does NOT directly
+/// dispatch Bash. The agent loop / model decides whether to actually call
+/// the Bash tool (DR4-001 prompt-injection guard).
+pub(crate) fn build_rerun_prompt_hint_if_eligible(
+    user_msg: &str,
+    session: &SessionSnapshot,
+) -> Option<String> {
+    if !is_rerun_trigger(user_msg) {
+        return None;
+    }
+    let cmd = session.last_verifier_command.as_deref()?;
+    if !is_runnable_rerun_hint(cmd) {
+        return None;
+    }
+    Some(format!(
+        "[Anvil rerun hint] The user appears to want a re-run of the \
+         previous verifier. Last recorded command: `{cmd}`. Verify it is \
+         still appropriate before invoking the Bash tool."
+    ))
+}
+
+/// Issue #608 Phase α-2 (AP-09 / VR-14 / DR4-001): runnable eligibility
+/// guard for the persisted last-verifier-command. Re-validates the command
+/// against the same invariants that gated its original observation, so a
+/// tampered session.json cannot smuggle an arbitrary command into a model
+/// prompt hint.
+///
+/// Returns `true` iff:
+///   1. command is non-empty after trim;
+///   2. command contains no NUL / ASCII control chars (`\x00..=\x1f` / DEL);
+///   3. command length is strictly less than the 4096-byte storage cap (a
+///      hit indicates the original command was over-cap and was truncated —
+///      not safe as a runnable hint);
+///   4. command does not contain shell-control operators
+///      (`is_completion_verifier_command` SSOT check);
+///   5. command classifies as `BashCommandClass::BuildTest`.
+pub(super) fn is_runnable_rerun_hint(cmd: &str) -> bool {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().any(|c| (c as u32) < 0x20 || c == '\x7f') {
+        return false;
+    }
+    if trimmed.len() >= MAX_VERIFIER_COMMAND_BYTES {
+        return false;
+    }
+    if !completion_evidence::is_completion_verifier_command(trimmed) {
+        return false;
+    }
+    if !matches!(classify_command(trimmed), BashCommandClass::BuildTest) {
+        return false;
+    }
+    true
+}
