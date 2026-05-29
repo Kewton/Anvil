@@ -1751,7 +1751,7 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
         .collect::<Vec<_>>();
     record_actor_loop_tool_call_summaries(&prepared_tool_calls, args.tool_call_summaries);
 
-    let effective_tool_policy = agent.effective_tool_policy();
+    let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(agent);
     if effective_tool_policy
         .allowed_tool_names_for_prompt()
         .is_some()

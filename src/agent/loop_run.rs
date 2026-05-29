@@ -131,6 +131,12 @@ mod repair_job_dispatch;
 // message appenders). All free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod build_request_messages;
+// Effective-tool-policy + arbiter candidate selection extracted from
+// `turn.rs` (parent #680). Hosts `effective_tool_policy` (pub(super)
+// entry point), `build_arbiter_candidates` (pub(super)), and 5 private
+// helpers as free fns over `&Agent`. Replaces former `impl Agent`
+// methods. `pub(super)` limited / no facade re-export (DR3-001).
+mod effective_tool_policy_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
