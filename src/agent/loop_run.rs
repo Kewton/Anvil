@@ -264,6 +264,14 @@ mod feedback_builders;
 // `build_anvil_test_summary`. `pub(super)` limited / no facade re-export
 // (DR3-001).
 mod case_record_extract;
+// Issue #453: per-prompt precaution selection pipeline extracted from
+// `turn.rs` (parent #680). Hosts `select_precautions_for_prompt` +
+// `normalize_relevance_key` / `relevance_keyset_from_*` /
+// `relevance_score` / `sort_precautions_for_prompt` /
+// `apply_budget_caps`. `select_precautions_for_prompt` is re-exported
+// below via `pub use` (pre-existing surface), the rest is `pub(super)`
+// (DR3-001).
+mod precaution_relevance;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
@@ -592,7 +600,7 @@ pub(crate) use progress_text::unicode_supported;
 // Issue #453: expose the precaution prompt selector so integration tests in
 // `tests/` (and any future callers) can validate the Act-mode prompt
 // selection pipeline without requiring a live Ollama call.
-pub use turn::select_precautions_for_prompt;
+pub use precaution_relevance::select_precautions_for_prompt;
 
 // Issue #556: expose pure helper functions so `tests/photon_turn_hook_smoke.rs`
 // can verify truncation and injection-message building without constructing
