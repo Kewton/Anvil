@@ -204,6 +204,18 @@ mod verifier_repair_targeting;
 // Dispatch methods on `impl Agent` stay in turn.rs and will be migrated
 // in follow-up PRs (mirrors Phase 1 / actor_loop_flow pattern).
 mod verifier_orchestration;
+// Issue #683 (parent #680, Phase 3): scaffold / deterministic-scaffold
+// pipeline data types + telemetry-event-name constants extracted from
+// `turn.rs`. Hosts ScaffoldFramework / PlanExplorationKey /
+// ScaffoldFallbackResult / DeterministicScaffoldSpec + 5 const
+// (EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD / _PYTHON_CLI /
+// _FORMAT_ERROR_SMALL_EDIT / _PYTHON_TEST_FALLBACK /
+// CREATE_NEXT_APP_PACKAGE_VERSION). Module is intentionally *not*
+// re-exported (DR3-001) — `turn.rs` is the only in-crate consumer.
+// Scaffold install / framework detection / fallback dispatch methods
+// on `impl Agent` stay in turn.rs for now and will be migrated in
+// follow-up PRs.
+mod scaffold_pipeline;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

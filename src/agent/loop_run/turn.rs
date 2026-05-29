@@ -85,6 +85,14 @@ use super::repair_patch_validation::VerifierRepairIntent;
 use super::safe_stop_payload::SAFE_STOP_REPORT_EVENT_MAX_BYTES;
 use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_labels};
 #[cfg(test)]
+use super::scaffold_pipeline::PlanExplorationKey;
+use super::scaffold_pipeline::{
+    CREATE_NEXT_APP_PACKAGE_VERSION, DeterministicScaffoldSpec,
+    EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
+    EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
+    ScaffoldFallbackResult, ScaffoldFramework,
+};
+#[cfg(test)]
 use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
     build_semantic_failure_report_from_legacy_assessment,
@@ -236,19 +244,11 @@ pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
 // Issue #634: SSOT for specialized-fallback ログ event 名。emit 側 / test 側の
 // 双方が参照し、typo による検証無効化を防ぐ。文字列値そのものは既存テスト互換の
 // ため不変。`EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK` は本 Issue で新規追加。
-const EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD: &str =
-    "agent.empty_workspace.deterministic_fastapi_scaffold";
-const EVENT_DETERMINISTIC_PYTHON_CLI: &str = "agent.empty_workspace.deterministic_python_cli";
-const EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT: &str =
-    "agent.deterministic_format_error_small_edit";
-const EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK: &str =
-    "agent.empty_workspace.deterministic_python_test_fallback";
 pub(super) const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 pub(super) const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
 pub(super) const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
 const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
 pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
-const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
 #[derive(Debug, Clone, Copy)]
 struct AssistantReplyRetryState {
@@ -1634,13 +1634,6 @@ fn task_requires_nextjs_scaffold(task: &str) -> bool {
     requested_scaffold_framework(task) == Some(ScaffoldFramework::Next)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScaffoldFramework {
-    Next,
-    React,
-    Nuxt,
-}
-
 impl ScaffoldFramework {
     fn label(self) -> &'static str {
         match self {
@@ -1765,13 +1758,6 @@ fn deterministic_timeout_fallback_plan(
     format!(
         "# Plan\n\n## Goal\n- Build {request_label} as a {platform_label} inside `{worktree_name}`.\n- Ensure the result runs locally on {port} and feels intentionally polished rather than placeholder-quality.\n\n## Constraints\n- Keep all work inside the current repository root and use repository-relative paths.\n- If the repository is empty, scaffold only the minimum project structure needed before implementing the requested feature.\n- Keep the implementation incremental and avoid placeholder-only output.\n\n## First Action\n- Confirm or scaffold the base app, then make the first concrete implementation edit in a primary artifact such as `src/app/page.tsx`, `app/page.tsx`, or the equivalent entry file.\n- Anchor `package.json` scripts and local startup behavior to {port} before final verification.\n\n## Verification\n- Install dependencies when needed and confirm the app boots locally on {port}.\n- Exercise the main interaction or user-facing flow end-to-end, including success and failure states where applicable.\n- If verification cannot run because of sandbox, network, or host constraints, report that exact constraint instead of treating the work as verified.\n\n<!-- runtime fallback plan: generated after repeated planning model timeouts; focus on {execution_focus}. -->\n"
     )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct PlanExplorationKey {
-    pub(super) stage: String,
-    pub(super) tool_name: String,
-    pub(super) normalized_args: String,
 }
 
 pub(super) fn normalize_exploration_path(raw_path: &str, work_root: &Path) -> String {
@@ -2064,14 +2050,6 @@ fn sort_precautions_for_prompt<'a>(
     active
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ScaffoldFallbackResult {
-    NotApplicable,
-    Applied,
-    Failed,
-    Skipped,
-}
-
 /// Issue #555: carries a retrieval message and the IDs of the selected
 /// records so the photon mapper can include them without re-parsing the
 /// rendered prompt text.
@@ -2283,13 +2261,6 @@ fn photon_context_pack_completion_status(
     } else {
         crate::agent::loop_run::PhotonContextPackStatus::NoInjection
     }
-}
-
-struct DeterministicScaffoldSpec {
-    label: &'static str,
-    event: &'static str,
-    scaffold_kind: &'static str,
-    files: Vec<(PathBuf, String)>,
 }
 
 struct PhotonEvaluateCompletedLog {
