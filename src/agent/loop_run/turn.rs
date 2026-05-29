@@ -88,9 +88,9 @@ use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_la
 use super::scaffold_pipeline::PlanExplorationKey;
 #[cfg(test)]
 use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
+use super::scaffold_pipeline::scaffold_candidate_priority;
 #[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
-use super::scaffold_pipeline::{ScaffoldFallbackResult, scaffold_candidate_priority};
 #[cfg(test)]
 use super::semantic_repair_planning::{
     build_semantic_failure_report_from_legacy,
@@ -5843,13 +5843,6 @@ impl Agent {
         super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(self, err)
     }
 
-    pub(super) fn materialize_deterministic_fallback_plan(
-        &mut self,
-        event_name: &str,
-    ) -> Result<bool, String> {
-        super::scaffold_pipeline::materialize_deterministic_fallback_plan(self, event_name)
-    }
-
     fn build_request_messages(
         &mut self,
         protocol: prompting::ToolProtocol,
@@ -9680,22 +9673,6 @@ impl Agent {
         )
     }
 
-    pub(super) fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
-        super::scaffold_pipeline::maybe_materialize_framework_game_fallback(self, last_iter)
-    }
-
-    pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
-        &mut self,
-        last_iter: usize,
-        interrupt_flag: &InterruptFlag,
-    ) -> ScaffoldFallbackResult {
-        super::scaffold_pipeline::maybe_apply_deterministic_nextjs_scaffold(
-            self,
-            last_iter,
-            interrupt_flag,
-        )
-    }
-
     fn workspace_appears_empty(&self) -> bool {
         workspace_appears_empty(&self.work_root)
     }
@@ -9830,39 +9807,11 @@ impl Agent {
         super::scaffold_pipeline::maybe_materialize_python_test_fallback(self)
     }
 
-    pub(super) fn maybe_apply_deterministic_quality_fallback(
-        &self,
-        request: &str,
-        relative_target: &str,
-    ) -> Result<bool, String> {
-        super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback(
-            self,
-            request,
-            relative_target,
-        )
-    }
-
-    pub(super) fn maybe_apply_deterministic_polish_fallback(
-        &self,
-        request: &str,
-        relative_target: &str,
-    ) -> Result<bool, String> {
-        super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback(
-            self,
-            request,
-            relative_target,
-        )
-    }
-
     pub(super) fn maybe_apply_local_llm_small_edit_fallback(
         &mut self,
         request: &str,
     ) -> Result<Option<String>, String> {
         super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(self, request)
-    }
-
-    pub(super) fn maybe_apply_requested_port_script(&self, request: &str) -> Result<(), String> {
-        super::scaffold_pipeline::maybe_apply_requested_port_script(self, request)
     }
 
     fn maybe_apply_deterministic_quality_fallback_after_timeout(

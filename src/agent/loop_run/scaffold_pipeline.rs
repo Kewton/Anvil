@@ -1389,7 +1389,7 @@ pub(super) fn maybe_apply_deterministic_polish_fallback(
     };
     std::fs::write(&target, replacement)
         .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
-    agent.maybe_apply_requested_port_script(request)?;
+    maybe_apply_requested_port_script(agent, request)?;
     log_llm_event(
         "agent.deterministic_ui_polish",
         serde_json::json!({
