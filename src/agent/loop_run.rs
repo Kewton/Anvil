@@ -639,10 +639,15 @@ mod task_contract;
 // via `super::task_workspace_scope::*`.
 mod task_workspace_scope;
 mod tester;
+// Workspace walker helpers extracted from `turn.rs` (parent #680).
+// Hosts `workspace_appears_empty`, `meaningful_workspace_files`,
+// `collect_meaningful_workspace_files`. `pub(super)` limited / no
+// facade re-export (DR3-001).
 mod tool_policy;
 mod turn;
 pub(crate) mod verifier_skill;
 pub(crate) mod work_mode_confirm;
+mod workspace_walk;
 
 // Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).

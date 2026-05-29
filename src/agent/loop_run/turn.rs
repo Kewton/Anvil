@@ -240,6 +240,7 @@ use super::work_mode_confirm::{
     self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
     run_work_mode_confirm_with_strategy,
 };
+use super::workspace_walk::{meaningful_workspace_files, workspace_appears_empty};
 use super::*;
 use crate::agent::orchestration::verify_repo_progress;
 use crate::logging::{log_llm_event, stable_path_hash};
@@ -12127,24 +12128,6 @@ pub(super) fn latest_turn_preferred_read_edit_target(
     latest_existing
 }
 
-pub(super) fn workspace_appears_empty(work_root: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(work_root) else {
-        return false;
-    };
-    !entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        !matches!(
-            name.as_ref(),
-            ".git" | ".anvil" | ".anvil-state" | "ANVIL.md" | "node_modules" | "target"
-        )
-    })
-}
-
-/// Issue #636: trim `s` so its byte length is at most `cap` while
-/// preserving the leading UTF-8 char boundary. Used by
-/// `bounded_post_edit_excerpt` to re-cap a post-masking string when
-/// redaction expanded it past `MAX_ARTIFACT_EXCERPT_BYTES`.
 /// Legacy un-scoped lookup kept for unit-test fixtures that exercise the
 /// `scaffold_candidate_priority` ordering independently of scope detection.
 /// Production code MUST use [`existing_workspace_candidate_for_role_in_scope`]
@@ -12227,44 +12210,6 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
     candidates
         .first()
         .map(|path| path.to_string_lossy().replace('\\', "/"))
-}
-
-pub(super) fn meaningful_workspace_files(work_root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_meaningful_workspace_files(work_root, work_root, limit, &mut files).ok()?;
-    Some(files)
-}
-
-fn collect_meaningful_workspace_files(
-    root: &Path,
-    current: &Path,
-    limit: usize,
-    files: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
-    if files.len() > limit {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(current)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // Issue #646 (E1): single SSOT for ignored workspace directories.
-        if super::task_workspace_scope::is_workspace_ignored_dir(&name) {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            collect_meaningful_workspace_files(root, &path, limit, files)?;
-        } else if path.is_file()
-            && let Ok(relative) = path.strip_prefix(root)
-        {
-            files.push(relative.to_path_buf());
-            if files.len() > limit {
-                return Ok(());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Format a single-line per-iteration progress line. ANSI color is only
