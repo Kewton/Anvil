@@ -45,7 +45,10 @@ use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
 use super::interrupt::InterruptFlag;
 use super::lifecycle;
-use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
+use super::quality::{
+    first_existing_impl_target, implementation_quality_issue_for_request,
+    package_json_with_requested_port, react_dev_wrapper_for_requested_port,
+};
 use super::task_contract::{ArtifactRole, CompletionDecision};
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
@@ -54,8 +57,8 @@ use super::turn::{
     WrittenScaffoldArtifacts, current_file_hash_for_relative_path,
     deterministic_timeout_fallback_plan, extract_filename_with_suffix, last_read_tool_path,
     latest_turn_preferred_read_edit_target, meaningful_workspace_files, normalize_memory_path,
-    progress_path_display, sha256_hex, tool_result_failed, workspace_appears_empty,
-    write_stdout_rendered,
+    progress_path_display, sha256_hex, sync_package_json_with_existing_lock, tool_result_failed,
+    workspace_appears_empty, write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::agent::recovery;
@@ -1492,8 +1495,8 @@ pub(super) fn maybe_apply_deterministic_quality_fallback(
     };
     std::fs::write(&target, replacement)
         .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
-    agent.maybe_apply_deterministic_framework_support_files(request)?;
-    agent.maybe_apply_requested_port_script(request)?;
+    maybe_apply_deterministic_framework_support_files(agent, request)?;
+    maybe_apply_requested_port_script(agent, request)?;
     log_llm_event(
         "agent.deterministic_ui_quality_repair",
         serde_json::json!({
@@ -1505,4 +1508,105 @@ pub(super) fn maybe_apply_deterministic_quality_fallback(
         }),
     );
     Ok(true)
+}
+
+pub(super) fn maybe_apply_deterministic_framework_support_files(
+    agent: &Agent,
+    request: &str,
+) -> Result<(), String> {
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_support_recovery()
+    {
+        return Ok(());
+    }
+    let Some(files) = deterministic::empty_framework_app_files(request) else {
+        return Ok(());
+    };
+    let mut written_paths = Vec::<String>::new();
+    for (relative, content) in files {
+        if deterministic_framework_game_impl_path(&relative) {
+            continue;
+        }
+        let content = sync_package_json_with_existing_lock(&agent.work_root, &relative, content);
+        let target_relative = deterministic_support_target_relative(&agent.work_root, &relative);
+        let target = agent.work_root.join(&target_relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+        std::fs::write(&target, content)
+            .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+        written_paths.push(target_relative.to_string_lossy().replace('\\', "/"));
+    }
+    if !written_paths.is_empty() {
+        log_llm_event(
+            "agent.deterministic_framework_support_files",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "work_root": agent.work_root.display().to_string(),
+                "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+                "fallback_action": "minimal_patch",
+                "files": written_paths,
+            }),
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn maybe_apply_requested_port_script(
+    agent: &Agent,
+    request: &str,
+) -> Result<(), String> {
+    let package_path = agent.work_root.join("package.json");
+    let Ok(current) = std::fs::read_to_string(&package_path) else {
+        return Ok(());
+    };
+    let react_dev_wrapper = react_dev_wrapper_for_requested_port(request, &current);
+    let Some(updated) = package_json_with_requested_port(request, &current) else {
+        if let Some(wrapper) = react_dev_wrapper {
+            write_react_dev_wrapper(agent, wrapper)?;
+        }
+        return Ok(());
+    };
+    std::fs::write(&package_path, updated)
+        .map_err(|err| format!("failed to write {}: {err}", package_path.display()))?;
+    if let Some(wrapper) = react_dev_wrapper {
+        write_react_dev_wrapper(agent, wrapper)?;
+    }
+    Ok(())
+}
+
+fn write_react_dev_wrapper(agent: &Agent, wrapper: String) -> Result<(), String> {
+    let scripts_dir = agent.work_root.join("scripts");
+    std::fs::create_dir_all(&scripts_dir)
+        .map_err(|err| format!("failed to create {}: {err}", scripts_dir.display()))?;
+    let wrapper_path = scripts_dir.join("dev.mjs");
+    std::fs::write(&wrapper_path, wrapper)
+        .map_err(|err| format!("failed to write {}: {err}", wrapper_path.display()))
+}
+
+pub(super) fn maybe_apply_deterministic_quality_fallback_after_timeout(
+    agent: &Agent,
+    err: &str,
+) -> Option<AssistantReply> {
+    if !err.to_ascii_lowercase().contains("timed out")
+        || !agent.current_request_needs_playable_ui_quality_gate()
+    {
+        return None;
+    }
+    None
+}
+
+pub(super) fn maybe_apply_deterministic_polish_fallback_after_timeout(
+    agent: &Agent,
+    err: &str,
+) -> Option<AssistantReply> {
+    if !err.to_ascii_lowercase().contains("timed out")
+        || !agent.current_request_needs_playable_ui_quality_gate()
+    {
+        return None;
+    }
+    None
 }
