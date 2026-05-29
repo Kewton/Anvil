@@ -475,7 +475,8 @@ impl Agent {
                     self.session.record_feedback_if_unset(feedback.clone());
                 }
                 if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
-                    let tester_recorded = self.try_invoke_tester(&stats.changed_files);
+                    let tester_recorded =
+                        super::tester_invocation::try_invoke_tester(self, &stats.changed_files);
                     if !tester_recorded && self.should_run_auto_test_for_success() {
                         let frame = build_feedback_for_no_verifier(&self.work_root);
                         self.session.record_feedback_if_unset(frame);
