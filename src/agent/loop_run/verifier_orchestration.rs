@@ -3019,7 +3019,8 @@ pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnos
     let scope = agent.current_workspace_scope();
     let turn_edited = agent.turn_edited_relative_paths.clone();
     let edited_predicate = |path: &str| turn_edited.contains(path);
-    let scaffold_predicate = |path: &str| agent.repo_edit_has_post_scaffold_delta(path);
+    let scaffold_predicate =
+        |path: &str| super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(agent, path);
     let admission = RepairTargetAdmissionContext {
         work_root: &agent.work_root,
         scope: &scope,

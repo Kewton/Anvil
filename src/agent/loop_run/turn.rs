@@ -5525,7 +5525,10 @@ impl Agent {
         //       qwen3.5 ユーザーの format-error 後 finish は flag off
         //       でも維持される。
         if recovery_dispatch_gate.allows_deterministic_fallback()
-            && let Some(reply) = self.maybe_apply_deterministic_edit_after_format_error(err)?
+            && let Some(reply) =
+                super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(
+                    self, err,
+                )?
         {
             return Ok(Some(AssistantReplyRetryDecision::ReturnReply(reply)));
         }
@@ -5594,7 +5597,10 @@ impl Agent {
             return None;
         }
         if recovery_dispatch_gate.allows_deterministic_fallback()
-            && let Some(reply) = self.maybe_apply_deterministic_polish_fallback_after_timeout(err)
+            && let Some(reply) =
+                super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback_after_timeout(
+                    self, err,
+                )
         {
             self.session.record_feedback_if_unset(
                 build_feedback_for_deterministic_content_fallback(&self.work_root),
@@ -5605,7 +5611,7 @@ impl Agent {
         if let Some(policy) = timeout_focused_policy {
             if recovery_dispatch_gate.allows_deterministic_fallback()
                 && let Some(reply) =
-                    self.maybe_apply_deterministic_quality_fallback_after_timeout(err)
+                    super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback_after_timeout(self, err)
             {
                 self.session.record_feedback_if_unset(
                     build_feedback_for_deterministic_content_fallback(&self.work_root),
@@ -5829,18 +5835,6 @@ impl Agent {
             prompt_tokens: None,
             completion_tokens: None,
         })
-    }
-
-    /// Issue #634: 旧名 `maybe_apply_qwen35_obvious_edit_fallback_after_format_error`。
-    /// 固定 arithmetic patch 系の edit 特化 fallback。experimental flag および
-    /// capability の双方が ON のときのみ動く。flag off では `Ok(None)` を返し、
-    /// 呼出側の format-error loop は次の handler (`maybe_finish_after_edit_format_error`)
-    /// にフォールスルーする。
-    fn maybe_apply_deterministic_edit_after_format_error(
-        &mut self,
-        err: &str,
-    ) -> Result<Option<AssistantReply>, String> {
-        super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(self, err)
     }
 
     fn build_request_messages(
@@ -8354,7 +8348,7 @@ impl Agent {
         let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(
             &relative_path,
         ));
-        if !self.repo_edit_has_post_scaffold_delta(&relative_path) {
+        if !super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, &relative_path) {
             crate::logging::log_completion_evidence_observed(
                 self.current_turn_index,
                 0,
@@ -8737,10 +8731,6 @@ impl Agent {
         )
     }
 
-    pub(super) fn repo_edit_has_post_scaffold_delta(&self, relative_path: &str) -> bool {
-        super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, relative_path)
-    }
-
     /// Issue #636: read a workspace-confined, cap-bounded excerpt of
     /// `relative_path` for behavior-coverage judgement.
     ///
@@ -8860,13 +8850,16 @@ impl Agent {
         let scope = self.current_workspace_scope();
         let mut states = Vec::new();
         for role in &contract.required_artifacts {
-            if let Some(path) = self.scaffold_candidate_for_missing_role(*role) {
+            if let Some(path) =
+                super::scaffold_pipeline::scaffold_candidate_for_missing_role(self, *role)
+            {
                 // Issue #659 (Task 2.4): seed the Scaffold-origin event
                 // alongside the existing `ArtifactState::scaffold` push so
                 // the ledger sees the same scaffold baseline. `post_scaffold_delta`
                 // is the production no-op gate, kept consistent with
                 // `observe_evidence_from_repo_edit`.
-                let post_scaffold_delta = self.repo_edit_has_post_scaffold_delta(&path);
+                let post_scaffold_delta =
+                    super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, &path);
                 self.seed_artifact_ledger_scaffold(&path, *role, post_scaffold_delta, &scope);
                 states.push(super::task_contract::ArtifactState::scaffold(*role, path));
             }
@@ -8878,7 +8871,8 @@ impl Agent {
             if let Some(path) =
                 existing_workspace_candidate_for_role_in_scope(&self.work_root, *role, &scope)
             {
-                let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
+                let scaffold_changed =
+                    super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, &path);
                 let edited_this_session = self.turn_edited_relative_paths.contains(&path);
                 let ownership = super::artifact_ownership::classify_ownership(
                     super::artifact_ownership::OwnershipInputs {
@@ -9077,7 +9071,7 @@ impl Agent {
             &self.work_root,
             &scope,
             &|path| self.turn_edited_relative_paths.contains(path),
-            &|path| self.repo_edit_has_post_scaffold_delta(path),
+            &|path| super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, path),
         );
         let ledger = self
             .artifact_ledger
@@ -9234,7 +9228,9 @@ impl Agent {
             return None;
         };
         let role = missing.first().copied()?;
-        if let Some(path) = self.scaffold_candidate_for_missing_role(role) {
+        if let Some(path) =
+            super::scaffold_pipeline::scaffold_candidate_for_missing_role(self, role)
+        {
             return Some(super::task_contract::RecoveryTargetHint {
                 role,
                 path,
@@ -9252,7 +9248,8 @@ impl Agent {
         if let Some(path) =
             existing_workspace_candidate_for_role_in_scope(&self.work_root, role, &scope)
         {
-            let scaffold_changed = self.repo_edit_has_post_scaffold_delta(&path);
+            let scaffold_changed =
+                super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, &path);
             let edited_this_session = self.turn_edited_relative_paths.contains(&path);
             let ownership = super::artifact_ownership::classify_ownership(
                 super::artifact_ownership::OwnershipInputs {
@@ -9589,13 +9586,6 @@ impl Agent {
         resolve_user_path(&self.work_root, &path_str).ok()
     }
 
-    fn scaffold_candidate_for_missing_role(
-        &self,
-        role: super::task_contract::ArtifactRole,
-    ) -> Option<String> {
-        super::scaffold_pipeline::scaffold_candidate_for_missing_role(self, role)
-    }
-
     fn answer_only_policy_error(
         &self,
         name: &str,
@@ -9653,23 +9643,6 @@ impl Agent {
             arguments,
             &self.work_root,
             scope.as_ref(),
-        )
-    }
-
-    pub(super) fn maybe_materialize_mode_deterministic_fallback(
-        &mut self,
-        last_iter: usize,
-    ) -> bool {
-        super::scaffold_pipeline::maybe_materialize_mode_deterministic_fallback(self, last_iter)
-    }
-
-    pub(super) fn maybe_materialize_task_contract_fallback(
-        &mut self,
-        decision: &super::task_contract::CompletionDecision,
-        last_iter: usize,
-    ) -> bool {
-        super::scaffold_pipeline::maybe_materialize_task_contract_fallback(
-            self, decision, last_iter,
         )
     }
 
@@ -9799,35 +9772,6 @@ impl Agent {
                 || name.ends_with("_test.py")
                 || name == "tests.py"
         })
-    }
-
-    pub(super) fn maybe_materialize_python_test_fallback(
-        &mut self,
-    ) -> Result<Option<String>, String> {
-        super::scaffold_pipeline::maybe_materialize_python_test_fallback(self)
-    }
-
-    pub(super) fn maybe_apply_local_llm_small_edit_fallback(
-        &mut self,
-        request: &str,
-    ) -> Result<Option<String>, String> {
-        super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(self, request)
-    }
-
-    fn maybe_apply_deterministic_quality_fallback_after_timeout(
-        &self,
-        err: &str,
-    ) -> Option<AssistantReply> {
-        super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback_after_timeout(
-            self, err,
-        )
-    }
-
-    fn maybe_apply_deterministic_polish_fallback_after_timeout(
-        &self,
-        err: &str,
-    ) -> Option<AssistantReply> {
-        super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback_after_timeout(self, err)
     }
 
     fn refresh_working_memory(&mut self) {
@@ -11548,9 +11492,9 @@ mod tests {
         std::fs::write(temp.path().join("fizzbuzz.py"), "# stub\n").unwrap();
         // Mode は Python だが flag off。
         agent.session.mode_state.work_mode = WorkMode::Python;
-        let result = agent
-            .maybe_materialize_python_test_fallback()
-            .expect("should not error");
+        let result =
+            super::super::scaffold_pipeline::maybe_materialize_python_test_fallback(&mut agent)
+                .expect("should not error");
         assert!(
             result.is_none(),
             "flag off で FizzBuzz fallback が発火してはならない"
@@ -11576,9 +11520,9 @@ mod tests {
         std::fs::write(temp.path().join("fizzbuzz.py"), "# stub\n").unwrap();
         agent.session.mode_state.work_mode = WorkMode::Python;
 
-        let result = agent
-            .maybe_materialize_python_test_fallback()
-            .expect("should not error");
+        let result =
+            super::super::scaffold_pipeline::maybe_materialize_python_test_fallback(&mut agent)
+                .expect("should not error");
         assert_eq!(
             result.as_deref(),
             Some("test_fizzbuzz.py"),
@@ -11612,7 +11556,9 @@ mod tests {
             "FastAPIでCRUD APIを作って".to_string(),
         ));
 
-        let fired = agent.maybe_materialize_mode_deterministic_fallback(0);
+        let fired = super::super::scaffold_pipeline::maybe_materialize_mode_deterministic_fallback(
+            &mut agent, 0,
+        );
         assert!(!fired, "flag off で Python ブランチが発火してはならない");
     }
 
@@ -11639,7 +11585,9 @@ mod tests {
         let decision = CompletionDecision::Continue {
             missing: Vec::new(),
         };
-        let fired = agent.maybe_materialize_task_contract_fallback(&decision, 0);
+        let fired = super::super::scaffold_pipeline::maybe_materialize_task_contract_fallback(
+            &mut agent, &decision, 0,
+        );
         assert!(
             !fired,
             "flag off で task contract fallback が発火してはならない"
@@ -11660,8 +11608,10 @@ mod tests {
         let (mut agent, _temp) = test_agent_with_config(cfg);
         // tool-call format error をシミュレート (Truncated 文字列)。
         let err = "Truncated tool call payload — recovery attempt needed.";
-        let result = agent
-            .maybe_apply_deterministic_edit_after_format_error(err)
+        let result =
+            super::super::scaffold_pipeline::maybe_apply_deterministic_edit_after_format_error(
+                &mut agent, err,
+            )
             .expect("should not error");
         assert!(
             result.is_none(),
@@ -13276,7 +13226,10 @@ mod tests {
         );
 
         // (3) Generic retry (local-LLM small-edit fallback) must NOT fire.
-        let result = agent.maybe_apply_local_llm_small_edit_fallback("update the project");
+        let result = super::super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
+            &mut agent,
+            "update the project",
+        );
         assert!(
             matches!(result, Ok(None)),
             "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
@@ -13388,7 +13341,10 @@ mod tests {
         );
 
         // (3) Generic retry MUST NOT fire.
-        let result = agent.maybe_apply_local_llm_small_edit_fallback("implement the feature");
+        let result = super::super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
+            &mut agent,
+            "implement the feature",
+        );
         assert!(
             matches!(result, Ok(None)),
             "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
@@ -13609,7 +13565,10 @@ mod tests {
         );
 
         // (3) Generic retry MUST NOT fire.
-        let result = agent.maybe_apply_local_llm_small_edit_fallback("update page.tsx");
+        let result = super::super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
+            &mut agent,
+            "update page.tsx",
+        );
         assert!(
             matches!(result, Ok(None)),
             "maybe_apply_local_llm_small_edit_fallback MUST be a no-op while \
@@ -13661,7 +13620,10 @@ mod tests {
         // model). The point of this test is the policy / selection
         // assertions above — confirming generic retry is *available* in
         // principle when no active job is selected.
-        let result = agent.maybe_apply_local_llm_small_edit_fallback("placeholder");
+        let result = super::super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
+            &mut agent,
+            "placeholder",
+        );
         assert!(
             matches!(result, Ok(None)),
             "fallback returns Ok(None) under the default test model; got {result:?}"
@@ -13743,14 +13705,12 @@ mod tests {
         // Timeout error string passed in; both fallbacks must return None.
         let timeout_err = "request timed out after 30s";
         assert!(
-            agent
-                .maybe_apply_deterministic_polish_fallback_after_timeout(timeout_err)
+            super::super::scaffold_pipeline::maybe_apply_deterministic_polish_fallback_after_timeout(&agent, timeout_err)
                 .is_none(),
             "timeout polish fallback MUST be inert while VerifierRepair owns the turn"
         );
         assert!(
-            agent
-                .maybe_apply_deterministic_quality_fallback_after_timeout(timeout_err)
+            super::super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback_after_timeout(&agent, timeout_err)
                 .is_none(),
             "timeout quality fallback MUST be inert while VerifierRepair owns the turn"
         );
