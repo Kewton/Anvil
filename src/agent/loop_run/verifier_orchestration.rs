@@ -2740,7 +2740,7 @@ pub(super) fn handle_task_contract_verifier_failure(
     if *args.contract_verification_retries >= attempt_limit {
         agent.repair_job = Some(repair_context);
         let (reason, prefix) = if previous_repair_context.is_some() {
-            agent.emit_safe_stop_report_for_repair_exhausted();
+            emit_safe_stop_report_for_repair_exhausted(agent);
             (
                 ExitReason::RepairExhausted,
                 "verifier repair budget exhausted",
@@ -2784,7 +2784,7 @@ pub(super) fn handle_task_contract_verifier_failure(
         false,
     );
     agent.repair_job = Some(repair_context);
-    agent.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
+    maybe_emit_repair_exhausted_from_promotion(agent, applied_outcome_promotion);
     *args.repo_change_retries = 0;
     *args.verifier_repair_retries = 0;
     agent.repair_job_artifact_attempts = 0;
@@ -2806,4 +2806,160 @@ pub(super) fn handle_task_contract_verifier_failure(
         agent.repair_job.as_ref(),
     ));
     super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue
+}
+
+pub(super) fn emit_safe_stop_report_for_repair_exhausted(agent: &mut Agent) {
+    agent.emit_repair_safe_stop_report(super::repair_job::StopReason::RepairExhausted);
+}
+
+pub(super) fn maybe_emit_repair_exhausted_from_promotion(
+    agent: &mut Agent,
+    promotion: Option<super::repair_job::PromotionResult>,
+) {
+    if promotion.map(|p| p.all_clusters_exhausted).unwrap_or(false) {
+        emit_safe_stop_report_for_repair_exhausted(agent);
+    }
+}
+
+pub(super) fn run_verifier_repair_pass_and_apply(
+    agent: &mut Agent,
+    target_hint: &RecoveryTargetHint,
+) -> VerifierRepairPassOutcome {
+    let mut prepared = match agent.prepare_verifier_repair_pass(target_hint) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let pass_started = std::time::Instant::now();
+
+    let mut last_error = "repair pass did not run".to_string();
+    let mut last_invalid_outcome: Option<RepairAttemptOutcome> = None;
+    for attempt in 1..=super::repair_driver::VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
+        last_invalid_outcome = None;
+        let elapsed = pass_started.elapsed();
+        let Some(attempt_timeout_secs) =
+            super::repair_driver::verifier_repair_pass_attempt_timeout_secs(elapsed)
+        else {
+            last_error = agent.verifier_repair_pass_wall_clock_timeout_error(
+                &prepared,
+                target_hint,
+                attempt,
+                elapsed,
+            );
+            break;
+        };
+        let repair_client = match verifier_repair_pass_client(agent, attempt_timeout_secs) {
+            Ok(client) => client,
+            Err(err) => {
+                last_error = err;
+                break;
+            }
+        };
+        let reply = repair_client.chat_text_json_control(&prepared.model, &prepared.messages);
+        match agent.handle_verifier_repair_pass_attempt(
+            &mut prepared,
+            target_hint,
+            attempt,
+            attempt_timeout_secs,
+            elapsed,
+            reply,
+        ) {
+            VerifierRepairAttemptProgress::Return(outcome) => return outcome,
+            VerifierRepairAttemptProgress::Continue {
+                last_error: attempt_error,
+                last_invalid_outcome: attempt_outcome,
+            } => {
+                last_error = attempt_error;
+                last_invalid_outcome = attempt_outcome;
+            }
+            VerifierRepairAttemptProgress::Break {
+                last_error: attempt_error,
+            } => {
+                last_error = attempt_error;
+                break;
+            }
+        }
+
+        if attempt < super::repair_driver::VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
+            prepared.messages.push(ConversationMessage::user(
+                super::repair_driver::verifier_repair_pass_retry_message(&last_error),
+            ));
+        }
+    }
+
+    let error = format!("verifier_repair_pass_invalid: {last_error}");
+    log_llm_event(
+        "agent.verifier_repair_pass.invalid",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "model": &prepared.model,
+            "path": target_hint.path,
+            "error": compact_verifier_failure_text(&error, 240),
+        }),
+    );
+    VerifierRepairPassOutcome::Invalid {
+        error,
+        repair_attempt_outcome: last_invalid_outcome,
+    }
+}
+
+pub(super) fn record_controller_verifier_repair_invalid(
+    agent: &mut Agent,
+    error: &str,
+    outcome: Option<RepairAttemptOutcome>,
+) {
+    let compact = super::repair_job::sanitize_repair_job_text_with_char_cap(error, 360);
+    let mut promotion_result: Option<super::repair_job::PromotionResult> = None;
+    let active_target_hint = agent
+        .repair_job
+        .as_ref()
+        .and_then(verifier_repair_effective_target_hint)
+        .cloned();
+    if let Some(context) = agent.repair_job.as_mut() {
+        context.repair_error = Some(compact.clone());
+        let mut lifecycle_reject_recorded = false;
+        let explicit_error_reason = super::repair_job::rejected_reason_for_repair_error(&compact);
+        let effective_outcome = match explicit_error_reason {
+            Some(super::repair_job::RejectedAttemptReason::ProviderTimeout) => outcome,
+            _ => outcome.or_else(|| {
+                super::repair_job::malformed_repair_attempt_outcome_for_active_target(
+                    context,
+                    active_target_hint.as_ref(),
+                )
+            }),
+        };
+        if let Some(o) = effective_outcome {
+            if let (Some(target_hint), Some(reason)) = (
+                active_target_hint.as_ref(),
+                super::repair_job::rejected_reason_for_repair_attempt_outcome_kind(&o.kind),
+            ) {
+                let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
+                context
+                    .apply_event(super::repair_job::RepairJobEvent::PatchRejected { key, reason });
+                lifecycle_reject_recorded = true;
+            }
+            promotion_result = Some(match active_target_hint.as_ref() {
+                Some(target_hint) => {
+                    context.record_repair_attempt_outcome_for_target(o, target_hint)
+                }
+                None => context.record_repair_attempt_outcome(o),
+            });
+        }
+        if !lifecycle_reject_recorded
+            && let Some(event) = super::repair_job::lifecycle_event_for_repair_error(
+                &compact,
+                active_target_hint.as_ref(),
+            )
+        {
+            context.apply_event(event);
+        }
+    }
+    agent.session.working_memory.note_error(compact.clone());
+    log_llm_event(
+        "agent.verifier_repair_pass.retryable_invalid",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "error": compact,
+        }),
+    );
+    maybe_emit_repair_exhausted_from_promotion(agent, promotion_result);
 }

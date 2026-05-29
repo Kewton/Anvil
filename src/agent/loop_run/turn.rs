@@ -43,9 +43,8 @@ use super::reminder::{
 #[cfg(test)]
 use super::repair_driver::VERIFIER_REPAIR_PASS_TIMEOUT_SECS;
 use super::repair_driver::{
-    VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT, VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-    VerifierRepairPassOutcome, verifier_repair_pass_attempt_timeout_secs,
-    verifier_repair_pass_retry_message, verifier_repair_pass_timeout_error,
+    VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
+    verifier_repair_pass_timeout_error,
 };
 use super::repair_framework_findings::findings_for_diagnostic as verifier_framework_findings_for_diagnostic;
 #[cfg(test)]
@@ -59,10 +58,7 @@ use super::repair_job;
 use super::repair_job::VerifierRepairDecision;
 #[cfg(test)]
 use super::repair_job::classify_verifier_failure_type;
-use super::repair_job::{
-    malformed_repair_attempt_outcome_for_active_target, verifier_repair_context_from_failure,
-    verifier_repair_effective_target_hint,
-};
+use super::repair_job::verifier_repair_context_from_failure;
 #[cfg(test)]
 use super::repair_patch_validation::ValidationWeakening;
 use super::repair_patch_validation::{
@@ -148,7 +144,6 @@ use super::verifier_driver::TaskContractVerifierOutcome;
 use super::verifier_driver::classify_verifier_timeout;
 #[cfg(test)]
 use super::verifier_driver::task_contract_structured_missing_outcome;
-use super::verifier_failure_signature::compact_verifier_failure_text;
 #[cfg(test)]
 use super::verifier_failure_signature::verifier_failure_count;
 use super::verifier_orchestration::{
@@ -288,6 +283,7 @@ impl AssistantReplyRetryState {
 
 #[cfg(test)]
 mod repair_lifecycle_event_tests {
+    use super::super::repair_driver::verifier_repair_pass_attempt_timeout_secs;
     use super::super::verifier_orchestration::PatchProposalShadowValidation;
     use super::*;
 
@@ -372,15 +368,15 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn repair_patch_provider_requires_committed_target_hint() {
-        let src = include_str!("turn.rs");
+        let src = include_str!("verifier_orchestration.rs");
         let body = function_body(
             src,
-            "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn verifier_repair_pass_wall_clock_timeout_error(",
+            "\npub(super) fn run_verifier_repair_pass_and_apply(",
+            "\npub(super) fn record_controller_verifier_repair_invalid(",
         );
 
         assert!(body.contains("target_hint:"));
-        assert!(body.contains("&super::task_contract::RecoveryTargetHint"));
+        assert!(body.contains("&RecoveryTargetHint"));
         assert!(
             !body.contains("verifier_repair_effective_target_hint(&context).cloned()"),
             "patch provider must consume the committed RepairStep target, not recalculate it"
@@ -389,11 +385,11 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn deterministic_repair_candidate_is_not_called_by_patch_provider_main_path() {
-        let src = include_str!("turn.rs");
+        let src = include_str!("verifier_orchestration.rs");
         let body = function_body(
             src,
-            "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn verifier_repair_pass_wall_clock_timeout_error(",
+            "\npub(super) fn run_verifier_repair_pass_and_apply(",
+            "\npub(super) fn record_controller_verifier_repair_invalid(",
         );
 
         assert!(
@@ -416,11 +412,11 @@ mod v0421_repair_runner_contract_tests {
 
     #[test]
     fn repair_patch_provider_uses_json_mode_and_no_think() {
-        let src = include_str!("turn.rs");
+        let src = include_str!("verifier_orchestration.rs");
         let body = function_body(
             src,
-            "\n    fn run_verifier_repair_pass_and_apply(",
-            "\n    fn verifier_repair_pass_wall_clock_timeout_error(",
+            "\npub(super) fn run_verifier_repair_pass_and_apply(",
+            "\npub(super) fn record_controller_verifier_repair_invalid(",
         );
         let orchestration = include_str!("verifier_orchestration.rs");
         let prompt = function_body(
@@ -4737,7 +4733,7 @@ impl Agent {
             task_contract_verifier_failure_attempt_limit(Some(&previous_repair_context));
         if *args.contract_verification_retries >= attempt_limit {
             self.repair_job = Some(repair_context);
-            self.emit_safe_stop_report_for_repair_exhausted();
+            super::verifier_orchestration::emit_safe_stop_report_for_repair_exhausted(self);
             return TaskContractVerifierFlowOutcome::Exit {
                 reason: ExitReason::RepairExhausted,
                 error_text: format!(
@@ -4775,7 +4771,10 @@ impl Agent {
             false,
         );
         self.repair_job = Some(repair_context);
-        self.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
+        super::verifier_orchestration::maybe_emit_repair_exhausted_from_promotion(
+            self,
+            applied_outcome_promotion,
+        );
         *args.repo_change_retries = 0;
         *args.verifier_repair_retries = 0;
         self.repair_job_artifact_attempts = 0;
@@ -4927,7 +4926,8 @@ impl Agent {
             "Verifier repair",
             "Running controller-applied repair pass for the selected target.",
         );
-        match self.run_verifier_repair_pass_and_apply(&target_hint) {
+        match super::verifier_orchestration::run_verifier_repair_pass_and_apply(self, &target_hint)
+        {
             VerifierRepairPassOutcome::Applied { relative_path } => {
                 *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
                 *args.repo_change_retries = 0;
@@ -4945,11 +4945,16 @@ impl Agent {
                 error,
                 repair_attempt_outcome,
             } => {
-                self.record_controller_verifier_repair_invalid(&error, repair_attempt_outcome);
+                super::verifier_orchestration::record_controller_verifier_repair_invalid(
+                    self,
+                    &error,
+                    repair_attempt_outcome,
+                );
                 self.dispatch_after_repair_patch_rejection(args.last_iter, error, Some(target_hint))
             }
             VerifierRepairPassOutcome::Unavailable { relative_path } => {
-                self.record_controller_verifier_repair_invalid(
+                super::verifier_orchestration::record_controller_verifier_repair_invalid(
+                    self,
                     &format!(
                         "verifier repair unavailable: no safe cheap check available for {relative_path}"
                     ),
@@ -7996,46 +8001,11 @@ impl Agent {
         self.record_safe_stop_report(input, ctx);
     }
 
-    /// Issue #662 — `repair_exhausted` emit shell. Fires when
-    /// `record_repair_attempt_outcome` reports `all_clusters_exhausted = true`
-    /// (= every repairable cluster in `semantic_plan.semantic_report` now
-    /// lives in `exhausted_attempts` under its preferred role). The shell
-    /// reuses the shared `FromRepair` SSOT pipeline so the `failure_type`
-    /// upgrade in `SafeStopReport::build_from` (design judgment #5 (b))
-    /// flows through automatically. `record_safe_stop_report` internally
-    /// dedups via `safe_stop_report_emitted: HashSet<StopReason>` so the
-    /// caller does not need to gate this call.
-    pub(super) fn emit_safe_stop_report_for_repair_exhausted(&mut self) {
-        self.emit_repair_safe_stop_report(super::repair_job::StopReason::RepairExhausted);
-    }
-
-    /// Issue #662 (Codex CB-002): single chokepoint consumed by **both**
-    /// production `PromotionResult`-observing call sites:
-    ///   - Applied caller in `drive_task_contract_verifier` (after the
-    ///     rerun has been classified and the outcome pushed via
-    ///     `record_repair_attempt_outcome`),
-    ///   - Invalid caller in `record_controller_verifier_repair_invalid`
-    ///     (after a rejected repair-intent attempt pushes a non-target
-    ///     outcome through the same SSOT push entry point).
-    ///
-    /// Emits the `repair_exhausted` safe-stop report iff the supplied
-    /// promotion result reports `all_clusters_exhausted = true`. Pulling
-    /// the observation / emit pair into a single helper keeps the two
-    /// call sites in lockstep — a CB-002-style regression in either site
-    /// (e.g. one caller forgetting to observe `all_clusters_exhausted`)
-    /// is caught by the in-crate E2E suite, which drives the production
-    /// helper via `drive_record_repair_attempt_outcomes_for_test`.
-    pub(super) fn maybe_emit_repair_exhausted_from_promotion(
-        &mut self,
-        promotion: Option<super::repair_job::PromotionResult>,
-    ) {
-        if promotion.map(|p| p.all_clusters_exhausted).unwrap_or(false) {
-            self.emit_safe_stop_report_for_repair_exhausted();
-        }
-    }
-
     /// Shared helper for repair-job-driven emit paths (E.2 / E.3 / E.4).
-    fn emit_repair_safe_stop_report(&mut self, stop_reason: super::repair_job::StopReason) {
+    pub(super) fn emit_repair_safe_stop_report(
+        &mut self,
+        stop_reason: super::repair_job::StopReason,
+    ) {
         let Some(job) = self.repair_job.clone() else {
             return;
         };
@@ -8148,101 +8118,7 @@ impl Agent {
         out
     }
 
-    fn run_verifier_repair_pass_and_apply(
-        &mut self,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-    ) -> VerifierRepairPassOutcome {
-        let mut prepared = match self.prepare_verifier_repair_pass(target_hint) {
-            Ok(prepared) => prepared,
-            Err(outcome) => return outcome,
-        };
-        let pass_started = Instant::now();
-
-        let mut last_error = "repair pass did not run".to_string();
-        // Issue #653 (DR2-005): 1 pass = 最大 1 outcome push。retry loop 内では
-        // 最新の invalid outcome を上書きし、loop 終了時に Invalid に載せる。
-        // Issue #653 CB-001: 各 attempt 冒頭で `None` にリセットし、過去 attempt の
-        // ledger 対象 outcome (典型的には `RejectedUnsafe`) が ledger-non-target な
-        // 後続失敗 (parse error / duplicate / exact match 失敗 / apply 失敗 /
-        // LLM request 失敗 / 予期せぬ tool call) に紛れて伝播しないようにする。
-        // `VerifierRepairPassOutcome::Invalid` は **最後の attempt が ledger 対象
-        // だった場合のみ** `Some(...)` を載せる契約 (DR2-005)。
-        let mut last_invalid_outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome> =
-            None;
-        for attempt in 1..=VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
-            // Issue #653 CB-001: 各 attempt 開始時にリセット。これ以降の branch で
-            // 明示的に `Some(...)` を入れた場合のみ最終 `Invalid` outcome に伝播する。
-            last_invalid_outcome = None;
-            let elapsed = pass_started.elapsed();
-            let Some(attempt_timeout_secs) = verifier_repair_pass_attempt_timeout_secs(elapsed)
-            else {
-                last_error = self.verifier_repair_pass_wall_clock_timeout_error(
-                    &prepared,
-                    target_hint,
-                    attempt,
-                    elapsed,
-                );
-                break;
-            };
-            let repair_client = match super::verifier_orchestration::verifier_repair_pass_client(
-                self,
-                attempt_timeout_secs,
-            ) {
-                Ok(client) => client,
-                Err(err) => {
-                    last_error = err;
-                    break;
-                }
-            };
-            let reply = repair_client.chat_text_json_control(&prepared.model, &prepared.messages);
-            match self.handle_verifier_repair_pass_attempt(
-                &mut prepared,
-                target_hint,
-                attempt,
-                attempt_timeout_secs,
-                elapsed,
-                reply,
-            ) {
-                VerifierRepairAttemptProgress::Return(outcome) => return outcome,
-                VerifierRepairAttemptProgress::Continue {
-                    last_error: attempt_error,
-                    last_invalid_outcome: attempt_outcome,
-                } => {
-                    last_error = attempt_error;
-                    last_invalid_outcome = attempt_outcome;
-                }
-                VerifierRepairAttemptProgress::Break {
-                    last_error: attempt_error,
-                } => {
-                    last_error = attempt_error;
-                    break;
-                }
-            }
-
-            if attempt < VERIFIER_REPAIR_PASS_ATTEMPT_LIMIT {
-                prepared.messages.push(ConversationMessage::user(
-                    verifier_repair_pass_retry_message(&last_error),
-                ));
-            }
-        }
-
-        let error = format!("verifier_repair_pass_invalid: {last_error}");
-        log_llm_event(
-            "agent.verifier_repair_pass.invalid",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "model": &prepared.model,
-                "path": target_hint.path,
-                "error": compact_verifier_failure_text(&error, 240),
-            }),
-        );
-        VerifierRepairPassOutcome::Invalid {
-            error,
-            repair_attempt_outcome: last_invalid_outcome,
-        }
-    }
-
-    fn verifier_repair_pass_wall_clock_timeout_error(
+    pub(super) fn verifier_repair_pass_wall_clock_timeout_error(
         &self,
         prepared: &PreparedVerifierRepairPass,
         target_hint: &super::task_contract::RecoveryTargetHint,
@@ -8276,7 +8152,7 @@ impl Agent {
         );
     }
 
-    fn handle_verifier_repair_pass_attempt(
+    pub(super) fn handle_verifier_repair_pass_attempt(
         &mut self,
         prepared: &mut PreparedVerifierRepairPass,
         target_hint: &super::task_contract::RecoveryTargetHint,
@@ -8343,7 +8219,7 @@ impl Agent {
         }
     }
 
-    fn prepare_verifier_repair_pass(
+    pub(super) fn prepare_verifier_repair_pass(
         &mut self,
         target_hint: &super::task_contract::RecoveryTargetHint,
     ) -> Result<PreparedVerifierRepairPass, VerifierRepairPassOutcome> {
@@ -8501,90 +8377,6 @@ impl Agent {
             ),
             Err(error) => Err(error),
         }
-    }
-
-    fn record_controller_verifier_repair_invalid(
-        &mut self,
-        error: &str,
-        outcome: Option<super::repair_attempt_outcome::RepairAttemptOutcome>,
-    ) {
-        // Issue #637 (CB-002): sanitize `repair_error` at the store boundary
-        // so the verifier_repair_pass payload's `previous_repair_error` field
-        // never carries raw secrets / Authorization headers / control chars.
-        let compact = super::repair_job::sanitize_repair_job_text_with_char_cap(error, 360);
-        let mut promotion_result: Option<super::repair_job::PromotionResult> = None;
-        let active_target_hint = self
-            .repair_job
-            .as_ref()
-            .and_then(verifier_repair_effective_target_hint)
-            .cloned();
-        if let Some(context) = self.repair_job.as_mut() {
-            context.repair_error = Some(compact.clone());
-            let mut lifecycle_reject_recorded = false;
-            let explicit_error_reason =
-                super::repair_job::rejected_reason_for_repair_error(&compact);
-            // Issue #653 (S7-003): ledger mutation は helper 集約。
-            // `outcome = Some(...)` の場合のみ ledger に push される。
-            //
-            // Issue #662: `record_repair_attempt_outcome` returns
-            // `PromotionResult`; observe `all_clusters_exhausted` and emit the
-            // `RepairExhausted` safe stop afterwards. `semantic_plan = None`
-            // path skips the precondition gate via the existing
-            // `if let Some(o) = outcome` guard (callers only build outcomes
-            // when `semantic_plan = Some`).
-            let effective_outcome = match explicit_error_reason {
-                Some(super::repair_job::RejectedAttemptReason::ProviderTimeout) => outcome,
-                _ => outcome.or_else(|| {
-                    malformed_repair_attempt_outcome_for_active_target(
-                        context,
-                        active_target_hint.as_ref(),
-                    )
-                }),
-            };
-            if let Some(o) = effective_outcome {
-                if let (Some(target_hint), Some(reason)) = (
-                    active_target_hint.as_ref(),
-                    super::repair_job::rejected_reason_for_repair_attempt_outcome_kind(&o.kind),
-                ) {
-                    let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
-                    context.apply_event(super::repair_job::RepairJobEvent::PatchRejected {
-                        key,
-                        reason,
-                    });
-                    lifecycle_reject_recorded = true;
-                }
-                promotion_result = Some(match active_target_hint.as_ref() {
-                    Some(target_hint) => {
-                        context.record_repair_attempt_outcome_for_target(o, target_hint)
-                    }
-                    None => context.record_repair_attempt_outcome(o),
-                });
-            }
-            if !lifecycle_reject_recorded
-                && let Some(event) = super::repair_job::lifecycle_event_for_repair_error(
-                    &compact,
-                    active_target_hint.as_ref(),
-                )
-            {
-                context.apply_event(event);
-            }
-        }
-        self.session.working_memory.note_error(compact.clone());
-        log_llm_event(
-            "agent.verifier_repair_pass.retryable_invalid",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "error": compact,
-                // Phase 0 invariant (b): `repair_attempt_outcomes` は payload に
-                // 出さない (variant 名のみで mask 不要だが、出力経路を増やさない)。
-            }),
-        );
-        // Issue #662: emit `StopReason::RepairExhausted` after the ledger
-        // mutation. `record_safe_stop_report` dedups internally via the
-        // `safe_stop_report_emitted` HashSet — no caller `contains` guard
-        // needed. The shared helper keeps the Invalid caller in lockstep
-        // with the Applied caller (CB-002 fix anchor).
-        self.maybe_emit_repair_exhausted_from_promotion(promotion_result);
     }
 
     pub(super) fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
@@ -18474,12 +18266,13 @@ mod progress_tests {
         successful_repo_edit_count, sync_package_json_with_existing_lock, tool_color, tool_display,
         tool_emoji, unicode_supported, validate_accepted_repair_plan_authorizes_target,
         verifier_diagnostic_attempt_spec, verifier_repair_context_from_failure,
-        verifier_repair_effective_target_hint, verifier_repair_intent_fingerprint,
-        verifier_repair_intents_fingerprint, verifier_repair_invalid_can_continue,
-        verifier_repair_pass_retry_message, verifier_repair_preferred_local_import_source,
+        verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
+        verifier_repair_invalid_can_continue, verifier_repair_preferred_local_import_source,
         verifier_repair_stale_assertion_test_target, verifier_repair_target_candidate_from_output,
         verifier_repair_target_hint_from_output, workspace_appears_empty,
     };
+    use crate::agent::loop_run::repair_driver::verifier_repair_pass_retry_message;
+    use crate::agent::loop_run::repair_job::verifier_repair_effective_target_hint;
     use crate::agent::recovery::ActionExpectation;
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
     use crate::ollama::xml_fallback::ToolCall;
@@ -21507,9 +21300,11 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
             .clone();
         let expected_role = target.role;
 
-        let outcome =
-            super::malformed_repair_attempt_outcome_for_active_target(&context, Some(target))
-                .expect("semantic plan + active target must produce a bounded outcome");
+        let outcome = super::super::repair_job::malformed_repair_attempt_outcome_for_active_target(
+            &context,
+            Some(target),
+        )
+        .expect("semantic plan + active target must produce a bounded outcome");
 
         assert_eq!(outcome.cluster, expected_cluster);
         assert_eq!(outcome.role, expected_role);
