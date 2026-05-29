@@ -2601,7 +2601,8 @@ pub(super) fn handle_structured_task_contract_verifier_selection(
         return TaskContractVerifierOutcome::NoVerifier;
     };
     if selection.command.runner() == "python3" {
-        agent.materialize_python_package_markers_for_owned_test_imports(
+        super::python_markers::materialize_python_package_markers_for_owned_test_imports(
+            agent,
             &selection.bound_test_artifacts_paths,
         );
     }
@@ -2682,8 +2683,12 @@ pub(super) fn finish_structured_task_contract_verifier_selection(
             &result,
         )
     {
-        let created_markers = agent
-            .materialize_python_package_markers_for_external_import(&result.stdout, &result.stderr);
+        let created_markers =
+            super::python_markers::materialize_python_package_markers_for_external_import(
+                agent,
+                &result.stdout,
+                &result.stderr,
+            );
         let borrowed = contamination.borrowed_hashes();
         agent.emit_agent_verifier_external_import_rejected_if_first(
             selection.command.runner(),

@@ -97,6 +97,11 @@ mod classify_confirm_flow;
 // over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod tester_invocation;
+// Python package-marker materialization extracted from `turn.rs`
+// (parent #680). Hosts 2 entry points + a shared materializer, all free
+// fns over `&mut Agent`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod python_markers;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
