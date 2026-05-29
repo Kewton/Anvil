@@ -34,10 +34,13 @@
 //! `pub(super)` limited / no facade re-export (DR3-001).
 //! `turn.rs` is the only in-crate consumer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use super::tool_history::latest_user_turn_slice;
+use crate::agent::recovery;
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
+use crate::session::store::ConversationMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScaffoldFramework {
@@ -142,4 +145,119 @@ pub(super) fn deterministic_nextjs_scaffold_reply() -> AssistantReply {
         prompt_tokens: None,
         completion_tokens: None,
     }
+}
+
+pub(super) const DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER: &str =
+    "Materialized deterministic framework app fallback files";
+
+pub(super) fn recent_post_scaffold_edit_attempt(messages: &[ConversationMessage]) -> usize {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role != "system" {
+                return None;
+            }
+            message
+                .content
+                .rsplit("post_scaffold_edit_attempt=")
+                .next()
+                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
+pub(super) fn recent_post_scaffold_continue_attempt(messages: &[ConversationMessage]) -> usize {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .find_map(|message| {
+            if message.role != "system" {
+                return None;
+            }
+            message
+                .content
+                .rsplit("post_scaffold_continue_attempt=")
+                .next()
+                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
+pub(super) fn recent_scaffold_command_seen(messages: &[ConversationMessage]) -> bool {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .any(|message| {
+            if message.role != "assistant" {
+                return false;
+            }
+            message.tool_calls.iter().rev().any(|tool_call| {
+                // Issue #664: legacy recovery-side scaffold detector.
+                #[allow(deprecated)]
+                let is_scaffold = tool_call.name == "Bash"
+                    && tool_call
+                        .arguments
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(recovery::is_scaffold_command);
+                is_scaffold
+            })
+        })
+}
+
+pub(super) fn recent_deterministic_framework_app_fallback_seen(
+    messages: &[ConversationMessage],
+) -> bool {
+    latest_user_turn_slice(messages)
+        .iter()
+        .rev()
+        .any(|message| {
+            message.role == "assistant"
+                && message
+                    .content
+                    .contains(DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER)
+        })
+}
+
+pub(super) fn post_scaffold_recovery_active(
+    messages: &[ConversationMessage],
+    active_root: Option<&Path>,
+    cwd: &Path,
+) -> bool {
+    recent_scaffold_command_seen(messages)
+        || recent_deterministic_framework_app_fallback_seen(messages)
+        || recent_post_scaffold_edit_attempt(messages) > 0
+        || (active_root.is_some_and(|root| root != cwd)
+            && latest_user_turn_slice(messages).iter().any(|message| {
+                message.role == "system"
+                    && message
+                        .content
+                        .trim_start()
+                        .starts_with("[Workspace Root Updated]")
+            }))
+}
+
+pub(super) fn post_scaffold_continuation_active(
+    _messages: &[ConversationMessage],
+    _active_root: Option<&Path>,
+    _cwd: &Path,
+    _work_root: &Path,
+    _plan_path: Option<&Path>,
+) -> bool {
+    // A second forced microscopic edit tends to trap scaffolded apps in
+    // placeholder-copy churn. After the first repo edit, let the normal
+    // implementation loop and final quality gate drive the next action.
+    false
+}
+
+pub(super) fn render_deterministic_scaffold_continuation_note(
+    request: &str,
+    written_paths: &[String],
+) -> String {
+    let request_json = serde_json::to_string(request).unwrap_or_else(|_| "\"<invalid>\"".into());
+    format!(
+        "[Deterministic Scaffold] The generated files are bootstrap scaffold only and do not satisfy the task by themselves. request_json={request_json}. Read and edit the scaffold to implement the user's specific requirements, including domain-specific implementation, tests, and usage documentation. Existing scaffold files: {}. Do not give a final answer until the implementation, tests, and docs match request_json and verification has run.",
+        written_paths.join(", ")
+    )
 }

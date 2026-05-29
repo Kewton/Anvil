@@ -87,12 +87,17 @@ use super::safe_stop_payload::{build_safe_stop_payload, collect_recent_action_la
 #[cfg(test)]
 use super::scaffold_pipeline::PlanExplorationKey;
 #[cfg(test)]
+use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
+#[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
     CREATE_NEXT_APP_PACKAGE_VERSION, DeterministicScaffoldSpec,
     EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
     EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
     ScaffoldFallbackResult, ScaffoldFramework, deterministic_nextjs_scaffold_reply,
+    post_scaffold_continuation_active, post_scaffold_recovery_active,
+    recent_post_scaffold_continue_attempt, recent_post_scaffold_edit_attempt,
+    recent_scaffold_command_seen, render_deterministic_scaffold_continuation_note,
     requested_scaffold_framework, scaffold_command_matches_framework,
     task_or_plan_requires_nextjs_scaffold,
 };
@@ -15881,40 +15886,6 @@ fn plan_file_alias(path: &Path) -> String {
         .unwrap_or_else(|| "plans/plan.md".to_string())
 }
 
-fn recent_post_scaffold_edit_attempt(messages: &[ConversationMessage]) -> usize {
-    latest_user_turn_slice(messages)
-        .iter()
-        .rev()
-        .find_map(|message| {
-            if message.role != "system" {
-                return None;
-            }
-            message
-                .content
-                .rsplit("post_scaffold_edit_attempt=")
-                .next()
-                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
-        })
-        .unwrap_or(0)
-}
-
-fn recent_post_scaffold_continue_attempt(messages: &[ConversationMessage]) -> usize {
-    latest_user_turn_slice(messages)
-        .iter()
-        .rev()
-        .find_map(|message| {
-            if message.role != "system" {
-                return None;
-            }
-            message
-                .content
-                .rsplit("post_scaffold_continue_attempt=")
-                .next()
-                .and_then(|suffix| suffix.trim().parse::<usize>().ok())
-        })
-        .unwrap_or(0)
-}
-
 pub(super) fn prune_plan_mode_messages(messages: &mut Vec<ConversationMessage>) {
     messages.retain(|message| {
         if message.role != "system" {
@@ -15988,71 +15959,6 @@ fn latest_turn_preferred_read_edit_target(
     latest_existing
 }
 
-fn recent_scaffold_command_seen(messages: &[ConversationMessage]) -> bool {
-    latest_user_turn_slice(messages)
-        .iter()
-        .rev()
-        .any(|message| {
-            if message.role != "assistant" {
-                return false;
-            }
-            message.tool_calls.iter().rev().any(|tool_call| {
-                // Issue #664: legacy recovery-side scaffold detector.
-                #[allow(deprecated)]
-                let is_scaffold = tool_call.name == "Bash"
-                    && tool_call
-                        .arguments
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(recovery::is_scaffold_command);
-                is_scaffold
-            })
-        })
-}
-
-fn post_scaffold_recovery_active(
-    messages: &[ConversationMessage],
-    active_root: Option<&Path>,
-    cwd: &Path,
-) -> bool {
-    recent_scaffold_command_seen(messages)
-        || recent_deterministic_framework_app_fallback_seen(messages)
-        || recent_post_scaffold_edit_attempt(messages) > 0
-        || (active_root.is_some_and(|root| root != cwd)
-            && latest_user_turn_slice(messages).iter().any(|message| {
-                message.role == "system"
-                    && message
-                        .content
-                        .trim_start()
-                        .starts_with("[Workspace Root Updated]")
-            }))
-}
-
-fn recent_deterministic_framework_app_fallback_seen(messages: &[ConversationMessage]) -> bool {
-    latest_user_turn_slice(messages)
-        .iter()
-        .rev()
-        .any(|message| {
-            message.role == "assistant"
-                && message
-                    .content
-                    .contains(DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER)
-        })
-}
-
-fn post_scaffold_continuation_active(
-    _messages: &[ConversationMessage],
-    _active_root: Option<&Path>,
-    _cwd: &Path,
-    _work_root: &Path,
-    _plan_path: Option<&Path>,
-) -> bool {
-    // A second forced microscopic edit tends to trap scaffolded apps in
-    // placeholder-copy churn. After the first repo edit, let the normal
-    // implementation loop and final quality gate drive the next action.
-    false
-}
-
 fn workspace_appears_empty(work_root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(work_root) else {
         return false;
@@ -16114,17 +16020,6 @@ fn deterministic_framework_app_files_needed(
         return false;
     }
     deterministic::playable_ui_repair(request, &target, &current).is_some()
-}
-
-fn render_deterministic_scaffold_continuation_note(
-    request: &str,
-    written_paths: &[String],
-) -> String {
-    let request_json = serde_json::to_string(request).unwrap_or_else(|_| "\"<invalid>\"".into());
-    format!(
-        "[Deterministic Scaffold] The generated files are bootstrap scaffold only and do not satisfy the task by themselves. request_json={request_json}. Read and edit the scaffold to implement the user's specific requirements, including domain-specific implementation, tests, and usage documentation. Existing scaffold files: {}. Do not give a final answer until the implementation, tests, and docs match request_json and verification has run.",
-        written_paths.join(", ")
-    )
 }
 
 fn scaffold_file_snapshot(path: &str, content: &[u8]) -> ScaffoldArtifactFileSnapshot {
@@ -16425,9 +16320,6 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-
-const DETERMINISTIC_FRAMEWORK_APP_FALLBACK_MARKER: &str =
-    "Materialized deterministic framework app fallback files";
 
 fn deterministic_framework_game_impl_path(path: &Path) -> bool {
     matches!(
