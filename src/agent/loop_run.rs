@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
 
 use crate::agent::prompting;
 use crate::agent::recovery;
@@ -114,6 +113,13 @@ mod emit_verifier_events;
 // `observe_task_contract_verifier_exit_zero_bound` — all free fns over
 // `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod verifier_observation;
+// Assistant-reply retry orchestration extracted from `turn.rs` (parent
+// #680). Hosts the retry loop entry point + 10 branch-by-branch error
+// handlers (format-error / timeout / transport / native-tool downgrade /
+// generic retry + actual Ollama dispatch). `current_assistant_model`
+// stays on Agent (5+ external call sites). `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod reply_retry;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
