@@ -389,6 +389,11 @@ mod turn_tests;
 // #[cfg(test)] only. No facade re-export (DR3-001).
 #[cfg(test)]
 mod progress_tests;
+// turn.rs `mod truncate_tests` extracted to a sibling file (parent #680).
+// Same pattern as turn_tests / progress_tests. #[cfg(test)] only.
+// No facade re-export (DR3-001).
+#[cfg(test)]
+mod truncate_tests;
 // Issue #666: structured per-turn job reports
 // (ArtifactCompletion/Verification/Repair/Memory). Private mod, no
 // facade re-export (DR3-001). `turn.rs` is the only in-crate consumer
