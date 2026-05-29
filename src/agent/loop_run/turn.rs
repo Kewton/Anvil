@@ -91,9 +91,8 @@ use super::scaffold_pipeline::recent_deterministic_framework_app_fallback_seen;
 #[cfg(test)]
 use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
-    DeterministicScaffoldSpec, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
-    EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK, ScaffoldFallbackResult, ScaffoldFramework,
-    deterministic_framework_app_files_needed, deterministic_framework_game_impl_path,
+    EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
+    ScaffoldFallbackResult, ScaffoldFramework, deterministic_framework_game_impl_path,
     deterministic_support_target_relative, scaffold_candidate_priority,
 };
 #[cfg(test)]
@@ -9828,183 +9827,13 @@ impl Agent {
         decision: &super::task_contract::CompletionDecision,
         last_iter: usize,
     ) -> bool {
-        // Issue #634: template 系特化 fallback (FastAPI scaffold) は
-        // experimental flag と `FullTemplate` の AND 条件で隔離。
-        // `policy_allows_python_specialized_fallback` が
-        // `ModePolicy::allow_python_deterministic_fallback` と
-        // `Config::specialized_template_fallback_enabled()` の AND 条件を担う。
-        if !super::policy_allows_python_specialized_fallback(
-            &self.session.mode_state.policy(),
-            &self.config,
-        ) {
-            return false;
-        }
-        if !matches!(
-            decision,
-            super::task_contract::CompletionDecision::Continue { .. }
-        ) {
-            return false;
-        }
-        if !self.workspace_appears_empty() {
-            return false;
-        }
-        let Some(request) = self.active_request_text() else {
-            return false;
-        };
-        let Some(files) = deterministic::fastapi_scaffold_files(&request) else {
-            return false;
-        };
-        let mut spec = DeterministicScaffoldSpec {
-            label: "Task scaffold",
-            event: "agent.task_contract.deterministic_fastapi_scaffold",
-            scaffold_kind: "FastAPI",
-            files,
-        };
-        let Some((written, snapshot_files)) =
-            super::scaffold_pipeline::write_deterministic_scaffold_files(
-                self,
-                std::mem::take(&mut spec.files),
-                "task contract deterministic fallback",
-                true,
-            )
-        else {
-            return false;
-        };
-        if written.is_empty() {
-            return false;
-        }
-        super::scaffold_pipeline::finalize_deterministic_scaffold_materialization(
-            self,
-            &request,
-            last_iter,
-            &spec,
-            "contract recovery",
-            written,
-            snapshot_files,
-        );
-        true
+        super::scaffold_pipeline::maybe_materialize_task_contract_fallback(
+            self, decision, last_iter,
+        )
     }
 
     pub(super) fn maybe_materialize_framework_game_fallback(&mut self, last_iter: usize) -> bool {
-        if !self.config.deterministic_fallback.allows_hint_only() {
-            return false;
-        }
-        if !self
-            .session
-            .mode_state
-            .policy()
-            .allow_ui_deterministic_fallback
-        {
-            return false;
-        }
-        let Some(request) = self.active_request_text() else {
-            return false;
-        };
-        let Some(files) = deterministic::empty_framework_app_files(&request) else {
-            return false;
-        };
-        if !self.workspace_appears_empty()
-            && !deterministic_framework_app_files_needed(&self.work_root, &files, &request)
-        {
-            return false;
-        }
-        if !self
-            .config
-            .deterministic_fallback
-            .allows_template_completion()
-        {
-            let level = self.config.deterministic_fallback.fallback_level();
-            write_stdout_rendered(
-                &format_iteration_status(
-                    last_iter,
-                    self.config.max_iterations,
-                    "App fallback hint",
-                    &format!(
-                        "Deterministic full-template fallback is disabled at level {level}; asked the model to continue with a task-specific implementation."
-                    ),
-                    self.footer.current_cols(),
-                ),
-                true,
-            );
-            log_llm_event(
-                "agent.empty_workspace.deterministic_framework_app_hint",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "work_root": self.work_root.display().to_string(),
-                    "fallback_level": level,
-                    "fallback_action": "hint_only",
-                }),
-            );
-            return true;
-        }
-
-        let mut written = Vec::<PathBuf>::new();
-        for (relative, content) in files {
-            let target = self.work_root.join(&relative);
-            if let Some(parent) = target.parent()
-                && let Err(err) = std::fs::create_dir_all(parent)
-            {
-                self.session.working_memory.note_error(format!(
-                    "deterministic fallback: failed to create {}: {err}",
-                    parent.display()
-                ));
-                return false;
-            }
-            if let Err(err) = std::fs::write(&target, content) {
-                self.session.working_memory.note_error(format!(
-                    "deterministic fallback: failed to write {}: {err}",
-                    target.display()
-                ));
-                return false;
-            }
-            self.session
-                .working_memory
-                .note_touched_file(normalize_memory_path(
-                    &relative.to_string_lossy(),
-                    &self.work_root,
-                ));
-            written.push(relative);
-        }
-
-        let written_paths = written
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        write_stdout_rendered(
-            &format_iteration_status(
-                last_iter,
-                self.config.max_iterations,
-                "App fallback",
-                &format!(
-                    "Materialized deterministic framework app files: {}.",
-                    written_paths.join(", ")
-                ),
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        log_llm_event(
-            "agent.empty_workspace.deterministic_framework_app",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "work_root": self.work_root.display().to_string(),
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "full_template",
-                "files": written_paths,
-            }),
-        );
-        self.session
-            .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
-                &self.work_root,
-            ));
-        self.session.messages.push(ConversationMessage::assistant(
-            format!(
-                "Materialized deterministic framework app fallback files as a recovery scaffold: {}. Continue implementation and verification before treating the task as complete.",
-                written_paths.join(", ")
-            ),
-            Vec::new(),
-        ));
-        true
+        super::scaffold_pipeline::maybe_materialize_framework_game_fallback(self, last_iter)
     }
 
     pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
