@@ -42,21 +42,23 @@ use super::actor_loop_flow::format_iteration_status;
 use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
 use super::interrupt::InterruptFlag;
+use super::lifecycle;
 use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
 use super::task_contract::ArtifactRole;
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
 use super::turn::{
-    WrittenScaffoldArtifacts, current_file_hash_for_relative_path, extract_filename_with_suffix,
-    last_read_tool_path, latest_turn_preferred_read_edit_target, meaningful_workspace_files,
-    normalize_memory_path, progress_path_display, sha256_hex, tool_result_failed,
-    workspace_appears_empty, write_stdout_rendered,
+    WrittenScaffoldArtifacts, current_file_hash_for_relative_path,
+    deterministic_timeout_fallback_plan, extract_filename_with_suffix, last_read_tool_path,
+    latest_turn_preferred_read_edit_target, meaningful_workspace_files, normalize_memory_path,
+    progress_path_display, sha256_hex, tool_result_failed, workspace_appears_empty,
+    write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{ExecutionMode, ModePolicy};
+use crate::modes::plan_act::{ExecutionMode, ModePolicy, PlanStage};
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::safety::path_guard::resolve_user_path;
@@ -972,4 +974,101 @@ pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
     } else {
         ScaffoldFallbackResult::Applied
     }
+}
+
+pub(super) fn maybe_materialize_mode_deterministic_fallback(
+    agent: &mut Agent,
+    last_iter: usize,
+) -> bool {
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_template_completion()
+    {
+        return false;
+    }
+    let policy = agent.session.mode_state.policy();
+    let Some(request) = agent.active_request_text() else {
+        return false;
+    };
+    let Some(mut spec) = mode_deterministic_scaffold_spec(agent, &request, &policy) else {
+        return false;
+    };
+    if !workspace_appears_empty(&agent.work_root) {
+        return false;
+    }
+    let Some((written, snapshot_files)) = write_deterministic_scaffold_files(
+        agent,
+        std::mem::take(&mut spec.files),
+        "deterministic fallback",
+        false,
+    ) else {
+        return false;
+    };
+    finalize_deterministic_scaffold_materialization(
+        agent,
+        &request,
+        last_iter,
+        &spec,
+        "bootstrap only",
+        written,
+        snapshot_files,
+    );
+    true
+}
+
+pub(super) fn materialize_deterministic_fallback_plan(
+    agent: &mut Agent,
+    event_name: &str,
+) -> Result<bool, String> {
+    let Some(plan_path) = agent.session.mode_state.active_plan_path.clone() else {
+        return Ok(false);
+    };
+
+    let current_contents = agent.current_plan_contents()?.unwrap_or_default();
+    if lifecycle::plan_is_substantive(&current_contents) {
+        return Ok(false);
+    }
+
+    let task = agent
+        .session
+        .working_memory
+        .active_task
+        .clone()
+        .or_else(|| {
+            agent
+                .session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+        })
+        .unwrap_or_else(|| "Complete the requested task.".to_string());
+
+    let fallback_plan = deterministic_timeout_fallback_plan(
+        &task,
+        agent.session.mode_state.task_profile,
+        &agent.work_root,
+    );
+    agent.ensure_plan_file(&plan_path)?;
+    std::fs::write(&plan_path, fallback_plan).map_err(|err| {
+        format!(
+            "failed to write deterministic fallback plan {}: {err}",
+            plan_path.display()
+        )
+    })?;
+    agent.session.mode_state.plan_stage = PlanStage::Ready;
+    log_llm_event(
+        event_name,
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "plan_path": plan_path.display().to_string(),
+            "task_profile": agent.session.mode_state.task_profile.as_str(),
+            "model_override": agent.plan_model_override,
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "minimal_patch",
+        }),
+    );
+    Ok(true)
 }

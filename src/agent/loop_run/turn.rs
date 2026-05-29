@@ -1648,7 +1648,7 @@ fn fallback_plan_platform_label(task: &str) -> &'static str {
     }
 }
 
-fn deterministic_timeout_fallback_plan(
+pub(super) fn deterministic_timeout_fallback_plan(
     task: &str,
     task_profile: TaskProfile,
     work_root: &Path,
@@ -5982,55 +5982,7 @@ impl Agent {
         &mut self,
         event_name: &str,
     ) -> Result<bool, String> {
-        let Some(plan_path) = self.session.mode_state.active_plan_path.clone() else {
-            return Ok(false);
-        };
-
-        let current_contents = self.current_plan_contents()?.unwrap_or_default();
-        if lifecycle::plan_is_substantive(&current_contents) {
-            return Ok(false);
-        }
-
-        let task = self
-            .session
-            .working_memory
-            .active_task
-            .clone()
-            .or_else(|| {
-                self.session
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == "user")
-                    .map(|message| message.content.clone())
-            })
-            .unwrap_or_else(|| "Complete the requested task.".to_string());
-
-        let fallback_plan = deterministic_timeout_fallback_plan(
-            &task,
-            self.session.mode_state.task_profile,
-            &self.work_root,
-        );
-        self.ensure_plan_file(&plan_path)?;
-        std::fs::write(&plan_path, fallback_plan).map_err(|err| {
-            format!(
-                "failed to write deterministic fallback plan {}: {err}",
-                plan_path.display()
-            )
-        })?;
-        self.session.mode_state.plan_stage = PlanStage::Ready;
-        log_llm_event(
-            event_name,
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "plan_path": plan_path.display().to_string(),
-                "task_profile": self.session.mode_state.task_profile.as_str(),
-                "model_override": self.plan_model_override,
-                "fallback_level": self.config.deterministic_fallback.fallback_level(),
-                "fallback_action": "minimal_patch",
-            }),
-        );
-        Ok(true)
+        super::scaffold_pipeline::materialize_deterministic_fallback_plan(self, event_name)
     }
 
     fn build_request_messages(
@@ -9864,85 +9816,11 @@ impl Agent {
         super::scaffold_pipeline::empty_workspace_scaffold_policy_error(self, name, arguments)
     }
 
-    fn mode_deterministic_scaffold_spec(
-        &self,
-        request: &str,
-        policy: &crate::modes::plan_act::ModePolicy,
-    ) -> Option<DeterministicScaffoldSpec> {
-        super::scaffold_pipeline::mode_deterministic_scaffold_spec(self, request, policy)
-    }
-
-    fn write_deterministic_scaffold_files(
-        &mut self,
-        files: Vec<(PathBuf, String)>,
-        error_prefix: &str,
-        skip_existing: bool,
-    ) -> Option<WrittenScaffoldArtifacts> {
-        super::scaffold_pipeline::write_deterministic_scaffold_files(
-            self,
-            files,
-            error_prefix,
-            skip_existing,
-        )
-    }
-
-    fn finalize_deterministic_scaffold_materialization(
-        &mut self,
-        request: &str,
-        last_iter: usize,
-        spec: &DeterministicScaffoldSpec,
-        assistant_context: &str,
-        written: Vec<PathBuf>,
-        snapshot_files: Vec<ScaffoldArtifactFileSnapshot>,
-    ) {
-        super::scaffold_pipeline::finalize_deterministic_scaffold_materialization(
-            self,
-            request,
-            last_iter,
-            spec,
-            assistant_context,
-            written,
-            snapshot_files,
-        )
-    }
-
     pub(super) fn maybe_materialize_mode_deterministic_fallback(
         &mut self,
         last_iter: usize,
     ) -> bool {
-        if !self
-            .config
-            .deterministic_fallback
-            .allows_template_completion()
-        {
-            return false;
-        }
-        let policy = self.session.mode_state.policy();
-        let Some(request) = self.active_request_text() else {
-            return false;
-        };
-        let Some(mut spec) = self.mode_deterministic_scaffold_spec(&request, &policy) else {
-            return false;
-        };
-        if !self.workspace_appears_empty() {
-            return false;
-        }
-        let Some((written, snapshot_files)) = self.write_deterministic_scaffold_files(
-            std::mem::take(&mut spec.files),
-            "deterministic fallback",
-            false,
-        ) else {
-            return false;
-        };
-        self.finalize_deterministic_scaffold_materialization(
-            &request,
-            last_iter,
-            &spec,
-            "bootstrap only",
-            written,
-            snapshot_files,
-        );
-        true
+        super::scaffold_pipeline::maybe_materialize_mode_deterministic_fallback(self, last_iter)
     }
 
     pub(super) fn maybe_materialize_task_contract_fallback(
@@ -9982,17 +9860,21 @@ impl Agent {
             scaffold_kind: "FastAPI",
             files,
         };
-        let Some((written, snapshot_files)) = self.write_deterministic_scaffold_files(
-            std::mem::take(&mut spec.files),
-            "task contract deterministic fallback",
-            true,
-        ) else {
+        let Some((written, snapshot_files)) =
+            super::scaffold_pipeline::write_deterministic_scaffold_files(
+                self,
+                std::mem::take(&mut spec.files),
+                "task contract deterministic fallback",
+                true,
+            )
+        else {
             return false;
         };
         if written.is_empty() {
             return false;
         }
-        self.finalize_deterministic_scaffold_materialization(
+        super::scaffold_pipeline::finalize_deterministic_scaffold_materialization(
+            self,
             &request,
             last_iter,
             &spec,
