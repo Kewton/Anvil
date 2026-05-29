@@ -92,6 +92,11 @@ mod case_record_flow;
 // points + 4 private attempt/resolution helpers, all free fns over
 // `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod classify_confirm_flow;
+// Tester invocation flow extracted from `turn.rs` (parent #680). Hosts
+// `try_invoke_tester` (pub(super)) and 5 private helpers as free fns
+// over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod tester_invocation;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
