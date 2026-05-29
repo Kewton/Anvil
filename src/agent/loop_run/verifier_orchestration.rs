@@ -2963,3 +2963,160 @@ pub(super) fn record_controller_verifier_repair_invalid(
     );
     maybe_emit_repair_exhausted_from_promotion(agent, promotion_result);
 }
+
+pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnosticPassOutcome {
+    let prepared = match agent.prepare_verifier_diagnostic_pass() {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let reply_content = match agent.request_verifier_diagnostic_reply(&prepared) {
+        Ok(reply_content) => reply_content,
+        Err(outcome) => return outcome,
+    };
+    let Some(mut parsed) =
+        super::verifier_assessment_parser::parse_verifier_repair_assessment_reply(&reply_content)
+    else {
+        return agent.handle_verifier_diagnostic_failure(
+            "diagnostic reply was malformed".to_string(),
+            prepared.attempt_spec.role,
+        );
+    };
+    let framework_findings = verifier_framework_findings_for_diagnostic(
+        &agent.work_root,
+        &prepared.context.command,
+        &verifier_framework_signal_for_context(&prepared.context),
+        &verifier_diagnostic_file_excerpts(&agent.work_root, &prepared.context),
+    );
+    let framework_override =
+        super::verifier_assessment_parser::apply_framework_findings_to_parsed_assessment(
+            &mut parsed,
+            &framework_findings,
+        );
+    // -------- BEGIN semantic-boundary (Issue #647 / S3-005 / SF3) --------
+    let semantic_report = if framework_override {
+        super::semantic_repair_planning::build_semantic_failure_report_from_legacy(
+            &parsed,
+            &prepared.context,
+        )
+    } else {
+        super::verifier_assessment_parser::parse_semantic_failure_report_from_reply(&reply_content)
+            .or_else(|| {
+                super::semantic_repair_planning::build_semantic_failure_report_from_legacy(
+                    &parsed,
+                    &prepared.context,
+                )
+            })
+    };
+    let agent_history_hint = super::spec_authority::AgentHistoryHint {
+        verifier_passed_in_loop: agent.task_contract_verifier_passed_this_actor_loop,
+    };
+    let authority_input =
+        super::semantic_repair_planning::build_spec_authority_input_for_active_request(
+            agent.active_request_text().as_deref(),
+            semantic_report.as_ref(),
+            agent_history_hint,
+        );
+    let scope = agent.current_workspace_scope();
+    let turn_edited = agent.turn_edited_relative_paths.clone();
+    let edited_predicate = |path: &str| turn_edited.contains(path);
+    let scaffold_predicate = |path: &str| agent.repo_edit_has_post_scaffold_delta(path);
+    let admission = RepairTargetAdmissionContext {
+        work_root: &agent.work_root,
+        scope: &scope,
+        edited_this_session_for: &edited_predicate,
+        scaffold_changed_for: &scaffold_predicate,
+    };
+    let semantic_report = semantic_report.and_then(|mut report| {
+        super::semantic_repair_planning::merge_legacy_targets_into_clusters(&mut report, &parsed);
+        let spec_authority = super::spec_authority::resolve(&authority_input);
+        super::semantic_repair_planning::enrich_failure_clusters_with_admitted_targets(
+            &mut report,
+            &agent.work_root,
+            &admission,
+            spec_authority,
+        );
+        if report
+            .failure_clusters
+            .iter()
+            .all(|c| c.admitted_cluster_targets.is_empty())
+        {
+            None
+        } else {
+            Some(report)
+        }
+    });
+    let pre_bump_assessment_generation = prepared.context.assessment_generation;
+    let mut semantic_plan = semantic_report.and_then(|report| {
+        super::semantic_repair_planning::build_semantic_repair_plan_from_report_with_authority_input(
+            report,
+            authority_input.clone(),
+            pre_bump_assessment_generation,
+        )
+    });
+    // -------- END semantic-boundary (Issue #647 / S3-005 / SF3) --------
+    let assessment = model_assessment_to_verifier_repair_assessment(
+        &agent.work_root,
+        &prepared.context,
+        parsed.clone(),
+        &admission,
+    );
+    let has_target = assessment.repair_target_hint.is_some();
+    if !has_target {
+        return agent.handle_verifier_diagnostic_failure(
+            "diagnostic did not identify a safe repair target".to_string(),
+            prepared.attempt_spec.role,
+        );
+    }
+    log_llm_event(
+        "agent.verifier_repair_pipeline.shadow",
+        super::verifier_repair_shadow::build_verifier_repair_pipeline_shadow_payload(
+            agent.session_store.session_id(),
+            &prepared.attempt_spec.model,
+            prepared.attempt_spec.role,
+            &prepared.context,
+            &parsed,
+            &assessment,
+        ),
+    );
+    if semantic_plan.is_none() {
+        semantic_plan = super::semantic_repair_planning::build_semantic_failure_report_from_legacy_assessment(
+            &assessment,
+            &prepared.context,
+        )
+        .and_then(|report| {
+            super::semantic_repair_planning::build_semantic_repair_plan_from_report_with_authority_input(
+                report,
+                authority_input.clone(),
+                pre_bump_assessment_generation,
+            )
+        });
+    }
+    if let Some(current) = agent.repair_job.as_mut() {
+        current.failure_type = assessment.failure_type;
+        current.repair_target_hint = assessment.repair_target_hint.clone();
+        current.diagnostic_error = None;
+        current.diagnostic_unavailable = false;
+        current.assessment = Some(assessment);
+        current.assessment_generation = pre_bump_assessment_generation.saturating_add(1);
+        let new_report = semantic_plan
+            .as_ref()
+            .map(|plan| plan.semantic_report.clone());
+        super::repair_job::assign_semantic_plan_preserving_exhausted(
+            current,
+            semantic_plan,
+            new_report.as_ref(),
+        );
+        super::repair_job::rebind_legacy_assessment_to_current_cluster(current);
+        current.apply_event(super::repair_job::RepairJobEvent::PlanAccepted);
+    }
+    log_llm_event(
+        "agent.verifier_diagnostic.completed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "model": prepared.attempt_spec.model,
+            "role": prepared.attempt_spec.role,
+            "accepted": has_target,
+        }),
+    );
+    VerifierDiagnosticPassOutcome::Accepted
+}
