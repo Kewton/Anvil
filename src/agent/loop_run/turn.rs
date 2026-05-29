@@ -93,12 +93,15 @@ use super::scaffold_pipeline::task_requires_nextjs_scaffold;
 use super::scaffold_pipeline::{
     CREATE_NEXT_APP_PACKAGE_VERSION, DeterministicScaffoldSpec,
     EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD, EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT,
-    EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
-    ScaffoldFallbackResult, ScaffoldFramework, deterministic_nextjs_scaffold_reply,
-    post_scaffold_continuation_active, post_scaffold_recovery_active,
-    recent_post_scaffold_continue_attempt, recent_post_scaffold_edit_attempt,
-    recent_scaffold_command_seen, render_deterministic_scaffold_continuation_note,
-    requested_scaffold_framework, scaffold_command_matches_framework,
+    EVENT_DETERMINISTIC_PYTHON_CLI, EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK, ScaffoldDiffStatus,
+    ScaffoldFallbackResult, ScaffoldFramework, deterministic_framework_app_files_needed,
+    deterministic_framework_game_impl_path, deterministic_nextjs_scaffold_reply,
+    deterministic_support_target_relative, post_scaffold_continuation_active,
+    post_scaffold_recovery_active, recent_post_scaffold_continue_attempt,
+    recent_post_scaffold_edit_attempt, recent_scaffold_command_seen,
+    render_deterministic_scaffold_continuation_note, requested_scaffold_framework,
+    scaffold_candidate_for_missing_role_from_snapshots, scaffold_candidate_priority,
+    scaffold_command_matches_framework, scaffold_diff_status, scaffold_file_snapshot,
     task_or_plan_requires_nextjs_scaffold,
 };
 #[cfg(test)]
@@ -216,7 +219,7 @@ use crate::session::feedback::{
 };
 use crate::session::precaution::{Precaution, PrecautionStatus, severity_order};
 use crate::session::store::{
-    ScaffoldArtifactFileSnapshot, ScaffoldArtifactRole, ScaffoldArtifactSnapshot, WorkingMemory,
+    ScaffoldArtifactFileSnapshot, ScaffoldArtifactSnapshot, WorkingMemory,
 };
 use crate::tools::registry::{BashErrorClass, ToolSpec};
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
@@ -234,8 +237,7 @@ use super::deterministic::empty_framework_game_files as deterministic_empty_fram
 use super::progress_text::{is_utf8_locale, tool_color, tool_emoji};
 use super::progress_text::{sanitize_for_progress, truncate};
 use super::quality::{
-    first_existing_impl_target, implementation_quality_issue_for_request,
-    package_json_with_requested_port, quality_first_pass_observation,
+    first_existing_impl_target, package_json_with_requested_port, quality_first_pass_observation,
     react_dev_wrapper_for_requested_port, repo_change_request_text,
     request_allows_fast_polish_fallback, request_explicitly_requires_tests,
     request_mentions_unsupported_ui_framework, request_needs_playable_ui_quality_gate,
@@ -15973,193 +15975,6 @@ fn workspace_appears_empty(work_root: &Path) -> bool {
     })
 }
 
-fn deterministic_framework_game_files_needed(
-    work_root: &Path,
-    files: &[(PathBuf, String)],
-) -> bool {
-    let impl_paths = files
-        .iter()
-        .map(|(path, _)| path)
-        .filter(|path| deterministic_framework_game_impl_path(path))
-        .collect::<Vec<_>>();
-    if impl_paths.is_empty() || impl_paths.iter().any(|path| work_root.join(path).is_file()) {
-        return false;
-    }
-
-    let Some(existing_files) = meaningful_workspace_files(work_root, 32) else {
-        return false;
-    };
-    if existing_files.is_empty() {
-        return true;
-    }
-
-    existing_files.iter().all(|existing| {
-        files
-            .iter()
-            .filter(|(path, _)| !deterministic_framework_game_impl_path(path))
-            .any(|(path, _)| path == existing)
-    })
-}
-
-fn deterministic_framework_app_files_needed(
-    work_root: &Path,
-    files: &[(PathBuf, String)],
-    request: &str,
-) -> bool {
-    if deterministic_framework_game_files_needed(work_root, files) {
-        return true;
-    }
-
-    let Some(target) = first_existing_impl_target(work_root) else {
-        return false;
-    };
-    let Ok(current) = std::fs::read_to_string(&target) else {
-        return false;
-    };
-    if implementation_quality_issue_for_request(request, &current).is_none() {
-        return false;
-    }
-    deterministic::playable_ui_repair(request, &target, &current).is_some()
-}
-
-fn scaffold_file_snapshot(path: &str, content: &[u8]) -> ScaffoldArtifactFileSnapshot {
-    ScaffoldArtifactFileSnapshot {
-        path: path.to_string(),
-        content_hash: sha256_hex(content),
-        roles: vec![scaffold_role_for_path(Path::new(path))],
-        bootstrap_only: true,
-    }
-}
-
-fn scaffold_role_for_path(path: &Path) -> ScaffoldArtifactRole {
-    match super::completion_evidence::classify_repo_edit_path(path) {
-        super::completion_evidence::RepoEditCategory::Impl => ScaffoldArtifactRole::Implementation,
-        super::completion_evidence::RepoEditCategory::Test => ScaffoldArtifactRole::Test,
-        super::completion_evidence::RepoEditCategory::Docs => ScaffoldArtifactRole::UsageDocs,
-        super::completion_evidence::RepoEditCategory::Setup => ScaffoldArtifactRole::Setup,
-        super::completion_evidence::RepoEditCategory::Other => ScaffoldArtifactRole::Other,
-    }
-}
-
-fn scaffold_role_matches_artifact_role(
-    candidate: ScaffoldArtifactRole,
-    role: super::task_contract::ArtifactRole,
-) -> bool {
-    matches!(
-        (candidate, role),
-        (
-            ScaffoldArtifactRole::Implementation,
-            super::task_contract::ArtifactRole::Implementation
-        ) | (
-            ScaffoldArtifactRole::Test,
-            super::task_contract::ArtifactRole::Test
-        ) | (
-            ScaffoldArtifactRole::UsageDocs,
-            super::task_contract::ArtifactRole::UsageDocs
-        ) | (
-            ScaffoldArtifactRole::Setup,
-            super::task_contract::ArtifactRole::Setup
-        )
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScaffoldDiffStatus {
-    NotScaffold,
-    Changed,
-    UnchangedOrMissing,
-}
-
-fn scaffold_diff_status(
-    snapshots: &[ScaffoldArtifactSnapshot],
-    relative_path: &str,
-    current_hash: Option<&str>,
-) -> ScaffoldDiffStatus {
-    let Some(file) = snapshots
-        .iter()
-        .rev()
-        .flat_map(|snapshot| snapshot.files.iter())
-        .find(|file| file.bootstrap_only && file.path == relative_path)
-    else {
-        return ScaffoldDiffStatus::NotScaffold;
-    };
-    match current_hash {
-        Some(hash) if hash != file.content_hash => ScaffoldDiffStatus::Changed,
-        _ => ScaffoldDiffStatus::UnchangedOrMissing,
-    }
-}
-
-fn scaffold_candidate_for_missing_role_from_snapshots(
-    snapshots: &[ScaffoldArtifactSnapshot],
-    work_root: &Path,
-    role: super::task_contract::ArtifactRole,
-) -> Option<String> {
-    let mut candidates = snapshots
-        .iter()
-        .rev()
-        .flat_map(|snapshot| snapshot.files.iter())
-        .filter(|file| {
-            file.bootstrap_only
-                && file
-                    .roles
-                    .iter()
-                    .any(|candidate| scaffold_role_matches_artifact_role(*candidate, role))
-                && matches!(
-                    scaffold_diff_status(
-                        snapshots,
-                        &file.path,
-                        current_file_hash_for_relative_path(work_root, &file.path).as_deref(),
-                    ),
-                    ScaffoldDiffStatus::UnchangedOrMissing
-                )
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|file| scaffold_candidate_priority(work_root, role, &file.path));
-    candidates.first().map(|file| file.path.clone())
-}
-
-fn scaffold_candidate_priority(
-    work_root: &Path,
-    role: super::task_contract::ArtifactRole,
-    relative_path: &str,
-) -> u8 {
-    if role != super::task_contract::ArtifactRole::Implementation {
-        return 0;
-    }
-    let path = Path::new(relative_path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let len = resolve_user_path(work_root, relative_path)
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    if len == 0 {
-        return 40;
-    }
-    if matches!(file_name, "__init__.py" | "mod.rs") && len <= 128 {
-        return 30;
-    }
-    if matches!(
-        file_name,
-        "main.py"
-            | "main.rs"
-            | "main.ts"
-            | "main.tsx"
-            | "app.py"
-            | "server.py"
-            | "server.ts"
-            | "lib.rs"
-            | "index.ts"
-            | "index.tsx"
-    ) {
-        return 0;
-    }
-    10
-}
-
 /// Issue #636: trim `s` so its byte length is at most `cap` while
 /// preserving the leading UTF-8 char boundary. Used by
 /// `bounded_post_edit_excerpt` to re-cap a post-masking string when
@@ -16222,7 +16037,10 @@ fn open_excerpt_file_nofollow(target: &Path) -> Option<std::fs::File> {
     }
 }
 
-fn current_file_hash_for_relative_path(work_root: &Path, relative_path: &str) -> Option<String> {
+pub(super) fn current_file_hash_for_relative_path(
+    work_root: &Path,
+    relative_path: &str,
+) -> Option<String> {
     let target = resolve_user_path(work_root, relative_path).ok()?;
     let root = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
     if target.strip_prefix(root).is_err() || !target.is_file() {
@@ -16317,32 +16135,11 @@ pub(super) fn existing_workspace_candidate_for_role_in_scope(
         .map(|path| path.to_string_lossy().replace('\\', "/"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn deterministic_framework_game_impl_path(path: &Path) -> bool {
-    matches!(
-        path.to_string_lossy().as_ref(),
-        "app.vue" | "src/App.tsx" | "src/app/page.tsx" | "app/page.tsx" | "src/routes/+page.svelte"
-    )
-}
-
-fn deterministic_support_target_relative(work_root: &Path, relative: &Path) -> PathBuf {
-    if let Ok(rest) = relative.strip_prefix("src/app")
-        && work_root.join("app").is_dir()
-    {
-        return PathBuf::from("app").join(rest);
-    }
-    if let Ok(rest) = relative.strip_prefix("app")
-        && work_root.join("src/app").is_dir()
-    {
-        return PathBuf::from("src/app").join(rest);
-    }
-    relative.to_path_buf()
-}
-
-fn meaningful_workspace_files(work_root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
+pub(super) fn meaningful_workspace_files(work_root: &Path, limit: usize) -> Option<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_meaningful_workspace_files(work_root, work_root, limit, &mut files).ok()?;
     Some(files)
@@ -17782,8 +17579,14 @@ mod progress_tests {
         framework_app_fallback_continuation_note, should_apply_repo_change_quality_gate,
         should_try_framework_app_fallback, task_contract_verifier_edit_required_note,
     };
+    use super::super::quality::implementation_quality_issue_for_request;
     use super::super::repair_job::{
         SNAPSHOT_FIELD_BYTE_CAP, sanitize_repair_job_text, truncate_for_snapshot,
+    };
+    use super::super::scaffold_pipeline::{
+        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
+        deterministic_support_target_relative, scaffold_candidate_for_missing_role_from_snapshots,
+        scaffold_diff_status, scaffold_file_snapshot,
     };
     use super::super::verifier_orchestration::{
         parse_verifier_repair_intent_reply, parse_verifier_repair_intents_reply,
@@ -17800,35 +17603,31 @@ mod progress_tests {
         ValidationFailure, VerifierRepairDecision, VerifierRepairIntent,
         artifact_directed_tool_policy_error, classify_verifier_failure_type,
         deterministic_empty_framework_app_files, deterministic_empty_framework_game_files,
-        deterministic_framework_app_files_needed, deterministic_framework_game_files_needed,
-        deterministic_support_target_relative, diagnostic_target_allowed_by_confidence,
-        effective_tool_batch_action, effective_tool_policy_error_for_call,
-        effective_tool_policy_error_for_call_with_scope, existing_workspace_candidate_for_role,
-        existing_workspace_candidate_for_role_in_scope, extract_page_copy_block_from_numbered_read,
-        first_existing_impl_target, focused_edit_compact_anchor_note,
-        focused_edit_compact_recovery_anchor, focused_edit_exact_anchor_history,
-        focused_edit_exact_recovery_anchor, focused_edit_first_slice_note,
-        focused_edit_first_slice_uses_exact_anchor, focused_edit_guidance_note,
-        focused_edit_guidance_note_for_policy, focused_edit_history,
+        diagnostic_target_allowed_by_confidence, effective_tool_batch_action,
+        effective_tool_policy_error_for_call, effective_tool_policy_error_for_call_with_scope,
+        existing_workspace_candidate_for_role, existing_workspace_candidate_for_role_in_scope,
+        extract_page_copy_block_from_numbered_read, first_existing_impl_target,
+        focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+        focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+        focused_edit_first_slice_note, focused_edit_first_slice_uses_exact_anchor,
+        focused_edit_guidance_note, focused_edit_guidance_note_for_policy, focused_edit_history,
         focused_edit_max_predict_override, focused_edit_minimal_history,
         focused_edit_policy_violation_feedback_note, focused_edit_second_slice_note,
         focused_edit_target_already_read, focused_edit_timeout_override_secs,
         focused_edit_tool_batch_action, focused_edit_tool_policy_error,
         focused_read_target_for_directory, has_successful_non_plan_repo_edit,
         has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
-        has_successful_repo_edit, implementation_quality_issue_for_request, is_utf8_locale,
-        last_read_tool_path, latest_page_copy_block_from_read,
-        latest_truncated_tool_call_note_index, latest_turn_preferred_read_edit_target,
-        parse_verifier_repair_assessment_reply, post_scaffold_continuation_active,
-        post_scaffold_recovery_active, prune_plan_mode_messages,
+        has_successful_repo_edit, is_utf8_locale, last_read_tool_path,
+        latest_page_copy_block_from_read, latest_truncated_tool_call_note_index,
+        latest_turn_preferred_read_edit_target, parse_verifier_repair_assessment_reply,
+        post_scaffold_continuation_active, post_scaffold_recovery_active, prune_plan_mode_messages,
         recent_deterministic_framework_app_fallback_seen, recent_scaffold_command_seen,
         recent_truncated_tool_call_attempt, render_deterministic_scaffold_continuation_note,
         repo_change_request_text, request_needs_playable_ui_quality_gate, sanitize_for_progress,
-        scaffold_candidate_for_missing_role_from_snapshots, scaffold_diff_status,
-        scaffold_file_snapshot, sha256_hex, should_use_streaming_transport,
-        strip_read_line_number_prefix, successful_non_plan_repo_edit_count,
-        successful_repo_edit_count, sync_package_json_with_existing_lock, tool_color, tool_display,
-        tool_emoji, unicode_supported, validate_accepted_repair_plan_authorizes_target,
+        sha256_hex, should_use_streaming_transport, strip_read_line_number_prefix,
+        successful_non_plan_repo_edit_count, successful_repo_edit_count,
+        sync_package_json_with_existing_lock, tool_color, tool_display, tool_emoji,
+        unicode_supported, validate_accepted_repair_plan_authorizes_target,
         verifier_diagnostic_attempt_spec, verifier_repair_context_from_failure,
         verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
         verifier_repair_invalid_can_continue, verifier_repair_preferred_local_import_source,
