@@ -38,7 +38,7 @@
 
 use std::path::Path;
 
-use super::auto_test::{AutoTestPlan, VerifierCommand};
+use super::auto_test::{AutoTestPlan, AutoTestResult, VerifierCommand};
 use super::completion_evidence::{
     CompletionEvidence, EvidenceSet, is_completion_verifier_command,
     redact_verifier_command_for_storage,
@@ -2479,7 +2479,8 @@ pub(super) fn run_task_contract_verifier_once(
             display_command,
             bound_test_artifacts_count,
             bound_test_artifacts_paths,
-        } => agent.handle_structured_task_contract_verifier_selection(
+        } => handle_structured_task_contract_verifier_selection(
+            agent,
             changed_files,
             workspace_scope_opt.as_ref(),
             StructuredTaskContractVerifierRun {
@@ -2549,14 +2550,16 @@ pub(super) fn drive_task_contract_verifier(
         TaskContractVerifierOutcome::Passed { command } => {
             handle_task_contract_verifier_pass(agent, args, previous_repair_context, command)
         }
-        TaskContractVerifierOutcome::Failed { command, output } => agent
-            .handle_task_contract_verifier_failure(
+        TaskContractVerifierOutcome::Failed { command, output } => {
+            handle_task_contract_verifier_failure(
+                agent,
                 args,
                 previous_repair_context,
                 &changed_files,
                 command,
                 output,
-            ),
+            )
+        }
         TaskContractVerifierOutcome::NoVerifier => {
             handle_task_contract_verifier_no_verifier(agent, args)
         }
@@ -2582,4 +2585,225 @@ pub(super) fn drive_task_contract_verifier(
             )
         }
     }
+}
+
+pub(super) fn handle_structured_task_contract_verifier_selection(
+    agent: &mut Agent,
+    changed_files: &[String],
+    workspace_scope: Option<&TaskWorkspaceScope>,
+    selection: StructuredTaskContractVerifierRun,
+) -> TaskContractVerifierOutcome {
+    let Some(workspace_scope) = workspace_scope else {
+        return TaskContractVerifierOutcome::NoVerifier;
+    };
+    if selection.command.runner() == "python3" {
+        agent.materialize_python_package_markers_for_owned_test_imports(
+            &selection.bound_test_artifacts_paths,
+        );
+    }
+    let invocation_report = super::verifier_driver::structured_verifier_invocation_report(
+        &agent.work_root,
+        &selection.command,
+    );
+    if let Some(snapshot) = invocation_report.snapshot.as_ref() {
+        agent.emit_agent_verifier_invoked_if_new(snapshot);
+    }
+    if let Some(hash) = invocation_report.rejected_pythonpath_hash.as_deref() {
+        agent.emit_agent_verifier_external_import_rejected_if_first(
+            selection.command.runner(),
+            "external_pythonpath_rejected",
+            &[(hash, "pythonpath")],
+            1,
+            false,
+        );
+    }
+    let result = {
+        let _sp = super::spinner::Spinner::start("running verifier...".to_string());
+        super::verifier_driver::run_structured_task_contract_verifier(
+            &agent.work_root,
+            workspace_scope,
+            &selection.command,
+            &selection.display_command,
+        )
+    };
+    match result {
+        Ok(result) => finish_structured_task_contract_verifier_selection(
+            agent,
+            changed_files,
+            workspace_scope,
+            selection,
+            result,
+        ),
+        Err(error) => {
+            let command = crate::session::feedback::redact_verifier_command_for_storage(
+                &selection.display_command,
+            );
+            let outcome = super::verifier_driver::task_contract_verifier_transport_error_to_outcome(
+                command, error,
+            );
+            let outcome_label =
+                super::verifier_driver::task_contract_verifier_outcome_label(&outcome);
+            log_llm_event(
+                "agent.task_contract.verifier.completed",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "outcome": outcome_label,
+                    "command": crate::session::feedback::redact_verifier_command_for_storage(&selection.display_command),
+                }),
+            );
+            outcome
+        }
+    }
+}
+
+pub(super) fn finish_structured_task_contract_verifier_selection(
+    agent: &mut Agent,
+    changed_files: &[String],
+    workspace_scope: &TaskWorkspaceScope,
+    selection: StructuredTaskContractVerifierRun,
+    result: AutoTestResult,
+) -> TaskContractVerifierOutcome {
+    log_llm_event(
+        "agent.autotest.completed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "command": &result.command,
+            "passed": result.passed,
+            "reason": &selection.plan.reason,
+        }),
+    );
+    if let Some(contamination) =
+        super::verifier_driver::detect_verifier_external_import_contamination(
+            &agent.work_root,
+            &result,
+        )
+    {
+        let created_markers = agent
+            .materialize_python_package_markers_for_external_import(&result.stdout, &result.stderr);
+        let borrowed = contamination.borrowed_hashes();
+        agent.emit_agent_verifier_external_import_rejected_if_first(
+            selection.command.runner(),
+            "external_import_detected",
+            &borrowed,
+            contamination.detected_count,
+            contamination.truncated,
+        );
+        return contamination.to_failure_outcome(result, &created_markers);
+    }
+    let frame = super::turn::build_feedback_for_auto_test(
+        &selection.plan,
+        &result,
+        &agent.work_root,
+        changed_files,
+    );
+    agent.session.record_feedback_if_unset(frame);
+    agent.record_task_contract_verifier_invocation(&result.command, result.exit_code);
+    let last_outcome = if result.passed {
+        super::artifact_ledger::VerifierOutcome::Pass
+    } else {
+        super::artifact_ledger::VerifierOutcome::Fail
+    };
+    let scope_for_seed = workspace_scope.clone();
+    agent.seed_artifact_ledger_verifier_observation(
+        &selection.bound_test_artifacts_paths,
+        last_outcome,
+        &scope_for_seed,
+    );
+    if result.passed {
+        agent.observe_task_contract_verifier_exit_zero_bound(
+            &result.command,
+            selection.bound_test_artifacts_count,
+        );
+    }
+    super::verifier_driver::task_contract_auto_test_result_to_outcome(result)
+}
+
+pub(super) fn handle_task_contract_verifier_failure(
+    agent: &mut Agent,
+    args: TaskContractVerifierFlowArgs<'_, '_>,
+    previous_repair_context: Option<RepairJob>,
+    changed_files: &[String],
+    command: String,
+    output: String,
+) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    *args.contract_verification_retries += 1;
+    let mut repair_context = super::repair_job::verifier_repair_context_from_failure(
+        &agent.work_root,
+        &command,
+        &output,
+        changed_files,
+        *args.contract_verification_retries,
+        previous_repair_context.as_ref(),
+    );
+    let attempt_limit =
+        task_contract_verifier_failure_attempt_limit(previous_repair_context.as_ref());
+    if *args.contract_verification_retries >= attempt_limit {
+        agent.repair_job = Some(repair_context);
+        let (reason, prefix) = if previous_repair_context.is_some() {
+            agent.emit_safe_stop_report_for_repair_exhausted();
+            (
+                ExitReason::RepairExhausted,
+                "verifier repair budget exhausted",
+            )
+        } else {
+            agent.emit_safe_stop_report_for_verifier_failed_safe_stop();
+            (ExitReason::VerifierFailed, "required verifier failed")
+        };
+        return super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+            reason,
+            error_text: format!(
+                "{prefix}: {}\n{}",
+                crate::session::feedback::mask_secrets(&command),
+                crate::session::feedback::mask_secrets(&output)
+            ),
+        };
+    }
+    let applied_outcome_promotion = super::repair_job::apply_verifier_rerun_observation(
+        &mut repair_context,
+        previous_repair_context.as_ref(),
+    );
+    *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
+    agent.task_contract_verifier_repair_pending = true;
+    if let Some(outcome) = repair_context.rerun_outcome {
+        log_llm_event(
+            "agent.verifier_repair.rerun_classified",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "outcome": outcome.as_str(),
+                "previous_failure_signature": repair_context.previous_failure_signature.as_deref(),
+                "current_failure_signature": repair_context.failure_signature.as_str(),
+                "previous_failure_count": repair_context.previous_failure_count,
+                "current_failure_count": repair_context.failure_count,
+            }),
+        );
+    }
+    emit_repair_progress_classified_event(
+        agent.session_store.session_id(),
+        previous_repair_context.as_ref(),
+        Some(&repair_context),
+        false,
+    );
+    agent.repair_job = Some(repair_context);
+    agent.maybe_emit_repair_exhausted_from_promotion(applied_outcome_promotion);
+    *args.repo_change_retries = 0;
+    *args.verifier_repair_retries = 0;
+    agent.repair_job_artifact_attempts = 0;
+    super::turn::write_stdout_rendered(
+        &super::actor_loop_flow::format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Verification failed",
+            "Asked the model to repair the repository using verifier diagnostics.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    agent.push_system_note(task_contract_verifier_repair_note(
+        &command,
+        &output,
+        *args.contract_verification_retries,
+        attempt_limit,
+        agent.repair_job.as_ref(),
+    ));
+    super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue
 }
