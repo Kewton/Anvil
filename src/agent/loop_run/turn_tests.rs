@@ -4229,7 +4229,9 @@ mod tests {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         assert!(agent.last_verifier_invoked_payload_digest.is_none());
         let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
-        let emitted = agent.emit_agent_verifier_invoked_if_new(&snapshot);
+        let emitted = super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+            &mut agent, &snapshot,
+        );
         assert!(
             emitted,
             "first emit of the turn must return true (None -> Some transition)"
@@ -4243,9 +4245,15 @@ mod tests {
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
-        assert!(agent.emit_agent_verifier_invoked_if_new(&snapshot));
+        assert!(
+            super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+                &mut agent, &snapshot
+            )
+        );
         let digest_after_first = agent.last_verifier_invoked_payload_digest;
-        let again = agent.emit_agent_verifier_invoked_if_new(&snapshot);
+        let again = super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+            &mut agent, &snapshot,
+        );
         assert!(
             !again,
             "identical snapshot in the same turn must be deduped (returns false)"
@@ -4263,10 +4271,16 @@ mod tests {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         let snap_a = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
         let snap_b = make_verifier_invoked_snapshot_cargo(&["tests/test_b.rs"]);
-        assert!(agent.emit_agent_verifier_invoked_if_new(&snap_a));
+        assert!(
+            super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+                &mut agent, &snap_a
+            )
+        );
         let digest_a = agent.last_verifier_invoked_payload_digest;
         assert!(
-            agent.emit_agent_verifier_invoked_if_new(&snap_b),
+            super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+                &mut agent, &snap_b
+            ),
             "different bound_artifacts must re-emit"
         );
         assert_ne!(
@@ -4283,11 +4297,17 @@ mod tests {
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
-        assert!(agent.emit_agent_verifier_invoked_if_new(&snapshot));
+        assert!(
+            super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+                &mut agent, &snapshot
+            )
+        );
         // Simulate per-turn reset.
         agent.last_verifier_invoked_payload_digest = None;
         assert!(
-            agent.emit_agent_verifier_invoked_if_new(&snapshot),
+            super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+                &mut agent, &snapshot
+            ),
             "post-turn-reset emit of same snapshot must return true (None -> Some transition)"
         );
     }
@@ -4311,7 +4331,9 @@ mod tests {
             &snapshot,
         );
         let pre_mask_digest = crate::logging::compute_payload_digest(&pre_mask_payload);
-        agent.emit_agent_verifier_invoked_if_new(&snapshot);
+        super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
+            &mut agent, &snapshot,
+        );
         // In Phase A there are no secret-like fields in the payload, so
         // the masked digest equals the pre-mask digest (mask is idempotent
         // on a clean payload). What matters is that the helper computes
@@ -4343,7 +4365,7 @@ mod tests {
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         assert!(!agent.external_import_rejected_emitted_this_turn);
-        let emitted = agent.emit_agent_verifier_external_import_rejected_if_first(
+        let emitted = super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_pythonpath_rejected",
             &[("deadbeefcafef00d", "pythonpath")],
@@ -4359,7 +4381,7 @@ mod tests {
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        assert!(agent.emit_agent_verifier_external_import_rejected_if_first(
+        assert!(super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_pythonpath_rejected",
             &[("hash1", "pythonpath")],
@@ -4368,7 +4390,7 @@ mod tests {
         ));
         // Second emit in the same turn (different reason / different hashes)
         // must be suppressed by the per-turn cap.
-        let again = agent.emit_agent_verifier_external_import_rejected_if_first(
+        let again = super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_import_detected",
             &[("hash2", "stdout_stderr")],
@@ -4389,7 +4411,7 @@ mod tests {
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        assert!(agent.emit_agent_verifier_external_import_rejected_if_first(
+        assert!(super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_pythonpath_rejected",
             &[("hashX", "pythonpath")],
@@ -4397,7 +4419,7 @@ mod tests {
             false,
         ));
         agent.external_import_rejected_emitted_this_turn = false;
-        let again = agent.emit_agent_verifier_external_import_rejected_if_first(
+        let again = super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_pythonpath_rejected",
             &[("hashX", "pythonpath")],

@@ -102,6 +102,12 @@ mod tester_invocation;
 // fns over `&mut Agent`. `pub(super)` limited / no facade re-export
 // (DR3-001).
 mod python_markers;
+// Verifier event emitters extracted from `turn.rs` (parent #680). Hosts
+// `emit_agent_verifier_invoked_if_new` (per-turn payload-digest dedup)
+// + `emit_agent_verifier_external_import_rejected_if_first` (single
+// per-turn cap). Both apply `mask_payload_inplace` as final defence.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod emit_verifier_events;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

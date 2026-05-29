@@ -2611,10 +2611,11 @@ pub(super) fn handle_structured_task_contract_verifier_selection(
         &selection.command,
     );
     if let Some(snapshot) = invocation_report.snapshot.as_ref() {
-        agent.emit_agent_verifier_invoked_if_new(snapshot);
+        super::emit_verifier_events::emit_agent_verifier_invoked_if_new(agent, snapshot);
     }
     if let Some(hash) = invocation_report.rejected_pythonpath_hash.as_deref() {
-        agent.emit_agent_verifier_external_import_rejected_if_first(
+        super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(
+            agent,
             selection.command.runner(),
             "external_pythonpath_rejected",
             &[(hash, "pythonpath")],
@@ -2690,7 +2691,8 @@ pub(super) fn finish_structured_task_contract_verifier_selection(
                 &result.stderr,
             );
         let borrowed = contamination.borrowed_hashes();
-        agent.emit_agent_verifier_external_import_rejected_if_first(
+        super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(
+            agent,
             selection.command.runner(),
             "external_import_detected",
             &borrowed,
