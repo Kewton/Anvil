@@ -1253,3 +1253,147 @@ pub(super) fn maybe_materialize_framework_game_fallback(
     ));
     true
 }
+
+pub(super) fn maybe_materialize_python_test_fallback(
+    agent: &mut Agent,
+) -> Result<Option<String>, String> {
+    if !super::policy_allows_python_specialized_fallback(
+        &agent.session.mode_state.policy(),
+        &agent.config,
+    ) {
+        return Ok(None);
+    }
+    let request = agent.active_request_text().unwrap_or_default();
+    let mut python_files = std::fs::read_dir(&agent.work_root)
+        .map_err(|err| format!("failed to read {}: {err}", agent.work_root.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("py")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        !name.starts_with("test_")
+                            && !name.ends_with("_test.py")
+                            && name != "tests.py"
+                    })
+        })
+        .collect::<Vec<_>>();
+    python_files.sort();
+    if python_files.len() != 1 {
+        return Ok(None);
+    }
+    let script = python_files.remove(0);
+    let Some(file_name) = script.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let stem = script
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("script");
+    let test_name = format!("test_{stem}.py");
+    let target = agent.work_root.join(&test_name);
+    let content = if request.to_ascii_lowercase().contains("fizzbuzz") {
+        format!(
+            r#"#!/usr/bin/env python3
+import subprocess
+import sys
+
+
+def test_fizzbuzz_limit_15():
+    result = subprocess.run(
+        [sys.executable, "{file_name}", "--limit", "15"],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert result.stdout.strip().splitlines() == [
+        "1", "2", "Fizz", "4", "Buzz", "Fizz", "7", "8", "Fizz", "Buzz",
+        "11", "Fizz", "13", "14", "FizzBuzz",
+    ]
+
+
+if __name__ == "__main__":
+    test_fizzbuzz_limit_15()
+    print("python smoke ok")
+"#
+        )
+    } else {
+        format!(
+            r#"#!/usr/bin/env python3
+import subprocess
+import sys
+
+
+def test_cli_help_runs():
+    result = subprocess.run(
+        [sys.executable, "{file_name}", "--help"],
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() or result.stderr.strip()
+
+
+if __name__ == "__main__":
+    test_cli_help_runs()
+    print("python smoke ok")
+"#
+        )
+    };
+    std::fs::write(&target, content)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    agent
+        .session
+        .working_memory
+        .note_touched_file(normalize_memory_path(&test_name, &agent.work_root));
+    log_llm_event(
+        EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK,
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "work_mode": agent.session.mode_state.work_mode.as_str(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "python_test_scaffold",
+            "target": &test_name,
+        }),
+    );
+    Ok(Some(test_name))
+}
+
+pub(super) fn maybe_apply_deterministic_quality_fallback(
+    agent: &Agent,
+    request: &str,
+    relative_target: &str,
+) -> Result<bool, String> {
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_template_completion()
+    {
+        return Ok(false);
+    }
+    let target = agent.work_root.join(relative_target);
+    let current = std::fs::read_to_string(&target)
+        .map_err(|err| format!("failed to read {}: {err}", target.display()))?;
+    let Some(replacement) = deterministic::playable_ui_repair(request, &target, &current) else {
+        return Ok(false);
+    };
+    std::fs::write(&target, replacement)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    agent.maybe_apply_deterministic_framework_support_files(request)?;
+    agent.maybe_apply_requested_port_script(request)?;
+    log_llm_event(
+        "agent.deterministic_ui_quality_repair",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "full_template",
+            "target": relative_target,
+        }),
+    );
+    Ok(true)
+}
