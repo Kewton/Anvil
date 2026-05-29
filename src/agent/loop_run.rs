@@ -256,6 +256,14 @@ mod answer_only_mode;
 // `pub(super)` limited / no facade re-export (DR3-001) — `turn.rs` is
 // the only in-crate consumer.
 mod feedback_builders;
+// Case-record extraction helpers + supporting agent-layer projections
+// (`derive_language_stack` for `RepoFingerprint`, `build_anvil_test_summary`
+// orchestration boundary) extracted from `turn.rs` (parent #680).
+// Hosts `case_record_auto_test_active` / `case_record_extraction_succeeded`
+// / `case_record_initial_feedback` / `derive_language_stack` /
+// `build_anvil_test_summary`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod case_record_extract;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;

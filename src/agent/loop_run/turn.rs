@@ -21,7 +21,7 @@ use super::actor_loop_flow::{
 use super::auto_test::{
     AutoTestKind, AutoTestPlan, AutoTestResult, AutoTestRunner,
     build_agent_verifier_external_import_rejected_payload, build_agent_verifier_invoked_payload,
-    classify_auto_test, count_compile_errors, count_test_failures,
+    classify_auto_test,
 };
 use super::completion_evidence::is_repo_edit_no_op;
 use super::feedback_kind_confirm::{
@@ -78,6 +78,10 @@ use super::verifier_repair_targeting::{
 
 use super::answer_only_mode::{
     answer_only_script_command_allowed, answer_only_script_execution_fallback_response,
+};
+use super::case_record_extract::{
+    case_record_auto_test_active, case_record_extraction_succeeded, case_record_initial_feedback,
+    derive_language_stack,
 };
 use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
@@ -539,36 +543,6 @@ fn latest_tool_result_since_last_user<'a>(
     None
 }
 
-fn case_record_auto_test_active(score: &crate::session::anvil_score::AnvilScore) -> bool {
-    score.build_passed.is_some() || score.tests_passed.is_some()
-}
-
-fn case_record_extraction_succeeded(
-    score: &crate::session::anvil_score::AnvilScore,
-    repo_edit_succeeded_this_turn: bool,
-    unsafe_blocks_this_turn: usize,
-) -> bool {
-    if case_record_auto_test_active(score) {
-        score.build_passed == Some(true)
-            && score.tests_passed == Some(true)
-            && score.user_visible_artifact
-            && score.unsafe_actions_blocked == 0
-            && score.consecutive_no_progress_turns == 0
-    } else {
-        repo_edit_succeeded_this_turn
-            && unsafe_blocks_this_turn == 0
-            && score.consecutive_no_progress_turns == 0
-    }
-}
-
-fn case_record_initial_feedback(
-    last_feedback: Option<&crate::session::feedback::FeedbackFrame>,
-) -> Vec<crate::session::feedback::FeedbackKind> {
-    last_feedback
-        .map(|feedback| vec![feedback.kind.clone()])
-        .unwrap_or_default()
-}
-
 // --- Issue #450 FeedbackFrame builders --------------------------------
 //
 // Each helper builds a `FeedbackFrameDraft`, then funnels it through
@@ -628,64 +602,6 @@ pub(super) fn build_feedback_for_auto_test(
 /// | (Build, false)  | Some(false)  | None         | count_compile_errors| None               |
 /// | (Test, true)    | None         | Some(true)   | None                | Some(0)            |
 /// | (Test, false)   | None         | Some(false)  | count_compile_errors| count_test_failures|
-/// Issue #462: derive the `language_stack` Vec for `RepoFingerprint`.
-/// Reuses `auto_test::has_*` helpers (also in the agent layer) so DR3-002 —
-/// agent → session is one-way — is preserved: the session-layer
-/// `case_record::extract` accepts the slice as input rather than calling back.
-fn derive_language_stack(work_root: &std::path::Path) -> Vec<String> {
-    let mut stack: Vec<String> = Vec::new();
-    if super::auto_test::has_cargo_manifest(work_root) {
-        stack.push("rust".into());
-    }
-    if super::auto_test::package_json_has_test_script(work_root) {
-        stack.push("node".into());
-    }
-    if super::auto_test::has_python_surface(work_root, &[]) {
-        stack.push("python".into());
-    }
-    stack.iter_mut().for_each(|s| *s = s.to_ascii_lowercase());
-    stack.sort();
-    stack.dedup();
-    stack
-}
-
-// Issue #466: build_anvil_test_summary は VerifierSkill 経路でも利用するため残置。
-// VerifierSkill 側 (verifier_skill.rs::build_anvil_test_summary_for_skill) は同等の
-// ロジックを内部 helper として保持する。将来 Issue で SSOT を一本化する。
-#[cfg_attr(not(test), allow(dead_code))]
-fn build_anvil_test_summary(
-    plan: &AutoTestPlan,
-    result: &AutoTestResult,
-) -> crate::session::anvil_score::AnvilTestSummary {
-    use crate::session::anvil_score::AnvilTestSummary;
-    match (plan.auto_test_kind(), result.passed) {
-        (AutoTestKind::Build, true) => AnvilTestSummary {
-            build_passed: Some(true),
-            tests_passed: None,
-            compile_error_count: Some(0),
-            test_failure_count: None,
-        },
-        (AutoTestKind::Build, false) => AnvilTestSummary {
-            build_passed: Some(false),
-            tests_passed: None,
-            compile_error_count: count_compile_errors(result),
-            test_failure_count: None,
-        },
-        (AutoTestKind::Test, true) => AnvilTestSummary {
-            build_passed: None,
-            tests_passed: Some(true),
-            compile_error_count: None,
-            test_failure_count: Some(0),
-        },
-        (AutoTestKind::Test, false) => AnvilTestSummary {
-            build_passed: None,
-            tests_passed: Some(false),
-            compile_error_count: count_compile_errors(result),
-            test_failure_count: count_test_failures(result),
-        },
-    }
-}
-
 fn raw_mode_safe_text(text: &str) -> String {
     text.replace('\n', "\r\n")
 }
@@ -14435,7 +14351,9 @@ mod truncate_tests {
             ..Default::default()
         };
 
-        assert!(super::case_record_extraction_succeeded(&score, false, 1));
+        assert!(
+            super::super::case_record_extract::case_record_extraction_succeeded(&score, false, 1)
+        );
     }
 
     #[test]
@@ -14449,7 +14367,9 @@ mod truncate_tests {
             ..Default::default()
         };
 
-        assert!(!super::case_record_extraction_succeeded(&score, true, 0));
+        assert!(
+            !super::super::case_record_extract::case_record_extraction_succeeded(&score, true, 0)
+        );
     }
 
     #[test]
@@ -14459,9 +14379,15 @@ mod truncate_tests {
             ..Default::default()
         };
 
-        assert!(super::case_record_extraction_succeeded(&score, true, 0));
-        assert!(!super::case_record_extraction_succeeded(&score, false, 0));
-        assert!(!super::case_record_extraction_succeeded(&score, true, 1));
+        assert!(
+            super::super::case_record_extract::case_record_extraction_succeeded(&score, true, 0)
+        );
+        assert!(
+            !super::super::case_record_extract::case_record_extraction_succeeded(&score, false, 0)
+        );
+        assert!(
+            !super::super::case_record_extract::case_record_extraction_succeeded(&score, true, 1)
+        );
     }
 
     #[test]
@@ -25137,7 +25063,7 @@ export default function App() {
     fn build_anvil_test_summary_build_pass() {
         let plan = build_plan();
         let result = auto_test_result(&plan, true, "", "");
-        let s = super::build_anvil_test_summary(&plan, &result);
+        let s = super::super::case_record_extract::build_anvil_test_summary(&plan, &result);
         assert_eq!(s.build_passed, Some(true));
         assert_eq!(s.tests_passed, None);
         assert_eq!(s.compile_error_count, Some(0));
@@ -25150,7 +25076,7 @@ export default function App() {
         let plan = build_plan();
         let stderr = "error[E0308]: mismatched types\nerror[E0382]: borrow of moved value\n";
         let result = auto_test_result(&plan, false, "", stderr);
-        let s = super::build_anvil_test_summary(&plan, &result);
+        let s = super::super::case_record_extract::build_anvil_test_summary(&plan, &result);
         assert_eq!(s.build_passed, Some(false));
         assert_eq!(s.tests_passed, None);
         assert_eq!(s.compile_error_count, Some(2));
@@ -25162,7 +25088,7 @@ export default function App() {
     fn build_anvil_test_summary_build_fail_count_none_when_unparsable() {
         let plan = build_plan();
         let result = auto_test_result(&plan, false, "linker died unexpectedly", "");
-        let s = super::build_anvil_test_summary(&plan, &result);
+        let s = super::super::case_record_extract::build_anvil_test_summary(&plan, &result);
         assert_eq!(s.build_passed, Some(false));
         assert_eq!(s.compile_error_count, None);
         assert_eq!(s.test_failure_count, None);
@@ -25173,7 +25099,7 @@ export default function App() {
     fn build_anvil_test_summary_test_pass() {
         let plan = test_plan();
         let result = auto_test_result(&plan, true, "test result: ok\n", "");
-        let s = super::build_anvil_test_summary(&plan, &result);
+        let s = super::super::case_record_extract::build_anvil_test_summary(&plan, &result);
         assert_eq!(s.build_passed, None);
         assert_eq!(s.tests_passed, Some(true));
         assert_eq!(s.compile_error_count, None);
@@ -25191,7 +25117,7 @@ export default function App() {
              test bar ... FAILED\n\
              test result: FAILED. 4 passed; 1 failed; 0 ignored\n";
         let result = auto_test_result(&plan, false, stdout, "");
-        let s = super::build_anvil_test_summary(&plan, &result);
+        let s = super::super::case_record_extract::build_anvil_test_summary(&plan, &result);
         assert_eq!(s.build_passed, None);
         assert_eq!(s.tests_passed, Some(false));
         // test_result line has no `error[` marker, so compile count is None.
