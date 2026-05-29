@@ -38,6 +38,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use super::Agent;
+use super::actor_loop_flow::format_iteration_status;
 use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
 use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
@@ -46,13 +47,15 @@ use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
 use super::turn::{
-    current_file_hash_for_relative_path, extract_filename_with_suffix, last_read_tool_path,
-    latest_turn_preferred_read_edit_target, meaningful_workspace_files, progress_path_display,
-    sha256_hex, workspace_appears_empty,
+    WrittenScaffoldArtifacts, current_file_hash_for_relative_path, extract_filename_with_suffix,
+    last_read_tool_path, latest_turn_preferred_read_edit_target, meaningful_workspace_files,
+    normalize_memory_path, progress_path_display, sha256_hex, workspace_appears_empty,
+    write_stdout_rendered,
 };
 use crate::agent::prompting;
 use crate::agent::recovery;
-use crate::modes::plan_act::ExecutionMode;
+use crate::logging::log_llm_event;
+use crate::modes::plan_act::{ExecutionMode, ModePolicy};
 use crate::ollama::client::AssistantReply;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::safety::path_guard::resolve_user_path;
@@ -728,4 +731,138 @@ pub(super) fn python_csv_names_from_request_and_anvil(
         request_script.or(instruction_script),
         request_sample.or(instruction_sample),
     )
+}
+
+pub(super) fn mode_deterministic_scaffold_spec(
+    agent: &Agent,
+    request: &str,
+    policy: &ModePolicy,
+) -> Option<DeterministicScaffoldSpec> {
+    if super::policy_allows_python_specialized_fallback(policy, &agent.config) {
+        if let Some(files) = deterministic::fastapi_scaffold_files(request) {
+            return Some(DeterministicScaffoldSpec {
+                label: "FastAPI scaffold",
+                event: EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD,
+                scaffold_kind: "FastAPI",
+                files,
+            });
+        }
+        let (script_name, sample_name) = python_csv_names_from_request_and_anvil(agent, request);
+        let files = deterministic::empty_python_cli_files_with_names(
+            request,
+            script_name.as_deref(),
+            sample_name.as_deref(),
+        )?;
+        return Some(DeterministicScaffoldSpec {
+            label: "Python scaffold",
+            event: EVENT_DETERMINISTIC_PYTHON_CLI,
+            scaffold_kind: "Python",
+            files,
+        });
+    }
+    if policy.allow_docs_deterministic_fallback {
+        return deterministic::empty_docs_files(request).map(|files| DeterministicScaffoldSpec {
+            label: "Docs scaffold",
+            event: "agent.empty_workspace.deterministic_docs",
+            scaffold_kind: "Docs",
+            files,
+        });
+    }
+    None
+}
+
+pub(super) fn write_deterministic_scaffold_files(
+    agent: &mut Agent,
+    files: Vec<(PathBuf, String)>,
+    error_prefix: &str,
+    skip_existing: bool,
+) -> Option<WrittenScaffoldArtifacts> {
+    let mut written = Vec::<PathBuf>::new();
+    let mut snapshot_files = Vec::<ScaffoldArtifactFileSnapshot>::new();
+    for (relative, content) in files {
+        let target = agent.work_root.join(&relative);
+        if skip_existing && target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            agent.session.working_memory.note_error(format!(
+                "{error_prefix}: failed to create {}: {err}",
+                parent.display()
+            ));
+            return None;
+        }
+        if let Err(err) = std::fs::write(&target, content.as_bytes()) {
+            agent.session.working_memory.note_error(format!(
+                "{error_prefix}: failed to write {}: {err}",
+                target.display()
+            ));
+            return None;
+        }
+        let relative_display = relative.to_string_lossy().to_string();
+        snapshot_files.push(scaffold_file_snapshot(
+            &relative_display.replace('\\', "/"),
+            content.as_bytes(),
+        ));
+        agent
+            .session
+            .working_memory
+            .note_touched_file(normalize_memory_path(&relative_display, &agent.work_root));
+        written.push(relative);
+    }
+    Some((written, snapshot_files))
+}
+
+pub(super) fn finalize_deterministic_scaffold_materialization(
+    agent: &mut Agent,
+    request: &str,
+    last_iter: usize,
+    spec: &DeterministicScaffoldSpec,
+    assistant_context: &str,
+    written: Vec<PathBuf>,
+    snapshot_files: Vec<ScaffoldArtifactFileSnapshot>,
+) {
+    let written_paths = written
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    write_stdout_rendered(
+        &format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            spec.label,
+            &format!(
+                "Materialized deterministic scaffold files: {}.",
+                written_paths.join(", ")
+            ),
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    log_llm_event(
+        spec.event,
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "work_mode": agent.session.mode_state.work_mode.as_str(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "bootstrap_scaffold",
+            "completion_evidence": false,
+            "files": written_paths,
+        }),
+    );
+    record_scaffold_artifact_snapshot(agent, request, snapshot_files);
+    agent.session.messages.push(ConversationMessage::assistant(
+        format!(
+            "Created deterministic {} scaffold files as {assistant_context}: {}. This is not task completion.",
+            spec.scaffold_kind,
+            written_paths.join(", ")
+        ),
+        Vec::new(),
+    ));
+    agent.push_system_note(render_deterministic_scaffold_continuation_note(
+        request,
+        &written_paths,
+    ));
 }
