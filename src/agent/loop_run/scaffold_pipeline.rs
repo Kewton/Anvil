@@ -38,13 +38,15 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use super::Agent;
-use super::actor_loop_flow::format_iteration_status;
+use super::actor_loop_flow::{
+    build_feedback_for_deterministic_content_fallback, format_iteration_status,
+};
 use super::completion_evidence::{RepoEditCategory, classify_repo_edit_path};
 use super::deterministic;
 use super::interrupt::InterruptFlag;
 use super::lifecycle;
 use super::quality::{first_existing_impl_target, implementation_quality_issue_for_request};
-use super::task_contract::ArtifactRole;
+use super::task_contract::{ArtifactRole, CompletionDecision};
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
@@ -1071,4 +1073,183 @@ pub(super) fn materialize_deterministic_fallback_plan(
         }),
     );
     Ok(true)
+}
+
+pub(super) fn maybe_materialize_task_contract_fallback(
+    agent: &mut Agent,
+    decision: &CompletionDecision,
+    last_iter: usize,
+) -> bool {
+    if !super::policy_allows_python_specialized_fallback(
+        &agent.session.mode_state.policy(),
+        &agent.config,
+    ) {
+        return false;
+    }
+    if !matches!(decision, CompletionDecision::Continue { .. }) {
+        return false;
+    }
+    if !workspace_appears_empty(&agent.work_root) {
+        return false;
+    }
+    let Some(request) = agent.active_request_text() else {
+        return false;
+    };
+    let Some(files) = deterministic::fastapi_scaffold_files(&request) else {
+        return false;
+    };
+    let mut spec = DeterministicScaffoldSpec {
+        label: "Task scaffold",
+        event: "agent.task_contract.deterministic_fastapi_scaffold",
+        scaffold_kind: "FastAPI",
+        files,
+    };
+    let Some((written, snapshot_files)) = write_deterministic_scaffold_files(
+        agent,
+        std::mem::take(&mut spec.files),
+        "task contract deterministic fallback",
+        true,
+    ) else {
+        return false;
+    };
+    if written.is_empty() {
+        return false;
+    }
+    finalize_deterministic_scaffold_materialization(
+        agent,
+        &request,
+        last_iter,
+        &spec,
+        "contract recovery",
+        written,
+        snapshot_files,
+    );
+    true
+}
+
+pub(super) fn maybe_materialize_framework_game_fallback(
+    agent: &mut Agent,
+    last_iter: usize,
+) -> bool {
+    if !agent.config.deterministic_fallback.allows_hint_only() {
+        return false;
+    }
+    if !agent
+        .session
+        .mode_state
+        .policy()
+        .allow_ui_deterministic_fallback
+    {
+        return false;
+    }
+    let Some(request) = agent.active_request_text() else {
+        return false;
+    };
+    let Some(files) = deterministic::empty_framework_app_files(&request) else {
+        return false;
+    };
+    if !workspace_appears_empty(&agent.work_root)
+        && !deterministic_framework_app_files_needed(&agent.work_root, &files, &request)
+    {
+        return false;
+    }
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_template_completion()
+    {
+        let level = agent.config.deterministic_fallback.fallback_level();
+        write_stdout_rendered(
+            &format_iteration_status(
+                last_iter,
+                agent.config.max_iterations,
+                "App fallback hint",
+                &format!(
+                    "Deterministic full-template fallback is disabled at level {level}; asked the model to continue with a task-specific implementation."
+                ),
+                agent.footer.current_cols(),
+            ),
+            true,
+        );
+        log_llm_event(
+            "agent.empty_workspace.deterministic_framework_app_hint",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "work_root": agent.work_root.display().to_string(),
+                "fallback_level": level,
+                "fallback_action": "hint_only",
+            }),
+        );
+        return true;
+    }
+
+    let mut written = Vec::<PathBuf>::new();
+    for (relative, content) in files {
+        let target = agent.work_root.join(&relative);
+        if let Some(parent) = target.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            agent.session.working_memory.note_error(format!(
+                "deterministic fallback: failed to create {}: {err}",
+                parent.display()
+            ));
+            return false;
+        }
+        if let Err(err) = std::fs::write(&target, content) {
+            agent.session.working_memory.note_error(format!(
+                "deterministic fallback: failed to write {}: {err}",
+                target.display()
+            ));
+            return false;
+        }
+        agent
+            .session
+            .working_memory
+            .note_touched_file(normalize_memory_path(
+                &relative.to_string_lossy(),
+                &agent.work_root,
+            ));
+        written.push(relative);
+    }
+
+    let written_paths = written
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    write_stdout_rendered(
+        &format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            "App fallback",
+            &format!(
+                "Materialized deterministic framework app files: {}.",
+                written_paths.join(", ")
+            ),
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    log_llm_event(
+        "agent.empty_workspace.deterministic_framework_app",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": "full_template",
+            "files": written_paths,
+        }),
+    );
+    agent
+        .session
+        .record_feedback_if_unset(build_feedback_for_deterministic_content_fallback(
+            &agent.work_root,
+        ));
+    agent.session.messages.push(ConversationMessage::assistant(
+        format!(
+            "Materialized deterministic framework app fallback files as a recovery scaffold: {}. Continue implementation and verification before treating the task as complete.",
+            written_paths.join(", ")
+        ),
+        Vec::new(),
+    ));
+    true
 }
