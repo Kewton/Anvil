@@ -37,9 +37,8 @@ use super::model_request::{
     focused_edit_timeout_override_secs, non_streaming_assistant_reply_timeout_secs,
     should_use_streaming_transport,
 };
-use super::reminder::{
-    self, ReminderInputs, ReminderOutcome, build_log_payload as build_reminder_log_payload,
-};
+use super::reminder::{self, ReminderOutcome};
+use super::reminder_pipeline::ReminderCallContext;
 #[cfg(test)]
 use super::repair_driver::VERIFIER_REPAIR_PASS_TIMEOUT_SECS;
 use super::repair_driver::{
@@ -2181,55 +2180,6 @@ struct PhotonEvaluateCompletedLog {
     truncated: bool,
     outcome_json: serde_json::Value,
     outcome_detail_json: serde_json::Value,
-}
-
-struct ReminderCallContext {
-    session_id: String,
-    model: Option<String>,
-    kind: FeedbackKind,
-    frame: FeedbackFrame,
-    mode_label: &'static str,
-    active_precautions_summary: String,
-    touched_files: Vec<String>,
-    user_task: String,
-    workspace_root: PathBuf,
-    active_precautions_at_call_time: Vec<String>,
-    anvil_score: Option<crate::session::anvil_score::AnvilScore>,
-    anvil_score_from_current_turn: bool,
-}
-
-impl ReminderCallContext {
-    fn inputs(&self) -> ReminderInputs<'_> {
-        let anvil_score = self.anvil_score.as_ref().map(|score| {
-            if self.anvil_score_from_current_turn {
-                crate::session::anvil_score::AnvilScoreSnapshot::CurrentTurn(score)
-            } else {
-                crate::session::anvil_score::AnvilScoreSnapshot::PreviousTurn(score)
-            }
-        });
-        ReminderInputs {
-            user_task: &self.user_task,
-            mode_label: self.mode_label,
-            plan_summary: None,
-            active_precautions_summary: &self.active_precautions_summary,
-            frame: &self.frame,
-            working_memory_touched: &self.touched_files,
-            anvil_score,
-            active_precautions_at_call_time: &self.active_precautions_at_call_time,
-        }
-    }
-
-    fn log_outcome(&self, turn_index: usize, outcome: &ReminderOutcome, include_inputs: bool) {
-        let maybe_inputs = include_inputs.then(|| self.inputs());
-        let (event, payload) = build_reminder_log_payload(
-            outcome,
-            &self.session_id,
-            self.model.as_deref(),
-            turn_index,
-            maybe_inputs.as_ref(),
-        );
-        log_llm_event(event, payload);
-    }
 }
 
 pub(super) type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);

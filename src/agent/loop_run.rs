@@ -216,6 +216,14 @@ mod verifier_orchestration;
 // on `impl Agent` stay in turn.rs for now and will be migrated in
 // follow-up PRs.
 mod scaffold_pipeline;
+// Issue #684 (parent #680, Phase 4): reminder dispatch orchestration extracted
+// from `turn.rs`. Hosts `ReminderCallContext` + the impl that materialises a
+// `ReminderInputs<'_>` view and emits the `agent.reminder.*` log event. The
+// reminder helper (`reminder.rs` sibling) keeps its public SSOT (Inputs /
+// Outcome / build_log_payload); only the orchestration that assembles the
+// context lives here. `pub(super)` limited / no facade re-export (DR3-001) —
+// `turn.rs` is the only in-crate consumer.
+mod reminder_pipeline;
 // v0.4.13 Phase 6: verifier rerun progress classifier.
 mod repair_progress;
 mod safe_stop_payload;
