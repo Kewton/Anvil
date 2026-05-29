@@ -91,17 +91,17 @@ use super::feedback_builders::{
     build_feedback_for_bash, build_feedback_for_edit_failure,
     build_feedback_for_unsafe_block_reason, extract_current_request_paths,
 };
-use super::focused_edit_recovery::{
-    focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
-    focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
-    focused_edit_first_slice_note, focused_edit_guidance_note_for_policy, focused_edit_history,
-    focused_edit_second_slice_note,
-};
 #[cfg(test)]
 use super::focused_edit_recovery::{
     extract_page_copy_block_from_numbered_read, focused_edit_first_slice_uses_exact_anchor,
     focused_edit_guidance_note, focused_edit_minimal_history, latest_page_copy_block_from_read,
     strip_read_line_number_prefix,
+};
+use super::focused_edit_recovery::{
+    focused_edit_compact_anchor_note, focused_edit_compact_recovery_anchor,
+    focused_edit_exact_anchor_history, focused_edit_exact_recovery_anchor,
+    focused_edit_first_slice_note, focused_edit_guidance_note_for_policy, focused_edit_history,
+    focused_edit_second_slice_note,
 };
 use super::path_helpers::normalize_memory_path;
 use super::photon_feedback_derive::{
