@@ -95,6 +95,11 @@ pub(crate) mod completion_evidence;
 mod deterministic;
 pub(crate) mod feedback_kind_confirm;
 mod footer;
+// Focused-edit recovery helpers extracted from `turn.rs` (parent #680).
+// Hosts the guidance-note builders, page-component anchor extractors, and
+// conversation history shapers used by the focused-edit recovery flow.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod focused_edit_recovery;
 // v0.4.13 Phase 1: bounded verifier-failure packet used as the shared
 // controller/LLM input for the new repair pipeline. Private module; no facade
 // re-export (DR3-001 pattern).
