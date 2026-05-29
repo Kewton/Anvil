@@ -37,8 +37,6 @@ use super::model_request::{
     focused_edit_timeout_override_secs, non_streaming_assistant_reply_timeout_secs,
     should_use_streaming_transport,
 };
-use super::reminder::{self, ReminderOutcome};
-use super::reminder_pipeline::ReminderCallContext;
 #[cfg(test)]
 use super::repair_driver::VERIFIER_REPAIR_PASS_TIMEOUT_SECS;
 use super::repair_driver::{
@@ -198,7 +196,6 @@ use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{
     ModeClassification, PlanStage, TaskProfile, WorkMode, classify_work_mode_json,
 };
-use crate::ollama::client::SIDECAR_SUMMARY_TIMEOUT_SECS;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::feedback::{
     FeedbackFrame, FeedbackFrameDraft, FeedbackKind, build_feedback_frame,
@@ -3548,168 +3545,7 @@ impl Agent {
     /// (`reminder_called_this_turn`) is consumed only by Completed / Failed
     /// — Skipped does not consume the cap (DR3-002).
     pub(super) fn maybe_invoke_reminder(&mut self, interrupt_flag: &InterruptFlag) {
-        let Some(kind) = self.reminder_feedback_kind() else {
-            return;
-        };
-        let Some(context) = self.prepare_reminder_context(kind, interrupt_flag) else {
-            return;
-        };
-        let sidecar_model = context
-            .model
-            .clone()
-            .expect("sidecar_available was checked by reminder gate");
-        let Some(reminder_client) = self.try_clone_reminder_client(&context) else {
-            return;
-        };
-        let outcome = self.run_reminder_sidecar(&context, &reminder_client, &sidecar_model);
-        self.reminder_called_this_turn = true;
-        context.log_outcome(self.current_turn_index, &outcome, true);
-    }
-
-    fn reminder_feedback_kind(&self) -> Option<FeedbackKind> {
-        match &self.session.last_feedback {
-            Some(frame) if reminder::kind_eligible(&frame.kind) => Some(frame.kind.clone()),
-            _ => None,
-        }
-    }
-
-    fn reminder_gate(&self, interrupt_flag: &InterruptFlag) -> reminder::ReminderGate {
-        reminder::ReminderGate {
-            disabled_by_env: reminder::reminder_disabled(|key| std::env::var_os(key)),
-            sidecar_available: self.models.sidecar.is_some(),
-            kind_eligible: true,
-            plan_mode: self.session.mode_state.mode == ExecutionMode::Plan,
-            interrupted: interrupt_flag.is_set(),
-            per_turn_already_called: self.reminder_called_this_turn,
-        }
-    }
-
-    fn prepare_reminder_context(
-        &self,
-        kind: FeedbackKind,
-        interrupt_flag: &InterruptFlag,
-    ) -> Option<ReminderCallContext> {
-        let session_id = self.session_store.session_id().to_string();
-        let model = self.models.sidecar.clone();
-        let gate = self.reminder_gate(interrupt_flag);
-        if let Some(skip_reason) = gate.skip_reason() {
-            ReminderCallContext {
-                session_id,
-                model,
-                kind: kind.clone(),
-                frame: FeedbackFrame::default(),
-                mode_label: "act",
-                active_precautions_summary: String::new(),
-                touched_files: Vec::new(),
-                user_task: String::new(),
-                workspace_root: self.work_root.clone(),
-                active_precautions_at_call_time: Vec::new(),
-                anvil_score: None,
-                anvil_score_from_current_turn: false,
-            }
-            .log_outcome(
-                self.current_turn_index,
-                &ReminderOutcome::Skipped {
-                    skip_reason,
-                    feedback_kind: Some(kind),
-                },
-                false,
-            );
-            return None;
-        }
-        let frame = self
-            .session
-            .last_feedback
-            .clone()
-            .expect("kind_eligible implies last_feedback is Some");
-        Some(ReminderCallContext {
-            session_id,
-            model,
-            kind,
-            frame,
-            mode_label: self.reminder_mode_label(),
-            active_precautions_summary: self
-                .session
-                .working_memory
-                .format_for_prompt()
-                .unwrap_or_else(|| "(none)".to_string()),
-            touched_files: self.session.working_memory.touched_files.clone(),
-            user_task: self
-                .session
-                .working_memory
-                .active_task
-                .clone()
-                .unwrap_or_default(),
-            workspace_root: self.work_root.clone(),
-            active_precautions_at_call_time: self.active_precautions_at_call_time(),
-            anvil_score: self.session.last_anvil_score.clone(),
-            anvil_score_from_current_turn: self.anvil_score_computed_this_turn,
-        })
-    }
-
-    fn reminder_mode_label(&self) -> &'static str {
-        match self.session.mode_state.mode {
-            ExecutionMode::Act => "act",
-            ExecutionMode::Plan => "plan",
-        }
-    }
-
-    fn active_precautions_at_call_time(&self) -> Vec<String> {
-        self.session
-            .working_memory
-            .active_precautions
-            .iter()
-            .filter(|p| p.status == crate::session::precaution::PrecautionStatus::Active)
-            .map(|p| p.text.clone())
-            .collect()
-    }
-
-    fn try_clone_reminder_client(
-        &mut self,
-        context: &ReminderCallContext,
-    ) -> Option<crate::ollama::client::OllamaClient> {
-        match self
-            .client
-            .clone_with_overrides(SIDECAR_SUMMARY_TIMEOUT_SECS, 384)
-        {
-            Ok(client) => Some(client),
-            Err(err) => {
-                self.reminder_called_this_turn = true;
-                context.log_outcome(
-                    self.current_turn_index,
-                    &ReminderOutcome::Failed {
-                        reason: reminder::FailureReason::LlmCall(format!(
-                            "clone_with_overrides: {err}"
-                        )),
-                        latency_ms: 0,
-                        prompt_log: String::new(),
-                        response_raw_log: String::new(),
-                        feedback_kind: context.kind.clone(),
-                    },
-                    false,
-                );
-                None
-            }
-        }
-    }
-
-    fn run_reminder_sidecar(
-        &mut self,
-        context: &ReminderCallContext,
-        reminder_client: &crate::ollama::client::OllamaClient,
-        sidecar_model: &str,
-    ) -> ReminderOutcome {
-        reminder::run_reminder_with_strategy(
-            context.inputs(),
-            &mut self.session.working_memory,
-            &context.workspace_root,
-            |prompt| {
-                reminder_client.chat_text(
-                    sidecar_model,
-                    &[ConversationMessage::user(prompt.to_string())],
-                )
-            },
-        )
+        super::reminder_pipeline::maybe_invoke_reminder(self, interrupt_flag)
     }
 
     /// Issue #557: call photon context_pack and store rendered response.
