@@ -304,6 +304,14 @@ mod path_helpers;
 // SSOT (`plan_section_has_content`, `normalize_plan_heading_for_progress`).
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod plan_sections;
+// Plan-mode helpers extracted from `turn.rs` (parent #680). Hosts
+// `should_materialize_plan_after_timeout`,
+// `should_materialize_plan_after_tool_call_format_error`,
+// `should_fallback_plan_model_after_timeout`, `assistant_model_for_mode`,
+// `plan_file_alias`, `prune_plan_mode_messages`,
+// `is_plan_mode_only_system_note`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod plan_mode_helpers;
 // Small standalone helpers extracted from `turn.rs` (parent #680). Hosts
 // `rfc3339_now_utc`, `masked_path_hash_bounded_list`,
 // `latest_tool_result_since_last_user`, `raw_mode_safe_text`,
