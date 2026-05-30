@@ -56,14 +56,15 @@ use super::quality::{
     first_existing_impl_target, implementation_quality_issue_for_request,
     package_json_with_requested_port, react_dev_wrapper_for_requested_port,
 };
+use super::read_target_helpers::{last_read_tool_path, latest_turn_preferred_read_edit_target};
 use super::task_contract::{ArtifactRole, CompletionDecision};
 use super::tool_display::progress_path_display;
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
 use super::turn::{
-    WrittenScaffoldArtifacts, extract_filename_with_suffix, last_read_tool_path,
-    latest_turn_preferred_read_edit_target, tool_result_failed, write_stdout_rendered,
+    WrittenScaffoldArtifacts, extract_filename_with_suffix, tool_result_failed,
+    write_stdout_rendered,
 };
 use super::workspace_walk::{meaningful_workspace_files, workspace_appears_empty};
 use crate::agent::prompting;

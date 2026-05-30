@@ -117,6 +117,9 @@ mod inner {
         first_existing_impl_target, repo_change_request_text,
         request_needs_playable_ui_quality_gate,
     };
+    use super::super::read_target_helpers::{
+        last_read_tool_path, latest_turn_preferred_read_edit_target,
+    };
     use super::super::repair_job::{
         SNAPSHOT_FIELD_BYTE_CAP, sanitize_repair_job_text, truncate_for_snapshot,
     };
@@ -154,7 +157,6 @@ mod inner {
         focused_edit_policy_violation_feedback_note, focused_edit_tool_batch_action,
         focused_edit_tool_policy_error,
     };
-    use super::super::turn::{last_read_tool_path, latest_turn_preferred_read_edit_target};
     use super::super::verifier_assessment_parser::parse_verifier_repair_assessment_reply;
     use super::super::verifier_diagnostic_attempt::{
         VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, VERIFIER_DIAGNOSTIC_MAIN_FALLBACK_TIMEOUT_SECS,
