@@ -21,7 +21,7 @@ use crate::session::compact::{
 };
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 use crate::stdin_prompt;
-use crate::tools::registry::{ToolContext, ToolRegistry};
+use crate::tools::registry::ToolRegistry;
 
 // Issue #646: artifact ownership classification. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `task_contract.rs` are the
@@ -259,6 +259,16 @@ mod task_contract_recovery;
 // production authority. Free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod owned_test_projection;
+// Tool-call execution dispatch extracted from `turn.rs` (parent #680).
+// Hosts the per-tool-call execution lifecycle: production chokepoint
+// `execute_tool_call` (policy gates → Bash vs. non-Bash dispatch) +
+// `tool_context` builder + 4 dispatch helpers
+// (`{handle_tool_execution_rejection,execute_bash_tool_call,capture_pre_tool_hash_if_needed,execute_non_bash_tool_call}`)
+// + Issue #606 T-1.6 `observe_evidence_from_bash_outcome` (Bash exit-0
+// → VerifierExitZero evidence + last_verifier_invocation record). Free
+// fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod tool_call_execution;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

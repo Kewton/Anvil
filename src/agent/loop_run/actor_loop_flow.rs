@@ -3376,14 +3376,16 @@ pub(super) fn run_actor_loop(
                         recovery::repeated_bash_error(&bash_command)
                     } else if start_spinner_for_exec {
                         let _sp = Spinner::start(format!("running {tool_name}..."));
-                        agent.execute_tool_call(
+                        super::tool_call_execution::execute_tool_call(
+                            agent,
                             &tool_name,
                             &tool_call.arguments,
                             Some(&effective_tool_policy),
                             Some(interrupt_flag.flag.clone()),
                         )
                     } else {
-                        agent.execute_tool_call(
+                        super::tool_call_execution::execute_tool_call(
+                            agent,
                             &tool_name,
                             &tool_call.arguments,
                             Some(&effective_tool_policy),
@@ -3392,14 +3394,16 @@ pub(super) fn run_actor_loop(
                     }
                 } else if start_spinner_for_exec {
                     let _sp = Spinner::start(format!("running {tool_name}..."));
-                    agent.execute_tool_call(
+                    super::tool_call_execution::execute_tool_call(
+                        agent,
                         &tool_name,
                         &tool_call.arguments,
                         Some(&effective_tool_policy),
                         Some(interrupt_flag.flag.clone()),
                     )
                 } else {
-                    agent.execute_tool_call(
+                    super::tool_call_execution::execute_tool_call(
+                        agent,
                         &tool_name,
                         &tool_call.arguments,
                         Some(&effective_tool_policy),
