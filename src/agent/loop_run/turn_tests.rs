@@ -3737,7 +3737,7 @@ mod tests {
         // Sanity: forced_small_edit_recovery_target must resolve under
         // this fixture (otherwise the arbiter would not select ForcedSmallEdit).
         assert!(
-            agent.forced_small_edit_recovery_target().is_some(),
+            super::super::forced_small_edit::forced_small_edit_recovery_target(&agent).is_some(),
             "fixture invariant: forced_small_edit_recovery_target must be Some"
         );
 

@@ -93,7 +93,7 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
     let mut candidates: Vec<JobCandidate> = Vec::new();
 
     // Priority 2: ForcedSmallEditRecovery.
-    if let Some(target) = agent.forced_small_edit_recovery_target() {
+    if let Some(target) = super::forced_small_edit::forced_small_edit_recovery_target(agent) {
         push_focused_edit_candidate(
             agent,
             &mut candidates,

@@ -7,12 +7,9 @@ use super::file_excerpt::{
 use super::plan_mode_helpers::assistant_model_for_mode;
 use super::small_helpers::raw_mode_safe_text;
 use super::summary::ExitReason;
-use super::tool_display::progress_path_display;
 use super::tool_history::{
     focused_edit_target_already_read, focused_read_target_for_directory,
-    has_successful_non_plan_repo_edit,
-    has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
-    is_preferred_read_edit_target, latest_user_turn_slice, recent_truncated_tool_call_attempt,
+    has_successful_non_plan_repo_edit, is_preferred_read_edit_target, latest_user_turn_slice,
 };
 use super::tool_policy::EffectiveToolPolicy;
 use super::verifier_orchestration::task_contract_no_verifier_note;
@@ -281,43 +278,6 @@ impl Agent {
             }
         };
         Some(ConversationMessage::system(text.to_string()))
-    }
-
-    pub(super) fn forced_small_edit_recovery_message(&self) -> Option<String> {
-        let path = self.forced_small_edit_recovery_target()?;
-        let attempt = recent_truncated_tool_call_attempt(&self.session.messages).max(1);
-        Some(recovery::forced_small_edit_recovery_note(
-            &progress_path_display(
-                &path.display().to_string(),
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-                120,
-            ),
-            attempt,
-        ))
-    }
-
-    pub(super) fn forced_small_edit_recovery_target(&self) -> Option<PathBuf> {
-        if self.session.mode_state.mode != ExecutionMode::Act {
-            return None;
-        }
-        if recent_truncated_tool_call_attempt(&self.session.messages) == 0 {
-            return None;
-        }
-        if has_successful_non_plan_repo_edit_after_latest_truncated_tool_call(
-            &self.session.messages,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        ) {
-            return None;
-        }
-        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root).or_else(
-            || {
-                let path = last_read_tool_path(&self.session.messages)?;
-                let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-                candidate.is_file().then_some(candidate)
-            },
-        )
     }
 
     /// Issue #636: read a workspace-confined, cap-bounded excerpt of
