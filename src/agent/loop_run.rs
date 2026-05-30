@@ -305,6 +305,14 @@ mod quality_gate;
 // `effective_tool_policy_flow`). Free fns over `&Agent`. `pub(super)`
 // limited / no facade re-export (DR3-001).
 mod tool_policy_decisions;
+// Python request inspection helpers extracted from `turn.rs` (parent
+// #680). Hosts the Python-specific signals that drive completion /
+// scaffold gating: `active_python_request_requires_tests`,
+// `python_verifier_available_for_requested_tests`, and
+// `python_test_artifact_exists` (top-level `test_*.py` / `*_test.py` /
+// `tests.py` scan). Free fns over `&Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod python_request_helpers;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

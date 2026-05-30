@@ -404,7 +404,9 @@ fn maybe_finish_after_edit_format_error(agent: &Agent, err: &str) -> Option<Assi
     {
         return None;
     }
-    if agent.active_python_request_requires_tests() && !agent.python_test_artifact_exists() {
+    if super::python_request_helpers::active_python_request_requires_tests(agent)
+        && !super::python_request_helpers::python_test_artifact_exists(agent)
+    {
         return None;
     }
     let edits = successful_non_plan_repo_edit_count(
