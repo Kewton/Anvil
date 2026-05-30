@@ -62,7 +62,7 @@ fn align_recovery_target_hint_to_request(
     if hint.role != ArtifactRole::Test {
         return hint;
     }
-    let Some(request) = agent.active_request_text() else {
+    let Some(request) = super::workspace_access::active_request_text(agent) else {
         return hint;
     };
     let Some((target_path, stack_label)) =

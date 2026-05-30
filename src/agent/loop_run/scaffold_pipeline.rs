@@ -617,7 +617,7 @@ pub(super) fn active_task_requires_nextjs_scaffold(agent: &Agent) -> bool {
     }
     let plan_contents = agent.current_plan_contents().ok().flatten();
     task_or_plan_requires_nextjs_scaffold(
-        agent.active_request_text().as_deref(),
+        super::workspace_access::active_request_text(agent).as_deref(),
         plan_contents.as_deref(),
     )
 }
@@ -626,8 +626,7 @@ pub(super) fn active_task_requested_scaffold_framework(agent: &Agent) -> Option<
     if agent.session.mode_state.mode != ExecutionMode::Act {
         return None;
     }
-    agent
-        .active_request_text()
+    super::workspace_access::active_request_text(agent)
         .as_deref()
         .and_then(requested_scaffold_framework)
 }
@@ -1002,7 +1001,7 @@ pub(super) fn maybe_materialize_mode_deterministic_fallback(
         return false;
     }
     let policy = agent.session.mode_state.policy();
-    let Some(request) = agent.active_request_text() else {
+    let Some(request) = super::workspace_access::active_request_text(agent) else {
         return false;
     };
     let Some(mut spec) = mode_deterministic_scaffold_spec(agent, &request, &policy) else {
@@ -1104,7 +1103,7 @@ pub(super) fn maybe_materialize_task_contract_fallback(
     if !workspace_appears_empty(&agent.work_root) {
         return false;
     }
-    let Some(request) = agent.active_request_text() else {
+    let Some(request) = super::workspace_access::active_request_text(agent) else {
         return false;
     };
     let Some(files) = deterministic::fastapi_scaffold_files(&request) else {
@@ -1154,7 +1153,7 @@ pub(super) fn maybe_materialize_framework_game_fallback(
     {
         return false;
     }
-    let Some(request) = agent.active_request_text() else {
+    let Some(request) = super::workspace_access::active_request_text(agent) else {
         return false;
     };
     let Some(files) = deterministic::empty_framework_app_files(&request) else {
@@ -1275,7 +1274,7 @@ pub(super) fn maybe_materialize_python_test_fallback(
     ) {
         return Ok(None);
     }
-    let request = agent.active_request_text().unwrap_or_default();
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     let mut python_files = std::fs::read_dir(&agent.work_root)
         .map_err(|err| format!("failed to read {}: {err}", agent.work_root.display()))?
         .flatten()
@@ -1467,7 +1466,7 @@ pub(super) fn maybe_apply_local_llm_small_edit_fallback(
 pub(super) fn local_llm_small_edit_fallback_target(agent: &Agent) -> Option<PathBuf> {
     if agent.session.mode_state.mode != ExecutionMode::Act
         || !agent.session.mode_state.policy().repo_edit_required
-        || !agent.active_task_expects_repo_change()
+        || !super::workspace_access::active_task_expects_repo_change(agent)
     {
         return None;
     }

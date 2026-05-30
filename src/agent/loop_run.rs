@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::prompting;
+// Re-exposed for legacy `super::recovery::*` paths in `progress_tests.rs`
+// (parent #680: after `turn.rs` became empty, this import is no longer
+// referenced from within `loop_run` itself).
+#[allow(unused_imports)]
 use crate::agent::recovery;
 use crate::config::Config;
 use crate::format_model_banner;
@@ -394,6 +398,12 @@ mod turn_constants;
 // Free fns over `&mut Agent`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod message_push;
+// Per-Agent workspace + active-request accessors extracted from
+// `turn.rs` (parent #680). Hosts `current_workspace_scope` (Issue
+// #646), `workspace_appears_empty`, `active_task_expects_repo_change`,
+// and `active_request_text`. Free fns over `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod workspace_access;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -1467,7 +1477,7 @@ pub(crate) fn seed_artifact_ledger_repo_edit_for_test(agent: &mut Agent, path: S
         return;
     };
 
-    let scope = agent.current_workspace_scope();
+    let scope = workspace_access::current_workspace_scope(agent);
     crate::agent::loop_run::artifact_ledger_state::seed_artifact_ledger_repo_edit(
         agent, &path, role, &scope,
     );
@@ -1525,7 +1535,7 @@ pub(crate) fn seed_artifact_completion_job_pending_for_test(
         reason: "664 e2e seed".to_string(),
     };
 
-    let scope = agent.current_workspace_scope();
+    let scope = workspace_access::current_workspace_scope(agent);
     let work_root = agent.work_root.clone();
     if let Ok(job) = artifact_completion_job::ArtifactCompletionJob::new(
         &work_root, &scope, hint, true,  // edited_this_session
@@ -2553,8 +2563,7 @@ impl Agent {
         // `first_missing_required_role` is evidence-aware and not available
         // here, so we fall back to the first required role hint
         // (DR3-004 — same pattern as `refresh_artifact_completion_satisfied`).
-        let task_contract = self
-            .active_request_text()
+        let task_contract = workspace_access::active_request_text(self)
             .map(|text| task_contract::TaskContract::from_request(&text));
         let role_hint_from_contract = task_contract
             .as_ref()

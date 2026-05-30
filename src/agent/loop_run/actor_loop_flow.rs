@@ -487,7 +487,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
 ) -> Option<PostReplyRecoveryOutcome> {
     if !(should_apply_repo_change_quality_gate(
         args.action_expectation,
-        agent.active_task_expects_repo_change(),
+        super::workspace_access::active_task_expects_repo_change(agent),
         agent.session.mode_state.mode,
     ) || super::quality_gate::current_request_needs_playable_ui_quality_gate(agent))
         || !args.recovery_dispatch_gate.allows_deterministic_fallback()
@@ -1209,7 +1209,7 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
         );
         return ActorLoopNoToolReplyOutcome::Continue;
     }
-    let request = agent.active_request_text().unwrap_or_default();
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     let fallback = match super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
         agent, &request,
     ) {
@@ -1603,7 +1603,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
         || !recovery_dispatch_gate.allows_deterministic_fallback()
         || !(should_apply_repo_change_quality_gate(
             action_expectation,
-            agent.active_task_expects_repo_change(),
+            super::workspace_access::active_task_expects_repo_change(agent),
             agent.session.mode_state.mode,
         ) || super::quality_gate::current_request_needs_playable_ui_quality_gate(agent))
     {
@@ -1828,7 +1828,7 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
         .is_some()
     {
         let batch_scope = if agent.missing_verifier_job.is_some() {
-            Some(agent.current_workspace_scope())
+            Some(super::workspace_access::current_workspace_scope(agent))
         } else {
             None
         };
@@ -2311,7 +2311,9 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
     ) {
         let note = super::task_contract::render_contract_recovery_note_with_hint(
             args.decision,
-            agent.active_request_text().as_deref().unwrap_or_default(),
+            super::workspace_access::active_request_text(agent)
+                .as_deref()
+                .unwrap_or_default(),
             artifact_attempt,
             attempt_limit,
             args.target_hint.as_ref(),
@@ -2387,7 +2389,9 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
     );
     let note = super::task_contract::render_contract_recovery_note_with_hint(
         &args.decision,
-        agent.active_request_text().as_deref().unwrap_or_default(),
+        super::workspace_access::active_request_text(agent)
+            .as_deref()
+            .unwrap_or_default(),
         artifact_attempt,
         attempt_limit,
         args.target_hint.as_ref(),
@@ -2705,7 +2709,7 @@ pub(super) fn maybe_handle_rejected_tool_batch_focused_retry_exhausted(
                     .to_string(),
         });
     }
-    let request = agent.active_request_text().unwrap_or_default();
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     let fallback = match super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(
         agent, &request,
     ) {
@@ -2861,7 +2865,7 @@ pub(super) fn repair_job_done_outcome() -> TaskContractVerifierFlowOutcome {
 pub(super) fn finalize_missing_repo_edit_retry_exhausted(
     agent: &mut Agent,
 ) -> PostReplyRecoveryOutcome {
-    let request = agent.active_request_text().unwrap_or_default();
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     match super::scaffold_pipeline::maybe_apply_local_llm_small_edit_fallback(agent, &request) {
         Ok(Some(relative)) => PostReplyRecoveryOutcome::Finalize {
             final_prose: format!(

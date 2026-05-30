@@ -84,7 +84,7 @@ fn task_contract_artifact_states_legacy(
     agent: &mut Agent,
     contract: &super::task_contract::TaskContract,
 ) -> Vec<super::task_contract::ArtifactState> {
-    let scope = agent.current_workspace_scope();
+    let scope = super::workspace_access::current_workspace_scope(agent);
     let mut states = Vec::new();
     for role in &contract.required_artifacts {
         if let Some(path) =

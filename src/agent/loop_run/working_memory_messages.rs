@@ -75,7 +75,7 @@ pub(super) fn working_memory_message(agent: &mut Agent) -> Option<ConversationMe
 }
 
 pub(super) fn answer_only_fallback_response(agent: &Agent) -> String {
-    let request = agent.active_request_text().unwrap_or_default();
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     let lower = request.to_ascii_lowercase();
     if request_explicitly_requests_script_execution(&request)
         && let Some(output) = latest_tool_result_since_last_user(&agent.session.messages, "Bash")

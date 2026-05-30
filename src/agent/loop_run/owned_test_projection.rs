@@ -35,7 +35,7 @@ pub(super) fn owned_test_artifacts_for_verifier(
     agent: &mut Agent,
     contract: &super::task_contract::TaskContract,
 ) -> Vec<String> {
-    let scope = agent.current_workspace_scope();
+    let scope = super::workspace_access::current_workspace_scope(agent);
     // `task_contract_artifact_states` has the side effect of seeding the
     // ledger with Existing / Scaffold baseline events. We MUST call it
     // before reading the ledger projection so the Phase 3 path sees the

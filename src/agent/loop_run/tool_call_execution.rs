@@ -104,7 +104,7 @@ fn effective_tool_policy_error_for_execution(
     let scope_for_policy = agent
         .missing_verifier_job
         .as_ref()
-        .map(|_| agent.current_workspace_scope());
+        .map(|_| super::workspace_access::current_workspace_scope(agent));
     if let Some(policy) = effective_tool_policy {
         effective_tool_policy_error_for_call_with_scope(
             policy,

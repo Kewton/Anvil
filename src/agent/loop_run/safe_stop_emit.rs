@@ -69,7 +69,7 @@ pub(super) fn resolve_current_role_for_safe_stop(
     {
         return Some(hint.role);
     }
-    let request = agent.active_request_text().unwrap_or_default();
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     if !request.is_empty() {
         let contract = super::task_contract::TaskContract::from_request(&request);
         if let Some(role) = contract.required_artifacts.first().copied() {
@@ -92,7 +92,9 @@ pub(super) fn emit_safe_stop_report_for_diagnostic_target_missing(agent: &mut Ag
     let turn_index = agent.current_turn_index as u64;
     let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
         &agent.work_root,
-        agent.active_request_text().unwrap_or_default().as_str(),
+        super::workspace_access::active_request_text(agent)
+            .unwrap_or_default()
+            .as_str(),
     );
     let candidates: Vec<String> = job
         .changed_file_hints
@@ -199,7 +201,9 @@ pub(super) fn emit_safe_stop_report_for_artifact_completion_failed(
     let turn_index = agent.current_turn_index as u64;
     let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
         &agent.work_root,
-        agent.active_request_text().unwrap_or_default().as_str(),
+        super::workspace_access::active_request_text(agent)
+            .unwrap_or_default()
+            .as_str(),
     );
     let owned_test_artifacts = collect_owned_test_artifacts(agent);
     // Prefer the real RepairJob (when one exists, e.g. the
@@ -269,7 +273,9 @@ pub(super) fn emit_repair_safe_stop_report(
     let turn_index = agent.current_turn_index as u64;
     let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
         &agent.work_root,
-        agent.active_request_text().unwrap_or_default().as_str(),
+        super::workspace_access::active_request_text(agent)
+            .unwrap_or_default()
+            .as_str(),
     );
     let owned_test_artifacts = collect_owned_test_artifacts(agent);
     let expected = job
@@ -312,7 +318,9 @@ pub(super) fn emit_safe_stop_report_for_verifier_missing(agent: &mut Agent) {
     let turn_index = agent.current_turn_index as u64;
     let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
         &agent.work_root,
-        agent.active_request_text().unwrap_or_default().as_str(),
+        super::workspace_access::active_request_text(agent)
+            .unwrap_or_default()
+            .as_str(),
     );
     let owned_test_artifacts = collect_owned_test_artifacts(agent);
     let input = super::repair_job::SafeStopInput::FromMissingVerifier {
@@ -344,7 +352,9 @@ pub(super) fn emit_safe_stop_report_for_verifier_missing(agent: &mut Agent) {
 fn collect_owned_test_artifacts(agent: &Agent) -> Vec<String> {
     let scope = super::task_workspace_scope::TaskWorkspaceScope::detect(
         &agent.work_root,
-        agent.active_request_text().unwrap_or_default().as_str(),
+        super::workspace_access::active_request_text(agent)
+            .unwrap_or_default()
+            .as_str(),
     );
     let mut out: Vec<String> = Vec::new();
     for rel in agent.turn_edited_relative_paths.iter() {

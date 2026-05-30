@@ -65,8 +65,7 @@ pub(super) fn answer_only_mode_active(agent: &Agent) -> bool {
 }
 
 pub(super) fn script_execution_requested(agent: &Agent) -> bool {
-    agent
-        .active_request_text()
+    super::workspace_access::active_request_text(agent)
         .as_deref()
         .is_some_and(request_explicitly_requests_script_execution)
 }
@@ -78,7 +77,7 @@ pub(super) fn effective_tool_policy_error(
 ) -> Option<String> {
     let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(agent);
     let scope = if agent.missing_verifier_job.is_some() {
-        Some(agent.current_workspace_scope())
+        Some(super::workspace_access::current_workspace_scope(agent))
     } else {
         None
     };

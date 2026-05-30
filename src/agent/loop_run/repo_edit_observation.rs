@@ -112,7 +112,8 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
     // Issue #646 (A1/B2): once an in-scope edit has landed, the
     // MissingVerifierJob can begin retrying verifier creation.
     if agent.missing_verifier_job.is_some() {
-        let in_scope = agent.current_workspace_scope().contains(&relative_path);
+        let in_scope =
+            super::workspace_access::current_workspace_scope(agent).contains(&relative_path);
         if in_scope && let Some(job) = agent.missing_verifier_job.as_mut() {
             job.record_in_scope_edit();
         }
@@ -157,7 +158,7 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
     // mapping so the `Other` category (which legacy callers do not
     // classify into a role) does not inject an ambiguous event.
     if let Some(role) = super::task_contract::role_from_repo_edit(category) {
-        let scope = agent.current_workspace_scope();
+        let scope = super::workspace_access::current_workspace_scope(agent);
         super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
             agent,
             &relative_path,

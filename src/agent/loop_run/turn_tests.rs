@@ -3452,7 +3452,7 @@ mod tests {
         std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
         std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
 
-        let scope = agent.current_workspace_scope();
+        let scope = super::workspace_access::current_workspace_scope(&agent);
         let artifact_hint = RecoveryTargetHint {
             role: ArtifactRole::Implementation,
             path: "src/main.py".to_string(),
@@ -3508,7 +3508,7 @@ mod tests {
         // candidate (regression guard for write policy bypass).
         std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
         std::fs::write(agent.work_root.join("src/main.py"), "# stub\n").unwrap();
-        let scope = agent.current_workspace_scope();
+        let scope = super::workspace_access::current_workspace_scope(&agent);
         let job = ArtifactCompletionJob::new(
             &agent.work_root,
             &scope,

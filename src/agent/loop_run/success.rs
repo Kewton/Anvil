@@ -133,8 +133,9 @@ impl Agent {
         if !recent_successful_bash_commands_since_last_user(&self.session.messages).is_empty() {
             return true;
         }
-        let scope = self.current_workspace_scope();
-        let project_unit = if let Some(request) = self.active_request_text() {
+        let scope = super::workspace_access::current_workspace_scope(self);
+        let project_unit = if let Some(request) = super::workspace_access::active_request_text(self)
+        {
             super::project_probe::probe_project_unit_for_request(
                 &self.work_root,
                 &request,
@@ -151,7 +152,7 @@ impl Agent {
         if project_unit.is_some_and(|unit| !unit.verifier_candidates.is_empty()) {
             return true;
         }
-        self.active_request_text()
+        super::workspace_access::active_request_text(self)
             .is_some_and(|request| super::quality::request_explicitly_requires_tests(&request))
     }
 
@@ -161,7 +162,7 @@ impl Agent {
     /// `evidence_set_missing_shapes_with_context`, and
     /// `should_run_auto_test_for_success_with_context`.
     pub(super) fn current_request_context(&self) -> RequestContext {
-        let request = self.active_request_text().unwrap_or_default();
+        let request = super::workspace_access::active_request_text(self).unwrap_or_default();
         RequestContext {
             requires_tests: super::quality::request_explicitly_requires_tests(&request),
             is_env_setup_only: super::quality::request_is_env_setup_only(&request),
@@ -196,7 +197,7 @@ impl Agent {
     /// structured Weak/Missing branch is then skipped and the legacy
     /// `detect_with_recent_successes -> run` path runs verbatim.
     fn success_verifier_test_binding(&mut self) -> (Vec<String>, bool) {
-        let Some(request) = self.active_request_text() else {
+        let Some(request) = super::workspace_access::active_request_text(self) else {
             return (Vec::new(), false);
         };
         let contract = TaskContract::from_request(&request);
@@ -225,8 +226,7 @@ impl Agent {
                 self.session.last_feedback.as_ref().is_some_and(|frame| {
                     frame.primary_error.as_deref() == Some(DETERMINISTIC_CONTENT_FALLBACK_TAG)
                 });
-            let requested_paths = self
-                .active_request_text()
+            let requested_paths = super::workspace_access::active_request_text(self)
                 .map(|text| requested_paths_from_text(&text))
                 .unwrap_or_default();
             // Issue #606 T-1.5 / Issue #607: Stage-2 short-circuit. Context-
@@ -309,8 +309,10 @@ impl Agent {
             recent_successful_bash_commands_since_last_user(&self.session.messages);
         // Issue #651 Phase 5.1: structured verifier binding inputs.
         let (owned_test_artifacts, test_execution_required) = self.success_verifier_test_binding();
-        let workspace_scope: TaskWorkspaceScope = self.current_workspace_scope();
-        let project_unit = if let Some(request) = self.active_request_text() {
+        let workspace_scope: TaskWorkspaceScope =
+            super::workspace_access::current_workspace_scope(self);
+        let project_unit = if let Some(request) = super::workspace_access::active_request_text(self)
+        {
             super::project_probe::probe_project_unit_for_request(
                 &self.work_root,
                 &request,

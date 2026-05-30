@@ -149,16 +149,16 @@ pub(super) fn verifier_repair_policy_message(
                 super::repair_job::RepairNextAction::RerunVerifier
                 | super::repair_job::RepairNextAction::VerifiedDone,
             ) => verifier_repair_transition_message(),
-            None if agent.missing_verifier_job.is_some() => {
-                verifier_setup_policy_message(&agent.active_request_text().unwrap_or_default())
-            }
+            None if agent.missing_verifier_job.is_some() => verifier_setup_policy_message(
+                &super::workspace_access::active_request_text(agent).unwrap_or_default(),
+            ),
             None => verifier_repair_transition_message(),
         }
     })
 }
 
 fn verifier_repair_diagnostic_policy_message(agent: &Agent) -> String {
-    let active_request = agent.active_request_text().unwrap_or_default();
+    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     let task_contract = super::task_contract::TaskContract::from_request(&active_request);
     let behavior_projection = super::required_behavior::project_behavior_contract(&task_contract);
     agent

@@ -36,7 +36,7 @@ pub(super) fn refresh_artifact_completion_satisfied(agent: &mut Agent) {
     if agent.artifact_completion_job.is_none() {
         return;
     }
-    let task_contract = match agent.active_request_text() {
+    let task_contract = match super::workspace_access::active_request_text(agent) {
         Some(req) => super::task_contract::TaskContract::from_request(&req),
         None => return,
     };
@@ -88,7 +88,9 @@ pub(super) fn record_missing_verifier_setup_failure(
         task_contract_no_verifier_note(
             attempt,
             attempt_limit,
-            agent.active_request_text().unwrap_or_default().as_str(),
+            super::workspace_access::active_request_text(agent)
+                .unwrap_or_default()
+                .as_str(),
         ),
     );
     false

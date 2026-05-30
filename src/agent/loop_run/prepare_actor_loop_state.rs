@@ -69,7 +69,7 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     // the current request key, then clear the per-turn flag.
     let promoted = match (
         agent.owned_test_verifier_missing_observed_carryover.take(),
-        agent.active_request_text(),
+        super::workspace_access::active_request_text(agent),
     ) {
         (Some(stored), Some(current)) => {
             let current_key = RequestCarryoverKey::from_request(&current);
@@ -119,8 +119,7 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     // Issue #638 (Task 1.4): clear the turn-local failure snapshot at the
     // same boundary as `repair_job` (design policy §5, A-only).
     agent.repair_failure_snapshot = None;
-    let task_contract = agent
-        .active_request_text()
+    let task_contract = super::workspace_access::active_request_text(agent)
         .map(|request| TaskContract::from_request(&request));
     if agent.session.mode_state.mode != ExecutionMode::Plan
         && let Some(contract) = task_contract.as_ref()

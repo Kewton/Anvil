@@ -40,8 +40,7 @@ pub(super) fn current_request_needs_playable_ui_quality_gate(agent: &Agent) -> b
     agent.session.mode_state.mode == ExecutionMode::Act
         && agent.session.mode_state.policy().quality_gate_enabled
         && !unsupported_ui_framework_context(agent)
-        && agent
-            .active_request_text()
+        && super::workspace_access::active_request_text(agent)
             .as_deref()
             .is_some_and(request_needs_playable_ui_quality_gate)
 }
@@ -55,7 +54,7 @@ pub(super) fn accepted_repo_change_quality_issue(
     if unsupported_ui_framework_context(agent) {
         return None;
     }
-    let request = agent.active_request_text()?;
+    let request = super::workspace_access::active_request_text(agent)?;
     let request = request.trim().to_string();
     if !request_needs_playable_ui_quality_gate(&request) {
         return None;
@@ -82,7 +81,7 @@ pub(super) fn accepted_repo_change_polish_target(agent: &mut Agent) -> Option<(S
     if unsupported_ui_framework_context(agent) {
         return None;
     }
-    let request = agent.active_request_text()?;
+    let request = super::workspace_access::active_request_text(agent)?;
     let request = request.trim().to_string();
     if !request_allows_fast_polish_fallback(&request) {
         return None;
@@ -110,8 +109,7 @@ pub(super) fn accepted_repo_change_polish_target(agent: &mut Agent) -> Option<(S
 }
 
 fn unsupported_ui_framework_context(agent: &Agent) -> bool {
-    agent
-        .active_request_text()
+    super::workspace_access::active_request_text(agent)
         .as_deref()
         .is_some_and(request_mentions_unsupported_ui_framework)
         || workspace_has_unsupported_ui_framework(&agent.work_root)
