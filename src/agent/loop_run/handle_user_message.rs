@@ -169,7 +169,7 @@ pub(super) fn handle_user_message(
             .messages
             .push(ConversationMessage::system(hint));
     }
-    let result = agent.run_turn(input, stream_output, &mut monitor);
+    let result = super::run_turn::run_turn(agent, input, stream_output, &mut monitor);
     // Issue #663 (Phase B / AD2 / DR1-001): refresh the active
     // `ArtifactCompletionJob` Satisfied state from the ledger
     // projection. This is the SSOT chokepoint — no status guard

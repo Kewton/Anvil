@@ -1,8 +1,7 @@
 use super::active_job_arbiter::{RecoveryOwner, build_active_job_selected_payload};
-use super::actor_loop_flow::{format_iteration_status, run_actor_loop};
+use super::actor_loop_flow::format_iteration_status;
 use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
-use super::interrupt::InterruptMonitor;
 use super::repair_driver::{
     VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
     verifier_repair_pass_timeout_error,
@@ -33,7 +32,7 @@ use super::small_helpers::masked_path_hash_bounded_list;
 use super::small_helpers::{
     latest_tool_result_since_last_user, raw_mode_safe_text, rfc3339_now_utc, user_interrupt_result,
 };
-use super::summary::{ExitReason, LoopResult};
+use super::summary::ExitReason;
 use super::tool_display::progress_path_display;
 use super::tool_execution::{
     failed_outcome_for_call, rejected_outcome_for_call, success_outcome_for_call,
@@ -233,64 +232,6 @@ impl Agent {
         }
     }
 
-    pub(super) fn run_turn(
-        &mut self,
-        input: &str,
-        stream_output: bool,
-        monitor: &mut InterruptMonitor,
-    ) -> LoopResult {
-        self.push_user_message(input.to_string());
-        if self.session.mode_state.mode != ExecutionMode::Plan {
-            // Issue #576: replace direct `classify_work_mode_json` + event
-            // emit with the shared `classify_with_confirmation` wrapper. The
-            // wrapper emits the existing `agent.work_mode.classified` event
-            // (now with `turn_index`) and drives the LLM second-pass via
-            // `maybe_invoke_work_mode_confirm`. Final (LLM-corrected when
-            // applicable) work_mode lives in `self.session.mode_state.work_mode`.
-            let _ =
-                super::classify_confirm_flow::classify_with_confirmation(self, input, "turn_start");
-            self.maybe_compact_session(DEFAULT_KEEP_TAIL);
-        }
-        let _ = self.refresh_plan_stage();
-
-        let mut action_expectation =
-            recovery::classify_action_expectation(input, self.session.mode_state.mode);
-        if !self.session.mode_state.policy().repo_edit_required {
-            action_expectation = recovery::ActionExpectation::None;
-        }
-        let requires_action = action_expectation != recovery::ActionExpectation::None;
-
-        // [Issue #556] pre-turn photon context_pack hook
-        if self.session.mode_state.mode != ExecutionMode::Plan {
-            super::photon_feedback_derive::invoke_photon_context_pack(self);
-        } else if self.photon.is_some() {
-            // Issue #594: surface plan-mode skip via /photon-why.
-            self.last_photon_context_pack_status =
-                crate::agent::loop_run::PhotonContextPackStatus::PlanMode;
-            // CB-003 (Issue #592): Plan-mode skip path must also clear stale
-            // inject tracking so a previous Act-turn's seed ids do not survive
-            // into a Plan turn and become "visible" to `/photon-thumbs-*`.
-            self.last_injected_summary_ids.clear();
-            self.last_injected_summary_turn_index = None;
-            log_llm_event(
-                "agent.photon_context_pack.skipped",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "reason": "plan_mode",
-                }),
-            );
-        }
-
-        run_actor_loop(
-            self,
-            action_expectation,
-            requires_action,
-            stream_output,
-            false,
-            monitor,
-        )
-    }
     pub(super) fn tool_policy_violation_exit_reason(recovery_owner: RecoveryOwner) -> ExitReason {
         if recovery_owner == RecoveryOwner::MissingVerifierJob {
             ExitReason::MissingVerification
@@ -3811,7 +3752,7 @@ impl Agent {
             .push(ConversationMessage::system(note));
     }
 
-    fn push_user_message(&mut self, content: String) {
+    pub(super) fn push_user_message(&mut self, content: String) {
         self.session
             .working_memory
             .set_active_task(Some(content.clone()));
