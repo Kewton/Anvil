@@ -137,6 +137,12 @@ mod build_request_messages;
 // helpers as free fns over `&Agent`. Replaces former `impl Agent`
 // methods. `pub(super)` limited / no facade re-export (DR3-001).
 mod effective_tool_policy_flow;
+// Per-turn entry point extracted from `turn.rs` (parent #680). Hosts
+// `handle_user_message` as a free fn over `&mut Agent`. Owns the per-
+// turn state reset (CLAUDE.md per-turn rule) + dispatch to
+// `Agent::run_turn` + post-turn ledger refresh + job report emit.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod handle_user_message;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

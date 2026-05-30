@@ -637,7 +637,7 @@ impl Agent {
             "The user approved the plan and said: {trigger_text}\nExecute the approved plan now. Follow this accepted plan summary:\n\n{plan_summary}\n\n{profile_guidance} Start with one small, self-contained repository change, then continue until the requested work is complete."
         );
         println!("{status}");
-        match self.handle_user_message(&exec_prompt, stream_output) {
+        match super::handle_user_message::handle_user_message(self, &exec_prompt, stream_output) {
             Ok((prose, stats)) => {
                 if !stream_output {
                     if crate::tui::markdown::markdown_fully_disabled() {
@@ -1354,7 +1354,8 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             } else {
                 trimmed.to_string()
             };
-            match self.handle_user_message(&user_input, stream_output) {
+            match super::handle_user_message::handle_user_message(self, &user_input, stream_output)
+            {
                 Ok((prose, stats)) => {
                     if !stream_output {
                         // Issue #431: non-streaming assistant prose also goes
