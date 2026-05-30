@@ -1137,7 +1137,7 @@ pub(super) fn invoke_photon_evaluate(agent: &mut Agent) {
         repo_edit_succeeded_this_turn: agent.session.repo_edit_succeeded_this_turn,
         // DR3-001 SSOT: AnswerOnly check goes through the helper, never
         // a direct `mode_state.work_mode == WorkMode::AnswerOnly` compare.
-        work_mode_is_answer_only: agent.answer_only_mode_active(),
+        work_mode_is_answer_only: super::tool_policy_decisions::answer_only_mode_active(agent),
         verifier_exit_zero_this_turn: photon_verifier_exit_zero_this_turn(agent),
     };
     let PhotonFeedbackOutcome {
