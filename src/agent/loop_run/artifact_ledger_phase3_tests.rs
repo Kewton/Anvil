@@ -317,7 +317,8 @@ fn owned_test_artifacts_for_verifier_matches_issue651_behavior() {
 
     let contract =
         TaskContract::from_request("FastAPIでCRUD APIを作成してREADMEとテストも追加してください");
-    let owned = agent.owned_test_artifacts_for_verifier(&contract);
+    let owned =
+        super::owned_test_projection::owned_test_artifacts_for_verifier(&mut agent, &contract);
     assert!(
         owned.iter().any(|p| p == "tests/test_match.py"),
         "Issue #651 contract: seeded Test edit must surface in owned slice; got {owned:?}"
@@ -349,9 +350,11 @@ fn owned_test_artifacts_for_verifier_signature_unchanged() {
     // Compile-time witness via a function-pointer cast: the type ascribed
     // here is the Phase-2 signature. If `owned_test_artifacts_for_verifier`
     // changes to a different shape (different receiver mut-ness, different
-    // arg/return types), this assignment fails to compile.
+    // arg/return types), this assignment fails to compile. (Parent #680:
+    // the method was promoted to a free fn in `owned_test_projection`; the
+    // signature itself is unchanged.)
     let signature_witness: fn(&mut Agent, &TaskContract) -> Vec<String> =
-        Agent::owned_test_artifacts_for_verifier;
+        super::owned_test_projection::owned_test_artifacts_for_verifier;
     let result = signature_witness(&mut agent, &contract);
     // The fixture has no edits or workspace files, so the slice is empty.
     assert!(

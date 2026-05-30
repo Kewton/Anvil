@@ -38,7 +38,7 @@ use super::verifier_orchestration::{
 };
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
-use crate::logging::{log_llm_event, stable_path_hash};
+use crate::logging::stable_path_hash;
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::WorkMode;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
@@ -1096,90 +1096,6 @@ impl Agent {
     ) -> super::task_workspace_scope::TaskWorkspaceScope {
         let request = self.active_request_text().unwrap_or_default();
         super::task_workspace_scope::TaskWorkspaceScope::detect(&self.work_root, &request)
-    }
-
-    /// Issue #651 Phase 5: produce the SSOT `owned_test_artifacts` slice
-    /// for the given `TaskContract`. Always classifies via
-    /// `artifact_ownership::owned_test_artifacts`, with the closure
-    /// predicates pointing back at `turn_edited_relative_paths` /
-    /// `repo_edit_has_post_scaffold_delta` so the planner-side ownership
-    /// signals stay consistent across all call sites (DR1-008).
-    ///
-    /// Issue #659 (Task 3.3): internal implementation now reads the
-    /// `ArtifactLedger` projection
-    /// (`artifact_ledger::owned_test_artifacts(ArtifactRole::Test)`) in
-    /// parallel with the legacy `artifact_ownership::owned_test_artifacts`
-    /// derivation. The two should agree by construction (write-through
-    /// adapter from Task 2.5 keeps both sources in lockstep); when they
-    /// diverge the adapter-period contract (Phase 6.1) preserves legacy
-    /// authority — we emit a masked
-    /// `agent.artifact_ledger.divergence_detected` event and return the
-    /// legacy slice. The caller signature (`&mut self`,
-    /// `&TaskContract`, `Vec<String>`) is unchanged so every existing
-    /// consumer (`success.rs`, `turn.rs::run_task_contract_verifier_once`,
-    /// `task_contract_recovery_action`) remains source-compatible.
-    pub(super) fn owned_test_artifacts_for_verifier(
-        &mut self,
-        contract: &super::task_contract::TaskContract,
-    ) -> Vec<String> {
-        let scope = self.current_workspace_scope();
-        // task_contract_artifact_states has the side effect of seeding the
-        // ledger with Existing / Scaffold baseline events. We MUST call it
-        // before reading the ledger projection so the Phase 3 path sees the
-        // same baseline the legacy derivation sees.
-        let states =
-            super::artifact_state_projection::task_contract_artifact_states(self, contract);
-        let legacy = super::artifact_ownership::owned_test_artifacts(
-            &states,
-            &self.work_root,
-            &scope,
-            &|path| self.turn_edited_relative_paths.contains(path),
-            &|path| super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, path),
-        );
-        let ledger = self
-            .artifact_ledger
-            .owned_test_artifacts(super::task_contract::ArtifactRole::Test);
-        if legacy != ledger {
-            self.emit_owned_test_artifacts_projection_divergence(&legacy, &ledger);
-        }
-        ledger
-    }
-
-    /// Issue #659 (Task 3.3): masked observability emit when the legacy and
-    /// ledger-projection derivations of `owned_test_artifacts_for_verifier`
-    /// disagree. v0.4.8 makes the ledger projection the production authority,
-    /// so `authority="ledger"` is emitted for these projection-level rows.
-    /// No raw paths are emitted; only role / count metadata.
-    ///
-    /// Issue #659 PR-001: also emit bounded masked path-hash lists (max
-    /// 16 entries each, deterministic order via BTreeSet) so dataset
-    /// consumers can join divergence rows back to per-event rows.
-    fn emit_owned_test_artifacts_projection_divergence(
-        &self,
-        legacy: &[String],
-        ledger: &[String],
-    ) {
-        let legacy_set: std::collections::BTreeSet<&str> =
-            legacy.iter().map(String::as_str).collect();
-        let ledger_set: std::collections::BTreeSet<&str> =
-            ledger.iter().map(String::as_str).collect();
-        let legacy_path_hashes =
-            super::artifact_ledger::bounded_masked_path_hashes(legacy_set.iter().copied());
-        let ledger_path_hashes =
-            super::artifact_ledger::bounded_masked_path_hashes(ledger_set.iter().copied());
-        log_llm_event(
-            "agent.artifact_ledger.divergence_detected",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "turn_index": self.current_turn_index,
-                "authority": "ledger",
-                "projection": "owned_test_artifacts_for_verifier",
-                "legacy_count": legacy.len() as u32,
-                "ledger_count": ledger.len() as u32,
-                "legacy_path_hashes": legacy_path_hashes,
-                "ledger_path_hashes": ledger_path_hashes,
-            }),
-        );
     }
 
     fn answer_only_policy_error(

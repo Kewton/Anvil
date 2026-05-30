@@ -74,7 +74,8 @@ pub(super) fn task_contract_recovery_action(
     // Issue #651 Phase 5: feed the SSOT `owned_test_artifacts` slice
     // into the planner so the SafeStop gate (test_execution_required
     // && owned_test_artifacts.is_empty()) can fire.
-    let owned_test_artifacts = agent.owned_test_artifacts_for_verifier(contract);
+    let owned_test_artifacts =
+        super::owned_test_projection::owned_test_artifacts_for_verifier(agent, contract);
     let action = super::task_contract::plan_artifact_recovery(
         super::task_contract::ArtifactRecoveryInputs {
             contract,
