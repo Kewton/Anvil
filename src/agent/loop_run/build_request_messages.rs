@@ -128,7 +128,7 @@ fn append_general_request_context_messages(
             recovery::empty_workspace_scaffold_note(),
         ));
     }
-    if let Some(memory_message) = agent.working_memory_message() {
+    if let Some(memory_message) = super::working_memory_messages::working_memory_message(agent) {
         messages.push(memory_message);
     }
     let case_injection = super::case_record_flow::try_inject_case_retrieval_message(agent);
@@ -140,7 +140,8 @@ fn append_general_request_context_messages(
         messages.push(inj.message.clone());
     }
     maybe_send_request_context_pack(agent, &case_injection, &anti_injection);
-    if let Some(repo_context_message) = agent.repo_context_message() {
+    if let Some(repo_context_message) = super::working_memory_messages::repo_context_message(agent)
+    {
         messages.push(repo_context_message);
     }
 }
