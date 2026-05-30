@@ -2995,18 +2995,21 @@ pub(super) fn record_controller_verifier_repair_invalid(
 }
 
 pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnosticPassOutcome {
-    let prepared = match agent.prepare_verifier_diagnostic_pass() {
+    let prepared = match super::verifier_diagnostic_flow::prepare_verifier_diagnostic_pass(agent) {
         Ok(prepared) => prepared,
         Err(outcome) => return outcome,
     };
-    let reply_content = match agent.request_verifier_diagnostic_reply(&prepared) {
+    let reply_content = match super::verifier_diagnostic_flow::request_verifier_diagnostic_reply(
+        agent, &prepared,
+    ) {
         Ok(reply_content) => reply_content,
         Err(outcome) => return outcome,
     };
     let Some(mut parsed) =
         super::verifier_assessment_parser::parse_verifier_repair_assessment_reply(&reply_content)
     else {
-        return agent.handle_verifier_diagnostic_failure(
+        return super::verifier_diagnostic_flow::handle_verifier_diagnostic_failure(
+            agent,
             "diagnostic reply was malformed".to_string(),
             prepared.attempt_spec.role,
         );
@@ -3093,7 +3096,8 @@ pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnos
     );
     let has_target = assessment.repair_target_hint.is_some();
     if !has_target {
-        return agent.handle_verifier_diagnostic_failure(
+        return super::verifier_diagnostic_flow::handle_verifier_diagnostic_failure(
+            agent,
             "diagnostic did not identify a safe repair target".to_string(),
             prepared.attempt_spec.role,
         );

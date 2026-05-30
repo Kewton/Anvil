@@ -40,22 +40,18 @@ use super::tool_policy::{
     effective_tool_policy_error_for_call_with_scope, focused_edit_policy_violation_feedback_note,
     workspace_relative_path_for_tool_arg,
 };
-use super::verifier_diagnostic_attempt::{
-    VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, verifier_diagnostic_attempt_spec,
-};
 use super::verifier_orchestration::{
-    PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass, VerifierDiagnosticPassOutcome,
-    VerifierRepairAttemptProgress, build_verifier_exit_zero_evidence,
+    PreparedVerifierRepairPass, VerifierRepairAttemptProgress, build_verifier_exit_zero_evidence,
     emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event,
     synthesized_missing_implementation_target_path_for_request, task_contract_no_verifier_note,
     task_contract_verifier_targeted_edit_required_note,
-    validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_messages,
-    verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
-    verifier_repair_intent_limits, verifier_repair_pass_messages,
-    verifier_repair_pass_request_error_message, verifier_repair_safe_stop_message,
-    verifier_repair_target_display, verifier_repair_transition_message,
-    verifier_repair_unsafe_target_message, verifier_setup_policy_message,
+    validate_verifier_repair_intents_with_accepted_plan, verifier_repair_context_diagnostics,
+    verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
+    verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
+    verifier_repair_safe_stop_message, verifier_repair_target_display,
+    verifier_repair_transition_message, verifier_repair_unsafe_target_message,
+    verifier_setup_policy_message,
 };
 use super::verifier_repair_shadow::legacy_repair_brief_input_from_assessment;
 use super::workspace_candidates::existing_workspace_candidate_for_role_in_scope;
@@ -87,7 +83,6 @@ pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
 pub(super) const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
 pub(super) const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
 pub(super) const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
-const VERIFIER_DIAGNOSTIC_MAX_PREDICT: usize = 2_048;
 pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
 
 #[derive(Debug, Clone, Copy)]
@@ -625,198 +620,6 @@ impl Agent {
             | super::repair_job::RepairNextAction::SafeStop { .. }
             | super::repair_job::RepairNextAction::VerifiedDone => false,
         }
-    }
-
-    pub(super) fn prepare_verifier_diagnostic_pass(
-        &mut self,
-    ) -> Result<PreparedVerifierDiagnosticPass, VerifierDiagnosticPassOutcome> {
-        self.reset_verifier_diagnostic_state_if_needed();
-        let Some(context) = self.repair_job.clone() else {
-            return Err(VerifierDiagnosticPassOutcome::Skipped);
-        };
-        if context.diagnostic_unavailable || context.assessment.is_some() {
-            return Err(VerifierDiagnosticPassOutcome::Skipped);
-        }
-        let Some(attempt_spec) = verifier_diagnostic_attempt_spec(
-            &self.models.main,
-            self.models.sidecar.as_deref(),
-            context.assessment_attempts,
-        ) else {
-            let error = context
-                .diagnostic_error
-                .clone()
-                .unwrap_or_else(|| "diagnostic attempts exhausted".to_string());
-            self.record_verifier_diagnostic_unavailable(error.clone());
-            return Err(VerifierDiagnosticPassOutcome::Unavailable { error });
-        };
-        if let Some(current) = self.repair_job.as_mut() {
-            current.diagnostic_attempted = true;
-            current.assessment_attempts = current.assessment_attempts.saturating_add(1);
-        }
-        let active_request = self.active_request_text().unwrap_or_default();
-        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
-        let behavior_projection =
-            super::required_behavior::project_behavior_contract(&task_contract);
-        super::active_job_emit::emit_behavior_contract_projected_if_changed(
-            self,
-            behavior_projection.as_ref(),
-            super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_DIAGNOSTIC,
-        );
-        Ok(PreparedVerifierDiagnosticPass {
-            context,
-            attempt_spec,
-            active_request,
-            behavior_projection,
-        })
-    }
-
-    fn reset_verifier_diagnostic_state_if_needed(&mut self) {
-        let stale_advance = self.repair_job.as_ref().is_some_and(|job| {
-            super::repair_job::has_stale_assessment_after_cluster_advance(job, &self.work_root)
-        });
-        let target_exhausted = self
-            .repair_job
-            .as_ref()
-            .is_some_and(|job| job.needs_diagnostic_after_target_exhaustion());
-        if (stale_advance || target_exhausted)
-            && let Some(current) = self.repair_job.as_mut()
-        {
-            current.assessment = None;
-            current.diagnostic_attempted = false;
-            if target_exhausted {
-                current.repair_target_hint = None;
-                current.assessment_bound_cluster_id = None;
-            }
-        }
-    }
-
-    pub(super) fn request_verifier_diagnostic_reply(
-        &mut self,
-        prepared: &PreparedVerifierDiagnosticPass,
-    ) -> Result<String, VerifierDiagnosticPassOutcome> {
-        let messages = verifier_diagnostic_messages(
-            &self.work_root,
-            &prepared.context,
-            &prepared.active_request,
-            prepared.behavior_projection.as_ref(),
-        );
-        let diagnostic_client = match self.client.clone_with_overrides(
-            prepared.attempt_spec.timeout_secs,
-            VERIFIER_DIAGNOSTIC_MAX_PREDICT,
-        ) {
-            Ok(client) => client,
-            Err(err) => {
-                return Err(self.handle_verifier_diagnostic_failure(
-                    format!("client clone failed: {err}"),
-                    prepared.attempt_spec.role,
-                ));
-            }
-        };
-        let reply = match diagnostic_client
-            .chat_text_json_control(&prepared.attempt_spec.model, &messages)
-        {
-            Ok(reply) => reply,
-            Err(err) => {
-                return Err(
-                    self.handle_verifier_diagnostic_failure(err, prepared.attempt_spec.role)
-                );
-            }
-        };
-        if !reply.tool_calls.is_empty() {
-            return Err(self.handle_verifier_diagnostic_failure(
-                "diagnostic reply contained unexpected tool calls".to_string(),
-                prepared.attempt_spec.role,
-            ));
-        }
-        Ok(reply.content)
-    }
-
-    pub(super) fn handle_verifier_diagnostic_failure(
-        &mut self,
-        error: String,
-        model_role: &'static str,
-    ) -> VerifierDiagnosticPassOutcome {
-        let compact = self.record_verifier_diagnostic_failure(error, model_role);
-        let attempts_done = self
-            .repair_job
-            .as_ref()
-            .map(|context| context.assessment_attempts)
-            .unwrap_or(VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT);
-        if verifier_diagnostic_attempt_spec(
-            &self.models.main,
-            self.models.sidecar.as_deref(),
-            attempts_done,
-        )
-        .is_some()
-        {
-            VerifierDiagnosticPassOutcome::RetryPending { error: compact }
-        } else {
-            self.record_verifier_diagnostic_unavailable(compact.clone());
-            VerifierDiagnosticPassOutcome::Unavailable { error: compact }
-        }
-    }
-
-    fn record_verifier_diagnostic_failure(
-        &mut self,
-        error: String,
-        model_role: &'static str,
-    ) -> String {
-        // Issue #637 (CB-002): sanitize at the RepairJob store boundary so
-        // the SSOT pipeline (mask_secrets + mask_header_family +
-        // control-char neutralization) is applied before the text reaches
-        // prompt payloads / log events.
-        let error = super::repair_job::sanitize_repair_job_text_with_char_cap(&error, 180);
-        if let Some(context) = self.repair_job.as_mut() {
-            context.repair_target_hint = None;
-            context.assessment = None;
-            context.diagnostic_error = Some(error.clone());
-            context.apply_event(super::repair_job::RepairJobEvent::DiagnosticMalformed);
-        }
-        // Issue #638 (CB-001 reflected): also refresh the bounded snapshot
-        // on every retry-pending diagnostic failure. Without this, attempts
-        // remaining mid-loop leave `repair_failure_snapshot` stale and the
-        // production wiring acceptance condition (work-plan Task 1.4) only
-        // holds at terminal `record_verifier_diagnostic_unavailable`.
-        self.repair_failure_snapshot = self.repair_job.as_ref().map(|job| job.failure_snapshot());
-        log_llm_event(
-            "agent.verifier_diagnostic.failed",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "role": model_role,
-                "error": error,
-            }),
-        );
-        error
-    }
-
-    fn record_verifier_diagnostic_unavailable(&mut self, error: String) {
-        // Issue #637 (CB-002): same SSOT sanitization as
-        // `record_verifier_diagnostic_failure`. We deliberately call the
-        // sanitizer (not the raw `compact_verifier_failure_text`) so the
-        // store-boundary invariant holds for every diagnostic_error write.
-        let error = super::repair_job::sanitize_repair_job_text_with_char_cap(&error, 180);
-        if let Some(context) = self.repair_job.as_mut() {
-            context.diagnostic_unavailable = true;
-            context.diagnostic_error = Some(error.clone());
-            context.apply_event(super::repair_job::RepairJobEvent::DiagnosticUnavailable);
-        }
-        // Issue #638 (Task 1.4): capture a bounded snapshot when diagnostic
-        // becomes unavailable. Turn-local only — not pushed to session.messages
-        // (design policy §5, A-only). Re-runs SSOT sanitizers as defence-in-depth.
-        self.repair_failure_snapshot = self.repair_job.as_ref().map(|job| job.failure_snapshot());
-        log_llm_event(
-            "agent.verifier_diagnostic.unavailable",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "error": error,
-            }),
-        );
-        // Issue #654: also emit the bounded structured safe stop report so
-        // downstream consumers (`/bug-fix`, semantic repair plan) can see
-        // role / expected target / actual actions / hypothesis ledger in a
-        // single structured event. Per-StopReason dedup is enforced by
-        // `record_safe_stop_report`.
-        super::safe_stop_emit::emit_safe_stop_report_for_diagnostic_target_missing(self);
     }
 
     pub(super) fn verifier_repair_pass_wall_clock_timeout_error(
