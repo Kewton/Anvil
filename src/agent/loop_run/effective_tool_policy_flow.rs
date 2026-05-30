@@ -148,7 +148,7 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
     }
 
     // Priority 6: LocalLlmSmallEditAfterRead.
-    if let Some(target) = agent.local_llm_small_edit_target() {
+    if let Some(target) = super::tool_prep::local_llm_small_edit_target(agent) {
         push_focused_edit_candidate(
             agent,
             &mut candidates,

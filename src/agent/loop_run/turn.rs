@@ -5,18 +5,13 @@ use super::plan_mode_helpers::assistant_model_for_mode;
 use super::small_helpers::raw_mode_safe_text;
 use super::summary::ExitReason;
 use super::tool_history::{
-    focused_edit_target_already_read, focused_read_target_for_directory,
-    has_successful_non_plan_repo_edit, is_preferred_read_edit_target, latest_user_turn_slice,
+    focused_read_target_for_directory, is_preferred_read_edit_target, latest_user_turn_slice,
 };
-use super::tool_policy::EffectiveToolPolicy;
 use super::verifier_orchestration::task_contract_no_verifier_note;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
-use crate::model_capabilities::model_capabilities;
-use crate::modes::plan_act::WorkMode;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::store::ScaffoldArtifactFileSnapshot;
-use crate::tools::registry::ToolSpec;
 use std::path::{Path, PathBuf};
 
 use super::quality::repo_change_request_text;
@@ -213,68 +208,6 @@ impl Agent {
             &self.models.main,
             self.plan_model_override.as_deref(),
         )
-    }
-
-    pub(super) fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
-        let mut specs = self.tool_registry.specs().to_vec();
-        if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt() {
-            specs.retain(|spec| allowed_tools.contains(&spec.function.name.as_str()));
-        }
-        specs
-    }
-
-    pub(super) fn local_llm_small_edit_target(&self) -> Option<PathBuf> {
-        if !model_capabilities(&self.current_assistant_model()).read_after_small_edit_protocol {
-            return None;
-        }
-        if self.session.mode_state.mode != ExecutionMode::Act
-            || !self.session.mode_state.policy().repo_edit_required
-            || !self.active_task_expects_repo_change()
-        {
-            return None;
-        }
-        if has_successful_non_plan_repo_edit(
-            &self.session.messages,
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-        ) {
-            return None;
-        }
-        if let Some(target) = super::artifact_recovery_flow::artifact_recovery_target_path(self) {
-            return focused_edit_target_already_read(
-                &self.session.messages,
-                &target,
-                &self.work_root,
-            )
-            .then_some(target);
-        }
-        let target =
-            latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root)?;
-        focused_edit_target_already_read(&self.session.messages, &target, &self.work_root)
-            .then_some(target)
-    }
-
-    pub(super) fn mode_policy_message(&self) -> Option<ConversationMessage> {
-        let work_mode = self.session.mode_state.work_mode;
-        let text = match work_mode {
-            WorkMode::Auto => return None,
-            WorkMode::TypeScriptUi => {
-                "[Mode Policy] Work mode is TypeScript UI. Prefer the existing JavaScript or TypeScript framework when present. Do not switch to Python or documentation-only output unless the user asks."
-            }
-            WorkMode::Python => {
-                "[Mode Policy] Work mode is Python. Use Python-oriented files and verification. Do not create TypeScript, React, Next.js, Nuxt, or browser UI scaffolds unless the user asks."
-            }
-            WorkMode::Docs => {
-                "[Mode Policy] Work mode is documentation. Edit or create documentation files only unless code changes are explicitly requested."
-            }
-            WorkMode::AnswerOnly => {
-                "[Mode Policy] Work mode is answer-only/read-only. You may inspect files if needed, and may run an explicitly requested local script or read-only command, but do not require or perform repository edits."
-            }
-            WorkMode::GenericCode | WorkMode::Unknown => {
-                "[Mode Policy] Work mode is generic code. Follow the repository stack and avoid TypeScript UI deterministic fallback unless the request explicitly asks for a browser UI."
-            }
-        };
-        Some(ConversationMessage::system(text.to_string()))
     }
 
     /// Issue #646: build the active `TaskWorkspaceScope` for the current

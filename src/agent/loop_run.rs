@@ -340,6 +340,13 @@ mod forced_small_edit;
 // a behavior-coverage snippet for `plan_artifact_recovery`. Free fn
 // over `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod post_edit_excerpt;
+// Tool-prep helpers extracted from `turn.rs` (parent #680). Hosts
+// `tool_specs_for_policy` (filter registered tool specs by policy
+// allowlist), `local_llm_small_edit_target` (small-edit Edit target
+// for local LLMs), and `mode_policy_message` (per-`WorkMode`
+// `[Mode Policy]` system note; Auto returns None). Free fns over
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod tool_prep;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
