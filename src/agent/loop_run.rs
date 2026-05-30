@@ -251,6 +251,14 @@ mod recovery_messages;
 // Free fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod task_contract_recovery;
+// `owned_test_artifacts_for_verifier` projection extracted from
+// `turn.rs` (parent #680). Hosts the Phase-3 (Issue #659 Task 3.3)
+// verifier-binding Owned-test-artifacts projection: legacy + ledger
+// derivations with masked `agent.artifact_ledger.divergence_detected`
+// emit when they disagree; returns the ledger projection as the v0.4.8
+// production authority. Free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod owned_test_projection;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
