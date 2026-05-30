@@ -134,9 +134,24 @@ fn legacy_set_matches_ledger_projection() {
     std::fs::write(work_root.join("src/lib.rs"), "").unwrap();
 
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_a.py", ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit("tests/test_b.py", ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit("src/lib.rs", ArtifactRole::Implementation, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_a.py",
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_b.py",
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "src/lib.rs",
+        ArtifactRole::Implementation,
+        &scope,
+    );
 
     let legacy: std::collections::BTreeSet<String> =
         agent.turn_edited_relative_paths.iter().cloned().collect();
@@ -166,7 +181,12 @@ fn caller_signature_unchanged_for_turn_edited_relative_paths() {
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_sig.py"), "").unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_sig.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_sig.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Compile-time witness: the field must keep its HashSet<String>
     // shape. If the type changes (e.g. to `BTreeSet<String>` or behind a
@@ -224,7 +244,12 @@ fn task_contract_artifact_states_uses_ledger_projection() {
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_ledger.py"), "x = 1\n").unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_ledger.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_ledger.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Use a Build-class contract so `required_artifacts` includes Test.
     let contract =
@@ -275,7 +300,12 @@ fn owned_test_artifacts_for_verifier_matches_issue651_behavior() {
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_match.py"), "x = 1\n").unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_match.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_match.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     let contract =
         TaskContract::from_request("FastAPIでCRUD APIを作成してREADMEとテストも追加してください");

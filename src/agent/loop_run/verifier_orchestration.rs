@@ -2729,7 +2729,8 @@ pub(super) fn finish_structured_task_contract_verifier_selection(
         super::artifact_ledger::VerifierOutcome::Fail
     };
     let scope_for_seed = workspace_scope.clone();
-    agent.seed_artifact_ledger_verifier_observation(
+    super::artifact_ledger_state::seed_artifact_ledger_verifier_observation(
+        agent,
         &selection.bound_test_artifacts_paths,
         last_outcome,
         &scope_for_seed,

@@ -153,8 +153,14 @@ fn nested_test_paths_classify_as_owned_via_generic_predicates() {
     std::fs::write(work_root.join("crates/foo/tests/test_foo.rs"), "").unwrap();
 
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("app/tests/test_app.py", ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit(
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "app/tests/test_app.py",
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
         "crates/foo/tests/test_foo.rs",
         ArtifactRole::Test,
         &scope,
@@ -337,7 +343,12 @@ fn log_llm_event_masks_artifact_ledger_event_recorded_payload() {
     // path. The payload contract (§7.1) is: raw `path` MUST NOT appear
     // in the payload — only `path_hash` (deterministic hash of the
     // mask_secrets'd value) and `path_len` (length).
-    agent.seed_artifact_ledger_repo_edit("tests/test_secret.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_secret.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Read back every `event_recorded` log line and check that the raw
     // workspace path does not appear in the payload as a leaf string —
@@ -444,9 +455,24 @@ fn event_recorded_emitted_once_per_admitted_event() {
         })
         .collect();
 
-    agent.seed_artifact_ledger_repo_edit(&p1, ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit(&p2, ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit(&p3, ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        &p1,
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        &p2,
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        &p3,
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Count event_recorded entries whose `path_hash` matches one of the
     // three we seeded. Each successful admit must emit exactly one.
@@ -526,7 +552,8 @@ fn owned_projection_for_nested_test_path_returns_owned_ownership() {
     std::fs::write(work_root.join("crates/bar/tests/test_bar.rs"), "").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_repo_edit(
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
         "crates/bar/tests/test_bar.rs",
         ArtifactRole::Test,
         &scope,

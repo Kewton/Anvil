@@ -3918,8 +3918,8 @@ pub(super) fn run_actor_loop(
     // assertion runs adjacent so the adapter-period contract
     // (`turn_edited_relative_paths` == ledger RepoEdit projection) is
     // pinned at the same boundary that the summary publishes.
-    agent.assert_dual_source_alignment_at_turn_end();
-    agent.record_turn_end_artifact_ledger_summary();
+    super::artifact_ledger_state::assert_dual_source_alignment_at_turn_end(agent);
+    super::artifact_ledger_state::record_turn_end_artifact_ledger_summary(agent);
 
     log_llm_event(
         "agent.milestone.turn_completed",

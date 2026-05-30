@@ -182,7 +182,7 @@ fn handle_user_message_clears_ledger_at_turn_start() {
     // Drive a single `clear_per_turn_ledger_state` call (the same helper
     // `handle_user_message` invokes) so the per-turn reset can be verified
     // without spinning up a real Ollama roundtrip.
-    agent.clear_per_turn_ledger_state();
+    super::artifact_ledger_state::clear_per_turn_ledger_state(&mut agent);
     assert_eq!(agent.artifact_ledger.event_count(), 0);
     assert_eq!(agent.artifact_ledger.dropped_count(), 0);
     assert!(!agent.artifact_ledger.overflowed());
@@ -192,7 +192,7 @@ fn handle_user_message_clears_ledger_at_turn_start() {
 fn turn_summary_emitted_once_at_turn_end() {
     let session_id = unique_session_id("summary-once");
     let (mut agent, dir) = build_agent(&session_id);
-    agent.clear_per_turn_ledger_state();
+    super::artifact_ledger_state::clear_per_turn_ledger_state(&mut agent);
     let work_root = dir.path();
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_b.py"), "").unwrap();
@@ -210,7 +210,7 @@ fn turn_summary_emitted_once_at_turn_end() {
         &session_id,
     )
     .len();
-    agent.record_turn_end_artifact_ledger_summary();
+    super::artifact_ledger_state::record_turn_end_artifact_ledger_summary(&agent);
     let after_count = read_log_events_by_event_name_and_session(
         "agent.artifact_ledger.turn_summary",
         &session_id,
@@ -238,8 +238,18 @@ fn existing_seed_invokes_record_existing_event_per_required_artifact() {
     std::fs::write(work_root.join("src/lib.rs"), "").unwrap();
 
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_existing("tests/test_c.py", ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_existing("src/lib.rs", ArtifactRole::Implementation, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_existing(
+        &mut agent,
+        "tests/test_c.py",
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_existing(
+        &mut agent,
+        "src/lib.rs",
+        ArtifactRole::Implementation,
+        &scope,
+    );
 
     let count = agent.artifact_ledger.event_count();
     assert!(count >= 2, "expected at least 2 events, got {count}");
@@ -254,7 +264,12 @@ fn existing_seed_is_idempotent_across_evaluations() {
     let scope = single_root_scope();
 
     for _ in 0..5 {
-        agent.seed_artifact_ledger_existing("README.md", ArtifactRole::UsageDocs, &scope);
+        super::artifact_ledger_state::seed_artifact_ledger_existing(
+            &mut agent,
+            "README.md",
+            ArtifactRole::UsageDocs,
+            &scope,
+        );
     }
     assert_eq!(
         agent.artifact_ledger.event_count(),
@@ -273,7 +288,12 @@ fn existing_seed_ignores_controller_owned_state() {
     std::fs::write(work_root.join(rel), "# generated\n").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_existing(rel, ArtifactRole::UsageDocs, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_existing(
+        &mut agent,
+        rel,
+        ArtifactRole::UsageDocs,
+        &scope,
+    );
 
     assert_eq!(
         agent.artifact_ledger.event_count(),
@@ -295,7 +315,13 @@ fn scaffold_seed_passes_post_scaffold_delta() {
     std::fs::write(work_root.join("app/main.py"), "").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_scaffold("app/main.py", ArtifactRole::Implementation, true, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_scaffold(
+        &mut agent,
+        "app/main.py",
+        ArtifactRole::Implementation,
+        true,
+        &scope,
+    );
     assert_eq!(agent.artifact_ledger.event_count(), 1);
 }
 
@@ -308,8 +334,20 @@ fn scaffold_unchanged_retains_baseline_with_delta_false() {
     std::fs::write(work_root.join("app/cfg.py"), "").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_scaffold("app/cfg.py", ArtifactRole::Implementation, false, &scope);
-    agent.seed_artifact_ledger_scaffold("app/cfg.py", ArtifactRole::Implementation, false, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_scaffold(
+        &mut agent,
+        "app/cfg.py",
+        ArtifactRole::Implementation,
+        false,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_scaffold(
+        &mut agent,
+        "app/cfg.py",
+        ArtifactRole::Implementation,
+        false,
+        &scope,
+    );
     assert_eq!(
         agent.artifact_ledger.event_count(),
         1,
@@ -327,7 +365,13 @@ fn scaffold_seed_ignores_controller_owned_state() {
     std::fs::write(work_root.join(rel), "print('generated')\n").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_scaffold(rel, ArtifactRole::Implementation, true, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_scaffold(
+        &mut agent,
+        rel,
+        ArtifactRole::Implementation,
+        true,
+        &scope,
+    );
 
     assert_eq!(
         agent.artifact_ledger.event_count(),
@@ -349,7 +393,12 @@ fn repo_edit_seed_synchronizes_legacy_set() {
     std::fs::write(work_root.join("tests/test_sync.py"), "").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_repo_edit("tests/test_sync.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_sync.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     assert!(
         agent
@@ -373,7 +422,12 @@ fn repo_edit_seed_ignores_controller_owned_state() {
     std::fs::write(work_root.join(rel), "").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_repo_edit(rel, ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        rel,
+        ArtifactRole::Test,
+        &scope,
+    );
 
     assert!(
         !agent.turn_edited_relative_paths.contains(rel),
@@ -418,7 +472,12 @@ fn repo_edit_no_op_does_not_seed_ledger() {
     // Drive a control call so the test isn't vacuous: the helper *does*
     // populate both sources when actually invoked, proving the absence
     // above is due to the missing call, not a silent rejection.
-    agent.seed_artifact_ledger_repo_edit("src/noop.rs", ArtifactRole::Implementation, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "src/noop.rs",
+        ArtifactRole::Implementation,
+        &scope,
+    );
     assert!(agent.artifact_ledger.event_count() >= 1);
     assert!(agent.turn_edited_relative_paths.contains("src/noop.rs"));
 }
@@ -437,7 +496,12 @@ fn verifier_observation_recorded_for_bound_path() {
     let scope = single_root_scope();
 
     let bound_paths = vec!["tests/test_bound.py".to_string()];
-    agent.seed_artifact_ledger_verifier_observation(&bound_paths, VerifierOutcome::Pass, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_verifier_observation(
+        &mut agent,
+        &bound_paths,
+        VerifierOutcome::Pass,
+        &scope,
+    );
     let obs = agent
         .artifact_ledger
         .verifier_observation_for("tests/test_bound.py")
@@ -461,7 +525,12 @@ fn verifier_observation_skipped_for_legacy_path() {
     // Legacy / unbound verifier: caller passes an empty path list because
     // no path-binding occurred (e.g. legacy `AutoTestRunner::run`).
     // Projection must interpret absence as NotRun (i.e. no record).
-    agent.seed_artifact_ledger_verifier_observation(&[], VerifierOutcome::Pass, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_verifier_observation(
+        &mut agent,
+        &[],
+        VerifierOutcome::Pass,
+        &scope,
+    );
     assert!(
         agent
             .artifact_ledger
@@ -481,7 +550,8 @@ fn verifier_observation_ignores_controller_owned_state() {
     std::fs::write(work_root.join(rel), "").unwrap();
     let scope = single_root_scope();
 
-    agent.seed_artifact_ledger_verifier_observation(
+    super::artifact_ledger_state::seed_artifact_ledger_verifier_observation(
+        &mut agent,
         &[rel.to_string()],
         VerifierOutcome::Fail,
         &scope,
@@ -513,9 +583,14 @@ fn divergence_assertion_passes_when_aligned() {
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_aligned.py"), "").unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_aligned.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_aligned.py",
+        ArtifactRole::Test,
+        &scope,
+    );
     // Both sources see "tests/test_aligned.py"; the assertion must not panic.
-    agent.assert_dual_source_alignment_at_turn_end();
+    super::artifact_ledger_state::assert_dual_source_alignment_at_turn_end(&agent);
 }
 
 #[test]
@@ -540,7 +615,7 @@ fn divergence_emit_includes_authority_legacy() {
     // the caller. The shell `emit_artifact_ledger_divergence_if_any`
     // is the release shape — debug-build alignment is asserted by the
     // companion test above.
-    agent.emit_artifact_ledger_divergence_if_any();
+    super::artifact_ledger_state::emit_artifact_ledger_divergence_if_any(&agent);
     let after = read_log_events_by_event_name("agent.artifact_ledger.divergence_detected").len();
     assert!(
         after > before,
@@ -586,7 +661,12 @@ fn divergence_panic_message_does_not_leak_raw_paths() {
     // the write-through helper. We achieve this by inserting the ledger
     // event directly via the public seed and then surgically deleting it
     // from the legacy mirror so `ledger - legacy` is non-empty.
-    agent.seed_artifact_ledger_repo_edit(&leak_path, ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        &leak_path,
+        ArtifactRole::Test,
+        &scope,
+    );
     let _ = agent.turn_edited_relative_paths.remove(&leak_path);
 
     // Drive the assertion under catch_unwind. A custom panic hook swaps
@@ -608,7 +688,7 @@ fn divergence_panic_message_does_not_leak_raw_paths() {
         *captured_for_hook.lock().unwrap() = Some(text);
     }));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        agent.assert_dual_source_alignment_at_turn_end();
+        super::artifact_ledger_state::assert_dual_source_alignment_at_turn_end(&agent);
     }));
     std::panic::set_hook(prev_hook);
     assert!(
@@ -670,8 +750,13 @@ fn event_recorded_payload_includes_turn_index_pr001() {
     // session_id. We drive `current_turn_index = 5` to exercise the
     // u32 narrowing path in the seed helper.
     agent.current_turn_index = 5;
-    agent.clear_per_turn_ledger_state();
-    agent.seed_artifact_ledger_repo_edit(&path, ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::clear_per_turn_ledger_state(&mut agent);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        &path,
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Compute the expected path_hash (mask_secrets→DefaultHasher→16-hex).
     use std::collections::hash_map::DefaultHasher;
@@ -717,15 +802,20 @@ fn turn_summary_payload_includes_turn_index_pr001() {
     let scope = single_root_scope();
 
     agent.current_turn_index = 11;
-    agent.clear_per_turn_ledger_state();
-    agent.seed_artifact_ledger_repo_edit(path, ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::clear_per_turn_ledger_state(&mut agent);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        path,
+        ArtifactRole::Test,
+        &scope,
+    );
 
     let before = read_log_events_by_event_name_and_session(
         "agent.artifact_ledger.turn_summary",
         &session_id,
     )
     .len();
-    agent.record_turn_end_artifact_ledger_summary();
+    super::artifact_ledger_state::record_turn_end_artifact_ledger_summary(&agent);
     let events = read_log_events_by_event_name_and_session(
         "agent.artifact_ledger.turn_summary",
         &session_id,
@@ -773,7 +863,7 @@ fn divergence_detected_payload_includes_bounded_masked_path_hashes_pr001() {
     }
 
     let before = read_log_events_by_event_name("agent.artifact_ledger.divergence_detected").len();
-    agent.emit_artifact_ledger_divergence_if_any();
+    super::artifact_ledger_state::emit_artifact_ledger_divergence_if_any(&agent);
     let events = read_log_events_by_event_name("agent.artifact_ledger.divergence_detected");
     assert!(
         events.len() > before,
@@ -878,9 +968,14 @@ fn handle_user_message_stamps_upcoming_turn_index_on_ledger() {
     // Mirror the production order exactly: increment THEN stamp.
     agent.current_turn_index = agent.current_turn_index.saturating_add(1);
     let upcoming_u32 = u32::try_from(agent.current_turn_index).unwrap_or(u32::MAX);
-    agent.clear_per_turn_ledger_state_for_turn(upcoming_u32);
+    super::artifact_ledger_state::clear_per_turn_ledger_state_for_turn(&mut agent, upcoming_u32);
 
-    agent.seed_artifact_ledger_repo_edit(&path, ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        &path,
+        ArtifactRole::Test,
+        &scope,
+    );
 
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
