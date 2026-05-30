@@ -9,7 +9,7 @@ use crate::format_model_banner;
 use crate::logging::log_llm_event;
 use crate::model_registry::RuntimeModels;
 use crate::modes::plan_act::{ExecutionMode, ModePolicy};
-use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
+use crate::ollama::client::{OllamaClient, should_use_native_tool_calls};
 use crate::repo_graph::{
     BuildOptions as RepoGraphBuildOptions, BuildOutcome, RepoGraph, RepoGraphError,
     build_repo_graph,
@@ -374,6 +374,13 @@ mod read_target_helpers;
 // `RetrievalInjection` struct + `WrittenScaffoldArtifacts` type alias.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod turn_helpers;
+// Assistant-reply retry state types extracted from `turn.rs` (parent
+// #680). Hosts `AssistantReplyRetryState` (per-attempt accumulator +
+// `new(chat_retries, message_count)` constructor) and
+// `AssistantReplyRetryDecision` (Retry / ReturnReply / Fail triplet).
+// Consumed only by `reply_retry`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod reply_retry_types;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
