@@ -182,6 +182,13 @@ mod artifact_recovery_flow;
 // synthesis helpers. Free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod set_artifact_recovery_target;
+// Per-turn artifact-ledger state management (parent #680). Hosts the
+// per-turn lifecycle of `Agent::artifact_ledger`: reset + observability
+// stamp, end-of-turn summary emit, four seed helpers (Existing /
+// Scaffold / RepoEdit / VerifierObservation), dual-source divergence
+// assertion + release-mode emitter. Free fns over `&mut Agent` /
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod artifact_ledger_state;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -1248,7 +1255,9 @@ pub(crate) fn seed_artifact_ledger_repo_edit_for_test(agent: &mut Agent, path: S
     };
 
     let scope = agent.current_workspace_scope();
-    agent.seed_artifact_ledger_repo_edit(&path, role, &scope);
+    crate::agent::loop_run::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        agent, &path, role, &scope,
+    );
 }
 
 // Issue #664 — in-crate `#[cfg(test)]` test seams for the Bash/Setup

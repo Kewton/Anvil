@@ -123,7 +123,7 @@ pub(super) fn handle_user_message(
     // shares `(session_id, turn_index)` join keys with sibling
     // observability events.
     let upcoming_turn_index = u32::try_from(agent.current_turn_index).unwrap_or(u32::MAX);
-    agent.clear_per_turn_ledger_state_for_turn(upcoming_turn_index);
+    super::artifact_ledger_state::clear_per_turn_ledger_state_for_turn(agent, upcoming_turn_index);
     // Issue #556: clear per-turn photon context_pack response.
     agent.photon_context_pack_response = None;
     // Issue #558: clear context_pack_id (turn boundary).
