@@ -258,7 +258,10 @@ fn execute_non_bash_tool_call(
                     .working_memory
                     .note_touched_file(normalize_memory_path(edit.raw_path(), &agent.work_root));
                 agent.session.repo_edit_succeeded_this_turn = true;
-                agent.observe_evidence_from_repo_edit(edit.raw_path());
+                super::repo_edit_observation::observe_evidence_from_repo_edit(
+                    agent,
+                    edit.raw_path(),
+                );
             }
             agent.maybe_update_work_root(name, arguments, &result);
             result
