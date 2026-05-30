@@ -61,7 +61,9 @@ pub(super) fn execute_tool_call(
     effective_tool_policy: Option<&EffectiveToolPolicy>,
     cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> String {
-    if let Some(err) = agent.answer_only_policy_error(name, arguments) {
+    if let Some(err) =
+        super::tool_policy_decisions::answer_only_policy_error(agent, name, arguments)
+    {
         agent.session.working_memory.note_error(err.clone());
         return lifecycle::format_tool_error(&err);
     }
@@ -112,7 +114,7 @@ fn effective_tool_policy_error_for_execution(
             scope_for_policy.as_ref(),
         )
     } else {
-        agent.effective_tool_policy_error(name, arguments)
+        super::tool_policy_decisions::effective_tool_policy_error(agent, name, arguments)
     }
 }
 

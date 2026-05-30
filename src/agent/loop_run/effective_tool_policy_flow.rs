@@ -42,14 +42,14 @@ pub(super) fn effective_tool_policy(agent: &Agent) -> EffectiveToolPolicy {
     // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
     // in §4 of the design policy). The arbiter never sees it; we early-
     // return before constructing any selectable `JobCandidate`.
-    if agent.answer_only_mode_active() {
+    if super::tool_policy_decisions::answer_only_mode_active(agent) {
         if agent.workspace_appears_empty() {
             return EffectiveToolPolicy::restricted(
                 EffectiveToolPolicyReason::AnswerOnly,
                 Vec::new(),
             );
         }
-        if agent.script_execution_requested() {
+        if super::tool_policy_decisions::script_execution_requested(agent) {
             return EffectiveToolPolicy::restricted(
                 EffectiveToolPolicyReason::AnswerOnly,
                 vec!["Read", "Glob", "Grep", "Bash"],

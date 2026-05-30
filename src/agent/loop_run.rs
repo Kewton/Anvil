@@ -296,6 +296,15 @@ mod recovery_targets;
 // `&mut Agent` / `&Agent`. `pub(super)` limited / no facade re-export
 // (DR3-001).
 mod quality_gate;
+// Per-Agent tool-policy decision helpers extracted from `turn.rs`
+// (parent #680). Hosts `answer_only_mode_active` (Issue #576 / DR3-001
+// SSOT: second-pass work_mode only) + `script_execution_requested` +
+// `answer_only_policy_error` (read-only gate with Read/Glob/Grep
+// allowlist + Bash-script allowlist branch) +
+// `effective_tool_policy_error` (no-explicit-policy fallback via
+// `effective_tool_policy_flow`). Free fns over `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod tool_policy_decisions;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

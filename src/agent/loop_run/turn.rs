@@ -2,11 +2,9 @@ use super::active_job_arbiter::RecoveryOwner;
 use super::actor_loop_flow::format_iteration_status;
 use super::auto_test::{AutoTestKind, AutoTestRunner};
 
-use super::answer_only_mode::answer_only_script_command_allowed;
 use super::file_excerpt::{
     open_excerpt_file_nofollow, truncate_on_char_boundary, utf8_prefix_respecting_cap,
 };
-use super::photon_feedback_derive::request_explicitly_requests_script_execution;
 use super::plan_mode_helpers::assistant_model_for_mode;
 use super::small_helpers::raw_mode_safe_text;
 use super::summary::ExitReason;
@@ -17,7 +15,9 @@ use super::tool_history::{
     has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
     is_preferred_read_edit_target, latest_user_turn_slice, recent_truncated_tool_call_attempt,
 };
-use super::tool_policy::{EffectiveToolPolicy, effective_tool_policy_error_for_call_with_scope};
+use super::tool_policy::EffectiveToolPolicy;
+#[cfg(test)]
+use super::tool_policy::effective_tool_policy_error_for_call_with_scope;
 use super::verifier_orchestration::task_contract_no_verifier_note;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
@@ -536,66 +536,6 @@ impl Agent {
     ) -> super::task_workspace_scope::TaskWorkspaceScope {
         let request = self.active_request_text().unwrap_or_default();
         super::task_workspace_scope::TaskWorkspaceScope::detect(&self.work_root, &request)
-    }
-
-    pub(super) fn answer_only_policy_error(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) -> Option<String> {
-        if !self.answer_only_mode_active() {
-            return None;
-        }
-        if matches!(name, "Read" | "Glob" | "Grep") {
-            return None;
-        }
-        if name == "Bash"
-            && self.script_execution_requested()
-            && arguments
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(answer_only_script_command_allowed)
-        {
-            return None;
-        }
-        Some(format!(
-            "Error: answer-only mode is read-only. Use Read, Glob, or Grep if inspection is needed, and only run Bash for an explicitly requested local script or read-only command. Blocked tool: {name}."
-        ))
-    }
-
-    pub(super) fn answer_only_mode_active(&self) -> bool {
-        // Issue #576 / DR3-001: tool policy must honour the second-pass-
-        // corrected `session.mode_state.work_mode` as the single source of
-        // truth. The previous OR with `infer_work_mode_from_text(active_request_text())`
-        // bypassed the second-pass result whenever the lexical pre-classifier
-        // still inferred `AnswerOnly`, defeating the whole point of this Issue.
-        self.session.mode_state.work_mode == WorkMode::AnswerOnly
-    }
-
-    pub(super) fn script_execution_requested(&self) -> bool {
-        self.active_request_text()
-            .as_deref()
-            .is_some_and(request_explicitly_requests_script_execution)
-    }
-
-    pub(super) fn effective_tool_policy_error(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-    ) -> Option<String> {
-        let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(self);
-        let scope = if self.missing_verifier_job.is_some() {
-            Some(self.current_workspace_scope())
-        } else {
-            None
-        };
-        effective_tool_policy_error_for_call_with_scope(
-            &effective_tool_policy,
-            name,
-            arguments,
-            &self.work_root,
-            scope.as_ref(),
-        )
     }
 
     pub(super) fn workspace_appears_empty(&self) -> bool {

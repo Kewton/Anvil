@@ -446,7 +446,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
     if !args.requires_action
-        && agent.answer_only_mode_active()
+        && super::tool_policy_decisions::answer_only_mode_active(agent)
         && answer_only_reply_is_inadequate(args.final_reply)
     {
         *args.no_tool_retries += 1;
@@ -2713,7 +2713,7 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
     if !args.requires_action
-        && agent.answer_only_mode_active()
+        && super::tool_policy_decisions::answer_only_mode_active(agent)
         && reply_looks_like_future_work(args.final_reply)
     {
         *args.no_tool_retries += 1;
