@@ -143,6 +143,12 @@ mod effective_tool_policy_flow;
 // `Agent::run_turn` + post-turn ledger refresh + job report emit.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod handle_user_message;
+// Per-actor-loop-turn state initializer extracted from `turn.rs`
+// (parent #680). Hosts `prepare_actor_loop_turn_state` as a free fn
+// over `&mut Agent`. Resets ~25 per-actor-loop caps / dedup carriers
+// and computes the initial TaskContract. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod prepare_actor_loop_state;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

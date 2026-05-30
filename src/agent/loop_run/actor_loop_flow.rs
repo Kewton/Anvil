@@ -2780,7 +2780,7 @@ pub(super) fn run_actor_loop(
     let mut before_snapshot = capture_repo_snapshot(&agent.work_root);
     let mut accumulated: Vec<RepoVerification> = Vec::new();
     let mut last_known_root = agent.work_root.clone();
-    let task_contract = agent.prepare_actor_loop_turn_state();
+    let task_contract = super::prepare_actor_loop_state::prepare_actor_loop_turn_state(agent);
 
     let mut tool_calls_made_this_turn = 0usize;
     let mut repo_edit_calls_made_this_turn = 0usize;
