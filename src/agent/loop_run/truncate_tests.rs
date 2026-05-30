@@ -36,7 +36,7 @@ mod inner {
         repo_edit_satisfies_artifact_recovery_target,
     };
     use super::super::tool_policy::focused_edit_tool_policy_error;
-    use super::super::turn::extract_filename_with_suffix;
+    use super::super::turn_helpers::extract_filename_with_suffix;
     use super::super::verifier_orchestration::{
         task_contract_needs_verification, task_contract_verifier_repair_note,
     };

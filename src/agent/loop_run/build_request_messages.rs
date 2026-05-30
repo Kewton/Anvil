@@ -39,7 +39,7 @@ use super::tool_history::{
     successful_non_plan_repo_edit_count,
 };
 use super::tool_policy::{EffectiveToolPolicy, focused_edit_policy_violation_feedback_note};
-use super::turn::RetrievalInjection;
+use super::turn_helpers::RetrievalInjection;
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::modes::plan_act::ExecutionMode;

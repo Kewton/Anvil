@@ -16,7 +16,7 @@
 //! facade re-export (DR3-001).
 
 use super::Agent;
-use super::turn::RetrievalInjection;
+use super::turn_helpers::RetrievalInjection;
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::feedback::{FeedbackFrame, FeedbackKind};

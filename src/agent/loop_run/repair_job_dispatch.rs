@@ -34,7 +34,7 @@ use super::repair_job;
 use super::repair_job::verifier_repair_context_from_failure;
 use super::summary::ExitReason;
 use super::task_contract::{RecoveryTargetHint, SafeStopReason};
-use super::turn::write_stdout_rendered;
+use super::turn_helpers::write_stdout_rendered;
 use super::verifier_driver::TaskContractVerifierOutcome;
 use super::verifier_orchestration::{
     TaskContractVerifierFlowArgs, VerifierDiagnosticPassOutcome,

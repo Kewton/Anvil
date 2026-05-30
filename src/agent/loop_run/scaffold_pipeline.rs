@@ -62,7 +62,7 @@ use super::tool_display::progress_path_display;
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
 };
-use super::turn::{
+use super::turn_helpers::{
     WrittenScaffoldArtifacts, extract_filename_with_suffix, tool_result_failed,
     write_stdout_rendered,
 };

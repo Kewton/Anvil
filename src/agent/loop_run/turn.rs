@@ -1,8 +1,5 @@
-use super::small_helpers::raw_mode_safe_text;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
-use crate::session::store::ScaffoldArtifactFileSnapshot;
-use std::path::PathBuf;
 
 use super::quality::repo_change_request_text;
 
@@ -46,79 +43,6 @@ impl AssistantReplyRetryState {
             tool_call_format_retry_count: 0,
         }
     }
-}
-
-pub(super) fn extract_filename_with_suffix(text: &str, suffix: &str) -> Option<String> {
-    text.split(|ch: char| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                '`' | '"'
-                    | '\''
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '、'
-                    | '。'
-                    | '，'
-                    | '：'
-                    | ':'
-                    | ';'
-            )
-    })
-    .map(|token| token.trim_matches([',', '.', '。', '、']))
-    .find(|token| {
-        token.ends_with(suffix)
-            && token.len() <= 80
-            && !token.contains('/')
-            && !token.contains('\\')
-            && !token.starts_with('.')
-            && token
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    })
-    .map(ToString::to_string)
-}
-
-pub(super) fn write_stdout_rendered(text: &str, trailing_newline: bool) {
-    let mut out = io::stdout().lock();
-    let rendered = raw_mode_safe_text(text);
-    let _ = out.write_all(rendered.as_bytes());
-    if trailing_newline {
-        let _ = out.write_all(b"\r\n");
-    }
-    let _ = out.flush();
-}
-
-pub(super) fn tool_result_failed(result: &str) -> bool {
-    result.starts_with("Error:") || result.contains("\ninterrupted=true\n")
-}
-
-/// Issue #555: carries a retrieval message and the IDs of the selected
-/// records so the photon mapper can include them without re-parsing the
-/// rendered prompt text.
-pub(super) struct RetrievalInjection {
-    pub message: ConversationMessage,
-    pub selected_ids: Vec<String>,
-}
-
-pub(super) type WrittenScaffoldArtifacts = (Vec<PathBuf>, Vec<ScaffoldArtifactFileSnapshot>);
-
-/// Issue #580: SSoT memoization key for the Quality-gate second-pass adapter.
-/// Hashes `(request, full_content)` with `DefaultHasher` (per design judgement
-/// #5: full_content avoids stale reuse when only the middle of a large file
-/// changes — the LLM still sees only the head+tail excerpt).
-pub(super) fn quality_confirm_cache_key(request: &str, content: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    request.hash(&mut hasher);
-    content.hash(&mut hasher);
-    hasher.finish()
 }
 
 impl Agent {
