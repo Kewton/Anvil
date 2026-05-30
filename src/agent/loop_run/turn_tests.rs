@@ -2435,7 +2435,9 @@ mod tests {
             path: "tests/test_foo.py".to_string(),
             reason: "missing test".to_string(),
         };
-        agent.set_artifact_recovery_target_from_hint(test_hint, 0);
+        super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+            &mut agent, test_hint, 0,
+        );
         assert!(
             agent.artifact_completion_job.is_some(),
             "fixture invariant: Test recovery target installs the job"
@@ -2445,7 +2447,9 @@ mod tests {
             path: "src/main.py".to_string(),
             reason: "missing implementation".to_string(),
         };
-        agent.set_artifact_recovery_target_from_hint(impl_hint, 0);
+        super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+            &mut agent, impl_hint, 0,
+        );
         // Issue #663 (Phase C / AD5): non-Test roles also install a job.
         // The Test job is replaced by the new Implementation job.
         let job = agent
@@ -2520,7 +2524,10 @@ mod tests {
             path: "node_modules/evil/test.js".to_string(),
             reason: "attacker-supplied".to_string(),
         };
-        let result = agent.set_artifact_recovery_target_from_hint(bad_hint, 0);
+        let result =
+            super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+                &mut agent, bad_hint, 0,
+            );
         assert!(
             result.is_none(),
             "PR-001: invalid Test hint must return None (no projection committed)"
@@ -2974,7 +2981,12 @@ mod tests {
             path: "tests/test_foo.py".to_string(),
             reason: "missing test".to_string(),
         };
-        let result = agent.set_artifact_recovery_target_from_hint(good_hint.clone(), 0);
+        let result =
+            super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+                &mut agent,
+                good_hint.clone(),
+                0,
+            );
         assert!(result.is_some(), "valid Test hint must return Some(hint)");
         let job = agent
             .artifact_completion_job
@@ -3008,7 +3020,10 @@ mod tests {
             path: "src/main.py".to_string(),
             reason: "missing implementation".to_string(),
         };
-        let result = agent.set_artifact_recovery_target_from_hint(impl_hint, 0);
+        let result =
+            super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+                &mut agent, impl_hint, 0,
+            );
         assert!(
             result.is_some(),
             "valid non-Test hint must commit the projection"
@@ -3044,7 +3059,9 @@ mod tests {
             path: "tests/initial.py".to_string(),
             reason: "missing test".to_string(),
         };
-        agent.set_artifact_recovery_target_from_hint(good_hint, 0);
+        super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+            &mut agent, good_hint, 0,
+        );
         assert!(agent.artifact_completion_job.is_some());
         assert!(agent.current_artifact_recovery_target.is_some());
         // Now a bad new hint:
@@ -3053,7 +3070,10 @@ mod tests {
             path: "node_modules/evil/test.js".to_string(),
             reason: "attacker-supplied".to_string(),
         };
-        let result = agent.set_artifact_recovery_target_from_hint(bad_hint, 1);
+        let result =
+            super::super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+                &mut agent, bad_hint, 1,
+            );
         assert!(result.is_none(), "PR-001: invalid Test hint returns None");
         assert!(
             agent.current_artifact_recovery_target.is_none(),

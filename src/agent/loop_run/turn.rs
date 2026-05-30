@@ -48,13 +48,12 @@ use super::verifier_diagnostic_attempt::{
     VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT, verifier_diagnostic_attempt_spec,
 };
 use super::verifier_orchestration::{
-    JobInstallOutcome, PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass,
-    VerifierDiagnosticPassOutcome, VerifierRepairAttemptProgress,
-    build_verifier_exit_zero_evidence, emit_patch_proposal_legacy_validation_comparison_event,
+    PreparedVerifierDiagnosticPass, PreparedVerifierRepairPass, VerifierDiagnosticPassOutcome,
+    VerifierRepairAttemptProgress, build_verifier_exit_zero_evidence,
+    emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event,
-    synthesized_missing_implementation_target_path_for_request,
-    synthesized_missing_test_target_path_for_request, task_contract_no_verifier_note,
-    task_contract_verifier_targeted_edit_required_note, test_target_path_compatible_with_request,
+    synthesized_missing_implementation_target_path_for_request, task_contract_no_verifier_note,
+    task_contract_verifier_targeted_edit_required_note,
     validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_messages,
     verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
     verifier_repair_intent_limits, verifier_repair_pass_messages,
@@ -2973,7 +2972,11 @@ impl Agent {
                 });
             }
         }
-        if let Some(path) = self.synthesized_missing_implementation_target_path(role) {
+        if let Some(path) = self
+            .active_request_text()
+            .as_deref()
+            .and_then(|req| synthesized_missing_implementation_target_path_for_request(role, req))
+        {
             return Some(super::task_contract::RecoveryTargetHint {
                 role,
                 path,
@@ -2983,126 +2986,6 @@ impl Agent {
         None
     }
 
-    fn synthesized_missing_implementation_target_path(
-        &self,
-        role: super::task_contract::ArtifactRole,
-    ) -> Option<String> {
-        let request = self.active_request_text()?;
-        synthesized_missing_implementation_target_path_for_request(role, &request)
-    }
-
-    pub(super) fn set_artifact_recovery_target_for_decision(
-        &mut self,
-        decision: &super::task_contract::CompletionDecision,
-        attempt: usize,
-    ) -> Option<super::task_contract::RecoveryTargetHint> {
-        let hint = self.task_contract_recovery_target(decision)?;
-        self.set_artifact_recovery_target_from_hint(hint, attempt)
-    }
-
-    pub(super) fn set_artifact_recovery_target_for_action(
-        &mut self,
-        action: &super::task_contract::ArtifactRecoveryAction,
-        attempt: usize,
-    ) -> Option<super::task_contract::RecoveryTargetHint> {
-        let hint = match action {
-            super::task_contract::ArtifactRecoveryAction::Continue { target_hint, .. }
-            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { target_hint } => {
-                target_hint.clone()?
-            }
-            _ => return None,
-        };
-        self.set_artifact_recovery_target_from_hint(hint, attempt)
-    }
-
-    fn align_recovery_target_hint_to_request(
-        &self,
-        mut hint: super::task_contract::RecoveryTargetHint,
-    ) -> super::task_contract::RecoveryTargetHint {
-        if hint.role != super::task_contract::ArtifactRole::Test {
-            return hint;
-        }
-        let Some(request) = self.active_request_text() else {
-            return hint;
-        };
-        let Some((target_path, stack_label)) =
-            synthesized_missing_test_target_path_for_request(&request)
-        else {
-            return hint;
-        };
-        if hint.path == target_path
-            || test_target_path_compatible_with_request(&hint.path, &request)
-        {
-            return hint;
-        }
-        hint.path = target_path.to_string();
-        hint.reason = format!(
-            "synthesized test artifact aligned with requested {stack_label} project family"
-        );
-        hint
-    }
-
-    pub(super) fn set_artifact_recovery_target_from_hint(
-        &mut self,
-        hint: super::task_contract::RecoveryTargetHint,
-        attempt: usize,
-    ) -> Option<super::task_contract::RecoveryTargetHint> {
-        let hint = self.align_recovery_target_hint_to_request(hint);
-        // Issue #652 PR-001: the `ArtifactCompletionJob` is the SSOT for
-        // target + role-specific retry budget. We must NOT update
-        // `current_artifact_recovery_target` before the job has been
-        // validated and installed — otherwise a validation failure would
-        // leave the projection set with no job attached, and
-        // `EffectiveToolPolicy::artifact_directed` would grant write
-        // access for a target with no role-specific budget. Ordering:
-        //   1. attempt to install / refresh the job for the hint
-        //   2. on success → commit the projection (atomic SWAP from any
-        //      prior state)
-        //   3. on failure (only possible for Test role) → clear BOTH
-        //      the projection and the job so no stale slot remains.
-        let install = super::artifact_recovery_flow::maybe_install_artifact_completion_job_for_hint(
-            self, &hint,
-        );
-        match install {
-            JobInstallOutcome::InstalledOrSkipped => {
-                let target = super::task_contract::RecoveryTarget::from_hint(hint.clone(), attempt);
-                let changed = self.current_artifact_recovery_target.as_ref() != Some(&target);
-                if changed {
-                    log_llm_event(
-                        "agent.artifact_recovery_target.selected",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "turn_index": self.current_turn_index,
-                            "role": target.role.label(),
-                            "path": target.path,
-                            "reason": target.reason,
-                            "attempt": target.attempt,
-                        }),
-                    );
-                }
-                self.current_artifact_recovery_target = Some(target);
-                Some(hint)
-            }
-            JobInstallOutcome::ValidationFailed => {
-                // PR-001 atomic clear: the new Test hint failed
-                // `ArtifactCompletionJob::new` validation. Drop the prior
-                // projection too — otherwise the artifact-directed
-                // policy would keep granting write permission for a
-                // target with no attached role-specific budget.
-                if self.current_artifact_recovery_target.take().is_some() {
-                    log_llm_event(
-                        "agent.artifact_recovery_target.cleared",
-                        serde_json::json!({
-                            "session_id": self.session_store.session_id(),
-                            "turn_index": self.current_turn_index,
-                            "reason": "artifact_completion_job_validation_failed",
-                        }),
-                    );
-                }
-                None
-            }
-        }
-    }
     fn answer_only_policy_error(
         &self,
         name: &str,

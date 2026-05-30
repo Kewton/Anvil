@@ -1242,7 +1242,8 @@ fn sync_post_tool_contract_recovery_target(
     match action {
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
         | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-            agent.set_artifact_recovery_target_for_action(
+            super::set_artifact_recovery_target::set_artifact_recovery_target_for_action(
+                agent,
                 &action,
                 args.contract_completion_retries.saturating_add(1),
             );
@@ -2119,7 +2120,8 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         .clone()
         .or_else(|| agent.task_contract_recovery_target(&decision))
         .and_then(|hint| {
-            agent.set_artifact_recovery_target_from_hint(
+            super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+                agent,
                 hint,
                 (*args.contract_completion_retries).saturating_add(1),
             )
@@ -2150,7 +2152,8 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         )
     {
         *args.contract_deterministic_fallback_materialized = true;
-        agent.set_artifact_recovery_target_for_decision(
+        super::set_artifact_recovery_target::set_artifact_recovery_target_for_decision(
+            agent,
             &decision,
             (*args.contract_completion_retries).saturating_add(1),
         );

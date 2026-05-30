@@ -127,7 +127,11 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     {
         let initial_decision = contract.evaluate(&EvidenceSet::new());
         if matches!(initial_decision, CompletionDecision::Continue { .. }) {
-            agent.set_artifact_recovery_target_for_decision(&initial_decision, 0);
+            super::set_artifact_recovery_target::set_artifact_recovery_target_for_decision(
+                agent,
+                &initial_decision,
+                0,
+            );
         }
     }
     task_contract
