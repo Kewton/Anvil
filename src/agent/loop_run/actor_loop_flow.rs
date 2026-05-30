@@ -490,12 +490,13 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         args.action_expectation,
         agent.active_task_expects_repo_change(),
         agent.session.mode_state.mode,
-    ) || agent.current_request_needs_playable_ui_quality_gate())
+    ) || super::quality_gate::current_request_needs_playable_ui_quality_gate(agent))
         || !args.recovery_dispatch_gate.allows_deterministic_fallback()
     {
         return None;
     }
-    let (request, target_path, issue) = agent.accepted_repo_change_quality_issue()?;
+    let (request, target_path, issue) =
+        super::quality_gate::accepted_repo_change_quality_issue(agent)?;
     match super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback(
         agent,
         &request,
@@ -1456,11 +1457,13 @@ fn handle_actor_loop_post_tool_no_edit_fallbacks(
     if repo_edit_calls_made_this_turn != 0
         || tool_calls_made_this_turn == 0
         || !recovery_dispatch_gate.allows_deterministic_fallback()
-        || !agent.current_request_needs_playable_ui_quality_gate()
+        || !super::quality_gate::current_request_needs_playable_ui_quality_gate(agent)
     {
         return ActorLoopPostToolFallbackOutcome::Proceed;
     }
-    if let Some((request, target_path)) = agent.accepted_repo_change_polish_target() {
+    if let Some((request, target_path)) =
+        super::quality_gate::accepted_repo_change_polish_target(agent)
+    {
         return handle_actor_loop_post_tool_polish_fallback(
             agent,
             last_iter,
@@ -1469,7 +1472,9 @@ fn handle_actor_loop_post_tool_no_edit_fallbacks(
             repo_change_retries,
         );
     }
-    if let Some((request, target_path, _issue)) = agent.accepted_repo_change_quality_issue() {
+    if let Some((request, target_path, _issue)) =
+        super::quality_gate::accepted_repo_change_quality_issue(agent)
+    {
         return handle_actor_loop_post_tool_quality_fallback(
             agent,
             last_iter,
@@ -1577,11 +1582,13 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
             action_expectation,
             agent.active_task_expects_repo_change(),
             agent.session.mode_state.mode,
-        ) || agent.current_request_needs_playable_ui_quality_gate())
+        ) || super::quality_gate::current_request_needs_playable_ui_quality_gate(agent))
     {
         return ActorLoopPostToolFallbackOutcome::Proceed;
     }
-    let Some((request, target_path, issue)) = agent.accepted_repo_change_quality_issue() else {
+    let Some((request, target_path, issue)) =
+        super::quality_gate::accepted_repo_change_quality_issue(agent)
+    else {
         return ActorLoopPostToolFallbackOutcome::Proceed;
     };
     match super::scaffold_pipeline::maybe_apply_deterministic_quality_fallback(
@@ -2046,11 +2053,11 @@ pub(super) fn maybe_handle_actor_loop_playable_ui_fallback(
     if !actor_loop_pre_reply_deterministic_fallback_allowed(
         *args.repo_edit_calls_made_this_turn,
         recovery_dispatch_gate,
-    ) || !agent.current_request_needs_playable_ui_quality_gate()
+    ) || !super::quality_gate::current_request_needs_playable_ui_quality_gate(agent)
     {
         return None;
     }
-    let (request, target_path) = agent.accepted_repo_change_polish_target()?;
+    let (request, target_path) = super::quality_gate::accepted_repo_change_polish_target(agent)?;
     match handle_actor_loop_post_tool_polish_fallback(
         agent,
         args.last_iter,

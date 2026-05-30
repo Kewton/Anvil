@@ -28,12 +28,7 @@ use crate::session::store::ScaffoldArtifactFileSnapshot;
 use crate::tools::registry::ToolSpec;
 use std::path::{Path, PathBuf};
 
-use super::deterministic;
-use super::quality::{
-    first_existing_impl_target, repo_change_request_text, request_allows_fast_polish_fallback,
-    request_explicitly_requires_tests, request_mentions_unsupported_ui_framework,
-    request_needs_playable_ui_quality_gate, workspace_has_unsupported_ui_framework,
-};
+use super::quality::{repo_change_request_text, request_explicitly_requires_tests};
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
@@ -621,86 +616,6 @@ impl Agent {
             self.session.working_memory.active_task.as_deref(),
             &self.session.messages,
         )
-    }
-
-    pub(super) fn current_request_needs_playable_ui_quality_gate(&self) -> bool {
-        self.session.mode_state.mode == ExecutionMode::Act
-            && self.session.mode_state.policy().quality_gate_enabled
-            && !self.unsupported_ui_framework_context()
-            && self
-                .active_request_text()
-                .as_deref()
-                .is_some_and(request_needs_playable_ui_quality_gate)
-    }
-
-    pub(super) fn accepted_repo_change_quality_issue(
-        &mut self,
-    ) -> Option<(String, String, String)> {
-        if !self.session.mode_state.policy().quality_gate_enabled {
-            return None;
-        }
-        if self.unsupported_ui_framework_context() {
-            return None;
-        }
-        let request = self.active_request_text()?;
-        let request = request.trim().to_string();
-        if !request_needs_playable_ui_quality_gate(&request) {
-            return None;
-        }
-        let target = first_existing_impl_target(&self.work_root)?;
-        let content = std::fs::read_to_string(&target).ok()?;
-        // Issue #580: route through the second-pass adapter so borderline UI
-        // verdicts can be confirmed/overridden by the sidecar LLM.
-        let issue = super::classify_confirm_flow::implementation_quality_issue_with_confirm(
-            self, &request, &content,
-        )?;
-        let relative = target
-            .strip_prefix(&self.work_root)
-            .unwrap_or(&target)
-            .to_string_lossy()
-            .replace('\\', "/");
-        Some((request, relative, issue))
-    }
-
-    pub(super) fn accepted_repo_change_polish_target(&mut self) -> Option<(String, String)> {
-        if !self.session.mode_state.policy().allow_polish_fallback {
-            return None;
-        }
-        if self.unsupported_ui_framework_context() {
-            return None;
-        }
-        let request = self.active_request_text()?;
-        let request = request.trim().to_string();
-        if !request_allows_fast_polish_fallback(&request) {
-            return None;
-        }
-        let target = first_existing_impl_target(&self.work_root)?;
-        let content = std::fs::read_to_string(&target).ok()?;
-        // Issue #580: a second-pass `interactive=false` verdict surfaces here
-        // as `Some(...)` which correctly suppresses the polish action
-        // (treating the file as a quality issue rather than polishing static
-        // code).
-        if super::classify_confirm_flow::implementation_quality_issue_with_confirm(
-            self, &request, &content,
-        )
-        .is_some()
-        {
-            return None;
-        }
-        deterministic::playable_ui_polish(&request, &target, &content)?;
-        let relative = target
-            .strip_prefix(&self.work_root)
-            .unwrap_or(&target)
-            .to_string_lossy()
-            .replace('\\', "/");
-        Some((request, relative))
-    }
-
-    fn unsupported_ui_framework_context(&self) -> bool {
-        self.active_request_text()
-            .as_deref()
-            .is_some_and(request_mentions_unsupported_ui_framework)
-            || workspace_has_unsupported_ui_framework(&self.work_root)
     }
 
     pub(super) fn active_python_request_requires_tests(&self) -> bool {
