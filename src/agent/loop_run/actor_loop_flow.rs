@@ -515,7 +515,8 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
             agent.session.record_feedback_if_unset(
                 build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
-            agent.push_deterministic_ui_recovery_continuation_note(
+            super::recovery_messages::push_deterministic_ui_recovery_continuation_note(
+                agent,
                 &target_path,
                 (*args.repo_change_retries).saturating_add(1),
             );
@@ -730,8 +731,12 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
     if let Some(target) = agent.focused_edit_recovery_target() {
         let target_already_read =
             focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
-        let note =
-            agent.focused_edit_no_tool_note_for_target(&target, target_already_read, attempt);
+        let note = super::recovery_messages::focused_edit_no_tool_note_for_target(
+            agent,
+            &target,
+            target_already_read,
+            attempt,
+        );
         agent.push_system_note(note);
         return;
     }
@@ -1131,7 +1136,8 @@ fn handle_prose_only_missing_repo_change_retry(
     if let Some(target) = agent.focused_edit_recovery_target() {
         let target_already_read =
             focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
-        let note = agent.focused_edit_no_tool_note_for_target(
+        let note = super::recovery_messages::focused_edit_no_tool_note_for_target(
+            agent,
             &target,
             target_already_read,
             repo_change_retries,
@@ -1493,7 +1499,8 @@ pub(super) fn handle_actor_loop_post_tool_polish_fallback(
             agent.session.record_feedback_if_unset(
                 build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
-            agent.push_deterministic_ui_recovery_continuation_note(
+            super::recovery_messages::push_deterministic_ui_recovery_continuation_note(
+                agent,
                 target_path,
                 (*repo_change_retries).saturating_add(1),
             );
@@ -1533,7 +1540,8 @@ fn handle_actor_loop_post_tool_quality_fallback(
             agent.session.record_feedback_if_unset(
                 build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
-            agent.push_deterministic_ui_recovery_continuation_note(
+            super::recovery_messages::push_deterministic_ui_recovery_continuation_note(
+                agent,
                 target_path,
                 (*repo_change_retries).saturating_add(1),
             );
@@ -1587,7 +1595,8 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
             agent.session.record_feedback_if_unset(
                 build_feedback_for_deterministic_content_fallback(&agent.work_root),
             );
-            agent.push_deterministic_ui_recovery_continuation_note(
+            super::recovery_messages::push_deterministic_ui_recovery_continuation_note(
+                agent,
                 &target_path,
                 (*repo_change_retries).saturating_add(1),
             );
@@ -2503,7 +2512,8 @@ pub(super) fn handle_actor_loop_rejected_tool_batch(
         true,
     );
     if let Some(policy) = focused_retry {
-        let note = agent.focused_edit_no_tool_note_for_policy(
+        let note = super::recovery_messages::focused_edit_no_tool_note_for_policy(
+            agent,
             &policy,
             args.effective_tool_policy,
             *args.focused_policy_retries,

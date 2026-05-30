@@ -230,6 +230,17 @@ mod verifier_repair_pass_flow;
 // transition). Free fns over `&mut Agent`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod artifact_completion_record;
+// Recovery / verifier-repair policy message builders extracted from
+// `turn.rs` (parent #680). Hosts the prompt-text builders that drive
+// the focused-edit / artifact-directed / verifier-repair recovery
+// policies: focused_edit_no_tool_note_for_{target,policy},
+// artifact_directed_recovery_message, verifier_repair_policy_message
+// (RepairNextAction dispatcher) + 2 private repair-policy sub-builders,
+// artifact_directed_policy_violation_message,
+// push_deterministic_ui_recovery_continuation_note. Free fns over
+// `&mut Agent` / `&Agent`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod recovery_messages;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
