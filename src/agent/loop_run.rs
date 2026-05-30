@@ -167,6 +167,13 @@ mod active_job_emit;
 // `repo_context_message` as free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod working_memory_messages;
+// Artifact-recovery target + completion-job lifecycle extracted from
+// `turn.rs` (parent #680). Hosts `clear_artifact_recovery_target`,
+// `maybe_install_artifact_completion_job_for_hint`,
+// `maybe_emit_artifact_completion_failed_diagnostic`, and
+// `artifact_recovery_target_path` as free fns over `&mut Agent` /
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod artifact_recovery_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

@@ -1249,10 +1249,16 @@ fn sync_post_tool_contract_recovery_target(
         }
         super::task_contract::ArtifactRecoveryAction::RunVerifier
         | super::task_contract::ArtifactRecoveryAction::Done => {
-            agent.clear_artifact_recovery_target("contract_artifacts_satisfied");
+            super::artifact_recovery_flow::clear_artifact_recovery_target(
+                agent,
+                "contract_artifacts_satisfied",
+            );
         }
         super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
-            agent.clear_artifact_recovery_target(task_contract_safe_stop_clear_tag(reason));
+            super::artifact_recovery_flow::clear_artifact_recovery_target(
+                agent,
+                task_contract_safe_stop_clear_tag(reason),
+            );
         }
     }
 }
