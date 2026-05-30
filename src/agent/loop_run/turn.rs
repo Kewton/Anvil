@@ -1,4 +1,4 @@
-use super::active_job_arbiter::{RecoveryOwner, build_active_job_selected_payload};
+use super::active_job_arbiter::RecoveryOwner;
 use super::actor_loop_flow::format_iteration_status;
 use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
@@ -436,121 +436,7 @@ impl Agent {
             .as_ref()
             .map(|j| j.attempts().len())
     }
-    /// Issue #660 (Phase C / DD-4): per-turn diff-based emit of
-    /// `agent.active_job.selected`. Computes the current
-    /// `ActiveJobSelection`, compares it with the previous emission stored
-    /// in `self.last_active_job_selection`, and emits a single structured
-    /// log event when the selection differs. Returns `true` when the event
-    /// was emitted, `false` when dedup skipped it.
-    ///
-    /// **Per-turn rule** (DR1-007): `self.last_active_job_selection` is
-    /// reset to `None` at the head of every `handle_user_message`, so the
-    /// first call of a new turn always emits.
-    ///
-    /// **Security** (Stage 4 DR4-001/002 / §7 of the design policy): the
-    /// payload contains only short type labels, sanitized
-    /// `EffectiveToolPolicyReason::as_str()` strings, counts, and
-    /// non-cryptographic `stable_path_hash(mask_secrets(...))` correlators.
-    /// Raw verifier commands / raw paths / raw recovery reasons are NEVER
-    /// included; emit goes through `log_llm_event` so
-    /// `mask_payload_inplace` is the final defense line.
-    ///
-    /// **`iteration_seq` semantics** (Codex CB-002): the caller passes the
-    /// actor-loop iteration counter (`run_actor_loop`'s `iter_count`) so
-    /// that the payload `iteration_seq` field name and value semantics
-    /// agree. Two re-emits within the same turn carry distinct
-    /// `iteration_seq` values, which lets #666 consumers identify the
-    /// iteration at which a selection change occurred.
-    pub(super) fn emit_active_job_selected_if_changed(&mut self, iteration_seq: u32) -> bool {
-        let selection = self.current_active_job_selection();
-        if self.last_active_job_selection.as_ref() == Some(&selection) {
-            return false;
-        }
-        let payload = build_active_job_selected_payload(
-            &selection,
-            iteration_seq,
-            self.repair_job_artifact_attempts as u32,
-            self.artifact_completion_job
-                .as_ref()
-                .map(|job| job.attempts().len() as u32)
-                .unwrap_or(0),
-        );
-        log_llm_event("agent.active_job.selected", payload);
-        self.last_active_job_selection = Some(selection);
-        true
-    }
 
-    /// Issue #665 (Phase 6 / S5-006 / S7-002): emit the
-    /// `agent.behavior_contract.projected` event with per-turn diff-based
-    /// dedup. Only emits when:
-    /// - `projection` is `Some(...)` (i.e. consumed by a prompt site), AND
-    /// - the payload-shaped key differs from
-    ///   `self.last_behavior_contract_projection_event`.
-    ///
-    /// **Per-turn rule** (DR1-007): `last_behavior_contract_projection_event`
-    /// is reset to `None` at the head of every `handle_user_message`, so the
-    /// first consumed projection in a new turn always emits.
-    ///
-    /// **Security**: payload contains only `schema_version`, `session_id`,
-    /// `turn_index`, `consumer`, `confidence`, `fields_used`. Raw `label` /
-    /// `excerpt` are NEVER included (S5-006). `log_llm_event` →
-    /// `mask_payload_inplace` is the final defense.
-    ///
-    /// Returns `true` when the event was emitted, `false` when dedup skipped
-    /// it or no projection was supplied.
-    pub(super) fn emit_behavior_contract_projected_if_changed(
-        &mut self,
-        projection: Option<&super::required_behavior::BehaviorContractProjection>,
-        consumer: &'static str,
-    ) -> bool {
-        let Some(proj) = projection else {
-            return false;
-        };
-        let key =
-            super::required_behavior::BehaviorProjectionEventKey::from_projection(proj, consumer);
-        if self.last_behavior_contract_projection_event.as_ref() == Some(&key) {
-            return false;
-        }
-        let session_id = self.session_store.session_id().to_string();
-        let turn_index = self.current_turn_index as u64;
-        let payload = super::required_behavior::behavior_contract_projected_payload(
-            &key,
-            proj.confidence,
-            &session_id,
-            turn_index,
-        );
-        log_llm_event("agent.behavior_contract.projected", payload);
-        self.last_behavior_contract_projection_event = Some(key);
-        true
-    }
-
-    /// Issue #660 (Phase C): compute the current `ActiveJobSelection`
-    /// using the same `build_arbiter_candidates` + `select_active_job`
-    /// pipeline as `effective_tool_policy()`. Pure on `self` — no log
-    /// emit, no state mutation. Recomputed on demand so callers
-    /// (`emit_active_job_selected_if_changed`) can observe the selection
-    /// independently of `effective_tool_policy()`.
-    ///
-    /// Issue #660 (Codex CB-001 / §4): mirrors the `effective_tool_policy`
-    /// pre-arbitration gate for `ExecutionMode::Plan`. The PAM gate at
-    /// `src/tools/registry.rs::resolve_plan_mode_write_target` /
-    /// `enforce_plan_stage_scope` is the authority for plan-file Write/Edit
-    /// arbitration; the arbiter does not see any candidate while Plan mode
-    /// is active, so observers (e.g. `emit_active_job_selected_if_changed`,
-    /// the `selected_skips_*` generic-retry guards in Phase D) see a
-    /// `None` selection that accurately reflects the design.
-    pub(super) fn current_active_job_selection(
-        &self,
-    ) -> super::active_job_arbiter::ActiveJobSelection {
-        if self.session.mode_state.mode == ExecutionMode::Plan {
-            return super::active_job_arbiter::ActiveJobSelection {
-                selected: None,
-                rejected: Vec::new(),
-            };
-        }
-        let candidates = super::effective_tool_policy_flow::build_arbiter_candidates(self);
-        super::active_job_arbiter::select_active_job(&candidates)
-    }
     pub(super) fn tool_specs_for_policy(&self, policy: &EffectiveToolPolicy) -> Vec<ToolSpec> {
         let mut specs = self.tool_registry.specs().to_vec();
         if let Some(allowed_tools) = policy.allowed_tool_names_for_prompt() {
@@ -789,7 +675,8 @@ impl Agent {
         let task_contract = super::task_contract::TaskContract::from_request(&active_request);
         let behavior_projection =
             super::required_behavior::project_behavior_contract(&task_contract);
-        self.emit_behavior_contract_projected_if_changed(
+        super::active_job_emit::emit_behavior_contract_projected_if_changed(
+            self,
             behavior_projection.as_ref(),
             super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_DIAGNOSTIC,
         );
@@ -1406,7 +1293,8 @@ impl Agent {
         let task_contract = super::task_contract::TaskContract::from_request(&active_request);
         let behavior_projection =
             super::required_behavior::project_behavior_contract(&task_contract);
-        self.emit_behavior_contract_projected_if_changed(
+        super::active_job_emit::emit_behavior_contract_projected_if_changed(
+            self,
             behavior_projection.as_ref(),
             super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_REPAIR,
         );

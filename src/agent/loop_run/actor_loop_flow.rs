@@ -2841,7 +2841,7 @@ pub(super) fn run_actor_loop(
         // payload's `iteration_seq` so the field name and the value
         // semantics agree (previously the per-turn index was passed,
         // which collapsed all same-turn re-emits to a single value).
-        agent.emit_active_job_selected_if_changed(iter_count as u32);
+        super::active_job_emit::emit_active_job_selected_if_changed(agent, iter_count as u32);
 
         let (reply, recovery_dispatch_gate, missing_verifier_setup_turn, recovery_owner) =
             match drive_actor_loop_pre_reply_phase(
