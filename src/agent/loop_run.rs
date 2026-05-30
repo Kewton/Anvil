@@ -205,6 +205,12 @@ mod artifact_state_projection;
 // owned-test-artifact collector. Free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod safe_stop_emit;
+// Verifier-diagnostic pass flow extracted from `turn.rs` (parent #680).
+// Hosts the Issue #637 / #638 / #654 lifecycle: prepare → request →
+// failure → record_failure / record_unavailable, plus the stale-state
+// reset helper. Free fns over `&mut Agent` / `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod verifier_diagnostic_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
