@@ -347,6 +347,16 @@ mod post_edit_excerpt;
 // `[Mode Policy]` system note; Auto returns None). Free fns over
 // `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod tool_prep;
+// Per-Agent misc lifecycle helpers extracted from `turn.rs` (parent
+// #680). Hosts `refresh_artifact_completion_satisfied` (Issue #663
+// SSOT for ledger-driven Satisfied transition),
+// `tool_policy_violation_exit_reason` (RecoveryOwner → ExitReason
+// mapping), `record_missing_verifier_setup_failure` (invalid setup
+// attempt → SafeStop or task_contract_no_verifier_note push), and
+// `current_assistant_model` (mode + plan-model override picker). Free
+// fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod agent_misc;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

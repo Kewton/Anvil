@@ -1500,17 +1500,19 @@ mod tests {
     #[test]
     fn tool_policy_violation_exit_reason_tracks_recovery_owner() {
         assert_eq!(
-            super::Agent::tool_policy_violation_exit_reason(
+            super::super::agent_misc::tool_policy_violation_exit_reason(
                 super::RecoveryOwner::MissingVerifierJob
             ),
             super::ExitReason::MissingVerification
         );
         assert_eq!(
-            super::Agent::tool_policy_violation_exit_reason(super::RecoveryOwner::RepairJob),
+            super::super::agent_misc::tool_policy_violation_exit_reason(
+                super::RecoveryOwner::RepairJob
+            ),
             super::ExitReason::VerifierFailed
         );
         assert_eq!(
-            super::Agent::tool_policy_violation_exit_reason(super::RecoveryOwner::None),
+            super::super::agent_misc::tool_policy_violation_exit_reason(super::RecoveryOwner::None),
             super::ExitReason::ToolCallFormatError
         );
     }

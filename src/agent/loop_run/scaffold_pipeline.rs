@@ -1419,7 +1419,9 @@ pub(super) fn maybe_apply_local_llm_small_edit_fallback(
     {
         return Ok(None);
     }
-    if !model_capabilities(&agent.current_assistant_model()).read_after_small_edit_protocol {
+    if !model_capabilities(&super::agent_misc::current_assistant_model(agent))
+        .read_after_small_edit_protocol
+    {
         return Ok(None);
     }
     let Some(target) = local_llm_small_edit_fallback_target(agent) else {
@@ -1626,7 +1628,7 @@ pub(super) fn maybe_apply_deterministic_edit_after_format_error(
         return Ok(None);
     }
     if !lifecycle::is_tool_call_format_error(err)
-        || !model_capabilities(&agent.current_assistant_model())
+        || !model_capabilities(&super::agent_misc::current_assistant_model(agent))
             .deterministic_edit_after_format_error
         || has_successful_non_plan_repo_edit(
             &agent.session.messages,

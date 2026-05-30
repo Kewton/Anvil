@@ -2552,7 +2552,11 @@ pub(super) fn maybe_handle_rejected_tool_batch_missing_verifier(
     if !missing_verifier_setup_turn {
         return None;
     }
-    if agent.record_missing_verifier_setup_failure(last_iter, "tool policy violation") {
+    if super::agent_misc::record_missing_verifier_setup_failure(
+        agent,
+        last_iter,
+        "tool policy violation",
+    ) {
         return Some(ActorLoopToolPreparationOutcome::Exit {
             reason: ExitReason::MissingVerification,
             error_text:
@@ -2649,7 +2653,7 @@ pub(super) fn maybe_handle_rejected_tool_batch_focused_retry_exhausted(
     }
     if !recovery_dispatch_gate.allows_focused_edit_recovery() {
         return Some(ActorLoopToolPreparationOutcome::Exit {
-            reason: Agent::tool_policy_violation_exit_reason(recovery_owner),
+            reason: super::agent_misc::tool_policy_violation_exit_reason(recovery_owner),
             error_text:
                 "verifier-owned recovery rejected invalid tool calls repeatedly before an allowed repair edit"
                     .to_string(),
@@ -3552,7 +3556,11 @@ pub(super) fn run_actor_loop(
 
         let final_reply = reply_content.trim().to_string();
         if missing_verifier_setup_turn {
-            if agent.record_missing_verifier_setup_failure(last_iter, "no setup edit emitted") {
+            if super::agent_misc::record_missing_verifier_setup_failure(
+                agent,
+                last_iter,
+                "no setup edit emitted",
+            ) {
                 exit_reason = ExitReason::MissingVerification;
                 error_text =
                     "task contract requires verification, but the MissingVerifierJob setup budget is exhausted"
@@ -3768,7 +3776,8 @@ pub(super) fn run_actor_loop(
         duration_secs,
     );
     if exit_reason == ExitReason::ToolCallFormatError
-        && model_capabilities(&agent.current_assistant_model()).finish_after_edit_format_error
+        && model_capabilities(&super::agent_misc::current_assistant_model(agent))
+            .finish_after_edit_format_error
         && stats.total_changed > 0
         && agent.session.mode_state.mode == ExecutionMode::Act
         && (!super::python_request_helpers::active_python_request_requires_tests(agent)

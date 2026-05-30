@@ -29,7 +29,7 @@
 //! `&mut Agent` / `&Agent`, matching `actor_loop_flow` /
 //! `anti_pattern_flow` / `case_record_flow` pattern. `current_assistant_model`
 //! stays on `Agent` because it has 5+ external call sites; this module
-//! reaches it via `agent.current_assistant_model()`.
+//! reaches it via `super::agent_misc::current_assistant_model(agent)`.
 //!
 //! `pub(super)` limited / no facade re-export (DR3-001).
 
@@ -69,7 +69,10 @@ pub(super) fn request_assistant_reply_with_retry(
     // Start spinner once at function entry; retries share the same
     // animation (no flicker between attempts). Dropped automatically on
     // function exit (Ok / Err / early-return), clearing the line.
-    let sp = Spinner::start(format!("thinking... ({})", agent.current_assistant_model()));
+    let sp = Spinner::start(format!(
+        "thinking... ({})",
+        super::agent_misc::current_assistant_model(agent)
+    ));
     let mut retry_state =
         AssistantReplyRetryState::new(agent.config.chat_retries, agent.session.messages.len());
     loop {
@@ -329,7 +332,7 @@ fn request_assistant_reply(
         protocol,
         &effective_tool_policy,
     );
-    let assistant_model = agent.current_assistant_model();
+    let assistant_model = super::agent_misc::current_assistant_model(agent);
     let request_plan = build_assistant_request_plan(
         assistant_model.as_str(),
         native_tools_enabled,
@@ -373,7 +376,7 @@ fn request_streaming_assistant_reply(
     stop_signal: Option<SpinnerStopSignal>,
     interrupt_flag: &InterruptFlag,
 ) -> Result<AssistantReply, String> {
-    let assistant_model = agent.current_assistant_model();
+    let assistant_model = super::agent_misc::current_assistant_model(agent);
     let mut render_state = super::streaming_reply::StreamingReplyRenderState::new();
     let reply = agent.client.chat_streaming_with_mode(
         assistant_model.as_str(),
@@ -399,7 +402,8 @@ fn request_streaming_assistant_reply(
 /// (experimental flag 非依存)。
 fn maybe_finish_after_edit_format_error(agent: &Agent, err: &str) -> Option<AssistantReply> {
     if !lifecycle::is_tool_call_format_error(err)
-        || !model_capabilities(&agent.current_assistant_model()).finish_after_edit_format_error
+        || !model_capabilities(&super::agent_misc::current_assistant_model(agent))
+            .finish_after_edit_format_error
         || agent.session.mode_state.mode != ExecutionMode::Act
     {
         return None;
