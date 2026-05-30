@@ -605,9 +605,9 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
     args: &mut PostReplyRecoveryArgs<'_, '_>,
 ) -> Option<PostReplyRecoveryOutcome> {
     if args.repo_edit_calls_made_this_turn == 0
-        || !agent.active_python_request_requires_tests()
-        || agent.python_test_artifact_exists()
-        || agent.python_verifier_available_for_requested_tests()
+        || !super::python_request_helpers::active_python_request_requires_tests(agent)
+        || super::python_request_helpers::python_test_artifact_exists(agent)
+        || super::python_request_helpers::python_verifier_available_for_requested_tests(agent)
     {
         return None;
     }
@@ -3771,7 +3771,8 @@ pub(super) fn run_actor_loop(
         && model_capabilities(&agent.current_assistant_model()).finish_after_edit_format_error
         && stats.total_changed > 0
         && agent.session.mode_state.mode == ExecutionMode::Act
-        && (!agent.active_python_request_requires_tests() || agent.python_test_artifact_exists())
+        && (!super::python_request_helpers::active_python_request_requires_tests(agent)
+            || super::python_request_helpers::python_test_artifact_exists(agent))
     {
         // Issue #634: 旧文言は qwen3.5 を名指ししていたが、capability ベース
         // (`finish_after_edit_format_error`) に統一されたためモデル非依存の文言に変更。

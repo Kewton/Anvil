@@ -1,6 +1,5 @@
 use super::active_job_arbiter::RecoveryOwner;
 use super::actor_loop_flow::format_iteration_status;
-use super::auto_test::{AutoTestKind, AutoTestRunner};
 
 use super::file_excerpt::{
     open_excerpt_file_nofollow, truncate_on_char_boundary, utf8_prefix_respecting_cap,
@@ -28,7 +27,7 @@ use crate::session::store::ScaffoldArtifactFileSnapshot;
 use crate::tools::registry::ToolSpec;
 use std::path::{Path, PathBuf};
 
-use super::quality::{repo_change_request_text, request_explicitly_requires_tests};
+use super::quality::repo_change_request_text;
 
 /// Maximum number of characters of tool-call arguments retained in trace logs.
 pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
@@ -558,36 +557,6 @@ impl Agent {
         )
     }
 
-    pub(super) fn active_python_request_requires_tests(&self) -> bool {
-        self.session.mode_state.work_mode == WorkMode::Python
-            && self
-                .active_request_text()
-                .as_deref()
-                .is_some_and(request_explicitly_requires_tests)
-    }
-
-    pub(super) fn python_verifier_available_for_requested_tests(&self) -> bool {
-        AutoTestRunner::detect(&self.work_root, &self.session.working_memory.touched_files)
-            .is_some_and(|plan| plan.auto_test_kind() == AutoTestKind::Test)
-    }
-
-    pub(super) fn python_test_artifact_exists(&self) -> bool {
-        let Ok(entries) = std::fs::read_dir(&self.work_root) else {
-            return false;
-        };
-        entries.flatten().any(|entry| {
-            let path = entry.path();
-            if !path.is_file() {
-                return false;
-            }
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                return false;
-            };
-            (name.starts_with("test_") && name.ends_with(".py"))
-                || name.ends_with("_test.py")
-                || name == "tests.py"
-        })
-    }
     pub(super) fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
         tool_call.arguments = normalize_tool_call_arguments(&tool_call.name, tool_call.arguments);
         if matches!(tool_call.name.as_str(), "Read" | "Write" | "Edit")
