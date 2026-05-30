@@ -458,7 +458,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
                     &agent.work_root,
                 ));
             return Some(PostReplyRecoveryOutcome::Finalize {
-                final_prose: agent.answer_only_fallback_response(),
+                final_prose: super::working_memory_messages::answer_only_fallback_response(agent),
                 exit_reason: ExitReason::Done,
                 error_text: String::new(),
             });
@@ -2646,7 +2646,7 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
         *args.no_tool_retries += 1;
         if *args.no_tool_retries >= 1 {
             return Some(PostReplyRecoveryOutcome::Finalize {
-                final_prose: agent.answer_only_fallback_response(),
+                final_prose: super::working_memory_messages::answer_only_fallback_response(agent),
                 exit_reason: ExitReason::Done,
                 error_text: String::new(),
             });

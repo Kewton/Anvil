@@ -161,6 +161,12 @@ mod run_turn;
 // `current_active_job_selection` as free fns over `&mut Agent` /
 // `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod active_job_emit;
+// Working-memory + repo-context prompt messages extracted from
+// `turn.rs` (parent #680). Hosts `refresh_working_memory`,
+// `working_memory_message`, `answer_only_fallback_response`, and
+// `repo_context_message` as free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod working_memory_messages;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
