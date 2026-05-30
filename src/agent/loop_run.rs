@@ -155,6 +155,12 @@ mod prepare_actor_loop_state;
 // context-pack hook + actor loop entry. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod run_turn;
+// Active-job + behavior-contract event emit helpers extracted from
+// `turn.rs` (parent #680). Hosts `emit_active_job_selected_if_changed`,
+// `emit_behavior_contract_projected_if_changed`, and
+// `current_active_job_selection` as free fns over `&mut Agent` /
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod active_job_emit;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

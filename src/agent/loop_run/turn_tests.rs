@@ -2621,7 +2621,8 @@ mod tests {
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         assert!(agent.last_active_job_selection.is_none());
-        let emitted = agent.emit_active_job_selected_if_changed(0);
+        let emitted =
+            super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
         assert!(
             emitted,
             "first call after turn reset must emit (None -> Some transition)"
@@ -2642,8 +2643,10 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        let first = agent.emit_active_job_selected_if_changed(0);
-        let second = agent.emit_active_job_selected_if_changed(1);
+        let first =
+            super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
+        let second =
+            super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 1);
         assert!(first, "first emit must succeed");
         assert!(
             !second,
@@ -2662,7 +2665,8 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        let first = agent.emit_active_job_selected_if_changed(0);
+        let first =
+            super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
         assert!(first);
 
         // Install a concrete verifier-repair job so the next selection
@@ -2670,7 +2674,8 @@ mod tests {
         // flag alone is intentionally not a dispatch source anymore.
         agent.task_contract_verifier_repair_pending = true;
         agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
-        let second = agent.emit_active_job_selected_if_changed(1);
+        let second =
+            super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 1);
         assert!(
             second,
             "selection change (None -> VerifierRepair) MUST re-emit"
@@ -2687,13 +2692,14 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        agent.emit_active_job_selected_if_changed(0);
+        super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
         assert!(agent.last_active_job_selection.is_some());
 
         // Simulate per-turn reset (same lines as handle_user_message head).
         agent.last_active_job_selection = None;
 
-        let after_reset = agent.emit_active_job_selected_if_changed(0);
+        let after_reset =
+            super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
         assert!(
             after_reset,
             "post-turn-reset call must emit again (None -> Some transition)"
@@ -3372,7 +3378,7 @@ mod tests {
 
         // (2) ActiveJobSelection.selected MUST be Some (Phase C dedup state
         //     would observe an active job at the head of the next iteration).
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         assert!(
             selection.selected.is_some(),
             "current_active_job_selection().selected must be Some(VerifierRepair)"
@@ -3487,7 +3493,7 @@ mod tests {
         );
 
         // (2) ActiveJobSelection.selected MUST be Some.
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         assert!(
             selection.selected.is_some(),
             "current_active_job_selection().selected must be Some(ArtifactRecovery)"
@@ -3538,7 +3544,7 @@ mod tests {
             "CB-001: bare recovery target without a job MUST NOT yield ArtifactDirectedRecovery"
         );
 
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         let chose_artifact_recovery = selection
             .selected
             .as_ref()
@@ -3702,7 +3708,7 @@ mod tests {
         );
 
         // (2) ActiveJobSelection.selected MUST be Some.
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         assert!(
             selection.selected.is_some(),
             "current_active_job_selection().selected must be Some(ForcedSmallEditRecovery)"
@@ -3763,7 +3769,7 @@ mod tests {
             super::EffectiveToolPolicyReason::Unrestricted,
             "without any selectable job, effective_tool_policy must be Unrestricted"
         );
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         assert!(
             selection.selected.is_none(),
             "without any selectable job, ActiveJobSelection.selected must be None"
@@ -3900,7 +3906,7 @@ mod tests {
         // return an empty selection — the registry-layer PAM gate is the
         // sole authority for write-target arbitration in Plan mode.
         agent.task_contract_verifier_repair_pending = true;
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         assert!(
             selection.selected.is_none(),
             "Plan mode pre-arbitration gate MUST short-circuit \
@@ -3954,7 +3960,7 @@ mod tests {
         // Cross-check: `current_active_job_selection()` mirrors the same
         // gate so consumers (`emit_active_job_selected_if_changed`, generic-
         // retry guards) observe `None`.
-        let selection = agent.current_active_job_selection();
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
         assert!(
             selection.selected.is_none(),
             "Plan mode pre-arbitration gate MUST also short-circuit \
