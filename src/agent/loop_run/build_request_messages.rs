@@ -116,7 +116,9 @@ fn append_general_request_context_messages(
     agent: &mut Agent,
     messages: &mut Vec<ConversationMessage>,
 ) {
-    if agent.active_task_expects_repo_change() && agent.workspace_appears_empty() {
+    if super::workspace_access::active_task_expects_repo_change(agent)
+        && super::workspace_access::workspace_appears_empty(agent)
+    {
         if let Some(framework) =
             super::scaffold_pipeline::active_task_requested_scaffold_framework(agent)
         {

@@ -43,7 +43,7 @@ pub(super) fn effective_tool_policy(agent: &Agent) -> EffectiveToolPolicy {
     // in §4 of the design policy). The arbiter never sees it; we early-
     // return before constructing any selectable `JobCandidate`.
     if super::tool_policy_decisions::answer_only_mode_active(agent) {
-        if agent.workspace_appears_empty() {
+        if super::workspace_access::workspace_appears_empty(agent) {
             return EffectiveToolPolicy::restricted(
                 EffectiveToolPolicyReason::AnswerOnly,
                 Vec::new(),
@@ -238,7 +238,7 @@ fn setup_bootstrap_candidate(agent: &Agent) -> Option<JobCandidate> {
     ) {
         return None;
     }
-    let request = agent.active_request_text()?;
+    let request = super::workspace_access::active_request_text(agent)?;
     let task_contract = super::task_contract::TaskContract::from_request(&request);
     let behavior_projection = super::required_behavior::project_behavior_contract(&task_contract);
     let verifier_signal = super::task_contract::VerifierPrerequisiteSignal::from_sources(

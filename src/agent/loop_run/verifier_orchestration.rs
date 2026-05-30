@@ -2159,14 +2159,14 @@ pub(super) fn verifier_repair_pass_client(
 pub(super) fn task_contract_verifier_test_binding(
     agent: &mut Agent,
 ) -> (Vec<String>, bool, Option<TaskWorkspaceScope>) {
-    let Some(request) = agent.active_request_text() else {
+    let Some(request) = super::workspace_access::active_request_text(agent) else {
         return (Vec::new(), false, None);
     };
     let contract = TaskContract::from_request(&request);
     let test_execution_required = contract.required_behavior.test_execution_required;
     let owned_test_artifacts =
         super::owned_test_projection::owned_test_artifacts_for_verifier(agent, &contract);
-    let scope = agent.current_workspace_scope();
+    let scope = super::workspace_access::current_workspace_scope(agent);
     (owned_test_artifacts, test_execution_required, Some(scope))
 }
 
@@ -2191,10 +2191,10 @@ pub(super) fn handle_missing_task_contract_verifier_selection(
     owned_test_artifacts_count: usize,
 ) -> TaskContractVerifierOutcome {
     agent.owned_test_verifier_missing_observed_this_turn = true;
-    agent.owned_test_verifier_missing_observed_carryover = agent
-        .active_request_text()
-        .as_deref()
-        .map(RequestCarryoverKey::from_request);
+    agent.owned_test_verifier_missing_observed_carryover =
+        super::workspace_access::active_request_text(agent)
+            .as_deref()
+            .map(RequestCarryoverKey::from_request);
     let frame = super::success::build_feedback_for_no_verifier(&agent.work_root);
     agent.session.record_feedback_if_unset(frame);
     if matches!(outcome, TaskContractVerifierOutcome::NoVerifier) {
@@ -2288,7 +2288,7 @@ pub(super) fn select_task_contract_verifier_once(
         super::success::recent_successful_bash_commands_since_last_user(&agent.session.messages);
     let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
         task_contract_verifier_test_binding(agent);
-    let active_request = agent.active_request_text();
+    let active_request = super::workspace_access::active_request_text(agent);
     let task_contract_project_unit = super::verifier_driver::select_task_contract_project_unit(
         &agent.work_root,
         active_request.as_deref(),
@@ -2464,7 +2464,9 @@ pub(super) fn handle_task_contract_verifier_no_verifier(
         task_contract_no_verifier_note(
             job_attempt,
             TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-            agent.active_request_text().unwrap_or_default().as_str(),
+            super::workspace_access::active_request_text(agent)
+                .unwrap_or_default()
+                .as_str(),
         ),
     );
     super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue
@@ -3056,11 +3058,11 @@ pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnos
     };
     let authority_input =
         super::semantic_repair_planning::build_spec_authority_input_for_active_request(
-            agent.active_request_text().as_deref(),
+            super::workspace_access::active_request_text(agent).as_deref(),
             semantic_report.as_ref(),
             agent_history_hint,
         );
-    let scope = agent.current_workspace_scope();
+    let scope = super::workspace_access::current_workspace_scope(agent);
     let turn_edited = agent.turn_edited_relative_paths.clone();
     let edited_predicate = |path: &str| turn_edited.contains(path);
     let scaffold_predicate =

@@ -49,7 +49,7 @@ pub(super) fn focused_edit_recovery_target(agent: &Agent) -> Option<PathBuf> {
 fn repo_change_no_edit_recovery_target(agent: &Agent) -> Option<PathBuf> {
     if agent.session.mode_state.mode != ExecutionMode::Act
         || !agent.session.mode_state.policy().repo_edit_required
-        || !agent.active_task_expects_repo_change()
+        || !super::workspace_access::active_task_expects_repo_change(agent)
         || has_successful_non_plan_repo_edit(
             &agent.session.messages,
             &agent.work_root,
@@ -104,7 +104,8 @@ pub(super) fn push_verifier_repair_recovery_note(agent: &mut Agent, attempt: usi
             // Issue #665 Phase 5: caller-side projection (S5-005 では
             // raw label/excerpt は system note に出さないため helper
             // 内部で metadata のみに縮退する)。
-            let active_request = agent.active_request_text().unwrap_or_default();
+            let active_request =
+                super::workspace_access::active_request_text(agent).unwrap_or_default();
             let task_contract = super::task_contract::TaskContract::from_request(&active_request);
             let behavior_projection =
                 super::required_behavior::project_behavior_contract(&task_contract);

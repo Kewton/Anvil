@@ -46,7 +46,7 @@ pub(super) fn local_llm_small_edit_target(agent: &Agent) -> Option<PathBuf> {
     }
     if agent.session.mode_state.mode != ExecutionMode::Act
         || !agent.session.mode_state.policy().repo_edit_required
-        || !agent.active_task_expects_repo_change()
+        || !super::workspace_access::active_task_expects_repo_change(agent)
     {
         return None;
     }

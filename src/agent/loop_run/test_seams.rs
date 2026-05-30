@@ -59,7 +59,7 @@ pub(super) fn drive_policy_error_for_test(
         .map(|j| j.attempts().len())
         .unwrap_or(0);
     let scope_for_policy = if agent.missing_verifier_job.is_some() {
-        Some(agent.current_workspace_scope())
+        Some(super::workspace_access::current_workspace_scope(agent))
     } else {
         None
     };

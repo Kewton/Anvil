@@ -63,7 +63,7 @@ pub(super) fn prepare_verifier_diagnostic_pass(
         current.diagnostic_attempted = true;
         current.assessment_attempts = current.assessment_attempts.saturating_add(1);
     }
-    let active_request = agent.active_request_text().unwrap_or_default();
+    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     let task_contract = super::task_contract::TaskContract::from_request(&active_request);
     let behavior_projection = super::required_behavior::project_behavior_contract(&task_contract);
     super::active_job_emit::emit_behavior_contract_projected_if_changed(

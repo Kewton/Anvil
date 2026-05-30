@@ -91,8 +91,8 @@ pub(super) fn task_contract_recovery_action(
         action,
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
     ) {
-        let request = agent.active_request_text().unwrap_or_default();
-        let scope = agent.current_workspace_scope();
+        let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
+        let scope = super::workspace_access::current_workspace_scope(agent);
         let probe = super::project_probe::probe_completion(
             &agent.work_root,
             &request,
@@ -156,7 +156,7 @@ pub(super) fn task_contract_recovery_target(
     // mentioned) MUST NOT be surfaced as a recovery target either. The
     // ownership signal — edit / scaffold delta / explicit scope mention
     // — is the same one the planner uses upstream.
-    let scope = agent.current_workspace_scope();
+    let scope = super::workspace_access::current_workspace_scope(agent);
     if let Some(path) =
         existing_workspace_candidate_for_role_in_scope(&agent.work_root, role, &scope)
     {
@@ -189,8 +189,7 @@ pub(super) fn task_contract_recovery_target(
             });
         }
     }
-    if let Some(path) = agent
-        .active_request_text()
+    if let Some(path) = super::workspace_access::active_request_text(agent)
         .as_deref()
         .and_then(|req| synthesized_missing_implementation_target_path_for_request(role, req))
     {

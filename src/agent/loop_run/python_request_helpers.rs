@@ -23,8 +23,7 @@ use crate::modes::plan_act::WorkMode;
 
 pub(super) fn active_python_request_requires_tests(agent: &Agent) -> bool {
     agent.session.mode_state.work_mode == WorkMode::Python
-        && agent
-            .active_request_text()
+        && super::workspace_access::active_request_text(agent)
             .as_deref()
             .is_some_and(request_explicitly_requires_tests)
 }

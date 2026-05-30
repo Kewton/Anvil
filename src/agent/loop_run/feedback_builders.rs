@@ -216,7 +216,7 @@ pub(super) fn extract_path_tokens_from_text(text: &str, work_root: &Path) -> Vec
 pub(super) fn extract_current_request_paths(agent: &Agent, work_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
 
-    if let Some(text) = agent.active_request_text() {
+    if let Some(text) = super::workspace_access::active_request_text(agent) {
         for p in extract_path_tokens_from_text(&text, work_root) {
             if !out.contains(&p) {
                 out.push(p);

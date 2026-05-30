@@ -94,7 +94,7 @@ pub(super) fn maybe_install_artifact_completion_job_for_hint(
     // `current_artifact_recovery_target` so no stale projection
     // remains (signalled by `JobInstallOutcome::ValidationFailed`).
     agent.artifact_completion_job = None;
-    let scope = agent.current_workspace_scope();
+    let scope = super::workspace_access::current_workspace_scope(agent);
     match ArtifactCompletionJob::new(
         &agent.work_root,
         &scope,
