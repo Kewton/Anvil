@@ -1786,7 +1786,7 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
     let mut prepared_tool_calls = args
         .reply_tool_calls
         .into_iter()
-        .map(|tool_call| agent.prepare_tool_call(tool_call))
+        .map(|tool_call| super::tool_call_prepare::prepare_tool_call(agent, tool_call))
         .collect::<Vec<_>>();
     record_actor_loop_tool_call_summaries(&prepared_tool_calls, args.tool_call_summaries);
 
