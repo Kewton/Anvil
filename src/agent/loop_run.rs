@@ -324,6 +324,14 @@ mod python_request_helpers;
 // re-export (DR3-001).
 #[cfg(test)]
 mod test_seams;
+// Forced-small-edit recovery target / note builders extracted from
+// `turn.rs` (parent #680). Hosts the focused-edit policy's
+// "previous tool call truncated → force a small follow-up edit"
+// branch: `forced_small_edit_recovery_target` (Act mode + truncated +
+// no successful non-plan edit since) + `forced_small_edit_recovery_message`
+// (renders the recovery note). Free fns over `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod forced_small_edit;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

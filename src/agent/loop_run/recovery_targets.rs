@@ -43,8 +43,7 @@ use crate::modes::plan_act::ExecutionMode;
 use crate::safety::path_guard::resolve_user_path;
 
 pub(super) fn focused_edit_recovery_target(agent: &Agent) -> Option<PathBuf> {
-    agent
-        .forced_small_edit_recovery_target()
+    super::forced_small_edit::forced_small_edit_recovery_target(agent)
         .or_else(|| super::scaffold_pipeline::post_scaffold_edit_recovery_target(agent))
         .or_else(|| super::scaffold_pipeline::post_scaffold_continuation_recovery_target(agent))
 }

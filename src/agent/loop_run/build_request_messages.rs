@@ -244,7 +244,7 @@ fn append_common_request_messages(
             plan_file_alias(plan_path)
         )));
     }
-    if let Some(note) = agent.forced_small_edit_recovery_message() {
+    if let Some(note) = super::forced_small_edit::forced_small_edit_recovery_message(agent) {
         messages.push(ConversationMessage::system(note));
     }
     if let Some(note) = super::scaffold_pipeline::post_scaffold_edit_recovery_message(agent) {
