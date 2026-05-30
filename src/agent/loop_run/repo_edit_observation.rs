@@ -134,7 +134,8 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
         // role-miss / read failure (back-compat with the existing
         // `repo_edit_has_post_scaffold_delta` no-data path).
         if let Some(role) = super::task_contract::role_from_repo_edit(category)
-            && let Some(excerpt) = agent.bounded_post_edit_excerpt(&relative_path)
+            && let Some(excerpt) =
+                super::post_edit_excerpt::bounded_post_edit_excerpt(agent, &relative_path)
         {
             agent.task_contract_excerpts.insert(role, excerpt);
         }
