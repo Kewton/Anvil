@@ -221,6 +221,15 @@ mod verifier_diagnostic_flow;
 // Free fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod verifier_repair_pass_flow;
+// Artifact-completion attempt-recording cluster extracted from `turn.rs`
+// (parent #680). Hosts `push_artifact_directed_recovery_note` (system
+// note push gated by focused-edit target) + `record_artifact_completion_attempt`
+// + `record_artifact_completion_bash_violation` + the shared
+// `record_artifact_completion_outcome` core (append outcome + trigger
+// turn-local `artifact_completion_failed` diagnostic on Exhausted
+// transition). Free fns over `&mut Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod artifact_completion_record;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

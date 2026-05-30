@@ -329,14 +329,15 @@ impl Agent {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+                    let _ = super::artifact_completion_record::record_artifact_completion_bash_violation(self, vec![command_arg]);
                 } else {
                     let actual_path = arguments
                         .get("path")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let _ = self.record_artifact_completion_attempt(
+                    let _ = super::artifact_completion_record::record_artifact_completion_attempt(
+                        self,
                         super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
                         vec![format!("{name} on {actual_path}")],
                     );
@@ -350,7 +351,11 @@ impl Agent {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+                let _ =
+                    super::artifact_completion_record::record_artifact_completion_bash_violation(
+                        self,
+                        vec![command_arg],
+                    );
             }
         }
         let after = self
@@ -604,103 +609,6 @@ impl Agent {
             super::repair_job::RepairNextAction::RerunVerifier
             | super::repair_job::RepairNextAction::SafeStop { .. }
             | super::repair_job::RepairNextAction::VerifiedDone => false,
-        }
-    }
-
-    pub(super) fn push_artifact_directed_recovery_note(&mut self, attempt: usize) -> bool {
-        if self.focused_edit_recovery_target().is_some() {
-            return false;
-        }
-        let Some(target) = self.current_artifact_recovery_target.as_ref() else {
-            return false;
-        };
-        self.push_system_note(recovery::artifact_directed_recovery_note(
-            target.role.label(),
-            &target.path,
-            attempt,
-        ));
-        true
-    }
-
-    /// Issue #652: record an attempt against the active
-    /// `ArtifactCompletionJob` (no-op when no job exists). Triggers the
-    /// turn-local `artifact_completion_failed` diagnostic when the
-    /// recording causes the job to transition to `Exhausted`.
-    pub(super) fn record_artifact_completion_attempt(
-        &mut self,
-        kind: super::artifact_completion_job::ArtifactAttemptOutcomeKind,
-        actual_actions: Vec<String>,
-    ) -> bool {
-        let expected_target = match self.artifact_completion_job.as_ref() {
-            Some(job) => job.target_path().to_string(),
-            None => return false,
-        };
-        let outcome = super::artifact_completion_job::ArtifactAttemptOutcome::new(
-            kind,
-            actual_actions,
-            expected_target,
-        );
-        self.record_artifact_completion_outcome(outcome)
-    }
-
-    /// Issue #664 iteration-2 (CB-003): record a Bash policy violation
-    /// against the active `ArtifactCompletionJob`. The outcome carries the
-    /// non-raw `bash_policy_violation = true` marker so
-    /// `attempt_outcome_to_json_value` emits
-    /// `category = "bash_out_of_policy"`.
-    ///
-    /// Raw command bytes are NOT stored verbatim — `actual_actions` is
-    /// sanitized at `ArtifactAttemptOutcome::new` (`mask_secrets` + length
-    /// cap + control-char neutralize) and hashed via `stable_path_hash`
-    /// at projection time (AD5 / CB-004).
-    fn record_artifact_completion_bash_violation(&mut self, actual_actions: Vec<String>) -> bool {
-        let expected_target = match self.artifact_completion_job.as_ref() {
-            Some(job) => job.target_path().to_string(),
-            None => return false,
-        };
-        let outcome =
-            super::artifact_completion_job::ArtifactAttemptOutcome::new_bash_policy_violation(
-                actual_actions,
-                expected_target,
-            );
-        self.record_artifact_completion_outcome(outcome)
-    }
-
-    /// Shared core: append `outcome` to the active job's attempt history
-    /// and trigger the turn-local exhaustion diagnostic when the job
-    /// transitions to `Exhausted`.
-    fn record_artifact_completion_outcome(
-        &mut self,
-        outcome: super::artifact_completion_job::ArtifactAttemptOutcome,
-    ) -> bool {
-        let status_after = match self.artifact_completion_job.as_mut() {
-            Some(job) => job.record_attempt(outcome),
-            None => return false,
-        };
-        if matches!(
-            status_after,
-            super::artifact_completion_job::ArtifactCompletionStatus::Exhausted { .. }
-        )
-        // Issue #663 (Phase A): with 5 variants the `Exhausted` match
-        // remains the only terminal-failure trigger; new states do not
-        // alter the diagnostic surface.
-        {
-            // CB-002: tag the turn so the actor loop terminates with
-            // `MissingRepoEdits` even on call paths that previously
-            // dropped the return value (artifact-directed policy
-            // WrongTarget). Emit the diagnostic only once per
-            // exhaustion (`maybe_emit_..._diagnostic` is gated by the
-            // same flag).
-            let first_exhaustion = !self.artifact_completion_exhausted_this_turn;
-            self.artifact_completion_exhausted_this_turn = true;
-            if first_exhaustion {
-                super::artifact_recovery_flow::maybe_emit_artifact_completion_failed_diagnostic(
-                    self,
-                );
-            }
-            true
-        } else {
-            false
         }
     }
 
@@ -971,14 +879,19 @@ impl Agent {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+                let _ =
+                    super::artifact_completion_record::record_artifact_completion_bash_violation(
+                        self,
+                        vec![command_arg],
+                    );
             } else {
                 let actual_path = arguments
                     .get("path")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let _ = self.record_artifact_completion_attempt(
+                let _ = super::artifact_completion_record::record_artifact_completion_attempt(
+                    self,
                     super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
                     vec![format!("{name} on {actual_path}")],
                 );
@@ -992,7 +905,10 @@ impl Agent {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let _ = self.record_artifact_completion_bash_violation(vec![command_arg]);
+            let _ = super::artifact_completion_record::record_artifact_completion_bash_violation(
+                self,
+                vec![command_arg],
+            );
         }
         lifecycle::format_tool_error(err)
     }
