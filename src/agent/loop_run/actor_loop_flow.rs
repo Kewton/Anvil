@@ -73,9 +73,8 @@ use super::tool_display::tool_display;
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
-use super::turn::{
-    LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD, write_stdout_rendered,
-};
+use super::turn::{LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD};
+use super::turn_helpers::write_stdout_rendered;
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
@@ -463,7 +462,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
                 error_text: String::new(),
             });
         }
-        super::turn::write_stdout_rendered(
+        super::turn_helpers::write_stdout_rendered(
             &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
@@ -503,7 +502,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         &target_path,
     ) {
         Ok(true) => {
-            super::turn::write_stdout_rendered(
+            super::turn_helpers::write_stdout_rendered(
                 &format_iteration_status(
                     args.last_iter,
                     agent.config.max_iterations,
@@ -540,7 +539,7 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
             error_text: issue,
         });
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -584,7 +583,7 @@ pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
                 .to_string(),
         });
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -635,7 +634,7 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
             error_text,
         });
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -669,7 +668,7 @@ pub(super) fn maybe_handle_missing_repo_edit_recovery(
     if *args.repo_change_retries >= 3 {
         return Some(finalize_missing_repo_edit_retry_exhausted(agent));
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -892,7 +891,7 @@ pub(super) fn handle_actor_loop_empty_reply(
                 },
             };
         }
-        super::turn::write_stdout_rendered(
+        super::turn_helpers::write_stdout_rendered(
             &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
@@ -931,7 +930,7 @@ pub(super) fn handle_actor_loop_empty_reply(
             error_text: ExitReason::EmptyResponses.default_error_text().to_string(),
         };
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -996,7 +995,7 @@ fn handle_plan_progress_prose_only_reply(
     if *args.plan_progress_retries >= 2 {
         return handle_plan_progress_prose_only_fallback(agent);
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -1045,7 +1044,7 @@ fn handle_generic_prose_only_retry(
             error_text: ExitReason::NoToolCalls.default_error_text().to_string(),
         };
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             last_iter,
             agent.config.max_iterations,
@@ -1088,7 +1087,7 @@ fn handle_actor_loop_missing_repo_change_retry_prompt(
     agent: &mut Agent,
     args: ActorLoopMissingRepoChangeRetryPromptArgs,
 ) -> ActorLoopNoToolReplyOutcome {
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -1180,7 +1179,7 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
             args.repo_change_retries,
         ))
     {
-        super::turn::write_stdout_rendered(
+        super::turn_helpers::write_stdout_rendered(
             &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,
@@ -1353,7 +1352,7 @@ pub(super) fn handle_actor_loop_completion(
                     },
                 };
             }
-            super::turn::write_stdout_rendered(
+            super::turn_helpers::write_stdout_rendered(
                 &format_iteration_status(
                     args.last_iter,
                     agent.config.max_iterations,
@@ -1499,7 +1498,7 @@ pub(super) fn handle_actor_loop_post_tool_polish_fallback(
         target_path,
     ) {
         Ok(true) => {
-            super::turn::write_stdout_rendered(
+            super::turn_helpers::write_stdout_rendered(
                 &format_iteration_status(
                     last_iter,
                     agent.config.max_iterations,
@@ -1540,7 +1539,7 @@ fn handle_actor_loop_post_tool_quality_fallback(
         target_path,
     ) {
         Ok(true) => {
-            super::turn::write_stdout_rendered(
+            super::turn_helpers::write_stdout_rendered(
                 &format_iteration_status(
                     last_iter,
                     agent.config.max_iterations,
@@ -1597,7 +1596,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
         &target_path,
     ) {
         Ok(true) => {
-            super::turn::write_stdout_rendered(
+            super::turn_helpers::write_stdout_rendered(
                 &format_iteration_status(
                     last_iter,
                     agent.config.max_iterations,
@@ -1625,7 +1624,7 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
                     error_text: issue,
                 }
             } else {
-                super::turn::write_stdout_rendered(
+                super::turn_helpers::write_stdout_rendered(
                     &format_iteration_status(
                         last_iter,
                         agent.config.max_iterations,
@@ -1809,7 +1808,7 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
             super::tool_policy::FocusedEditBatchAction::Accept => {}
             super::tool_policy::FocusedEditBatchAction::TruncateToFirst => {
                 prepared_tool_calls.truncate(1);
-                super::turn::write_stdout_rendered(
+                super::turn_helpers::write_stdout_rendered(
                     &format_iteration_status(
                         args.last_iter,
                         agent.config.max_iterations,
@@ -2260,7 +2259,7 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
             ),
         };
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -2328,7 +2327,7 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
             ),
         };
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -2395,7 +2394,7 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
             error_text: "assistant stopped before repairing the verifier failure".to_string(),
         };
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             last_iter,
             agent.config.max_iterations,
@@ -2517,7 +2516,7 @@ pub(super) fn handle_actor_loop_rejected_tool_batch(
         };
     }
     let retry_status_note = rejected_tool_batch_retry_status_note(focused_retry.is_some());
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -2619,7 +2618,7 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
             ),
         });
     }
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &format_iteration_status(
             last_iter,
             agent.config.max_iterations,
@@ -2728,7 +2727,7 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
                 error_text: String::new(),
             });
         }
-        super::turn::write_stdout_rendered(
+        super::turn_helpers::write_stdout_rendered(
             &format_iteration_status(
                 args.last_iter,
                 agent.config.max_iterations,

@@ -21,7 +21,7 @@ use super::case_record_extract::{
     case_record_auto_test_active, case_record_extraction_succeeded, case_record_initial_feedback,
     derive_language_stack,
 };
-use super::turn::RetrievalInjection;
+use super::turn_helpers::RetrievalInjection;
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::precaution::PrecautionStatus;

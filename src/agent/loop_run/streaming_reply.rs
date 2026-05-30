@@ -21,7 +21,8 @@
 
 use super::interrupt::InterruptFlag;
 use super::spinner::SpinnerStopSignal;
-use super::turn::{USER_INTERRUPT_ERROR, write_stdout_rendered};
+use super::turn::USER_INTERRUPT_ERROR;
+use super::turn_helpers::write_stdout_rendered;
 
 pub(super) struct StreamingReplyRenderState {
     pub(super) first_chunk: bool,

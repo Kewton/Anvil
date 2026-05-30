@@ -368,6 +368,12 @@ mod tool_call_prepare;
 // `is_preferred_read_edit_target` matches). Free fns (no Agent
 // dependency). `pub(super)` limited / no facade re-export (DR3-001).
 mod read_target_helpers;
+// Small helpers + shared types extracted from `turn.rs` (parent #680).
+// Hosts `extract_filename_with_suffix`, `write_stdout_rendered`,
+// `tool_result_failed`, `quality_confirm_cache_key` free fns +
+// `RetrievalInjection` struct + `WrittenScaffoldArtifacts` type alias.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod turn_helpers;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

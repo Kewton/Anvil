@@ -33,7 +33,7 @@ use super::quality_confirm::{
     QualityConfirmation, QualityConfirmationSource, run_quality_confirm_with_strategy,
     should_request_quality_confirmation,
 };
-use super::turn::quality_confirm_cache_key;
+use super::turn_helpers::quality_confirm_cache_key;
 use super::work_mode_confirm::{
     self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
     run_work_mode_confirm_with_strategy,

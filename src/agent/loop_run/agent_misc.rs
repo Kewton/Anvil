@@ -29,7 +29,7 @@ use super::active_job_arbiter::RecoveryOwner;
 use super::actor_loop_flow::format_iteration_status;
 use super::plan_mode_helpers::assistant_model_for_mode;
 use super::summary::ExitReason;
-use super::turn::write_stdout_rendered;
+use super::turn_helpers::write_stdout_rendered;
 use super::verifier_orchestration::task_contract_no_verifier_note;
 
 pub(super) fn refresh_artifact_completion_satisfied(agent: &mut Agent) {

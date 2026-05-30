@@ -2444,7 +2444,7 @@ pub(super) fn handle_task_contract_verifier_no_verifier(
     *args.repo_change_retries = 0;
     *args.verifier_repair_retries = 0;
     agent.repair_job_artifact_attempts = 0;
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &super::actor_loop_flow::format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -2551,7 +2551,7 @@ pub(super) fn drive_task_contract_verifier(
         args.accumulated,
         &current_verif,
     );
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &super::actor_loop_flow::format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
@@ -2816,7 +2816,7 @@ pub(super) fn handle_task_contract_verifier_failure(
     *args.repo_change_retries = 0;
     *args.verifier_repair_retries = 0;
     agent.repair_job_artifact_attempts = 0;
-    super::turn::write_stdout_rendered(
+    super::turn_helpers::write_stdout_rendered(
         &super::actor_loop_flow::format_iteration_status(
             args.last_iter,
             agent.config.max_iterations,
