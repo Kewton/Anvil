@@ -339,7 +339,7 @@ fn request_assistant_reply(
         focused_edit_target,
         &agent.work_root,
     );
-    let tool_specs = agent.tool_specs_for_policy(&effective_tool_policy);
+    let tool_specs = super::tool_prep::tool_specs_for_policy(agent, &effective_tool_policy);
 
     if request_plan.use_streaming_transport {
         request_streaming_assistant_reply(

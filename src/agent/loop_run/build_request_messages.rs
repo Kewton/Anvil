@@ -90,7 +90,7 @@ pub(super) fn build_request_messages(
         &next_sections,
         effective_tool_policy.allowed_tool_names_for_prompt(),
     )));
-    if let Some(message) = agent.mode_policy_message() {
+    if let Some(message) = super::tool_prep::mode_policy_message(agent) {
         messages.push(message);
     }
     if focused_edit_target.is_none() {
