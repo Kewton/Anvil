@@ -735,7 +735,7 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
         agent.push_system_note(note);
         return;
     }
-    if !agent.push_artifact_directed_recovery_note(attempt) {
+    if !super::artifact_completion_record::push_artifact_directed_recovery_note(agent, attempt) {
         agent.push_system_note(recovery::repo_change_recovery_note(attempt));
     }
 }
@@ -1107,12 +1107,15 @@ fn handle_empty_missing_repo_change_retry(
     agent: &mut Agent,
     repo_change_retries: usize,
 ) -> ActorLoopNoToolReplyOutcome {
-    if !agent.push_artifact_directed_recovery_note(repo_change_retries)
-        && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
+    if !super::artifact_completion_record::push_artifact_directed_recovery_note(
+        agent,
+        repo_change_retries,
+    ) && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
     {
         agent.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
     }
-    if agent.record_artifact_completion_attempt(
+    if super::artifact_completion_record::record_artifact_completion_attempt(
+        agent,
         super::artifact_completion_job::ArtifactAttemptOutcomeKind::NoTool,
         Vec::new(),
     ) {
@@ -1134,14 +1137,17 @@ fn handle_prose_only_missing_repo_change_retry(
             repo_change_retries,
         );
         agent.push_system_note(note);
-    } else if !agent.push_artifact_directed_recovery_note(repo_change_retries)
-        && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
+    } else if !super::artifact_completion_record::push_artifact_directed_recovery_note(
+        agent,
+        repo_change_retries,
+    ) && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
     {
         agent.push_system_note(recovery::repo_change_no_tool_recovery_note(
             repo_change_retries,
         ));
     }
-    if agent.record_artifact_completion_attempt(
+    if super::artifact_completion_record::record_artifact_completion_attempt(
+        agent,
         super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly,
         Vec::new(),
     ) {
@@ -1155,8 +1161,10 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
     args: ActorLoopMissingRepoChangeRetryExhaustedArgs<'_>,
 ) -> ActorLoopNoToolReplyOutcome {
     if args.repo_change_retries == 2
-        && (agent.push_artifact_directed_recovery_note(args.repo_change_retries)
-            || agent.push_repo_change_no_edit_recovery_note(args.repo_change_retries))
+        && (super::artifact_completion_record::push_artifact_directed_recovery_note(
+            agent,
+            args.repo_change_retries,
+        ) || agent.push_repo_change_no_edit_recovery_note(args.repo_change_retries))
     {
         super::turn::write_stdout_rendered(
             &format_iteration_status(
@@ -2190,7 +2198,11 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
     } else {
         super::artifact_completion_job::ArtifactAttemptOutcomeKind::ProseOnly
     };
-    if agent.record_artifact_completion_attempt(kind, Vec::new()) {
+    if super::artifact_completion_record::record_artifact_completion_attempt(
+        agent,
+        kind,
+        Vec::new(),
+    ) {
         return ActorLoopTaskContractReplyOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
@@ -2233,7 +2245,10 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
         ),
         true,
     );
-    if !agent.push_artifact_directed_recovery_note(artifact_attempt) {
+    if !super::artifact_completion_record::push_artifact_directed_recovery_note(
+        agent,
+        artifact_attempt,
+    ) {
         let note = super::task_contract::render_contract_recovery_note_with_hint(
             args.decision,
             agent.active_request_text().as_deref().unwrap_or_default(),
@@ -2366,7 +2381,10 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
         true,
     );
     if !agent.push_verifier_repair_recovery_note(*verifier_repair_retries)
-        && !agent.push_artifact_directed_recovery_note(*verifier_repair_retries)
+        && !super::artifact_completion_record::push_artifact_directed_recovery_note(
+            agent,
+            *verifier_repair_retries,
+        )
     {
         agent.push_system_note(task_contract_verifier_edit_required_note(
             *verifier_repair_retries,
@@ -2534,7 +2552,8 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
         .as_ref()
         .map(|target| target.role)
         .unwrap_or(super::task_contract::ArtifactRole::Implementation);
-    if agent.record_artifact_completion_attempt(
+    if super::artifact_completion_record::record_artifact_completion_attempt(
+        agent,
         super::artifact_completion_job::ArtifactAttemptOutcomeKind::RolePolicyViolation,
         vec!["focused_edit_batch_reject".to_string()],
     ) {
@@ -2580,7 +2599,10 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
         ),
         true,
     );
-    if !agent.push_artifact_directed_recovery_note(artifact_attempt) {
+    if !super::artifact_completion_record::push_artifact_directed_recovery_note(
+        agent,
+        artifact_attempt,
+    ) {
         agent.push_system_note(format!(
             "[Artifact Completion] Previous tool call was rejected and was not executed. Missing role: {}. Emit exactly one allowed tool call on the current target path now. artifact_completion_attempt={artifact_attempt}/{attempt_limit}",
             role.label()

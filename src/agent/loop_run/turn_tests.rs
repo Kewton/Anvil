@@ -2002,10 +2002,12 @@ mod tests {
         let limit = super::super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT;
         // All attempts before the budget edge → still InFlight, flag not set.
         for i in 0..limit.saturating_sub(1) {
-            let exhausted = agent.record_artifact_completion_attempt(
-                super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
-                vec![format!("Write on src/x_{i}.py")],
-            );
+            let exhausted =
+                super::super::artifact_completion_record::record_artifact_completion_attempt(
+                    &mut agent,
+                    super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                    vec![format!("Write on src/x_{i}.py")],
+                );
             assert!(!exhausted, "iteration {i} must not exhaust yet");
             assert!(
                 !agent.artifact_completion_exhausted_this_turn,
@@ -2013,10 +2015,12 @@ mod tests {
             );
         }
         // Final budgeted WrongTarget attempt → transition to Exhausted; flag flips.
-        let exhausted = agent.record_artifact_completion_attempt(
-            super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
-            vec![format!("Write on src/x_{limit}.py")],
-        );
+        let exhausted =
+            super::super::artifact_completion_record::record_artifact_completion_attempt(
+                &mut agent,
+                super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                vec![format!("Write on src/x_{limit}.py")],
+            );
         assert!(exhausted, "final budgeted attempt must exhaust the budget");
         assert!(
             agent.artifact_completion_exhausted_this_turn,
@@ -2055,7 +2059,8 @@ mod tests {
         // residual error is still present in unresolved_errors.
         install_artifact_completion_job_for_test(&mut agent, "tests/test_foo.py");
         for _ in 0..super::super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT {
-            agent.record_artifact_completion_attempt(
+            super::super::artifact_completion_record::record_artifact_completion_attempt(
+                &mut agent,
                 super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
                 vec!["Write on src/x.py".to_string()],
             );
@@ -2100,7 +2105,8 @@ mod tests {
 
         // Drive to exhaustion.
         for _ in 0..super::super::artifact_completion_job::ARTIFACT_COMPLETION_ATTEMPT_LIMIT {
-            agent.record_artifact_completion_attempt(
+            super::super::artifact_completion_record::record_artifact_completion_attempt(
+                &mut agent,
                 super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
                 vec!["Write on src/x.py".to_string()],
             );
@@ -2122,10 +2128,12 @@ mod tests {
         // A post-exhaustion attempt must NOT re-emit. The
         // record_attempt is a no-op on Exhausted, returns true again,
         // but the dedup gate suppresses the diagnostic.
-        let exhausted_again = agent.record_artifact_completion_attempt(
-            super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
-            vec!["Write on src/y.py".to_string()],
-        );
+        let exhausted_again =
+            super::super::artifact_completion_record::record_artifact_completion_attempt(
+                &mut agent,
+                super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
+                vec!["Write on src/y.py".to_string()],
+            );
         // The function still returns true (exhausted), but the
         // working memory must not gain a 2nd identical error.
         assert!(exhausted_again);
@@ -2204,7 +2212,8 @@ mod tests {
         std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
         install_artifact_completion_job_for_test(&mut agent, "tests/keep.py");
         // Consume one attempt.
-        agent.record_artifact_completion_attempt(
+        super::super::artifact_completion_record::record_artifact_completion_attempt(
+            &mut agent,
             super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
             vec!["Write on src/x.py".to_string()],
         );
@@ -2472,7 +2481,8 @@ mod tests {
         std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
         install_artifact_completion_job_for_test(&mut agent, "tests/first.py");
         // Consume an attempt against the first target.
-        agent.record_artifact_completion_attempt(
+        super::super::artifact_completion_record::record_artifact_completion_attempt(
+            &mut agent,
             super::super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
             vec!["Write on src/x.py".to_string()],
         );
