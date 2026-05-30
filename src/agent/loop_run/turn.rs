@@ -4,23 +4,15 @@ use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
 
 use super::answer_only_mode::answer_only_script_command_allowed;
-use super::feedback_builders::{
-    build_feedback_for_bash, build_feedback_for_edit_failure,
-    build_feedback_for_unsafe_block_reason,
-};
 use super::file_excerpt::{
     current_file_hash_for_relative_path, open_excerpt_file_nofollow, truncate_on_char_boundary,
     utf8_prefix_respecting_cap,
 };
-use super::path_helpers::normalize_memory_path;
 use super::photon_feedback_derive::request_explicitly_requests_script_execution;
 use super::plan_mode_helpers::assistant_model_for_mode;
-use super::small_helpers::{raw_mode_safe_text, rfc3339_now_utc, user_interrupt_result};
+use super::small_helpers::raw_mode_safe_text;
 use super::summary::ExitReason;
 use super::tool_display::progress_path_display;
-use super::tool_execution::{
-    failed_outcome_for_call, rejected_outcome_for_call, success_outcome_for_call,
-};
 use super::tool_history::{
     focused_edit_target_already_read, focused_read_target_for_directory,
     has_successful_non_plan_repo_edit,
@@ -32,9 +24,8 @@ use super::tool_policy::{
     workspace_relative_path_for_tool_arg,
 };
 use super::verifier_orchestration::{
-    build_verifier_exit_zero_evidence, task_contract_no_verifier_note,
-    task_contract_verifier_targeted_edit_required_note, verifier_repair_diagnostic_pending_note,
-    verifier_repair_target_display,
+    task_contract_no_verifier_note, task_contract_verifier_targeted_edit_required_note,
+    verifier_repair_diagnostic_pending_note, verifier_repair_target_display,
 };
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
@@ -43,7 +34,7 @@ use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::WorkMode;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::store::ScaffoldArtifactFileSnapshot;
-use crate::tools::registry::{BashErrorClass, ToolSpec};
+use crate::tools::registry::ToolSpec;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use std::path::{Path, PathBuf};
 
@@ -607,308 +598,6 @@ impl Agent {
         }
     }
 
-    pub(super) fn execute_tool_call(
-        &mut self,
-        name: &str,
-        arguments: &serde_json::Value,
-        effective_tool_policy: Option<&EffectiveToolPolicy>,
-        cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) -> String {
-        if let Some(err) = self.answer_only_policy_error(name, arguments) {
-            self.session.working_memory.note_error(err.clone());
-            return lifecycle::format_tool_error(&err);
-        }
-        if let Some(err) =
-            super::scaffold_pipeline::empty_workspace_scaffold_policy_error(self, name, arguments)
-        {
-            self.session.working_memory.note_error(err.clone());
-            return lifecycle::format_tool_error(&err);
-        }
-        // Issue #646 (A1/A3): when a first-class MissingVerifierJob is
-        // active, hand the active workspace scope to the policy gate so
-        // out-of-scope `Write`/`Edit` paths are rejected even when the
-        // restricted whitelist would otherwise admit them.
-        if let Some(err) =
-            self.effective_tool_policy_error_for_execution(name, arguments, effective_tool_policy)
-        {
-            return self.handle_tool_execution_rejection(name, arguments, &err);
-        }
-        if cancel_flag
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
-        {
-            return user_interrupt_result();
-        }
-        let context = self.tool_context(cancel_flag);
-        if name == "Bash" {
-            return self.execute_bash_tool_call(name, arguments, &context);
-        }
-
-        self.execute_non_bash_tool_call(name, arguments, &context)
-    }
-
-    fn effective_tool_policy_error_for_execution(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-        effective_tool_policy: Option<&EffectiveToolPolicy>,
-    ) -> Option<String> {
-        let scope_for_policy = self
-            .missing_verifier_job
-            .as_ref()
-            .map(|_| self.current_workspace_scope());
-        if let Some(policy) = effective_tool_policy {
-            effective_tool_policy_error_for_call_with_scope(
-                policy,
-                name,
-                arguments,
-                &self.work_root,
-                scope_for_policy.as_ref(),
-            )
-        } else {
-            self.effective_tool_policy_error(name, arguments)
-        }
-    }
-
-    fn handle_tool_execution_rejection(
-        &mut self,
-        name: &str,
-        arguments: &serde_json::Value,
-        err: &str,
-    ) -> String {
-        let _tool_outcome = rejected_outcome_for_call(name, err);
-        self.session.working_memory.note_error(err.to_string());
-        if err.contains("artifact-directed recovery rejected") {
-            if name == "Bash" {
-                let command_arg = arguments
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let _ =
-                    super::artifact_completion_record::record_artifact_completion_bash_violation(
-                        self,
-                        vec![command_arg],
-                    );
-            } else {
-                let actual_path = arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let _ = super::artifact_completion_record::record_artifact_completion_attempt(
-                    self,
-                    super::artifact_completion_job::ArtifactAttemptOutcomeKind::WrongTarget,
-                    vec![format!("{name} on {actual_path}")],
-                );
-            }
-        } else if err.starts_with("setup bootstrap")
-            && name == "Bash"
-            && self.artifact_completion_job.is_some()
-        {
-            let command_arg = arguments
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let _ = super::artifact_completion_record::record_artifact_completion_bash_violation(
-                self,
-                vec![command_arg],
-            );
-        }
-        lifecycle::format_tool_error(err)
-    }
-
-    fn tool_context(
-        &self,
-        cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) -> ToolContext {
-        let tmp_tests_root = Some(
-            self.session_store
-                .state_root()
-                .join("sessions")
-                .join(self.session_store.session_id())
-                .join("tmp-tests"),
-        );
-        ToolContext {
-            root: self.work_root.clone(),
-            mode: self.session.mode_state.mode,
-            plan_path: self.session.mode_state.active_plan_path.clone(),
-            plan_stage: self.session.mode_state.plan_stage,
-            auto_approve: self.config.yes_mode,
-            interactive_approval: io::stdin().is_terminal(),
-            offline: self.config.offline,
-            cancel_flag,
-            tmp_tests_root,
-            tester_active: self.tester_called_this_turn,
-        }
-    }
-
-    fn execute_bash_tool_call(
-        &mut self,
-        name: &str,
-        arguments: &serde_json::Value,
-        context: &ToolContext,
-    ) -> String {
-        let (result, outcome) = self
-            .tool_registry
-            .execute_bash_with_outcome(arguments, context);
-        if let Some(outcome) = outcome.as_ref()
-            && let Some(frame) = build_feedback_for_bash(outcome, &self.work_root)
-        {
-            self.session.record_feedback(frame);
-        }
-        if let Some(outcome) = outcome.as_ref() {
-            self.observe_evidence_from_bash_outcome(outcome);
-        }
-        match result {
-            Ok(text) => {
-                self.maybe_update_work_root(name, arguments, &text);
-                text
-            }
-            Err((err, class)) => {
-                self.session
-                    .working_memory
-                    .note_error(format!("{name}: {err}"));
-                if class == BashErrorClass::DangerousBlock {
-                    let cmd = arguments
-                        .get("command")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let frame = build_feedback_for_unsafe_block_reason(cmd, &err, &self.work_root);
-                    self.session.record_feedback(frame);
-                    self.session.unsafe_blocks_this_turn =
-                        self.session.unsafe_blocks_this_turn.saturating_add(1);
-                }
-                lifecycle::format_tool_error(&err)
-            }
-        }
-    }
-
-    fn capture_pre_tool_hash_if_needed(&mut self, arguments: &serde_json::Value, name: &str) {
-        if matches!(name, "Write" | "Edit")
-            && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
-            && let Some(rel) = workspace_relative_path_for_tool_arg(&self.work_root, raw_path)
-        {
-            let pre_hash = current_file_hash_for_relative_path(&self.work_root, &rel);
-            self.turn_pre_tool_file_hashes.insert(rel, pre_hash);
-        }
-    }
-
-    fn execute_non_bash_tool_call(
-        &mut self,
-        name: &str,
-        arguments: &serde_json::Value,
-        context: &ToolContext,
-    ) -> String {
-        self.capture_pre_tool_hash_if_needed(arguments, name);
-        match self.tool_registry.execute(name, arguments, context) {
-            Ok(result) => {
-                let tool_outcome = success_outcome_for_call(name, arguments, &self.work_root);
-                if let Some(edit) = tool_outcome.repo_edit_evidence() {
-                    self.session
-                        .working_memory
-                        .note_touched_file(normalize_memory_path(edit.raw_path(), &self.work_root));
-                    self.session.repo_edit_succeeded_this_turn = true;
-                    self.observe_evidence_from_repo_edit(edit.raw_path());
-                }
-                self.maybe_update_work_root(name, arguments, &result);
-                result
-            }
-            Err(err) => {
-                let _tool_outcome = failed_outcome_for_call(name, &err);
-                self.session
-                    .working_memory
-                    .note_error(format!("{name}: {err}"));
-                if name == "Edit" {
-                    let path = arguments.get("path").and_then(serde_json::Value::as_str);
-                    let frame = build_feedback_for_edit_failure(path, &err, &self.work_root);
-                    self.session.record_feedback(frame);
-                }
-                lifecycle::format_tool_error(&err)
-            }
-        }
-    }
-
-    /// Issue #606 (T-1.6): post-hoc observation of a Bash invocation as
-    /// `VerifierExitZero` completion evidence. A signal is recorded **only**
-    /// when:
-    ///
-    /// 1. `outcome.exit_code == Some(0)` — non-zero / timeout / interrupted
-    ///    invocations are explicit failures, not silent passes.
-    /// 2. `outcome.class == BuildTest` — read-only / network / mutating
-    ///    classes don't represent verification work even when they
-    ///    happen to exit 0.
-    /// 3. `is_completion_verifier_command(&outcome.command) == true` —
-    ///    rejects commands containing shell control operators that can
-    ///    mask the real exit code (DR4-002, e.g. `cargo test || true`).
-    ///
-    /// The evidence is consumed by
-    /// `ProtocolKind::evidence_set_satisfies` in `success.rs`.
-    fn observe_evidence_from_bash_outcome(
-        &mut self,
-        outcome: &crate::tools::bash::BashExecutionOutcome,
-    ) {
-        use crate::tools::bash::BashCommandClass;
-        // Issue #608 Phase α-2 (AP-09): record `last_verifier_command` /
-        // `last_verifier_invocation` for any BuildTest invocation (regardless
-        // of exit code) so the rerun-trigger handler can surface the most
-        // recent verifier attempt — even failed ones (the user often types
-        // `再実行` precisely because the last run failed).
-        if matches!(outcome.class, BashCommandClass::BuildTest)
-            && super::completion_evidence::is_completion_verifier_command(&outcome.command)
-        {
-            let redacted =
-                crate::session::feedback::redact_verifier_command_for_storage(&outcome.command);
-            // Drop empty redacted commands (e.g. all-control-char input).
-            if !redacted.trim().is_empty() {
-                self.session.last_verifier_command = Some(redacted.clone());
-                self.session.last_verifier_invocation =
-                    Some(crate::session::store::VerifierInvocationRecord {
-                        command: redacted,
-                        exit_code: outcome.exit_code.unwrap_or(-1),
-                        recorded_at: rfc3339_now_utc(),
-                    });
-            }
-        }
-
-        // Issue #607 (β): build VerifierExitZero evidence for BuildTest |
-        // EnvSetup exit-zero outcomes (per `build_verifier_exit_zero_evidence`).
-        let Some(evidence) = build_verifier_exit_zero_evidence(outcome) else {
-            return;
-        };
-        let crate::agent::loop_run::completion_evidence::CompletionEvidence::VerifierExitZero {
-            class,
-            ..
-        } = evidence
-        else {
-            // build_verifier_exit_zero_evidence only ever constructs
-            // VerifierExitZero today; the match keeps us honest if a future
-            // helper returns a different variant.
-            self.evidence_set_this_turn.push(evidence.clone());
-            if self.current_artifact_recovery_target.is_none() {
-                self.task_contract_evidence_set_this_turn.push(evidence);
-            }
-            return;
-        };
-        self.evidence_set_this_turn.push(evidence.clone());
-        if self.current_artifact_recovery_target.is_none() {
-            self.task_contract_evidence_set_this_turn
-                .push(evidence.clone());
-        }
-        crate::logging::log_completion_evidence_observed(
-            self.current_turn_index,
-            0, // α-1: iter_index plumbing is α-2 work; emit 0 for now.
-            "verifier_exit_zero",
-            serde_json::json!({
-                // Issue #607 BP-07 / S3-002: snake_case label matches serde
-                // rename_all so `command_class` reads `"env_setup"` /
-                // `"build_test"` instead of `"EnvSetup"` / `"BuildTest"`.
-                "command_class": class.as_str(),
-            }),
-        );
-    }
-
     /// Issue #606 (T-1.7): post-hoc observation of an Edit/Write success
     /// as `RepoEdit` completion evidence. The path is run through
     /// `classify_repo_edit_path` which uses the SSOT in `util::file_classify`
@@ -1098,7 +787,7 @@ impl Agent {
         super::task_workspace_scope::TaskWorkspaceScope::detect(&self.work_root, &request)
     }
 
-    fn answer_only_policy_error(
+    pub(super) fn answer_only_policy_error(
         &self,
         name: &str,
         arguments: &serde_json::Value,
@@ -1138,7 +827,7 @@ impl Agent {
             .is_some_and(request_explicitly_requests_script_execution)
     }
 
-    fn effective_tool_policy_error(
+    pub(super) fn effective_tool_policy_error(
         &self,
         name: &str,
         arguments: &serde_json::Value,

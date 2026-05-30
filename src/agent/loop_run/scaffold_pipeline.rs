@@ -949,7 +949,8 @@ pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
 
     let mut fallback_failed = false;
     for tool_call in fallback_tool_calls {
-        let raw_result = agent.execute_tool_call(
+        let raw_result = super::tool_call_execution::execute_tool_call(
+            agent,
             &tool_call.name,
             &tool_call.arguments,
             None,
