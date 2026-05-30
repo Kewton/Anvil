@@ -26,7 +26,7 @@ use super::Agent;
 use crate::agent::recovery;
 
 pub(super) fn push_artifact_directed_recovery_note(agent: &mut Agent, attempt: usize) -> bool {
-    if agent.focused_edit_recovery_target().is_some() {
+    if super::recovery_targets::focused_edit_recovery_target(agent).is_some() {
         return false;
     }
     let Some(target) = agent.current_artifact_recovery_target.as_ref() else {

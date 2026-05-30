@@ -223,7 +223,7 @@ pub(super) fn extract_current_request_paths(agent: &Agent, work_root: &Path) -> 
             }
         }
     }
-    if let Some(target) = agent.focused_edit_recovery_target() {
+    if let Some(target) = super::recovery_targets::focused_edit_recovery_target(agent) {
         let canonical_root = work_root.canonicalize().ok();
         let rel = if let Some(root) = &canonical_root {
             target

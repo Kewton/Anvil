@@ -137,7 +137,7 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
     }
 
     // Priority 5: FocusedEditRecovery.
-    if let Some(target) = agent.focused_edit_recovery_target() {
+    if let Some(target) = super::recovery_targets::focused_edit_recovery_target(agent) {
         push_focused_edit_candidate(
             agent,
             &mut candidates,

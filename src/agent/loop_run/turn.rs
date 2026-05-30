@@ -18,10 +18,7 @@ use super::tool_history::{
     is_preferred_read_edit_target, latest_user_turn_slice, recent_truncated_tool_call_attempt,
 };
 use super::tool_policy::{EffectiveToolPolicy, effective_tool_policy_error_for_call_with_scope};
-use super::verifier_orchestration::{
-    task_contract_no_verifier_note, task_contract_verifier_targeted_edit_required_note,
-    verifier_repair_diagnostic_pending_note, verifier_repair_target_display,
-};
+use super::verifier_orchestration::task_contract_no_verifier_note;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
 use crate::model_capabilities::model_capabilities;
@@ -479,116 +476,6 @@ impl Agent {
                 candidate.is_file().then_some(candidate)
             },
         )
-    }
-
-    pub(super) fn focused_edit_recovery_target(&self) -> Option<PathBuf> {
-        self.forced_small_edit_recovery_target()
-            .or_else(|| super::scaffold_pipeline::post_scaffold_edit_recovery_target(self))
-            .or_else(|| super::scaffold_pipeline::post_scaffold_continuation_recovery_target(self))
-    }
-
-    fn repo_change_no_edit_recovery_target(&self) -> Option<PathBuf> {
-        if self.session.mode_state.mode != ExecutionMode::Act
-            || !self.session.mode_state.policy().repo_edit_required
-            || !self.active_task_expects_repo_change()
-            || has_successful_non_plan_repo_edit(
-                &self.session.messages,
-                &self.work_root,
-                self.session.mode_state.active_plan_path.as_deref(),
-            )
-        {
-            return None;
-        }
-        if let Some(candidate) = super::artifact_recovery_flow::artifact_recovery_target_path(self)
-        {
-            return Some(candidate);
-        }
-        if let Some(candidate) = first_existing_impl_target(&self.work_root)
-            && focused_edit_target_already_read(&self.session.messages, &candidate, &self.work_root)
-        {
-            return Some(candidate);
-        }
-        latest_turn_preferred_read_edit_target(&self.session.messages, &self.work_root).or_else(
-            || {
-                let path = last_read_tool_path(&self.session.messages)?;
-                let candidate = resolve_user_path(&self.work_root, &path).ok()?;
-                candidate.is_file().then_some(candidate)
-            },
-        )
-    }
-
-    pub(super) fn push_repo_change_no_edit_recovery_note(&mut self, attempt: usize) -> bool {
-        let Some(target) = self.repo_change_no_edit_recovery_target() else {
-            return false;
-        };
-        let target_display = progress_path_display(
-            &target.display().to_string(),
-            &self.work_root,
-            self.session.mode_state.active_plan_path.as_deref(),
-            120,
-        );
-        let note = if !target.is_file() {
-            recovery::focused_edit_missing_target_recovery_note(&target_display, attempt)
-        } else {
-            recovery::repo_change_after_read_no_edit_note(&target_display, attempt)
-        };
-        self.push_system_note(note);
-        true
-    }
-
-    pub(super) fn push_verifier_repair_recovery_note(&mut self, attempt: usize) -> bool {
-        let Some(context) = self.repair_job.as_ref() else {
-            return false;
-        };
-        match context.next_action() {
-            super::repair_job::RepairNextAction::RequestDiagnostic
-            | super::repair_job::RepairNextAction::Replan => {
-                // Issue #665 Phase 5: caller-side projection (S5-005 では
-                // raw label/excerpt は system note に出さないため helper
-                // 内部で metadata のみに縮退する)。
-                let active_request = self.active_request_text().unwrap_or_default();
-                let task_contract =
-                    super::task_contract::TaskContract::from_request(&active_request);
-                let behavior_projection =
-                    super::required_behavior::project_behavior_contract(&task_contract);
-                let note =
-                    verifier_repair_diagnostic_pending_note(context, behavior_projection.as_ref());
-                self.push_system_note(note);
-                true
-            }
-            super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
-                let Some(relative) =
-                    super::repair_job::safe_relative_path_string(&target_hint.path)
-                else {
-                    return false;
-                };
-                let target = self.work_root.join(relative);
-                let target = std::fs::canonicalize(&target).unwrap_or(target);
-                if !target.is_file() {
-                    let target_display = verifier_repair_target_display(&target, &self.work_root);
-                    self.push_system_note(recovery::focused_edit_missing_target_recovery_note(
-                        &target_display,
-                        attempt,
-                    ));
-                    return true;
-                }
-                self.push_system_note(task_contract_verifier_targeted_edit_required_note(
-                    context,
-                    &self.work_root,
-                    focused_edit_target_already_read(
-                        &self.session.messages,
-                        &target,
-                        &self.work_root,
-                    ),
-                    attempt,
-                    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-                ));
-                true
-            }
-            super::repair_job::RepairNextAction::RerunVerifier
-            | super::repair_job::RepairNextAction::SafeStop { .. }
-            | super::repair_job::RepairNextAction::VerifiedDone => false,
-        }
     }
 
     /// Issue #636: read a workspace-confined, cap-bounded excerpt of
