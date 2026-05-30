@@ -1599,7 +1599,7 @@ pub(super) fn maybe_apply_deterministic_quality_fallback_after_timeout(
     err: &str,
 ) -> Option<AssistantReply> {
     if !err.to_ascii_lowercase().contains("timed out")
-        || !agent.current_request_needs_playable_ui_quality_gate()
+        || !super::quality_gate::current_request_needs_playable_ui_quality_gate(agent)
     {
         return None;
     }
@@ -1611,7 +1611,7 @@ pub(super) fn maybe_apply_deterministic_polish_fallback_after_timeout(
     err: &str,
 ) -> Option<AssistantReply> {
     if !err.to_ascii_lowercase().contains("timed out")
-        || !agent.current_request_needs_playable_ui_quality_gate()
+        || !super::quality_gate::current_request_needs_playable_ui_quality_gate(agent)
     {
         return None;
     }

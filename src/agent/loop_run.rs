@@ -287,6 +287,15 @@ mod repo_edit_observation;
 // RequestPatch branches). Free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod recovery_targets;
+// Playable-UI quality gate decision helpers extracted from `turn.rs`
+// (parent #680). Hosts `current_request_needs_playable_ui_quality_gate`
+// (Act + policy + request gate), `accepted_repo_change_quality_issue`
+// (Issue #580 second-pass classifier), `accepted_repo_change_polish_target`
+// (deterministic polish target with quality-suppression), and the
+// private `unsupported_ui_framework_context` predicate. Free fns over
+// `&mut Agent` / `&Agent`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod quality_gate;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
