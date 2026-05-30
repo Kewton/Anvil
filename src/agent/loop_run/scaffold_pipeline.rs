@@ -930,7 +930,7 @@ pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
         .tool_calls
         .iter()
         .cloned()
-        .map(|tool_call| agent.prepare_tool_call(tool_call))
+        .map(|tool_call| super::tool_call_prepare::prepare_tool_call(agent, tool_call))
         .collect::<Vec<_>>();
     agent.session.messages.push(ConversationMessage::assistant(
         fallback_reply.content,

@@ -10,7 +10,6 @@ use crate::logging::log_llm_event;
 use crate::model_registry::RuntimeModels;
 use crate::modes::plan_act::{ExecutionMode, ModePolicy};
 use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
-use crate::ollama::xml_fallback::ToolCall;
 use crate::repo_graph::{
     BuildOptions as RepoGraphBuildOptions, BuildOutcome, RepoGraph, RepoGraphError,
     build_repo_graph,
@@ -357,6 +356,12 @@ mod tool_prep;
 // fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod agent_misc;
+// Per-tool-call argument normalization extracted from `turn.rs`
+// (parent #680). Hosts `prepare_tool_call`: per-tool argument sanitise
+// + Read/Write/Edit workspace-confined path resolution +
+// focused-edit Read directory→target redirect. Free fn over `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod tool_call_prepare;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

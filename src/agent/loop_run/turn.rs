@@ -1,10 +1,7 @@
 use super::small_helpers::raw_mode_safe_text;
-use super::tool_history::{
-    focused_read_target_for_directory, is_preferred_read_edit_target, latest_user_turn_slice,
-};
+use super::tool_history::{is_preferred_read_edit_target, latest_user_turn_slice};
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
-use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::store::ScaffoldArtifactFileSnapshot;
 use std::path::{Path, PathBuf};
 
@@ -157,32 +154,6 @@ impl Agent {
             self.session.working_memory.active_task.as_deref(),
             &self.session.messages,
         )
-    }
-
-    pub(super) fn prepare_tool_call(&self, mut tool_call: ToolCall) -> ToolCall {
-        tool_call.arguments = normalize_tool_call_arguments(&tool_call.name, tool_call.arguments);
-        if matches!(tool_call.name.as_str(), "Read" | "Write" | "Edit")
-            && let Some(arguments) = tool_call.arguments.as_object_mut()
-            && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
-            && let Ok(resolved) = resolve_user_path(&self.work_root, raw_path)
-        {
-            let resolved = if tool_call.name == "Read" {
-                super::effective_tool_policy_flow::effective_tool_policy(self)
-                    .focused_edit_policy()
-                    .and_then(|policy| {
-                        focused_read_target_for_directory(&resolved, &policy.target)
-                            .then_some(policy.target.clone())
-                    })
-                    .unwrap_or(resolved)
-            } else {
-                resolved
-            };
-            arguments.insert(
-                "path".to_string(),
-                serde_json::Value::String(resolved.display().to_string()),
-            );
-        }
-        tool_call
     }
 
     pub(super) fn push_system_note(&mut self, note: String) {
