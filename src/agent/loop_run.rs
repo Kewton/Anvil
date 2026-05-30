@@ -269,6 +269,15 @@ mod owned_test_projection;
 // fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod tool_call_execution;
+// Post-Edit/Write repo-edit evidence observation extracted from
+// `turn.rs` (parent #680). Hosts the Issue #606 (T-1.7)
+// `observe_evidence_from_repo_edit` chokepoint: ignored-top-dir gate
+// → scaffold-delta gate → no-op-hash gate →
+// `turn_edited_relative_paths` write-through + per-turn evidence +
+// task-contract evidence + bounded post-edit excerpt + Issue #659
+// Task 2.5 ArtifactLedger seed. Free fn over `&mut Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod repo_edit_observation;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

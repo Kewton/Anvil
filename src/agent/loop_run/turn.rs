@@ -1,12 +1,10 @@
 use super::active_job_arbiter::RecoveryOwner;
 use super::actor_loop_flow::format_iteration_status;
 use super::auto_test::{AutoTestKind, AutoTestRunner};
-use super::completion_evidence::is_repo_edit_no_op;
 
 use super::answer_only_mode::answer_only_script_command_allowed;
 use super::file_excerpt::{
-    current_file_hash_for_relative_path, open_excerpt_file_nofollow, truncate_on_char_boundary,
-    utf8_prefix_respecting_cap,
+    open_excerpt_file_nofollow, truncate_on_char_boundary, utf8_prefix_respecting_cap,
 };
 use super::photon_feedback_derive::request_explicitly_requests_script_execution;
 use super::plan_mode_helpers::assistant_model_for_mode;
@@ -19,23 +17,18 @@ use super::tool_history::{
     has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
     is_preferred_read_edit_target, latest_user_turn_slice, recent_truncated_tool_call_attempt,
 };
-use super::tool_policy::{
-    EffectiveToolPolicy, effective_tool_policy_error_for_call_with_scope,
-    workspace_relative_path_for_tool_arg,
-};
+use super::tool_policy::{EffectiveToolPolicy, effective_tool_policy_error_for_call_with_scope};
 use super::verifier_orchestration::{
     task_contract_no_verifier_note, task_contract_verifier_targeted_edit_required_note,
     verifier_repair_diagnostic_pending_note, verifier_repair_target_display,
 };
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
-use crate::logging::stable_path_hash;
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::WorkMode;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::session::store::ScaffoldArtifactFileSnapshot;
 use crate::tools::registry::ToolSpec;
-use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use std::path::{Path, PathBuf};
 
 use super::deterministic;
@@ -595,130 +588,6 @@ impl Agent {
             super::repair_job::RepairNextAction::RerunVerifier
             | super::repair_job::RepairNextAction::SafeStop { .. }
             | super::repair_job::RepairNextAction::VerifiedDone => false,
-        }
-    }
-
-    /// Issue #606 (T-1.7): post-hoc observation of an Edit/Write success
-    /// as `RepoEdit` completion evidence. The path is run through
-    /// `classify_repo_edit_path` which uses the SSOT in `util::file_classify`
-    /// and applies the DR1-001 ordering rule (`.mdx → Docs` even though
-    /// `is_implementation_file` would otherwise claim it).
-    pub(super) fn observe_evidence_from_repo_edit(&mut self, path: &str) {
-        let Some(relative_path) = workspace_relative_path_for_tool_arg(&self.work_root, path)
-        else {
-            return;
-        };
-        if is_ignored_workspace_display_path(&relative_path) {
-            crate::logging::log_completion_evidence_observed(
-                self.current_turn_index,
-                0,
-                "repo_edit_ignored_controller_state",
-                serde_json::json!({
-                    "path_hash": stable_path_hash(&relative_path),
-                }),
-            );
-            return;
-        }
-        let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(
-            &relative_path,
-        ));
-        if !super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(self, &relative_path) {
-            crate::logging::log_completion_evidence_observed(
-                self.current_turn_index,
-                0,
-                "repo_edit_scaffold_unchanged",
-                serde_json::json!({
-                    "category": format!("{:?}", category),
-                    "path": relative_path,
-                }),
-            );
-            return;
-        }
-        // Issue #646 (C2 / A4): even after the scaffold-delta gate, a
-        // Write/Edit can be a content no-op for a NON-scaffold file (e.g.
-        // model writes the same body back, or `Edit` whose `old_string`
-        // equals `new_string`). Compare the pre-tool hash captured in
-        // `execute_tool_call` against the current on-disk hash. Identical
-        // hashes mean the file did not actually change — bail out so the
-        // path does NOT enter `turn_edited_relative_paths` and does NOT
-        // contribute completion evidence. The pre-tool entry is removed in
-        // either branch to keep the cache turn-local and bounded.
-        let pre_tool_hash = self.turn_pre_tool_file_hashes.remove(&relative_path);
-        let current_hash = current_file_hash_for_relative_path(&self.work_root, &relative_path);
-        if is_repo_edit_no_op(
-            pre_tool_hash.as_ref().and_then(Option::as_deref),
-            current_hash.as_deref(),
-        ) {
-            crate::logging::log_completion_evidence_observed(
-                self.current_turn_index,
-                0,
-                "repo_edit_no_op",
-                serde_json::json!({
-                    "category": format!("{:?}", category),
-                    "path": relative_path,
-                }),
-            );
-            return;
-        }
-        // Issue #646 (C2): record the edited path AFTER both the scaffold-
-        // delta gate AND the no-op hash check so a content-unchanged
-        // Write/Edit (scaffold body re-written, or `Edit` with
-        // `old_string == new_string`) never promotes the file to `Owned`.
-        self.turn_edited_relative_paths
-            .insert(relative_path.clone());
-        // Issue #646 (A1/B2): once an in-scope edit has landed, the
-        // MissingVerifierJob can begin retrying verifier creation.
-        if self.missing_verifier_job.is_some() {
-            let in_scope = self.current_workspace_scope().contains(&relative_path);
-            if in_scope && let Some(job) = self.missing_verifier_job.as_mut() {
-                job.record_in_scope_edit();
-            }
-        }
-        self.evidence_set_this_turn
-            .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
-        if super::task_contract::repo_edit_satisfies_artifact_recovery_target(
-            category,
-            &relative_path,
-            self.current_artifact_recovery_target.as_ref(),
-        ) {
-            self.task_contract_evidence_set_this_turn.push(
-                super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 },
-            );
-            // Issue #636: capture bounded post-edit excerpt for the
-            // current role so `plan_artifact_recovery` can assert that
-            // the edit actually carries the requested behavior. Silent
-            // skip on role-miss / read failure (back-compat with the
-            // existing `repo_edit_has_post_scaffold_delta` no-data path).
-            if let Some(role) = super::task_contract::role_from_repo_edit(category)
-                && let Some(excerpt) = self.bounded_post_edit_excerpt(&relative_path)
-            {
-                self.task_contract_excerpts.insert(role, excerpt);
-            }
-        }
-        crate::logging::log_completion_evidence_observed(
-            self.current_turn_index,
-            0,
-            "repo_edit",
-            serde_json::json!({
-                "category": format!("{:?}", category),
-                "path": relative_path,
-            }),
-        );
-        // Issue #659 Task 2.5: write-through seed into the ArtifactLedger
-        // SSOT. `relative_path` has already passed the workspace-relative /
-        // scaffold-delta / no-op guards; the legacy
-        // `turn_edited_relative_paths` insert above stays as the adapter-
-        // period authority. The seed is gated by category-to-role mapping
-        // so the `Other` category (which legacy callers do not classify
-        // into a role) does not inject an ambiguous event.
-        if let Some(role) = super::task_contract::role_from_repo_edit(category) {
-            let scope = self.current_workspace_scope();
-            super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
-                self,
-                &relative_path,
-                role,
-                &scope,
-            );
         }
     }
 

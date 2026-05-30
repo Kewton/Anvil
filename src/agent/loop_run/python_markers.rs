@@ -65,7 +65,7 @@ fn materialize_python_package_marker_candidates(
         {
             continue;
         }
-        agent.observe_evidence_from_repo_edit(&relative_path);
+        super::repo_edit_observation::observe_evidence_from_repo_edit(agent, &relative_path);
         log_llm_event(
             "agent.verifier.python_package_marker.created",
             serde_json::json!({

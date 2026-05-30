@@ -7219,7 +7219,7 @@ E   assert [{'id': 1}] == []\n";
         std::fs::create_dir_all(temp.path().join(".anvil-state/verifier-python/site")).unwrap();
         std::fs::write(temp.path().join(rel), "def test_generated(): pass\n").unwrap();
 
-        agent.observe_evidence_from_repo_edit(rel);
+        super::super::repo_edit_observation::observe_evidence_from_repo_edit(&mut agent, rel);
 
         assert!(
             !agent.turn_edited_relative_paths.contains(rel),

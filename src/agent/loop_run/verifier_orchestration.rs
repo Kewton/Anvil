@@ -2123,7 +2123,7 @@ pub(super) fn record_controller_verifier_repair_edit(
         .session
         .working_memory
         .note_touched_file(normalize_memory_path(relative_path, &agent.work_root));
-    agent.observe_evidence_from_repo_edit(relative_path);
+    super::repo_edit_observation::observe_evidence_from_repo_edit(agent, relative_path);
     if let Some(context) = agent.repair_job.as_mut() {
         if !context
             .applied_repair_intents
