@@ -1248,7 +1248,8 @@ fn sync_post_tool_contract_recovery_target(
     let Some(contract) = args.task_contract else {
         return;
     };
-    let action = agent.task_contract_recovery_action(
+    let action = super::task_contract_recovery::task_contract_recovery_action(
+        agent,
         contract,
         args.contract_verifier_repair_edit_count,
         args.repo_edit_calls_made_this_turn,
@@ -1896,7 +1897,8 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
         None
     } else {
         args.task_contract.map(|contract| {
-            agent.task_contract_recovery_action(
+            super::task_contract_recovery::task_contract_recovery_action(
+                agent,
                 contract,
                 *args.contract_verifier_repair_edit_count,
                 *args.repo_edit_calls_made_this_turn,
@@ -2135,7 +2137,7 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
     let target_hint = args
         .target_hint
         .clone()
-        .or_else(|| agent.task_contract_recovery_target(&decision))
+        .or_else(|| super::task_contract_recovery::task_contract_recovery_target(agent, &decision))
         .and_then(|hint| {
             super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
                 agent,
@@ -3545,7 +3547,8 @@ pub(super) fn run_actor_loop(
             None
         } else {
             task_contract.as_ref().map(|contract| {
-                agent.task_contract_recovery_action(
+                super::task_contract_recovery::task_contract_recovery_action(
+                    agent,
                     contract,
                     contract_verifier_repair_edit_count,
                     repo_edit_calls_made_this_turn,

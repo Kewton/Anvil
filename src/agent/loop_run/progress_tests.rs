@@ -3235,7 +3235,12 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
             "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
         );
 
-        let action = agent.task_contract_recovery_action(&contract, Some(0), 1);
+        let action = super::super::task_contract_recovery::task_contract_recovery_action(
+            &mut agent,
+            &contract,
+            Some(0),
+            1,
+        );
 
         assert_eq!(
             action,

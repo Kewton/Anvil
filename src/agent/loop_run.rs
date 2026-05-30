@@ -241,6 +241,16 @@ mod artifact_completion_record;
 // `&mut Agent` / `&Agent`. `pub(super)` limited / no facade re-export
 // (DR3-001).
 mod recovery_messages;
+// TaskContract recovery action / target planners extracted from
+// `turn.rs` (parent #680). Hosts `task_contract_recovery_action` (the
+// production chokepoint that routes between `RunVerifier` / `Continue`
+// / `Done` per artifact state + repair state + completion probe) +
+// `task_contract_recovery_target` (`Continue { missing }` →
+// scaffold-candidate / existing-Owned / synthesised-implementation
+// target hint) + the private `task_contract_repair_state` adapter.
+// Free fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod task_contract_recovery;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
