@@ -2210,7 +2210,11 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
                     .as_ref()
                     .map(|target| target.path.clone())
             });
-        agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+        super::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
+            agent,
+            role,
+            expected_target,
+        );
         return ActorLoopTaskContractReplyOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: format!(
@@ -2271,7 +2275,11 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
                     .as_ref()
                     .map(|target| target.path.clone())
             });
-        agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+        super::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
+            agent,
+            role,
+            expected_target,
+        );
         return ActorLoopTaskContractReplyOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: format!(
@@ -2337,7 +2345,11 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
                     .and_then(|job| job.target_hint.as_ref())
                     .map(|hint| hint.path.clone())
             });
-        agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+        super::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
+            agent,
+            role,
+            expected_target,
+        );
         return ActorLoopTaskContractReplyOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: "assistant stopped before repairing the verifier failure".to_string(),
@@ -2545,7 +2557,11 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
             .current_artifact_recovery_target
             .as_ref()
             .map(|target| target.path.clone());
-        agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+        super::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
+            agent,
+            role,
+            expected_target,
+        );
         return Some(ActorLoopToolPreparationOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: format!(

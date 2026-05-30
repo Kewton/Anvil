@@ -280,7 +280,8 @@ fn handle_repair_job_diagnostic_step(
             TaskContractVerifierFlowOutcome::Continue
         }
         VerifierDiagnosticPassOutcome::Unavailable { error } => {
-            agent.emit_safe_stop_report_for_repair_terminal(
+            super::safe_stop_emit::emit_safe_stop_report_for_repair_terminal(
+                agent,
                 repair_job::RepairTerminalReason::DiagnosticUnavailable,
             );
             TaskContractVerifierFlowOutcome::Exit {
@@ -371,7 +372,8 @@ fn write_repair_job_step_status(agent: &Agent, last_iter: usize, title: &str, me
 }
 
 fn repair_job_diagnostic_skipped_error(agent: &mut Agent) -> String {
-    agent.emit_safe_stop_report_for_repair_terminal(
+    super::safe_stop_emit::emit_safe_stop_report_for_repair_terminal(
+        agent,
         repair_job::RepairTerminalReason::DiagnosticUnavailable,
     );
     "verifier repair diagnostic skipped after committed dispatch".to_string()
@@ -381,7 +383,7 @@ fn repair_job_safe_stop_outcome(
     agent: &mut Agent,
     reason: repair_job::RepairTerminalReason,
 ) -> TaskContractVerifierFlowOutcome {
-    agent.emit_safe_stop_report_for_repair_terminal(reason);
+    super::safe_stop_emit::emit_safe_stop_report_for_repair_terminal(agent, reason);
     TaskContractVerifierFlowOutcome::Exit {
         reason: repair_terminal_exit_reason(reason),
         error_text: format!("verifier repair safe stop: {}", reason.as_str()),
@@ -453,7 +455,7 @@ pub(super) fn dispatch_missing_verifier_job_step(
             super::verifier_orchestration::drive_task_contract_verifier(agent, args),
         ),
         repair_job::VerifierBootstrapNextAction::SafeStop { reason } => {
-            agent.emit_safe_stop_report_for_verifier_missing();
+            super::safe_stop_emit::emit_safe_stop_report_for_verifier_missing(agent);
             Some(TaskContractVerifierFlowOutcome::Exit {
                 reason: ExitReason::MissingVerification,
                 error_text: reason.to_string(),
@@ -476,7 +478,7 @@ fn dispatch_after_repair_patch_rejection(
     };
     match action {
         repair_job::RepairNextAction::SafeStop { reason } => {
-            agent.emit_safe_stop_report_for_repair_terminal(reason);
+            super::safe_stop_emit::emit_safe_stop_report_for_repair_terminal(agent, reason);
             TaskContractVerifierFlowOutcome::Exit {
                 reason: repair_terminal_exit_reason(reason),
                 error_text: format!(
