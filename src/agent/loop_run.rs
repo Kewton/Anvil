@@ -189,6 +189,14 @@ mod set_artifact_recovery_target;
 // assertion + release-mode emitter. Free fns over `&mut Agent` /
 // `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod artifact_ledger_state;
+// TaskContract artifact-state projection extracted from `turn.rs` (parent
+// #680). Hosts the Phase-3 (Issue #659 Task 3.2) production helper
+// `task_contract_artifact_states` (ledger authority + legacy shadow +
+// divergence emit), the legacy / ledger derivations, the masked
+// observability emit, and three `#[cfg(test)]` test seams. Free fns
+// over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod artifact_state_projection;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
