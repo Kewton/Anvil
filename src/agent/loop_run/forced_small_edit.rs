@@ -19,12 +19,12 @@
 use std::path::PathBuf;
 
 use super::Agent;
+use super::read_target_helpers::{last_read_tool_path, latest_turn_preferred_read_edit_target};
 use super::tool_display::progress_path_display;
 use super::tool_history::{
     has_successful_non_plan_repo_edit_after_latest_truncated_tool_call,
     recent_truncated_tool_call_attempt,
 };
-use super::turn::{last_read_tool_path, latest_turn_preferred_read_edit_target};
 use crate::agent::recovery;
 use crate::modes::plan_act::ExecutionMode;
 use crate::safety::path_guard::resolve_user_path;

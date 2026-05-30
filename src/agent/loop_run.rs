@@ -14,7 +14,6 @@ use crate::repo_graph::{
     BuildOptions as RepoGraphBuildOptions, BuildOutcome, RepoGraph, RepoGraphError,
     build_repo_graph,
 };
-use crate::safety::path_guard::resolve_user_path;
 use crate::session::compact::{
     approximate_token_count, compact_messages, compact_messages_with_strategy,
 };
@@ -362,6 +361,13 @@ mod agent_misc;
 // focused-edit Read directory→target redirect. Free fn over `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod tool_call_prepare;
+// Read-tool path lookup helpers extracted from `turn.rs` (parent
+// #680). Hosts `last_read_tool_path` (most recent `Read` path across
+// all turns) and `latest_turn_preferred_read_edit_target` (latest user
+// turn's `Read`s, resolved + filtered to existing files, prefers
+// `is_preferred_read_edit_target` matches). Free fns (no Agent
+// dependency). `pub(super)` limited / no facade re-export (DR3-001).
+mod read_target_helpers;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
