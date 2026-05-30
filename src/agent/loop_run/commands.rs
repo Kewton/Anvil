@@ -782,11 +782,14 @@ impl Agent {
             .mode_state
             .enter_plan(self.session_store.plan_dir(), task_profile)?;
         self.ensure_plan_file(&plan_path)?;
-        self.push_system_note(format!(
-            "[Plan Mode / {}] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
-            self.session.mode_state.task_profile.as_str(),
-            plan_path.display()
-        ));
+        super::message_push::push_system_note(
+            self,
+            format!(
+                "[Plan Mode / {}] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
+                self.session.mode_state.task_profile.as_str(),
+                plan_path.display()
+            ),
+        );
         self.footer.publish_flags(
             self.session.mode_state.mode,
             self.config.log_level,
@@ -817,11 +820,14 @@ impl Agent {
         }
         self.session.mode_state.approve();
         super::plan_mode_helpers::prune_plan_mode_messages(&mut self.session.messages);
-        self.push_system_note(format!(
-            "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
-            self.session.mode_state.task_profile.as_str(),
-            lifecycle::plan_act_summary(&plan_contents)
-        ));
+        super::message_push::push_system_note(
+            self,
+            format!(
+                "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
+                self.session.mode_state.task_profile.as_str(),
+                lifecycle::plan_act_summary(&plan_contents)
+            ),
+        );
         self.footer.publish_flags(
             self.session.mode_state.mode,
             self.config.log_level,

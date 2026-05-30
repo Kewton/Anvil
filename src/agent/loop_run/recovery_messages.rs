@@ -219,7 +219,10 @@ pub(super) fn push_deterministic_ui_recovery_continuation_note(
     target_path: &str,
     attempt: usize,
 ) {
-    agent.push_system_note(format!(
-        "Deterministic UI recovery updated {target_path}, but this is recovery context, not completion. Inspect the file if needed, then make one small model-produced Edit or run the project verifier before finalizing. deterministic_ui_recovery_attempt={attempt}"
-    ));
+    super::message_push::push_system_note(
+        agent,
+        format!(
+            "Deterministic UI recovery updated {target_path}, but this is recovery context, not completion. Inspect the file if needed, then make one small model-produced Edit or run the project verifier before finalizing. deterministic_ui_recovery_attempt={attempt}"
+        ),
+    );
 }

@@ -197,30 +197,39 @@ fn push_tool_call_format_retry_note(agent: &mut Agent, err: &str, retry_count: u
             120,
         );
         if !target.is_file() {
-            agent.push_system_note(recovery::focused_edit_missing_target_recovery_note(
-                &target_display,
-                retry_count,
-            ));
+            super::message_push::push_system_note(
+                agent,
+                recovery::focused_edit_missing_target_recovery_note(&target_display, retry_count),
+            );
             return;
         }
         if lower_err.contains("truncated tool call") {
-            agent.push_system_note(recovery::focused_edit_truncated_tool_call_note(
-                &target_display,
-                target_already_read,
-                retry_count,
-            ));
+            super::message_push::push_system_note(
+                agent,
+                recovery::focused_edit_truncated_tool_call_note(
+                    &target_display,
+                    target_already_read,
+                    retry_count,
+                ),
+            );
             return;
         }
         if lower_err.contains("unterminated <anvil_tool_call> block") {
-            agent.push_system_note(recovery::focused_edit_unterminated_tool_call_note(
-                &target_display,
-                target_already_read,
-                retry_count,
-            ));
+            super::message_push::push_system_note(
+                agent,
+                recovery::focused_edit_unterminated_tool_call_note(
+                    &target_display,
+                    target_already_read,
+                    retry_count,
+                ),
+            );
             return;
         }
     }
-    agent.push_system_note(recovery::tool_call_format_recovery_note(err, retry_count));
+    super::message_push::push_system_note(
+        agent,
+        recovery::tool_call_format_recovery_note(err, retry_count),
+    );
 }
 
 fn maybe_handle_assistant_reply_timeout_error(
@@ -264,16 +273,19 @@ fn maybe_handle_assistant_reply_timeout_error(
         if retry_state.focused_edit_timeout_retry_count >= 2 {
             return Some(AssistantReplyRetryDecision::Fail(err.to_string()));
         }
-        agent.push_system_note(recovery::focused_edit_timeout_recovery_note(
-            &progress_path_display(
-                &policy.target.display().to_string(),
-                &agent.work_root,
-                agent.session.mode_state.active_plan_path.as_deref(),
-                120,
+        super::message_push::push_system_note(
+            agent,
+            recovery::focused_edit_timeout_recovery_note(
+                &progress_path_display(
+                    &policy.target.display().to_string(),
+                    &agent.work_root,
+                    agent.session.mode_state.active_plan_path.as_deref(),
+                    120,
+                ),
+                policy.target_already_read,
+                retry_state.focused_edit_timeout_retry_count,
             ),
-            policy.target_already_read,
-            retry_state.focused_edit_timeout_retry_count,
-        ));
+        );
         return Some(AssistantReplyRetryDecision::Retry);
     }
     None

@@ -95,16 +95,22 @@ impl Agent {
     pub(super) fn disable_native_tools_for_session(&mut self) {
         self.native_tools_enabled = false;
         self.session.native_tools_disabled = true;
-        self.push_system_note(prompting::ToolProtocol::TaggedXml.parser_downgrade_notice());
+        super::message_push::push_system_note(
+            self,
+            prompting::ToolProtocol::TaggedXml.parser_downgrade_notice(),
+        );
     }
 
     fn apply_scaffold_root(&mut self, new_root: PathBuf) {
         self.work_root = new_root.clone();
         self.session.active_root = Some(new_root.clone());
-        self.push_system_note(format!(
-            "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
-            new_root.display()
-        ));
+        super::message_push::push_system_note(
+            self,
+            format!(
+                "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
+                new_root.display()
+            ),
+        );
     }
 }
 

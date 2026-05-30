@@ -90,7 +90,7 @@ pub(super) fn push_repo_change_no_edit_recovery_note(agent: &mut Agent, attempt:
     } else {
         recovery::repo_change_after_read_no_edit_note(&target_display, attempt)
     };
-    agent.push_system_note(note);
+    super::message_push::push_system_note(agent, note);
     true
 }
 
@@ -110,7 +110,7 @@ pub(super) fn push_verifier_repair_recovery_note(agent: &mut Agent, attempt: usi
                 super::required_behavior::project_behavior_contract(&task_contract);
             let note =
                 verifier_repair_diagnostic_pending_note(context, behavior_projection.as_ref());
-            agent.push_system_note(note);
+            super::message_push::push_system_note(agent, note);
             true
         }
         super::repair_job::RepairNextAction::RequestPatch { target_hint } => {
@@ -122,23 +122,26 @@ pub(super) fn push_verifier_repair_recovery_note(agent: &mut Agent, attempt: usi
             let target = std::fs::canonicalize(&target).unwrap_or(target);
             if !target.is_file() {
                 let target_display = verifier_repair_target_display(&target, &agent.work_root);
-                agent.push_system_note(recovery::focused_edit_missing_target_recovery_note(
-                    &target_display,
-                    attempt,
-                ));
+                super::message_push::push_system_note(
+                    agent,
+                    recovery::focused_edit_missing_target_recovery_note(&target_display, attempt),
+                );
                 return true;
             }
-            agent.push_system_note(task_contract_verifier_targeted_edit_required_note(
-                context,
-                &agent.work_root,
-                focused_edit_target_already_read(
-                    &agent.session.messages,
-                    &target,
+            super::message_push::push_system_note(
+                agent,
+                task_contract_verifier_targeted_edit_required_note(
+                    context,
                     &agent.work_root,
+                    focused_edit_target_already_read(
+                        &agent.session.messages,
+                        &target,
+                        &agent.work_root,
+                    ),
+                    attempt,
+                    TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
                 ),
-                attempt,
-                TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-            ));
+            );
             true
         }
         super::repair_job::RepairNextAction::RerunVerifier

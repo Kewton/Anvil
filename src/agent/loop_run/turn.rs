@@ -36,22 +36,4 @@ impl Agent {
             &self.session.messages,
         )
     }
-
-    pub(super) fn push_system_note(&mut self, note: String) {
-        if prompting::should_skip_system_note(&self.session.messages, &note) {
-            return;
-        }
-        self.session
-            .messages
-            .push(ConversationMessage::system(note));
-    }
-
-    pub(super) fn push_user_message(&mut self, content: String) {
-        self.session
-            .working_memory
-            .set_active_task(Some(content.clone()));
-        self.session
-            .messages
-            .push(ConversationMessage::user(content));
-    }
 }

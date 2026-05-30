@@ -167,13 +167,16 @@ fn handle_repair_job_verifier_failure(
         ),
         true,
     );
-    agent.push_system_note(task_contract_verifier_repair_note(
-        &command,
-        &output,
-        *args.contract_verification_retries,
-        attempt_limit,
-        agent.repair_job.as_ref(),
-    ));
+    super::message_push::push_system_note(
+        agent,
+        task_contract_verifier_repair_note(
+            &command,
+            &output,
+            *args.contract_verification_retries,
+            attempt_limit,
+            agent.repair_job.as_ref(),
+        ),
+    );
     TaskContractVerifierFlowOutcome::Continue
 }
 
