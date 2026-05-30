@@ -31,7 +31,7 @@ use super::Agent;
 use super::read_target_helpers::{last_read_tool_path, latest_turn_preferred_read_edit_target};
 use super::tool_display::progress_path_display;
 use super::tool_history::{focused_edit_target_already_read, has_successful_non_plan_repo_edit};
-use super::turn::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT;
+use super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT;
 use super::verifier_orchestration::{
     task_contract_verifier_targeted_edit_required_note, verifier_repair_diagnostic_pending_note,
     verifier_repair_target_display,

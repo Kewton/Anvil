@@ -3,17 +3,6 @@ use super::*;
 
 use super::quality::repo_change_request_text;
 
-/// Maximum number of characters of tool-call arguments retained in trace logs.
-pub(super) const LOG_ARGS_MAX_CHARS: usize = 200;
-
-// Issue #634: SSOT for specialized-fallback ログ event 名。emit 側 / test 側の
-// 双方が参照し、typo による検証無効化を防ぐ。文字列値そのものは既存テスト互換の
-// ため不変。`EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK` は本 Issue で新規追加。
-pub(super) const PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD: usize = 2;
-pub(super) const TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT: usize = 3;
-pub(super) const TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT: usize = 6;
-pub(super) const USER_INTERRUPT_ERROR: &str = "__anvil_user_interrupt__";
-
 impl Agent {
     /// Issue #646: build the active `TaskWorkspaceScope` for the current
     /// task. Pure projection of `work_root` + the active user request; no

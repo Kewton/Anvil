@@ -381,6 +381,12 @@ mod turn_helpers;
 // Consumed only by `reply_retry`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod reply_retry_types;
+// Module-level constants extracted from `turn.rs` (parent #680). Hosts
+// `LOG_ARGS_MAX_CHARS`, `PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD`,
+// `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`,
+// `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT`, `USER_INTERRUPT_ERROR`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod turn_constants;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
