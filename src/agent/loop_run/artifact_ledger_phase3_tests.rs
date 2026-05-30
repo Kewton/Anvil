@@ -222,7 +222,9 @@ fn task_contract_artifact_states_returns_same_shape_as_before_empty() {
     // both derivations should be empty. (The Phase 3 implementation
     // delegates to legacy on divergence; the legacy and ledger
     // derivations must align for the empty case.)
-    let states = agent.task_contract_artifact_states_for_test(&contract);
+    let states = super::artifact_state_projection::task_contract_artifact_states_for_test(
+        &mut agent, &contract,
+    );
     assert!(
         states.is_empty(),
         "no required artifacts => no states; got {states:?}"
@@ -259,8 +261,14 @@ fn task_contract_artifact_states_uses_ledger_projection() {
         "fixture contract must require a Test artifact"
     );
 
-    let legacy_states = agent.task_contract_artifact_states_legacy_for_test(&contract);
-    let ledger_states = agent.task_contract_artifact_states_from_ledger_for_test(&contract);
+    let legacy_states =
+        super::artifact_state_projection::task_contract_artifact_states_legacy_for_test(
+            &mut agent, &contract,
+        );
+    let ledger_states =
+        super::artifact_state_projection::task_contract_artifact_states_from_ledger_for_test(
+            &agent, &contract,
+        );
 
     let edit_test_state = |states: &[ArtifactState]| -> Option<ArtifactState> {
         states
