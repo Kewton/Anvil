@@ -278,6 +278,15 @@ mod tool_call_execution;
 // Task 2.5 ArtifactLedger seed. Free fn over `&mut Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod repo_edit_observation;
+// Focused-edit / repo-change / verifier-repair recovery target +
+// note builders extracted from `turn.rs` (parent #680). Hosts
+// `focused_edit_recovery_target` (focused-edit chain),
+// `repo_change_no_edit_recovery_target` (private repo-change chain),
+// `push_repo_change_no_edit_recovery_note`, and
+// `push_verifier_repair_recovery_note` (RequestDiagnostic /
+// RequestPatch branches). Free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod recovery_targets;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

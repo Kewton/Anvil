@@ -728,7 +728,7 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
 }
 
 pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usize) {
-    if let Some(target) = agent.focused_edit_recovery_target() {
+    if let Some(target) = super::recovery_targets::focused_edit_recovery_target(agent) {
         let target_already_read =
             focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
         let note = super::recovery_messages::focused_edit_no_tool_note_for_target(
@@ -1115,8 +1115,10 @@ fn handle_empty_missing_repo_change_retry(
     if !super::artifact_completion_record::push_artifact_directed_recovery_note(
         agent,
         repo_change_retries,
-    ) && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
-    {
+    ) && !super::recovery_targets::push_repo_change_no_edit_recovery_note(
+        agent,
+        repo_change_retries,
+    ) {
         agent.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
     }
     if super::artifact_completion_record::record_artifact_completion_attempt(
@@ -1133,7 +1135,7 @@ fn handle_prose_only_missing_repo_change_retry(
     agent: &mut Agent,
     repo_change_retries: usize,
 ) -> ActorLoopNoToolReplyOutcome {
-    if let Some(target) = agent.focused_edit_recovery_target() {
+    if let Some(target) = super::recovery_targets::focused_edit_recovery_target(agent) {
         let target_already_read =
             focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
         let note = super::recovery_messages::focused_edit_no_tool_note_for_target(
@@ -1146,8 +1148,10 @@ fn handle_prose_only_missing_repo_change_retry(
     } else if !super::artifact_completion_record::push_artifact_directed_recovery_note(
         agent,
         repo_change_retries,
-    ) && !agent.push_repo_change_no_edit_recovery_note(repo_change_retries)
-    {
+    ) && !super::recovery_targets::push_repo_change_no_edit_recovery_note(
+        agent,
+        repo_change_retries,
+    ) {
         agent.push_system_note(recovery::repo_change_no_tool_recovery_note(
             repo_change_retries,
         ));
@@ -1170,7 +1174,10 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
         && (super::artifact_completion_record::push_artifact_directed_recovery_note(
             agent,
             args.repo_change_retries,
-        ) || agent.push_repo_change_no_edit_recovery_note(args.repo_change_retries))
+        ) || super::recovery_targets::push_repo_change_no_edit_recovery_note(
+            agent,
+            args.repo_change_retries,
+        ))
     {
         super::turn::write_stdout_rendered(
             &format_iteration_status(
@@ -2391,7 +2398,7 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
         ),
         true,
     );
-    if !agent.push_verifier_repair_recovery_note(*verifier_repair_retries)
+    if !super::recovery_targets::push_verifier_repair_recovery_note(agent, *verifier_repair_retries)
         && !super::artifact_completion_record::push_artifact_directed_recovery_note(
             agent,
             *verifier_repair_retries,
