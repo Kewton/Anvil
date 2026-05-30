@@ -3267,7 +3267,10 @@ mod tests {
         let (agent, _temp) = test_agent_with_config(Config::default());
         // Even with no other signals, an explicit caller-supplied role wins.
         assert_eq!(
-            agent.resolve_current_role_for_safe_stop(Some(ArtifactRole::Setup)),
+            super::super::safe_stop_emit::resolve_current_role_for_safe_stop(
+                &agent,
+                Some(ArtifactRole::Setup)
+            ),
             Some(ArtifactRole::Setup),
         );
     }
@@ -3285,7 +3288,7 @@ mod tests {
         });
         agent.repair_job = Some(job);
         assert_eq!(
-            agent.resolve_current_role_for_safe_stop(None),
+            super::super::safe_stop_emit::resolve_current_role_for_safe_stop(&agent, None),
             Some(ArtifactRole::Test),
         );
     }
@@ -3301,7 +3304,7 @@ mod tests {
         });
         // No semantic_plan, no repair_job -> recovery_target wins.
         assert_eq!(
-            agent.resolve_current_role_for_safe_stop(None),
+            super::super::safe_stop_emit::resolve_current_role_for_safe_stop(&agent, None),
             Some(ArtifactRole::UsageDocs),
         );
     }
@@ -3318,7 +3321,7 @@ mod tests {
         // No semantic_plan + no recovery target -> target_hint must win.
         agent.repair_job = Some(job);
         assert_eq!(
-            agent.resolve_current_role_for_safe_stop(None),
+            super::super::safe_stop_emit::resolve_current_role_for_safe_stop(&agent, None),
             Some(ArtifactRole::Test),
         );
     }
@@ -3332,7 +3335,7 @@ mod tests {
             "FastAPIのテストコードを実装してください".to_string(),
         ));
         assert_eq!(
-            agent.resolve_current_role_for_safe_stop(None),
+            super::super::safe_stop_emit::resolve_current_role_for_safe_stop(&agent, None),
             Some(ArtifactRole::Test),
         );
     }
@@ -3341,7 +3344,10 @@ mod tests {
     fn resolve_current_role_for_safe_stop_returns_none_without_signal() {
         let (agent, _temp) = test_agent_with_config(Config::default());
         // No repair_job, no recovery_target, no active request -> None.
-        assert_eq!(agent.resolve_current_role_for_safe_stop(None), None);
+        assert_eq!(
+            super::super::safe_stop_emit::resolve_current_role_for_safe_stop(&agent, None),
+            None
+        );
     }
 
     // ========================================================================

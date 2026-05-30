@@ -2429,7 +2429,7 @@ pub(super) fn handle_task_contract_verifier_no_verifier(
         .as_mut()
         .is_some_and(|job| !job.record_retry());
     if budget_exhausted {
-        agent.emit_safe_stop_report_for_verifier_missing();
+        super::safe_stop_emit::emit_safe_stop_report_for_verifier_missing(agent);
         return super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
             reason: ExitReason::MissingVerification,
             error_text:
@@ -2773,7 +2773,7 @@ pub(super) fn handle_task_contract_verifier_failure(
                 "verifier repair budget exhausted",
             )
         } else {
-            agent.emit_safe_stop_report_for_verifier_failed_safe_stop();
+            super::safe_stop_emit::emit_safe_stop_report_for_verifier_failed_safe_stop(agent);
             (ExitReason::VerifierFailed, "required verifier failed")
         };
         return super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
@@ -2836,7 +2836,10 @@ pub(super) fn handle_task_contract_verifier_failure(
 }
 
 pub(super) fn emit_safe_stop_report_for_repair_exhausted(agent: &mut Agent) {
-    agent.emit_repair_safe_stop_report(super::repair_job::StopReason::RepairExhausted);
+    super::safe_stop_emit::emit_repair_safe_stop_report(
+        agent,
+        super::repair_job::StopReason::RepairExhausted,
+    );
 }
 
 pub(super) fn maybe_emit_repair_exhausted_from_promotion(

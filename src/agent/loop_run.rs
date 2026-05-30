@@ -197,6 +197,14 @@ mod artifact_ledger_state;
 // over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod artifact_state_projection;
+// `agent.safe_stop.report` emit cluster extracted from `turn.rs` (parent
+// #680). Hosts the Issue #654 emit lifecycle: per-StopReason dedup +
+// emit-4-job-reports + SafeStopReport build + bounded payload render +
+// final-defence-masked log_llm_event, the §6.4 current-role priority
+// chain, six emit shells, the shared repair-job emit helper, and the
+// owned-test-artifact collector. Free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod safe_stop_emit;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -1012,7 +1020,9 @@ pub(crate) fn emit_safe_stop_report_diagnostic_target_missing_for_test(agent: &m
         // production guarantee by ensuring callers see the same no-op path.
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_diagnostic_target_missing();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_diagnostic_target_missing(
+        agent,
+    );
 }
 
 /// Issue #654 (E.3) test seam: invoke the `verifier_failed_safe_stop` emit
@@ -1023,7 +1033,9 @@ pub(crate) fn emit_safe_stop_report_verifier_failed_safe_stop_for_test(agent: &m
     if agent.repair_job.is_none() {
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_verifier_failed_safe_stop();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_verifier_failed_safe_stop(
+        agent,
+    );
 }
 
 /// Issue #654 (E.4) test seam: invoke the `verifier_weak` emit shell. In
@@ -1034,7 +1046,7 @@ pub(crate) fn emit_safe_stop_report_verifier_weak_for_test(agent: &mut Agent) {
     if agent.repair_job.is_none() {
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_verifier_weak();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_verifier_weak(agent);
 }
 
 /// Issue #662 test seam: invoke the `repair_exhausted` emit shell. In
@@ -1193,7 +1205,7 @@ pub(crate) fn emit_safe_stop_report_verifier_missing_for_test(agent: &mut Agent)
     if agent.missing_verifier_job.is_none() {
         agent.missing_verifier_job = Some(repair_job::MissingVerifierJob::new(1, 0));
     }
-    agent.emit_safe_stop_report_for_verifier_missing();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_verifier_missing(agent);
 }
 
 /// Issue #654 (E.2) test seam: invoke the `artifact_completion_failed` emit
@@ -1211,7 +1223,11 @@ pub(crate) fn emit_safe_stop_report_artifact_completion_failed_for_test(
         "setup" => task_contract::ArtifactRole::Setup,
         _ => task_contract::ArtifactRole::Implementation,
     };
-    agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
+        agent,
+        role,
+        expected_target,
+    );
 }
 
 /// Issue #654 test seam: clear the per-turn dedup marker so a test can verify
