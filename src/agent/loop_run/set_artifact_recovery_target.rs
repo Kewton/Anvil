@@ -38,7 +38,7 @@ pub(super) fn set_artifact_recovery_target_for_decision(
     decision: &CompletionDecision,
     attempt: usize,
 ) -> Option<RecoveryTargetHint> {
-    let hint = agent.task_contract_recovery_target(decision)?;
+    let hint = super::task_contract_recovery::task_contract_recovery_target(agent, decision)?;
     set_artifact_recovery_target_from_hint(agent, hint, attempt)
 }
 
