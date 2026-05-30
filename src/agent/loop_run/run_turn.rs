@@ -27,7 +27,7 @@ pub(super) fn run_turn(
     stream_output: bool,
     monitor: &mut InterruptMonitor,
 ) -> LoopResult {
-    agent.push_user_message(input.to_string());
+    super::message_push::push_user_message(agent, input.to_string());
     if agent.session.mode_state.mode != ExecutionMode::Plan {
         // Issue #576: replace direct `classify_work_mode_json` + event
         // emit with the shared `classify_with_confirmation` wrapper. The

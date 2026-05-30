@@ -83,11 +83,14 @@ pub(super) fn record_missing_verifier_setup_failure(
         ),
         true,
     );
-    agent.push_system_note(task_contract_no_verifier_note(
-        attempt,
-        attempt_limit,
-        agent.active_request_text().unwrap_or_default().as_str(),
-    ));
+    super::message_push::push_system_note(
+        agent,
+        task_contract_no_verifier_note(
+            attempt,
+            attempt_limit,
+            agent.active_request_text().unwrap_or_default().as_str(),
+        ),
+    );
     false
 }
 

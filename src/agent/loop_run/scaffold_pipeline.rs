@@ -877,10 +877,10 @@ pub(super) fn finalize_deterministic_scaffold_materialization(
         ),
         Vec::new(),
     ));
-    agent.push_system_note(render_deterministic_scaffold_continuation_note(
-        request,
-        &written_paths,
-    ));
+    super::message_push::push_system_note(
+        agent,
+        render_deterministic_scaffold_continuation_note(request, &written_paths),
+    );
 }
 
 pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
@@ -1707,9 +1707,10 @@ pub(super) fn maybe_fallback_plan_model_after_timeout(agent: &mut Agent, err: &s
     }
 
     agent.plan_model_override = Some(sidecar.clone());
-    agent.push_system_note(format!(
-        "Main planning model timed out. Retry the plan step with sidecar model {sidecar}."
-    ));
+    super::message_push::push_system_note(
+        agent,
+        format!("Main planning model timed out. Retry the plan step with sidecar model {sidecar}."),
+    );
     true
 }
 

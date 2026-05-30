@@ -387,6 +387,13 @@ mod reply_retry_types;
 // `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT`, `USER_INTERRUPT_ERROR`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod turn_constants;
+// Session message push helpers extracted from `turn.rs` (parent #680).
+// Hosts `push_system_note` (`prompting::should_skip_system_note`
+// dedup + ConversationMessage::system push) and `push_user_message`
+// (working_memory.set_active_task + ConversationMessage::user push).
+// Free fns over `&mut Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod message_push;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

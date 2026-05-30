@@ -472,7 +472,7 @@ pub(super) fn maybe_handle_answer_only_inadequate_recovery(
             ),
             true,
         );
-        agent.push_system_note(
+        super::message_push::push_system_note(agent,
             "[Answer-only Recovery] Answer the user's request now with concrete findings from the available context. Do not output a tool call, do not edit files, and do not ask the user to run anything."
                 .to_string(),
         );
@@ -549,12 +549,15 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         ),
         true,
     );
-    agent.push_system_note(recovery::repo_change_quality_gate_note(
-        &request,
-        &target_path,
-        &issue,
-        *args.repo_change_retries,
-    ));
+    super::message_push::push_system_note(
+        agent,
+        recovery::repo_change_quality_gate_note(
+            &request,
+            &target_path,
+            &issue,
+            *args.repo_change_retries,
+        ),
+    );
     Some(PostReplyRecoveryOutcome::Continue)
 }
 
@@ -593,9 +596,10 @@ pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
         ),
         true,
     );
-    agent.push_system_note(recovery::repo_change_partial_progress_note(
-        *args.repo_change_retries,
-    ));
+    super::message_push::push_system_note(
+        agent,
+        recovery::repo_change_partial_progress_note(*args.repo_change_retries),
+    );
     Some(PostReplyRecoveryOutcome::Continue)
 }
 
@@ -644,7 +648,7 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
         ),
         true,
     );
-    agent.push_system_note(
+    super::message_push::push_system_note(agent,
         "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
             .to_string(),
     );
@@ -695,7 +699,10 @@ pub(super) fn maybe_continue_missing_repo_framework_fallback(
         return false;
     }
     *args.framework_app_fallback_materialized = true;
-    agent.push_system_note(framework_app_fallback_continuation_note().to_string());
+    super::message_push::push_system_note(
+        agent,
+        framework_app_fallback_continuation_note().to_string(),
+    );
     true
 }
 
@@ -718,9 +725,10 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
             if *args.repo_change_retries >= 3 {
                 return Some(missing_repo_edits_finalize_outcome());
             }
-            agent.push_system_note(recovery::repo_change_recovery_note(
-                *args.repo_change_retries,
-            ));
+            super::message_push::push_system_note(
+                agent,
+                recovery::repo_change_recovery_note(*args.repo_change_retries),
+            );
             Some(PostReplyRecoveryOutcome::Continue)
         }
         super::scaffold_pipeline::ScaffoldFallbackResult::NotApplicable => None,
@@ -737,11 +745,11 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
             target_already_read,
             attempt,
         );
-        agent.push_system_note(note);
+        super::message_push::push_system_note(agent, note);
         return;
     }
     if !super::artifact_completion_record::push_artifact_directed_recovery_note(agent, attempt) {
-        agent.push_system_note(recovery::repo_change_recovery_note(attempt));
+        super::message_push::push_system_note(agent, recovery::repo_change_recovery_note(attempt));
     }
 }
 
@@ -914,12 +922,15 @@ pub(super) fn handle_actor_loop_empty_reply(
             &missing_sections,
             *args.plan_progress_retries,
         );
-        agent.push_system_note(recovery::plan_progress_recovery_note(
-            current_stage,
-            &next_sections,
-            &missing_sections,
-            *args.plan_progress_retries,
-        ));
+        super::message_push::push_system_note(
+            agent,
+            recovery::plan_progress_recovery_note(
+                current_stage,
+                &next_sections,
+                &missing_sections,
+                *args.plan_progress_retries,
+            ),
+        );
         return ActorLoopNoToolReplyOutcome::Continue;
     }
 
@@ -940,10 +951,10 @@ pub(super) fn handle_actor_loop_empty_reply(
         ),
         true,
     );
-    agent.push_system_note(recovery::empty_response_recovery_note(
-        *args.empty_retries,
-        args.requires_action,
-    ));
+    super::message_push::push_system_note(
+        agent,
+        recovery::empty_response_recovery_note(*args.empty_retries, args.requires_action),
+    );
     ActorLoopNoToolReplyOutcome::Continue
 }
 
@@ -1018,11 +1029,14 @@ fn handle_plan_progress_prose_only_reply(
         &missing_sections,
         *args.plan_progress_retries,
     );
-    agent.push_system_note(recovery::plan_no_tool_recovery_note(
-        current_stage,
-        &next_sections,
-        *args.plan_progress_retries,
-    ));
+    super::message_push::push_system_note(
+        agent,
+        recovery::plan_no_tool_recovery_note(
+            current_stage,
+            &next_sections,
+            *args.plan_progress_retries,
+        ),
+    );
     ActorLoopNoToolReplyOutcome::Continue
 }
 
@@ -1054,7 +1068,7 @@ fn handle_generic_prose_only_retry(
         ),
         true,
     );
-    agent.push_system_note(recovery::no_tool_recovery_note(*no_tool_retries));
+    super::message_push::push_system_note(agent, recovery::no_tool_recovery_note(*no_tool_retries));
     ActorLoopNoToolReplyOutcome::Continue
 }
 
@@ -1119,7 +1133,10 @@ fn handle_empty_missing_repo_change_retry(
         agent,
         repo_change_retries,
     ) {
-        agent.push_system_note(recovery::repo_change_recovery_note(repo_change_retries));
+        super::message_push::push_system_note(
+            agent,
+            recovery::repo_change_recovery_note(repo_change_retries),
+        );
     }
     if super::artifact_completion_record::record_artifact_completion_attempt(
         agent,
@@ -1144,7 +1161,7 @@ fn handle_prose_only_missing_repo_change_retry(
             target_already_read,
             repo_change_retries,
         );
-        agent.push_system_note(note);
+        super::message_push::push_system_note(agent, note);
     } else if !super::artifact_completion_record::push_artifact_directed_recovery_note(
         agent,
         repo_change_retries,
@@ -1152,9 +1169,10 @@ fn handle_prose_only_missing_repo_change_retry(
         agent,
         repo_change_retries,
     ) {
-        agent.push_system_note(recovery::repo_change_no_tool_recovery_note(
-            repo_change_retries,
-        ));
+        super::message_push::push_system_note(
+            agent,
+            recovery::repo_change_no_tool_recovery_note(repo_change_retries),
+        );
     }
     if super::artifact_completion_record::record_artifact_completion_attempt(
         agent,
@@ -1217,7 +1235,10 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
         )
     {
         *args.framework_app_fallback_materialized = true;
-        agent.push_system_note(framework_app_fallback_continuation_note().to_string());
+        super::message_push::push_system_note(
+            agent,
+            framework_app_fallback_continuation_note().to_string(),
+        );
         return ActorLoopNoToolReplyOutcome::Continue;
     }
     ActorLoopNoToolReplyOutcome::Exit {
@@ -1374,12 +1395,15 @@ pub(super) fn handle_actor_loop_completion(
                 &missing_sections,
                 *args.plan_progress_retries,
             );
-            agent.push_system_note(recovery::plan_progress_recovery_note(
-                current_stage,
-                &next_sections,
-                &missing_sections,
-                *args.plan_progress_retries,
-            ));
+            super::message_push::push_system_note(
+                agent,
+                recovery::plan_progress_recovery_note(
+                    current_stage,
+                    &next_sections,
+                    &missing_sections,
+                    *args.plan_progress_retries,
+                ),
+            );
             return ActorLoopCompletionOutcome::Continue;
         }
     }
@@ -1434,14 +1458,14 @@ fn record_actor_loop_post_tool_notes(
     logged_act_first_repo_edit: bool,
 ) {
     if emitted_bash_loop_note {
-        agent.push_system_note(recovery::install_loop_recovery_note());
+        super::message_push::push_system_note(agent, recovery::install_loop_recovery_note());
     } else if agent.session.mode_state.mode == super::ExecutionMode::Act
         && action_expectation == recovery::ActionExpectation::RepoChange
         && bash_only_tool_turn
         && repo_edit_calls_made_this_turn == 0
         && !logged_act_first_repo_edit
     {
-        agent.push_system_note(recovery::repo_change_after_setup_note());
+        super::message_push::push_system_note(agent, recovery::repo_change_after_setup_note());
     }
 }
 
@@ -1634,12 +1658,15 @@ fn handle_actor_loop_post_tool_repo_edit_quality_gate(
                     ),
                     true,
                 );
-                agent.push_system_note(recovery::repo_change_quality_gate_note(
-                    &request,
-                    &target_path,
-                    &issue,
-                    *repo_change_retries,
-                ));
+                super::message_push::push_system_note(
+                    agent,
+                    recovery::repo_change_quality_gate_note(
+                        &request,
+                        &target_path,
+                        &issue,
+                        *repo_change_retries,
+                    ),
+                );
                 ActorLoopPostToolFallbackOutcome::Proceed
             }
         }
@@ -1697,12 +1724,15 @@ fn handle_plan_file_edit_followup(
     if *args.plan_progress_retries >= 2 {
         return Some(handle_non_progress_plan_edit_fallback(agent));
     }
-    agent.push_system_note(recovery::plan_progress_recovery_note(
-        agent.session.mode_state.plan_stage,
-        &super::lifecycle::plan_next_stage_sections(&plan_contents),
-        &missing_after,
-        *args.plan_progress_retries,
-    ));
+    super::message_push::push_system_note(
+        agent,
+        recovery::plan_progress_recovery_note(
+            agent.session.mode_state.plan_stage,
+            &super::lifecycle::plan_next_stage_sections(&plan_contents),
+            &missing_after,
+            *args.plan_progress_retries,
+        ),
+    );
     Some(ActorLoopPlanToolFollowupOutcome::Proceed)
 }
 
@@ -1760,12 +1790,15 @@ fn handle_actor_loop_plan_exploration_only_turn(
                     &missing_sections,
                     *plan_progress_retries,
                 );
-                agent.push_system_note(recovery::plan_progress_recovery_note(
-                    current_stage,
-                    &next_sections,
-                    &missing_sections,
-                    *plan_progress_retries,
-                ));
+                super::message_push::push_system_note(
+                    agent,
+                    recovery::plan_progress_recovery_note(
+                        current_stage,
+                        &next_sections,
+                        &missing_sections,
+                        *plan_progress_retries,
+                    ),
+                );
             }
             Some(ActorLoopPlanToolFollowupOutcome::Proceed)
         }
@@ -2040,7 +2073,10 @@ pub(super) fn maybe_continue_actor_loop_framework_fallback(
         return false;
     }
     *args.framework_app_fallback_materialized = true;
-    agent.push_system_note(framework_app_fallback_continuation_note().to_string());
+    super::message_push::push_system_note(
+        agent,
+        framework_app_fallback_continuation_note().to_string(),
+    );
     true
 }
 
@@ -2190,7 +2226,7 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
             (*args.contract_completion_retries).saturating_add(1),
         );
         let scaffold_note = "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response.";
-        agent.push_system_note(scaffold_note.to_string());
+        super::message_push::push_system_note(agent, scaffold_note.to_string());
         return ActorLoopTaskContractReplyOutcome::Continue;
     }
     handle_actor_loop_task_contract_incomplete_artifacts(
@@ -2280,7 +2316,7 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
             attempt_limit,
             args.target_hint.as_ref(),
         );
-        agent.push_system_note(note);
+        super::message_push::push_system_note(agent, note);
     }
     ActorLoopTaskContractReplyOutcome::Continue
 }
@@ -2356,7 +2392,7 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
         attempt_limit,
         args.target_hint.as_ref(),
     );
-    agent.push_system_note(note);
+    super::message_push::push_system_note(agent, note);
     ActorLoopTaskContractReplyOutcome::Continue
 }
 
@@ -2412,10 +2448,13 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
             *verifier_repair_retries,
         )
     {
-        agent.push_system_note(task_contract_verifier_edit_required_note(
-            *verifier_repair_retries,
-            super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-        ));
+        super::message_push::push_system_note(
+            agent,
+            task_contract_verifier_edit_required_note(
+                *verifier_repair_retries,
+                super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            ),
+        );
     }
     ActorLoopTaskContractReplyOutcome::Continue
 }
@@ -2535,12 +2574,15 @@ pub(super) fn handle_actor_loop_rejected_tool_batch(
             args.effective_tool_policy,
             *args.focused_policy_retries,
         );
-        agent.push_system_note(note);
+        super::message_push::push_system_note(agent, note);
     } else {
-        agent.push_system_note(format!(
-            "The previous tool call violated the current tool policy and was not executed. Emit exactly one allowed tool call now. tool_policy_retry_attempt={}",
-            *args.focused_policy_retries
-        ));
+        super::message_push::push_system_note(
+            agent,
+            format!(
+                "The previous tool call violated the current tool policy and was not executed. Emit exactly one allowed tool call now. tool_policy_retry_attempt={}",
+                *args.focused_policy_retries
+            ),
+        );
     }
     ActorLoopToolPreparationOutcome::Continue
 }
@@ -2634,10 +2676,13 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
         agent,
         artifact_attempt,
     ) {
-        agent.push_system_note(format!(
-            "[Artifact Completion] Previous tool call was rejected and was not executed. Missing role: {}. Emit exactly one allowed tool call on the current target path now. artifact_completion_attempt={artifact_attempt}/{attempt_limit}",
-            role.label()
-        ));
+        super::message_push::push_system_note(
+            agent,
+            format!(
+                "[Artifact Completion] Previous tool call was rejected and was not executed. Missing role: {}. Emit exactly one allowed tool call on the current target path now. artifact_completion_attempt={artifact_attempt}/{attempt_limit}",
+                role.label()
+            ),
+        );
     }
     Some(ActorLoopToolPreparationOutcome::Continue)
 }
@@ -2739,7 +2784,7 @@ pub(super) fn maybe_handle_answer_only_future_work_recovery(
             ),
             true,
         );
-        agent.push_system_note(
+        super::message_push::push_system_note(agent,
             "[Answer-only Recovery] Answer the user's request now using only the context already inspected. Do not announce the next action, do not use tools, do not edit files, and do not ask the user to run anything."
                 .to_string(),
         );

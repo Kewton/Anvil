@@ -34,7 +34,7 @@ pub(super) fn push_artifact_directed_recovery_note(agent: &mut Agent, attempt: u
     };
     let note =
         recovery::artifact_directed_recovery_note(target.role.label(), &target.path, attempt);
-    agent.push_system_note(note);
+    super::message_push::push_system_note(agent, note);
     true
 }
 

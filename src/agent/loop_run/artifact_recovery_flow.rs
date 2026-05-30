@@ -148,9 +148,12 @@ pub(super) fn maybe_emit_artifact_completion_failed_diagnostic(agent: &mut Agent
         .collect::<Vec<_>>()
         .join(", ");
     // Sink 1: system note — sanitized snapshot fields only.
-    agent.push_system_note(format!(
-        "[Artifact Completion Failed] Missing role: {role_label}. Expected target: {expected_target}. Recent actions: {actions_preview}. Retry budget exhausted."
-    ));
+    super::message_push::push_system_note(
+        agent,
+        format!(
+            "[Artifact Completion Failed] Missing role: {role_label}. Expected target: {expected_target}. Recent actions: {actions_preview}. Retry budget exhausted."
+        ),
+    );
     // Sink 2: working-memory error.
     agent.session.working_memory.note_error(format!(
         "artifact_completion_failed role={role_label} target={expected_target}"

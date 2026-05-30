@@ -2459,11 +2459,14 @@ pub(super) fn handle_task_contract_verifier_no_verifier(
         .as_ref()
         .map(|job| job.retries_used as usize)
         .unwrap_or(0);
-    agent.push_system_note(task_contract_no_verifier_note(
-        job_attempt,
-        TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
-        agent.active_request_text().unwrap_or_default().as_str(),
-    ));
+    super::message_push::push_system_note(
+        agent,
+        task_contract_no_verifier_note(
+            job_attempt,
+            TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            agent.active_request_text().unwrap_or_default().as_str(),
+        ),
+    );
     super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue
 }
 
@@ -2826,13 +2829,16 @@ pub(super) fn handle_task_contract_verifier_failure(
         ),
         true,
     );
-    agent.push_system_note(task_contract_verifier_repair_note(
-        &command,
-        &output,
-        *args.contract_verification_retries,
-        attempt_limit,
-        agent.repair_job.as_ref(),
-    ));
+    super::message_push::push_system_note(
+        agent,
+        task_contract_verifier_repair_note(
+            &command,
+            &output,
+            *args.contract_verification_retries,
+            attempt_limit,
+            agent.repair_job.as_ref(),
+        ),
+    );
     super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue
 }
 
