@@ -3475,7 +3475,7 @@ mod tests {
         agent.task_contract_verifier_repair_pending = true;
         agent.repair_job = Some(super::super::repair_job::RepairJob::new_for_test());
 
-        let candidates = agent.build_arbiter_candidates_pub_for_test();
+        let candidates = super::super::test_seams::build_arbiter_candidates_pub_for_test(&agent);
         assert_eq!(
             candidates.len(),
             1,
@@ -3612,7 +3612,7 @@ mod tests {
                 .to_string(),
         ));
 
-        let candidates = agent.build_arbiter_candidates_pub_for_test();
+        let candidates = super::super::test_seams::build_arbiter_candidates_pub_for_test(&agent);
         assert!(
             !candidates
                 .iter()

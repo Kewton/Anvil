@@ -6373,7 +6373,7 @@ E   assert [{'id': 1}] == []\n";
         agent.task_contract_verifier_repair_pending = true;
         agent.repair_job = Some(verifier_context_for("app/main.py"));
 
-        let candidates = agent.build_arbiter_candidates_pub_for_test();
+        let candidates = super::super::test_seams::build_arbiter_candidates_pub_for_test(&agent);
         let selection = super::super::active_job_arbiter::select_active_job(&candidates);
         let selected = selection.selected.expect("verifier repair candidate");
         assert_eq!(
