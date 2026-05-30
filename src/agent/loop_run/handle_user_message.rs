@@ -178,7 +178,7 @@ pub(super) fn handle_user_message(
     // (DR1-001 SSOT集約). Runs BEFORE `maybe_emit_job_reports` so
     // the job state emitted in `ArtifactCompletionReport` reflects
     // ledger-driven Satisfied transitions for the turn.
-    agent.refresh_artifact_completion_satisfied();
+    super::agent_misc::refresh_artifact_completion_satisfied(agent);
     // Issue #666: emit per-turn structured job reports just before
     // returning. Wrapping the result guarantees emit fires once per
     // turn regardless of how `run_turn` exited (Ok / Err / early

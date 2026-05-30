@@ -37,8 +37,10 @@ pub(super) fn tool_specs_for_policy(agent: &Agent, policy: &EffectiveToolPolicy)
 }
 
 pub(super) fn local_llm_small_edit_target(agent: &Agent) -> Option<PathBuf> {
-    if !crate::model_capabilities::model_capabilities(&agent.current_assistant_model())
-        .read_after_small_edit_protocol
+    if !crate::model_capabilities::model_capabilities(&super::agent_misc::current_assistant_model(
+        agent,
+    ))
+    .read_after_small_edit_protocol
     {
         return None;
     }

@@ -1,13 +1,7 @@
-use super::active_job_arbiter::RecoveryOwner;
-use super::actor_loop_flow::format_iteration_status;
-
-use super::plan_mode_helpers::assistant_model_for_mode;
 use super::small_helpers::raw_mode_safe_text;
-use super::summary::ExitReason;
 use super::tool_history::{
     focused_read_target_for_directory, is_preferred_read_edit_target, latest_user_turn_slice,
 };
-use super::verifier_orchestration::task_contract_no_verifier_note;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
@@ -132,84 +126,6 @@ pub(super) fn quality_confirm_cache_key(request: &str, content: &str) -> u64 {
 }
 
 impl Agent {
-    /// Issue #663 (AD2 / AD9 / DR1-001): SSOT chokepoint for the
-    /// ledger-driven Satisfied transition. Status guard is intentionally
-    /// absent here — it lives inside
-    /// `ArtifactCompletionJob::record_satisfied_from_ledger`. The function
-    /// computes the projection once and delegates to every active job.
-    ///
-    /// Today the Agent still holds a single `Option<ArtifactCompletionJob>`
-    /// (the BTreeMap migration tracked in AD9 is staged for the legacy
-    /// counter cleanup follow-up PR); the function therefore iterates the
-    /// single-entry option but is shaped so the future BTreeMap
-    /// substitution is a single-line replacement.
-    pub(super) fn refresh_artifact_completion_satisfied(&mut self) {
-        if self.artifact_completion_job.is_none() {
-            return;
-        }
-        let task_contract = match self.active_request_text() {
-            Some(req) => super::task_contract::TaskContract::from_request(&req),
-            None => return,
-        };
-        let projection = self
-            .artifact_ledger
-            .required_artifacts_completed_projection(&task_contract);
-        if let Some(job) = self.artifact_completion_job.as_mut() {
-            job.record_satisfied_from_ledger(&projection);
-        }
-    }
-
-    pub(super) fn tool_policy_violation_exit_reason(recovery_owner: RecoveryOwner) -> ExitReason {
-        if recovery_owner == RecoveryOwner::MissingVerifierJob {
-            ExitReason::MissingVerification
-        } else if recovery_owner.is_verifier_owned() {
-            ExitReason::VerifierFailed
-        } else {
-            ExitReason::ToolCallFormatError
-        }
-    }
-
-    pub(super) fn record_missing_verifier_setup_failure(
-        &mut self,
-        last_iter: usize,
-        reason: &str,
-    ) -> bool {
-        let Some(job) = self.missing_verifier_job.as_mut() else {
-            return false;
-        };
-        let exhausted = job.record_invalid_setup_attempt();
-        let attempt = job.setup_attempts_used as usize;
-        let attempt_limit = job.retry_budget as usize;
-        if exhausted {
-            super::safe_stop_emit::emit_safe_stop_report_for_verifier_missing(self);
-            return true;
-        }
-        write_stdout_rendered(
-            &format_iteration_status(
-                last_iter,
-                self.config.max_iterations,
-                "Verification missing",
-                &format!("Verifier setup still needs an in-scope repository edit ({reason})."),
-                self.footer.current_cols(),
-            ),
-            true,
-        );
-        self.push_system_note(task_contract_no_verifier_note(
-            attempt,
-            attempt_limit,
-            self.active_request_text().unwrap_or_default().as_str(),
-        ));
-        false
-    }
-
-    pub(super) fn current_assistant_model(&self) -> String {
-        assistant_model_for_mode(
-            self.session.mode_state.mode,
-            &self.models.main,
-            self.plan_model_override.as_deref(),
-        )
-    }
-
     /// Issue #646: build the active `TaskWorkspaceScope` for the current
     /// task. Pure projection of `work_root` + the active user request; no
     /// filesystem mutation. Called from `task_contract_artifact_states` and
