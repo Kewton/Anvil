@@ -2855,10 +2855,11 @@ pub(super) fn run_verifier_repair_pass_and_apply(
     agent: &mut Agent,
     target_hint: &RecoveryTargetHint,
 ) -> VerifierRepairPassOutcome {
-    let mut prepared = match agent.prepare_verifier_repair_pass(target_hint) {
-        Ok(prepared) => prepared,
-        Err(outcome) => return outcome,
-    };
+    let mut prepared =
+        match super::verifier_repair_pass_flow::prepare_verifier_repair_pass(agent, target_hint) {
+            Ok(prepared) => prepared,
+            Err(outcome) => return outcome,
+        };
     let pass_started = std::time::Instant::now();
 
     let mut last_error = "repair pass did not run".to_string();
@@ -2869,12 +2870,14 @@ pub(super) fn run_verifier_repair_pass_and_apply(
         let Some(attempt_timeout_secs) =
             super::repair_driver::verifier_repair_pass_attempt_timeout_secs(elapsed)
         else {
-            last_error = agent.verifier_repair_pass_wall_clock_timeout_error(
-                &prepared,
-                target_hint,
-                attempt,
-                elapsed,
-            );
+            last_error =
+                super::verifier_repair_pass_flow::verifier_repair_pass_wall_clock_timeout_error(
+                    agent,
+                    &prepared,
+                    target_hint,
+                    attempt,
+                    elapsed,
+                );
             break;
         };
         let repair_client = match verifier_repair_pass_client(agent, attempt_timeout_secs) {
@@ -2885,7 +2888,8 @@ pub(super) fn run_verifier_repair_pass_and_apply(
             }
         };
         let reply = repair_client.chat_text_json_control(&prepared.model, &prepared.messages);
-        match agent.handle_verifier_repair_pass_attempt(
+        match super::verifier_repair_pass_flow::handle_verifier_repair_pass_attempt(
+            agent,
             &mut prepared,
             target_hint,
             attempt,

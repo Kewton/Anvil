@@ -211,6 +211,16 @@ mod safe_stop_emit;
 // reset helper. Free fns over `&mut Agent` / `&Agent`. `pub(super)`
 // limited / no facade re-export (DR3-001).
 mod verifier_diagnostic_flow;
+// Verifier-repair pass flow extracted from `turn.rs` (parent #680).
+// Hosts the per-attempt repair-plan-driven targeted-edit loop:
+// prepare (admission + accepted-plan build + behavior projection emit +
+// prompt render) → handle_attempt (per-reply dispatcher → progress
+// outcome) → handle_reply (parse + shadow validation + intent admission
+// + legacy comparison + apply via `apply_verifier_repair_pass_edit`),
+// plus wall-clock-timeout error + bounded timeout-event log helper.
+// Free fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod verifier_repair_pass_flow;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

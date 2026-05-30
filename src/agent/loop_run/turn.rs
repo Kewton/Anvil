@@ -2,14 +2,6 @@ use super::active_job_arbiter::RecoveryOwner;
 use super::actor_loop_flow::format_iteration_status;
 use super::auto_test::{AutoTestKind, AutoTestRunner};
 use super::completion_evidence::is_repo_edit_no_op;
-use super::repair_driver::{
-    VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS, VerifierRepairPassOutcome,
-    verifier_repair_pass_timeout_error,
-};
-use super::repair_patch_validation::{
-    CheapCheckOutcome, RepairRejectionSignal, ValidationFailure,
-    build_verifier_repair_pass_ledger_outcome, validate_accepted_repair_plan_authorizes_target,
-};
 
 use super::answer_only_mode::answer_only_script_command_allowed;
 use super::feedback_builders::{
@@ -41,19 +33,13 @@ use super::tool_policy::{
     workspace_relative_path_for_tool_arg,
 };
 use super::verifier_orchestration::{
-    PreparedVerifierRepairPass, VerifierRepairAttemptProgress, build_verifier_exit_zero_evidence,
-    emit_patch_proposal_legacy_validation_comparison_event,
-    emit_patch_proposal_shadow_validation_event,
-    synthesized_missing_implementation_target_path_for_request, task_contract_no_verifier_note,
-    task_contract_verifier_targeted_edit_required_note,
-    validate_verifier_repair_intents_with_accepted_plan, verifier_repair_context_diagnostics,
-    verifier_repair_diagnostic_pending_note, verifier_repair_intent_limits,
-    verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
+    build_verifier_exit_zero_evidence, synthesized_missing_implementation_target_path_for_request,
+    task_contract_no_verifier_note, task_contract_verifier_targeted_edit_required_note,
+    verifier_repair_context_diagnostics, verifier_repair_diagnostic_pending_note,
     verifier_repair_safe_stop_message, verifier_repair_target_display,
     verifier_repair_transition_message, verifier_repair_unsafe_target_message,
     verifier_setup_policy_message,
 };
-use super::verifier_repair_shadow::legacy_repair_brief_input_from_assessment;
 use super::workspace_candidates::existing_workspace_candidate_for_role_in_scope;
 use super::workspace_walk::workspace_appears_empty;
 use super::*;
@@ -65,7 +51,6 @@ use crate::session::store::ScaffoldArtifactFileSnapshot;
 use crate::tools::registry::{BashErrorClass, ToolSpec};
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use super::deterministic;
 use super::quality::{
@@ -619,268 +604,6 @@ impl Agent {
             super::repair_job::RepairNextAction::RerunVerifier
             | super::repair_job::RepairNextAction::SafeStop { .. }
             | super::repair_job::RepairNextAction::VerifiedDone => false,
-        }
-    }
-
-    pub(super) fn verifier_repair_pass_wall_clock_timeout_error(
-        &self,
-        prepared: &PreparedVerifierRepairPass,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-        attempt: usize,
-        elapsed: Duration,
-    ) -> String {
-        let error = verifier_repair_pass_timeout_error(elapsed);
-        self.log_verifier_repair_pass_timeout(prepared, target_hint, attempt, elapsed, None);
-        error
-    }
-
-    fn log_verifier_repair_pass_timeout(
-        &self,
-        prepared: &PreparedVerifierRepairPass,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-        attempt: usize,
-        elapsed: Duration,
-        attempt_timeout_secs: Option<u64>,
-    ) {
-        log_llm_event(
-            "agent.verifier_repair_pass.timeout",
-            serde_json::json!({
-                "session_id": self.session_store.session_id(),
-                "model": &prepared.model,
-                "path": target_hint.path,
-                "attempt": attempt,
-                "elapsed_secs": elapsed.as_secs(),
-                "limit_secs": VERIFIER_REPAIR_PASS_WALL_CLOCK_LIMIT_SECS,
-                "attempt_timeout_secs": attempt_timeout_secs,
-            }),
-        );
-    }
-
-    pub(super) fn handle_verifier_repair_pass_attempt(
-        &mut self,
-        prepared: &mut PreparedVerifierRepairPass,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-        attempt: usize,
-        attempt_timeout_secs: u64,
-        elapsed: Duration,
-        reply: Result<AssistantReply, String>,
-    ) -> VerifierRepairAttemptProgress {
-        let reply = match reply {
-            Ok(reply) => reply,
-            Err(err) => {
-                let last_error =
-                    verifier_repair_pass_request_error_message(&err, attempt_timeout_secs);
-                if last_error.contains("verifier_repair_pass_timeout") {
-                    self.log_verifier_repair_pass_timeout(
-                        prepared,
-                        target_hint,
-                        attempt,
-                        elapsed,
-                        Some(attempt_timeout_secs),
-                    );
-                }
-                return VerifierRepairAttemptProgress::Break { last_error };
-            }
-        };
-        if !reply.tool_calls.is_empty() {
-            return VerifierRepairAttemptProgress::Continue {
-                last_error: "repair reply contained unexpected tool calls".to_string(),
-                last_invalid_outcome: None,
-            };
-        }
-        match self.handle_verifier_repair_pass_reply(prepared, target_hint, attempt, &reply.content)
-        {
-            Ok(outcome) => VerifierRepairAttemptProgress::Return(outcome),
-            Err(ValidationFailure {
-                outcome: CheapCheckOutcome::Failed(message),
-                weakening,
-                rejection_signal,
-            }) => VerifierRepairAttemptProgress::Continue {
-                last_error: message,
-                last_invalid_outcome: build_verifier_repair_pass_ledger_outcome(
-                    weakening,
-                    rejection_signal,
-                    prepared.context.semantic_plan.as_ref(),
-                ),
-            },
-            Err(ValidationFailure {
-                outcome: CheapCheckOutcome::Unavailable,
-                ..
-            }) => {
-                log_llm_event(
-                    "agent.verifier_repair_pass.unavailable",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "model": &prepared.model,
-                        "target_path": target_hint.path,
-                        "attempt": attempt,
-                    }),
-                );
-                VerifierRepairAttemptProgress::Return(VerifierRepairPassOutcome::Unavailable {
-                    relative_path: target_hint.path.clone(),
-                })
-            }
-        }
-    }
-
-    pub(super) fn prepare_verifier_repair_pass(
-        &mut self,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-    ) -> Result<PreparedVerifierRepairPass, VerifierRepairPassOutcome> {
-        let Some(context) = self.repair_job.clone() else {
-            return Err(VerifierRepairPassOutcome::Skipped);
-        };
-        let active_request = self.active_request_text().unwrap_or_default();
-        let task_contract = super::task_contract::TaskContract::from_request(&active_request);
-        let behavior_projection =
-            super::required_behavior::project_behavior_contract(&task_contract);
-        super::active_job_emit::emit_behavior_contract_projected_if_changed(
-            self,
-            behavior_projection.as_ref(),
-            super::required_behavior::BEHAVIOR_CONTRACT_CONSUMER_VERIFIER_REPAIR,
-        );
-        let behavior_contract_has_repair_authority =
-            super::required_behavior::behavior_contract_has_repair_authority(&task_contract);
-        let legacy_input = context
-            .assessment
-            .as_ref()
-            .map(|assessment| legacy_repair_brief_input_from_assessment(assessment, 0.6));
-        let accepted_plan = match super::repair_plan_admission::validate_repair_plan_admission(
-            super::repair_plan_admission::RepairPlanAdmissionInput {
-                context: &context,
-                active_request: &active_request,
-                behavior_contract_present: behavior_contract_has_repair_authority,
-                legacy_input,
-            },
-        ) {
-            Ok(plan) => plan,
-            Err(err) => {
-                let reason = err.message();
-                let error = format!("verifier_repair_pass_invalid: {reason}");
-                if let Some(job) = self.repair_job.as_mut() {
-                    job.apply_event(super::repair_plan_admission::admission_error_event(&err));
-                }
-                log_llm_event(
-                    "agent.verifier_repair_plan.rejected",
-                    serde_json::json!({
-                        "session_id": self.session_store.session_id(),
-                        "target_path": target_hint.path,
-                        "reason": reason,
-                    }),
-                );
-                return Err(VerifierRepairPassOutcome::Invalid {
-                    error,
-                    repair_attempt_outcome: None,
-                });
-            }
-        };
-        if let Err(err) = validate_accepted_repair_plan_authorizes_target(
-            &accepted_plan,
-            target_hint,
-            &target_hint.path,
-        ) {
-            return Err(VerifierRepairPassOutcome::Invalid {
-                error: format!("verifier_repair_pass_invalid: {}", err.reason_label()),
-                repair_attempt_outcome: build_verifier_repair_pass_ledger_outcome(
-                    err.weakening,
-                    err.rejection_signal,
-                    context.semantic_plan.as_ref(),
-                ),
-            });
-        }
-        let messages = match verifier_repair_pass_messages(
-            &self.work_root,
-            &context,
-            target_hint,
-            &active_request,
-            behavior_projection.as_ref(),
-        ) {
-            Ok(messages) => messages,
-            Err(err) => {
-                return Err(VerifierRepairPassOutcome::Invalid {
-                    error: format!("verifier_repair_pass_invalid: {err}"),
-                    repair_attempt_outcome: None,
-                });
-            }
-        };
-        Ok(PreparedVerifierRepairPass {
-            context,
-            accepted_plan,
-            messages,
-            model: self.models.main.clone(),
-        })
-    }
-
-    fn handle_verifier_repair_pass_reply(
-        &mut self,
-        prepared: &mut PreparedVerifierRepairPass,
-        target_hint: &super::task_contract::RecoveryTargetHint,
-        attempt: usize,
-        reply_content: &str,
-    ) -> Result<VerifierRepairPassOutcome, ValidationFailure> {
-        let validation =
-            super::repair_patch_validation::parse_verifier_repair_patch_proposal_reply(
-                reply_content,
-                verifier_repair_intent_limits(),
-            )
-            .map_err(|message| {
-                ValidationFailure::failed_with_signal(message, RepairRejectionSignal::Malformed)
-            })
-            .and_then(|proposal| {
-                let shadow_validation = emit_patch_proposal_shadow_validation_event(
-                    self.session_store.session_id(),
-                    &prepared.model,
-                    attempt,
-                    &self.work_root,
-                    &prepared.accepted_plan,
-                    &proposal,
-                );
-                if shadow_validation.is_decisive() && !shadow_validation.accepted() {
-                    return Err(ValidationFailure::failed_with_signal(
-                        format!(
-                            "patch provider admission rejected: {}",
-                            shadow_validation.reason
-                        ),
-                        RepairRejectionSignal::Malformed,
-                    ));
-                }
-                let intents =
-                    super::repair_patch_validation::patch_proposal_to_verifier_repair_intents(
-                        proposal.clone(),
-                        verifier_repair_intent_limits(),
-                    )
-                    .map_err(|message| {
-                        ValidationFailure::failed_with_signal(
-                            message,
-                            RepairRejectionSignal::Malformed,
-                        )
-                    })?;
-                let validation = validate_verifier_repair_intents_with_accepted_plan(
-                    &self.work_root,
-                    &prepared.context,
-                    target_hint,
-                    &prepared.accepted_plan,
-                    intents,
-                );
-                emit_patch_proposal_legacy_validation_comparison_event(
-                    self.session_store.session_id(),
-                    &prepared.model,
-                    attempt,
-                    &proposal,
-                    shadow_validation,
-                    &validation,
-                );
-                validation
-            });
-        match validation {
-            Ok(edit) => super::verifier_orchestration::apply_verifier_repair_pass_edit(
-                self,
-                prepared,
-                target_hint,
-                attempt,
-                edit,
-            ),
-            Err(error) => Err(error),
         }
     }
 
