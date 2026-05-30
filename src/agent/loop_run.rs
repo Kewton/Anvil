@@ -332,6 +332,14 @@ mod test_seams;
 // (renders the recovery note). Free fns over `&Agent`. `pub(super)`
 // limited / no facade re-export (DR3-001).
 mod forced_small_edit;
+// Issue #636 bounded post-edit excerpt reader extracted from `turn.rs`
+// (parent #680). Hosts `bounded_post_edit_excerpt`: workspace-confined
+// + O_NOFOLLOW + 8 KiB cap + NUL/UTF-8 guards + mask_secrets +
+// mask_header_family + post-mask char-boundary re-truncation. Used by
+// `repo_edit_observation::observe_evidence_from_repo_edit` to capture
+// a behavior-coverage snippet for `plan_artifact_recovery`. Free fn
+// over `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod post_edit_excerpt;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally

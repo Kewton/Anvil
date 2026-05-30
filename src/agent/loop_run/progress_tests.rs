@@ -11596,23 +11596,27 @@ export default function App() {
         let (agent, _temp) = test_agent_with_config(Config::default());
 
         // Absolute path outside the workspace.
-        assert!(agent.bounded_post_edit_excerpt("/etc/hosts").is_none());
+        assert!(
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "/etc/hosts")
+                .is_none()
+        );
 
         // `..` escape: even if it resolves to a real file, it escapes
         // the workspace.
         assert!(
-            agent
-                .bounded_post_edit_excerpt("../../../etc/passwd")
-                .is_none()
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(
+                &agent,
+                "../../../etc/passwd"
+            )
+            .is_none()
         );
 
         // Non-file (workspace root itself is a directory, not a file).
-        assert!(agent.bounded_post_edit_excerpt(".").is_none());
+        assert!(super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, ".").is_none());
 
         // Missing file inside workspace.
         assert!(
-            agent
-                .bounded_post_edit_excerpt("does/not/exist.rs")
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "does/not/exist.rs")
                 .is_none()
         );
     }
@@ -11632,7 +11636,8 @@ export default function App() {
         // Cap: file twice the size of the cap is truncated.
         let big_path = temp.path().join("big.txt");
         std::fs::write(&big_path, "a".repeat(MAX_ARTIFACT_EXCERPT_BYTES * 2)).unwrap();
-        let excerpt = agent.bounded_post_edit_excerpt("big.txt").unwrap();
+        let excerpt =
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "big.txt").unwrap();
         assert!(
             excerpt.len() <= MAX_ARTIFACT_EXCERPT_BYTES,
             "excerpt cap violated: {} > {}",
@@ -11643,7 +11648,9 @@ export default function App() {
         // Binary: NUL bytes mean we treat it as non-text and return None.
         let bin_path = temp.path().join("bin.dat");
         std::fs::write(&bin_path, [0x00u8, 0x01, 0x02, 0x03]).unwrap();
-        assert!(agent.bounded_post_edit_excerpt("bin.dat").is_none());
+        assert!(
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "bin.dat").is_none()
+        );
 
         // Masking: a recognisable secret-like token must not survive
         // verbatim. `mask_secrets` rewrites `API_KEY=...` style assigns,
@@ -11656,7 +11663,9 @@ export default function App() {
              Authorization: Bearer abc123def456\n",
         )
         .unwrap();
-        let excerpt = agent.bounded_post_edit_excerpt("secret.rs").unwrap();
+        let excerpt =
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "secret.rs")
+                .unwrap();
         assert!(
             !excerpt.contains("sk-proj-aaaaaaaaaaaaaaaaaaaaaaaa"),
             "raw secret leaked: {excerpt}"
@@ -11692,9 +11701,9 @@ export default function App() {
         let path = temp.path().join("multibyte.txt");
         std::fs::write(&path, content).unwrap();
 
-        let excerpt = agent
-            .bounded_post_edit_excerpt("multibyte.txt")
-            .expect("excerpt must succeed even when cap splits a multi-byte char");
+        let excerpt =
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "multibyte.txt")
+                .expect("excerpt must succeed even when cap splits a multi-byte char");
         assert!(
             excerpt.len() <= MAX_ARTIFACT_EXCERPT_BYTES,
             "excerpt cap violated: {} > {}",
@@ -11734,7 +11743,8 @@ export default function App() {
         // confinement catches it first (canonical strip_prefix) or the
         // O_NOFOLLOW open path catches it (TOCTOU race window).
         assert!(
-            agent.bounded_post_edit_excerpt("link.txt").is_none(),
+            super::super::post_edit_excerpt::bounded_post_edit_excerpt(&agent, "link.txt")
+                .is_none(),
             "symlink pointing outside the workspace must be rejected"
         );
     }
