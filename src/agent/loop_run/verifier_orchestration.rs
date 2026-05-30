@@ -2539,7 +2539,10 @@ pub(super) fn drive_task_contract_verifier(
 ) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
     *args.contract_verifier_repair_edit_count = None;
     agent.task_contract_verifier_repair_pending = false;
-    agent.clear_artifact_recovery_target("artifact_controller_verify_pending");
+    super::artifact_recovery_flow::clear_artifact_recovery_target(
+        agent,
+        "artifact_controller_verify_pending",
+    );
     let previous_repair_context = agent.repair_job.clone();
     agent.repair_job = None;
     let current_verif = verify_repo_progress(args.before_snapshot, &agent.work_root);

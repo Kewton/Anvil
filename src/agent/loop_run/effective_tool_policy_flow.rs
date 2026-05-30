@@ -105,7 +105,7 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
 
     // Priority 3: ArtifactRecovery.
     if let (Some(target), Some(job)) = (
-        agent.artifact_recovery_target_path(),
+        super::artifact_recovery_flow::artifact_recovery_target_path(agent),
         agent.artifact_completion_job.as_ref(),
     ) {
         let target_already_read =

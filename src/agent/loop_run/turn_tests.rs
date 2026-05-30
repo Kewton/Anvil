@@ -1979,7 +1979,9 @@ mod tests {
             path: target.to_string(),
             reason: "fixture".to_string(),
         };
-        agent.maybe_install_artifact_completion_job_for_hint(&hint);
+        super::super::artifact_recovery_flow::maybe_install_artifact_completion_job_for_hint(
+            agent, &hint,
+        );
     }
 
     #[test]
@@ -2180,7 +2182,9 @@ mod tests {
             path: "node_modules/evil/test.js".to_string(),
             reason: "attacker-supplied".to_string(),
         };
-        agent.maybe_install_artifact_completion_job_for_hint(&bad_hint);
+        super::super::artifact_recovery_flow::maybe_install_artifact_completion_job_for_hint(
+            &mut agent, &bad_hint,
+        );
 
         assert!(
             agent.artifact_completion_job.is_none(),
@@ -2253,7 +2257,10 @@ mod tests {
                 path: "src/main.py".to_string(),
                 reason: "role change".to_string(),
             };
-            agent.maybe_install_artifact_completion_job_for_hint(&non_test_hint);
+            super::super::artifact_recovery_flow::maybe_install_artifact_completion_job_for_hint(
+                &mut agent,
+                &non_test_hint,
+            );
             let job = agent
                 .artifact_completion_job
                 .as_ref()

@@ -401,7 +401,7 @@ impl Agent {
     #[cfg(test)]
     pub(super) fn artifact_directed_policy_for_test(&self) -> Option<EffectiveToolPolicy> {
         let job = self.artifact_completion_job.as_ref()?;
-        let target = self.artifact_recovery_target_path()?;
+        let target = super::artifact_recovery_flow::artifact_recovery_target_path(self)?;
         let target_already_read =
             focused_edit_target_already_read(&self.session.messages, &target, &self.work_root);
         Some(EffectiveToolPolicy::artifact_directed_from_job(
@@ -457,7 +457,7 @@ impl Agent {
         ) {
             return None;
         }
-        if let Some(target) = self.artifact_recovery_target_path() {
+        if let Some(target) = super::artifact_recovery_flow::artifact_recovery_target_path(self) {
             return focused_edit_target_already_read(
                 &self.session.messages,
                 &target,
@@ -549,7 +549,8 @@ impl Agent {
         {
             return None;
         }
-        if let Some(candidate) = self.artifact_recovery_target_path() {
+        if let Some(candidate) = super::artifact_recovery_flow::artifact_recovery_target_path(self)
+        {
             return Some(candidate);
         }
         if let Some(candidate) = first_existing_impl_target(&self.work_root)
@@ -1525,7 +1526,9 @@ impl Agent {
             let first_exhaustion = !self.artifact_completion_exhausted_this_turn;
             self.artifact_completion_exhausted_this_turn = true;
             if first_exhaustion {
-                self.maybe_emit_artifact_completion_failed_diagnostic();
+                super::artifact_recovery_flow::maybe_emit_artifact_completion_failed_diagnostic(
+                    self,
+                );
             }
             true
         } else {
@@ -3057,7 +3060,9 @@ impl Agent {
         //      prior state)
         //   3. on failure (only possible for Test role) → clear BOTH
         //      the projection and the job so no stale slot remains.
-        let install = self.maybe_install_artifact_completion_job_for_hint(&hint);
+        let install = super::artifact_recovery_flow::maybe_install_artifact_completion_job_for_hint(
+            self, &hint,
+        );
         match install {
             JobInstallOutcome::InstalledOrSkipped => {
                 let target = super::task_contract::RecoveryTarget::from_hint(hint.clone(), attempt);
@@ -3098,186 +3103,6 @@ impl Agent {
             }
         }
     }
-
-    pub(super) fn clear_artifact_recovery_target(&mut self, reason: &'static str) {
-        if let Some(target) = self.current_artifact_recovery_target.take() {
-            log_llm_event(
-                "agent.artifact_recovery_target.cleared",
-                serde_json::json!({
-                    "session_id": self.session_store.session_id(),
-                    "turn_index": self.current_turn_index,
-                    "role": target.role.label(),
-                    "path": target.path,
-                    "reason": reason,
-                }),
-            );
-        }
-        // Issue #652: drop the SSOT artifact-completion job along with the
-        // projection so a subsequent role change cannot reuse stale budget.
-        self.artifact_completion_job = None;
-    }
-
-    /// Issue #652: install (or refresh) the `ArtifactCompletionJob` for a
-    /// fresh `RecoveryTargetHint` when the target role is `Test` (the only
-    /// role for which `RequiredBehaviorContract::requires_test_execution()`
-    /// currently fires). Refresh is identity-based on `(role, target_path)`
-    /// — re-pointing at the same path leaves the existing job (and its
-    /// retry budget) intact so wrong-target attempts already recorded keep
-    /// counting.
-    ///
-    /// Returns:
-    /// - `InstalledOrSkipped` when the job was installed, the existing
-    ///   identity-refresh was kept, or the hint role does not require a
-    ///   job (non-Test). The caller may commit the projection.
-    /// - `ValidationFailed` ONLY when a Test-role hint did not pass
-    ///   `ArtifactCompletionJob::new` validation. The caller MUST clear
-    ///   `current_artifact_recovery_target` as well (PR-001 atomic clear)
-    ///   so no stale projection survives.
-    pub(super) fn maybe_install_artifact_completion_job_for_hint(
-        &mut self,
-        hint: &super::task_contract::RecoveryTargetHint,
-    ) -> JobInstallOutcome {
-        // Issue #663 (Phase C / AD5): the legacy `hint.role != Test`
-        // early-return is removed — all required roles (Implementation /
-        // Test / UsageDocs / Setup) install/refresh an
-        // `ArtifactCompletionJob` so the role-specific budget and
-        // attempt-history apply uniformly. The previous "drop the stale
-        // Test job" behaviour for non-Test roles is preserved below by
-        // the identity-refresh + atomic-clear ordering, which now applies
-        // to every role.
-        let trimmed = hint.path.trim();
-        // Identity refresh: same role + same target → keep the existing
-        // job (and its retry budget) intact. Same-target hints must NOT
-        // reset the budget so accumulated wrong-target attempts keep
-        // counting toward exhaustion.
-        if let Some(job) = self.artifact_completion_job.as_ref()
-            && job.role() == hint.role
-            && job.target_path() == trimmed
-        {
-            return JobInstallOutcome::InstalledOrSkipped;
-        }
-        // CB-005: when the new hint points at a *different* target than
-        // the current job, the prior job's expected target is now
-        // stale. Drop it BEFORE attempting to validate the new hint so
-        // a validation failure cannot leave the agent with a stale job
-        // whose budget belongs to an old `current_artifact_recovery_target`.
-        // The atomic ordering is: clear → validate-and-install. If the
-        // new hint validates, we install it (atomic SWAP). PR-001: if
-        // it does NOT validate, the caller MUST also clear
-        // `current_artifact_recovery_target` so no stale projection
-        // remains (signalled by `JobInstallOutcome::ValidationFailed`).
-        self.artifact_completion_job = None;
-        let scope = self.current_workspace_scope();
-        match super::artifact_completion_job::ArtifactCompletionJob::new(
-            &self.work_root,
-            &scope,
-            hint.clone(),
-            self.turn_edited_relative_paths.contains(trimmed),
-            false,
-        ) {
-            Ok(job) => {
-                self.artifact_completion_job = Some(job);
-                JobInstallOutcome::InstalledOrSkipped
-            }
-            Err(_) => {
-                // Validation failure for a Test-role hint: signal the
-                // caller to drop the projection too (PR-001 SSOT).
-                JobInstallOutcome::ValidationFailed
-            }
-        }
-    }
-
-    /// Issue #652: emit a turn-local `artifact_completion_failed` diagnostic
-    /// when the active job has exhausted its budget. Sinks are limited to:
-    /// system note, working-memory error, and an agent-controlled failure
-    /// JSON event (design judgement #7). The payload is rendered from the
-    /// sanitized `failure_snapshot()` (mask + cap + control-char neutralize
-    /// already applied) and passed through `mask_payload_inplace` as the
-    /// defensive final-defence line.
-    fn maybe_emit_artifact_completion_failed_diagnostic(&mut self) -> bool {
-        let snapshot = match self.artifact_completion_job.as_ref() {
-            Some(job) => match job.failure_snapshot() {
-                Some(s) => s,
-                None => return false,
-            },
-            None => return false,
-        };
-        // CB-002 / CB2-003: once the current turn has already emitted the
-        // exhaustion diagnostic, subsequent identical-kind attempts (which
-        // are no-ops on `record_attempt`) must NOT re-fire the system note
-        // / log / working-memory tuple. The dedup is gated on a
-        // **turn-local** flag (`artifact_completion_failed_diagnostic_emitted_this_turn`),
-        // reset at every `handle_user_message` head.
-        //
-        // The previous implementation matched against
-        // `working_memory.unresolved_errors` for the
-        // `artifact_completion_failed role=<role>` prefix, but
-        // `working_memory` is session state — `handle_user_message` does
-        // NOT clear it. So a residual error from the prior turn would
-        // suppress the very first emission of the current turn. CB2-003
-        // moves the dedup to a per-turn boolean instead.
-        if self.artifact_completion_failed_diagnostic_emitted_this_turn {
-            return false;
-        }
-        let role_label = snapshot.current_role.label();
-        let expected_target = snapshot.expected_target.clone();
-        let actions_preview = snapshot
-            .actual_actions
-            .iter()
-            .take(3)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        // Sink 1: system note — sanitized snapshot fields only.
-        self.push_system_note(format!(
-            "[Artifact Completion Failed] Missing role: {role_label}. Expected target: {expected_target}. Recent actions: {actions_preview}. Retry budget exhausted."
-        ));
-        // Sink 2: working-memory error.
-        self.session.working_memory.note_error(format!(
-            "artifact_completion_failed role={role_label} target={expected_target}"
-        ));
-        // Sink 3: agent-controlled failure result emitted as a JSON event
-        // run through `mask_payload_inplace` as a defensive final pass.
-        let mut payload = serde_json::json!({
-            "session_id": self.session_store.session_id(),
-            "turn_index": self.current_turn_index,
-            "role": role_label,
-            "expected_target": expected_target,
-            "actual_actions": snapshot.actual_actions,
-            "attempts": snapshot.attempts.len(),
-        });
-        crate::logging::mask_payload_inplace(&mut payload);
-        log_llm_event("agent.artifact_completion_failed", payload);
-        // CB2-003: flip the turn-local dedup flag AFTER the three sinks
-        // have actually run, so a within-turn second call short-circuits
-        // at the top guard above. Cross-turn dedup is handled by the
-        // per-turn reset in `handle_user_message`, which restores this
-        // flag to `false` at every fresh user turn.
-        self.artifact_completion_failed_diagnostic_emitted_this_turn = true;
-        true
-    }
-
-    pub(super) fn artifact_recovery_target_path(&self) -> Option<PathBuf> {
-        // Issue #652 PR-001 SSOT: when an `ArtifactCompletionJob` is
-        // active, read the target straight from the job — that is the
-        // single source of truth for the in-flight artifact-completion
-        // task this turn. `current_artifact_recovery_target` is kept in
-        // sync at `set_artifact_recovery_target_from_hint` (atomic
-        // install + commit), but reading the job first makes the SSOT
-        // invariant explicit and means that any future drift between
-        // the two surfaces still resolves to the job's authoritative
-        // path. For non-Test roles (no attached job today) we still
-        // fall through to the legacy projection so the existing
-        // artifact-directed recovery semantics for Implementation /
-        // UsageDocs / Setup roles continue to work.
-        let path_str = if let Some(job) = self.artifact_completion_job.as_ref() {
-            job.target_path().to_string()
-        } else {
-            self.current_artifact_recovery_target.as_ref()?.path.clone()
-        };
-        resolve_user_path(&self.work_root, &path_str).ok()
-    }
-
     fn answer_only_policy_error(
         &self,
         name: &str,
