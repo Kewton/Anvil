@@ -254,13 +254,20 @@ fn append_common_request_messages(
     {
         messages.push(ConversationMessage::system(note));
     }
-    if let Some(note) = agent.verifier_repair_policy_message(effective_tool_policy) {
+    if let Some(note) =
+        super::recovery_messages::verifier_repair_policy_message(agent, effective_tool_policy)
+    {
         messages.push(ConversationMessage::system(note));
     }
-    if let Some(note) = agent.artifact_directed_policy_violation_message(effective_tool_policy) {
+    if let Some(note) = super::recovery_messages::artifact_directed_policy_violation_message(
+        agent,
+        effective_tool_policy,
+    ) {
         messages.push(ConversationMessage::system(note));
     }
-    if let Some(note) = agent.artifact_directed_recovery_message(effective_tool_policy) {
+    if let Some(note) =
+        super::recovery_messages::artifact_directed_recovery_message(agent, effective_tool_policy)
+    {
         messages.push(ConversationMessage::system(note));
     }
     let current_request_paths = extract_current_request_paths(agent, &agent.work_root);
