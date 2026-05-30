@@ -86,7 +86,7 @@ use super::task_contract::{
 use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
-use super::turn::{
+use super::turn_constants::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
 };
 use super::verifier_assessment_parser::{

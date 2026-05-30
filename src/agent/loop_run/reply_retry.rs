@@ -47,7 +47,7 @@ use super::reply_retry_types::{AssistantReplyRetryDecision, AssistantReplyRetryS
 use super::spinner::{Spinner, SpinnerStopSignal};
 use super::tool_display::progress_path_display;
 use super::tool_history::successful_non_plan_repo_edit_count;
-use super::turn::USER_INTERRUPT_ERROR;
+use super::turn_constants::USER_INTERRUPT_ERROR;
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::model_capabilities::model_capabilities;

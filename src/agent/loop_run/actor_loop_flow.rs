@@ -73,7 +73,7 @@ use super::tool_display::tool_display;
 use super::tool_history::focused_edit_target_already_read;
 use super::tool_history::is_plan_file_tool_call;
 use super::tool_policy::EffectiveToolPolicy;
-use super::turn::{LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD};
+use super::turn_constants::{LOG_ARGS_MAX_CHARS, PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD};
 use super::turn_helpers::write_stdout_rendered;
 use crate::agent::prompting;
 use crate::session::compact::approximate_token_count;
@@ -768,14 +768,14 @@ pub(super) fn actor_loop_pre_reply_request_error(
     agent: &mut Agent,
     err: String,
 ) -> ActorLoopPreReplyOutcome {
-    let reason = if err == super::turn::USER_INTERRUPT_ERROR {
+    let reason = if err == super::turn_constants::USER_INTERRUPT_ERROR {
         ExitReason::Interrupted
     } else if super::lifecycle::is_tool_call_format_error(&err) {
         ExitReason::ToolCallFormatError
     } else {
         ExitReason::TransportError
     };
-    if err != super::turn::USER_INTERRUPT_ERROR
+    if err != super::turn_constants::USER_INTERRUPT_ERROR
         && (super::lifecycle::is_native_tool_parser_failure(&err)
             || super::lifecycle::is_tool_call_format_error(&err)
             || super::lifecycle::is_native_tool_transport_failure(&err))
@@ -2367,7 +2367,9 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
 ) -> ActorLoopTaskContractReplyOutcome {
     agent.repair_job_artifact_attempts = agent.repair_job_artifact_attempts.saturating_add(1);
     *verifier_repair_retries = agent.repair_job_artifact_attempts;
-    if agent.repair_job_artifact_attempts >= super::turn::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT {
+    if agent.repair_job_artifact_attempts
+        >= super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
+    {
         let role = agent
             .current_artifact_recovery_target
             .as_ref()
@@ -2412,7 +2414,7 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
     {
         agent.push_system_note(task_contract_verifier_edit_required_note(
             *verifier_repair_retries,
-            super::turn::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
         ));
     }
     ActorLoopTaskContractReplyOutcome::Continue

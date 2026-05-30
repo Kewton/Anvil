@@ -13,7 +13,6 @@
 // Bring sibling modules + Agent (loop_run scope) and turn.rs pub(super) items
 // into this file's scope so `super::X` from the inner mod resolves the same
 // names that `turn.rs`'s scope would.
-use super::turn::*;
 use super::*;
 // Additional explicit imports that turn.rs's `use super::*` chain previously
 // supplied but are needed directly by test bodies (qualified `super::X`).
@@ -10818,13 +10817,16 @@ export default function App() {
         // SSOT value sanity-check (mirrors the prod constant; if this
         // breaks, the constant moved and the regression note in
         // `run_turn` needs updating).
-        assert_eq!(super::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, 3);
+        assert_eq!(
+            super::super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            3
+        );
 
         // Simulate the run_turn counter loop semantics: increment and
         // compare against the SSOT bound. The loop in production breaks
         // with `ExitReason::MissingRepoEdits` as soon as the counter
         // reaches the limit.
-        let limit = super::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT;
+        let limit = super::super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT;
         let mut attempts: usize = 0;
         let mut hit_exhaustion = false;
         for _ in 0..(limit + 1) {
@@ -10881,7 +10883,7 @@ export default function App() {
         let next = agent.repair_job_artifact_attempts.saturating_add(1);
         assert_eq!(next, 1, "next RepairArtifact attempt starts at 1, not 3");
         assert!(
-            next < super::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
+            next < super::super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT,
             "fresh repair cycle must not immediately trip the attempt limit"
         );
     }
