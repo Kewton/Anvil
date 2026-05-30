@@ -313,6 +313,17 @@ mod tool_policy_decisions;
 // `tests.py` scan). Free fns over `&Agent`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod python_request_helpers;
+// Per-Agent `#[cfg(test)]` test seams extracted from `turn.rs` (parent
+// #680). Hosts the test-only `pub(super)` seams that drive the
+// production wiring without widening visibility (Issue #664 / CB2-003):
+// effective_tool_policy_pub / build_arbiter_candidates_pub /
+// drive_policy_error / artifact_directed_policy /
+// last_attempt_bash_policy_violation / artifact_completion_job_attempts_len.
+// Free fns over `&mut Agent` / `&Agent`. `#![cfg(test)]` module guard
+// excludes from production binary. `pub(super)` limited / no facade
+// re-export (DR3-001).
+#[cfg(test)]
+mod test_seams;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -1582,7 +1593,8 @@ pub(crate) fn carryover_key_raw_text_not_stored_for_test(agent: &Agent, needle: 
 /// ```
 #[cfg(test)]
 pub(crate) fn build_arbiter_candidates_for_test(agent: &Agent) -> Vec<serde_json::Value> {
-    let candidates = agent.build_arbiter_candidates_pub_for_test();
+    let candidates =
+        crate::agent::loop_run::test_seams::build_arbiter_candidates_pub_for_test(agent);
     candidates
         .into_iter()
         .map(|c| {
@@ -1615,7 +1627,7 @@ pub(crate) fn build_arbiter_candidates_for_test(agent: &Agent) -> Vec<serde_json
 /// module (DR3-001 / DR2-005).
 #[cfg(test)]
 pub(crate) fn effective_tool_policy_for_test(agent: &Agent) -> (Vec<String>, String) {
-    let policy = agent.effective_tool_policy_pub_for_test();
+    let policy = crate::agent::loop_run::test_seams::effective_tool_policy_pub_for_test(agent);
     let allowed_tool_names: Vec<String> = policy
         .allowed_tool_names_for_prompt()
         .map(|tools| tools.iter().map(|s| (*s).to_string()).collect())
@@ -1646,12 +1658,15 @@ pub(crate) fn drive_artifact_directed_policy_error_for_test(
     name: &str,
     arguments: serde_json::Value,
 ) -> Option<(Option<String>, Option<bool>, usize)> {
-    let policy = agent.artifact_directed_policy_for_test()?;
-    let (err, _delta) = agent.drive_policy_error_for_test(&policy, name, &arguments);
-    let marker = agent.last_attempt_bash_policy_violation_for_test();
-    let attempts_after = agent
-        .artifact_completion_job_attempts_len_for_test()
-        .unwrap_or(0);
+    let policy = crate::agent::loop_run::test_seams::artifact_directed_policy_for_test(agent)?;
+    let (err, _delta) = crate::agent::loop_run::test_seams::drive_policy_error_for_test(
+        agent, &policy, name, &arguments,
+    );
+    let marker =
+        crate::agent::loop_run::test_seams::last_attempt_bash_policy_violation_for_test(agent);
+    let attempts_after =
+        crate::agent::loop_run::test_seams::artifact_completion_job_attempts_len_for_test(agent)
+            .unwrap_or(0);
     Some((err, marker, attempts_after))
 }
 
