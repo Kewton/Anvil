@@ -149,6 +149,12 @@ mod handle_user_message;
 // and computes the initial TaskContract. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod prepare_actor_loop_state;
+// Per-turn driver extracted from `turn.rs` (parent #680). Hosts
+// `run_turn` as a free fn over `&mut Agent`. Pushes user message +
+// runs work-mode classify second-pass + plan stage refresh + photon
+// context-pack hook + actor loop entry. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod run_turn;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
