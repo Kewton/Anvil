@@ -794,7 +794,8 @@ impl Agent {
 pub(in crate::agent::loop_run) mod tests_export {
     use crate::agent::loop_run::pam_advisory::{
         MAX_PAM_DECISION_LIST_LEN, PamAdvisoryDecision, PamAdvisoryDecisionPayload,
-        PamAdvisoryMode, ShadowVsLiveDiff, SuppressedSummary, SuppressionReason,
+        PamAdvisoryMode, PamCandidateAction, PamCandidateDecision, PamDecisionEffect,
+        ShadowVsLiveDiff, SuppressedSummary, SuppressionReason,
     };
 
     /// Re-export of `MemoryReport::PAYLOAD_SCHEMA_VERSION` for the
@@ -821,6 +822,33 @@ pub(in crate::agent::loop_run) mod tests_export {
                 suppressed_summary_ids_truncated: false,
                 shadow_vs_live_diff: None,
                 active_job_role: "ArtifactRecovery:test".to_string(),
+                candidate_decisions: vec![
+                    PamCandidateDecision {
+                        summary_id: "s1".to_string(),
+                        action: PamCandidateAction::Inject,
+                        inferred_role: Some("test"),
+                        suppression_reason: None,
+                        decision_impact: "prompt_context_injected",
+                        context_excerpt: "tests/foo_test.py".to_string(),
+                        context_excerpt_truncated: false,
+                    },
+                    PamCandidateDecision {
+                        summary_id: "s2".to_string(),
+                        action: PamCandidateAction::Suppress,
+                        inferred_role: Some("implementation"),
+                        suppression_reason: Some(SuppressionReason::RoleMismatch),
+                        decision_impact: "artifact_role_mismatch_suppressed",
+                        context_excerpt: "src/lib.rs".to_string(),
+                        context_excerpt_truncated: false,
+                    },
+                ],
+                candidate_decisions_truncated: false,
+                decision_effect: PamDecisionEffect {
+                    actual_injected_count: 1,
+                    suppressed_count: 1,
+                    would_inject_in_live_count: 0,
+                    influenced_decision: "prompt_context_injection",
+                },
             };
             decision.to_json_value()
         }
@@ -837,6 +865,22 @@ pub(in crate::agent::loop_run) mod tests_export {
                     would_inject_in_live_truncated: false,
                 }),
                 active_job_role: ":".to_string(),
+                candidate_decisions: vec![PamCandidateDecision {
+                    summary_id: "sX".to_string(),
+                    action: PamCandidateAction::WouldInjectInLive,
+                    inferred_role: Some("test"),
+                    suppression_reason: None,
+                    decision_impact: "shadow_counterfactual_not_injected",
+                    context_excerpt: "tests/shadow_test.py".to_string(),
+                    context_excerpt_truncated: false,
+                }],
+                candidate_decisions_truncated: false,
+                decision_effect: PamDecisionEffect {
+                    actual_injected_count: 0,
+                    suppressed_count: 0,
+                    would_inject_in_live_count: 1,
+                    influenced_decision: "shadow_counterfactual",
+                },
             };
             decision.to_json_value()
         }
@@ -857,6 +901,14 @@ pub(in crate::agent::loop_run) mod tests_export {
             suppressed_summary_ids_truncated: false,
             shadow_vs_live_diff: None,
             active_job_role: ":".to_string(),
+            candidate_decisions: Vec::new(),
+            candidate_decisions_truncated: false,
+            decision_effect: PamDecisionEffect {
+                actual_injected_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                suppressed_count: 0,
+                would_inject_in_live_count: 0,
+                influenced_decision: "prompt_context_injection",
+            },
         };
         decision.to_json_value()
     }
@@ -929,6 +981,14 @@ pub(in crate::agent::loop_run) mod tests_export {
                 would_inject_in_live_truncated: true,
             }),
             active_job_role: "ArtifactRecovery:test".to_string(),
+            candidate_decisions: Vec::new(),
+            candidate_decisions_truncated: true,
+            decision_effect: PamDecisionEffect {
+                actual_injected_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                suppressed_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                would_inject_in_live_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                influenced_decision: "shadow_counterfactual",
+            },
         };
         decision.to_json_value()
     }
