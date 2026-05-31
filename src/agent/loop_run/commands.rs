@@ -1066,17 +1066,7 @@ impl Agent {
     }
 
     fn command_workspace_appears_empty(work_root: &std::path::Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(work_root) else {
-            return false;
-        };
-        entries.flatten().all(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            matches!(
-                name.as_ref(),
-                ".git" | ".anvil" | ".anvil-state" | "node_modules" | "target"
-            )
-        })
+        super::workspace_walk::workspace_appears_empty(work_root)
     }
 
     pub fn initial_prompt_from_cli_or_stdin(&self) -> Result<Option<String>, String> {
