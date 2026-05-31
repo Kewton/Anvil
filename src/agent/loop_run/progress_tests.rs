@@ -5486,6 +5486,32 @@ E   assert [{'id': 1}] == []\n";
         assert!(super::build_semantic_repair_plan_from_report(report).is_none());
     }
 
+    #[test]
+    fn issue_839_setup_failure_stays_setup_recovery_not_semantic_repair() {
+        let reply = r#"{
+            "failure_kind":"dependency_missing",
+            "confidence":0.93,
+            "preferred_repair_role":"setup",
+            "repair_hypothesis":"pytest needs a dependency manifest",
+            "failure_clusters":[
+                {
+                    "observed":"ModuleNotFoundError: fastapi",
+                    "expected":"dependency installed before verifier",
+                    "input_shape":"pytest collection",
+                    "assertion_shape":"ImportError",
+                    "involved_artifacts":["setup"],
+                    "affected_cases":["test_app_imports"]
+                }
+            ]
+        }"#;
+        let report = super::parse_semantic_failure_report_from_reply(reply).expect("parses");
+
+        assert!(
+            super::build_semantic_repair_plan_from_report(report).is_none(),
+            "setup failures must stay on scaffold/setup recovery instead of semantic repair"
+        );
+    }
+
     /// Phase D / D.3: `ConfigOrVerifierError` likewise routes to setup
     /// repair — no `SemanticRepairPlan` is constructed.
     #[test]
