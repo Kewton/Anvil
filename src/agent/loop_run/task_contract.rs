@@ -1809,7 +1809,12 @@ mod tests {
         assert_ne!(contract.intent, TaskIntent::Install);
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
         assert!(!contract.verification_required);
+        assert!(!contract.required_behavior.test_execution_required);
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
     }
 
     #[test]
