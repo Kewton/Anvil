@@ -7,8 +7,8 @@ use anvil::session::case_retrieval::CaseScoreBreakdown;
 use anvil::session::eval_log::{
     AnvilScoreSummary, CaseRetrievalSummary, ChangedFileClasses, EvalPrecautionSnapshot,
     EvalRecord, FeedbackFrameSummary, MAX_EVAL_LOG_RECORD_BYTES, MAX_EVAL_PRECAUTIONS,
-    MAX_EVAL_TASK_BYTES, ToolCallSummary, build_eval_record, scrub_absolute_paths,
-    write_eval_record_to,
+    MAX_EVAL_TASK_BYTES, ToolCallSummary, build_eval_record, build_terminal_diagnostics,
+    scrub_absolute_paths, write_eval_record_to,
 };
 use serde_json::Value;
 use std::fs::OpenOptions;
@@ -256,6 +256,10 @@ fn r5_write_eval_record_valid_jsonl() {
     assert_eq!(parsed["schema_version"], 1);
     assert_eq!(parsed["session_id"], "sess-r5");
     assert_eq!(parsed["final_outcome"], "done");
+    assert_eq!(
+        parsed["terminal_diagnostics"]["classification"], "success",
+        "eval log should carry issue-848 terminal diagnostics"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,6 +365,15 @@ fn r9_oversized_record_is_dropped() {
         photon_eval: None,
         photon_canary: 0,
         auto_promote: None,
+        terminal_diagnostics: Some(build_terminal_diagnostics(
+            "done",
+            &ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            0,
+        )),
         final_outcome: "done".to_string(),
     };
 
