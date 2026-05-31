@@ -4,15 +4,17 @@ use crate::util::file_classify::{is_setup_file, is_test_file};
 
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::summary::LoopStats;
+use super::task_contract::CompletionPolicy;
 
 /// Issue #607: judgment context extracted from the active request text.
 /// Bundled in a struct (instead of two bool params) so future flags
 /// (`request_is_docs_only`, `request_is_bench_only`, …) can be added with
 /// a field append rather than a breaking signature change (DR1-003 OCP).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct RequestContext {
     pub requires_tests: bool,
     pub is_env_setup_only: bool,
+    pub completion_policy: CompletionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,12 +120,17 @@ impl ProtocolKind {
         set: &EvidenceSet,
         ctx: &RequestContext,
     ) -> bool {
-        // Repo-edit / AnswerOnly evidence retain their context-free semantics.
+        // Repo-edit / AnswerOnly evidence are judged through the
+        // request-derived completion policy. This keeps docs-only,
+        // artifact-only, impl+test, and impl-without-test completion
+        // semantics in one place instead of spreading them across
+        // WorkMode-specific protocol branches.
         let has_non_env_setup_evidence = set.iter().any(|ev| match ev {
             CompletionEvidence::VerifierExitZero { class, .. } => {
-                *class != BashCommandClass::EnvSetup && self.accepts(ev)
+                *class != BashCommandClass::EnvSetup
+                    && self.accepts_request_policy_evidence(&ctx.completion_policy, ev)
             }
-            _ => self.accepts(ev),
+            _ => self.accepts_request_policy_evidence(&ctx.completion_policy, ev),
         });
         if has_non_env_setup_evidence {
             return true;
@@ -152,6 +159,33 @@ impl ProtocolKind {
             self,
             ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode
         )
+    }
+
+    fn accepts_request_policy_evidence(
+        self,
+        policy: &CompletionPolicy,
+        evidence: &CompletionEvidence,
+    ) -> bool {
+        if !policy.accepts_evidence(evidence) {
+            return false;
+        }
+        match self {
+            ProtocolKind::Docs => {
+                policy.project_intent == super::task_contract::ProjectIntent::DocsOnly
+                    && self.accepts(evidence)
+            }
+            ProtocolKind::AnswerOnly => {
+                matches!(
+                    evidence,
+                    CompletionEvidence::VerifierExitZero {
+                        class: BashCommandClass::BuildTest,
+                        ..
+                    }
+                ) || (policy.project_intent == super::task_contract::ProjectIntent::AnswerOnly
+                    && self.accepts(evidence))
+            }
+            ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode => true,
+        }
     }
 
     /// Issue #607: context-aware missing-shapes report. When tests/code are
@@ -1166,6 +1200,47 @@ mod tests {
     }
 
     #[test]
+    fn completion_policy_docs_only_readme_satisfies_generic_protocol() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request("READMEを更新してください"),
+        };
+        let mut set = EvidenceSet::new();
+        set.push(ev_repo_edit(RepoEditCategory::Docs));
+
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
+    fn completion_policy_pytest_pass_artifact_only_avoids_missing_repo_edits() {
+        let ctx = RequestContext {
+            requires_tests: true,
+            is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request(
+                "pytest を実行してテストを通してください",
+            ),
+        };
+        let mut set = EvidenceSet::new();
+        set.push(ev_verifier());
+
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
+    fn completion_policy_rejects_docs_only_for_implementation_request() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request("Implement feature X"),
+        };
+        let mut set = EvidenceSet::new();
+        set.push(ev_repo_edit(RepoEditCategory::Docs));
+
+        assert!(!ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
     fn evidence_set_unsatisfied_docs_with_only_verifier() {
         let mut set = EvidenceSet::new();
         set.push(ev_verifier());
@@ -1202,6 +1277,9 @@ mod tests {
         RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: CompletionPolicy::from_request(
+                "Install the dependencies listed in requirements.txt.",
+            ),
         }
     }
 
@@ -1209,6 +1287,7 @@ mod tests {
         RequestContext {
             requires_tests: true,
             is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request("Implement feature X and add tests"),
         }
     }
 
