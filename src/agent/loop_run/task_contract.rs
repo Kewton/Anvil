@@ -89,6 +89,145 @@ impl ProjectIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompletionProjectIntent {
+    DocsOnly,
+    ArtifactOnly,
+    ImplWithTest,
+    ImplWithoutTest,
+    AnswerOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CompletionPolicy {
+    pub(super) project_intent: CompletionProjectIntent,
+    required_artifacts: Vec<ArtifactRole>,
+    verification_required: bool,
+    test_execution_required: bool,
+}
+
+impl CompletionPolicy {
+    pub(super) fn from_contract_parts(
+        intent: TaskIntent,
+        required_artifacts: &[ArtifactRole],
+        verification_required: bool,
+        required_behavior: &RequiredBehaviorContract,
+    ) -> Self {
+        let project_intent = project_intent_from_required_artifacts(intent, required_artifacts);
+        Self {
+            project_intent,
+            required_artifacts: required_artifacts.to_vec(),
+            verification_required,
+            test_execution_required: required_behavior.test_execution_required,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_request(request: &str) -> Self {
+        TaskContract::from_request(request).completion_policy
+    }
+
+    pub(super) fn legacy_generic_code() -> Self {
+        Self {
+            project_intent: CompletionProjectIntent::ImplWithoutTest,
+            required_artifacts: Vec::new(),
+            verification_required: false,
+            test_execution_required: false,
+        }
+    }
+
+    fn required_artifacts(&self) -> &[ArtifactRole] {
+        &self.required_artifacts
+    }
+
+    fn verification_required(&self) -> bool {
+        self.verification_required
+    }
+
+    fn test_execution_required(&self) -> bool {
+        self.test_execution_required
+    }
+
+    pub(super) fn accepts_evidence(&self, evidence: &CompletionEvidence) -> bool {
+        match evidence {
+            CompletionEvidence::RepoEdit { category, .. } => {
+                self.accepts_repo_edit_category(*category)
+            }
+            CompletionEvidence::VerifierExitZero { class, .. } => {
+                self.accepts_verifier_class(*class)
+            }
+            CompletionEvidence::AnswerOnly => {
+                self.project_intent == CompletionProjectIntent::AnswerOnly
+            }
+        }
+    }
+
+    fn accepts_repo_edit_category(&self, category: RepoEditCategory) -> bool {
+        let Some(role) = role_from_repo_edit(category) else {
+            return self.project_intent == CompletionProjectIntent::ArtifactOnly
+                && self.required_artifacts.is_empty();
+        };
+        match self.project_intent {
+            CompletionProjectIntent::DocsOnly => role == ArtifactRole::UsageDocs,
+            CompletionProjectIntent::ArtifactOnly => {
+                self.required_artifacts.is_empty() || self.required_artifacts.contains(&role)
+            }
+            CompletionProjectIntent::ImplWithTest => {
+                matches!(role, ArtifactRole::Implementation | ArtifactRole::Test)
+            }
+            CompletionProjectIntent::ImplWithoutTest => role == ArtifactRole::Implementation,
+            CompletionProjectIntent::AnswerOnly => false,
+        }
+    }
+
+    fn accepts_verifier_class(&self, class: BashCommandClass) -> bool {
+        match class {
+            BashCommandClass::BuildTest => matches!(
+                self.project_intent,
+                CompletionProjectIntent::ArtifactOnly
+                    | CompletionProjectIntent::ImplWithTest
+                    | CompletionProjectIntent::ImplWithoutTest
+                    | CompletionProjectIntent::AnswerOnly
+            ),
+            BashCommandClass::EnvSetup => {
+                self.project_intent == CompletionProjectIntent::ArtifactOnly
+                    && self.required_artifacts.contains(&ArtifactRole::Setup)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for CompletionPolicy {
+    fn default() -> Self {
+        Self::legacy_generic_code()
+    }
+}
+
+fn project_intent_from_required_artifacts(
+    intent: TaskIntent,
+    required_artifacts: &[ArtifactRole],
+) -> CompletionProjectIntent {
+    if matches!(intent, TaskIntent::Explain) {
+        return CompletionProjectIntent::AnswerOnly;
+    }
+    let has_impl = required_artifacts.contains(&ArtifactRole::Implementation);
+    let has_test = required_artifacts.contains(&ArtifactRole::Test);
+    let docs_only =
+        !has_impl && !has_test && required_artifacts == [ArtifactRole::UsageDocs].as_slice();
+    if docs_only {
+        return CompletionProjectIntent::DocsOnly;
+    }
+    if !has_impl {
+        return CompletionProjectIntent::ArtifactOnly;
+    }
+    if has_test {
+        CompletionProjectIntent::ImplWithTest
+    } else {
+        CompletionProjectIntent::ImplWithoutTest
+    }
+}
+
 // Issue #635: `Eq` is intentionally dropped because the new
 // `required_behavior` field carries an `f32` confidence. `PartialEq` is still
 // enough for `assert_eq!` and all existing tests; no in-tree code uses
@@ -100,6 +239,7 @@ pub(super) struct TaskContract {
     pub(super) required_artifacts: Vec<ArtifactRole>,
     pub(super) optional_artifacts: Vec<ArtifactRole>,
     pub(super) verification_required: bool,
+    pub(super) completion_policy: CompletionPolicy,
     // Issue #635: deterministic behavior schema. Built once in
     // `from_request` and stored alongside the existing artifact gates.
     // Issue #636 will read this field; nothing in #635 mutates the
@@ -699,19 +839,25 @@ impl TaskContract {
         optional.sort();
         optional.dedup();
 
-        // Issue #635/#836: build the deterministic behavior schema as
-        // behavior-only context for completion / repair. Artifact and
-        // verification ownership now belongs to `ProjectIntent` ->
-        // `TaskContract` projection, so the nested legacy fields are
-        // scrubbed to avoid carrying a second artifact/verification SSOT.
+        // Issue #635: build the deterministic behavior schema. The
+        // existing `required_artifacts` gate above is the source of truth
+        // for the artifact list; behavior schema is stored alongside it
+        // as a future read-only input for #636.
         let mut required_behavior = required_behavior::extract(request);
         required_behavior.required_artifacts = None;
         required_behavior.verification = None;
+        let completion_policy = CompletionPolicy::from_contract_parts(
+            intent,
+            &required,
+            project_intent.verification_required(),
+            &required_behavior,
+        );
         Self {
             intent,
             required_artifacts: required,
             optional_artifacts: optional,
-            verification_required: project_intent.verification_required(),
+            verification_required: completion_policy.verification_required(),
+            completion_policy,
             required_behavior,
         }
     }
@@ -794,9 +940,11 @@ impl TaskContract {
         if matches!(self.intent, TaskIntent::Explain) {
             return CompletionDecision::Done;
         }
+        let policy = &self.completion_policy;
         let observed = observed_artifacts(evidence);
         let missing = self
-            .required_artifacts
+            .completion_policy
+            .required_artifacts()
             .iter()
             .copied()
             .filter(|role| !observed.contains(role))
@@ -804,7 +952,7 @@ impl TaskContract {
         if !missing.is_empty() {
             return CompletionDecision::Continue { missing };
         }
-        if self.verification_required && !has_build_test_verifier(evidence) {
+        if policy.verification_required() && !has_build_test_verifier(evidence) {
             return CompletionDecision::Verify;
         }
         // Issue #651 Task 4.1: test-execution gate. Only fires under the
@@ -816,7 +964,7 @@ impl TaskContract {
             owned: owned_test_artifacts,
             weak_metadata,
         } = mode
-            && self.required_behavior.test_execution_required
+            && policy.test_execution_required()
         {
             // Sub-gate 1: empty owned slice → nothing for the verifier to
             // have bound to. SafeStop unconditionally.
@@ -2108,7 +2256,38 @@ mod tests {
 
         assert_eq!(contract.intent, TaskIntent::Modify);
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert_eq!(
+            contract.completion_policy.project_intent,
+            CompletionProjectIntent::DocsOnly
+        );
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn completion_policy_classifies_artifact_only_pytest_request() {
+        let contract = TaskContract::from_request("pytest を実行してテストを通してください");
+        assert_eq!(
+            contract.completion_policy.project_intent,
+            CompletionProjectIntent::ArtifactOnly
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(contract.completion_policy.accepts_evidence(&build_test()));
+    }
+
+    #[test]
+    fn completion_policy_classifies_impl_with_and_without_tests() {
+        let with_tests =
+            TaskContract::from_request("Implement a Rust library feature X and add tests");
+        assert_eq!(
+            with_tests.completion_policy.project_intent,
+            CompletionProjectIntent::ImplWithTest
+        );
+
+        let without_tests = TaskContract::from_request("Implement a Rust library feature X");
+        assert_eq!(
+            without_tests.completion_policy.project_intent,
+            CompletionProjectIntent::ImplWithoutTest
+        );
     }
 
     #[test]

@@ -163,9 +163,11 @@ impl Agent {
     /// `should_run_auto_test_for_success_with_context`.
     pub(super) fn current_request_context(&self) -> RequestContext {
         let request = super::workspace_access::active_request_text(self).unwrap_or_default();
+        let completion_policy = TaskContract::from_request(&request).completion_policy;
         RequestContext {
             requires_tests: super::quality::request_explicitly_requires_tests(&request),
             is_env_setup_only: super::quality::request_is_env_setup_only(&request),
+            completion_policy,
         }
     }
 
@@ -708,6 +710,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: Default::default(),
         };
         // setup-only request + EnvSetup-only evidence satisfied → suppress.
         assert!(suppress_success_verifier_for_context(&ctx, true));
@@ -721,6 +724,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: true,
             is_env_setup_only: true,
+            completion_policy: Default::default(),
         };
         assert!(!suppress_success_verifier_for_context(&ctx, true));
     }
@@ -730,6 +734,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: false,
+            completion_policy: Default::default(),
         };
         // Regular feature request → verifier never suppressed.
         assert!(!suppress_success_verifier_for_context(&ctx, false));
@@ -741,6 +746,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: Default::default(),
         };
         assert!(suppress_success_verifier_for_context(&ctx, true));
         // When suppression fires in `run_post_loop_success_verifier`,
@@ -767,6 +773,9 @@ mod tests {
         RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: super::super::task_contract::CompletionPolicy::from_request(
+                "Install the dependencies listed in requirements.txt.",
+            ),
         }
     }
 
@@ -774,6 +783,9 @@ mod tests {
         RequestContext {
             requires_tests: true,
             is_env_setup_only: true,
+            completion_policy: super::super::task_contract::CompletionPolicy::from_request(
+                "Implement feature X and add tests",
+            ),
         }
     }
 
@@ -910,6 +922,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: false,
+            completion_policy: Default::default(),
         };
         let mut set = ES::new();
         set.push(env_setup_evidence());

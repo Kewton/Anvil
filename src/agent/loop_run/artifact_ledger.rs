@@ -1006,6 +1006,28 @@ mod tests {
         }
     }
 
+    fn test_contract(
+        required_artifacts: Vec<ArtifactRole>,
+        verification_required: bool,
+    ) -> super::super::task_contract::TaskContract {
+        let required_behavior = test_required_behavior();
+        let intent = super::super::task_contract::TaskIntent::Build;
+        let completion_policy = super::super::task_contract::CompletionPolicy::from_contract_parts(
+            intent,
+            &required_artifacts,
+            verification_required,
+            &required_behavior,
+        );
+        super::super::task_contract::TaskContract {
+            intent,
+            required_artifacts,
+            optional_artifacts: vec![],
+            verification_required,
+            completion_policy,
+            required_behavior,
+        }
+    }
+
     // ---- Task 1.1: skeleton -----------------------------------------------
 
     #[test]
@@ -1397,13 +1419,7 @@ mod tests {
             ArtifactRole::Test,
             true,
         );
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Implementation, ArtifactRole::Test], true);
         let completed = ledger.required_artifacts_completed(&contract);
         assert_eq!(completed.get(&ArtifactRole::Test).copied(), Some(true));
         assert_eq!(
@@ -1419,13 +1435,10 @@ mod tests {
     #[test]
     fn active_job_candidates_returns_declaration_order_stub() {
         let ledger = ArtifactLedger::new();
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: false,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(
+            vec![ArtifactRole::Implementation, ArtifactRole::Test],
+            false,
+        );
         let got = ledger.active_job_candidates(&contract);
         assert_eq!(
             got,
@@ -1770,13 +1783,7 @@ mod tests {
             true,
         );
         assert!(ledger.overflowed());
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Test, ArtifactRole::Implementation],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Test, ArtifactRole::Implementation], true);
         let completed = ledger.required_artifacts_completed(&contract);
         assert_eq!(completed.get(&ArtifactRole::Test).copied(), Some(false));
         assert_eq!(
@@ -1807,13 +1814,7 @@ mod tests {
             ArtifactRole::Test,
             true,
         );
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Test, ArtifactRole::Implementation],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Test, ArtifactRole::Implementation], true);
         assert_eq!(
             ledger.active_job_candidates(&contract),
             Vec::<ArtifactRole>::new(),
@@ -1949,13 +1950,7 @@ mod tests {
     #[test]
     fn required_artifacts_projection_empty_ledger_reports_all_false() {
         let ledger = ArtifactLedger::new();
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Implementation, ArtifactRole::Test], true);
         let p = ledger.required_artifacts_completed_projection(&contract);
         assert!(!p.overflowed());
         assert!(!p.is_satisfied(ArtifactRole::Implementation));
@@ -1978,13 +1973,7 @@ mod tests {
             ArtifactRole::Test,
             true,
         );
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Implementation, ArtifactRole::Test], true);
         let p = ledger.required_artifacts_completed_projection(&contract);
         assert!(p.is_satisfied(ArtifactRole::Test));
         assert!(!p.is_satisfied(ArtifactRole::Implementation));
@@ -2015,13 +2004,7 @@ mod tests {
             ledger.record_repo_edit_event(&ctx(dir.path(), &scope), path, ArtifactRole::Test, true);
         }
         assert!(ledger.overflowed(), "fixture: ledger must overflow");
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Test], true);
         let p = ledger.required_artifacts_completed_projection(&contract);
         assert!(p.overflowed());
         assert!(

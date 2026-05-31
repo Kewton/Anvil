@@ -1241,25 +1241,35 @@ mod tests {
                 true,
             );
         }
+        let required_artifacts = vec![role];
+        let required_behavior =
+            crate::agent::loop_run::required_behavior::RequiredBehaviorContract {
+                operations: None,
+                domain_terms: None,
+                interface_hints: None,
+                required_artifacts: None,
+                verification: None,
+                confidence: 0.0,
+                test_execution_required: false,
+                behavior_goal: None,
+                required_capabilities: None,
+                verification_expectations: None,
+                non_goals: None,
+            };
+        let intent = super::super::task_contract::TaskIntent::Build;
+        let completion_policy = super::super::task_contract::CompletionPolicy::from_contract_parts(
+            intent,
+            &required_artifacts,
+            true,
+            &required_behavior,
+        );
         let contract = super::super::task_contract::TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![role],
+            intent,
+            required_artifacts,
             optional_artifacts: vec![],
             verification_required: true,
-            required_behavior:
-                crate::agent::loop_run::required_behavior::RequiredBehaviorContract {
-                    operations: None,
-                    domain_terms: None,
-                    interface_hints: None,
-                    required_artifacts: None,
-                    verification: None,
-                    confidence: 0.0,
-                    test_execution_required: false,
-                    behavior_goal: None,
-                    required_capabilities: None,
-                    verification_expectations: None,
-                    non_goals: None,
-                },
+            completion_policy,
+            required_behavior,
         };
         ledger.required_artifacts_completed_projection(&contract)
     }
