@@ -171,7 +171,7 @@ impl ProtocolKind {
         }
         match self {
             ProtocolKind::Docs => {
-                policy.project_intent == super::task_contract::ProjectIntent::DocsOnly
+                policy.project_intent == super::task_contract::CompletionProjectIntent::DocsOnly
                     && self.accepts(evidence)
             }
             ProtocolKind::AnswerOnly => {
@@ -181,7 +181,8 @@ impl ProtocolKind {
                         class: BashCommandClass::BuildTest,
                         ..
                     }
-                ) || (policy.project_intent == super::task_contract::ProjectIntent::AnswerOnly
+                ) || (policy.project_intent
+                    == super::task_contract::CompletionProjectIntent::AnswerOnly
                     && self.accepts(evidence))
             }
             ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode => true,

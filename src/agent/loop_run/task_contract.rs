@@ -31,7 +31,66 @@ pub(super) enum TaskIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProjectIntent {
+pub(super) enum ProjectLanguage {
+    Rust,
+    Node,
+    Python,
+    Docs,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectShape {
+    Cli,
+    Library,
+    Api,
+    WebApp,
+    Documentation,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VerificationRequirement {
+    NotRequired,
+    Required {
+        preferred_runner: Option<&'static str>,
+    },
+    ArtifactOnly,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ProjectIntent {
+    pub(super) intent: TaskIntent,
+    pub(super) language: Option<ProjectLanguage>,
+    pub(super) shape: Option<ProjectShape>,
+    pub(super) verification: VerificationRequirement,
+    pub(super) confidence: f32,
+}
+
+impl ProjectIntent {
+    pub(super) fn from_request(request: &str) -> Self {
+        let lower = request.to_ascii_lowercase();
+        let intent = infer_intent(request, &lower);
+        let language = infer_project_language(request, &lower);
+        let shape = infer_project_shape(request, &lower);
+        let verification = infer_verification_requirement(request, &lower, language, shape);
+        let confidence = project_intent_confidence(intent, language, shape, verification);
+        Self {
+            intent,
+            language: Some(language),
+            shape: Some(shape),
+            verification,
+            confidence,
+        }
+    }
+
+    fn verification_required(self) -> bool {
+        matches!(self.verification, VerificationRequirement::Required { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompletionProjectIntent {
     DocsOnly,
     ArtifactOnly,
     ImplWithTest,
@@ -41,7 +100,7 @@ pub(super) enum ProjectIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CompletionPolicy {
-    pub(super) project_intent: ProjectIntent,
+    pub(super) project_intent: CompletionProjectIntent,
     required_artifacts: Vec<ArtifactRole>,
     verification_required: bool,
     test_execution_required: bool,
@@ -70,7 +129,7 @@ impl CompletionPolicy {
 
     pub(super) fn legacy_generic_code() -> Self {
         Self {
-            project_intent: ProjectIntent::ImplWithoutTest,
+            project_intent: CompletionProjectIntent::ImplWithoutTest,
             required_artifacts: Vec::new(),
             verification_required: false,
             test_execution_required: false,
@@ -97,25 +156,27 @@ impl CompletionPolicy {
             CompletionEvidence::VerifierExitZero { class, .. } => {
                 self.accepts_verifier_class(*class)
             }
-            CompletionEvidence::AnswerOnly => self.project_intent == ProjectIntent::AnswerOnly,
+            CompletionEvidence::AnswerOnly => {
+                self.project_intent == CompletionProjectIntent::AnswerOnly
+            }
         }
     }
 
     fn accepts_repo_edit_category(&self, category: RepoEditCategory) -> bool {
         let Some(role) = role_from_repo_edit(category) else {
-            return self.project_intent == ProjectIntent::ArtifactOnly
+            return self.project_intent == CompletionProjectIntent::ArtifactOnly
                 && self.required_artifacts.is_empty();
         };
         match self.project_intent {
-            ProjectIntent::DocsOnly => role == ArtifactRole::UsageDocs,
-            ProjectIntent::ArtifactOnly => {
+            CompletionProjectIntent::DocsOnly => role == ArtifactRole::UsageDocs,
+            CompletionProjectIntent::ArtifactOnly => {
                 self.required_artifacts.is_empty() || self.required_artifacts.contains(&role)
             }
-            ProjectIntent::ImplWithTest => {
+            CompletionProjectIntent::ImplWithTest => {
                 matches!(role, ArtifactRole::Implementation | ArtifactRole::Test)
             }
-            ProjectIntent::ImplWithoutTest => role == ArtifactRole::Implementation,
-            ProjectIntent::AnswerOnly => false,
+            CompletionProjectIntent::ImplWithoutTest => role == ArtifactRole::Implementation,
+            CompletionProjectIntent::AnswerOnly => false,
         }
     }
 
@@ -123,13 +184,13 @@ impl CompletionPolicy {
         match class {
             BashCommandClass::BuildTest => matches!(
                 self.project_intent,
-                ProjectIntent::ArtifactOnly
-                    | ProjectIntent::ImplWithTest
-                    | ProjectIntent::ImplWithoutTest
-                    | ProjectIntent::AnswerOnly
+                CompletionProjectIntent::ArtifactOnly
+                    | CompletionProjectIntent::ImplWithTest
+                    | CompletionProjectIntent::ImplWithoutTest
+                    | CompletionProjectIntent::AnswerOnly
             ),
             BashCommandClass::EnvSetup => {
-                self.project_intent == ProjectIntent::ArtifactOnly
+                self.project_intent == CompletionProjectIntent::ArtifactOnly
                     && self.required_artifacts.contains(&ArtifactRole::Setup)
             }
             _ => false,
@@ -146,24 +207,24 @@ impl Default for CompletionPolicy {
 fn project_intent_from_required_artifacts(
     intent: TaskIntent,
     required_artifacts: &[ArtifactRole],
-) -> ProjectIntent {
+) -> CompletionProjectIntent {
     if matches!(intent, TaskIntent::Explain) {
-        return ProjectIntent::AnswerOnly;
+        return CompletionProjectIntent::AnswerOnly;
     }
     let has_impl = required_artifacts.contains(&ArtifactRole::Implementation);
     let has_test = required_artifacts.contains(&ArtifactRole::Test);
     let docs_only =
         !has_impl && !has_test && required_artifacts == [ArtifactRole::UsageDocs].as_slice();
     if docs_only {
-        return ProjectIntent::DocsOnly;
+        return CompletionProjectIntent::DocsOnly;
     }
     if !has_impl {
-        return ProjectIntent::ArtifactOnly;
+        return CompletionProjectIntent::ArtifactOnly;
     }
     if has_test {
-        ProjectIntent::ImplWithTest
+        CompletionProjectIntent::ImplWithTest
     } else {
-        ProjectIntent::ImplWithoutTest
+        CompletionProjectIntent::ImplWithoutTest
     }
 }
 
@@ -742,7 +803,8 @@ impl From<CompletionDecision> for ArtifactRecoveryAction {
 impl TaskContract {
     pub(super) fn from_request(request: &str) -> Self {
         let lower = request.to_ascii_lowercase();
-        let intent = infer_intent(request, &lower);
+        let project_intent = ProjectIntent::from_request(request);
+        let intent = project_intent.intent;
         let asks_for_tests = request_asks_for_test_artifact(request, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
@@ -781,11 +843,13 @@ impl TaskContract {
         // existing `required_artifacts` gate above is the source of truth
         // for the artifact list; behavior schema is stored alongside it
         // as a future read-only input for #636.
-        let required_behavior = required_behavior::extract(request);
+        let mut required_behavior = required_behavior::extract(request);
+        required_behavior.required_artifacts = None;
+        required_behavior.verification = None;
         let completion_policy = CompletionPolicy::from_contract_parts(
             intent,
             &required,
-            request_asks_for_verification(request, &lower),
+            project_intent.verification_required(),
             &required_behavior,
         );
         Self {
@@ -1225,6 +1289,193 @@ fn infer_intent(request: &str, lower: &str) -> TaskIntent {
     TaskIntent::Build
 }
 
+fn infer_project_language(request: &str, lower: &str) -> ProjectLanguage {
+    let rust = contains_any(
+        lower,
+        &["rust", "cargo", "crate", "cargo.toml", ".rs", "rustc"],
+    ) || request.contains("Rust");
+    let node = contains_any(
+        lower,
+        &[
+            "node",
+            "node.js",
+            "nodejs",
+            "npm",
+            "package.json",
+            "javascript",
+            "typescript",
+            ".js",
+            ".ts",
+            "tsx",
+            "jsx",
+        ],
+    );
+    let python = contains_any(
+        lower,
+        &[
+            "python",
+            "python3",
+            "pytest",
+            "pip",
+            "fastapi",
+            "flask",
+            "django",
+            ".py",
+            "requirements.txt",
+        ],
+    ) || request.contains("Python");
+    let docs = contains_any(
+        lower,
+        &[
+            "readme",
+            "markdown",
+            ".md",
+            "docs/",
+            "documentation",
+            "manual",
+        ],
+    ) || contains_any(
+        request,
+        &["README", "ドキュメント", "仕様書", "設計書", "手順書"],
+    );
+
+    if rust {
+        ProjectLanguage::Rust
+    } else if node {
+        ProjectLanguage::Node
+    } else if python {
+        ProjectLanguage::Python
+    } else if docs {
+        ProjectLanguage::Docs
+    } else {
+        ProjectLanguage::Unknown
+    }
+}
+
+fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
+    let docs = contains_any(
+        lower,
+        &[
+            "readme",
+            "markdown",
+            ".md",
+            "docs/",
+            "documentation",
+            "manual",
+        ],
+    ) || contains_any(
+        request,
+        &["README", "ドキュメント", "仕様書", "設計書", "手順書"],
+    );
+    let cli = contains_any(lower, &["cli", "command", "stdin", "stdout"])
+        || contains_any(request, &["標準入力", "コマンド"]);
+    let library = contains_any(lower, &["library", "crate", "package", "module"])
+        || contains_any(
+            request,
+            &["ライブラリ", "クレート", "パッケージ", "モジュール"],
+        );
+    let api = contains_ascii_token(lower, "api")
+        || contains_any(
+            lower,
+            &[
+                "crud", "endpoint", "server", "backend", "fastapi", "flask", "django",
+            ],
+        )
+        || contains_any(request, &["エンドポイント", "サーバ", "バックエンド"]);
+    let web_app = contains_any(
+        lower,
+        &[
+            "web app",
+            "browser app",
+            "frontend",
+            "front-end",
+            "next.js",
+            "nextjs",
+            "react",
+            "vue",
+            "nuxt",
+            "svelte",
+        ],
+    ) || contains_any(request, &["アプリ", "フロントエンド", "画面"]);
+
+    if cli {
+        ProjectShape::Cli
+    } else if library {
+        ProjectShape::Library
+    } else if api {
+        ProjectShape::Api
+    } else if web_app {
+        ProjectShape::WebApp
+    } else if docs {
+        ProjectShape::Documentation
+    } else {
+        ProjectShape::Unknown
+    }
+}
+
+fn infer_verification_requirement(
+    request: &str,
+    lower: &str,
+    language: ProjectLanguage,
+    shape: ProjectShape,
+) -> VerificationRequirement {
+    if matches!(infer_intent(request, lower), TaskIntent::Explain) {
+        return VerificationRequirement::NotRequired;
+    }
+    if request_asks_for_test_artifact(request, lower)
+        || contains_any(lower, &["verify", "validate", "check"])
+        || contains_any(request, &["検証", "動作確認", "確認"])
+    {
+        return VerificationRequirement::Required {
+            preferred_runner: preferred_runner_for_language(language),
+        };
+    }
+    if matches!(
+        shape,
+        ProjectShape::Documentation
+            | ProjectShape::Cli
+            | ProjectShape::Library
+            | ProjectShape::Api
+            | ProjectShape::WebApp
+    ) || request_asks_for_setup(request, lower)
+    {
+        VerificationRequirement::ArtifactOnly
+    } else {
+        VerificationRequirement::NotRequired
+    }
+}
+
+fn preferred_runner_for_language(language: ProjectLanguage) -> Option<&'static str> {
+    match language {
+        ProjectLanguage::Rust => Some("cargo test"),
+        ProjectLanguage::Node => Some("npm test"),
+        ProjectLanguage::Python => Some("pytest"),
+        ProjectLanguage::Docs | ProjectLanguage::Unknown => None,
+    }
+}
+
+fn project_intent_confidence(
+    intent: TaskIntent,
+    language: ProjectLanguage,
+    shape: ProjectShape,
+    verification: VerificationRequirement,
+) -> f32 {
+    let mut confidence: f32 = 0.35;
+    if !matches!(intent, TaskIntent::Build) {
+        confidence += 0.15;
+    }
+    if !matches!(language, ProjectLanguage::Unknown) {
+        confidence += 0.20;
+    }
+    if !matches!(shape, ProjectShape::Unknown) {
+        confidence += 0.20;
+    }
+    if !matches!(verification, VerificationRequirement::NotRequired) {
+        confidence += 0.10;
+    }
+    confidence.min(1.0)
+}
+
 /// Returns `true` when the request asks for any code-work signal
 /// (production / edit action over a recognizable code subject) **without**
 /// regard to support-artifact context.
@@ -1620,12 +1871,6 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
             .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
-fn request_asks_for_verification(request: &str, lower: &str) -> bool {
-    request_asks_for_test_artifact(request, lower)
-        || contains_any(lower, &["verify", "validate", "check"])
-        || contains_any(request, &["検証", "動作確認", "確認"])
-}
-
 fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
     let mut roles = Vec::new();
     for item in evidence.iter() {
@@ -1915,6 +2160,75 @@ mod tests {
     }
 
     #[test]
+    fn project_intent_classifies_rust_cli_word_counter_prompt() {
+        let request = "Rustで標準入力から単語数を数えるCLIを作成してください。README.mdとcargo testで動くテストも実装してください。";
+        let intent = ProjectIntent::from_request(request);
+
+        assert_eq!(intent.intent, TaskIntent::Build);
+        assert_eq!(intent.language, Some(ProjectLanguage::Rust));
+        assert_eq!(intent.shape, Some(ProjectShape::Cli));
+        assert_eq!(
+            intent.verification,
+            VerificationRequirement::Required {
+                preferred_runner: Some("cargo test"),
+            }
+        );
+        assert!(intent.confidence >= 0.80, "intent={intent:?}");
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.intent, intent.intent);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(contract.verification_required);
+        assert!(contract.required_behavior.required_artifacts.is_none());
+        assert!(contract.required_behavior.verification.is_none());
+    }
+
+    #[test]
+    fn project_intent_classifies_node_cli_json_formatter_prompt() {
+        let request = "Node.jsでJSONを整形するCLIを作成してください。package.jsonとREADME.md、npm testで動くテストも追加してください。";
+        let intent = ProjectIntent::from_request(request);
+
+        assert_eq!(intent.intent, TaskIntent::Build);
+        assert_eq!(intent.language, Some(ProjectLanguage::Node));
+        assert_eq!(intent.shape, Some(ProjectShape::Cli));
+        assert_eq!(
+            intent.verification,
+            VerificationRequirement::Required {
+                preferred_runner: Some("npm test"),
+            }
+        );
+        assert!(intent.confidence >= 0.80, "intent={intent:?}");
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.intent, intent.intent);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(contract.optional_artifacts.contains(&ArtifactRole::Setup));
+        assert!(contract.verification_required);
+        assert!(contract.required_behavior.required_artifacts.is_none());
+        assert!(contract.required_behavior.verification.is_none());
+    }
+
+    #[test]
     fn fastapi_crud_contract_requires_impl_tests_and_docs() {
         let contract = TaskContract::from_request(
             "FastAPIでcrudのAPIを開発してください。使用方法をREADME.mdに記述してください。テストコードも実装してください。",
@@ -1944,7 +2258,7 @@ mod tests {
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
         assert_eq!(
             contract.completion_policy.project_intent,
-            ProjectIntent::DocsOnly
+            CompletionProjectIntent::DocsOnly
         );
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
     }
@@ -1954,7 +2268,7 @@ mod tests {
         let contract = TaskContract::from_request("pytest を実行してテストを通してください");
         assert_eq!(
             contract.completion_policy.project_intent,
-            ProjectIntent::ArtifactOnly
+            CompletionProjectIntent::ArtifactOnly
         );
         assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
         assert!(contract.completion_policy.accepts_evidence(&build_test()));
@@ -1966,13 +2280,13 @@ mod tests {
             TaskContract::from_request("Implement a Rust library feature X and add tests");
         assert_eq!(
             with_tests.completion_policy.project_intent,
-            ProjectIntent::ImplWithTest
+            CompletionProjectIntent::ImplWithTest
         );
 
         let without_tests = TaskContract::from_request("Implement a Rust library feature X");
         assert_eq!(
             without_tests.completion_policy.project_intent,
-            ProjectIntent::ImplWithoutTest
+            CompletionProjectIntent::ImplWithoutTest
         );
     }
 
@@ -1987,7 +2301,12 @@ mod tests {
         assert_ne!(contract.intent, TaskIntent::Install);
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
         assert!(!contract.verification_required);
+        assert!(!contract.required_behavior.test_execution_required);
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
     }
 
     #[test]

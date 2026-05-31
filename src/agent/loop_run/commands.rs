@@ -3,6 +3,7 @@ use super::quality::{
     deterministic_empty_python_cli_files, first_existing_impl_target,
     request_allows_fast_polish_fallback, request_is_playable_ui_improvement,
 };
+use super::scaffold_pipeline::project_skeleton_plan_for_request;
 use super::slash_commands::{self, AnvilEditor, build_editor};
 use super::summary::{ExitReason, format_run_summary};
 use super::*;
@@ -947,6 +948,8 @@ impl Agent {
             && Self::command_workspace_appears_empty(&self.work_root))
             || (policy.allow_docs_deterministic_fallback
                 && deterministic_empty_docs_files(input).is_some()
+                && Self::command_workspace_appears_empty(&self.work_root))
+            || (project_skeleton_plan_for_request(input).is_some()
                 && Self::command_workspace_appears_empty(&self.work_root))
         {
             self.session.mode_state.task_profile = TaskProfile::Coding;

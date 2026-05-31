@@ -575,6 +575,12 @@ mod inner {
             requested_scaffold_framework("Next.jsアプリとして開発してください"),
             Some(ScaffoldFramework::Next)
         );
+        assert_eq!(
+            requested_scaffold_framework(
+                "Node.jsでToDo管理CLIを開発してください。README.mdとテストコードも作成してください。"
+            ),
+            None
+        );
         assert_eq!(requested_scaffold_framework("Rust CLIを作って"), None);
     }
 
@@ -626,6 +632,12 @@ mod inner {
         assert!(!task_or_plan_requires_nextjs_scaffold(
             Some("yes"),
             Some("Build a local Rust CLI."),
+        ));
+        assert!(!task_or_plan_requires_nextjs_scaffold(
+            Some(
+                "Node.jsでToDo管理CLIを開発してください。README.mdとテストコードも作成してください。"
+            ),
+            None,
         ));
     }
 

@@ -131,6 +131,402 @@ pub(super) struct DeterministicScaffoldSpec {
     pub(super) files: Vec<(PathBuf, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectRuntime {
+    Rust,
+    Node,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectShape {
+    Cli,
+    Library,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProjectIntent {
+    pub(super) runtime: Option<ProjectRuntime>,
+    pub(super) shape: Option<ProjectShape>,
+    pub(super) wants_tests: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct ScaffoldPlan {
+    pub(super) label: &'static str,
+    pub(super) event: &'static str,
+    pub(super) scaffold_kind: &'static str,
+    pub(super) files: Vec<(PathBuf, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ScaffoldOutcome {
+    Applied { written: Vec<PathBuf> },
+    Failed,
+}
+
+impl ProjectIntent {
+    pub(super) fn from_request(request: &str) -> Self {
+        let lower = request.to_ascii_lowercase();
+        let asks_create = contains_ascii_word_any(
+            &lower,
+            &[
+                "create",
+                "build",
+                "develop",
+                "implement",
+                "scaffold",
+                "write",
+                "generate",
+            ],
+        ) || request.contains("作って")
+            || request.contains("作成")
+            || request.contains("開発")
+            || request.contains("実装")
+            || request.contains("生成");
+        if !asks_create {
+            return Self {
+                runtime: None,
+                shape: None,
+                wants_tests: false,
+            };
+        }
+        let runtime = if contains_ascii_word_any(&lower, &["rust", "cargo", "crate"]) {
+            Some(ProjectRuntime::Rust)
+        } else if lower.contains("node.js")
+            || lower.contains("nodejs")
+            || lower.contains("node --test")
+            || contains_ascii_word_any(&lower, &["node", "javascript", "js", "npm", "package.json"])
+        {
+            Some(ProjectRuntime::Node)
+        } else {
+            None
+        };
+        let shape = if contains_ascii_word_any(&lower, &["cli", "command-line", "commandline"])
+            || lower.contains("command line")
+            || lower.contains("コマンドライン")
+        {
+            Some(ProjectShape::Cli)
+        } else if contains_ascii_word_any(&lower, &["library", "lib", "crate", "module", "package"])
+            || lower.contains("ライブラリ")
+        {
+            Some(ProjectShape::Library)
+        } else {
+            runtime.map(|_| ProjectShape::Library)
+        };
+        let wants_tests = lower.contains("test")
+            || lower.contains("node --test")
+            || lower.contains("cargo test")
+            || request.contains("テスト")
+            || request.contains("検証");
+
+        Self {
+            runtime,
+            shape,
+            wants_tests,
+        }
+    }
+}
+
+impl From<ScaffoldPlan> for DeterministicScaffoldSpec {
+    fn from(plan: ScaffoldPlan) -> Self {
+        Self {
+            label: plan.label,
+            event: plan.event,
+            scaffold_kind: plan.scaffold_kind,
+            files: plan.files,
+        }
+    }
+}
+
+pub(super) fn project_skeleton_plan_for_request(request: &str) -> Option<ScaffoldPlan> {
+    let intent = ProjectIntent::from_request(request);
+    plan_project_skeleton(&intent)
+}
+
+pub(super) fn plan_project_skeleton(intent: &ProjectIntent) -> Option<ScaffoldPlan> {
+    match (intent.runtime?, intent.shape?) {
+        (ProjectRuntime::Rust, ProjectShape::Cli) => Some(ScaffoldPlan {
+            label: "Rust CLI scaffold",
+            event: "agent.empty_workspace.deterministic_rust_cli",
+            scaffold_kind: "Rust CLI",
+            files: rust_cli_skeleton_files(intent.wants_tests),
+        }),
+        (ProjectRuntime::Rust, ProjectShape::Library) => Some(ScaffoldPlan {
+            label: "Rust library scaffold",
+            event: "agent.empty_workspace.deterministic_rust_library",
+            scaffold_kind: "Rust library",
+            files: rust_library_skeleton_files(intent.wants_tests),
+        }),
+        (ProjectRuntime::Node, ProjectShape::Cli) => Some(ScaffoldPlan {
+            label: "Node CLI scaffold",
+            event: "agent.empty_workspace.deterministic_node_cli",
+            scaffold_kind: "Node CLI",
+            files: node_skeleton_files(ProjectShape::Cli, intent.wants_tests),
+        }),
+        (ProjectRuntime::Node, ProjectShape::Library) => Some(ScaffoldPlan {
+            label: "Node library scaffold",
+            event: "agent.empty_workspace.deterministic_node_library",
+            scaffold_kind: "Node library",
+            files: node_skeleton_files(ProjectShape::Library, intent.wants_tests),
+        }),
+    }
+}
+
+pub(super) fn materialize_scaffold(
+    agent: &mut Agent,
+    request: &str,
+    last_iter: usize,
+    plan: ScaffoldPlan,
+    reason: &str,
+    skip_existing: bool,
+) -> ScaffoldOutcome {
+    let mut spec = DeterministicScaffoldSpec::from(plan);
+    let Some((written, snapshot_files)) = write_deterministic_scaffold_files(
+        agent,
+        std::mem::take(&mut spec.files),
+        reason,
+        skip_existing,
+    ) else {
+        return ScaffoldOutcome::Failed;
+    };
+    finalize_deterministic_scaffold_materialization(
+        agent,
+        request,
+        last_iter,
+        &spec,
+        "generic project skeleton",
+        written.clone(),
+        snapshot_files,
+    );
+    ScaffoldOutcome::Applied { written }
+}
+
+fn contains_ascii_word_any(haystack: &str, tokens: &[&str]) -> bool {
+    haystack
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
+        .any(|word| tokens.contains(&word))
+}
+
+fn rust_cli_skeleton_files(_wants_tests: bool) -> Vec<(PathBuf, String)> {
+    vec![
+        (
+            PathBuf::from("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("src/main.rs"),
+            r#"use std::io::{self, Read};
+
+fn main() {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .expect("failed to read stdin");
+    print!("{input}");
+}
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("README.md"),
+            r#"# Rust CLI Skeleton
+
+## Run
+
+```bash
+cargo run -- < input.txt
+```
+
+## Test
+
+```bash
+cargo test
+```
+
+Replace the pass-through command body with the requested CLI behavior.
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("tests/cli.rs"),
+            r#"use std::io::Write;
+use std::process::{Command, Stdio};
+
+#[test]
+fn cli_accepts_stdin() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_app"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn app");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"sample input")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8"), "sample input");
+}
+"#
+            .to_string(),
+        ),
+    ]
+}
+
+fn rust_library_skeleton_files(_wants_tests: bool) -> Vec<(PathBuf, String)> {
+    vec![
+        (
+            PathBuf::from("Cargo.toml"),
+            r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "app"
+path = "src/lib.rs"
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("src/lib.rs"),
+            r#"pub fn transform(input: &str) -> String {
+    input.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transform;
+
+    #[test]
+    fn transform_passes_input_through() {
+        assert_eq!(transform("sample input"), "sample input");
+    }
+}
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("README.md"),
+            r#"# Rust Library Skeleton
+
+## Use
+
+```rust
+let output = app::transform("sample input");
+```
+
+## Test
+
+```bash
+cargo test
+```
+
+Replace the neutral `transform` implementation with the requested library behavior.
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("tests/integration.rs"),
+            r#"#[test]
+fn transform_passes_input_through_from_integration_test() {
+    assert_eq!(app::transform("sample input"), "sample input");
+}
+"#
+            .to_string(),
+        ),
+    ]
+}
+
+fn node_skeleton_files(shape: ProjectShape, _wants_tests: bool) -> Vec<(PathBuf, String)> {
+    let bin_block = if shape == ProjectShape::Cli {
+        r#",
+  "bin": {
+    "app": "./src/index.js"
+  }"#
+    } else {
+        ""
+    };
+    vec![
+        (
+            PathBuf::from("package.json"),
+            format!(
+                r#"{{
+  "name": "app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {{
+    "test": "node --test"
+  }}{bin_block}
+}}
+"#
+            ),
+        ),
+        (
+            PathBuf::from("src/index.js"),
+            r#"#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+
+export function transform(input) {
+  return input;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const input = readFileSync(0, "utf8");
+  process.stdout.write(transform(input));
+}
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("README.md"),
+            r#"# Node Project Skeleton
+
+## Run
+
+```bash
+node src/index.js < input.txt
+```
+
+## Test
+
+```bash
+npm test
+```
+
+Replace the neutral `transform` implementation with the requested behavior.
+"#
+            .to_string(),
+        ),
+        (
+            PathBuf::from("tests/index.test.js"),
+            r#"import test from "node:test";
+import assert from "node:assert/strict";
+
+import { transform } from "../src/index.js";
+
+test("transform passes input through", () => {
+  assert.equal(transform("sample input"), "sample input");
+});
+"#
+            .to_string(),
+        ),
+    ]
+}
+
 pub(super) const EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD: &str =
     "agent.empty_workspace.deterministic_fastapi_scaffold";
 pub(super) const EVENT_DETERMINISTIC_PYTHON_CLI: &str =
@@ -753,6 +1149,9 @@ pub(super) fn mode_deterministic_scaffold_spec(
     request: &str,
     policy: &ModePolicy,
 ) -> Option<DeterministicScaffoldSpec> {
+    if let Some(plan) = project_skeleton_plan_for_request(request) {
+        return Some(plan.into());
+    }
     if super::policy_allows_python_specialized_fallback(policy, &agent.config) {
         if let Some(files) = deterministic::fastapi_scaffold_files(request) {
             return Some(DeterministicScaffoldSpec {
@@ -1010,24 +1409,23 @@ pub(super) fn maybe_materialize_mode_deterministic_fallback(
     if !workspace_appears_empty(&agent.work_root) {
         return false;
     }
-    let Some((written, snapshot_files)) = write_deterministic_scaffold_files(
-        agent,
-        std::mem::take(&mut spec.files),
-        "deterministic fallback",
-        false,
-    ) else {
-        return false;
+    let plan = ScaffoldPlan {
+        label: spec.label,
+        event: spec.event,
+        scaffold_kind: spec.scaffold_kind,
+        files: std::mem::take(&mut spec.files),
     };
-    finalize_deterministic_scaffold_materialization(
-        agent,
-        &request,
-        last_iter,
-        &spec,
-        "bootstrap only",
-        written,
-        snapshot_files,
-    );
-    true
+    matches!(
+        materialize_scaffold(
+            agent,
+            &request,
+            last_iter,
+            plan,
+            "deterministic fallback",
+            false,
+        ),
+        ScaffoldOutcome::Applied { .. }
+    )
 }
 
 pub(super) fn materialize_deterministic_fallback_plan(
@@ -1757,4 +2155,102 @@ pub(super) fn maybe_materialize_plan_after_tool_call_format_error(
         prompt_tokens: None,
         completion_tokens: None,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn file_paths(plan: &ScaffoldPlan) -> Vec<String> {
+        plan.files
+            .iter()
+            .map(|(path, _)| path.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn file_content<'a>(plan: &'a ScaffoldPlan, path: &str) -> &'a str {
+        plan.files
+            .iter()
+            .find(|(candidate, _)| candidate == Path::new(path))
+            .map(|(_, content)| content.as_str())
+            .expect("file content")
+    }
+
+    #[test]
+    fn project_skeleton_plans_rust_cli_word_counter_shape() {
+        let plan = project_skeleton_plan_for_request("Create a Rust CLI word counter with tests")
+            .expect("rust cli plan");
+        let paths = file_paths(&plan);
+
+        assert_eq!(plan.scaffold_kind, "Rust CLI");
+        assert!(paths.contains(&"Cargo.toml".to_string()));
+        assert!(paths.contains(&"src/main.rs".to_string()));
+        assert!(paths.contains(&"tests/cli.rs".to_string()));
+        assert!(!paths.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn project_skeleton_plans_node_json_formatter_cli_shape() {
+        let plan = project_skeleton_plan_for_request(
+            "Build a Node.js JSON formatter CLI with node --test",
+        )
+        .expect("node cli plan");
+        let package_json = file_content(&plan, "package.json");
+        let paths = file_paths(&plan);
+
+        assert_eq!(plan.scaffold_kind, "Node CLI");
+        assert!(paths.contains(&"package.json".to_string()));
+        assert!(paths.contains(&"src/index.js".to_string()));
+        assert!(paths.contains(&"tests/index.test.js".to_string()));
+        assert!(package_json.contains(r#""test": "node --test""#));
+        assert!(package_json.contains(r#""bin""#));
+    }
+
+    #[test]
+    fn project_skeleton_plans_rust_library_without_slugify_behavior() {
+        let plan = project_skeleton_plan_for_request("Create a Rust slugify library")
+            .expect("rust library plan");
+        let paths = file_paths(&plan);
+        let combined = plan
+            .files
+            .iter()
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+
+        assert_eq!(plan.scaffold_kind, "Rust library");
+        assert!(paths.contains(&"Cargo.toml".to_string()));
+        assert!(paths.contains(&"src/lib.rs".to_string()));
+        assert!(paths.contains(&"tests/integration.rs".to_string()));
+        assert!(!paths.contains(&"src/main.rs".to_string()));
+        assert!(!combined.contains("slug"));
+        assert!(combined.contains("transform"));
+    }
+
+    #[test]
+    fn materialize_scaffold_writes_rust_cli_skeleton() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+        use crate::session::store::ConversationMessage;
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, temp) = test_agent_with_config(cfg);
+        agent.session.mode_state.work_mode = WorkMode::GenericCode;
+        agent.session.messages.push(ConversationMessage::user(
+            "Create a Rust CLI word counter with tests".to_string(),
+        ));
+
+        let fired = maybe_materialize_mode_deterministic_fallback(&mut agent, 0);
+
+        assert!(fired);
+        assert!(temp.path().join("Cargo.toml").is_file());
+        assert!(temp.path().join("src/main.rs").is_file());
+        assert!(temp.path().join("tests/cli.rs").is_file());
+    }
 }
