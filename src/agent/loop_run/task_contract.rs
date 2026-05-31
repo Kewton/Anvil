@@ -21,6 +21,12 @@ impl ArtifactRole {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArtifactObligation {
+    pub(super) role: ArtifactRole,
+    pub(super) path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TaskIntent {
     Build,
@@ -237,6 +243,7 @@ fn project_intent_from_required_artifacts(
 pub(super) struct TaskContract {
     pub(super) intent: TaskIntent,
     pub(super) required_artifacts: Vec<ArtifactRole>,
+    pub(super) required_artifact_identities: Vec<ArtifactObligation>,
     pub(super) optional_artifacts: Vec<ArtifactRole>,
     pub(super) verification_required: bool,
     pub(super) completion_policy: CompletionPolicy,
@@ -599,7 +606,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     let verifier_passed = has_build_test_verifier(inputs.evidence);
     let mut missing = Vec::new();
     for role in &inputs.contract.required_artifacts {
-        if observed.contains(role) || artifact_ready_for_verification(inputs.artifacts, *role) {
+        if required_role_satisfied(inputs.contract, inputs.artifacts, &observed, *role) {
             continue;
         }
         missing.push(*role);
@@ -607,7 +614,11 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
 
     if !missing.is_empty() {
         return ArtifactRecoveryAction::Continue {
-            target_hint: recovery_target_hint_for_missing(inputs.artifacts, &missing),
+            target_hint: recovery_target_hint_for_missing_with_contract(
+                inputs.contract,
+                inputs.artifacts,
+                &missing,
+            ),
             missing,
         };
     }
@@ -641,7 +652,11 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
             if !covered {
                 let missing = vec![*role];
                 return ArtifactRecoveryAction::Continue {
-                    target_hint: recovery_target_hint_for_missing(inputs.artifacts, &missing),
+                    target_hint: recovery_target_hint_for_missing_with_contract(
+                        inputs.contract,
+                        inputs.artifacts,
+                        &missing,
+                    ),
                     missing,
                 };
             }
@@ -699,6 +714,40 @@ fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRo
     })
 }
 
+fn required_role_satisfied(
+    contract: &TaskContract,
+    artifacts: &[ArtifactState],
+    observed: &[ArtifactRole],
+    role: ArtifactRole,
+) -> bool {
+    let identities = contract.required_identities_for_role(role);
+    if identities.is_empty() {
+        return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
+    }
+    identities
+        .iter()
+        .all(|identity| artifact_identity_ready_for_verification(artifacts, identity))
+}
+
+fn artifact_identity_ready_for_verification(
+    artifacts: &[ArtifactState],
+    identity: &ArtifactObligation,
+) -> bool {
+    artifacts.iter().any(|artifact| {
+        artifact.role == identity.role
+            && artifact
+                .path
+                .as_deref()
+                .is_some_and(|path| normalized_artifact_path_eq(path, &identity.path))
+            && matches!(
+                artifact.kind,
+                ArtifactStateKind::ExistsButUnverified
+                    | ArtifactStateKind::ChangedThisTurn
+                    | ArtifactStateKind::Verified
+            )
+    })
+}
+
 fn recovery_target_hint_for_missing(
     artifacts: &[ArtifactState],
     missing: &[ArtifactRole],
@@ -721,6 +770,26 @@ fn recovery_target_hint_for_missing(
         return Some(scaffold_hint);
     }
     synthesized_missing_role_target_hint(artifacts, role)
+}
+
+fn recovery_target_hint_for_missing_with_contract(
+    contract: &TaskContract,
+    artifacts: &[ArtifactState],
+    missing: &[ArtifactRole],
+) -> Option<RecoveryTargetHint> {
+    let role = missing.first().copied()?;
+    if let Some(identity) = contract
+        .required_identities_for_role(role)
+        .into_iter()
+        .find(|identity| !artifact_identity_ready_for_verification(artifacts, identity))
+    {
+        return Some(RecoveryTargetHint {
+            role,
+            path: identity.path.clone(),
+            reason: "explicitly requested artifact identity is still missing".to_string(),
+        });
+    }
+    recovery_target_hint_for_missing(artifacts, missing)
 }
 
 fn synthesized_missing_role_target_hint(
@@ -838,6 +907,8 @@ impl TaskContract {
         required.dedup();
         optional.sort();
         optional.dedup();
+        let mut required_artifact_identities = explicit_artifact_obligations_from_request(request);
+        required_artifact_identities.retain(|identity| required.contains(&identity.role));
 
         // Issue #635: build the deterministic behavior schema. The
         // existing `required_artifacts` gate above is the source of truth
@@ -855,6 +926,7 @@ impl TaskContract {
         Self {
             intent,
             required_artifacts: required,
+            required_artifact_identities,
             optional_artifacts: optional,
             verification_required: completion_policy.verification_required(),
             completion_policy,
@@ -870,6 +942,16 @@ impl TaskContract {
     /// directly so the SafeStop gate can fire.
     pub(super) fn evaluate(&self, evidence: &EvidenceSet) -> CompletionDecision {
         self.evaluate_inner(evidence, EvaluateMode::Legacy)
+    }
+
+    pub(super) fn required_identities_for_role(
+        &self,
+        role: ArtifactRole,
+    ) -> Vec<&ArtifactObligation> {
+        self.required_artifact_identities
+            .iter()
+            .filter(|identity| identity.role == role)
+            .collect()
     }
 
     /// Issue #651 Task 4.1 / PR-001: evaluate completion with awareness
@@ -1871,6 +1953,123 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
             .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
+pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<ArtifactObligation> {
+    let mut obligations = Vec::new();
+    for token in request.split(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
+    }) {
+        let Some(path) = normalize_explicit_artifact_path(token) else {
+            continue;
+        };
+        let category =
+            super::completion_evidence::classify_repo_edit_path(std::path::Path::new(&path));
+        let Some(role) = role_from_repo_edit(category) else {
+            continue;
+        };
+        if !obligations
+            .iter()
+            .any(|existing: &ArtifactObligation| existing.role == role && existing.path == path)
+        {
+            obligations.push(ArtifactObligation { role, path });
+        }
+    }
+    obligations.sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
+    obligations
+}
+
+fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|ch: char| {
+        ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '`' | '\''
+                    | '"'
+                    | ','
+                    | '.'
+                    | ':'
+                    | ';'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '、'
+                    | '。'
+                    | '，'
+                    | '．'
+            )
+    });
+    if !trimmed.contains('.') {
+        return None;
+    }
+    let path = trimmed.replace('\\', "/");
+    if matches!(
+        path.to_ascii_lowercase().as_str(),
+        "node.js" | "next.js" | "vue.js"
+    ) {
+        return None;
+    }
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with("./.")
+        || path.contains("://")
+        || path.bytes().any(|b| b.is_ascii_control())
+    {
+        return None;
+    }
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| {
+        segment.is_empty()
+            || *segment == "."
+            || *segment == ".."
+            || !segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    }) {
+        return None;
+    }
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+    let recognized = matches!(
+        ext.as_str(),
+        "py" | "rs"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "md"
+            | "mdx"
+            | "txt"
+            | "rst"
+            | "toml"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "lock"
+    );
+    recognized.then_some(path)
+}
+
+pub(super) fn normalized_artifact_path_eq(actual: &str, expected: &str) -> bool {
+    let actual = actual
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
+    let expected = expected
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
+    if expected.eq_ignore_ascii_case("README.md") {
+        return actual.eq_ignore_ascii_case("README.md");
+    }
+    actual == expected
+}
+
 fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
     let mut roles = Vec::new();
     for item in evidence.iter() {
@@ -2438,6 +2637,77 @@ mod tests {
     }
 
     #[test]
+    fn explicit_impl_filename_identity_keeps_wrong_impl_path_missing() {
+        let contract = TaskContract::from_request("Create lru_cache.py with tests and README.");
+        assert!(
+            contract
+                .required_artifact_identities
+                .contains(&ArtifactObligation {
+                    role: ArtifactRole::Implementation,
+                    path: "lru_cache.py".to_string(),
+                })
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+        evidence.push(build_test_bound(1));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Implementation, "main.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_lru_cache.py"),
+            ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &["tests/test_lru_cache.py".to_string()],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Implementation],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "lru_cache.py".to_string(),
+                    reason: "explicitly requested artifact identity is still missing".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_impl_filename_identity_allows_requested_path_to_reach_verifier() {
+        let contract = TaskContract::from_request("Create lru_cache.py with tests and README.");
+        let evidence = EvidenceSet::new();
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Implementation, "lru_cache.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_lru_cache.py"),
+            ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
     fn controller_runs_verifier_when_existing_candidates_cover_required_artifacts() {
         // Issue #646: `ArtifactState::exists` admission is the planner's
         // ownership signal — the upstream `task_contract_artifact_states`
@@ -2627,8 +2897,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::UsageDocs,
                     path: "README.md".to_string(),
-                    reason: "no existing artifact for the missing role; create a conventional artifact path"
-                        .to_string(),
+                    reason: "explicitly requested artifact identity is still missing".to_string(),
                 }),
             }
         );

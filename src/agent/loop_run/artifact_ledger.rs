@@ -1021,6 +1021,7 @@ mod tests {
         super::super::task_contract::TaskContract {
             intent,
             required_artifacts,
+            required_artifact_identities: vec![],
             optional_artifacts: vec![],
             verification_required,
             completion_policy,
