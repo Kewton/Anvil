@@ -55,6 +55,7 @@ const MAX_REPAIR_TARGET_ATTEMPTS: usize = 24;
 const APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD: usize = 3;
 const MAX_REPAIR_LIFECYCLE_EVENTS: usize = 32;
 const MAX_REJECTED_ATTEMPTS: usize = 16;
+const REPEATED_FAILURE_SIGNATURE_STOP_THRESHOLD: usize = 3;
 #[allow(dead_code)] // used by the v0.4.16 next_action migration surface.
 const REPEATED_REJECTED_ATTEMPT_THRESHOLD: usize = 2;
 
@@ -1031,6 +1032,21 @@ impl RepairJob {
         Some(RepairNextAction::RequestPatch { target_hint })
     }
 
+    fn next_action_for_unchanged_verifier_observation(&self) -> RepairNextAction {
+        if self.repair_attempt >= REPEATED_FAILURE_SIGNATURE_STOP_THRESHOLD {
+            return RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::RepairBudgetExhausted,
+            };
+        }
+        if self.applied_repair_intents.is_empty() {
+            if let Some(target_hint) = self.current_repair_target_hint_for_next_action() {
+                return RepairNextAction::RequestPatch { target_hint };
+            }
+            return self.request_diagnostic_or_safe_stop(RepairTerminalReason::NoSafeRepairTarget);
+        }
+        self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted)
+    }
+
     fn next_action_for_terminal_event(event: &RepairJobEvent) -> Option<RepairNextAction> {
         match event {
             RepairJobEvent::DiagnosticUnavailable => Some(RepairNextAction::SafeStop {
@@ -1050,9 +1066,9 @@ impl RepairJob {
         match delta {
             VerifierDelta::Passed => Some(RepairNextAction::VerifiedDone),
             VerifierDelta::Improved => self.next_action_for_improved_verifier_observation(),
-            VerifierDelta::Unchanged
-            | VerifierDelta::Worsened
-            | VerifierDelta::DifferentFailure => {
+            VerifierDelta::Unchanged => Some(self.next_action_for_unchanged_verifier_observation()),
+            VerifierDelta::DifferentFailure => Some(RepairNextAction::Replan),
+            VerifierDelta::Worsened => {
                 Some(self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted))
             }
             VerifierDelta::VerifierUnavailable => Some(RepairNextAction::SafeStop {
@@ -2256,12 +2272,12 @@ pub(super) fn apply_verifier_rerun_observation(
         repair_context,
         previous_repair_target_hint.as_ref(),
     );
+    apply_semantic_repair_dispatch_after_rerun(repair_context, previous_cluster_id.as_ref());
     if let Some(outcome) = repair_context.rerun_outcome {
         repair_context.apply_event(RepairJobEvent::VerifierObserved {
             delta: outcome.into(),
         });
     }
-    apply_semantic_repair_dispatch_after_rerun(repair_context, previous_cluster_id.as_ref());
     applied_outcome_promotion
 }
 
@@ -3468,6 +3484,69 @@ mod tests {
                 reason: RepairTerminalReason::VerifierUnavailable
             })
         );
+    }
+
+    #[test]
+    fn issue_839_same_signature_no_diff_targets_repair() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target.clone())),
+            repair_attempt: 2,
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Unchanged,
+        });
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: target
+            }
+        );
+    }
+
+    #[test]
+    fn issue_839_three_same_signature_iterations_safe_stop() {
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Implementation,
+                "app/main.py",
+            ))),
+            repair_attempt: REPEATED_FAILURE_SIGNATURE_STOP_THRESHOLD,
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::Unchanged,
+        });
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::RepairBudgetExhausted
+            }
+        );
+    }
+
+    #[test]
+    fn issue_839_signature_change_continues_even_after_diagnostic_budget() {
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Implementation,
+                "app/main.py",
+            ))),
+            repair_attempt: REPEATED_FAILURE_SIGNATURE_STOP_THRESHOLD,
+            assessment_attempts: crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::VerifierObserved {
+            delta: VerifierDelta::DifferentFailure,
+        });
+
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
