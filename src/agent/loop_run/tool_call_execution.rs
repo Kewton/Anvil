@@ -67,6 +67,10 @@ pub(super) fn execute_tool_call(
         agent.session.working_memory.note_error(err.clone());
         return lifecycle::format_tool_error(&err);
     }
+    if let Some(err) = protected_metadata_edit_policy_error(agent, name, arguments) {
+        agent.session.working_memory.note_error(err.clone());
+        return lifecycle::format_tool_error(&err);
+    }
     if let Some(err) =
         super::scaffold_pipeline::empty_workspace_scaffold_policy_error(agent, name, arguments)
     {
@@ -93,6 +97,24 @@ pub(super) fn execute_tool_call(
         return execute_bash_tool_call(agent, name, arguments, &context);
     }
     execute_non_bash_tool_call(agent, name, arguments, &context)
+}
+
+fn protected_metadata_edit_policy_error(
+    agent: &Agent,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if !matches!(name, "Write" | "Edit") {
+        return None;
+    }
+    let raw_path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+    let relative = workspace_relative_path_for_tool_arg(&agent.work_root, raw_path)?;
+    if !super::workspace_walk::is_protected_input_metadata_path(&relative) {
+        return None;
+    }
+    Some(format!(
+        "protected workspace metadata rejected {name}; prompt/cmd input files are not project artifacts: {relative}"
+    ))
 }
 
 fn effective_tool_policy_error_for_execution(

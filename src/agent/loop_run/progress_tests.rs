@@ -7230,10 +7230,48 @@ E   assert [{'id': 1}] == []\n";
         std::fs::create_dir_all(work_root.join(".anvil/plans")).unwrap();
         std::fs::create_dir_all(work_root.join(".anvil-state")).unwrap();
         std::fs::write(work_root.join("ANVIL.md"), "# rules\n").unwrap();
+        std::fs::write(work_root.join("prompt.md"), "build a Rust CLI\n").unwrap();
+        std::fs::write(work_root.join("cmd.txt"), "cargo test\n").unwrap();
         assert!(workspace_appears_empty(work_root));
 
         std::fs::write(work_root.join("README.md"), "# app\n").unwrap();
         assert!(!workspace_appears_empty(work_root));
+    }
+
+    #[test]
+    fn protected_prompt_and_cmd_metadata_edit_is_rejected() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        std::fs::write(temp.path().join("prompt.md"), "original prompt\n").unwrap();
+        std::fs::write(temp.path().join("cmd.txt"), "original command\n").unwrap();
+
+        let prompt_result = super::super::tool_call_execution::execute_tool_call(
+            &mut agent,
+            "Write",
+            &json!({"path":"prompt.md","content":"mutated\n"}),
+            None,
+            None,
+        );
+        let cmd_result = super::super::tool_call_execution::execute_tool_call(
+            &mut agent,
+            "Edit",
+            &json!({"path":"cmd.txt","old_string":"original","new_string":"mutated"}),
+            None,
+            None,
+        );
+
+        assert!(prompt_result.contains("protected workspace metadata rejected Write"));
+        assert!(cmd_result.contains("protected workspace metadata rejected Edit"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("prompt.md")).unwrap(),
+            "original prompt\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cmd.txt")).unwrap(),
+            "original command\n"
+        );
     }
 
     #[test]
@@ -7266,6 +7304,34 @@ E   assert [{'id': 1}] == []\n";
                 .repo_edit_projection_set()
                 .contains(rel),
             "controller-owned state must not enter artifact ledger repo edit projection"
+        );
+    }
+
+    #[test]
+    fn repo_edit_observation_ignores_protected_input_metadata() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        std::fs::write(temp.path().join("prompt.md"), "mutated\n").unwrap();
+
+        super::super::repo_edit_observation::observe_evidence_from_repo_edit(
+            &mut agent,
+            "prompt.md",
+        );
+
+        assert!(
+            !agent.turn_edited_relative_paths.contains("prompt.md"),
+            "protected input metadata must not become repo edit evidence"
+        );
+        assert!(agent.evidence_set_this_turn.is_empty());
+        assert!(agent.task_contract_evidence_set_this_turn.is_empty());
+        assert!(
+            !agent
+                .artifact_ledger
+                .repo_edit_projection_set()
+                .contains("prompt.md"),
+            "protected input metadata must not enter artifact ledger repo edit projection"
         );
     }
 

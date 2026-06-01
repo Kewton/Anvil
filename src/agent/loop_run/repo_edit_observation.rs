@@ -61,6 +61,17 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
         );
         return;
     }
+    if super::workspace_walk::is_protected_input_metadata_path(&relative_path) {
+        crate::logging::log_completion_evidence_observed(
+            agent.current_turn_index,
+            0,
+            "repo_edit_protected_input_metadata",
+            serde_json::json!({
+                "path_hash": stable_path_hash(&relative_path),
+            }),
+        );
+        return;
+    }
     let category =
         super::completion_evidence::classify_repo_edit_path(std::path::Path::new(&relative_path));
     if !super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(agent, &relative_path) {

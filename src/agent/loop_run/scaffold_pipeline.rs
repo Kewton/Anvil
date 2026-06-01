@@ -2253,4 +2253,62 @@ mod tests {
         assert!(temp.path().join("src/main.rs").is_file());
         assert!(temp.path().join("tests/cli.rs").is_file());
     }
+
+    #[test]
+    fn rust_scaffold_materializes_when_prompt_metadata_exists() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+        use crate::session::store::ConversationMessage;
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, temp) = test_agent_with_config(cfg);
+        std::fs::write(temp.path().join("prompt.md"), "Create a Rust CLI\n").unwrap();
+        agent.session.mode_state.work_mode = WorkMode::GenericCode;
+        agent.session.messages.push(ConversationMessage::user(
+            "Create a Rust CLI word counter with tests".to_string(),
+        ));
+
+        let fired = maybe_materialize_mode_deterministic_fallback(&mut agent, 0);
+
+        assert!(fired);
+        assert!(temp.path().join("Cargo.toml").is_file());
+        assert!(temp.path().join("src/main.rs").is_file());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("prompt.md")).unwrap(),
+            "Create a Rust CLI\n"
+        );
+    }
+
+    #[test]
+    fn node_scaffold_materializes_when_prompt_metadata_exists() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+        use crate::session::store::ConversationMessage;
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, temp) = test_agent_with_config(cfg);
+        std::fs::write(temp.path().join("prompt.md"), "Build a Node CLI\n").unwrap();
+        agent.session.mode_state.work_mode = WorkMode::GenericCode;
+        agent.session.messages.push(ConversationMessage::user(
+            "Build a Node.js JSON formatter CLI with node --test".to_string(),
+        ));
+
+        let fired = maybe_materialize_mode_deterministic_fallback(&mut agent, 0);
+
+        assert!(fired);
+        assert!(temp.path().join("package.json").is_file());
+        assert!(temp.path().join("src/index.js").is_file());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("prompt.md")).unwrap(),
+            "Build a Node CLI\n"
+        );
+    }
 }
