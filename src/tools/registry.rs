@@ -8,6 +8,7 @@ use crate::modes::plan_act::{ExecutionMode, PlanStage};
 use crate::safety::path_guard::resolve_user_path;
 use crate::tools::bash::BashExecutionOutcome;
 use crate::tools::{bash, edit, glob, grep, read, write};
+use crate::util::workspace_paths::WorkspacePolicy;
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -31,6 +32,10 @@ pub struct ToolContext {
     /// path is resolved (keeping the check on the raw `tmp-tests/<rel>`
     /// prefix rather than the post-resolution absolute path).
     pub tester_active: bool,
+    /// Shared workspace policy for hiding controller metadata from ordinary
+    /// model reads/discovery. Log-analysis tasks may opt into protected
+    /// metadata reads, but writes stay blocked elsewhere.
+    pub workspace_policy: WorkspacePolicy,
 }
 
 impl ToolContext {
@@ -133,7 +138,14 @@ impl ToolRegistry {
                 };
                 let start_line = get_optional_usize(arguments, "start_line");
                 let end_line = get_optional_usize(arguments, "end_line");
-                read::run(&path, start_line, end_line)
+                enforce_workspace_read_policy(&context.root, &path, context.workspace_policy)?;
+                read::run(
+                    &context.root,
+                    &path,
+                    start_line,
+                    end_line,
+                    context.workspace_policy,
+                )
             }
             "Write" => {
                 let raw_path = get_required_string(arguments, "path")?;
@@ -173,7 +185,7 @@ impl ToolRegistry {
             }
             "Glob" => {
                 let pattern = get_required_string(arguments, "pattern")?;
-                glob::run(&context.root, pattern)
+                glob::run(&context.root, pattern, context.workspace_policy)
             }
             "Grep" => {
                 let pattern = get_required_string(arguments, "pattern")?;
@@ -182,7 +194,13 @@ impl ToolRegistry {
                     .get("case_sensitive")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                grep::run(&context.root, pattern, glob, case_sensitive)
+                grep::run(
+                    &context.root,
+                    pattern,
+                    glob,
+                    case_sensitive,
+                    context.workspace_policy,
+                )
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -267,6 +285,28 @@ fn preflight_bash_command(arguments: &Value) -> Option<String> {
     let command = arguments.get("command")?.as_str()?;
     let reason = bash::check_blocked_command(command)?;
     Some(bash::render_block_error(&reason))
+}
+
+fn enforce_workspace_read_policy(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    workspace_policy: WorkspacePolicy,
+) -> Result<(), String> {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .or_else(|_| path.strip_prefix(root));
+    let Ok(relative) = relative else {
+        return Ok(());
+    };
+    if relative.as_os_str().is_empty() || workspace_policy.allows_model_read_relative_path(relative)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "protected workspace metadata rejected Read; explicit log-analysis permission is required: {}",
+        relative.display()
+    ))
 }
 
 /// CB2-001: how a bash dispatch failed when no `BashExecutionOutcome` was
@@ -834,6 +874,7 @@ mod tests {
         resolve_plan_mode_write_target,
     };
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
+    use crate::util::workspace_paths::WorkspacePolicy;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -912,6 +953,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let out = registry
             .execute(
@@ -955,6 +997,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let err = enforce_plan_stage_scope(
             "Write",
@@ -988,6 +1031,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         enforce_plan_stage_scope(
             "Edit",
@@ -1025,6 +1069,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         ToolRegistry::default()
             .execute(
@@ -1067,6 +1112,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         ToolRegistry::default()
             .execute(
@@ -1107,6 +1153,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
@@ -1136,6 +1183,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
@@ -1163,6 +1211,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
@@ -1188,6 +1237,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1214,6 +1264,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
@@ -1240,6 +1291,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1265,6 +1317,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: tmp_tests_root.map(|p| p.to_path_buf()),
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         }
     }
 
@@ -1339,6 +1392,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests.clone()),
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         registry
             .execute(
@@ -1371,6 +1425,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let err = registry
             .execute(
@@ -1402,6 +1457,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests),
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let out = registry
             .execute("Read", &json!({"path": "tmp-tests/src/foo.rs"}), &context)
@@ -1427,6 +1483,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests_root.to_path_buf()),
             tester_active,
+            workspace_policy: WorkspacePolicy::default(),
         }
     }
 
@@ -1570,6 +1627,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "shutdown -h now"}), &context);
@@ -1602,6 +1660,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "iptables -F"}), &context);
@@ -1628,6 +1687,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let err = registry
             .execute("Bash", &json!({"command": "reboot"}), &context)
@@ -1662,6 +1722,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");

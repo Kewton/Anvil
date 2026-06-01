@@ -28,6 +28,7 @@ use anvil::session::tmp_tests::{
     discard_tmp_test, list_tmp_tests, promote_tmp_test, read_metadata_dir,
 };
 use anvil::tools::registry::{ToolContext, ToolRegistry};
+use anvil::util::workspace_paths::WorkspacePolicy;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -108,6 +109,7 @@ fn tool_context_for(fixture: &SessionFixture) -> ToolContext {
         cancel_flag: None,
         tmp_tests_root: Some(fixture.tmp_tests_root.clone()),
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     }
 }
 
@@ -300,6 +302,7 @@ fn tmp_tests_prefix_with_none_root_is_rejected() {
         // Critical: simulate the early-startup / unit-test path.
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     let err = registry
