@@ -4,6 +4,7 @@
 # Runs bench.sh with a fake anvil binary and verifies:
 #   * summary.tsv header is unchanged
 #   * summary.tsv row count and column order match
+#   * --pam-ab expands the same prompt suite into pam_on/pam_off variants
 #   * run-dir contains session.json, meta.json, logs/llm-io.jsonl
 #   * meta.json "rc" and "elapsed_s" are numeric
 
@@ -46,10 +47,12 @@ uuid="00000000-0000-4000-8000-000000000001"
 session_dir="$state_dir/sessions/$uuid"
 mkdir -p "$session_dir/logs"
 cat > "$session_dir/session.json" <<JSON
-{"id":"$uuid","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
+{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
 echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{}}' \
   > "$session_dir/logs/llm-io.jsonl"
+echo '{"schema_version":1,"session_id":"fake","final_outcome":"done","pam_eval":{"advisory_only":true}}' \
+  > "$session_dir/logs/eval.jsonl"
 exit 0
 EOF
 chmod +x "$fake_anvil"
@@ -59,9 +62,13 @@ bench_yaml_dir="$REPO_ROOT/benchmarks"
 bench_yaml="$bench_yaml_dir/bench-smoke-fixture.yaml"
 mkdir -p "$bench_yaml_dir"
 cat > "$bench_yaml" <<'EOF'
-prompt: smoke test
 args:
   max_iterations: 1
+cases:
+  - name: docs
+    prompt: update README copy
+  - name: data
+    prompt: transform CSV rows
 EOF
 trap 'rm -rf "$tmp"; rm -f "$bench_yaml"' EXIT
 
@@ -69,7 +76,7 @@ trap 'rm -rf "$tmp"; rm -f "$bench_yaml"' EXIT
 export ANVIL_BIN="$fake_anvil"
 export BENCH_DEBUG=1
 cd "$REPO_ROOT"
-bash scripts/bench.sh bench-smoke-fixture --model "smoke-model" --runs 1 \
+bash scripts/bench.sh bench-smoke-fixture --model "smoke-model" --runs 1 --pam-ab \
   > "$tmp/bench.stdout" 2> "$tmp/bench.stderr" || {
   echo "FAIL: bench.sh non-zero exit" >&2
   cat "$tmp/bench.stderr" >&2
@@ -92,7 +99,7 @@ if [[ ! -f "$summary" ]]; then
 fi
 
 header=$(head -n 1 "$summary")
-expected_header=$'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\textras_json'
+expected_header=$'run\tmodel\tcase\tpam_variant\trc\telapsed_sec\tworkdir\tsession_copied\textras_json'
 if [[ "$header" != "$expected_header" ]]; then
   echo "FAIL: summary.tsv header mismatch" >&2
   echo "  got:      $header" >&2
@@ -101,18 +108,41 @@ if [[ "$header" != "$expected_header" ]]; then
 fi
 
 rows=$(($(wc -l < "$summary") - 1))
-if [[ "$rows" -ne 1 ]]; then
-  echo "FAIL: expected 1 data row, got $rows" >&2
+if [[ "$rows" -ne 4 ]]; then
+  echo "FAIL: expected 4 data rows, got $rows" >&2
   exit 1
 fi
 
-run_dir="$BENCH_ROOT/smoke-model/run-1"
-for f in session.json meta.json logs/llm-io.jsonl workdir; do
-  if [[ ! -e "$run_dir/$f" ]]; then
-    echo "FAIL: missing $run_dir/$f" >&2
-    exit 1
-  fi
+for case_name in docs data; do
+  for pam_variant in pam_on pam_off; do
+    run_dir="$BENCH_ROOT/smoke-model/$case_name/$pam_variant/run-1"
+    for f in session.json meta.json logs/llm-io.jsonl logs/eval.jsonl workdir; do
+      if [[ ! -e "$run_dir/$f" ]]; then
+        echo "FAIL: missing $run_dir/$f" >&2
+        exit 1
+      fi
+    done
+    expected_pam="true"
+    if [[ "$pam_variant" == "pam_off" ]]; then
+      expected_pam="false"
+    fi
+    jq -e --arg expected "$expected_pam" '.pam == $expected' "$run_dir/session.json" >/dev/null || {
+      echo "FAIL: PAM env mismatch in $run_dir/session.json" >&2
+      cat "$run_dir/session.json" >&2
+      exit 1
+    }
+  done
 done
+
+run_dir="$BENCH_ROOT/smoke-model/docs/pam_on/run-1"
+
+pam_on_count=$(awk -F'\t' 'NR > 1 && $4 == "pam_on" { n++ } END { print n + 0 }' "$summary")
+pam_off_count=$(awk -F'\t' 'NR > 1 && $4 == "pam_off" { n++ } END { print n + 0 }' "$summary")
+if [[ "$pam_on_count" -ne 2 || "$pam_off_count" -ne 2 ]]; then
+  echo "FAIL: expected 2 pam_on and 2 pam_off rows" >&2
+  cat "$summary" >&2
+  exit 1
+fi
 
 rc_val=$(jq -r '.rc' "$run_dir/meta.json")
 elapsed_val=$(jq -r '.elapsed_s' "$run_dir/meta.json")

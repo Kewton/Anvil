@@ -28,9 +28,17 @@ scripts/compare.py --metric rc,elapsed_s --format json baseline/ experiment/
 
 # しきい値を 10% に緩める
 scripts/compare.py --threshold 0.10 baseline/ experiment/
+
+# PAM advisory A/B 用の固定 suite を同一 prompt set で実行
+scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
 ```
 
 出力は stdout、警告は stderr。`--output` は v1 で提供しない。
+
+`--pam-ab` は各 benchmark case を `pam_on` /
+`pam_off` の 2 variant で実行し、`summary.tsv` に `case` と
+`pam_variant` を記録する。PAM 採用 context と suppression 理由は
+各 run の `logs/eval.jsonl` / `logs/llm-io.jsonl` から追跡する。
 
 ## 2. 期待する入力レイアウト
 

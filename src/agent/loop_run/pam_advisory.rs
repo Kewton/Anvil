@@ -293,6 +293,31 @@ impl PamAdvisoryDecision {
         serde_json::to_value(PamAdvisoryDecisionPayload::from(self))
             .unwrap_or(serde_json::Value::Null)
     }
+
+    /// Issue #857: bounded projection for `logs/eval.jsonl`.
+    ///
+    /// The eval log records only categorical impact and counts. Per-context
+    /// adoption/suppression reasons stay in the structured memory report.
+    pub(super) fn to_eval_summary(&self) -> crate::session::eval_log::PamEvalSummary {
+        let mut decision_types = Vec::new();
+        push_unique_decision_type(
+            &mut decision_types,
+            self.decision_effect.influenced_decision,
+        );
+        for decision in &self.candidate_decisions {
+            push_unique_decision_type(&mut decision_types, decision.decision_impact);
+        }
+        crate::session::eval_log::PamEvalSummary {
+            mode: self.mode.as_str().to_string(),
+            decision_type: self.decision_effect.influenced_decision.to_string(),
+            decision_types,
+            actual_injected_count: self.decision_effect.actual_injected_count,
+            suppressed_count: self.decision_effect.suppressed_count,
+            would_inject_in_live_count: self.decision_effect.would_inject_in_live_count,
+            advisory_only: true,
+            completion_judgement_override: false,
+        }
+    }
 }
 
 /// Adapter input view for shadow / live state (DR1-002).
@@ -617,6 +642,13 @@ fn apply_cap_candidate_decisions(v: &mut Vec<PamCandidateDecision>) -> bool {
     } else {
         false
     }
+}
+
+fn push_unique_decision_type(out: &mut Vec<String>, value: &'static str) {
+    if out.len() >= MAX_PAM_DECISION_LIST_LEN || out.iter().any(|existing| existing == value) {
+        return;
+    }
+    out.push(value.to_string());
 }
 
 fn push_candidate_decision(

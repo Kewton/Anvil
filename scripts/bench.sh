@@ -7,6 +7,7 @@
 #   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
 #   --runs <n>        実行回数（デフォルト: 5）
 #   --dry-run         anvil 呼び出しを echo で代替
+#   --pam-ab          Same prompt suite with PAM enabled and disabled
 #   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
 #   --help            この用例を表示して終了
 #
@@ -34,6 +35,7 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
   --no-case-memory  Case memory を無効化（ANVIL_NO_CASE_RETRIEVAL=1 ANVIL_NO_CASE_RECORD=1）
   --no-auto-test    Auto test を無効化（ANVIL_NO_AUTO_TEST=1）
+  --pam-ab          Same prompt suite with PAM enabled and disabled
   --dry-run         anvil 呼び出しを echo で代替
   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
   --help            この用例を表示して終了
@@ -54,6 +56,7 @@ DRY_RUN=0
 no_precautions=0
 no_case_memory=0
 no_auto_test=0
+pam_ab=0
 # BENCH_DEBUG toggles `--trace` on the anvil invocation. Allowed values: "0" or "1".
 BENCH_DEBUG="${BENCH_DEBUG:-1}"
 case "$BENCH_DEBUG" in
@@ -100,6 +103,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-auto-test)
       no_auto_test=1
+      shift
+      ;;
+    --pam-ab)
+      pam_ab=1
       shift
       ;;
     --dry-run)
@@ -211,28 +218,30 @@ umask 077
 BENCH_ROOT="$REPO_ROOT/.anvil/benchmarks/$(date +%Y%m%dT%H%M%S)-$$"
 mkdir -p "$BENCH_ROOT"
 
-# -------- yaml load (whitelist) --------
-prompt=$(yq -r '.prompt' "$BENCH_YAML")
-max_iterations=$(yq -r '.args.max_iterations // ""' "$BENCH_YAML")
-chat_retries=$(yq -r '.args.chat_retries // ""' "$BENCH_YAML")
-sidecar_model=$(yq -r '.args.sidecar_model // ""' "$BENCH_YAML")
-
-if [[ -z "$prompt" || "$prompt" == "null" ]]; then
-  echo "Error: .prompt is required in $BENCH_YAML" >&2
+# -------- yaml validation --------
+case_count=$(yq -r '(.cases // []) | length' "$BENCH_YAML")
+if ! [[ "$case_count" =~ ^[0-9]+$ ]]; then
+  echo "Error: invalid .cases length in $BENCH_YAML" >&2
   exit 1
 fi
-
-if ! { [[ -z "$max_iterations" ]] || [[ "$max_iterations" =~ ^[0-9]+$ ]]; }; then
-  echo "Error: invalid max_iterations: $max_iterations" >&2
-  exit 1
-fi
-if ! { [[ -z "$chat_retries" ]] || [[ "$chat_retries" =~ ^[0-9]+$ ]]; }; then
-  echo "Error: invalid chat_retries: $chat_retries" >&2
-  exit 1
+if [[ "$case_count" -eq 0 ]]; then
+  prompt=$(yq -r '.prompt // ""' "$BENCH_YAML")
+  if [[ -z "$prompt" || "$prompt" == "null" ]]; then
+    echo "Error: .prompt or .cases[].prompt is required in $BENCH_YAML" >&2
+    exit 1
+  fi
+else
+  for (( case_idx=0; case_idx<case_count; case_idx++ )); do
+    prompt=$(yq -r ".cases[$case_idx].prompt // \"\"" "$BENCH_YAML")
+    if [[ -z "$prompt" || "$prompt" == "null" ]]; then
+      echo "Error: .cases[$case_idx].prompt is required in $BENCH_YAML" >&2
+      exit 1
+    fi
+  done
 fi
 
 # -------- summary.tsv header --------
-printf 'run\tmodel\trc\telapsed_sec\tworkdir\tsession_copied\textras_json\n' > "$BENCH_ROOT/summary.tsv"
+printf 'run\tmodel\tcase\tpam_variant\trc\telapsed_sec\tworkdir\tsession_copied\textras_json\n' > "$BENCH_ROOT/summary.tsv"
 
 # -------- validate_model --------
 validate_model() {
@@ -421,14 +430,17 @@ validate_models_array
 # -------- trap (registered after cleaned_models is populated) --------
 CURRENT_RUN=""
 CURRENT_MODEL=""
+CURRENT_CASE="default"
+CURRENT_PAM_VARIANT="default"
 CURRENT_RUN_DIR=""
 CURRENT_START_TS=""
 RUN_LOGGED=0
 META_WRITTEN=0
 on_interrupt() {
   if [[ "$RUN_LOGGED" -eq 0 && -n "$CURRENT_RUN" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "130" "N/A" "N/A" "0" "null" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$CURRENT_RUN" "${CURRENT_MODEL:-unknown}" "${CURRENT_CASE:-default}" \
+      "${CURRENT_PAM_VARIANT:-default}" "130" "N/A" "N/A" "0" "null" \
       >> "$BENCH_ROOT/summary.tsv"
   fi
   if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
@@ -443,167 +455,230 @@ on_interrupt() {
 trap 'on_interrupt' SIGINT SIGTERM
 
 # -------- main loop --------
+pam_variants=("default")
+if [[ "$pam_ab" -eq 1 ]]; then
+  pam_variants=("pam_on" "pam_off")
+fi
+
+case_loop_count="$case_count"
+if [[ "$case_loop_count" -eq 0 ]]; then
+  case_loop_count=1
+fi
+
 model_idx=0
 for model in "${cleaned_models[@]}"; do
   model_idx=$((model_idx + 1))
   model_slug=$(slugify "$model")
 
-  for (( run=1; run<=runs; run++ )); do
-    printf '[model %d/%d | run %d/%d] %s\n' \
-      "$model_idx" "${#cleaned_models[@]}" "$run" "$runs" "$model" >&2
+  for (( case_idx=0; case_idx<case_loop_count; case_idx++ )); do
+    if [[ "$case_count" -eq 0 ]]; then
+      case_name="default"
+      prompt=$(yq -r '.prompt // ""' "$BENCH_YAML")
+      max_iterations=$(yq -r '.args.max_iterations // ""' "$BENCH_YAML")
+      chat_retries=$(yq -r '.args.chat_retries // ""' "$BENCH_YAML")
+      sidecar_model=$(yq -r '.args.sidecar_model // ""' "$BENCH_YAML")
+    else
+      case_name=$(yq -r ".cases[$case_idx].name // \"case-$((case_idx + 1))\"" "$BENCH_YAML")
+      prompt=$(yq -r ".cases[$case_idx].prompt // \"\"" "$BENCH_YAML")
+      max_iterations=$(yq -r ".cases[$case_idx].args.max_iterations // .args.max_iterations // \"\"" "$BENCH_YAML")
+      chat_retries=$(yq -r ".cases[$case_idx].args.chat_retries // .args.chat_retries // \"\"" "$BENCH_YAML")
+      sidecar_model=$(yq -r ".cases[$case_idx].args.sidecar_model // .args.sidecar_model // \"\"" "$BENCH_YAML")
+    fi
 
-    CURRENT_RUN="$run"
-    CURRENT_MODEL="$model"
-    RUN_LOGGED=0
-    META_WRITTEN=0
-
-    RUN_DIR="$BENCH_ROOT/$model_slug/run-$run"
-    WORKDIR="$RUN_DIR/workdir"
-    STATE_DIR="$RUN_DIR/state"
-    CURRENT_RUN_DIR="$RUN_DIR"
-    CURRENT_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    # STATE_DIR assert: absolute path & no ..
-    if [[ "$STATE_DIR" != /* ]]; then
-      echo "STATE_DIR must be absolute" >&2
+    if [[ -z "$case_name" || "$case_name" == "null" ]]; then
+      echo "Error: empty benchmark case name" >&2
       exit 1
     fi
-    case "$STATE_DIR" in
-      *..*)
-        echo "STATE_DIR must not contain '..'" >&2
-        exit 1
-        ;;
-    esac
-
-    mkdir -p "$WORKDIR" "$STATE_DIR" "$RUN_DIR/logs"
-    cd "$WORKDIR" || { echo "Error: cd $WORKDIR failed" >&2; exit 1; }
-
-    # -------- caller env isolation --------
-    # Unset ANVIL_NO_* from caller env to prevent baseline cell contamination.
-    unset ANVIL_NO_REMINDER ANVIL_NO_CASE_RETRIEVAL ANVIL_NO_CASE_RECORD \
-          ANVIL_NO_AUTO_TEST ANVIL_NO_TESTER ANVIL_NO_REPO_GRAPH \
-          ANVIL_CASE_RECORD_DRY_RUN ANVIL_CASE_RETRIEVAL_DRY_RUN
-
-    # Build env_kv array from feature flags (bash array, no eval)
-    declare -a env_kv=()
-    if [[ "$no_precautions" -eq 1 ]]; then
-      env_kv+=("ANVIL_NO_REMINDER=1")
+    case_slug=$(slugify "$case_name")
+    if [[ -z "$case_slug" || "$case_slug" == "." || "$case_slug" == ".." ]]; then
+      echo "Error: invalid benchmark case name: $case_name" >&2
+      exit 1
     fi
-    if [[ "$no_case_memory" -eq 1 ]]; then
-      env_kv+=("ANVIL_NO_CASE_RETRIEVAL=1" "ANVIL_NO_CASE_RECORD=1")
+    if ! { [[ -z "$max_iterations" ]] || [[ "$max_iterations" =~ ^[0-9]+$ ]]; }; then
+      echo "Error: invalid max_iterations for case $case_name: $max_iterations" >&2
+      exit 1
     fi
-    if [[ "$no_auto_test" -eq 1 ]]; then
-      env_kv+=("ANVIL_NO_AUTO_TEST=1")
+    if ! { [[ -z "$chat_retries" ]] || [[ "$chat_retries" =~ ^[0-9]+$ ]]; }; then
+      echo "Error: invalid chat_retries for case $case_name: $chat_retries" >&2
+      exit 1
     fi
 
-    start=$SECONDS
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-      echo "(dry-run) anvil --oneshot --prompt ... --state-dir $STATE_DIR --model $model" \
-        > ../stdout.log
-      rc=0
-    else
-      anvil_args=(--oneshot --offline --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
-      if [[ -n "$max_iterations" ]]; then
-        anvil_args+=(--max-iterations "$max_iterations")
-      fi
-      if [[ -n "$chat_retries" ]]; then
-        anvil_args+=(--chat-retries "$chat_retries")
-      fi
-      if [[ -n "$sidecar_model" ]]; then
-        anvil_args+=(--sidecar-model "$sidecar_model")
-      fi
-      if [[ "$BENCH_DEBUG" -eq 1 ]]; then
-        anvil_args+=(--trace)
-      fi
-      # Launch anvil with:
-      #   - env_kv feature flags (ANVIL_NO_* vars)
-      #   - stripped parent credentials (security: DR4-002)
-      #   - allowlisted env vars only
-      env -i \
-        HOME="$HOME" \
-        PATH="$PATH" \
-        TERM="${TERM:-xterm}" \
-        TMPDIR="${TMPDIR:-/tmp}" \
-        "${env_kv[@]+"${env_kv[@]}"}" \
-        "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1
-      rc=$?
-    fi
-    elapsed=$(( SECONDS - start ))
+    for pam_variant in "${pam_variants[@]}"; do
+      for (( run=1; run<=runs; run++ )); do
+        printf '[model %d/%d | case %d/%d | %s | run %d/%d] %s\n' \
+          "$model_idx" "${#cleaned_models[@]}" "$((case_idx + 1))" "$case_loop_count" \
+          "$pam_variant" "$run" "$runs" "$model" >&2
 
-    # session.json copy (nullglob → empty array if no match)
-    # bash 3.2 + set -u needs guard for empty array expansion
-    session_copied=0
-    latest_session=""
-    session_json_list=("$STATE_DIR/sessions/"*/session.json)
-    if [[ ${#session_json_list[@]} -gt 0 ]]; then
-      for f in "${session_json_list[@]}"; do
-        latest_session="$f"
-      done
-    fi
-    if [[ -n "$latest_session" && -f "$latest_session" && ! -L "$latest_session" ]]; then
-      # reject symlinks before copy to prevent information leakage
-      real_session=$(realpath "$latest_session" 2>/dev/null || true)
-      real_state=$(realpath "$STATE_DIR" 2>/dev/null || true)
-      if [[ -n "$real_session" && -n "$real_state" && "$real_session" == "$real_state"/* ]]; then
-        if cp "$latest_session" ../session.json; then
-          session_copied=1
+        CURRENT_RUN="$run"
+        CURRENT_MODEL="$model"
+        CURRENT_CASE="$case_name"
+        CURRENT_PAM_VARIANT="$pam_variant"
+        RUN_LOGGED=0
+        META_WRITTEN=0
+
+        if [[ "$case_slug" == "default" && "$pam_variant" == "default" ]]; then
+          RUN_DIR="$BENCH_ROOT/$model_slug/run-$run"
+          workdir_rel="$model_slug/run-$run/workdir"
         else
-          echo "warning: session.json copy failed" >&2
+          RUN_DIR="$BENCH_ROOT/$model_slug/$case_slug/$pam_variant/run-$run"
+          workdir_rel="$model_slug/$case_slug/$pam_variant/run-$run/workdir"
+        fi
+        WORKDIR="$RUN_DIR/workdir"
+        STATE_DIR="$RUN_DIR/state"
+        CURRENT_RUN_DIR="$RUN_DIR"
+        CURRENT_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        # STATE_DIR assert: absolute path & no ..
+        if [[ "$STATE_DIR" != /* ]]; then
+          echo "STATE_DIR must be absolute" >&2
+          exit 1
+        fi
+        case "$STATE_DIR" in
+          *..*)
+            echo "STATE_DIR must not contain '..'" >&2
+            exit 1
+            ;;
+        esac
+
+        mkdir -p "$WORKDIR" "$STATE_DIR" "$RUN_DIR/logs"
+        cd "$WORKDIR" || { echo "Error: cd $WORKDIR failed" >&2; exit 1; }
+
+        # -------- caller env isolation --------
+        # Unset ANVIL_NO_* from caller env to prevent baseline cell contamination.
+        unset ANVIL_NO_REMINDER ANVIL_NO_CASE_RETRIEVAL ANVIL_NO_CASE_RECORD \
+              ANVIL_NO_AUTO_TEST ANVIL_NO_TESTER ANVIL_NO_REPO_GRAPH \
+              ANVIL_CASE_RECORD_DRY_RUN ANVIL_CASE_RETRIEVAL_DRY_RUN \
+              ANVIL_PAM_ADVISORY_ENABLED
+
+        # Build env_kv array from feature flags (bash array, no eval)
+        declare -a env_kv=()
+        if [[ "$no_precautions" -eq 1 ]]; then
+          env_kv+=("ANVIL_NO_REMINDER=1")
+        fi
+        if [[ "$no_case_memory" -eq 1 ]]; then
+          env_kv+=("ANVIL_NO_CASE_RETRIEVAL=1" "ANVIL_NO_CASE_RECORD=1")
+        fi
+        if [[ "$no_auto_test" -eq 1 ]]; then
+          env_kv+=("ANVIL_NO_AUTO_TEST=1")
+        fi
+        if [[ "$pam_variant" == "pam_on" ]]; then
+          env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=true")
+        elif [[ "$pam_variant" == "pam_off" ]]; then
+          env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=false")
         fi
 
-        # Copy llm-io.jsonl from the state-dir session directory (if present)
-        session_id=$(basename "$(dirname "$latest_session")")
-        if [[ "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
-          log_src="$STATE_DIR/sessions/$session_id/logs/llm-io.jsonl"
-          if [[ -f "$log_src" && ! -L "$log_src" ]]; then
-            real_log=$(realpath "$log_src" 2>/dev/null || true)
-            if [[ -n "$real_log" && "$real_log" == "$real_state"/* ]]; then
-              cp "$log_src" "$RUN_DIR/logs/llm-io.jsonl" || echo "warning: llm-io.jsonl copy failed" >&2
+        start=$SECONDS
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+          echo "(dry-run) anvil --oneshot --prompt ... --state-dir $STATE_DIR --model $model --case $case_name --pam-variant $pam_variant" \
+            > ../stdout.log
+          rc=0
+        else
+          anvil_args=(--oneshot --offline --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+          if [[ -n "$max_iterations" ]]; then
+            anvil_args+=(--max-iterations "$max_iterations")
+          fi
+          if [[ -n "$chat_retries" ]]; then
+            anvil_args+=(--chat-retries "$chat_retries")
+          fi
+          if [[ -n "$sidecar_model" ]]; then
+            anvil_args+=(--sidecar-model "$sidecar_model")
+          fi
+          if [[ "$BENCH_DEBUG" -eq 1 ]]; then
+            anvil_args+=(--trace)
+          fi
+          # Launch anvil with:
+          #   - env_kv feature flags (ANVIL_NO_* vars)
+          #   - stripped parent credentials (security: DR4-002)
+          #   - allowlisted env vars only
+          env -i \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            TERM="${TERM:-xterm}" \
+            TMPDIR="${TMPDIR:-/tmp}" \
+            "${env_kv[@]+"${env_kv[@]}"}" \
+            "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1
+          rc=$?
+        fi
+        elapsed=$(( SECONDS - start ))
+
+        # session.json copy (nullglob → empty array if no match)
+        # bash 3.2 + set -u needs guard for empty array expansion
+        session_copied=0
+        latest_session=""
+        session_json_list=("$STATE_DIR/sessions/"*/session.json)
+        if [[ ${#session_json_list[@]} -gt 0 ]]; then
+          for f in "${session_json_list[@]}"; do
+            latest_session="$f"
+          done
+        fi
+        if [[ -n "$latest_session" && -f "$latest_session" && ! -L "$latest_session" ]]; then
+          # reject symlinks before copy to prevent information leakage
+          real_session=$(realpath "$latest_session" 2>/dev/null || true)
+          real_state=$(realpath "$STATE_DIR" 2>/dev/null || true)
+          if [[ -n "$real_session" && -n "$real_state" && "$real_session" == "$real_state"/* ]]; then
+            if cp "$latest_session" ../session.json; then
+              session_copied=1
+            else
+              echo "warning: session.json copy failed" >&2
             fi
+
+            # Copy structured logs from the state-dir session directory (if present).
+            session_id=$(basename "$(dirname "$latest_session")")
+            if [[ "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              for log_name in llm-io.jsonl eval.jsonl; do
+                log_src="$STATE_DIR/sessions/$session_id/logs/$log_name"
+                if [[ -f "$log_src" && ! -L "$log_src" ]]; then
+                  real_log=$(realpath "$log_src" 2>/dev/null || true)
+                  if [[ -n "$real_log" && "$real_log" == "$real_state"/* ]]; then
+                    cp "$log_src" "$RUN_DIR/logs/$log_name" || echo "warning: $log_name copy failed" >&2
+                  fi
+                fi
+              done
+            fi
+          else
+            echo "warning: session.json path outside STATE_DIR, skipping copy" >&2
           fi
         fi
-      else
-        echo "warning: session.json path outside STATE_DIR, skipping copy" >&2
-      fi
-    fi
 
-    # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
-    if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR"; then
-      META_WRITTEN=1
-    else
-      echo "warning: meta.json write failed" >&2
-    fi
+        # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
+        if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR"; then
+          META_WRITTEN=1
+        else
+          echo "warning: meta.json write failed" >&2
+        fi
 
-    # -------- analyze_run.py per-cell invocation (DR2-002, DR4-001) --------
-    # Absolute path + symlink check (DR4-001: prevent hijack from benchmark workdir)
-    ANALYZE_RUN="$REPO_ROOT/scripts/analyze_run.py"
-    extras_json="null"
-    if [[ -f "$ANALYZE_RUN" && ! -L "$ANALYZE_RUN" ]] && command -v python3 &>/dev/null; then
-      # python3 -I: isolated mode (no PYTHONPATH/sitecustomize from environment)
-      raw_json=$(python3 -I "$ANALYZE_RUN" "$RUN_DIR" 2>/dev/null || echo "null")
-      # jq -c: compact JSON + validate + whitelist fields (DR4-003: TSV/Markdown injection)
-      if command -v jq &>/dev/null; then
-        extras_json=$(printf '%s' "$raw_json" | jq -c '{
-          anvil_score: .anvil_score,
-          tool_call_count: .tool_call_total,
-          failure_kind: .failure_kind,
-          token_prompt: .token_prompt,
-          token_completion: .token_completion
-        }' 2>/dev/null || echo "null")
-      else
+        # -------- analyze_run.py per-cell invocation (DR2-002, DR4-001) --------
+        # Absolute path + symlink check (DR4-001: prevent hijack from benchmark workdir)
+        ANALYZE_RUN="$REPO_ROOT/scripts/analyze_run.py"
         extras_json="null"
-      fi
-    fi
+        if [[ -f "$ANALYZE_RUN" && ! -L "$ANALYZE_RUN" ]] && command -v python3 &>/dev/null; then
+          # python3 -I: isolated mode (no PYTHONPATH/sitecustomize from environment)
+          raw_json=$(python3 -I "$ANALYZE_RUN" "$RUN_DIR" 2>/dev/null || echo "null")
+          # jq -c: compact JSON + validate + whitelist fields (DR4-003: TSV/Markdown injection)
+          if command -v jq &>/dev/null; then
+            extras_json=$(printf '%s' "$raw_json" | jq -c '{
+              anvil_score: .anvil_score,
+              tool_call_count: .tool_call_total,
+              failure_kind: .failure_kind,
+              token_prompt: .token_prompt,
+              token_completion: .token_completion
+            }' 2>/dev/null || echo "null")
+          else
+            extras_json="null"
+          fi
+        fi
 
-    workdir_rel="$model_slug/run-$run/workdir"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$run" "$model" "$rc" "$elapsed" "$workdir_rel" "$session_copied" "$extras_json" \
-      >> "$BENCH_ROOT/summary.tsv"
-    RUN_LOGGED=1
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$run" "$model" "$case_name" "$pam_variant" "$rc" "$elapsed" \
+          "$workdir_rel" "$session_copied" "$extras_json" \
+          >> "$BENCH_ROOT/summary.tsv"
+        RUN_LOGGED=1
 
-    CURRENT_RUN_DIR=""
-    CURRENT_START_TS=""
-    cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
+        CURRENT_RUN_DIR=""
+        CURRENT_START_TS=""
+        cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
+      done
+    done
   done
 
   if [[ -n "$models_arg" ]]; then

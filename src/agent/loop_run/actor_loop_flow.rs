@@ -4037,6 +4037,10 @@ pub(super) fn run_actor_loop(
             agent.last_auto_promote_outcome.clone(),
             exit_reason.label(),
         );
+        record.pam_eval = agent
+            .last_pam_decision_this_turn
+            .as_ref()
+            .map(|decision| decision.to_eval_summary());
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }

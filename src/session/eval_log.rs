@@ -55,6 +55,11 @@ pub struct EvalRecord {
     pub verify_commands: Vec<String>,
     pub case_retrieval_result: Option<CaseRetrievalSummary>,
     pub photon_eval: Option<PhotonEvalSummary>,
+    /// Issue #857: turn-level PAM advisory impact summary. This intentionally
+    /// records categorical decision impact only; PAM context text and per-item
+    /// adoption reasons stay in `agent.memory.report.pam_decision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pam_eval: Option<PamEvalSummary>,
     /// Photon canary value (0-1000) recorded at turn time.
     /// 0 = disabled, 1000 = full traffic.
     #[serde(default)]
@@ -208,6 +213,23 @@ pub struct PhotonEvalSummary {
     /// skip_serializing_if = "Option::is_none")]` maintains backward compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_detail_emitted: Option<String>,
+}
+
+/// Issue #857: bounded eval-log projection of the PAM advisory decision.
+///
+/// `advisory_only=true` and `completion_judgement_override=false` are explicit
+/// audit fields: PAM can explain or filter prompt context, but it must not be
+/// terminal completion authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PamEvalSummary {
+    pub mode: String,
+    pub decision_type: String,
+    pub decision_types: Vec<String>,
+    pub actual_injected_count: u32,
+    pub suppressed_count: u32,
+    pub would_inject_in_live_count: u32,
+    pub advisory_only: bool,
+    pub completion_judgement_override: bool,
 }
 
 /// Issue #604 (Task 4.1 / DR2-007): 3-field flat summary attached to
@@ -388,6 +410,7 @@ pub fn build_eval_record(
         verify_commands,
         case_retrieval_result,
         photon_eval,
+        pam_eval: None,
         photon_canary: 0,
         auto_promote,
         terminal_diagnostics,
@@ -670,6 +693,7 @@ mod tests {
             verify_commands: vec!["cargo test".to_string()],
             case_retrieval_result: None,
             photon_eval: None,
+            pam_eval: None,
             photon_canary: 0,
             auto_promote: None,
             terminal_diagnostics: Some(build_terminal_diagnostics(
