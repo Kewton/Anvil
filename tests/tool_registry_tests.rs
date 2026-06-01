@@ -2,6 +2,7 @@ use std::fs;
 
 use anvil::modes::plan_act::{ExecutionMode, PlanStage};
 use anvil::tools::registry::{ToolContext, ToolRegistry};
+use anvil::util::workspace_paths::WorkspacePolicy;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -20,6 +21,7 @@ fn read_write_edit_glob_and_grep_work() {
         cancel_flag: None,
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     registry
@@ -59,6 +61,121 @@ fn read_write_edit_glob_and_grep_work() {
 }
 
 #[test]
+fn protected_workspace_metadata_is_hidden_from_normal_discovery() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("prompt.md"),
+        "build from these instructions",
+    )
+    .unwrap();
+    fs::write(dir.path().join("cmd.txt"), "anvil run").unwrap();
+    fs::write(dir.path().join("anvil.out"), "runtime log").unwrap();
+    fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+    fs::write(dir.path().join(".anvil/session.json"), "{}").unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        plan_stage: PlanStage::Stage1,
+        auto_approve: true,
+        interactive_approval: false,
+        offline: false,
+        cancel_flag: None,
+        tmp_tests_root: None,
+        tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
+    };
+
+    let listing = registry
+        .execute("Read", &json!({"path":"."}), &context)
+        .unwrap();
+    assert!(!listing.contains("prompt.md"), "got: {listing}");
+    assert!(!listing.contains("cmd.txt"), "got: {listing}");
+    assert!(!listing.contains("anvil.out"), "got: {listing}");
+    assert!(!listing.contains(".anvil"), "got: {listing}");
+    assert!(listing.contains("src"), "got: {listing}");
+
+    let globbed = registry
+        .execute("Glob", &json!({"pattern":"**/*"}), &context)
+        .unwrap();
+    assert!(!globbed.contains("prompt.md"), "got: {globbed}");
+    assert!(!globbed.contains("cmd.txt"), "got: {globbed}");
+    assert!(!globbed.contains("anvil.out"), "got: {globbed}");
+    assert!(!globbed.contains(".anvil"), "got: {globbed}");
+    assert!(globbed.contains("src/main.rs"), "got: {globbed}");
+
+    let grep = registry
+        .execute("Grep", &json!({"pattern":"runtime"}), &context)
+        .unwrap();
+    assert!(grep.is_empty(), "got: {grep}");
+}
+
+#[test]
+fn normal_task_rejects_v0430_style_first_reads_of_prompt_and_cmd() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("prompt.md"), "user prompt").unwrap();
+    fs::write(dir.path().join("cmd.txt"), "controller command").unwrap();
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        plan_stage: PlanStage::Stage1,
+        auto_approve: true,
+        interactive_approval: false,
+        offline: false,
+        cancel_flag: None,
+        tmp_tests_root: None,
+        tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
+    };
+
+    for path in ["prompt.md", "cmd.txt"] {
+        let err = registry
+            .execute("Read", &json!({"path": path}), &context)
+            .unwrap_err();
+        assert!(
+            err.contains("protected workspace metadata rejected Read"),
+            "got: {err}"
+        );
+    }
+}
+
+#[test]
+fn explicit_log_analysis_policy_can_read_protected_metadata() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("anvil.out"), "runtime log").unwrap();
+    let registry = ToolRegistry::default();
+    let context = ToolContext {
+        root: dir.path().to_path_buf(),
+        mode: ExecutionMode::Act,
+        plan_path: None,
+        plan_stage: PlanStage::Stage1,
+        auto_approve: true,
+        interactive_approval: false,
+        offline: false,
+        cancel_flag: None,
+        tmp_tests_root: None,
+        tester_active: false,
+        workspace_policy: WorkspacePolicy::allow_protected_metadata_reads(),
+    };
+
+    let read = registry
+        .execute("Read", &json!({"path":"anvil.out"}), &context)
+        .unwrap();
+    assert!(read.contains("runtime log"), "got: {read}");
+
+    let globbed = registry
+        .execute("Glob", &json!({"pattern":"anvil.out"}), &context)
+        .unwrap();
+    assert_eq!(globbed, "anvil.out");
+}
+
+#[test]
 fn edit_tool_salvages_token_anchor_drift() {
     let dir = tempdir().unwrap();
     let registry = ToolRegistry::default();
@@ -73,6 +190,7 @@ fn edit_tool_salvages_token_anchor_drift() {
         cancel_flag: None,
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     registry
@@ -118,6 +236,7 @@ fn plan_mode_only_allows_plan_file_writes() {
         cancel_flag: None,
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     registry
@@ -158,6 +277,7 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         cancel_flag: None,
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     registry
@@ -195,6 +315,7 @@ fn offline_mode_blocks_network_bash_commands() {
         cancel_flag: None,
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     let err = registry
@@ -222,6 +343,7 @@ fn offline_mode_allows_build_test_bash_commands() {
         cancel_flag: None,
         tmp_tests_root: None,
         tester_active: false,
+        workspace_policy: WorkspacePolicy::default(),
     };
 
     let result = registry

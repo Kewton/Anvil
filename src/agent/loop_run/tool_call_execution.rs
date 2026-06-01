@@ -108,8 +108,21 @@ fn protected_metadata_edit_policy_error(
         return None;
     }
     let raw_path = arguments.get("path").and_then(serde_json::Value::as_str)?;
+    if crate::tools::registry::resolve_plan_mode_write_target(
+        &agent.work_root,
+        raw_path,
+        agent.session.mode_state.active_plan_path.as_deref(),
+    )
+    .ok()
+    .flatten()
+    .is_some()
+    {
+        return None;
+    }
     let relative = workspace_relative_path_for_tool_arg(&agent.work_root, raw_path)?;
-    if !super::workspace_walk::is_protected_input_path(&relative) {
+    if !crate::util::workspace_paths::WorkspacePolicy::default()
+        .is_protected_input_relative_path(std::path::Path::new(&relative))
+    {
         return None;
     }
     Some(format!(
@@ -211,6 +224,10 @@ fn tool_context(
         cancel_flag,
         tmp_tests_root,
         tester_active: agent.tester_called_this_turn,
+        workspace_policy: super::workspace_access::active_request_text(agent)
+            .as_deref()
+            .map(crate::util::workspace_paths::WorkspacePolicy::for_task_request)
+            .unwrap_or_default(),
     }
 }
 

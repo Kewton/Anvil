@@ -2,20 +2,35 @@ use std::fs;
 use std::path::Path;
 
 use crate::tools::registry::truncate_output;
+use crate::util::workspace_paths::WorkspacePolicy;
 
 pub fn run(
+    root: &Path,
     path: &Path,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    workspace_policy: WorkspacePolicy,
 ) -> Result<String, String> {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let metadata =
         fs::metadata(path).map_err(|err| format!("failed to stat {}: {err}", path.display()))?;
     if metadata.is_dir() {
-        let mut entries = fs::read_dir(path)
-            .map_err(|err| format!("failed to list {}: {err}", path.display()))?
-            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().to_string()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| format!("failed to read dir {}: {err}", path.display()))?;
+        let mut entries = Vec::new();
+        for entry in
+            fs::read_dir(path).map_err(|err| format!("failed to list {}: {err}", path.display()))?
+        {
+            let entry =
+                entry.map_err(|err| format!("failed to read dir {}: {err}", path.display()))?;
+            let child = entry.path();
+            if let Ok(relative) = child
+                .strip_prefix(&canonical_root)
+                .or_else(|_| child.strip_prefix(root))
+                && !workspace_policy.allows_model_read_relative_path(relative)
+            {
+                continue;
+            }
+            entries.push(entry.file_name().to_string_lossy().to_string());
+        }
         entries.sort();
         return Ok(entries.join("\n"));
     }
