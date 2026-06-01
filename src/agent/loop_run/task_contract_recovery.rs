@@ -153,7 +153,7 @@ pub(super) fn task_contract_recovery_target(
         return Some(super::task_contract::RecoveryTargetHint {
             role,
             path: identity.path,
-            reason: "explicitly requested artifact identity is still missing".to_string(),
+            reason: "required artifact identity is still missing".to_string(),
         });
     }
     if let Some(path) = super::scaffold_pipeline::scaffold_candidate_for_missing_role(agent, role) {

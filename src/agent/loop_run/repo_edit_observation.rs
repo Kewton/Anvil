@@ -131,15 +131,23 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
     }
     agent
         .evidence_set_this_turn
-        .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
+        .push(super::completion_evidence::CompletionEvidence::RepoEdit {
+            category,
+            count: 1,
+            path: Some(relative_path.clone()),
+        });
     if super::task_contract::repo_edit_satisfies_artifact_recovery_target(
         category,
         &relative_path,
         agent.current_artifact_recovery_target.as_ref(),
     ) {
-        agent
-            .task_contract_evidence_set_this_turn
-            .push(super::completion_evidence::CompletionEvidence::RepoEdit { category, count: 1 });
+        agent.task_contract_evidence_set_this_turn.push(
+            super::completion_evidence::CompletionEvidence::RepoEdit {
+                category,
+                count: 1,
+                path: Some(relative_path.clone()),
+            },
+        );
         // Issue #636: capture bounded post-edit excerpt for the
         // current role so `plan_artifact_recovery` can assert that the
         // edit actually carries the requested behavior. Silent skip on

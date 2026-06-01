@@ -295,7 +295,7 @@ fn contract_required_role_has_current_artifact(
     }
     identities.iter().all(|identity| {
         facts.files.iter().any(|path| {
-            facts.edited_files.contains(path)
+            (role == ArtifactRole::Setup || facts.edited_files.contains(path))
                 && super::task_contract::normalized_artifact_path_eq(path, &identity.path)
                 && file_matches_role(work_root, path, role)
         })

@@ -816,6 +816,7 @@ mod tests {
         set.push(CE::RepoEdit {
             category: RepoEditCategory::Impl,
             count: 1,
+            path: None,
         });
         for kind in [
             ProtocolKind::Python,
@@ -943,6 +944,7 @@ mod tests {
         set.push(CE::RepoEdit {
             category: RepoEditCategory::Setup,
             count: 1,
+            path: None,
         });
         let ctx = setup_only_ctx();
         let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);

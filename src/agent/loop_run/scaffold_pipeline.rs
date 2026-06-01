@@ -57,7 +57,7 @@ use super::quality::{
     package_json_with_requested_port, react_dev_wrapper_for_requested_port,
 };
 use super::read_target_helpers::{last_read_tool_path, latest_turn_preferred_read_edit_target};
-use super::task_contract::{ArtifactRole, CompletionDecision};
+use super::task_contract::{ArtifactObligation, ArtifactRole, CompletionDecision};
 use super::tool_display::progress_path_display;
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
@@ -240,34 +240,44 @@ impl From<ScaffoldPlan> for DeterministicScaffoldSpec {
 
 pub(super) fn project_skeleton_plan_for_request(request: &str) -> Option<ScaffoldPlan> {
     let intent = ProjectIntent::from_request(request);
-    plan_project_skeleton(&intent)
+    let obligations = super::task_contract::explicit_artifact_obligations_from_request(request);
+    plan_project_skeleton_with_obligations(&intent, &obligations)
 }
 
-pub(super) fn plan_project_skeleton(intent: &ProjectIntent) -> Option<ScaffoldPlan> {
+fn plan_project_skeleton_with_obligations(
+    intent: &ProjectIntent,
+    obligations: &[ArtifactObligation],
+) -> Option<ScaffoldPlan> {
     match (intent.runtime?, intent.shape?) {
         (ProjectRuntime::Rust, ProjectShape::Cli) => Some(ScaffoldPlan {
             label: "Rust CLI scaffold",
             event: "agent.empty_workspace.deterministic_rust_cli",
             scaffold_kind: "Rust CLI",
-            files: rust_cli_skeleton_files(intent.wants_tests),
+            files: rust_cli_skeleton_files(rust_requested_impl_path(obligations, "src/main.rs")),
         }),
         (ProjectRuntime::Rust, ProjectShape::Library) => Some(ScaffoldPlan {
             label: "Rust library scaffold",
             event: "agent.empty_workspace.deterministic_rust_library",
             scaffold_kind: "Rust library",
-            files: rust_library_skeleton_files(intent.wants_tests),
+            files: rust_library_skeleton_files(rust_requested_impl_path(obligations, "src/lib.rs")),
         }),
         (ProjectRuntime::Node, ProjectShape::Cli) => Some(ScaffoldPlan {
             label: "Node CLI scaffold",
             event: "agent.empty_workspace.deterministic_node_cli",
             scaffold_kind: "Node CLI",
-            files: node_skeleton_files(ProjectShape::Cli, intent.wants_tests),
+            files: node_skeleton_files(
+                ProjectShape::Cli,
+                node_requested_impl_path(obligations, "src/index.js"),
+            ),
         }),
         (ProjectRuntime::Node, ProjectShape::Library) => Some(ScaffoldPlan {
             label: "Node library scaffold",
             event: "agent.empty_workspace.deterministic_node_library",
             scaffold_kind: "Node library",
-            files: node_skeleton_files(ProjectShape::Library, intent.wants_tests),
+            files: node_skeleton_files(
+                ProjectShape::Library,
+                node_requested_impl_path(obligations, "src/index.js"),
+            ),
         }),
     }
 }
@@ -307,23 +317,51 @@ fn contains_ascii_word_any(haystack: &str, tokens: &[&str]) -> bool {
         .any(|word| tokens.contains(&word))
 }
 
-fn rust_cli_skeleton_files(_wants_tests: bool) -> Vec<(PathBuf, String)> {
+fn rust_requested_impl_path(obligations: &[ArtifactObligation], default: &str) -> PathBuf {
+    obligations
+        .iter()
+        .find(|obligation| {
+            obligation.role == ArtifactRole::Implementation && obligation.path.ends_with(".rs")
+        })
+        .map(|obligation| PathBuf::from(&obligation.path))
+        .unwrap_or_else(|| PathBuf::from(default))
+}
+
+fn node_requested_impl_path(obligations: &[ArtifactObligation], default: &str) -> PathBuf {
+    obligations
+        .iter()
+        .find(|obligation| {
+            obligation.role == ArtifactRole::Implementation
+                && matches!(
+                    Path::new(&obligation.path)
+                        .extension()
+                        .and_then(|ext| ext.to_str()),
+                    Some("js" | "mjs" | "cjs" | "ts" | "tsx" | "jsx")
+                )
+        })
+        .map(|obligation| PathBuf::from(&obligation.path))
+        .unwrap_or_else(|| PathBuf::from(default))
+}
+
+fn rust_cli_skeleton_files(impl_path: PathBuf) -> Vec<(PathBuf, String)> {
+    let impl_path_display = impl_path.to_string_lossy().to_string();
     vec![
         (
             PathBuf::from("Cargo.toml"),
-            r#"[package]
+            format!(
+                r#"[package]
 name = "app"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
 name = "app"
-path = "src/main.rs"
+path = "{impl_path_display}"
 "#
-            .to_string(),
+            ),
         ),
         (
-            PathBuf::from("src/main.rs"),
+            impl_path,
             r#"use std::io::{self, Read};
 
 fn main() {
@@ -385,23 +423,25 @@ fn cli_accepts_stdin() {
     ]
 }
 
-fn rust_library_skeleton_files(_wants_tests: bool) -> Vec<(PathBuf, String)> {
+fn rust_library_skeleton_files(impl_path: PathBuf) -> Vec<(PathBuf, String)> {
+    let impl_path_display = impl_path.to_string_lossy().to_string();
     vec![
         (
             PathBuf::from("Cargo.toml"),
-            r#"[package]
+            format!(
+                r#"[package]
 name = "app"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 name = "app"
-path = "src/lib.rs"
+path = "{impl_path_display}"
 "#
-            .to_string(),
+            ),
         ),
         (
-            PathBuf::from("src/lib.rs"),
+            impl_path,
             r#"pub fn transform(input: &str) -> String {
     input.to_string()
 }
@@ -450,15 +490,23 @@ fn transform_passes_input_through_from_integration_test() {
     ]
 }
 
-fn node_skeleton_files(shape: ProjectShape, _wants_tests: bool) -> Vec<(PathBuf, String)> {
+fn node_test_import_path(impl_path: &Path) -> String {
+    format!("../{}", impl_path.to_string_lossy().replace('\\', "/"))
+}
+
+fn node_skeleton_files(shape: ProjectShape, impl_path: PathBuf) -> Vec<(PathBuf, String)> {
+    let impl_path_display = impl_path.to_string_lossy().replace('\\', "/");
     let bin_block = if shape == ProjectShape::Cli {
-        r#",
-  "bin": {
-    "app": "./src/index.js"
-  }"#
+        format!(
+            r#",
+  "bin": {{
+    "app": "./{impl_path_display}"
+  }}"#
+        )
     } else {
-        ""
+        String::new()
     };
+    let test_import_path = node_test_import_path(&impl_path);
     vec![
         (
             PathBuf::from("package.json"),
@@ -470,13 +518,14 @@ fn node_skeleton_files(shape: ProjectShape, _wants_tests: bool) -> Vec<(PathBuf,
   "type": "module",
   "scripts": {{
     "test": "node --test"
-  }}{bin_block}
+  }}{}
 }}
-"#
+"#,
+                bin_block
             ),
         ),
         (
-            PathBuf::from("src/index.js"),
+            impl_path,
             r#"#!/usr/bin/env node
 import { readFileSync } from "node:fs";
 
@@ -513,16 +562,17 @@ Replace the neutral `transform` implementation with the requested behavior.
         ),
         (
             PathBuf::from("tests/index.test.js"),
-            r#"import test from "node:test";
+            format!(
+                r#"import test from "node:test";
 import assert from "node:assert/strict";
 
-import { transform } from "../src/index.js";
+import {{ transform }} from "{test_import_path}";
 
-test("transform passes input through", () => {
+test("transform passes input through", () => {{
   assert.equal(transform("sample input"), "sample input");
-});
+}});
 "#
-            .to_string(),
+            ),
         ),
     ]
 }
@@ -2227,6 +2277,34 @@ mod tests {
         assert!(!paths.contains(&"src/main.rs".to_string()));
         assert!(!combined.contains("slug"));
         assert!(combined.contains("transform"));
+    }
+
+    #[test]
+    fn project_skeleton_uses_requested_rust_impl_obligation_path() {
+        let plan = project_skeleton_plan_for_request(
+            "Create a Rust CLI word counter in tools/word_count.rs",
+        )
+        .expect("rust cli plan");
+        let paths = file_paths(&plan);
+        let cargo_toml = file_content(&plan, "Cargo.toml");
+
+        assert!(paths.contains(&"tools/word_count.rs".to_string()));
+        assert!(!paths.contains(&"src/main.rs".to_string()));
+        assert!(cargo_toml.contains(r#"path = "tools/word_count.rs""#));
+    }
+
+    #[test]
+    fn project_skeleton_uses_requested_node_impl_obligation_path() {
+        let plan = project_skeleton_plan_for_request("Build a Node CLI at bin/formatter.js")
+            .expect("node cli plan");
+        let paths = file_paths(&plan);
+        let package_json = file_content(&plan, "package.json");
+        let test_file = file_content(&plan, "tests/index.test.js");
+
+        assert!(paths.contains(&"bin/formatter.js".to_string()));
+        assert!(!paths.contains(&"src/index.js".to_string()));
+        assert!(package_json.contains(r#""app": "./bin/formatter.js""#));
+        assert!(test_file.contains(r#"from "../bin/formatter.js""#));
     }
 
     #[test]
