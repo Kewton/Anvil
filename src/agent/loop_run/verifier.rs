@@ -137,6 +137,7 @@ impl Verifier for DataVerifier {
     }
 }
 
+#[allow(dead_code)]
 fn generic_verifier_failure_packet(
     command: &str,
     failure_kind: &str,
