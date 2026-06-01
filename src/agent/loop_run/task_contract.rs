@@ -1573,13 +1573,13 @@ fn infer_verification_requirement(
     }
     if matches!(
         shape,
-        ProjectShape::Documentation
-            | ProjectShape::Cli
-            | ProjectShape::Library
-            | ProjectShape::Api
-            | ProjectShape::WebApp
-    ) || request_asks_for_setup(request, lower)
-    {
+        ProjectShape::Cli | ProjectShape::Library | ProjectShape::Api | ProjectShape::WebApp
+    ) {
+        return VerificationRequirement::Required {
+            preferred_runner: preferred_runner_for_language(language),
+        };
+    }
+    if matches!(shape, ProjectShape::Documentation) || request_asks_for_setup(request, lower) {
         VerificationRequirement::ArtifactOnly
     } else {
         VerificationRequirement::NotRequired
@@ -2578,6 +2578,61 @@ mod tests {
     }
 
     #[test]
+    fn python_cli_main_py_only_requires_verifier_before_done() {
+        let contract = TaskContract::from_request("Create a Python CLI in main.py");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "main.py"));
+
+        assert!(contract.verification_required);
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Verify
+        );
+    }
+
+    #[test]
+    fn node_cli_package_json_only_does_not_satisfy_implementation() {
+        let contract = TaskContract::from_request("Create a Node CLI with package.json");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "package.json"));
+
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
+        assert_eq!(missing_labels(&decision), vec!["implementation"]);
+    }
+
+    #[test]
+    fn docs_only_readme_sections_do_not_require_verifier() {
+        let contract = TaskContract::from_request(
+            "Create README.md documentation with installation, usage, and verification sections.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        let artifacts = vec![ArtifactState::changed_at(
+            ArtifactRole::UsageDocs,
+            "README.md",
+        )];
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "# Usage\n\n## Installation\nInstall dependencies.\n\n## Run\nRun the CLI.\n\n## Verification\nRun checks.\n",
+        )]);
+        let repair_state = VerifierRepairState::None;
+
+        assert!(!contract.verification_required);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
     fn completion_policy_classifies_artifact_only_pytest_request() {
         let contract = TaskContract::from_request("pytest を実行してテストを通してください");
         assert_eq!(
@@ -2941,7 +2996,7 @@ mod tests {
 
         assert_eq!(
             contract.evaluate(&requested_paths),
-            CompletionDecision::Done
+            CompletionDecision::Verify
         );
     }
 

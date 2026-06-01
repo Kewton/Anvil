@@ -32,6 +32,7 @@ pub const MAX_EVAL_VERIFY_CMD_BYTES: usize = 4096;
 pub const MAX_PHOTON_EVAL_FIELD_BYTES: usize = 256;
 pub const MAX_PHOTON_EVAL_WARNINGS: usize = 8;
 pub const MAX_PHOTON_EVAL_WARNING_BYTES: usize = 512;
+pub const MAX_EVAL_COMPLETION_REASON_BYTES: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -80,6 +81,13 @@ pub struct EvalRecord {
     /// intentionally unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_diagnostics: Option<TerminalDiagnosticsSummary>,
+    /// Issue #866: bounded terminal reason for completion authority.
+    ///
+    /// For successful turns this explains which evidence class made `done`
+    /// admissible. For non-success terminal outcomes it mirrors the outcome
+    /// family so downstream evals do not need to infer completion authority
+    /// from free-text summaries.
+    pub completion_reason: String,
     pub final_outcome: String,
 }
 
@@ -435,6 +443,10 @@ pub fn build_eval_record_with_terminal_context(
         verify_commands.len(),
         last_failure_signature,
     ));
+    let completion_reason = truncate_bytes(
+        &completion_reason_for_eval(final_outcome, &changed_file_classes, verify_commands.len()),
+        MAX_EVAL_COMPLETION_REASON_BYTES,
+    );
 
     // Precautions: cap count
     let active_precautions: Vec<EvalPrecautionSnapshot> = active_precautions
@@ -463,6 +475,7 @@ pub fn build_eval_record_with_terminal_context(
         photon_canary: 0,
         auto_promote,
         terminal_diagnostics,
+        completion_reason,
         final_outcome: final_outcome.to_string(),
     }
 }
@@ -715,6 +728,28 @@ fn terminal_verifier_status(final_outcome: &str, verify_command_count: usize) ->
     }
 }
 
+fn completion_reason_for_eval(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    verify_command_count: usize,
+) -> String {
+    if final_outcome != "done" {
+        return final_outcome.to_string();
+    }
+    if verify_command_count > 0 {
+        return "verifier_evidence_satisfied".to_string();
+    }
+    let changed_count = changed_file_classes
+        .test
+        .saturating_add(changed_file_classes.impl_files)
+        .saturating_add(changed_file_classes.setup);
+    if changed_count > 0 {
+        "artifact_obligations_satisfied".to_string()
+    } else {
+        "answer_or_plan_completion".to_string()
+    }
+}
+
 fn obligation(
     id: &str,
     status: &str,
@@ -829,6 +864,7 @@ mod tests {
                 },
                 1,
             )),
+            completion_reason: "verifier_evidence_satisfied".to_string(),
             final_outcome: "done".to_string(),
         }
     }
@@ -866,6 +902,7 @@ mod tests {
         assert_eq!(rec.model, "qwen3:14b");
         assert_eq!(rec.tool_calls.len(), 1);
         assert_eq!(rec.final_outcome, "done");
+        assert_eq!(rec.completion_reason, "verifier_evidence_satisfied");
         assert_eq!(
             rec.terminal_diagnostics
                 .as_ref()
