@@ -336,6 +336,7 @@ pub(super) enum ActorLoopPlanToolFollowupOutcome {
 pub(super) struct ActorLoopCompletionArgs<'a, 'b> {
     pub(super) last_iter: usize,
     pub(super) final_reply: &'a str,
+    pub(super) task_contract_action: Option<&'a super::task_contract::ArtifactRecoveryAction>,
     pub(super) plan_progress_retries: &'b mut usize,
 }
 
@@ -1406,6 +1407,11 @@ pub(super) fn handle_actor_loop_completion(
             );
             return ActorLoopCompletionOutcome::Continue;
         }
+    }
+    if let Some((reason, error_text)) =
+        task_contract_action_completion_exit(args.task_contract_action)
+    {
+        return ActorLoopCompletionOutcome::Exit { reason, error_text };
     }
     ActorLoopCompletionOutcome::Done {
         final_prose: args.final_reply.to_string(),
@@ -3746,6 +3752,7 @@ pub(super) fn run_actor_loop(
             ActorLoopCompletionArgs {
                 last_iter,
                 final_reply: &final_reply,
+                task_contract_action: task_contract_action.as_ref(),
                 plan_progress_retries: &mut plan_progress_retries,
             },
         ) {
@@ -4666,6 +4673,26 @@ pub(super) fn task_contract_continue_requires_tool_recovery(
     ) && current_reply_tool_calls == 0
 }
 
+pub(super) fn task_contract_action_completion_exit(
+    action: Option<&super::task_contract::ArtifactRecoveryAction>,
+) -> Option<(ExitReason, String)> {
+    match action {
+        None | Some(super::task_contract::ArtifactRecoveryAction::Done) => None,
+        Some(
+            super::task_contract::ArtifactRecoveryAction::Continue { .. }
+            | super::task_contract::ArtifactRecoveryAction::RunVerifier
+            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
+        ) => Some((
+            ExitReason::MissingRepoEdits,
+            "task contract did not produce evidence-based completion".to_string(),
+        )),
+        Some(super::task_contract::ArtifactRecoveryAction::SafeStop { reason }) => {
+            let (exit_reason, _) = task_contract_verifier_safe_stop_mapping(*reason);
+            Some((exit_reason, exit_reason.default_error_text().to_string()))
+        }
+    }
+}
+
 pub(super) fn increment_artifact_completion_role_attempt(
     attempts: &mut HashMap<super::task_contract::ArtifactRole, usize>,
     role: super::task_contract::ArtifactRole,
@@ -4919,5 +4946,44 @@ pub(super) fn plan_phase_from_sections(
             PlanStage::Stage3 => "Approval review",
             PlanStage::Ready => "Approval review",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_contract_completion_gate_allows_only_done_or_no_contract() {
+        assert!(task_contract_action_completion_exit(None).is_none());
+        assert!(
+            task_contract_action_completion_exit(Some(
+                &super::super::task_contract::ArtifactRecoveryAction::Done
+            ))
+            .is_none()
+        );
+
+        let continue_action = super::super::task_contract::ArtifactRecoveryAction::Continue {
+            missing: vec![super::super::task_contract::ArtifactRole::Implementation],
+            target_hint: None,
+        };
+        let (reason, text) = task_contract_action_completion_exit(Some(&continue_action))
+            .expect("non-done contract action must block completion");
+        assert_eq!(reason, ExitReason::MissingRepoEdits);
+        assert!(text.contains("evidence-based completion"));
+    }
+
+    #[test]
+    fn task_contract_completion_gate_preserves_safe_stop_reason() {
+        let action = super::super::task_contract::ArtifactRecoveryAction::SafeStop {
+            reason: super::super::task_contract::SafeStopReason::VerifierMissing,
+        };
+        let (reason, text) = task_contract_action_completion_exit(Some(&action))
+            .expect("safe stop must terminate completion");
+        assert_eq!(reason, ExitReason::SafeStopVerifierMissing);
+        assert_eq!(
+            text,
+            ExitReason::SafeStopVerifierMissing.default_error_text()
+        );
     }
 }

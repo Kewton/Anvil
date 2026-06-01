@@ -97,6 +97,7 @@ fn r1_build_eval_record_round_trip() {
     assert_eq!(rec.changed_file_classes.test, 1);
     assert_eq!(rec.verify_commands, vec!["cargo build"]);
     assert!(rec.case_retrieval_result.is_none());
+    assert_eq!(rec.completion_reason, "verifier_evidence_satisfied");
     assert_eq!(rec.final_outcome, "done");
 }
 
@@ -419,6 +420,7 @@ fn r9_oversized_record_is_dropped() {
             },
             0,
         )),
+        completion_reason: "answer_or_plan_completion".to_string(),
         final_outcome: "done".to_string(),
     };
 
