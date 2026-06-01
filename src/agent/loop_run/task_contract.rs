@@ -21,6 +21,47 @@ impl ArtifactRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TaskKind {
+    Coding,
+    Docs,
+    Data,
+    Research,
+    Ops,
+}
+
+impl TaskKind {
+    #[cfg(test)]
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            TaskKind::Coding => "coding",
+            TaskKind::Docs => "docs",
+            TaskKind::Data => "data",
+            TaskKind::Research => "research",
+            TaskKind::Ops => "ops",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeliverableKind {
+    Code,
+    Tests,
+    UsageDocs,
+    Setup,
+    Data,
+    ResearchNotes,
+    OpsRunbook,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TaskDeliverable {
+    pub(super) kind: DeliverableKind,
+    pub(super) role: Option<ArtifactRole>,
+    pub(super) path: Option<String>,
+    pub(super) required_sections: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ArtifactObligation {
     pub(super) role: ArtifactRole,
@@ -106,6 +147,7 @@ pub(super) enum CompletionProjectIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CompletionPolicy {
+    pub(super) task_kind: TaskKind,
     pub(super) project_intent: CompletionProjectIntent,
     required_artifacts: Vec<ArtifactRole>,
     verification_required: bool,
@@ -114,6 +156,7 @@ pub(super) struct CompletionPolicy {
 
 impl CompletionPolicy {
     pub(super) fn from_contract_parts(
+        task_kind: TaskKind,
         intent: TaskIntent,
         required_artifacts: &[ArtifactRole],
         verification_required: bool,
@@ -125,6 +168,7 @@ impl CompletionPolicy {
             CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
         );
         Self {
+            task_kind,
             project_intent,
             required_artifacts: required_artifacts.to_vec(),
             verification_required: verification_required && !verifier_free_document_task,
@@ -140,6 +184,7 @@ impl CompletionPolicy {
 
     pub(super) fn legacy_generic_code() -> Self {
         Self {
+            task_kind: TaskKind::Coding,
             project_intent: CompletionProjectIntent::ImplWithoutTest,
             required_artifacts: Vec::new(),
             verification_required: false,
@@ -246,7 +291,9 @@ fn project_intent_from_required_artifacts(
 // trade-off analysis.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct TaskContract {
+    pub(super) task_kind: TaskKind,
     pub(super) intent: TaskIntent,
+    pub(super) deliverables: Vec<TaskDeliverable>,
     pub(super) required_artifacts: Vec<ArtifactRole>,
     pub(super) required_artifact_identities: Vec<ArtifactObligation>,
     pub(super) optional_artifacts: Vec<ArtifactRole>,
@@ -922,16 +969,26 @@ impl TaskContract {
         let asks_for_tests = request_asks_for_test_artifact(request, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
-        let mut required = Vec::new();
-        let mut optional = Vec::new();
-
-        if request_asks_for_implementation_artifact(
+        let task_kind = infer_task_kind(
             request,
             &lower,
+            intent,
             asks_for_tests,
             asks_for_usage_docs,
             asks_for_setup,
-        ) {
+        );
+        let mut required = Vec::new();
+        let mut optional = Vec::new();
+
+        if task_kind == TaskKind::Coding
+            && request_asks_for_implementation_artifact(
+                request,
+                &lower,
+                asks_for_tests,
+                asks_for_usage_docs,
+                asks_for_setup,
+            )
+        {
             required.push(ArtifactRole::Implementation);
         }
         if asks_for_tests {
@@ -969,6 +1026,13 @@ impl TaskContract {
         required.dedup();
         required_artifact_identities
             .sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
+        let deliverables = deliverables_from_contract_parts(
+            request,
+            task_kind,
+            &required,
+            &required_artifact_identities,
+            &optional,
+        );
 
         // Issue #635: build the deterministic behavior schema. The
         // existing `required_artifacts` gate above is the source of truth
@@ -978,13 +1042,16 @@ impl TaskContract {
         required_behavior.required_artifacts = None;
         required_behavior.verification = None;
         let completion_policy = CompletionPolicy::from_contract_parts(
+            task_kind,
             intent,
             &required,
             project_intent.verification_required(),
             &required_behavior,
         );
         Self {
+            task_kind,
             intent,
+            deliverables,
             required_artifacts: required,
             required_artifact_identities,
             optional_artifacts: optional,
@@ -1393,6 +1460,342 @@ fn missing_labels(decision: &CompletionDecision) -> Vec<&'static str> {
             SafeStopReason::VerifierMissing => vec!["verifier_missing"],
         },
     }
+}
+
+fn infer_task_kind(
+    request: &str,
+    lower: &str,
+    intent: TaskIntent,
+    asks_for_tests: bool,
+    asks_for_usage_docs: bool,
+    asks_for_setup: bool,
+) -> TaskKind {
+    let code_work = request_asks_for_code_work(request, lower);
+    let data_task = request_asks_for_data_task(request, lower);
+    let implementation_artifact = request_asks_for_implementation_artifact(
+        request,
+        lower,
+        asks_for_tests,
+        asks_for_usage_docs,
+        asks_for_setup,
+    );
+    if asks_for_tests {
+        return TaskKind::Coding;
+    }
+    if asks_for_usage_docs && !implementation_artifact {
+        return TaskKind::Docs;
+    }
+    if data_task && !request_has_explicit_coding_subject(request, lower) {
+        return TaskKind::Data;
+    }
+    if code_work {
+        return TaskKind::Coding;
+    }
+    if request_asks_for_research_task(request, lower, intent) {
+        return TaskKind::Research;
+    }
+    if request_asks_for_ops_task(request, lower) || asks_for_setup {
+        return TaskKind::Ops;
+    }
+    if asks_for_usage_docs {
+        return TaskKind::Docs;
+    }
+    TaskKind::Coding
+}
+
+fn deliverables_from_contract_parts(
+    request: &str,
+    task_kind: TaskKind,
+    required_artifacts: &[ArtifactRole],
+    required_artifact_identities: &[ArtifactObligation],
+    optional_artifacts: &[ArtifactRole],
+) -> Vec<TaskDeliverable> {
+    let mut deliverables = Vec::new();
+    for role in required_artifacts {
+        deliverables.push(deliverable_for_role(
+            request,
+            *role,
+            required_artifact_identities,
+            false,
+        ));
+    }
+    for role in optional_artifacts {
+        deliverables.push(deliverable_for_role(
+            request,
+            *role,
+            required_artifact_identities,
+            true,
+        ));
+    }
+    if deliverables.is_empty() {
+        deliverables.push(generic_task_deliverable(request, task_kind));
+    }
+    deliverables
+}
+
+fn deliverable_for_role(
+    request: &str,
+    role: ArtifactRole,
+    required_artifact_identities: &[ArtifactObligation],
+    optional: bool,
+) -> TaskDeliverable {
+    let path = required_artifact_identities
+        .iter()
+        .find(|identity| identity.role == role)
+        .map(|identity| identity.path.clone())
+        .or_else(|| default_deliverable_path(role).map(str::to_string));
+    TaskDeliverable {
+        kind: deliverable_kind_for_role(role),
+        role: Some(role),
+        path,
+        required_sections: if role == ArtifactRole::UsageDocs && !optional {
+            required_doc_sections_from_request(request)
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn generic_task_deliverable(request: &str, task_kind: TaskKind) -> TaskDeliverable {
+    match task_kind {
+        TaskKind::Docs => TaskDeliverable {
+            kind: DeliverableKind::UsageDocs,
+            role: Some(ArtifactRole::UsageDocs),
+            path: Some(default_docs_path_from_request(request)),
+            required_sections: required_doc_sections_from_request(request),
+        },
+        TaskKind::Data => TaskDeliverable {
+            kind: DeliverableKind::Data,
+            role: None,
+            path: explicit_path_with_data_extension(request),
+            required_sections: Vec::new(),
+        },
+        TaskKind::Research => TaskDeliverable {
+            kind: DeliverableKind::ResearchNotes,
+            role: None,
+            path: None,
+            required_sections: required_research_sections_from_request(request),
+        },
+        TaskKind::Ops => TaskDeliverable {
+            kind: DeliverableKind::OpsRunbook,
+            role: None,
+            path: None,
+            required_sections: required_ops_sections_from_request(request),
+        },
+        TaskKind::Coding => TaskDeliverable {
+            kind: DeliverableKind::Code,
+            role: Some(ArtifactRole::Implementation),
+            path: None,
+            required_sections: Vec::new(),
+        },
+    }
+}
+
+fn deliverable_kind_for_role(role: ArtifactRole) -> DeliverableKind {
+    match role {
+        ArtifactRole::Implementation => DeliverableKind::Code,
+        ArtifactRole::Test => DeliverableKind::Tests,
+        ArtifactRole::UsageDocs => DeliverableKind::UsageDocs,
+        ArtifactRole::Setup => DeliverableKind::Setup,
+    }
+}
+
+fn default_deliverable_path(role: ArtifactRole) -> Option<&'static str> {
+    match role {
+        ArtifactRole::UsageDocs => Some("README.md"),
+        ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup => None,
+    }
+}
+
+fn default_docs_path_from_request(request: &str) -> String {
+    explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .find(|identity| identity.role == ArtifactRole::UsageDocs)
+        .map(|identity| identity.path)
+        .unwrap_or_else(|| "README.md".to_string())
+}
+
+fn required_doc_sections_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut sections = Vec::new();
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["install", "setup", "getting started"])
+            || contains_any(request, &["インストール", "セットアップ", "導入"]),
+        "installation",
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["usage", "how to use", "examples", "example"])
+            || contains_any(request, &["使用方法", "使い方", "利用方法", "例"]),
+        "usage",
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["test method", "testing", "tests", "verify"])
+            || contains_any(request, &["テスト方法", "テスト", "検証"]),
+        "testing",
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["api", "endpoint", "reference", "configuration"])
+            || contains_any(request, &["API", "エンドポイント", "設定"]),
+        "reference",
+    );
+    if sections.is_empty() {
+        sections.push("overview".to_string());
+    }
+    sections
+}
+
+fn required_research_sections_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut sections = vec!["findings".to_string(), "sources".to_string()];
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["recommend", "compare", "tradeoff"])
+            || contains_any(request, &["比較", "推奨", "トレードオフ"]),
+        "recommendation",
+    );
+    sections
+}
+
+fn required_ops_sections_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut sections = Vec::new();
+    push_section_if(
+        &mut sections,
+        contains_any(
+            &lower,
+            &["runbook", "procedure", "checklist", "deploy", "deployment"],
+        ) || contains_any(request, &["手順", "チェックリスト", "デプロイ"]),
+        "procedure",
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["rollback", "restore"]) || contains_any(request, &["ロールバック"]),
+        "rollback",
+    );
+    if sections.is_empty() {
+        sections.push("procedure".to_string());
+    }
+    sections
+}
+
+fn push_section_if(sections: &mut Vec<String>, condition: bool, section: &str) {
+    if condition && !sections.iter().any(|existing| existing == section) {
+        sections.push(section.to_string());
+    }
+}
+
+fn request_asks_for_data_task(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "csv",
+            "jsonl",
+            "dataset",
+            "spreadsheet",
+            "data",
+            "etl",
+            "transform",
+            "clean data",
+            "summary.csv",
+        ],
+    ) || contains_any(request, &["データ", "CSV", "集計", "整形"])
+}
+
+fn request_has_explicit_coding_subject(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "api",
+            "backend",
+            "frontend",
+            "cli",
+            "library",
+            "module",
+            "script",
+            "service",
+            "component",
+            "rust",
+            "python",
+            "node",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "API",
+            "バックエンド",
+            "フロントエンド",
+            "CLI",
+            "ライブラリ",
+            "モジュール",
+            "スクリプト",
+            "Rust",
+            "Python",
+        ],
+    ) || mentions_stack_as_build_target(request, lower)
+        || contains_implementation_file_hint(lower)
+}
+
+fn request_asks_for_research_task(request: &str, lower: &str, intent: TaskIntent) -> bool {
+    matches!(intent, TaskIntent::Explain)
+        || contains_any(
+            lower,
+            &[
+                "research",
+                "investigate",
+                "compare",
+                "summarize",
+                "analysis",
+                "analyze",
+                "report",
+            ],
+        )
+        || contains_any(request, &["調査", "比較", "分析", "レポート"])
+}
+
+fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "deploy",
+            "deployment",
+            "rollback",
+            "runbook",
+            "incident",
+            "monitoring",
+            "checklist",
+            "release",
+            "operation",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "デプロイ",
+            "ロールバック",
+            "運用",
+            "監視",
+            "リリース",
+            "手順",
+        ],
+    )
+}
+
+fn explicit_path_with_data_extension(request: &str) -> Option<String> {
+    request
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
+        })
+        .find_map(|token| {
+            let path = normalize_explicit_artifact_path(token)?;
+            let ext = std::path::Path::new(&path)
+                .extension()
+                .and_then(|ext| ext.to_str())?
+                .to_ascii_lowercase();
+            matches!(ext.as_str(), "csv" | "json" | "jsonl" | "tsv").then_some(path)
+        })
 }
 
 fn infer_intent(request: &str, lower: &str) -> TaskIntent {
@@ -2125,6 +2528,9 @@ fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
             | "tsx"
             | "js"
             | "jsx"
+            | "csv"
+            | "tsv"
+            | "jsonl"
             | "md"
             | "mdx"
             | "txt"
@@ -2602,6 +3008,102 @@ mod tests {
             without_tests.completion_policy.project_intent,
             CompletionProjectIntent::ImplWithoutTest
         );
+    }
+
+    #[test]
+    fn task_contract_generates_generic_task_kinds_for_representative_prompts() {
+        let cases = [
+            (
+                "Implement a Rust library feature X and add tests",
+                TaskKind::Coding,
+                DeliverableKind::Code,
+            ),
+            (
+                "Update README.md with installation, usage, and testing sections",
+                TaskKind::Docs,
+                DeliverableKind::UsageDocs,
+            ),
+            (
+                "Clean data.csv and write summary.csv with grouped totals",
+                TaskKind::Data,
+                DeliverableKind::Data,
+            ),
+            (
+                "Research and compare local LLM options, include sources and a recommendation",
+                TaskKind::Research,
+                DeliverableKind::ResearchNotes,
+            ),
+            (
+                "Prepare a deployment runbook checklist with rollback steps",
+                TaskKind::Ops,
+                DeliverableKind::OpsRunbook,
+            ),
+        ];
+
+        for (request, task_kind, deliverable_kind) in cases {
+            let contract = TaskContract::from_request(request);
+            assert_eq!(contract.task_kind, task_kind, "request={request}");
+            assert_eq!(
+                contract.completion_policy.task_kind, task_kind,
+                "request={request}"
+            );
+            assert_eq!(
+                task_kind.label(),
+                contract.completion_policy.task_kind.label()
+            );
+            assert!(
+                contract
+                    .deliverables
+                    .iter()
+                    .any(|deliverable| deliverable.kind == deliverable_kind),
+                "request={request} deliverables={:?}",
+                contract.deliverables
+            );
+        }
+    }
+
+    #[test]
+    fn coding_task_that_requires_tests_records_test_obligation() {
+        let contract = TaskContract::from_request(
+            "Implement a Python slugify helper and add pytest tests for edge cases",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(
+            contract.deliverables.iter().any(|deliverable| {
+                deliverable.kind == DeliverableKind::Tests
+                    && deliverable.role == Some(ArtifactRole::Test)
+            }),
+            "deliverables={:?}",
+            contract.deliverables
+        );
+        assert!(contract.completion_policy.test_execution_required());
+    }
+
+    #[test]
+    fn docs_only_task_records_docs_path_and_required_sections() {
+        let contract = TaskContract::from_request(
+            "Update README.md with installation, usage, and testing sections",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        let docs = contract
+            .deliverables
+            .iter()
+            .find(|deliverable| deliverable.kind == DeliverableKind::UsageDocs)
+            .expect("docs deliverable");
+        assert_eq!(docs.path.as_deref(), Some("README.md"));
+        assert_eq!(
+            docs.required_sections,
+            vec![
+                "installation".to_string(),
+                "usage".to_string(),
+                "testing".to_string()
+            ]
+        );
+        assert_eq!(contract.completion_policy.task_kind, TaskKind::Docs);
     }
 
     #[test]
