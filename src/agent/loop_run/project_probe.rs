@@ -319,6 +319,10 @@ fn file_matches_role(work_root: &Path, relative_path: &str, role: ArtifactRole) 
                         Some("go.mod" | "pom.xml" | "Gemfile" | "composer.json")
                     ))
         }
+        ArtifactRole::DataOutput => matches!(
+            p.extension().and_then(|ext| ext.to_str()),
+            Some("csv" | "tsv" | "jsonl" | "ndjson" | "parquet")
+        ),
     }
 }
 

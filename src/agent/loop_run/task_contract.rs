@@ -8,6 +8,7 @@ pub(super) enum ArtifactRole {
     Test,
     UsageDocs,
     Setup,
+    DataOutput,
 }
 
 impl ArtifactRole {
@@ -17,6 +18,7 @@ impl ArtifactRole {
             ArtifactRole::Test => "test",
             ArtifactRole::UsageDocs => "usage_docs",
             ArtifactRole::Setup => "setup",
+            ArtifactRole::DataOutput => "data_output",
         }
     }
 }
@@ -43,6 +45,7 @@ impl TaskKind {
     }
 }
 
+#[allow(dead_code)] // Issue #864: generic deliverable variants are part of the model before every producer is wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliverableKind {
     Code,
@@ -52,6 +55,11 @@ pub(super) enum DeliverableKind {
     Data,
     ResearchNotes,
     OpsRunbook,
+    File,
+    Directory,
+    CommandOutput,
+    StructuredRecord,
+    ExternalReference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,9 +71,49 @@ pub(super) struct TaskDeliverable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StructuredRecordSchema {
+    pub(super) columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ArtifactObligation {
     pub(super) role: ArtifactRole,
+    pub(super) kind: DeliverableKind,
     pub(super) path: String,
+    pub(super) required_sections: Vec<String>,
+    pub(super) structured_record_schema: Option<StructuredRecordSchema>,
+}
+
+impl ArtifactObligation {
+    pub(super) fn file(role: ArtifactRole, path: impl Into<String>) -> Self {
+        Self {
+            role,
+            kind: DeliverableKind::File,
+            path: path.into(),
+            required_sections: Vec::new(),
+            structured_record_schema: None,
+        }
+    }
+
+    fn readme(path: impl Into<String>, required_sections: Vec<String>) -> Self {
+        Self {
+            role: ArtifactRole::UsageDocs,
+            kind: DeliverableKind::File,
+            path: path.into(),
+            required_sections,
+            structured_record_schema: None,
+        }
+    }
+
+    fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
+        Self {
+            role: ArtifactRole::DataOutput,
+            kind: DeliverableKind::StructuredRecord,
+            path: path.into(),
+            required_sections: Vec::new(),
+            structured_record_schema: Some(StructuredRecordSchema { columns }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,9 +277,17 @@ impl CompletionPolicy {
                 self.required_artifacts.is_empty() || self.required_artifacts.contains(&role)
             }
             CompletionProjectIntent::ImplWithTest => {
-                matches!(role, ArtifactRole::Implementation | ArtifactRole::Test)
+                matches!(
+                    role,
+                    ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::DataOutput
+                )
             }
-            CompletionProjectIntent::ImplWithoutTest => role == ArtifactRole::Implementation,
+            CompletionProjectIntent::ImplWithoutTest => {
+                matches!(
+                    role,
+                    ArtifactRole::Implementation | ArtifactRole::DataOutput
+                )
+            }
             CompletionProjectIntent::AnswerOnly => false,
         }
     }
@@ -651,6 +707,44 @@ fn usage_docs_marker_hit(lower: &str, needle: &str, token_boundary: bool) -> boo
     }
 }
 
+fn usage_docs_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
+    let section_obligations = contract
+        .required_identities_for_role(ArtifactRole::UsageDocs)
+        .into_iter()
+        .flat_map(|identity| identity.required_sections.iter())
+        .collect::<Vec<_>>();
+    if section_obligations.is_empty() {
+        return usage_docs_surface_satisfied(excerpt);
+    }
+    section_obligations.iter().all(|section| {
+        let lower = excerpt.to_ascii_lowercase();
+        let normalized = section.to_ascii_lowercase();
+        lower.contains(&format!("## {normalized}"))
+            || lower.contains(&format!("# {normalized}"))
+            || lower.contains(&normalized)
+    }) && usage_docs_surface_satisfied(excerpt)
+}
+
+fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
+    let schemas = contract
+        .required_identities_for_role(ArtifactRole::DataOutput)
+        .into_iter()
+        .filter_map(|identity| identity.structured_record_schema.as_ref())
+        .collect::<Vec<_>>();
+    if schemas.is_empty() {
+        return !excerpt.trim().is_empty();
+    }
+    schemas.iter().all(|schema| {
+        schema.columns.iter().all(|column| {
+            excerpt
+                .lines()
+                .next()
+                .is_some_and(|header| header.split(',').any(|cell| cell.trim() == column))
+                || excerpt.contains(column)
+        })
+    })
+}
+
 pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> ArtifactRecoveryAction {
     if matches!(inputs.contract.intent, TaskIntent::Explain) {
         return ArtifactRecoveryAction::Done;
@@ -666,7 +760,13 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     let verifier_passed = has_build_test_verifier(inputs.evidence);
     let mut missing = Vec::new();
     for role in &inputs.contract.required_artifacts {
-        if required_role_satisfied(inputs.contract, inputs.artifacts, &observed, *role) {
+        if required_role_satisfied(
+            inputs.contract,
+            inputs.evidence,
+            inputs.artifacts,
+            &observed,
+            *role,
+        ) {
             continue;
         }
         missing.push(*role);
@@ -706,8 +806,13 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
                 // brittle for multilingual prompts and for tests that express
                 // behavior through expected values rather than domain words.
                 ArtifactRole::Test => true,
-                ArtifactRole::UsageDocs => usage_docs_surface_satisfied(excerpt),
+                ArtifactRole::UsageDocs => {
+                    usage_docs_excerpt_satisfies_obligations(inputs.contract, excerpt)
+                }
                 ArtifactRole::Setup => true,
+                ArtifactRole::DataOutput => {
+                    structured_record_excerpt_satisfies_obligations(inputs.contract, excerpt)
+                }
             };
             if !covered {
                 let missing = vec![*role];
@@ -776,6 +881,7 @@ fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRo
 
 fn required_role_satisfied(
     contract: &TaskContract,
+    evidence: &EvidenceSet,
     artifacts: &[ArtifactState],
     observed: &[ArtifactRole],
     role: ArtifactRole,
@@ -784,9 +890,13 @@ fn required_role_satisfied(
     if identities.is_empty() {
         return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
     }
-    identities
-        .iter()
-        .all(|identity| artifact_identity_ready_for_verification(artifacts, identity))
+    if role == ArtifactRole::UsageDocs && observed.contains(&role) {
+        return true;
+    }
+    identities.iter().all(|identity| {
+        artifact_identity_ready_for_verification(artifacts, identity)
+            || artifact_identity_observed_in_evidence(evidence, identity)
+    })
 }
 
 fn artifact_identity_ready_for_verification(
@@ -816,6 +926,9 @@ fn required_role_satisfied_by_evidence(
     let identities = contract.required_identities_for_role(role);
     if identities.is_empty() {
         return observed_artifacts(evidence).contains(&role);
+    }
+    if role == ArtifactRole::UsageDocs && observed_artifacts(evidence).contains(&role) {
+        return true;
     }
     identities
         .iter()
@@ -891,6 +1004,7 @@ fn synthesized_missing_role_target_hint(
     let path = match role {
         ArtifactRole::Test => synthesized_test_target_path(artifacts)?,
         ArtifactRole::UsageDocs => "README.md".to_string(),
+        ArtifactRole::DataOutput => "output.csv".to_string(),
         ArtifactRole::Implementation | ArtifactRole::Setup => return None,
     };
     Some(RecoveryTargetHint {
@@ -969,6 +1083,7 @@ impl TaskContract {
         let asks_for_tests = request_asks_for_test_artifact(request, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
+        let asks_for_data_output = request_asks_for_data_output_artifact(&lower);
         let task_kind = infer_task_kind(
             request,
             &lower,
@@ -1004,10 +1119,20 @@ impl TaskContract {
                 optional.push(ArtifactRole::Setup);
             }
         }
+        if asks_for_data_output {
+            required.push(ArtifactRole::DataOutput);
+        }
 
         optional.sort();
         optional.dedup();
         let mut required_artifact_identities = explicit_artifact_obligations_from_request(request);
+        if asks_for_data_output
+            && required_artifact_identities
+                .iter()
+                .any(|identity| identity.role == ArtifactRole::DataOutput)
+        {
+            required.push(ArtifactRole::DataOutput);
+        }
         required_artifact_identities.retain(|identity| required.contains(&identity.role));
         for identity in
             inferred_artifact_obligations_from_project_intent(&project_intent, &required)
@@ -1015,12 +1140,16 @@ impl TaskContract {
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
-            if !required_artifact_identities
-                .iter()
-                .any(|existing| existing.role == identity.role && existing.path == identity.path)
-            {
-                required_artifact_identities.push(identity);
+            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+        }
+        for identity in inferred_docs_obligations_from_request(&lower, &required) {
+            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+        }
+        for identity in inferred_data_obligations_from_request(request, &lower) {
+            if !required.contains(&identity.role) {
+                required.push(identity.role);
             }
+            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
         required.sort();
         required.dedup();
@@ -1597,12 +1726,14 @@ fn deliverable_kind_for_role(role: ArtifactRole) -> DeliverableKind {
         ArtifactRole::Test => DeliverableKind::Tests,
         ArtifactRole::UsageDocs => DeliverableKind::UsageDocs,
         ArtifactRole::Setup => DeliverableKind::Setup,
+        ArtifactRole::DataOutput => DeliverableKind::StructuredRecord,
     }
 }
 
 fn default_deliverable_path(role: ArtifactRole) -> Option<&'static str> {
     match role {
         ArtifactRole::UsageDocs => Some("README.md"),
+        ArtifactRole::DataOutput => Some("output.csv"),
         ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup => None,
     }
 }
@@ -2415,6 +2546,24 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
             .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
+fn request_asks_for_data_output_artifact(lower: &str) -> bool {
+    contains_any(lower, &["csv", "tsv", "jsonl", "ndjson"])
+        && contains_any(
+            lower,
+            &[
+                "output", "export", "generate", "produce", "write", "schema", "column", "columns",
+                "出力", "列",
+            ],
+        )
+}
+
+fn default_readme_required_sections() -> Vec<String> {
+    ["setup", "usage", "test"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 fn inferred_artifact_obligations_from_project_intent(
     project_intent: &ProjectIntent,
     required_artifacts: &[ArtifactRole],
@@ -2426,17 +2575,169 @@ fn inferred_artifact_obligations_from_project_intent(
     if !matches!(shape, ProjectShape::Cli | ProjectShape::Library) {
         return Vec::new();
     }
+    let mut obligations = Vec::new();
     match project_intent.language.unwrap_or(ProjectLanguage::Unknown) {
-        ProjectLanguage::Rust => vec![ArtifactObligation {
-            role: ArtifactRole::Setup,
-            path: "Cargo.toml".to_string(),
-        }],
-        ProjectLanguage::Node => vec![ArtifactObligation {
-            role: ArtifactRole::Setup,
-            path: "package.json".to_string(),
-        }],
-        ProjectLanguage::Python | ProjectLanguage::Docs | ProjectLanguage::Unknown => Vec::new(),
+        ProjectLanguage::Rust => {
+            obligations.push(ArtifactObligation::file(ArtifactRole::Setup, "Cargo.toml"));
+        }
+        ProjectLanguage::Node => {
+            obligations.push(ArtifactObligation::file(
+                ArtifactRole::Setup,
+                "package.json",
+            ));
+            if matches!(shape, ProjectShape::Cli) {
+                obligations.push(ArtifactObligation::file(
+                    ArtifactRole::Implementation,
+                    "src/index.js",
+                ));
+                if required_artifacts.contains(&ArtifactRole::Test) {
+                    obligations.push(ArtifactObligation::file(
+                        ArtifactRole::Test,
+                        "tests/index.test.js",
+                    ));
+                }
+                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
+                    obligations.push(ArtifactObligation::readme(
+                        "README.md",
+                        default_readme_required_sections(),
+                    ));
+                }
+            }
+        }
+        ProjectLanguage::Python => {
+            if matches!(shape, ProjectShape::Cli) {
+                obligations.push(ArtifactObligation::file(
+                    ArtifactRole::Implementation,
+                    "main.py",
+                ));
+                if required_artifacts.contains(&ArtifactRole::Test) {
+                    obligations.push(ArtifactObligation::file(
+                        ArtifactRole::Test,
+                        "tests/test_main.py",
+                    ));
+                }
+                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
+                    obligations.push(ArtifactObligation::readme(
+                        "README.md",
+                        default_readme_required_sections(),
+                    ));
+                }
+            }
+        }
+        ProjectLanguage::Docs | ProjectLanguage::Unknown => {}
     }
+    obligations
+}
+
+fn push_or_merge_artifact_obligation(
+    obligations: &mut Vec<ArtifactObligation>,
+    incoming: ArtifactObligation,
+) {
+    let Some(existing) = obligations
+        .iter_mut()
+        .find(|existing| existing.role == incoming.role && existing.path == incoming.path)
+    else {
+        obligations.push(incoming);
+        return;
+    };
+    if existing.kind == DeliverableKind::File && incoming.kind != DeliverableKind::File {
+        existing.kind = incoming.kind;
+    }
+    if existing.required_sections.is_empty() && !incoming.required_sections.is_empty() {
+        existing.required_sections = incoming.required_sections;
+    }
+    if existing.structured_record_schema.is_none() {
+        existing.structured_record_schema = incoming.structured_record_schema;
+    }
+}
+
+fn inferred_docs_obligations_from_request(
+    lower: &str,
+    required_artifacts: &[ArtifactRole],
+) -> Vec<ArtifactObligation> {
+    if !required_artifacts.contains(&ArtifactRole::UsageDocs)
+        || !lower.contains("readme")
+        || !lower.contains("section")
+    {
+        return Vec::new();
+    }
+    let mut sections = Vec::new();
+    if contains_any(lower, &["setup", "install", "dependency", "dependencies"]) {
+        sections.push("setup".to_string());
+    }
+    if contains_any(
+        lower,
+        &["usage", "run", "example", "使い方", "実行", "使用"],
+    ) {
+        sections.push("usage".to_string());
+    }
+    if contains_any(lower, &["test", "verify", "verification", "テスト", "検証"]) {
+        sections.push("test".to_string());
+    }
+    if lower.contains("section") && sections.is_empty() {
+        sections = default_readme_required_sections();
+    }
+    if sections.is_empty() {
+        return Vec::new();
+    }
+    vec![ArtifactObligation::readme("README.md", sections)]
+}
+
+fn inferred_data_obligations_from_request(request: &str, lower: &str) -> Vec<ArtifactObligation> {
+    if !request_asks_for_data_output_artifact(lower) {
+        return Vec::new();
+    }
+    let explicit_output = explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .find(|identity| identity.role == ArtifactRole::DataOutput)
+        .map(|identity| identity.path);
+    let path = explicit_output.unwrap_or_else(|| {
+        if lower.contains("tsv") {
+            "output.tsv".to_string()
+        } else if lower.contains("jsonl") || lower.contains("ndjson") {
+            "output.jsonl".to_string()
+        } else {
+            "output.csv".to_string()
+        }
+    });
+    vec![ArtifactObligation::structured_record(
+        path,
+        extract_required_columns_from_request(request),
+    )]
+}
+
+fn extract_required_columns_from_request(request: &str) -> Vec<String> {
+    let Some(start) = request.to_ascii_lowercase().find("column") else {
+        return Vec::new();
+    };
+    let tail = &request[start..];
+    let window = tail
+        .split(['.', '\n', ';'])
+        .next()
+        .unwrap_or(tail)
+        .replace(['`', '"', '\''], " ");
+    let mut columns = Vec::new();
+    for raw in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')) {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "column" | "columns" | "with" | "and" | "or" | "as" | "the" | "a" | "an"
+        ) {
+            continue;
+        }
+        if matches!(lower.as_str(), "from" | "for" | "in" | "into") {
+            break;
+        }
+        if columns.iter().any(|existing| existing == token) {
+            continue;
+        }
+        columns.push(token.to_string());
+    }
+    columns
 }
 
 pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<ArtifactObligation> {
@@ -2456,7 +2757,7 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
             .iter()
             .any(|existing: &ArtifactObligation| existing.role == role && existing.path == path)
         {
-            obligations.push(ArtifactObligation { role, path });
+            obligations.push(ArtifactObligation::file(role, path));
         }
     }
     obligations.sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
@@ -2540,6 +2841,11 @@ fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
             | "yaml"
             | "yml"
             | "lock"
+            | "csv"
+            | "tsv"
+            | "jsonl"
+            | "ndjson"
+            | "parquet"
     );
     recognized.then_some(path)
 }
@@ -2595,6 +2901,7 @@ pub(super) fn role_from_repo_edit(category: RepoEditCategory) -> Option<Artifact
         RepoEditCategory::Test => Some(ArtifactRole::Test),
         RepoEditCategory::Docs => Some(ArtifactRole::UsageDocs),
         RepoEditCategory::Setup => Some(ArtifactRole::Setup),
+        RepoEditCategory::Data => Some(ArtifactRole::DataOutput),
         RepoEditCategory::Other => None,
     }
 }
@@ -2814,6 +3121,9 @@ fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
             "Write or Edit the usage documentation artifact with concrete setup, run, API or CLI usage, and test commands"
         }
         ArtifactRole::Setup => "Write the missing setup/dependency file only if it is not present",
+        ArtifactRole::DataOutput => {
+            "Write or Edit the required data output file with the requested schema and columns"
+        }
     }
 }
 
@@ -2857,6 +3167,18 @@ mod tests {
             command: "pytest tests/test_x.py".to_string(),
             bound_test_artifacts_count: Some(bound_count),
         }
+    }
+
+    fn required_obligation<'a>(
+        contract: &'a TaskContract,
+        role: ArtifactRole,
+        path: &str,
+    ) -> &'a ArtifactObligation {
+        contract
+            .required_artifact_identities
+            .iter()
+            .find(|identity| identity.role == role && identity.path == path)
+            .unwrap_or_else(|| panic!("missing obligation role={role:?} path={path}"))
     }
 
     #[test]
@@ -2926,6 +3248,63 @@ mod tests {
         assert!(contract.verification_required);
         assert!(contract.required_behavior.required_artifacts.is_none());
         assert!(contract.required_behavior.verification.is_none());
+    }
+
+    #[test]
+    fn node_cli_contract_tracks_required_deliverables_separately() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json, implementation, tests, and README.md.",
+        );
+
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Setup, "package.json").kind,
+            DeliverableKind::File
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Implementation, "src/index.js").kind,
+            DeliverableKind::File
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Test, "tests/index.test.js").kind,
+            DeliverableKind::File
+        );
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+        assert_eq!(readme.kind, DeliverableKind::File);
+        assert_eq!(readme.required_sections, default_readme_required_sections());
+    }
+
+    #[test]
+    fn python_cli_main_py_alone_leaves_tests_and_readme_missing() {
+        let contract = TaskContract::from_request(
+            "Create a Python CLI in main.py with tests and README.md usage docs.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "main.py"));
+        let artifacts = vec![ArtifactState::exists(
+            ArtifactRole::Implementation,
+            "main.py",
+        )];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Test, ArtifactRole::UsageDocs],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/test_main.py".to_string(),
+                    reason: "required artifact identity is still missing".to_string(),
+                }),
+            }
+        );
     }
 
     #[test]
@@ -3259,10 +3638,10 @@ mod tests {
         assert!(
             contract
                 .required_artifact_identities
-                .contains(&ArtifactObligation {
-                    role: ArtifactRole::Implementation,
-                    path: "lru_cache.py".to_string(),
-                })
+                .contains(&ArtifactObligation::file(
+                    ArtifactRole::Implementation,
+                    "lru_cache.py",
+                ))
         );
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit(RepoEditCategory::Impl));
@@ -3330,10 +3709,7 @@ mod tests {
         assert!(
             contract
                 .required_artifact_identities
-                .contains(&ArtifactObligation {
-                    role: ArtifactRole::Setup,
-                    path: "Cargo.toml".to_string(),
-                })
+                .contains(&ArtifactObligation::file(ArtifactRole::Setup, "Cargo.toml"))
         );
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/main.rs"));
@@ -3370,10 +3746,10 @@ mod tests {
         assert!(
             contract
                 .required_artifact_identities
-                .contains(&ArtifactObligation {
-                    role: ArtifactRole::Setup,
-                    path: "package.json".to_string(),
-                })
+                .contains(&ArtifactObligation::file(
+                    ArtifactRole::Setup,
+                    "package.json"
+                ))
         );
         let evidence = EvidenceSet::new();
         let artifacts = vec![ArtifactState::exists(
@@ -3747,6 +4123,100 @@ mod tests {
             map.insert(*role, (*body).to_string());
         }
         map
+    }
+
+    #[test]
+    fn docs_only_readme_required_sections_are_validated() {
+        let contract =
+            TaskContract::from_request("Update README.md with setup, usage, and test sections.");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        let repair_state = VerifierRepairState::None;
+
+        let weak = build_excerpts(&[(ArtifactRole::UsageDocs, "# Project\n\n## Setup\ninstall\n")]);
+        assert!(matches!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &[],
+                repair_state: &repair_state,
+                artifact_excerpts: &weak,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing,
+                ..
+            } if missing == vec![ArtifactRole::UsageDocs]
+        ));
+
+        let complete = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "# Project\n\n## Setup\ninstall\n\n## Usage\nrun it\n\n## Test\npytest\n",
+        )]);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &[],
+                repair_state: &repair_state,
+                artifact_excerpts: &complete,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn data_task_tracks_output_file_columns_as_structured_record_obligation() {
+        let contract = TaskContract::from_request(
+            "Generate output.csv with columns Category and Total from the input CSV.",
+        );
+        let obligation = required_obligation(&contract, ArtifactRole::DataOutput, "output.csv");
+        assert_eq!(obligation.kind, DeliverableKind::StructuredRecord);
+        assert_eq!(
+            obligation
+                .structured_record_schema
+                .as_ref()
+                .map(|schema| schema.columns.as_slice()),
+            Some(["Category".to_string(), "Total".to_string()].as_slice())
+        );
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
+        let repair_state = VerifierRepairState::None;
+        let wrong_columns = build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
+        assert!(matches!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &[],
+                repair_state: &repair_state,
+                artifact_excerpts: &wrong_columns,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing,
+                ..
+            } if missing == vec![ArtifactRole::DataOutput]
+        ));
+
+        let matching_columns =
+            build_excerpts(&[(ArtifactRole::DataOutput, "Category,Total\nA,1\n")]);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &[],
+                repair_state: &repair_state,
+                artifact_excerpts: &matching_columns,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
+        );
     }
 
     #[test]

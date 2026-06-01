@@ -1130,6 +1130,7 @@ pub fn classify_repo_edit_path_for_test(path: &std::path::Path) -> &'static str 
         RepoEditCategory::Test => "test",
         RepoEditCategory::Docs => "docs",
         RepoEditCategory::Setup => "setup",
+        RepoEditCategory::Data => "data",
         RepoEditCategory::Other => "other",
     }
 }

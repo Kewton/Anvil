@@ -105,6 +105,7 @@ pub(super) fn sort_admitted_by_authority_role_priority(
                 super::task_contract::ArtifactRole::Implementation => 1,
                 super::task_contract::ArtifactRole::UsageDocs => 2,
                 super::task_contract::ArtifactRole::Setup => 3,
+                super::task_contract::ArtifactRole::DataOutput => 4,
             };
         }
         if matches!(
@@ -117,6 +118,7 @@ pub(super) fn sort_admitted_by_authority_role_priority(
                 super::task_contract::ArtifactRole::Implementation => 1,
                 super::task_contract::ArtifactRole::UsageDocs => 2,
                 super::task_contract::ArtifactRole::Test => 3,
+                super::task_contract::ArtifactRole::DataOutput => 4,
             };
         }
         if matches!(
@@ -130,6 +132,7 @@ pub(super) fn sort_admitted_by_authority_role_priority(
                     super::task_contract::ArtifactRole::Test => 1,
                     super::task_contract::ArtifactRole::UsageDocs => 2,
                     super::task_contract::ArtifactRole::Setup => 3,
+                    super::task_contract::ArtifactRole::DataOutput => 4,
                 },
                 super::spec_authority::SpecAuthority::VerifiedPublicInterface
                 | super::spec_authority::SpecAuthority::ImplementationContract
@@ -138,6 +141,7 @@ pub(super) fn sort_admitted_by_authority_role_priority(
                     super::task_contract::ArtifactRole::Implementation => 1,
                     super::task_contract::ArtifactRole::UsageDocs => 2,
                     super::task_contract::ArtifactRole::Setup => 3,
+                    super::task_contract::ArtifactRole::DataOutput => 4,
                 },
             };
         }
@@ -146,6 +150,7 @@ pub(super) fn sort_admitted_by_authority_role_priority(
             super::task_contract::ArtifactRole::UsageDocs => 1,
             super::task_contract::ArtifactRole::Setup => 2,
             super::task_contract::ArtifactRole::Test => 3,
+            super::task_contract::ArtifactRole::DataOutput => 4,
         }
     };
     admitted.sort_by(|a, b| {

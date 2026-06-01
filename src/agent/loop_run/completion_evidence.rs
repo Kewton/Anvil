@@ -63,6 +63,7 @@ pub(crate) enum RepoEditCategory {
     Test,
     Docs,
     Setup,
+    Data,
     Other,
 }
 
@@ -168,6 +169,9 @@ pub(crate) fn classify_repo_edit_path<P: AsRef<Path>>(path: P) -> RepoEditCatego
     if has_docs_extension(path) {
         return RepoEditCategory::Docs;
     }
+    if has_structured_data_extension(path) {
+        return RepoEditCategory::Data;
+    }
     if is_implementation_file(path) {
         return RepoEditCategory::Impl;
     }
@@ -185,6 +189,13 @@ fn has_docs_extension(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some("md" | "mdx" | "txt" | "rst")
+    )
+}
+
+fn has_structured_data_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("csv" | "tsv" | "jsonl" | "ndjson" | "parquet")
     )
 }
 
@@ -374,6 +385,18 @@ mod tests {
         assert_eq!(
             classify_repo_edit_path(PathBuf::from("notes.txt")),
             RepoEditCategory::Docs
+        );
+    }
+
+    #[test]
+    fn repo_edit_category_classifies_structured_data_path() {
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("output.csv")),
+            RepoEditCategory::Data
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("reports/summary.jsonl")),
+            RepoEditCategory::Data
         );
     }
 

@@ -806,6 +806,10 @@ fn role_matches_path(role: ArtifactRole, path: &str) -> bool {
         // injection vector we guard against here.
         ArtifactRole::Implementation => !is_test_file(p) && !is_setup_file(p),
         ArtifactRole::UsageDocs => !is_test_file(p) && !is_setup_file(p),
+        ArtifactRole::DataOutput => matches!(
+            p.extension().and_then(|ext| ext.to_str()),
+            Some("csv" | "tsv" | "jsonl" | "ndjson" | "parquet")
+        ),
     }
 }
 
@@ -1033,6 +1037,9 @@ mod tests {
                         super::super::task_contract::DeliverableKind::UsageDocs
                     }
                     ArtifactRole::Setup => super::super::task_contract::DeliverableKind::Setup,
+                    ArtifactRole::DataOutput => {
+                        super::super::task_contract::DeliverableKind::StructuredRecord
+                    }
                 },
                 role: Some(role),
                 path: None,
