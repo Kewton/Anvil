@@ -13,18 +13,22 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkspaceFileClass {
-    ProjectArtifact,
-    ProtectedInputMetadata,
+    UserDeliverable,
+    ProtectedInput,
     GeneratedMetadata,
 }
 
 pub(super) fn workspace_appears_empty(work_root: &Path) -> bool {
-    !workspace_contains_project_artifact(work_root, work_root).unwrap_or(true)
+    !workspace_contains_user_deliverable(work_root, work_root).unwrap_or(true)
 }
 
-pub(super) fn is_protected_input_metadata_path(relative_path: &str) -> bool {
+pub(super) fn is_protected_input_path(relative_path: &str) -> bool {
+    classify_workspace_relative_path(Path::new(relative_path)) == WorkspaceFileClass::ProtectedInput
+}
+
+pub(super) fn is_user_deliverable_path(relative_path: &str) -> bool {
     classify_workspace_relative_path(Path::new(relative_path))
-        == WorkspaceFileClass::ProtectedInputMetadata
+        == WorkspaceFileClass::UserDeliverable
 }
 
 pub(super) fn classify_workspace_relative_path(relative: &Path) -> WorkspaceFileClass {
@@ -37,22 +41,31 @@ pub(super) fn classify_workspace_relative_path(relative: &Path) -> WorkspaceFile
         return WorkspaceFileClass::GeneratedMetadata;
     }
     let Some(name) = top_level_file_name(relative) else {
-        return WorkspaceFileClass::ProjectArtifact;
+        return WorkspaceFileClass::UserDeliverable;
     };
     let lower = name.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
         "prompt.md" | "prompt.txt" | "cmd.txt" | "command.txt"
     ) {
-        return WorkspaceFileClass::ProtectedInputMetadata;
+        return WorkspaceFileClass::ProtectedInput;
     }
     if matches!(
         lower.as_str(),
-        "anvil.md" | "session.json" | "meta.json" | "metadata.json" | "llm-io.jsonl" | "log.jsonl"
+        "anvil.md"
+            | "session.json"
+            | "meta.json"
+            | "metadata.json"
+            | "llm-io.jsonl"
+            | "log.jsonl"
+            | "anvil.out"
+            | "anvil.err"
+            | "postcheck.out"
+            | "postcheck.err"
     ) {
         return WorkspaceFileClass::GeneratedMetadata;
     }
-    WorkspaceFileClass::ProjectArtifact
+    WorkspaceFileClass::UserDeliverable
 }
 
 fn first_component_name(relative: &Path) -> Option<&str> {
@@ -71,7 +84,7 @@ fn top_level_file_name(relative: &Path) -> Option<&str> {
     components.next().is_none().then_some(first)
 }
 
-fn workspace_contains_project_artifact(root: &Path, current: &Path) -> std::io::Result<bool> {
+fn workspace_contains_user_deliverable(root: &Path, current: &Path) -> std::io::Result<bool> {
     let Ok(entries) = std::fs::read_dir(current) else {
         return Ok(true);
     };
@@ -86,14 +99,14 @@ fn workspace_contains_project_artifact(root: &Path, current: &Path) -> std::io::
             continue;
         };
         if file_type.is_dir() {
-            if workspace_contains_project_artifact(root, &path)? {
+            if workspace_contains_user_deliverable(root, &path)? {
                 return Ok(true);
             }
             continue;
         }
         if (file_type.is_file() || file_type.is_symlink())
             && let Ok(relative) = path.strip_prefix(root)
-            && classify_workspace_relative_path(relative) == WorkspaceFileClass::ProjectArtifact
+            && classify_workspace_relative_path(relative) == WorkspaceFileClass::UserDeliverable
         {
             return Ok(true);
         }
@@ -129,7 +142,7 @@ fn collect_meaningful_workspace_files(
             collect_meaningful_workspace_files(root, &path, limit, files)?;
         } else if path.is_file()
             && let Ok(relative) = path.strip_prefix(root)
-            && classify_workspace_relative_path(relative) == WorkspaceFileClass::ProjectArtifact
+            && classify_workspace_relative_path(relative) == WorkspaceFileClass::UserDeliverable
         {
             files.push(relative.to_path_buf());
             if files.len() > limit {
@@ -150,6 +163,10 @@ mod tests {
         let temp = tempdir().unwrap();
         std::fs::write(temp.path().join("prompt.md"), "build a Rust CLI\n").unwrap();
         std::fs::write(temp.path().join("cmd.txt"), "cargo test\n").unwrap();
+        std::fs::write(temp.path().join("anvil.out"), "controller stdout\n").unwrap();
+        std::fs::write(temp.path().join("anvil.err"), "controller stderr\n").unwrap();
+        std::fs::write(temp.path().join("postcheck.out"), "postcheck stdout\n").unwrap();
+        std::fs::write(temp.path().join("postcheck.err"), "postcheck stderr\n").unwrap();
         std::fs::write(temp.path().join("session.json"), "{}\n").unwrap();
         std::fs::write(temp.path().join("meta.json"), "{}\n").unwrap();
         std::fs::create_dir_all(temp.path().join("logs")).unwrap();
@@ -168,6 +185,8 @@ mod tests {
         std::fs::write(temp.path().join("prompt.txt"), "task\n").unwrap();
         std::fs::write(temp.path().join("command.txt"), "npm test\n").unwrap();
         std::fs::write(temp.path().join("llm-io.jsonl"), "{}\n").unwrap();
+        std::fs::write(temp.path().join("anvil.out"), "controller stdout\n").unwrap();
+        std::fs::write(temp.path().join("postcheck.err"), "postcheck stderr\n").unwrap();
         std::fs::create_dir_all(temp.path().join("logs")).unwrap();
         std::fs::write(temp.path().join("logs/run.log"), "log\n").unwrap();
         std::fs::create_dir_all(temp.path().join("src")).unwrap();

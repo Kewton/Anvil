@@ -2177,6 +2177,12 @@ mod tests {
             .expect("file content")
     }
 
+    fn write_workspace_metadata_fixture(root: &Path, prompt: &str, command: &str) {
+        std::fs::write(root.join("prompt.md"), prompt).unwrap();
+        std::fs::write(root.join("cmd.txt"), command).unwrap();
+        std::fs::write(root.join("anvil.out"), "controller stdout\n").unwrap();
+    }
+
     #[test]
     fn project_skeleton_plans_rust_cli_word_counter_shape() {
         let plan = project_skeleton_plan_for_request("Create a Rust CLI word counter with tests")
@@ -2266,7 +2272,7 @@ mod tests {
             ..Config::default()
         };
         let (mut agent, temp) = test_agent_with_config(cfg);
-        std::fs::write(temp.path().join("prompt.md"), "Create a Rust CLI\n").unwrap();
+        write_workspace_metadata_fixture(temp.path(), "Create a Rust CLI\n", "cargo test\n");
         agent.session.mode_state.work_mode = WorkMode::GenericCode;
         agent.session.messages.push(ConversationMessage::user(
             "Create a Rust CLI word counter with tests".to_string(),
@@ -2280,6 +2286,14 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("prompt.md")).unwrap(),
             "Create a Rust CLI\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cmd.txt")).unwrap(),
+            "cargo test\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("anvil.out")).unwrap(),
+            "controller stdout\n"
         );
     }
 
@@ -2295,7 +2309,7 @@ mod tests {
             ..Config::default()
         };
         let (mut agent, temp) = test_agent_with_config(cfg);
-        std::fs::write(temp.path().join("prompt.md"), "Build a Node CLI\n").unwrap();
+        write_workspace_metadata_fixture(temp.path(), "Build a Node CLI\n", "npm test\n");
         agent.session.mode_state.work_mode = WorkMode::GenericCode;
         agent.session.messages.push(ConversationMessage::user(
             "Build a Node.js JSON formatter CLI with node --test".to_string(),
@@ -2309,6 +2323,54 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("prompt.md")).unwrap(),
             "Build a Node CLI\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cmd.txt")).unwrap(),
+            "npm test\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("anvil.out")).unwrap(),
+            "controller stdout\n"
+        );
+    }
+
+    #[test]
+    fn docs_scaffold_materializes_when_prompt_cmd_and_anvil_output_metadata_exist() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::{Config, DeterministicFallbackMode};
+        use crate::modes::plan_act::WorkMode;
+        use crate::session::store::ConversationMessage;
+
+        let cfg = Config {
+            deterministic_fallback: DeterministicFallbackMode::FullTemplate,
+            ..Config::default()
+        };
+        let (mut agent, temp) = test_agent_with_config(cfg);
+        write_workspace_metadata_fixture(
+            temp.path(),
+            "READMEを作成してください。\n",
+            "cat README.md\n",
+        );
+        agent.session.mode_state.work_mode = WorkMode::Docs;
+        agent.session.messages.push(ConversationMessage::user(
+            "READMEを作成してください。".to_string(),
+        ));
+
+        let fired = maybe_materialize_mode_deterministic_fallback(&mut agent, 0);
+
+        assert!(fired);
+        assert!(temp.path().join("README.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("prompt.md")).unwrap(),
+            "READMEを作成してください。\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("cmd.txt")).unwrap(),
+            "cat README.md\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("anvil.out")).unwrap(),
+            "controller stdout\n"
         );
     }
 }
