@@ -784,6 +784,7 @@ impl Agent {
     /// of release binaries.
     pub(in crate::agent::loop_run) fn reset_last_pam_decision_for_test(&mut self) {
         self.last_pam_decision_this_turn = None;
+        self.last_pam_unused_reason_this_turn = None;
     }
 }
 
@@ -2337,6 +2338,9 @@ pub struct Agent {
     /// `last_behavior_contract_projection_event`).
     pub(in crate::agent::loop_run) last_pam_decision_this_turn:
         Option<pam_advisory::PamAdvisoryDecision>,
+    /// Issue #867: per-turn reason PAM advisory was not used. Eval logging
+    /// consumes this only when `last_pam_decision_this_turn` is `None`.
+    pub(in crate::agent::loop_run) last_pam_unused_reason_this_turn: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2589,6 +2593,7 @@ impl Agent {
             owned_test_verifier_missing_observed_carryover: None,
             // Issue #667: PAM advisory per-turn carrier.
             last_pam_decision_this_turn: None,
+            last_pam_unused_reason_this_turn: None,
         }
     }
 
@@ -2662,9 +2667,11 @@ impl Agent {
         shadow_input: bool,
     ) -> Option<pam_advisory::PamAdvisoryOutcome> {
         if !self.config.pam_advisory_enabled {
+            self.record_pam_unused_reason("pam_disabled");
             return None;
         }
         if self.last_pam_decision_this_turn.is_some() {
+            self.record_pam_unused_reason("already_decided_this_turn");
             return None;
         }
         let inputs = self.pam_advisory_inputs();
@@ -2680,7 +2687,16 @@ impl Agent {
             },
         );
         self.last_pam_decision_this_turn = Some(outcome.decision.clone());
+        self.last_pam_unused_reason_this_turn = None;
         Some(outcome)
+    }
+
+    pub(in crate::agent::loop_run) fn record_pam_unused_reason(&mut self, reason: &str) {
+        if self.last_pam_decision_this_turn.is_none()
+            && self.last_pam_unused_reason_this_turn.is_none()
+        {
+            self.last_pam_unused_reason_this_turn = Some(reason.to_string());
+        }
     }
 }
 

@@ -71,6 +71,7 @@ pub(super) fn handle_user_message(
     // decision carrier. `is_some()` is the "decided this turn" predicate;
     // the 2 production chokepoints set this exactly once (DR1-005).
     agent.last_pam_decision_this_turn = None;
+    agent.last_pam_unused_reason_this_turn = None;
     // Issue #661 Task 2.6 (DR1-004 / DR1-010): per-turn dedup state for
     // `agent.verifier.invoked` (digest of canonical-JSON payload) and
     // per-turn cap for `agent.verifier.external_import_rejected`. Reset

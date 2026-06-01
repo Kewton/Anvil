@@ -4058,7 +4058,15 @@ pub(super) fn run_actor_loop(
         record.pam_eval = agent
             .last_pam_decision_this_turn
             .as_ref()
-            .map(|decision| decision.to_eval_summary());
+            .map(|decision| decision.to_eval_summary())
+            .or_else(|| {
+                agent
+                    .last_pam_unused_reason_this_turn
+                    .as_ref()
+                    .map(|reason| {
+                        crate::session::eval_log::PamEvalSummary::skipped(reason.as_str())
+                    })
+            });
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }

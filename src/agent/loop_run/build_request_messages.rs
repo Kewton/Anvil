@@ -181,6 +181,14 @@ fn maybe_send_request_context_pack(
         turn_idx: agent.current_turn_index,
     };
     if !crate::photon::mapper::should_send_context_pack(&gate) {
+        let reason = if agent.photon.is_none() {
+            "photon_unavailable"
+        } else if agent.config.photon_shadow_mode {
+            "shadow_mode"
+        } else {
+            "canary_gate"
+        };
+        agent.record_pam_unused_reason(reason);
         return;
     }
     let resp_opt = match &agent.photon {
@@ -208,6 +216,9 @@ fn maybe_send_request_context_pack(
         }
         None => None,
     };
+    if resp_opt.is_none() {
+        agent.record_pam_unused_reason("context_pack_failed");
+    }
     if let Some(resp) = resp_opt.as_ref() {
         let blocked_ids: std::collections::HashSet<String> = if agent.config.photon_respect_warnings
         {

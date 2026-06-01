@@ -128,11 +128,18 @@ fn r1b_pam_eval_summary_serializes_advisory_impact() {
         mode: "live".to_string(),
         decision_type: "prompt_context_injection".to_string(),
         decision_types: vec!["prompt_context_injection".to_string()],
+        affected_targets: vec![anvil::session::eval_log::PamEvalTarget {
+            target_type: "prompt_context".to_string(),
+            target: "context_pack_prompt".to_string(),
+            decision_type: "prompt_context_injection".to_string(),
+            summary_id: Some("seed-a".to_string()),
+        }],
         actual_injected_count: 2,
         suppressed_count: 1,
         would_inject_in_live_count: 0,
         advisory_only: true,
         completion_judgement_override: false,
+        unused_reason: None,
     });
 
     let json = serde_json::to_value(&rec).unwrap();
@@ -142,6 +149,39 @@ fn r1b_pam_eval_summary_serializes_advisory_impact() {
     );
     assert_eq!(json["pam_eval"]["actual_injected_count"], 2);
     assert_eq!(json["pam_eval"]["advisory_only"], true);
+    assert_eq!(json["pam_eval"]["completion_judgement_override"], false);
+    assert_eq!(
+        json["pam_eval"]["affected_targets"][0]["target_type"],
+        "prompt_context"
+    );
+    assert!(json["pam_eval"].get("unused_reason").is_none());
+}
+
+#[test]
+fn r1c_pam_eval_summary_serializes_unused_reason() {
+    let mut rec = build_eval_record(
+        "sess-r1c",
+        1_700_000_000_002,
+        "fix the compilation error",
+        "qwen3:14b",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        make_classes(),
+        &[],
+        None,
+        None,
+        None,
+        "safe_stop",
+    );
+    rec.pam_eval = Some(PamEvalSummary::skipped("canary_gate"));
+
+    let json = serde_json::to_value(&rec).unwrap();
+    assert_eq!(json["pam_eval"]["decision_type"], "not_used");
+    assert_eq!(json["pam_eval"]["unused_reason"], "canary_gate");
     assert_eq!(json["pam_eval"]["completion_judgement_override"], false);
 }
 

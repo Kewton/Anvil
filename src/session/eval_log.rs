@@ -33,6 +33,7 @@ pub const MAX_PHOTON_EVAL_FIELD_BYTES: usize = 256;
 pub const MAX_PHOTON_EVAL_WARNINGS: usize = 8;
 pub const MAX_PHOTON_EVAL_WARNING_BYTES: usize = 512;
 pub const MAX_EVAL_COMPLETION_REASON_BYTES: usize = 256;
+pub const MAX_PAM_EVAL_TARGETS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -233,11 +234,46 @@ pub struct PamEvalSummary {
     pub mode: String,
     pub decision_type: String,
     pub decision_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_targets: Vec<PamEvalTarget>,
     pub actual_injected_count: u32,
     pub suppressed_count: u32,
     pub would_inject_in_live_count: u32,
     pub advisory_only: bool,
     pub completion_judgement_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unused_reason: Option<String>,
+}
+
+impl PamEvalSummary {
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            mode: "not_used".to_string(),
+            decision_type: "not_used".to_string(),
+            decision_types: vec!["not_used".to_string()],
+            affected_targets: Vec::new(),
+            actual_injected_count: 0,
+            suppressed_count: 0,
+            would_inject_in_live_count: 0,
+            advisory_only: true,
+            completion_judgement_override: false,
+            unused_reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Issue #867: bounded PAM advisory attribution target for eval logs.
+///
+/// These entries identify where PAM advice was allowed to matter. They are
+/// intentionally not completion evidence: `completion_judgement_override`
+/// remains false and completion still comes from task-contract/verifier state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PamEvalTarget {
+    pub target_type: String,
+    pub target: String,
+    pub decision_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
 }
 
 /// Issue #604 (Task 4.1 / DR2-007): 3-field flat summary attached to
