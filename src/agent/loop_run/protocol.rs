@@ -93,6 +93,7 @@ impl ProtocolKind {
                     ..
                 },
             ) => true,
+            (ProtocolKind::Docs, CompletionEvidence::RequiredSectionsPass { .. }) => true,
             _ => false,
         }
     }
@@ -315,10 +316,10 @@ impl ProtocolKind {
                         CompletionEvidence::RepoEdit {
                             category: RepoEditCategory::Docs,
                             ..
-                        }
+                        } | CompletionEvidence::RequiredSectionsPass { .. }
                     )
                 }) {
-                    missing.push("repo_edit_docs");
+                    missing.push("repo_edit_docs_or_required_sections_pass");
                 }
             }
         }
@@ -1041,6 +1042,12 @@ mod tests {
         }
     }
 
+    fn ev_required_sections() -> CompletionEvidence {
+        CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        }
+    }
+
     /// U-09 — 5 ProtocolKind × evidence variant matrix smoke.
     #[test]
     fn protocol_kind_accepts_each_completion_evidence_kind() {
@@ -1050,6 +1057,7 @@ mod tests {
         let docs_edit = ev_repo_edit(RepoEditCategory::Docs);
         let setup_edit = ev_repo_edit(RepoEditCategory::Setup);
         let other_edit = ev_repo_edit(RepoEditCategory::Other);
+        let sections_pass = ev_required_sections();
         let answer_only = CompletionEvidence::AnswerOnly;
 
         // Python
@@ -1059,6 +1067,7 @@ mod tests {
         assert!(!ProtocolKind::Python.accepts(&docs_edit));
         assert!(!ProtocolKind::Python.accepts(&setup_edit));
         assert!(!ProtocolKind::Python.accepts(&other_edit));
+        assert!(!ProtocolKind::Python.accepts(&sections_pass));
         assert!(!ProtocolKind::Python.accepts(&answer_only));
 
         // TypeScriptUi
@@ -1066,6 +1075,7 @@ mod tests {
         assert!(ProtocolKind::TypeScriptUi.accepts(&impl_edit));
         assert!(!ProtocolKind::TypeScriptUi.accepts(&test_edit));
         assert!(!ProtocolKind::TypeScriptUi.accepts(&docs_edit));
+        assert!(!ProtocolKind::TypeScriptUi.accepts(&sections_pass));
 
         // GenericCode — any RepoEdit, plus VerifierExitZero
         assert!(ProtocolKind::GenericCode.accepts(&verifier));
@@ -1074,6 +1084,7 @@ mod tests {
         assert!(ProtocolKind::GenericCode.accepts(&docs_edit));
         assert!(ProtocolKind::GenericCode.accepts(&setup_edit));
         assert!(ProtocolKind::GenericCode.accepts(&other_edit));
+        assert!(!ProtocolKind::GenericCode.accepts(&sections_pass));
         assert!(!ProtocolKind::GenericCode.accepts(&answer_only));
 
         // AnswerOnly
@@ -1081,9 +1092,11 @@ mod tests {
         assert!(ProtocolKind::AnswerOnly.accepts(&answer_only));
         assert!(!ProtocolKind::AnswerOnly.accepts(&impl_edit));
         assert!(!ProtocolKind::AnswerOnly.accepts(&docs_edit));
+        assert!(!ProtocolKind::AnswerOnly.accepts(&sections_pass));
 
         // Docs
         assert!(ProtocolKind::Docs.accepts(&docs_edit));
+        assert!(ProtocolKind::Docs.accepts(&sections_pass));
         assert!(!ProtocolKind::Docs.accepts(&verifier));
         assert!(!ProtocolKind::Docs.accepts(&impl_edit));
         assert!(!ProtocolKind::Docs.accepts(&answer_only));
@@ -1176,7 +1189,7 @@ mod tests {
         );
         assert_eq!(
             ProtocolKind::Docs.evidence_set_missing_shapes(&empty),
-            vec!["repo_edit_docs"]
+            vec!["repo_edit_docs_or_required_sections_pass"]
         );
 
         // Partial — a Test edit satisfies Python's repo-edit slot but

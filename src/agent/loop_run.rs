@@ -1060,6 +1060,7 @@ mod task_contract;
 // via `super::task_workspace_scope::*`.
 mod task_workspace_scope;
 mod tester;
+mod verifier;
 // Workspace walker helpers extracted from `turn.rs` (parent #680).
 // Hosts `workspace_appears_empty`, `meaningful_workspace_files`,
 // `collect_meaningful_workspace_files`. `pub(super)` limited / no
