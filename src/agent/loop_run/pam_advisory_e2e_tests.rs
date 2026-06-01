@@ -259,6 +259,32 @@ fn t17_pam_advisory_decision_payload_schema_pin() {
         ],
         "suppressed_summary_ids_truncated": false,
         "active_job_role": "ArtifactRecovery:test",
+        "candidate_decisions": [
+            {
+                "summary_id": "s1",
+                "action": "inject",
+                "inferred_role": "test",
+                "decision_impact": "prompt_context_injected",
+                "context_excerpt": "tests/foo_test.py",
+                "context_excerpt_truncated": false
+            },
+            {
+                "summary_id": "s2",
+                "action": "suppress",
+                "inferred_role": "implementation",
+                "suppression_reason": "role_mismatch",
+                "decision_impact": "artifact_role_mismatch_suppressed",
+                "context_excerpt": "src/lib.rs",
+                "context_excerpt_truncated": false
+            }
+        ],
+        "candidate_decisions_truncated": false,
+        "decision_effect": {
+            "actual_injected_count": 1,
+            "suppressed_count": 1,
+            "would_inject_in_live_count": 0,
+            "influenced_decision": "prompt_context_injection"
+        }
     });
     let live_payload = PamAdvisoryDecisionPayloadShape::sample_live();
     assert_eq!(live_payload, expected_live);
@@ -274,6 +300,23 @@ fn t17_pam_advisory_decision_payload_schema_pin() {
             "would_inject_in_live_truncated": false,
         },
         "active_job_role": ":",
+        "candidate_decisions": [
+            {
+                "summary_id": "sX",
+                "action": "would_inject_in_live",
+                "inferred_role": "test",
+                "decision_impact": "shadow_counterfactual_not_injected",
+                "context_excerpt": "tests/shadow_test.py",
+                "context_excerpt_truncated": false
+            }
+        ],
+        "candidate_decisions_truncated": false,
+        "decision_effect": {
+            "actual_injected_count": 0,
+            "suppressed_count": 0,
+            "would_inject_in_live_count": 1,
+            "influenced_decision": "shadow_counterfactual"
+        }
     });
     let shadow_payload = PamAdvisoryDecisionPayloadShape::sample_shadow();
     assert_eq!(shadow_payload, expected_shadow);
@@ -423,6 +466,95 @@ fn t1_t2_t3_mode_precedence_branches() {
     assert_eq!(outcome_m.decision.mode, PamAdvisoryMode::Live);
     assert!(!outcome_m.decision.injected_summary_ids.is_empty());
     assert!(!outcome_m.decision.suppressed_summary_ids.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #849 — decision log explains which PAM context was adopted or
+// suppressed and what downstream decision surface it affected.
+// ---------------------------------------------------------------------------
+#[test]
+fn issue849_decision_log_captures_context_and_decision_effect() {
+    use crate::agent::loop_run::pam_advisory::{
+        PamAdvisoryModeInput, build_active_job_selection_artifact_recovery_for_test,
+        pam_advisory_decide_for_test,
+    };
+    let resp = build_response_with_items(&[
+        (
+            "s-test-adopted",
+            "tests/foo_test.py: add regression coverage",
+        ),
+        (
+            "s-impl-blocked",
+            "src/database.py: expand implementation during repair",
+        ),
+    ]);
+    let blocked: HashSet<String> = HashSet::new();
+    let active = build_active_job_selection_artifact_recovery_for_test();
+    let outcome = pam_advisory_decide_for_test(
+        &resp,
+        &blocked,
+        Some(&active),
+        Some(crate::agent::loop_run::task_contract::ArtifactRole::Test),
+        None,
+        PamAdvisoryModeInput { shadow: false },
+    );
+    let payload = outcome.decision.to_json_value();
+    let candidates = payload
+        .get("candidate_decisions")
+        .and_then(|v| v.as_array())
+        .expect("candidate_decisions array");
+    assert_eq!(candidates.len(), 2);
+
+    let adopted = candidates
+        .iter()
+        .find(|v| v.get("summary_id").and_then(|s| s.as_str()) == Some("s-test-adopted"))
+        .expect("adopted candidate");
+    assert_eq!(
+        adopted.get("action").and_then(|v| v.as_str()),
+        Some("inject")
+    );
+    assert_eq!(
+        adopted.get("inferred_role").and_then(|v| v.as_str()),
+        Some("test")
+    );
+    assert_eq!(
+        adopted.get("decision_impact").and_then(|v| v.as_str()),
+        Some("prompt_context_injected")
+    );
+    assert!(
+        adopted
+            .get("context_excerpt")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .contains("tests/foo_test.py"),
+        "adopted PAM context excerpt should identify the memory"
+    );
+
+    let suppressed = candidates
+        .iter()
+        .find(|v| v.get("summary_id").and_then(|s| s.as_str()) == Some("s-impl-blocked"))
+        .expect("suppressed candidate");
+    assert_eq!(
+        suppressed.get("action").and_then(|v| v.as_str()),
+        Some("suppress")
+    );
+    assert_eq!(
+        suppressed
+            .get("suppression_reason")
+            .and_then(|v| v.as_str()),
+        Some("impl_expansion_blocked")
+    );
+    assert_eq!(
+        suppressed.get("decision_impact").and_then(|v| v.as_str()),
+        Some("artifact_recovery_suppressed_impl_expansion")
+    );
+    assert_eq!(
+        payload
+            .get("decision_effect")
+            .and_then(|v| v.get("influenced_decision"))
+            .and_then(|v| v.as_str()),
+        Some("prompt_context_injection")
+    );
 }
 
 // ---------------------------------------------------------------------------

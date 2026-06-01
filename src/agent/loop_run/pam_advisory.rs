@@ -52,6 +52,10 @@ use crate::photon::schema::ContextPackResponse;
 /// which carry different semantic ranges.
 pub(super) const MAX_PAM_DECISION_LIST_LEN: usize = 16;
 
+/// Per-candidate context excerpt cap. This keeps the decision log useful for
+/// A/B attribution while leaving final envelope bounds to `job_report`.
+const MAX_PAM_CONTEXT_EXCERPT_CHARS: usize = 160;
+
 // ---------------------------------------------------------------------------
 // Enum types
 // ---------------------------------------------------------------------------
@@ -108,6 +112,34 @@ impl SuppressionReason {
     }
 }
 
+/// Per-memory action recorded in the decision log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum PamCandidateAction {
+    Inject,
+    Suppress,
+    WouldInjectInLive,
+}
+
+impl PamCandidateAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            PamCandidateAction::Inject => "inject",
+            PamCandidateAction::Suppress => "suppress",
+            PamCandidateAction::WouldInjectInLive => "would_inject_in_live",
+        }
+    }
+}
+
+impl serde::Serialize for PamCandidateAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Struct types
 // ---------------------------------------------------------------------------
@@ -146,6 +178,37 @@ pub(super) struct ShadowVsLiveDiff {
     pub(super) would_inject_in_live_truncated: bool,
 }
 
+/// Per-memory attribution entry. This is intentionally additive to the
+/// existing `pam_decision` payload: older consumers can continue reading the
+/// summary-id lists, while A/B analysis can explain why each memory was or was
+/// not allowed to affect prompt context.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) struct PamCandidateDecision {
+    pub(super) summary_id: String,
+    pub(super) action: PamCandidateAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) inferred_role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) suppression_reason: Option<SuppressionReason>,
+    pub(super) decision_impact: &'static str,
+    pub(super) context_excerpt: String,
+    #[serde(default)]
+    pub(super) context_excerpt_truncated: bool,
+}
+
+/// Roll-up for turn-level PAM effect attribution. It describes what kind of
+/// downstream decision PAM was allowed to influence in this turn, not whether
+/// the final task outcome was good or bad.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) struct PamDecisionEffect {
+    pub(super) actual_injected_count: u32,
+    pub(super) suppressed_count: u32,
+    pub(super) would_inject_in_live_count: u32,
+    pub(super) influenced_decision: &'static str,
+}
+
 /// Turn-local decision value. Adapter writes exactly one of these per turn
 /// (DR1-005 single-set contract) into `Agent.last_pam_decision_this_turn`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +223,9 @@ pub(super) struct PamAdvisoryDecision {
     /// `"<ActiveJobKind>:<ArtifactRole?>"` string. Built ONCE by
     /// `format_active_job_role` (DR1-003 SSOT).
     pub(super) active_job_role: String,
+    pub(super) candidate_decisions: Vec<PamCandidateDecision>,
+    pub(super) candidate_decisions_truncated: bool,
+    pub(super) decision_effect: PamDecisionEffect,
 }
 
 /// Adapter evaluation result. `decision` flows into `MemoryReport.pam_decision`
@@ -193,6 +259,11 @@ pub(super) struct PamAdvisoryDecisionPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) shadow_vs_live_diff: Option<ShadowVsLiveDiff>,
     pub(super) active_job_role: String,
+    #[serde(default)]
+    pub(super) candidate_decisions: Vec<PamCandidateDecision>,
+    #[serde(default)]
+    pub(super) candidate_decisions_truncated: bool,
+    pub(super) decision_effect: PamDecisionEffect,
 }
 
 impl From<&PamAdvisoryDecision> for PamAdvisoryDecisionPayload {
@@ -205,6 +276,9 @@ impl From<&PamAdvisoryDecision> for PamAdvisoryDecisionPayload {
             suppressed_summary_ids_truncated: d.suppressed_summary_ids_truncated,
             shadow_vs_live_diff: d.shadow_vs_live_diff.clone(),
             active_job_role: d.active_job_role.clone(),
+            candidate_decisions: d.candidate_decisions.clone(),
+            candidate_decisions_truncated: d.candidate_decisions_truncated,
+            decision_effect: d.decision_effect.clone(),
         }
     }
 }
@@ -393,18 +467,36 @@ pub(super) fn evaluate_pam_advisory(
     let mut live_admitted_views: Vec<AdmittedItemView> = Vec::new();
     let mut injected_summary_ids: Vec<String> = Vec::new();
     let mut suppressed_summary_ids: Vec<SuppressedSummary> = Vec::new();
+    let mut candidate_decisions: Vec<PamCandidateDecision> = Vec::new();
     let all_admitted_ids: Vec<String> = admitted_views
         .iter()
         .filter_map(|v| v.provenance.summary_id.clone())
         .collect();
 
     for (view, classification) in admitted_views.iter().zip(classifications.iter()) {
+        let suggested_role = infer_role_from_view(view);
         match classification {
             SummaryClassification::Inject => {
                 live_admitted_views.push(view.clone());
                 if let Some(id) = view.provenance.summary_id.clone() {
                     injected_summary_ids.push(id);
                 }
+                push_candidate_decision(
+                    &mut candidate_decisions,
+                    view,
+                    suggested_role,
+                    None,
+                    if mode_input.shadow {
+                        PamCandidateAction::WouldInjectInLive
+                    } else {
+                        PamCandidateAction::Inject
+                    },
+                    if mode_input.shadow {
+                        "shadow_counterfactual_not_injected"
+                    } else {
+                        "prompt_context_injected"
+                    },
+                );
             }
             SummaryClassification::Suppress(reason) => {
                 if let Some(id) = view.provenance.summary_id.clone() {
@@ -413,12 +505,21 @@ pub(super) fn evaluate_pam_advisory(
                         reason: *reason,
                     });
                 }
+                push_candidate_decision(
+                    &mut candidate_decisions,
+                    view,
+                    suggested_role,
+                    Some(*reason),
+                    PamCandidateAction::Suppress,
+                    suppression_impact(*reason, active_kind),
+                );
             }
         }
     }
 
     let mut injected_summary_ids_truncated = apply_cap_strings(&mut injected_summary_ids);
     let suppressed_summary_ids_truncated = apply_cap_suppressed(&mut suppressed_summary_ids);
+    let candidate_decisions_truncated = apply_cap_candidate_decisions(&mut candidate_decisions);
 
     // shadow_vs_live_diff: only populated on shadow turns.
     let shadow_vs_live_diff = if mode_input.shadow {
@@ -453,6 +554,15 @@ pub(super) fn evaluate_pam_advisory(
     }
 
     let active_job_role = format_active_job_role(active_kind, current_role_hint);
+    let decision_effect = build_decision_effect(
+        mode,
+        injected_summary_ids.len(),
+        suppressed_summary_ids.len(),
+        shadow_vs_live_diff
+            .as_ref()
+            .map(|diff| diff.would_inject_in_live.len())
+            .unwrap_or(0),
+    );
 
     let decision = PamAdvisoryDecision {
         mode,
@@ -462,6 +572,9 @@ pub(super) fn evaluate_pam_advisory(
         suppressed_summary_ids_truncated,
         shadow_vs_live_diff,
         active_job_role,
+        candidate_decisions,
+        candidate_decisions_truncated,
+        decision_effect,
     };
 
     PamAdvisoryOutcome {
@@ -493,6 +606,90 @@ fn apply_cap_suppressed(v: &mut Vec<SuppressedSummary>) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Apply `MAX_PAM_DECISION_LIST_LEN` cap to candidate attribution entries.
+fn apply_cap_candidate_decisions(v: &mut Vec<PamCandidateDecision>) -> bool {
+    if v.len() > MAX_PAM_DECISION_LIST_LEN {
+        v.truncate(MAX_PAM_DECISION_LIST_LEN);
+        true
+    } else {
+        false
+    }
+}
+
+fn push_candidate_decision(
+    out: &mut Vec<PamCandidateDecision>,
+    view: &AdmittedItemView,
+    inferred_role: Option<ArtifactRole>,
+    suppression_reason: Option<SuppressionReason>,
+    action: PamCandidateAction,
+    decision_impact: &'static str,
+) {
+    let Some(summary_id) = view.provenance.summary_id.clone() else {
+        return;
+    };
+    let (context_excerpt, context_excerpt_truncated) =
+        truncate_context_excerpt(&view.render_text, MAX_PAM_CONTEXT_EXCERPT_CHARS);
+    out.push(PamCandidateDecision {
+        summary_id,
+        action,
+        inferred_role: inferred_role.map(ArtifactRole::label),
+        suppression_reason,
+        decision_impact,
+        context_excerpt,
+        context_excerpt_truncated,
+    });
+}
+
+fn truncate_context_excerpt(text: &str, max_chars: usize) -> (String, bool) {
+    let mut out = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count == max_chars {
+            return (out, true);
+        }
+        out.push(ch);
+    }
+    (out, false)
+}
+
+fn suppression_impact(
+    reason: SuppressionReason,
+    active_kind: Option<ActiveJobKind>,
+) -> &'static str {
+    match (reason, active_kind) {
+        (SuppressionReason::ImplExpansionBlocked, Some(ActiveJobKind::VerifierRepair)) => {
+            "repair_context_suppressed_impl_expansion"
+        }
+        (SuppressionReason::ImplExpansionBlocked, Some(ActiveJobKind::ArtifactRecovery)) => {
+            "artifact_recovery_suppressed_impl_expansion"
+        }
+        (SuppressionReason::BehaviorNonGoalMismatch, _) => "behavior_contract_suppressed_non_goal",
+        (SuppressionReason::RoleMismatch, _) => "artifact_role_mismatch_suppressed",
+        (SuppressionReason::ImplExpansionBlocked, _) => "impl_expansion_suppressed",
+    }
+}
+
+fn build_decision_effect(
+    mode: PamAdvisoryMode,
+    injected_count: usize,
+    suppressed_count: usize,
+    would_inject_count: usize,
+) -> PamDecisionEffect {
+    let influenced_decision = match mode {
+        PamAdvisoryMode::Shadow => "shadow_counterfactual",
+        PamAdvisoryMode::Live if injected_count > 0 => "prompt_context_injection",
+        PamAdvisoryMode::Suppressed | PamAdvisoryMode::Live if suppressed_count > 0 => {
+            "advisory_suppression"
+        }
+        PamAdvisoryMode::Live | PamAdvisoryMode::Suppressed => "none",
+    };
+    PamDecisionEffect {
+        actual_injected_count: injected_count as u32,
+        suppressed_count: suppressed_count as u32,
+        would_inject_in_live_count: would_inject_count as u32,
+        influenced_decision,
     }
 }
 
