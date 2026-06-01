@@ -524,6 +524,7 @@ fn verifier_repair_candidate_from_path(
         super::task_contract::ArtifactRole::Implementation => 30,
         super::task_contract::ArtifactRole::Setup => 25,
         super::task_contract::ArtifactRole::Test => 15,
+        super::task_contract::ArtifactRole::DataOutput => 10,
         super::task_contract::ArtifactRole::UsageDocs => 5,
     };
     let import_provider_score = if from_verifier_output

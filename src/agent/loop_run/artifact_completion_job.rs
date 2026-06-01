@@ -1278,6 +1278,9 @@ mod tests {
                         super::super::task_contract::DeliverableKind::UsageDocs
                     }
                     ArtifactRole::Setup => super::super::task_contract::DeliverableKind::Setup,
+                    ArtifactRole::DataOutput => {
+                        super::super::task_contract::DeliverableKind::StructuredRecord
+                    }
                 },
                 role: Some(role),
                 path: None,

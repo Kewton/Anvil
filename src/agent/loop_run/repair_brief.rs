@@ -420,6 +420,7 @@ fn artifact_role_from_str(value: &str) -> Option<ArtifactRole> {
         "test" | "tests" => Some(ArtifactRole::Test),
         "usage_docs" | "docs" | "readme" => Some(ArtifactRole::UsageDocs),
         "setup" | "dependency" | "config" => Some(ArtifactRole::Setup),
+        "data_output" | "data" | "output" => Some(ArtifactRole::DataOutput),
         _ => None,
     }
 }
@@ -451,6 +452,7 @@ pub(super) fn legacy_kind_to_allowed_change_kind_for_role(
             _ => AllowedChangeKind::FixDependencyOrConfig,
         },
         Some(ArtifactRole::UsageDocs) => AllowedChangeKind::InsufficientEvidence,
+        Some(ArtifactRole::DataOutput) => AllowedChangeKind::InsufficientEvidence,
         Some(ArtifactRole::Implementation) | None => {
             legacy_kind_to_allowed_change_kind_unscoped(&normalized)
         }

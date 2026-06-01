@@ -832,6 +832,7 @@ pub(super) fn scaffold_role_for_path(path: &Path) -> ScaffoldArtifactRole {
         RepoEditCategory::Test => ScaffoldArtifactRole::Test,
         RepoEditCategory::Docs => ScaffoldArtifactRole::UsageDocs,
         RepoEditCategory::Setup => ScaffoldArtifactRole::Setup,
+        RepoEditCategory::Data => ScaffoldArtifactRole::Other,
         RepoEditCategory::Other => ScaffoldArtifactRole::Other,
     }
 }
