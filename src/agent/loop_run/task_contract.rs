@@ -167,6 +167,10 @@ impl CompletionPolicy {
             CompletionEvidence::VerifierExitZero { class, .. } => {
                 self.accepts_verifier_class(*class)
             }
+            CompletionEvidence::RequiredSectionsPass { .. } => {
+                self.project_intent == CompletionProjectIntent::DocsOnly
+                    || self.required_artifacts.contains(&ArtifactRole::UsageDocs)
+            }
             CompletionEvidence::AnswerOnly => {
                 self.project_intent == CompletionProjectIntent::AnswerOnly
             }
@@ -532,76 +536,12 @@ fn implementation_excerpt_satisfies_completion(contract: &TaskContract, excerpt:
     excerpt_satisfies_behavior(contract, excerpt) || !excerpt.trim().is_empty()
 }
 
-/// `usage_docs` surface marker categories. Short tokens (`run`) use the
-/// token-boundary helper so "running" / "github.run" do not false-positive.
-const USAGE_DOCS_SETUP_MARKERS: &[(&str, bool)] = &[
-    ("install", false),
-    ("setup", false),
-    ("dependency", false),
-    ("dependencies", false),
-    ("package", false),
-    ("requirements", false),
-    ("cargo.toml", false),
-    ("package.json", false),
-    ("pyproject.toml", false),
-    ("セットアップ", false),
-    ("依存", false),
-    ("設定", false),
-];
-const USAGE_DOCS_RUN_MARKERS: &[(&str, bool)] = &[
-    ("run", true),
-    ("start", false),
-    ("usage", false),
-    ("example", false),
-    ("build", false),
-    ("execute", false),
-    ("使用", false),
-    ("使い方", false),
-    ("実行", false),
-    ("例", false),
-    ("ビルド", false),
-];
-const USAGE_DOCS_VERIFY_MARKERS: &[(&str, bool)] = &[
-    ("test", false),
-    ("verify", false),
-    ("check", false),
-    ("pytest", false),
-    ("cargo test", false),
-    ("npm test", false),
-    ("テスト", false),
-    ("検証", false),
-];
-
 /// At least two of {setup, run, verification} surface categories must
 /// appear in the README excerpt for usage_docs to count as covered. One
 /// category is too weak (scaffold READMEs that only mention `install`),
 /// three is overly strict for minimal but honest docs.
 fn usage_docs_surface_satisfied(excerpt: &str) -> bool {
-    let lower = excerpt.to_ascii_lowercase();
-    let hit = |markers: &[(&str, bool)]| -> bool {
-        markers
-            .iter()
-            .any(|(needle, token_boundary)| usage_docs_marker_hit(&lower, needle, *token_boundary))
-    };
-    let mut categories = 0;
-    if hit(USAGE_DOCS_SETUP_MARKERS) {
-        categories += 1;
-    }
-    if hit(USAGE_DOCS_RUN_MARKERS) {
-        categories += 1;
-    }
-    if hit(USAGE_DOCS_VERIFY_MARKERS) {
-        categories += 1;
-    }
-    categories >= 2
-}
-
-fn usage_docs_marker_hit(lower: &str, needle: &str, token_boundary: bool) -> bool {
-    if token_boundary {
-        contains_ascii_token(lower, needle)
-    } else {
-        lower.contains(needle)
-    }
+    super::verifier::DocsVerifier.required_sections_pass(excerpt)
 }
 
 pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> ArtifactRecoveryAction {
@@ -779,17 +719,20 @@ fn artifact_identity_observed_in_evidence(
     evidence: &EvidenceSet,
     identity: &ArtifactObligation,
 ) -> bool {
-    evidence.iter().any(|item| {
-        let CompletionEvidence::RepoEdit {
+    evidence.iter().any(|item| match item {
+        CompletionEvidence::RepoEdit {
             category,
             path: Some(path),
             ..
-        } = item
-        else {
-            return false;
-        };
-        role_from_repo_edit(*category) == Some(identity.role)
-            && normalized_artifact_path_eq(path, &identity.path)
+        } => {
+            role_from_repo_edit(*category) == Some(identity.role)
+                && normalized_artifact_path_eq(path, &identity.path)
+        }
+        CompletionEvidence::RequiredSectionsPass { path: Some(path) } => {
+            identity.role == ArtifactRole::UsageDocs
+                && normalized_artifact_path_eq(path, &identity.path)
+        }
+        _ => false,
     })
 }
 
@@ -2171,6 +2114,7 @@ fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
                 ..
             } => roles.push(ArtifactRole::Setup),
             CompletionEvidence::VerifierExitZero { .. } => {}
+            CompletionEvidence::RequiredSectionsPass { .. } => roles.push(ArtifactRole::UsageDocs),
             CompletionEvidence::AnswerOnly => {}
         }
     }
@@ -2554,6 +2498,18 @@ mod tests {
             contract.completion_policy.project_intent,
             CompletionProjectIntent::DocsOnly
         );
+        assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn docs_required_sections_pass_satisfies_docs_completion() {
+        let contract = TaskContract::from_request("READMEを更新してください");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        });
+
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
     }
 

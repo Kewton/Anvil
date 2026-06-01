@@ -153,6 +153,7 @@ impl VerifierCandidate {
 pub(super) enum RunnerKind {
     Cargo,
     Python3,
+    Npm,
 }
 
 impl RunnerKind {
@@ -163,6 +164,7 @@ impl RunnerKind {
         match self {
             RunnerKind::Cargo => "cargo",
             RunnerKind::Python3 => "python3",
+            RunnerKind::Npm => "npm",
         }
     }
 
@@ -180,6 +182,7 @@ impl RunnerKind {
         match runner {
             "cargo" => Some(RunnerKind::Cargo),
             "python3" => Some(RunnerKind::Python3),
+            "npm" => Some(RunnerKind::Npm),
             _ => None,
         }
     }
@@ -1079,8 +1082,8 @@ pub(super) const VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP: usize = 16;
 impl VerifierInvokedSnapshot {
     /// Construct the snapshot from a `VerifierCommand` and a built
     /// `HermeticEnvPlan`. Only callable for runners with a `RunnerKind`
-    /// variant — production `OwnedTestVerifierPlan::Runnable` only yields
-    /// `cargo` / `python3` today, so this returns `None` for any future or
+    /// variant — production `OwnedTestVerifierPlan::Runnable` yields
+    /// `cargo` / `python3` / `npm` today, so this returns `None` for any future or
     /// unsupported runner (DR4-004 security gate: unknown runner string
     /// cannot reach the event payload).
     ///
@@ -1286,21 +1289,18 @@ impl VerifierCommand {
         Some(abs.to_string_lossy().into_owned())
     }
 
-    /// `cargo test --test <name> ...` structured constructor.
+    /// Full `cargo test` structured constructor.
     ///
-    /// Issue #651 (CB-001 / CB-002): cargo positional args are
-    /// test-name filters, **not** file paths. Passing `tests/test_a.rs`
-    /// directly produces 0 tests matched and a misleading exit 0. We
-    /// therefore convert each owned test artifact to a
-    /// `--test <name>` flag for top-level `tests/<name>.rs` integration
-    /// tests. Any path we cannot safely convert (`src/...` unit tests,
-    /// nested integration paths, paths without a `.rs` stem) makes the
-    /// constructor return `None` so the caller falls back to `Weak`.
+    /// Issue #865: Rust task final success must be the full suite, not a
+    /// partial `cargo test --test <name>` run. The owned test artifacts are
+    /// still retained in `bound_test_artifacts` so planning/execution can
+    /// prove that task-owned tests exist and are in scope before spawning the
+    /// verifier, but they are intentionally not forwarded as cargo filters.
     ///
     /// CB-001 defense in depth: empty `owned_test_artifacts` is also a
     /// hard reject. An unbound cargo verifier could otherwise execute
     /// the entire test suite without satisfying the design contract
-    /// that the *current task's* test artifact actually ran.
+    /// that the current task owns at least one test artifact.
     ///
     /// `args_prefix` lets the detector inject flags like `--no-fail-fast`
     /// when needed; today the cargo path passes an empty prefix.
@@ -1312,16 +1312,9 @@ impl VerifierCommand {
         if owned_test_artifacts.is_empty() {
             return None;
         }
-        let mut test_flags: Vec<String> = Vec::with_capacity(owned_test_artifacts.len() * 2);
-        for path in owned_test_artifacts {
-            let name = cargo_integration_test_name(path)?;
-            test_flags.push("--test".to_string());
-            test_flags.push(name);
-        }
-        let mut args = Vec::with_capacity(args_prefix.len() + 1 + test_flags.len());
+        let mut args = Vec::with_capacity(args_prefix.len() + 1);
         args.push("test".to_string());
         args.extend(args_prefix);
-        args.extend(test_flags);
         Self::new_allowlisted("cargo", args, owned_test_artifacts.to_vec())
     }
 
@@ -1348,7 +1341,7 @@ impl VerifierCommand {
         Self::new_allowlisted("pytest", args, owned_test_artifacts.to_vec())
     }
 
-    /// `python3 -B -m pytest -p no:cacheprovider [<owned_test_artifacts>]`
+    /// `python3 -m pytest -q -p no:cacheprovider [<owned_test_artifacts>]`
     /// structured constructor for the stdlib-Python toolchain detected by
     /// `python_pytest_command`. Toolchain-specific runners (`uv run` etc.)
     /// still go through Weak in Phase 2.2 because parsing their shell
@@ -1364,14 +1357,32 @@ impl VerifierCommand {
             return None;
         }
         let mut args = vec![
-            "-B".to_string(),
             "-m".to_string(),
             "pytest".to_string(),
+            "-q".to_string(),
             "-p".to_string(),
             "no:cacheprovider".to_string(),
         ];
         args.extend(owned_test_artifacts.iter().cloned());
         Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
+    }
+
+    /// Full `npm test` structured constructor.
+    ///
+    /// Issue #865: package-script verification should accept `npm test` as
+    /// completion evidence. Owned test artifacts are validated before spawn
+    /// but are not passed as argv filters because package scripts own their
+    /// test discovery contract.
+    #[allow(dead_code)]
+    pub(super) fn from_npm_test(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        Self::new_allowlisted(
+            "npm",
+            vec!["test".to_string()],
+            owned_test_artifacts.to_vec(),
+        )
     }
 
     /// `node --test <owned_test_artifacts>` structured constructor.
@@ -1606,7 +1617,7 @@ impl AutoTestRunner {
     ///
     /// - `Runnable` when the source has an allowlisted structured
     ///   constructor (currently `CargoManifest` → cargo test and
-    ///   `PythonTests` stdlib → `python3 -B -m pytest`).
+    ///   `PythonTests` stdlib → `python3 -m pytest -q`).
     /// - `Weak` when a candidate exists but cannot be expressed as a
     ///   structured `VerifierCommand` (free-form shell strings from
     ///   ProjectInstruction / RecentSuccessfulBash, npm/pnpm/yarn or
@@ -1667,15 +1678,12 @@ impl AutoTestRunner {
                 {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }
-                // CB-002: `from_cargo_test` returns `None` when an owned
-                // test artifact cannot be safely mapped to
-                // `cargo test --test <name>` (src/... internal paths,
-                // nested integration paths, non-`tests/<stem>.rs`
-                // shapes). The allowlist may also have rejected an arg.
-                // Either way we fall back to `Weak` rather than fabricate
-                // a positional filter that would match 0 tests.
+                // `from_cargo_test` returns `None` only when the allowlist
+                // rejects the command shape. Rust final success uses full
+                // `cargo test`, so owned artifacts are validated as binding
+                // metadata rather than converted to partial test filters.
                 OwnedTestVerifierPlan::Weak {
-                    reason: "cargo runner cannot bind owned test artifacts as --test flag",
+                    reason: "cargo runner cannot bind owned test artifacts",
                     detected_source: source.as_str(),
                     display_command: Some(display_command),
                 }
@@ -1701,7 +1709,7 @@ impl AutoTestRunner {
                 }
             }
             VerifierCandidateSource::PackageJsonScripts => {
-                if let Some(command) = VerifierCommand::from_node_test(owned_test_artifacts) {
+                if let Some(command) = VerifierCommand::from_npm_test(owned_test_artifacts) {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }
                 OwnedTestVerifierPlan::Weak {
@@ -3116,7 +3124,7 @@ fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
         let packages = python_pyproject_test_packages(&pyproject);
         return PythonPytestCommand {
             command: format!(
-                "python3 -m pip install {} && PYTHONPATH=src:. python3 -B -m pytest -p no:cacheprovider",
+                "python3 -m pip install {} && PYTHONPATH=src:. python3 -m pytest -q -p no:cacheprovider",
                 packages.join(" ")
             ),
             reason: "Python tests detected with pyproject.toml; installing declared test dependencies before pytest".to_string(),
@@ -3125,7 +3133,7 @@ fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
         };
     }
     PythonPytestCommand {
-        command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+        command: "python3 -m pytest -q -p no:cacheprovider".to_string(),
         reason: "Python tests detected".to_string(),
         confidence: 0.78,
         evidence: vec!["python-toolchain:stdlib".to_string()],
@@ -3778,7 +3786,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
         let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
-        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
+        assert_eq!(plan.command, "python3 -m pytest -q -p no:cacheprovider");
     }
 
     #[test]
@@ -4037,7 +4045,7 @@ mod tests {
 
     fn pytest_plan() -> AutoTestPlan {
         AutoTestPlan {
-            command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+            command: "python3 -m pytest -q -p no:cacheprovider".to_string(),
             reason: "test".to_string(),
         }
     }
@@ -4278,7 +4286,7 @@ mod tests {
         let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
         assert_eq!(
             plan.command,
-            "python3 -m pip install pytest && PYTHONPATH=src:. python3 -B -m pytest -p no:cacheprovider"
+            "python3 -m pip install pytest && PYTHONPATH=src:. python3 -m pytest -q -p no:cacheprovider"
         );
         assert!(plan.reason.contains("pytest-dependency"));
         assert!(plan.reason.contains("python-toolchain:pip-direct-deps"));
@@ -4539,25 +4547,14 @@ dev = [
 
     #[test]
     fn verifier_command_from_cargo_test_binds_artifact_paths() {
-        // CB-002: `tests/<name>.rs` paths convert to `--test <name>`
-        // flags rather than passing the file path verbatim (which cargo
-        // would interpret as a test-name filter, not a file path).
         let owned = vec!["tests/test_a.rs".to_string()];
         let command =
             VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo is allowlisted");
         assert_eq!(command.runner(), "cargo");
-        assert_eq!(
-            command.args(),
-            vec![
-                "test".to_string(),
-                "--test".to_string(),
-                "test_a".to_string()
-            ]
-            .as_slice()
-        );
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
         assert_eq!(command.bound_test_artifacts(), owned.as_slice());
         // Display string joins with single spaces — no `shlex`.
-        assert_eq!(command.to_display_string(), "cargo test --test test_a");
+        assert_eq!(command.to_display_string(), "cargo test");
     }
 
     #[test]
@@ -4628,17 +4625,7 @@ dev = [
             OwnedTestVerifierPlan::Runnable { command, .. } => {
                 assert_eq!(command.runner(), "cargo");
                 assert_eq!(command.bound_test_artifacts(), owned.as_slice());
-                // CB-002: positional `tests/test_a.rs` becomes
-                // `--test test_a` so cargo runs the integration test.
-                assert_eq!(
-                    command.args(),
-                    vec![
-                        "test".to_string(),
-                        "--test".to_string(),
-                        "test_a".to_string()
-                    ]
-                    .as_slice()
-                );
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
             }
             other => panic!("expected Runnable, got {other:?}"),
         }
@@ -4659,6 +4646,7 @@ dev = [
             OwnedTestVerifierPlan::Runnable { command, .. } => {
                 assert_eq!(command.runner(), "python3");
                 assert!(command.args().contains(&"pytest".to_string()));
+                assert!(command.args().contains(&"-q".to_string()));
                 assert!(
                     command.args().contains(&"tests/test_x.py".to_string()),
                     "owned test artifact must be appended to args, got {:?}",
@@ -4721,12 +4709,11 @@ dev = [
             &owned,
         );
         match unfiltered {
-            OwnedTestVerifierPlan::Weak {
-                detected_source, ..
-            } => {
-                assert_eq!(detected_source, "cargo_manifest");
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "cargo");
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
             }
-            other => panic!("expected unfiltered cargo weak verifier, got {other:?}"),
+            other => panic!("expected unfiltered cargo verifier, got {other:?}"),
         }
 
         let mut artifact_roles = BTreeSet::new();
@@ -4737,7 +4724,7 @@ dev = [
             manifests: Vec::new(),
             artifact_roles,
             verifier_candidates: vec![super::super::project_probe::ProjectUnitVerifierCandidate {
-                command_preview: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+                command_preview: "python3 -m pytest -q -p no:cacheprovider".to_string(),
                 source: "python_tests",
                 timeout_class: super::super::project_probe::ProjectUnitTimeoutClass::ShortUnitTest,
             }],
@@ -5226,45 +5213,33 @@ dev = [
     }
 
     // -----------------------------------------------------------------
-    // Issue #651 CB-002: cargo positional arg is a name filter, not
-    // a path. `from_cargo_test` must convert `tests/<stem>.rs` →
-    // `--test <stem>` and reject paths it cannot safely convert.
+    // Issue #865: Rust final success verifier is full `cargo test`.
     // -----------------------------------------------------------------
 
     #[test]
-    fn verifier_command_from_cargo_test_converts_tests_dir_to_test_flag() {
+    fn verifier_command_from_cargo_test_runs_full_suite() {
         let owned = vec!["tests/integration_one.rs".to_string()];
         let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
         assert_eq!(
             command.args(),
-            vec![
-                "test".to_string(),
-                "--test".to_string(),
-                "integration_one".to_string()
-            ]
-            .as_slice(),
-            "tests/<stem>.rs must map to `--test <stem>` (CB-002)"
+            vec!["test".to_string()].as_slice(),
+            "Rust final success verifier must be full cargo test"
         );
     }
 
     #[test]
-    fn verifier_command_from_cargo_test_rejects_src_internal_path_returns_none() {
-        // src/... is a unit-test module path; cargo cannot run an
-        // arbitrary file under `src/` as an integration test, so the
-        // constructor must return None (and the caller falls back to
-        // Weak).
+    fn verifier_command_from_cargo_test_accepts_src_internal_test_artifact() {
         let owned = vec!["src/lib/foo.rs".to_string()];
-        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
-        assert!(command.is_none(), "src/... path must not be convertible");
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+        assert_eq!(command.bound_test_artifacts(), owned.as_slice());
     }
 
     #[test]
-    fn verifier_command_from_cargo_test_rejects_non_rs_extension_returns_none() {
-        // `.py`, `.toml`, etc. cannot be an integration test file —
-        // the helper must refuse to fabricate a `--test <stem>` flag.
+    fn verifier_command_from_cargo_test_accepts_owned_artifact_without_filtering() {
         let owned = vec!["tests/test_a.py".to_string()];
-        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
-        assert!(command.is_none(), "non-.rs path must not be convertible");
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
     }
 
     #[test]
@@ -5288,7 +5263,7 @@ dev = [
     }
 
     #[test]
-    fn detect_owned_for_package_json_script_with_js_test_returns_runnable() {
+    fn detect_owned_for_package_json_script_returns_npm_test_runnable() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("package.json"),
@@ -5299,7 +5274,8 @@ dev = [
         let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
         match plan {
             OwnedTestVerifierPlan::Runnable { command, .. } => {
-                assert_eq!(command.runner(), "node");
+                assert_eq!(command.runner(), "npm");
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
                 assert_eq!(command.bound_test_artifacts(), owned.as_slice());
             }
             other => panic!("expected Runnable, got {other:?}"),
@@ -5307,24 +5283,14 @@ dev = [
     }
 
     #[test]
-    fn verifier_command_from_cargo_test_rejects_nested_tests_path_returns_none() {
-        // tests/sub/dir.rs is a sub-directory integration file. cargo's
-        // `--test <name>` flag does not address those; reject so the
-        // caller drops to Weak rather than fabricate a misleading flag.
+    fn verifier_command_from_cargo_test_accepts_nested_tests_path_for_full_suite() {
         let owned = vec!["tests/sub/dir.rs".to_string()];
-        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
-        assert!(
-            command.is_none(),
-            "nested tests/<sub>/<file>.rs must not be convertible"
-        );
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
     }
 
     #[test]
-    fn detect_owned_for_cargo_project_with_unconvertible_path_returns_weak() {
-        // A Cargo project with an owned test artifact under src/...
-        // means `from_cargo_test` returns None. The detector must
-        // surface this as `Weak` so the caller never executes an
-        // unbound `cargo test` (CB-002).
+    fn detect_owned_for_cargo_project_with_src_test_returns_runnable() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -5334,12 +5300,12 @@ dev = [
         let owned = vec!["src/lib/foo.rs".to_string()];
         let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
         match plan {
-            OwnedTestVerifierPlan::Weak {
-                detected_source, ..
-            } => {
-                assert_eq!(detected_source, "cargo_manifest");
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "cargo");
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
             }
-            other => panic!("expected Weak, got {other:?}"),
+            other => panic!("expected Runnable, got {other:?}"),
         }
     }
 
@@ -5615,6 +5581,11 @@ dev = [
     }
 
     #[test]
+    fn runner_kind_npm_serializes_as_npm_string() {
+        assert_eq!(RunnerKind::Npm.as_str(), "npm");
+    }
+
+    #[test]
     fn runner_kind_is_copy_clone_eq() {
         // Compile-time: Copy + Clone + PartialEq + Eq (required for
         // downstream payload dedup and value passing).
@@ -5635,7 +5606,7 @@ dev = [
     fn runner_kind_as_str_from_runner_str_round_trip_covers_all_variants() {
         // List every variant explicitly. When a new variant is added, this
         // test forces the author to extend both the list and `from_runner_str`.
-        let all = [RunnerKind::Cargo, RunnerKind::Python3];
+        let all = [RunnerKind::Cargo, RunnerKind::Python3, RunnerKind::Npm];
         for kind in all {
             let serialized = kind.as_str();
             let parsed = RunnerKind::from_runner_str(serialized).unwrap_or_else(|| {
@@ -5974,8 +5945,8 @@ dev = [
 
     /// Phase B Task 6.4 (DR4-002 leading-dash argv injection): a path that
     /// begins with `-` MUST reject `VerifierCommand` construction. Both
-    /// `from_pytest` (forwards path verbatim) and `from_cargo_test` (converts
-    /// to `--test <name>`) must refuse.
+    /// `from_pytest` (forwards path verbatim) and `from_cargo_test` (stores
+    /// bound metadata for full `cargo test`) must refuse.
     #[test]
     fn verifier_command_rejects_leading_dash_bound_path_from_pytest() {
         let owned = vec!["-malicious_test.py".to_string()];
@@ -6454,7 +6425,6 @@ dev = [
     #[test]
     fn verifier_invoked_snapshot_maps_cargo_runner_to_runnerkind_cargo() {
         let work = tempdir().expect("work");
-        // cargo from_cargo_test only accepts `tests/<stem>.rs` shapes.
         let owned = vec!["tests/test_a.rs".to_string()];
         let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
         let env_plan = build_hermetic_env_plan(work.path(), &[]);
@@ -6486,6 +6456,19 @@ dev = [
             "app/tests/test_a.py",
         ));
         assert_eq!(snapshot.bound_artifacts[0].as_str(), expected);
+    }
+
+    #[test]
+    fn verifier_invoked_snapshot_maps_npm_runner_to_runnerkind_npm() {
+        let work = tempdir().expect("work");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_npm_test(&owned).expect("npm test");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan)
+            .expect("npm runner must map to RunnerKind::Npm");
+        assert_eq!(snapshot.runner, RunnerKind::Npm);
+        assert_eq!(snapshot.runner.as_str(), "npm");
+        assert_eq!(snapshot.bound_test_artifacts_count, 1);
     }
 
     #[test]
@@ -6561,11 +6544,11 @@ dev = [
             RunnerKind::from_runner_str("python3"),
             Some(RunnerKind::Python3)
         );
+        assert_eq!(RunnerKind::from_runner_str("npm"), Some(RunnerKind::Npm));
         // Unknown / future runners MUST return None so they cannot reach
         // the `agent.verifier.invoked` payload without an explicit
         // `RunnerKind` variant + constructor + validator (DR4-004).
         assert!(RunnerKind::from_runner_str("pytest").is_none());
-        assert!(RunnerKind::from_runner_str("npm").is_none());
         assert!(RunnerKind::from_runner_str("").is_none());
     }
 }

@@ -114,6 +114,14 @@ pub(crate) enum CompletionEvidence {
         #[serde(default)]
         bound_test_artifacts_count: Option<usize>,
     },
+    /// A non-shell task-kind verifier proved that a documentation artifact
+    /// contains the required section surface. This is intentionally not a
+    /// Bash verifier: docs completion should not need a fake command exit to
+    /// produce completion evidence.
+    RequiredSectionsPass {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// The model produced an answer-only reply (no tool calls). Reserved
     /// for AnswerOnly protocol acceptance.
     AnswerOnly,
