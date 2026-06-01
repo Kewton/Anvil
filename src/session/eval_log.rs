@@ -67,6 +67,14 @@ pub struct EvalRecord {
     /// schema invariant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_promote: Option<AutoPromoteOutcomeSummary>,
+    /// Issue #848: obligation-level diagnosis for `final_outcome`.
+    ///
+    /// Additive eval-log field so downstream evaluators can classify terminal
+    /// failures without reconstructing model/control/verifier state from free
+    /// text or sibling event streams. Job-report and safe-stop schemas are
+    /// intentionally unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_diagnostics: Option<TerminalDiagnosticsSummary>,
     pub final_outcome: String,
 }
 
@@ -228,6 +236,24 @@ pub struct AutoPromoteOutcomeSummary {
     pub summary_id: Option<String>,
 }
 
+/// Issue #848: structured terminal-outcome classification for eval logs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalDiagnosticsSummary {
+    pub outcome: String,
+    pub classification: String,
+    pub obligations: Vec<TerminalObligationDiagnostic>,
+}
+
+/// One obligation status within a terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalObligationDiagnostic {
+    pub id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_domain: Option<String>,
+    pub detail: String,
+}
+
 // ---------------------------------------------------------------------------
 // OnceLock state
 // ---------------------------------------------------------------------------
@@ -333,6 +359,11 @@ pub fn build_eval_record(
         .iter()
         .map(|c| truncate_bytes(&mask_secrets(c), MAX_EVAL_VERIFY_CMD_BYTES))
         .collect();
+    let terminal_diagnostics = Some(build_terminal_diagnostics(
+        final_outcome,
+        &changed_file_classes,
+        verify_commands.len(),
+    ));
 
     // Precautions: cap count
     let active_precautions: Vec<EvalPrecautionSnapshot> = active_precautions
@@ -359,7 +390,209 @@ pub fn build_eval_record(
         photon_eval,
         photon_canary: 0,
         auto_promote,
+        terminal_diagnostics,
         final_outcome: final_outcome.to_string(),
+    }
+}
+
+pub fn build_terminal_diagnostics(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    verify_command_count: usize,
+) -> TerminalDiagnosticsSummary {
+    let classification = classify_terminal_outcome(final_outcome);
+    let changed_count = changed_file_classes
+        .test
+        .saturating_add(changed_file_classes.impl_files)
+        .saturating_add(changed_file_classes.setup);
+    let repo_edit_status = if changed_count > 0 {
+        ("satisfied", "repository edits were recorded")
+    } else {
+        ("not_observed", "no repository edits were recorded")
+    };
+    let verifier_status = if verify_command_count > 0 {
+        ("satisfied", "verifier command evidence was recorded")
+    } else {
+        ("not_observed", "no verifier command evidence was recorded")
+    };
+
+    let mut obligations = vec![
+        obligation(
+            "model_output_format",
+            "satisfied",
+            None,
+            "model output was parseable enough to reach terminal handling",
+        ),
+        obligation("repo_edit", repo_edit_status.0, None, repo_edit_status.1),
+        obligation(
+            "verification_environment",
+            verifier_status.0,
+            None,
+            verifier_status.1,
+        ),
+        obligation(
+            "verification_evidence",
+            verifier_status.0,
+            None,
+            verifier_status.1,
+        ),
+        obligation(
+            "repair_convergence",
+            "not_applicable",
+            None,
+            "repair loop was not the terminal authority",
+        ),
+    ];
+
+    match final_outcome {
+        "done" => {
+            if changed_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "repo_edit",
+                    "not_applicable",
+                    None,
+                    "no repository edit obligation was observed for this successful turn",
+                );
+            }
+            if verify_command_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "verification_environment",
+                    "not_applicable",
+                    None,
+                    "no verifier obligation was observed for this successful turn",
+                );
+                set_obligation(
+                    &mut obligations,
+                    "verification_evidence",
+                    "not_applicable",
+                    None,
+                    "no verifier evidence obligation was observed for this successful turn",
+                );
+            }
+        }
+        "missing_repo_edits" => {
+            set_obligation(
+                &mut obligations,
+                "repo_edit",
+                "unsatisfied",
+                Some("model_output_failure"),
+                "terminal outcome reports that required repository edits were not produced",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "not_applicable",
+                None,
+                "verification environment was not the terminal blocker",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "not_applicable",
+                None,
+                "verification evidence was not reached because repository edits were missing",
+            );
+        }
+        "tool_call_format_error" => {
+            set_obligation(
+                &mut obligations,
+                "model_output_format",
+                "unsatisfied",
+                Some("model_output_failure"),
+                "assistant emitted malformed or truncated tool calls repeatedly",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "not_applicable",
+                None,
+                "verification environment was not the terminal blocker",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "not_applicable",
+                None,
+                "verification evidence was not reached because tool-call parsing failed",
+            );
+        }
+        "safe_stop_verifier_missing" => {
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "requested verification could not run because no authoritative verifier was available",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "verification evidence is absent because verifier setup is missing",
+            );
+        }
+        "repair_exhausted" => {
+            set_obligation(
+                &mut obligations,
+                "repair_convergence",
+                "unsatisfied",
+                Some("control_loop_failure"),
+                "verifier repair reached its controlled exhaustion terminal",
+            );
+        }
+        _ => {}
+    }
+
+    TerminalDiagnosticsSummary {
+        outcome: final_outcome.to_string(),
+        classification: classification.to_string(),
+        obligations,
+    }
+}
+
+fn classify_terminal_outcome(final_outcome: &str) -> &'static str {
+    match final_outcome {
+        "done" => "success",
+        "missing_repo_edits" | "tool_call_format_error" => "model_output_failure",
+        "safe_stop_verifier_missing" => "verification_environment_failure",
+        "repair_exhausted" => "control_loop_failure",
+        "missing_verification" | "verifier_failed" | "safe_stop_verifier_weak" => {
+            "verification_failure"
+        }
+        "transport_error" => "transport_failure",
+        "interrupted" => "interrupted",
+        _ => "control_loop_failure",
+    }
+}
+
+fn obligation(
+    id: &str,
+    status: &str,
+    failure_domain: Option<&str>,
+    detail: &str,
+) -> TerminalObligationDiagnostic {
+    TerminalObligationDiagnostic {
+        id: id.to_string(),
+        status: status.to_string(),
+        failure_domain: failure_domain.map(str::to_string),
+        detail: detail.to_string(),
+    }
+}
+
+fn set_obligation(
+    obligations: &mut [TerminalObligationDiagnostic],
+    id: &str,
+    status: &str,
+    failure_domain: Option<&str>,
+    detail: &str,
+) {
+    if let Some(obligation) = obligations.iter_mut().find(|o| o.id == id) {
+        obligation.status = status.to_string();
+        obligation.failure_domain = failure_domain.map(str::to_string);
+        obligation.detail = detail.to_string();
     }
 }
 
@@ -439,6 +672,15 @@ mod tests {
             photon_eval: None,
             photon_canary: 0,
             auto_promote: None,
+            terminal_diagnostics: Some(build_terminal_diagnostics(
+                "done",
+                &ChangedFileClasses {
+                    test: 1,
+                    impl_files: 2,
+                    setup: 0,
+                },
+                1,
+            )),
             final_outcome: "done".to_string(),
         }
     }
@@ -476,6 +718,67 @@ mod tests {
         assert_eq!(rec.model, "qwen3:14b");
         assert_eq!(rec.tool_calls.len(), 1);
         assert_eq!(rec.final_outcome, "done");
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|d| d.classification.as_str()),
+            Some("success")
+        );
+    }
+
+    #[test]
+    fn terminal_diagnostics_classifies_issue_848_outcomes() {
+        let changed = ChangedFileClasses {
+            test: 1,
+            impl_files: 1,
+            setup: 0,
+        };
+        for (outcome, classification, failed_obligation, failure_domain) in [
+            ("done", "success", None, None),
+            (
+                "missing_repo_edits",
+                "model_output_failure",
+                Some("repo_edit"),
+                Some("model_output_failure"),
+            ),
+            (
+                "safe_stop_verifier_missing",
+                "verification_environment_failure",
+                Some("verification_environment"),
+                Some("verification_environment_failure"),
+            ),
+            (
+                "repair_exhausted",
+                "control_loop_failure",
+                Some("repair_convergence"),
+                Some("control_loop_failure"),
+            ),
+            (
+                "tool_call_format_error",
+                "model_output_failure",
+                Some("model_output_format"),
+                Some("model_output_failure"),
+            ),
+        ] {
+            let diag = build_terminal_diagnostics(outcome, &changed, 1);
+            assert_eq!(diag.outcome, outcome);
+            assert_eq!(diag.classification, classification);
+            if let Some(id) = failed_obligation {
+                let obligation = diag
+                    .obligations
+                    .iter()
+                    .find(|o| o.id == id)
+                    .unwrap_or_else(|| panic!("{outcome} missing obligation {id}"));
+                assert_eq!(obligation.status, "unsatisfied");
+                assert_eq!(obligation.failure_domain.as_deref(), failure_domain);
+            } else {
+                assert!(
+                    diag.obligations.iter().all(|o| o.status != "unsatisfied"),
+                    "done should not contain an unsatisfied obligation: {:?}",
+                    diag.obligations
+                );
+            }
+        }
     }
 
     #[test]
