@@ -2841,9 +2841,6 @@ fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
             | "yaml"
             | "yml"
             | "lock"
-            | "csv"
-            | "tsv"
-            | "jsonl"
             | "ndjson"
             | "parquet"
     );
