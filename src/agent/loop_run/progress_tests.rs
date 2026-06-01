@@ -1268,6 +1268,42 @@ mod inner {
     }
 
     #[test]
+    fn verifier_repair_pass_prompt_surfaces_repeated_signature_invariant() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "def create_item():\n    return {'status': 500}\n",
+        )
+        .unwrap();
+        let mut context = verifier_context_for("app/main.py");
+        context.failure_signature = "tests/test_main.py failed_tests:1 AssertionError".to_string();
+        context.previous_failure_signature = Some(context.failure_signature.clone());
+        context.repair_attempt = 2;
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let messages =
+            verifier_repair_pass_messages(work_root, &context, &target, "fix app", None).unwrap();
+        let payload = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(payload.contains("repeated_failure_invariant"));
+        assert!(payload.contains("same failure signature recurred"));
+        assert!(payload.contains("do not broaden the edit beyond the selected target"));
+        assert!(payload.contains("previous_failure_signature"));
+    }
+
+    #[test]
     fn verifier_repair_pass_prompt_preserves_test_verification_intent() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();

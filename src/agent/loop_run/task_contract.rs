@@ -120,11 +120,16 @@ impl CompletionPolicy {
         required_behavior: &RequiredBehaviorContract,
     ) -> Self {
         let project_intent = project_intent_from_required_artifacts(intent, required_artifacts);
+        let verifier_free_document_task = matches!(
+            project_intent,
+            CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
+        );
         Self {
             project_intent,
             required_artifacts: required_artifacts.to_vec(),
-            verification_required,
-            test_execution_required: required_behavior.test_execution_required,
+            verification_required: verification_required && !verifier_free_document_task,
+            test_execution_required: required_behavior.test_execution_required
+                && !verifier_free_document_task,
         }
     }
 
@@ -2550,6 +2555,26 @@ mod tests {
             CompletionProjectIntent::DocsOnly
         );
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn docs_only_check_request_reaches_done_without_coding_verifier() {
+        let contract =
+            TaskContract::from_request("Check and update the README documentation for usage");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Docs));
+
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert_eq!(
+            contract.completion_policy.project_intent,
+            CompletionProjectIntent::DocsOnly
+        );
+        assert!(!contract.verification_required);
+        assert!(!contract.completion_policy.test_execution_required());
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
     }
 
     #[test]

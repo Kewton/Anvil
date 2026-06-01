@@ -1827,6 +1827,16 @@ impl AutoTestRunner {
                 )
             })?;
 
+        if let Some(preflight_result) = run_structured_generated_test_preflight(
+            &runner_program,
+            &env_plan,
+            work_root,
+            command,
+            display_command,
+        )? {
+            return Ok(preflight_result);
+        }
+
         let dependency_site =
             match structured_python_pytest_dependency_setup_packages(work_root, command) {
                 Some(packages) => {
@@ -1893,6 +1903,101 @@ impl AutoTestRunner {
             stderr,
         })
     }
+}
+
+fn run_structured_generated_test_preflight(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    _work_root: &Path,
+    command: &VerifierCommand,
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    match command.runner() {
+        "python3" | "python" => {
+            let python_tests = command
+                .bound_test_artifacts()
+                .iter()
+                .filter(|path| Path::new(path).extension().is_some_and(|ext| ext == "py"))
+                .cloned()
+                .collect::<Vec<_>>();
+            if python_tests.is_empty() {
+                return Ok(None);
+            }
+            let mut args = vec!["-B".to_string(), "-m".to_string(), "py_compile".to_string()];
+            args.extend(python_tests);
+            run_structured_preflight_command(
+                runner_program,
+                env_plan,
+                args,
+                &format!("python3 -B -m py_compile + {display_command}"),
+            )
+        }
+        "cargo" => {
+            let mut args = vec!["test".to_string(), "--no-run".to_string()];
+            for path in command.bound_test_artifacts() {
+                let Some(name) = cargo_integration_test_name(path) else {
+                    return Ok(None);
+                };
+                args.push("--test".to_string());
+                args.push(name);
+            }
+            if args.len() == 2 {
+                return Ok(None);
+            }
+            run_structured_preflight_command(
+                runner_program,
+                env_plan,
+                args,
+                &format!("cargo test --no-run + {display_command}"),
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
+fn run_structured_preflight_command(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    args: Vec<String>,
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    let mut preflight_cmd = Command::new(runner_program);
+    preflight_cmd
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_plan.apply_to(&mut preflight_cmd);
+    crate::tools::bash::apply_unix_pgroup(&mut preflight_cmd);
+    let output = wait_with_auto_test_timeout(
+        &mut preflight_cmd,
+        Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("generated test preflight {err}"))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut combined = String::new();
+    combined.push_str(&stdout);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+    let redacted = crate::session::feedback::redact_verifier_command_for_storage(display_command);
+    Ok(Some(AutoTestResult {
+        command: redacted,
+        passed: false,
+        output: truncate(&formatted, MAX_OUTPUT_BYTES),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    }))
 }
 
 fn structured_python_pytest_dependency_setup_packages(
@@ -4701,6 +4806,39 @@ dev = [
         assert!(
             AutoTestRunner::detect_candidates(dir.path(), &changed).is_empty(),
             "controller-owned changed files must not create verifier candidates"
+        );
+    }
+
+    #[test]
+    fn structured_python_verifier_preflights_generated_test_syntax() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".anvil-state/generated")).expect("state dir");
+        std::fs::write(
+            dir.path().join(".anvil-state/generated/test_generated.py"),
+            "def test_generated(:\n    pass\n",
+        )
+        .expect("generated test");
+        let owned = vec![".anvil-state/generated/test_generated.py".to_string()];
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
+        let env_plan = build_hermetic_env_plan(dir.path(), VERIFIER_ENV_PYTHON_EXTRA);
+
+        let result = run_structured_generated_test_preflight(
+            "python3",
+            &env_plan,
+            dir.path(),
+            &command,
+            &command.to_display_string(),
+        )
+        .expect("preflight should run")
+        .expect("syntax failure should be returned before pytest");
+
+        assert!(!result.passed);
+        assert!(result.command.contains("py_compile"), "{}", result.command);
+        assert!(
+            result.output.contains("SyntaxError") || result.output.contains("syntax"),
+            "{}",
+            result.output
         );
     }
 
