@@ -1257,14 +1257,37 @@ mod tests {
                 non_goals: None,
             };
         let intent = super::super::task_contract::TaskIntent::Build;
+        let task_kind = super::super::task_contract::TaskKind::Coding;
         let completion_policy = super::super::task_contract::CompletionPolicy::from_contract_parts(
+            task_kind,
             intent,
             &required_artifacts,
             true,
             &required_behavior,
         );
+        let deliverables = required_artifacts
+            .iter()
+            .copied()
+            .map(|role| super::super::task_contract::TaskDeliverable {
+                kind: match role {
+                    ArtifactRole::Implementation => {
+                        super::super::task_contract::DeliverableKind::Code
+                    }
+                    ArtifactRole::Test => super::super::task_contract::DeliverableKind::Tests,
+                    ArtifactRole::UsageDocs => {
+                        super::super::task_contract::DeliverableKind::UsageDocs
+                    }
+                    ArtifactRole::Setup => super::super::task_contract::DeliverableKind::Setup,
+                },
+                role: Some(role),
+                path: None,
+                required_sections: Vec::new(),
+            })
+            .collect();
         let contract = super::super::task_contract::TaskContract {
+            task_kind,
             intent,
+            deliverables,
             required_artifacts,
             required_artifact_identities: vec![],
             optional_artifacts: vec![],
