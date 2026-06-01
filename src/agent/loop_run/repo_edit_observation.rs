@@ -9,24 +9,27 @@
 //!    normalization.
 //! 2. `is_ignored_workspace_display_path` ignored-top-dir gate (emits
 //!    `repo_edit_ignored_controller_state` and returns).
-//! 3. `classify_repo_edit_path` + `repo_edit_has_post_scaffold_delta`
+//! 3. `workspace_walk::is_user_deliverable_path` excludes protected
+//!    inputs and generated metadata/log files from edited-file and
+//!    completion-evidence summaries.
+//! 4. `classify_repo_edit_path` + `repo_edit_has_post_scaffold_delta`
 //!    scaffold-delta gate (emits `repo_edit_scaffold_unchanged` and
 //!    returns when the path is a scaffold body that didn't change).
-//! 4. Issue #646 (C2 / A4) content-no-op gate: pre-tool hash vs.
+//! 5. Issue #646 (C2 / A4) content-no-op gate: pre-tool hash vs.
 //!    current on-disk hash. Identical → emit `repo_edit_no_op` and
 //!    return. The pre-tool entry is removed in either branch to keep
 //!    the cache turn-local and bounded.
-//! 5. Record the path into `turn_edited_relative_paths` (the legacy
+//! 6. Record the path into `turn_edited_relative_paths` (the legacy
 //!    adapter-period authority).
-//! 6. Issue #646 (A1/B2): record an in-scope edit against the active
+//! 7. Issue #646 (A1/B2): record an in-scope edit against the active
 //!    `MissingVerifierJob` (if any).
-//! 7. Append `CompletionEvidence::RepoEdit` to the per-turn evidence
+//! 8. Append `CompletionEvidence::RepoEdit` to the per-turn evidence
 //!    set; when it satisfies the current artifact-recovery target,
 //!    mirror it into `task_contract_evidence_set_this_turn` + capture
 //!    a bounded `bounded_post_edit_excerpt` for the role.
-//! 8. Emit `agent.completion_evidence.observed` with category + path.
-//! 9. Issue #659 Task 2.5 write-through seed into the
-//!    `ArtifactLedger` SSOT.
+//! 9. Emit `agent.completion_evidence.observed` with category + path.
+//! 10. Issue #659 Task 2.5 write-through seed into the
+//!     `ArtifactLedger` SSOT.
 //!
 //! Originally an `impl Agent` method; converted to a free function
 //! taking `&mut Agent`, matching the `actor_loop_flow` / `reply_retry`
@@ -61,11 +64,11 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
         );
         return;
     }
-    if super::workspace_walk::is_protected_input_metadata_path(&relative_path) {
+    if !super::workspace_walk::is_user_deliverable_path(&relative_path) {
         crate::logging::log_completion_evidence_observed(
             agent.current_turn_index,
             0,
-            "repo_edit_protected_input_metadata",
+            "repo_edit_non_user_deliverable",
             serde_json::json!({
                 "path_hash": stable_path_hash(&relative_path),
             }),

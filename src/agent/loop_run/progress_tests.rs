@@ -7232,6 +7232,10 @@ E   assert [{'id': 1}] == []\n";
         std::fs::write(work_root.join("ANVIL.md"), "# rules\n").unwrap();
         std::fs::write(work_root.join("prompt.md"), "build a Rust CLI\n").unwrap();
         std::fs::write(work_root.join("cmd.txt"), "cargo test\n").unwrap();
+        std::fs::write(work_root.join("anvil.out"), "controller stdout\n").unwrap();
+        std::fs::write(work_root.join("anvil.err"), "controller stderr\n").unwrap();
+        std::fs::write(work_root.join("postcheck.out"), "postcheck stdout\n").unwrap();
+        std::fs::write(work_root.join("postcheck.err"), "postcheck stderr\n").unwrap();
         assert!(workspace_appears_empty(work_root));
 
         std::fs::write(work_root.join("README.md"), "# app\n").unwrap();
@@ -7333,6 +7337,68 @@ E   assert [{'id': 1}] == []\n";
                 .contains("prompt.md"),
             "protected input metadata must not enter artifact ledger repo edit projection"
         );
+    }
+
+    #[test]
+    fn repo_edit_observation_ignores_generated_log_outputs() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        for rel in ["anvil.out", "anvil.err", "postcheck.out", "postcheck.err"] {
+            let (mut agent, temp) = test_agent_with_config(Config::default());
+            std::fs::write(temp.path().join(rel), "generated output\n").unwrap();
+
+            super::super::repo_edit_observation::observe_evidence_from_repo_edit(&mut agent, rel);
+
+            assert!(
+                !agent.turn_edited_relative_paths.contains(rel),
+                "{rel} must not become repo edit evidence"
+            );
+            assert!(agent.evidence_set_this_turn.is_empty());
+            assert!(agent.task_contract_evidence_set_this_turn.is_empty());
+            assert!(
+                !agent
+                    .artifact_ledger
+                    .repo_edit_projection_set()
+                    .contains(rel),
+                "{rel} must not enter artifact ledger repo edit projection"
+            );
+        }
+    }
+
+    #[test]
+    fn write_to_generated_output_does_not_touch_working_memory_or_evidence() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let cfg = Config {
+            yes_mode: true,
+            ..Config::default()
+        };
+        let (mut agent, temp) = test_agent_with_config(cfg);
+        std::fs::write(temp.path().join("README.md"), "# app\n").unwrap();
+
+        let result = super::super::tool_call_execution::execute_tool_call(
+            &mut agent,
+            "Write",
+            &json!({"path":"anvil.out","content":"controller output\n"}),
+            None,
+            None,
+        );
+
+        assert!(!result.contains("rejected"), "unexpected result: {result}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("anvil.out")).unwrap(),
+            "controller output\n"
+        );
+        assert!(
+            agent.session.working_memory.touched_files.is_empty(),
+            "generated outputs must not appear in edited/touched file summaries"
+        );
+        assert!(!agent.session.repo_edit_succeeded_this_turn);
+        assert!(agent.evidence_set_this_turn.is_empty());
+        assert!(agent.task_contract_evidence_set_this_turn.is_empty());
+        assert!(!agent.turn_edited_relative_paths.contains("anvil.out"));
     }
 
     #[test]

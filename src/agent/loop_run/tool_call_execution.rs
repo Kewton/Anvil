@@ -109,7 +109,7 @@ fn protected_metadata_edit_policy_error(
     }
     let raw_path = arguments.get("path").and_then(serde_json::Value::as_str)?;
     let relative = workspace_relative_path_for_tool_arg(&agent.work_root, raw_path)?;
-    if !super::workspace_walk::is_protected_input_metadata_path(&relative) {
+    if !super::workspace_walk::is_protected_input_path(&relative) {
         return None;
     }
     Some(format!(
@@ -277,11 +277,19 @@ fn execute_non_bash_tool_call(
         Ok(result) => {
             let tool_outcome = success_outcome_for_call(name, arguments, &agent.work_root);
             if let Some(edit) = tool_outcome.repo_edit_evidence() {
-                agent
-                    .session
-                    .working_memory
-                    .note_touched_file(normalize_memory_path(edit.raw_path(), &agent.work_root));
-                agent.session.repo_edit_succeeded_this_turn = true;
+                let user_deliverable =
+                    workspace_relative_path_for_tool_arg(&agent.work_root, edit.raw_path())
+                        .is_some_and(|rel| super::workspace_walk::is_user_deliverable_path(&rel));
+                if user_deliverable {
+                    agent
+                        .session
+                        .working_memory
+                        .note_touched_file(normalize_memory_path(
+                            edit.raw_path(),
+                            &agent.work_root,
+                        ));
+                    agent.session.repo_edit_succeeded_this_turn = true;
+                }
                 super::repo_edit_observation::observe_evidence_from_repo_edit(
                     agent,
                     edit.raw_path(),
