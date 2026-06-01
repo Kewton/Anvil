@@ -1034,7 +1034,11 @@ mod tests {
     }
 
     fn ev_repo_edit(category: RepoEditCategory) -> CompletionEvidence {
-        CompletionEvidence::RepoEdit { category, count: 1 }
+        CompletionEvidence::RepoEdit {
+            category,
+            count: 1,
+            path: None,
+        }
     }
 
     /// U-09 — 5 ProtocolKind × evidence variant matrix smoke.

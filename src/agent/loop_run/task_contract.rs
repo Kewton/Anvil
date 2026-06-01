@@ -399,6 +399,14 @@ impl ArtifactState {
             kind: ArtifactStateKind::ChangedThisTurn,
         }
     }
+
+    pub(super) fn changed_at(role: ArtifactRole, path: impl Into<String>) -> Self {
+        Self {
+            role,
+            path: Some(path.into()),
+            kind: ArtifactStateKind::ChangedThisTurn,
+        }
+    }
 }
 
 // Issue #637: `VerifierRepairState` definition lives in
@@ -748,6 +756,38 @@ fn artifact_identity_ready_for_verification(
     })
 }
 
+fn required_role_satisfied_by_evidence(
+    contract: &TaskContract,
+    evidence: &EvidenceSet,
+    role: ArtifactRole,
+) -> bool {
+    let identities = contract.required_identities_for_role(role);
+    if identities.is_empty() {
+        return observed_artifacts(evidence).contains(&role);
+    }
+    identities
+        .iter()
+        .all(|identity| artifact_identity_observed_in_evidence(evidence, identity))
+}
+
+fn artifact_identity_observed_in_evidence(
+    evidence: &EvidenceSet,
+    identity: &ArtifactObligation,
+) -> bool {
+    evidence.iter().any(|item| {
+        let CompletionEvidence::RepoEdit {
+            category,
+            path: Some(path),
+            ..
+        } = item
+        else {
+            return false;
+        };
+        role_from_repo_edit(*category) == Some(identity.role)
+            && normalized_artifact_path_eq(path, &identity.path)
+    })
+}
+
 fn recovery_target_hint_for_missing(
     artifacts: &[ArtifactState],
     missing: &[ArtifactRole],
@@ -786,7 +826,7 @@ fn recovery_target_hint_for_missing_with_contract(
         return Some(RecoveryTargetHint {
             role,
             path: identity.path.clone(),
-            reason: "explicitly requested artifact identity is still missing".to_string(),
+            reason: "required artifact identity is still missing".to_string(),
         });
     }
     recovery_target_hint_for_missing(artifacts, missing)
@@ -903,12 +943,27 @@ impl TaskContract {
             }
         }
 
-        required.sort();
-        required.dedup();
         optional.sort();
         optional.dedup();
         let mut required_artifact_identities = explicit_artifact_obligations_from_request(request);
         required_artifact_identities.retain(|identity| required.contains(&identity.role));
+        for identity in
+            inferred_artifact_obligations_from_project_intent(&project_intent, &required)
+        {
+            if !required.contains(&identity.role) {
+                required.push(identity.role);
+            }
+            if !required_artifact_identities
+                .iter()
+                .any(|existing| existing.role == identity.role && existing.path == identity.path)
+            {
+                required_artifact_identities.push(identity);
+            }
+        }
+        required.sort();
+        required.dedup();
+        required_artifact_identities
+            .sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
 
         // Issue #635: build the deterministic behavior schema. The
         // existing `required_artifacts` gate above is the source of truth
@@ -1023,13 +1078,12 @@ impl TaskContract {
             return CompletionDecision::Done;
         }
         let policy = &self.completion_policy;
-        let observed = observed_artifacts(evidence);
         let missing = self
             .completion_policy
             .required_artifacts()
             .iter()
             .copied()
-            .filter(|role| !observed.contains(role))
+            .filter(|role| !required_role_satisfied_by_evidence(self, evidence, *role))
             .collect::<Vec<_>>();
         if !missing.is_empty() {
             return CompletionDecision::Continue { missing };
@@ -1953,6 +2007,30 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
             .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
+fn inferred_artifact_obligations_from_project_intent(
+    project_intent: &ProjectIntent,
+    required_artifacts: &[ArtifactRole],
+) -> Vec<ArtifactObligation> {
+    if !required_artifacts.contains(&ArtifactRole::Implementation) {
+        return Vec::new();
+    }
+    let shape = project_intent.shape.unwrap_or(ProjectShape::Unknown);
+    if !matches!(shape, ProjectShape::Cli | ProjectShape::Library) {
+        return Vec::new();
+    }
+    match project_intent.language.unwrap_or(ProjectLanguage::Unknown) {
+        ProjectLanguage::Rust => vec![ArtifactObligation {
+            role: ArtifactRole::Setup,
+            path: "Cargo.toml".to_string(),
+        }],
+        ProjectLanguage::Node => vec![ArtifactObligation {
+            role: ArtifactRole::Setup,
+            path: "package.json".to_string(),
+        }],
+        ProjectLanguage::Python | ProjectLanguage::Docs | ProjectLanguage::Unknown => Vec::new(),
+    }
+}
+
 pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<ArtifactObligation> {
     let mut obligations = Vec::new();
     for token in request.split(|ch: char| {
@@ -2333,7 +2411,19 @@ mod tests {
     use super::*;
 
     fn repo_edit(category: RepoEditCategory) -> CompletionEvidence {
-        CompletionEvidence::RepoEdit { category, count: 1 }
+        CompletionEvidence::RepoEdit {
+            category,
+            count: 1,
+            path: None,
+        }
+    }
+
+    fn repo_edit_path(category: RepoEditCategory, path: &str) -> CompletionEvidence {
+        CompletionEvidence::RepoEdit {
+            category,
+            count: 1,
+            path: Some(path.to_string()),
+        }
     }
 
     fn build_test() -> CompletionEvidence {
@@ -2495,7 +2585,7 @@ mod tests {
             "このプロジェクトの使い方を説明するREADME.mdを作成してください。インストール、実行、テスト方法を含めてください。",
         );
         let mut evidence = EvidenceSet::new();
-        evidence.push(repo_edit(RepoEditCategory::Docs));
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
 
         assert_ne!(contract.intent, TaskIntent::Install);
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
@@ -2555,7 +2645,7 @@ mod tests {
         let decision = contract.evaluate(&EvidenceSet::new());
         assert_eq!(
             missing_labels(&decision),
-            vec!["implementation", "test", "usage_docs"]
+            vec!["implementation", "test", "usage_docs", "setup"]
         );
     }
 
@@ -2618,7 +2708,7 @@ mod tests {
         evidence.push(repo_edit(RepoEditCategory::Docs));
 
         let decision = contract.evaluate(&evidence);
-        assert_eq!(missing_labels(&decision), vec!["implementation"]);
+        assert_eq!(missing_labels(&decision), vec!["implementation", "setup"]);
     }
 
     #[test]
@@ -2676,7 +2766,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::Implementation,
                     path: "lru_cache.py".to_string(),
-                    reason: "explicitly requested artifact identity is still missing".to_string(),
+                    reason: "required artifact identity is still missing".to_string(),
                 }),
             }
         );
@@ -2704,6 +2794,129 @@ mod tests {
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn rust_cli_manifest_obligation_blocks_completion_when_cargo_toml_missing() {
+        let contract = TaskContract::from_request("Create a Rust CLI word counter");
+        assert!(
+            contract
+                .required_artifact_identities
+                .contains(&ArtifactObligation {
+                    role: ArtifactRole::Setup,
+                    path: "Cargo.toml".to_string(),
+                })
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/main.rs"));
+        let artifacts = vec![ArtifactState::exists(
+            ArtifactRole::Implementation,
+            "src/main.rs",
+        )];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Setup],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Setup,
+                    path: "Cargo.toml".to_string(),
+                    reason: "required artifact identity is still missing".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn node_package_manifest_obligation_blocks_completion_when_package_json_missing() {
+        let contract = TaskContract::from_request("Build a Node package for slugifying strings");
+        assert!(
+            contract
+                .required_artifact_identities
+                .contains(&ArtifactObligation {
+                    role: ArtifactRole::Setup,
+                    path: "package.json".to_string(),
+                })
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = vec![ArtifactState::exists(
+            ArtifactRole::Implementation,
+            "src/index.js",
+        )];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Setup],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Setup,
+                    path: "package.json".to_string(),
+                    reason: "required artifact identity is still missing".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn docs_only_required_docs_artifact_completes_without_executable_verifier() {
+        let contract = TaskContract::from_request("Update README.md with usage documentation");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        let artifacts = vec![ArtifactState::exists(ArtifactRole::UsageDocs, "README.md")];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn evaluate_requires_requested_obligation_paths_not_only_roles() {
+        let contract = TaskContract::from_request("Create src/word_count.rs as a Rust CLI");
+        let mut wrong_path = EvidenceSet::new();
+        wrong_path.push(repo_edit_path(RepoEditCategory::Impl, "src/main.rs"));
+        wrong_path.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+
+        assert_eq!(
+            missing_labels(&contract.evaluate(&wrong_path)),
+            vec!["implementation"]
+        );
+
+        let mut requested_paths = EvidenceSet::new();
+        requested_paths.push(repo_edit_path(RepoEditCategory::Impl, "src/word_count.rs"));
+        requested_paths.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+
+        assert_eq!(
+            contract.evaluate(&requested_paths),
+            CompletionDecision::Done
         );
     }
 
@@ -2897,7 +3110,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::UsageDocs,
                     path: "README.md".to_string(),
-                    reason: "explicitly requested artifact identity is still missing".to_string(),
+                    reason: "required artifact identity is still missing".to_string(),
                 }),
             }
         );
@@ -3033,7 +3246,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3068,7 +3281,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3100,7 +3313,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3137,7 +3350,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3169,7 +3382,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3205,7 +3418,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3239,7 +3452,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
@@ -3283,7 +3496,7 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[],
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,

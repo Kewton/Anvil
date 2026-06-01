@@ -78,6 +78,8 @@ pub(crate) enum CompletionEvidence {
     RepoEdit {
         category: RepoEditCategory,
         count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// A Bash command classified as `BuildTest` that exited with code 0.
     /// `command` is masked through `redact_verifier_command_for_storage`
@@ -402,6 +404,7 @@ mod tests {
         set.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Impl,
             count: 1,
+            path: None,
         });
         set.push(CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::BuildTest,

@@ -89,14 +89,17 @@ mod inner {
         evidence.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Impl,
             count: 1,
+            path: None,
         });
         evidence.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Test,
             count: 1,
+            path: None,
         });
         evidence.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Docs,
             count: 1,
+            path: Some("README.md".to_string()),
         });
 
         let verify_pending =

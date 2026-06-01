@@ -149,10 +149,18 @@ fn task_contract_artifact_states_legacy(
         }
     }
     for evidence in agent.task_contract_evidence_set_this_turn.iter() {
-        if let super::completion_evidence::CompletionEvidence::RepoEdit { category, .. } = evidence
+        if let super::completion_evidence::CompletionEvidence::RepoEdit { category, path, .. } =
+            evidence
             && let Some(role) = super::task_contract::role_from_repo_edit(*category)
         {
-            states.push(super::task_contract::ArtifactState::changed(role));
+            if let Some(path) = path {
+                states.push(super::task_contract::ArtifactState::changed_at(
+                    role,
+                    path.clone(),
+                ));
+            } else {
+                states.push(super::task_contract::ArtifactState::changed(role));
+            }
         }
     }
     states
@@ -218,10 +226,18 @@ fn task_contract_artifact_states_from_ledger(
         }
     }
     for evidence in agent.task_contract_evidence_set_this_turn.iter() {
-        if let super::completion_evidence::CompletionEvidence::RepoEdit { category, .. } = evidence
+        if let super::completion_evidence::CompletionEvidence::RepoEdit { category, path, .. } =
+            evidence
             && let Some(role) = super::task_contract::role_from_repo_edit(*category)
         {
-            states.push(super::task_contract::ArtifactState::changed(role));
+            if let Some(path) = path {
+                states.push(super::task_contract::ArtifactState::changed_at(
+                    role,
+                    path.clone(),
+                ));
+            } else {
+                states.push(super::task_contract::ArtifactState::changed(role));
+            }
         }
     }
     states
