@@ -3956,7 +3956,7 @@ pub(super) fn run_actor_loop(
     {
         use crate::session::eval_log::{
             AnvilScoreSummary, ChangedFileClasses, EvalPrecautionSnapshot, FeedbackFrameSummary,
-            build_eval_record, write_eval_record,
+            build_eval_record_with_terminal_context, write_eval_record,
         };
         use crate::session::precaution::PrecautionStatus;
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -4019,7 +4019,17 @@ pub(super) fn run_actor_loop(
             impl_files: stats.changed_impl_count,
             setup: stats.changed_setup_count,
         };
-        let mut record = build_eval_record(
+        let last_failure_signature = agent
+            .repair_job
+            .as_ref()
+            .map(|job| job.failure_signature.clone())
+            .or_else(|| {
+                agent
+                    .repair_failure_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.failure_signature.clone())
+            });
+        let mut record = build_eval_record_with_terminal_context(
             &session_id,
             ts_ms,
             active_task,
@@ -4036,6 +4046,7 @@ pub(super) fn run_actor_loop(
             agent.last_photon_eval_summary.take(),
             agent.last_auto_promote_outcome.clone(),
             exit_reason.label(),
+            last_failure_signature.as_deref(),
         );
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);

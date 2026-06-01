@@ -241,6 +241,11 @@ pub struct AutoPromoteOutcomeSummary {
 pub struct TerminalDiagnosticsSummary {
     pub outcome: String,
     pub classification: String,
+    pub satisfied_obligations: Vec<String>,
+    pub missing_obligations: Vec<String>,
+    pub verifier_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_signature: Option<String>,
     pub obligations: Vec<TerminalObligationDiagnostic>,
 }
 
@@ -353,16 +358,60 @@ pub fn build_eval_record(
     auto_promote: Option<AutoPromoteOutcomeSummary>,
     final_outcome: &str,
 ) -> EvalRecord {
+    build_eval_record_with_terminal_context(
+        session_id,
+        ts_ms,
+        task,
+        model,
+        mode,
+        tool_protocol,
+        tool_calls,
+        feedback_frame,
+        active_precautions,
+        anvil_score,
+        changed_file_classes,
+        verify_commands,
+        case_retrieval_result,
+        photon_eval,
+        auto_promote,
+        final_outcome,
+        None,
+    )
+}
+
+/// Variant of [`build_eval_record`] for callers that have verifier-repair
+/// terminal context available at the turn boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn build_eval_record_with_terminal_context(
+    session_id: &str,
+    ts_ms: u64,
+    task: &str,
+    model: &str,
+    mode: &str,
+    tool_protocol: &str,
+    tool_calls: &[ToolCallSummary],
+    feedback_frame: Option<FeedbackFrameSummary>,
+    active_precautions: &[EvalPrecautionSnapshot],
+    anvil_score: Option<AnvilScoreSummary>,
+    changed_file_classes: ChangedFileClasses,
+    verify_commands: &[String],
+    case_retrieval_result: Option<CaseRetrievalSummary>,
+    photon_eval: Option<PhotonEvalSummary>,
+    auto_promote: Option<AutoPromoteOutcomeSummary>,
+    final_outcome: &str,
+    last_failure_signature: Option<&str>,
+) -> EvalRecord {
     // DR4-002: mask_secrets → truncate for free-text fields
     let task = truncate_bytes(&mask_secrets(task), MAX_EVAL_TASK_BYTES);
     let verify_commands: Vec<String> = verify_commands
         .iter()
         .map(|c| truncate_bytes(&mask_secrets(c), MAX_EVAL_VERIFY_CMD_BYTES))
         .collect();
-    let terminal_diagnostics = Some(build_terminal_diagnostics(
+    let terminal_diagnostics = Some(build_terminal_diagnostics_with_context(
         final_outcome,
         &changed_file_classes,
         verify_commands.len(),
+        last_failure_signature,
     ));
 
     // Precautions: cap count
@@ -400,11 +449,26 @@ pub fn build_terminal_diagnostics(
     changed_file_classes: &ChangedFileClasses,
     verify_command_count: usize,
 ) -> TerminalDiagnosticsSummary {
-    let classification = classify_terminal_outcome(final_outcome);
+    build_terminal_diagnostics_with_context(
+        final_outcome,
+        changed_file_classes,
+        verify_command_count,
+        None,
+    )
+}
+
+pub fn build_terminal_diagnostics_with_context(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    verify_command_count: usize,
+    last_failure_signature: Option<&str>,
+) -> TerminalDiagnosticsSummary {
     let changed_count = changed_file_classes
         .test
         .saturating_add(changed_file_classes.impl_files)
         .saturating_add(changed_file_classes.setup);
+    let classification =
+        classify_terminal_outcome_with_context(final_outcome, changed_count, verify_command_count);
     let repo_edit_status = if changed_count > 0 {
         ("satisfied", "repository edits were recorded")
     } else {
@@ -535,29 +599,78 @@ pub fn build_terminal_diagnostics(
             );
         }
         "repair_exhausted" => {
+            if changed_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "repo_edit",
+                    "unsatisfied",
+                    Some("model_output_failure"),
+                    "repair exhausted before a repository edit was recorded",
+                );
+            }
+            if verify_command_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "verification_environment",
+                    "unsatisfied",
+                    Some("verification_environment_failure"),
+                    "repair exhausted without verifier command evidence",
+                );
+                set_obligation(
+                    &mut obligations,
+                    "verification_evidence",
+                    "unsatisfied",
+                    Some("verification_environment_failure"),
+                    "repair exhausted before verifier evidence could be recorded",
+                );
+            }
             set_obligation(
                 &mut obligations,
                 "repair_convergence",
                 "unsatisfied",
-                Some("control_loop_failure"),
+                Some(classification),
                 "verifier repair reached its controlled exhaustion terminal",
             );
         }
         _ => {}
     }
 
+    let satisfied_obligations = obligations
+        .iter()
+        .filter(|obligation| obligation.status == "satisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    let missing_obligations = obligations
+        .iter()
+        .filter(|obligation| obligation.status == "unsatisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    let verifier_status = terminal_verifier_status(final_outcome, verify_command_count);
+    let last_failure_signature = last_failure_signature
+        .map(|signature| truncate_bytes(&mask_secrets(signature), MAX_PHOTON_EVAL_WARNING_BYTES));
+
     TerminalDiagnosticsSummary {
         outcome: final_outcome.to_string(),
         classification: classification.to_string(),
+        satisfied_obligations,
+        missing_obligations,
+        verifier_status: verifier_status.to_string(),
+        last_failure_signature,
         obligations,
     }
 }
 
-fn classify_terminal_outcome(final_outcome: &str) -> &'static str {
+fn classify_terminal_outcome_with_context(
+    final_outcome: &str,
+    changed_count: usize,
+    verify_command_count: usize,
+) -> &'static str {
     match final_outcome {
         "done" => "success",
         "missing_repo_edits" | "tool_call_format_error" => "model_output_failure",
         "safe_stop_verifier_missing" => "verification_environment_failure",
+        "repair_exhausted" if verify_command_count == 0 => "verification_environment_failure",
+        "repair_exhausted" if changed_count == 0 => "model_output_failure",
         "repair_exhausted" => "control_loop_failure",
         "missing_verification" | "verifier_failed" | "safe_stop_verifier_weak" => {
             "verification_failure"
@@ -565,6 +678,17 @@ fn classify_terminal_outcome(final_outcome: &str) -> &'static str {
         "transport_error" => "transport_failure",
         "interrupted" => "interrupted",
         _ => "control_loop_failure",
+    }
+}
+
+fn terminal_verifier_status(final_outcome: &str, verify_command_count: usize) -> &'static str {
+    if verify_command_count == 0 {
+        return "not_observed";
+    }
+    if final_outcome == "done" {
+        "satisfied"
+    } else {
+        "failed_or_incomplete"
     }
 }
 
@@ -724,6 +848,12 @@ mod tests {
                 .map(|d| d.classification.as_str()),
             Some("success")
         );
+        let diag = rec.terminal_diagnostics.as_ref().unwrap();
+        assert_eq!(diag.verifier_status, "satisfied");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"repo_edit".to_string())
+        );
     }
 
     #[test]
@@ -771,6 +901,7 @@ mod tests {
                     .unwrap_or_else(|| panic!("{outcome} missing obligation {id}"));
                 assert_eq!(obligation.status, "unsatisfied");
                 assert_eq!(obligation.failure_domain.as_deref(), failure_domain);
+                assert!(diag.missing_obligations.contains(&id.to_string()));
             } else {
                 assert!(
                     diag.obligations.iter().all(|o| o.status != "unsatisfied"),
@@ -779,6 +910,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_diagnostics_distinguishes_repair_exhausted_domains() {
+        let changed = ChangedFileClasses {
+            test: 1,
+            impl_files: 1,
+            setup: 0,
+        };
+        let control =
+            build_terminal_diagnostics_with_context("repair_exhausted", &changed, 1, Some("sig"));
+        assert_eq!(control.classification, "control_loop_failure");
+        assert_eq!(control.last_failure_signature.as_deref(), Some("sig"));
+        assert_eq!(control.verifier_status, "failed_or_incomplete");
+
+        let model_output = build_terminal_diagnostics_with_context(
+            "repair_exhausted",
+            &ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            1,
+            None,
+        );
+        assert_eq!(model_output.classification, "model_output_failure");
+        assert!(
+            model_output
+                .missing_obligations
+                .contains(&"repo_edit".to_string())
+        );
+
+        let verifier_env =
+            build_terminal_diagnostics_with_context("repair_exhausted", &changed, 0, None);
+        assert_eq!(
+            verifier_env.classification,
+            "verification_environment_failure"
+        );
+        assert_eq!(verifier_env.verifier_status, "not_observed");
+        assert!(
+            verifier_env
+                .missing_obligations
+                .contains(&"verification_environment".to_string())
+        );
     }
 
     #[test]
