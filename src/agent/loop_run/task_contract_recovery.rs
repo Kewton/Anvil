@@ -142,6 +142,20 @@ pub(super) fn task_contract_recovery_target(
         return None;
     };
     let role = missing.first().copied()?;
+    if let Some(identity) = super::workspace_access::active_request_text(agent)
+        .as_deref()
+        .and_then(|request| {
+            super::task_contract::explicit_artifact_obligations_from_request(request)
+                .into_iter()
+                .find(|identity| identity.role == role)
+        })
+    {
+        return Some(super::task_contract::RecoveryTargetHint {
+            role,
+            path: identity.path,
+            reason: "explicitly requested artifact identity is still missing".to_string(),
+        });
+    }
     if let Some(path) = super::scaffold_pipeline::scaffold_candidate_for_missing_role(agent, role) {
         return Some(super::task_contract::RecoveryTargetHint {
             role,

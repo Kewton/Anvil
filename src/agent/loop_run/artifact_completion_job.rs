@@ -1266,6 +1266,7 @@ mod tests {
         let contract = super::super::task_contract::TaskContract {
             intent,
             required_artifacts,
+            required_artifact_identities: vec![],
             optional_artifacts: vec![],
             verification_required: true,
             completion_policy,

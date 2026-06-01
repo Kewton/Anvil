@@ -158,7 +158,7 @@ pub(super) fn probe_completion(
     }
 
     for role in &contract.required_artifacts {
-        if !role_has_current_artifact(work_root, &facts, *role) {
+        if !contract_required_role_has_current_artifact(work_root, &facts, contract, *role) {
             return CompletionProbeDecision::KeepArtifactFlow;
         }
     }
@@ -281,6 +281,25 @@ fn role_has_current_artifact(work_root: &Path, facts: &WorkspaceFacts, role: Art
         .files
         .iter()
         .any(|path| facts.edited_files.contains(path) && file_matches_role(work_root, path, role))
+}
+
+fn contract_required_role_has_current_artifact(
+    work_root: &Path,
+    facts: &WorkspaceFacts,
+    contract: &TaskContract,
+    role: ArtifactRole,
+) -> bool {
+    let identities = contract.required_identities_for_role(role);
+    if identities.is_empty() {
+        return role_has_current_artifact(work_root, facts, role);
+    }
+    identities.iter().all(|identity| {
+        facts.files.iter().any(|path| {
+            facts.edited_files.contains(path)
+                && super::task_contract::normalized_artifact_path_eq(path, &identity.path)
+                && file_matches_role(work_root, path, role)
+        })
+    })
 }
 
 fn file_matches_role(work_root: &Path, relative_path: &str, role: ArtifactRole) -> bool {
@@ -676,6 +695,29 @@ mod tests {
             &contract(request),
             &scope(dir.path(), request),
             &edited(&[]),
+        );
+        assert_eq!(decision, CompletionProbeDecision::KeepArtifactFlow);
+    }
+
+    #[test]
+    fn explicit_impl_filename_identity_prevents_wrong_path_probe_promotion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(dir.path().join("main.py"), "def put(): pass\n").expect("impl");
+        std::fs::write(
+            dir.path().join("tests/test_lru_cache.py"),
+            "def test_cache(): pass\n",
+        )
+        .expect("test");
+        std::fs::write(dir.path().join("README.md"), "pytest\n").expect("readme");
+
+        let request = "Create lru_cache.py with tests and README.";
+        let decision = probe_completion(
+            dir.path(),
+            request,
+            &contract(request),
+            &scope(dir.path(), request),
+            &edited(&["main.py", "tests/test_lru_cache.py", "README.md"]),
         );
         assert_eq!(decision, CompletionProbeDecision::KeepArtifactFlow);
     }
