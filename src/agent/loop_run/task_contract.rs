@@ -1726,7 +1726,7 @@ fn deliverable_kind_for_role(role: ArtifactRole) -> DeliverableKind {
         ArtifactRole::Test => DeliverableKind::Tests,
         ArtifactRole::UsageDocs => DeliverableKind::UsageDocs,
         ArtifactRole::Setup => DeliverableKind::Setup,
-        ArtifactRole::DataOutput => DeliverableKind::StructuredRecord,
+        ArtifactRole::DataOutput => DeliverableKind::Data,
     }
 }
 
