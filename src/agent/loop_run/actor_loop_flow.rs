@@ -4048,6 +4048,10 @@ pub(super) fn run_actor_loop(
             exit_reason.label(),
             last_failure_signature.as_deref(),
         );
+        record.pam_eval = agent
+            .last_pam_decision_this_turn
+            .as_ref()
+            .map(|decision| decision.to_eval_summary());
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }

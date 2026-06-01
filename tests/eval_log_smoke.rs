@@ -7,8 +7,8 @@ use anvil::session::case_retrieval::CaseScoreBreakdown;
 use anvil::session::eval_log::{
     AnvilScoreSummary, CaseRetrievalSummary, ChangedFileClasses, EvalPrecautionSnapshot,
     EvalRecord, FeedbackFrameSummary, MAX_EVAL_LOG_RECORD_BYTES, MAX_EVAL_PRECAUTIONS,
-    MAX_EVAL_TASK_BYTES, ToolCallSummary, build_eval_record, build_terminal_diagnostics,
-    scrub_absolute_paths, write_eval_record_to,
+    MAX_EVAL_TASK_BYTES, PamEvalSummary, ToolCallSummary, build_eval_record,
+    build_terminal_diagnostics, scrub_absolute_paths, write_eval_record_to,
 };
 use serde_json::Value;
 use std::fs::OpenOptions;
@@ -98,6 +98,50 @@ fn r1_build_eval_record_round_trip() {
     assert_eq!(rec.verify_commands, vec!["cargo build"]);
     assert!(rec.case_retrieval_result.is_none());
     assert_eq!(rec.final_outcome, "done");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R1b: PAM eval summary is additive and advisory-only
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn r1b_pam_eval_summary_serializes_advisory_impact() {
+    let mut rec = build_eval_record(
+        "sess-r1b",
+        1_700_000_000_001,
+        "fix the compilation error",
+        "qwen3:14b",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        make_classes(),
+        &[],
+        None,
+        None,
+        None,
+        "done",
+    );
+    rec.pam_eval = Some(PamEvalSummary {
+        mode: "live".to_string(),
+        decision_type: "prompt_context_injection".to_string(),
+        decision_types: vec!["prompt_context_injection".to_string()],
+        actual_injected_count: 2,
+        suppressed_count: 1,
+        would_inject_in_live_count: 0,
+        advisory_only: true,
+        completion_judgement_override: false,
+    });
+
+    let json = serde_json::to_value(&rec).unwrap();
+    assert_eq!(
+        json["pam_eval"]["decision_type"],
+        "prompt_context_injection"
+    );
+    assert_eq!(json["pam_eval"]["actual_injected_count"], 2);
+    assert_eq!(json["pam_eval"]["advisory_only"], true);
+    assert_eq!(json["pam_eval"]["completion_judgement_override"], false);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -363,6 +407,7 @@ fn r9_oversized_record_is_dropped() {
         verify_commands: giant_cmds,
         case_retrieval_result: None,
         photon_eval: None,
+        pam_eval: None,
         photon_canary: 0,
         auto_promote: None,
         terminal_diagnostics: Some(build_terminal_diagnostics(
