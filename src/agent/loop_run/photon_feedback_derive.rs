@@ -684,6 +684,7 @@ pub(super) fn skip_photon_context_pack(
     reason: &str,
 ) {
     agent.last_photon_context_pack_status = status;
+    agent.record_pam_unused_reason(reason);
     log_llm_event(
         "agent.photon_context_pack.skipped",
         serde_json::json!({
@@ -1042,6 +1043,7 @@ pub(super) fn invoke_photon_context_pack(agent: &mut Agent) {
 
     // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
     if agent.photon.is_none() {
+        agent.record_pam_unused_reason("photon_unavailable");
         return;
     }
 
@@ -1085,6 +1087,7 @@ pub(super) fn invoke_photon_context_pack(agent: &mut Agent) {
         Some(resp) => process_photon_context_pack_response(agent, resp, warning_filter_enabled),
         None => {
             clear_photon_context_pack_injection_tracking(agent);
+            agent.record_pam_unused_reason("context_pack_failed");
             (0, false)
         }
     };

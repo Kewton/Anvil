@@ -299,6 +299,7 @@ impl PamAdvisoryDecision {
     /// The eval log records only categorical impact and counts. Per-context
     /// adoption/suppression reasons stay in the structured memory report.
     pub(super) fn to_eval_summary(&self) -> crate::session::eval_log::PamEvalSummary {
+        let mut affected_targets = Vec::new();
         let mut decision_types = Vec::new();
         push_unique_decision_type(
             &mut decision_types,
@@ -306,16 +307,23 @@ impl PamAdvisoryDecision {
         );
         for decision in &self.candidate_decisions {
             push_unique_decision_type(&mut decision_types, decision.decision_impact);
+            push_eval_target(
+                &mut affected_targets,
+                decision,
+                self.active_job_role.as_str(),
+            );
         }
         crate::session::eval_log::PamEvalSummary {
             mode: self.mode.as_str().to_string(),
             decision_type: self.decision_effect.influenced_decision.to_string(),
             decision_types,
+            affected_targets,
             actual_injected_count: self.decision_effect.actual_injected_count,
             suppressed_count: self.decision_effect.suppressed_count,
             would_inject_in_live_count: self.decision_effect.would_inject_in_live_count,
             advisory_only: true,
             completion_judgement_override: false,
+            unused_reason: None,
         }
     }
 }
@@ -651,6 +659,47 @@ fn push_unique_decision_type(out: &mut Vec<String>, value: &'static str) {
     out.push(value.to_string());
 }
 
+fn push_eval_target(
+    out: &mut Vec<crate::session::eval_log::PamEvalTarget>,
+    decision: &PamCandidateDecision,
+    active_job_role: &str,
+) {
+    if out.len() >= crate::session::eval_log::MAX_PAM_EVAL_TARGETS {
+        return;
+    }
+    let (target_type, target) = pam_eval_target(decision, active_job_role);
+    out.push(crate::session::eval_log::PamEvalTarget {
+        target_type: target_type.to_string(),
+        target,
+        decision_type: decision.decision_impact.to_string(),
+        summary_id: Some(decision.summary_id.clone()),
+    });
+}
+
+fn pam_eval_target(
+    decision: &PamCandidateDecision,
+    active_job_role: &str,
+) -> (&'static str, String) {
+    match decision.action {
+        PamCandidateAction::Inject => ("prompt_context", "context_pack_prompt".to_string()),
+        PamCandidateAction::WouldInjectInLive => {
+            ("shadow_counterfactual", "context_pack_prompt".to_string())
+        }
+        PamCandidateAction::Suppress => match decision.suppression_reason {
+            Some(SuppressionReason::BehaviorNonGoalMismatch) => {
+                ("task_contract", "behavior_contract:non_goals".to_string())
+            }
+            Some(SuppressionReason::ImplExpansionBlocked) => {
+                ("repair_hint", active_job_role.to_string())
+            }
+            Some(SuppressionReason::RoleMismatch) | None => {
+                let role = decision.inferred_role.unwrap_or("unknown");
+                ("task_contract", format!("required_artifact_role:{role}"))
+            }
+        },
+    }
+}
+
 fn push_candidate_decision(
     out: &mut Vec<PamCandidateDecision>,
     view: &AdmittedItemView,
@@ -886,7 +935,30 @@ pub(super) fn build_behavior_projection_with_non_goals_for_test(
 
 #[cfg(test)]
 mod unit_tests {
+    use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
+    use super::super::task_contract::{CompletionDecision, TaskContract};
     use super::*;
+    use crate::tools::bash::BashCommandClass;
+
+    fn context_pack_with_summary(id: &str, summary: &str) -> ContextPackResponse {
+        ContextPackResponse(serde_json::json!({
+            "items": [
+                {
+                    "kind": "summary",
+                    "id": id,
+                    "summary": summary,
+                }
+            ]
+        }))
+    }
+
+    fn repo_edit(category: RepoEditCategory) -> CompletionEvidence {
+        CompletionEvidence::RepoEdit {
+            category,
+            count: 1,
+            path: None,
+        }
+    }
 
     #[test]
     fn mode_as_str_matches_documented_vocabulary() {
@@ -1055,5 +1127,117 @@ mod unit_tests {
             "17 entries (> cap) must trigger truncation"
         );
         assert_eq!(v17.len(), 16);
+    }
+
+    #[test]
+    fn pam_eval_summary_records_contract_and_repair_hint_targets() {
+        let blocked = HashSet::new();
+        let contract_resp = context_pack_with_summary(
+            "contract_seed",
+            "Prior task edited src/lib.rs implementation details.",
+        );
+        let contract_outcome = evaluate_pam_advisory(
+            &contract_resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+        let contract_summary = contract_outcome.decision.to_eval_summary();
+        assert!(
+            contract_summary.affected_targets.iter().any(|target| {
+                target.target_type == "task_contract"
+                    && target.target == "required_artifact_role:implementation"
+                    && target.summary_id.as_deref() == Some("contract_seed")
+            }),
+            "role mismatch must be attributable to the task contract"
+        );
+
+        let repair_selection = build_active_job_selection_artifact_recovery_for_test();
+        let repair_resp = context_pack_with_summary(
+            "repair_seed",
+            "Earlier implementation expansion touched src/app.rs.",
+        );
+        let repair_outcome = evaluate_pam_advisory(
+            &repair_resp,
+            &blocked,
+            Some(&repair_selection),
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+        let repair_summary = repair_outcome.decision.to_eval_summary();
+        assert!(
+            repair_summary.affected_targets.iter().any(|target| {
+                target.target_type == "repair_hint"
+                    && target.target == "ArtifactRecovery:test"
+                    && target.summary_id.as_deref() == Some("repair_seed")
+            }),
+            "active artifact-recovery suppression must be attributable to a repair hint"
+        );
+        assert!(repair_summary.advisory_only);
+        assert!(!repair_summary.completion_judgement_override);
+    }
+
+    #[test]
+    fn pam_advisory_does_not_change_task_contract_completion_decision() {
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        let mut missing_test_evidence = EvidenceSet::new();
+        missing_test_evidence.push(repo_edit(RepoEditCategory::Impl));
+        let before_missing = contract.evaluate(&missing_test_evidence);
+
+        let blocked = HashSet::new();
+        let resp = context_pack_with_summary(
+            "test_seed",
+            "Prior task added tests/test_feature.py for similar behavior.",
+        );
+        let outcome = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+        assert_eq!(outcome.decision.decision_effect.actual_injected_count, 1);
+        let after_missing = contract.evaluate(&missing_test_evidence);
+        assert_eq!(
+            before_missing, after_missing,
+            "PAM injection must not satisfy missing required deliverables"
+        );
+        assert!(matches!(
+            after_missing,
+            CompletionDecision::Continue { missing } if missing.contains(&ArtifactRole::Test)
+        ));
+
+        let mut unverified_evidence = EvidenceSet::new();
+        unverified_evidence.push(repo_edit(RepoEditCategory::Impl));
+        unverified_evidence.push(repo_edit(RepoEditCategory::Test));
+        let before_verify = contract.evaluate(&unverified_evidence);
+        let _ = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+        assert_eq!(
+            before_verify,
+            contract.evaluate(&unverified_evidence),
+            "PAM injection must not bypass verifier-required completion"
+        );
+        assert_eq!(before_verify, CompletionDecision::Verify);
+
+        unverified_evidence.push(CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "pytest".to_string(),
+            bound_test_artifacts_count: None,
+        });
+        assert_eq!(
+            contract.evaluate(&unverified_evidence),
+            CompletionDecision::Done
+        );
     }
 }

@@ -55,6 +55,7 @@ pub(super) fn run_turn(
         // Issue #594: surface plan-mode skip via /photon-why.
         agent.last_photon_context_pack_status =
             crate::agent::loop_run::PhotonContextPackStatus::PlanMode;
+        agent.record_pam_unused_reason("plan_mode");
         // CB-003 (Issue #592): Plan-mode skip path must also clear stale
         // inject tracking so a previous Act-turn's seed ids do not survive
         // into a Plan turn and become "visible" to `/photon-thumbs-*`.

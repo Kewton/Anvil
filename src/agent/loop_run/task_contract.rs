@@ -3351,7 +3351,7 @@ mod tests {
         )];
         let excerpts = build_excerpts(&[(
             ArtifactRole::UsageDocs,
-            "# Usage\n\n## Installation\nInstall dependencies.\n\n## Run\nRun the CLI.\n\n## Verification\nRun checks.\n",
+            "# Usage\n\n## Setup\nInstall dependencies.\n\n## Usage\nRun the CLI.\n\n## Test\nRun verification checks.\n",
         )]);
         let repair_state = VerifierRepairState::None;
 
