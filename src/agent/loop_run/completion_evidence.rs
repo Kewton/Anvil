@@ -123,6 +123,22 @@ pub(crate) enum CompletionEvidence {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+    /// A non-shell deliverable checker proved that a structured data
+    /// artifact satisfies its requested shape, such as required CSV columns
+    /// or a structured-record schema. This keeps data completion independent
+    /// from coding verifier exits.
+    StructuredDataPass {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// A non-shell deliverable checker proved that a report-like artifact is
+    /// complete enough for the active obligation. This is intentionally
+    /// generic so docs/research/ops producers can emit completion evidence
+    /// without pretending they ran a coding verifier.
+    ReportCompletenessPass {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// The model produced an answer-only reply (no tool calls). Reserved
     /// for AnswerOnly protocol acceptance.
     AnswerOnly,
