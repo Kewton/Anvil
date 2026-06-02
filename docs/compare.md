@@ -41,7 +41,10 @@ scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
 各 run の `logs/eval.jsonl` / `logs/llm-io.jsonl` から追跡する。
 `scripts/report.py` は `task_kind` 別に terminal success (`rc==0`) と
 artifact-level postcheck (`postcheck_success`) を分離集計し、PAM variant 別の
-比較表も出力する。
+比較表も出力する。各表には Anvil 判定と postcheck の
+`true_positive` / `false_positive` / `false_negative` / `true_negative`
+件数を含め、`--format json` では同じ taxonomy を機械可読 summary として
+出力する。
 
 ## 2. 期待する入力レイアウト
 

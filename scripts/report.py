@@ -67,6 +67,14 @@ COLUMNS: list[Column] = [
     Column("compact_events", "compacts", False, "int"),
 ]
 
+OUTCOME_AGREEMENTS = (
+    "true_positive",
+    "false_positive",
+    "false_negative",
+    "true_negative",
+    "unknown",
+)
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -393,6 +401,108 @@ def _aggregate_tool_calls(rows: list[dict]) -> dict[str, int]:
     return dict(sorted(totals.items()))
 
 
+def _terminal_success(row: dict) -> bool | None:
+    success = row.get("anvil_terminal_success")
+    if isinstance(success, bool):
+        return success
+    rc = row.get("rc")
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        return None
+    return rc == 0
+
+
+def _outcome_agreement(row: dict) -> str:
+    raw = row.get("outcome_agreement")
+    if isinstance(raw, str) and raw in OUTCOME_AGREEMENTS:
+        return raw
+    terminal_success = _terminal_success(row)
+    postcheck_success = row.get("postcheck_success")
+    if terminal_success is None or not isinstance(postcheck_success, bool):
+        return "unknown"
+    if terminal_success and postcheck_success:
+        return "true_positive"
+    if terminal_success and not postcheck_success:
+        return "false_positive"
+    if not terminal_success and postcheck_success:
+        return "false_negative"
+    return "true_negative"
+
+
+def _agreement_counts(rows: list[dict]) -> dict[str, int]:
+    counts = {name: 0 for name in OUTCOME_AGREEMENTS}
+    for row in rows:
+        counts[_outcome_agreement(row)] += 1
+    return counts
+
+
+def _count_strings(rows: list[dict], key: str, default: str = "unknown") -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        raw = row.get(key)
+        value = raw if isinstance(raw, str) and raw else default
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _ratio(ok: int, total: int) -> float | None:
+    return None if total == 0 else ok / total
+
+
+def _quality_summary(rows: list[dict]) -> dict:
+    term_rate, term_ok, term_total = _success_rate(rows)
+    post_rate, post_ok, post_total = _bool_success_rate(rows, "postcheck_success")
+    both_total = 0
+    both_ok = 0
+    for r in rows:
+        terminal_success = _terminal_success(r)
+        postcheck_success = r.get("postcheck_success")
+        if terminal_success is None or not isinstance(postcheck_success, bool):
+            continue
+        both_total += 1
+        if terminal_success and postcheck_success:
+            both_ok += 1
+    return {
+        "runs": len(rows),
+        "terminal_success": {
+            "ok": term_ok,
+            "total": term_total,
+            "rate": _ratio(term_ok, term_total),
+            "display": term_rate,
+        },
+        "postcheck_success": {
+            "ok": post_ok,
+            "total": post_total,
+            "rate": _ratio(post_ok, post_total),
+            "display": post_rate,
+        },
+        "both_success": {
+            "ok": both_ok,
+            "total": both_total,
+            "rate": _ratio(both_ok, both_total),
+        },
+        "outcome_agreement": _agreement_counts(rows),
+        "failure_authority": _count_strings(rows, "failure_authority"),
+    }
+
+
+def _grouped_quality(rows: list[dict], group_keys: list[str]) -> list[dict]:
+    groups: dict[tuple[str, ...], list[dict]] = {}
+    for r in rows:
+        if r.get("_failed"):
+            continue
+        key = tuple(str(r.get(k, "default")) for k in group_keys)
+        groups.setdefault(key, []).append(r)
+
+    out: list[dict] = []
+    for key in sorted(groups):
+        item = {group_keys[i]: key[i] for i in range(len(group_keys))}
+        item.update(_quality_summary(groups[key]))
+        for i, group_key in enumerate(group_keys):
+            item[group_key] = key[i]
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # rendering: per-bench-root report
 # ---------------------------------------------------------------------------
@@ -433,7 +543,15 @@ def _gather(bench_root: Path) -> tuple[list[tuple[str, int, Path]], list[dict]]:
 
 
 def _render_run_summary(rows: list[dict]) -> list[str]:
-    headers = ["run", "model", "case", "task_kind", "pam"] + [c.label for c in COLUMNS]
+    headers = [
+        "run",
+        "model",
+        "case",
+        "task_kind",
+        "pam",
+        "agreement",
+        "failure_authority",
+    ] + [c.label for c in COLUMNS]
     lines: list[str] = []
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("-----" for _ in headers) + "|")
@@ -444,6 +562,8 @@ def _render_run_summary(rows: list[dict]) -> list[str]:
             _md_escape_cell(r.get("case", "default")),
             _md_escape_cell(r.get("task_kind", "coding")),
             _md_escape_cell(r.get("pam_variant", "default")),
+            _md_escape_cell(r.get("outcome_agreement", _outcome_agreement(r))),
+            _md_escape_cell(r.get("failure_authority", "unknown")),
         ]
         if r.get("_failed"):
             # rc column shows the analyze_run.py rc; rest are N/A.
@@ -539,12 +659,14 @@ def _terminal_postcheck_summary(rows: list[dict], group_keys: list[str]) -> list
         both_total = 0
         both_ok = 0
         for r in sub:
-            if r.get("rc") is None or not isinstance(r.get("postcheck_success"), bool):
+            terminal_success = _terminal_success(r)
+            if terminal_success is None or not isinstance(r.get("postcheck_success"), bool):
                 continue
             both_total += 1
-            if r.get("rc") == 0 and r.get("postcheck_success") is True:
+            if terminal_success and r.get("postcheck_success") is True:
                 both_ok += 1
         both_rate = "N/A" if both_total == 0 else f"{100 * both_ok // both_total}%"
+        counts = _agreement_counts(sub)
         out.append(
             [
                 *[_md_escape_cell(v) for v in key],
@@ -552,6 +674,10 @@ def _terminal_postcheck_summary(rows: list[dict], group_keys: list[str]) -> list
                 f"{term_rate} ({term_ok}/{term_total})",
                 f"{post_rate} ({post_ok}/{post_total})",
                 f"{both_rate} ({both_ok}/{both_total})" if both_total else "N/A",
+                str(counts["true_positive"]),
+                str(counts["false_positive"]),
+                str(counts["false_negative"]),
+                str(counts["true_negative"]),
             ]
         )
     return out
@@ -563,7 +689,17 @@ def _render_task_kind_summary(rows: list[dict]) -> list[str]:
     if not table_rows:
         lines.append("(no completed analyses)")
         return lines
-    headers = ["task_kind", "runs", "terminal_success", "postcheck_success", "both_success"]
+    headers = [
+        "task_kind",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("-----" for _ in headers) + "|")
     for row in table_rows:
@@ -584,6 +720,58 @@ def _render_pam_task_kind_summary(rows: list[dict]) -> list[str]:
         "terminal_success",
         "postcheck_success",
         "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_pam_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["pam_variant"])
+    lines = ["## PAM Summary", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "pam_variant",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_failure_authority_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["failure_authority"])
+    lines = ["## Failure Authority Summary", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "failure_authority",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
     ]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("-----" for _ in headers) + "|")
@@ -618,11 +806,39 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
         parts.append("(no runs discovered)")
     parts.append("")
     if rows:
+        parts.extend(_render_pam_summary(rows))
+        parts.append("")
         parts.extend(_render_task_kind_summary(rows))
         parts.append("")
         parts.extend(_render_pam_task_kind_summary(rows))
         parts.append("")
+        parts.extend(_render_failure_authority_summary(rows))
+        parts.append("")
     return "\n".join(parts)
+
+
+def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
+    analyzed = [r for r in rows if not r.get("_failed")]
+    failed = [r for r in rows if r.get("_failed")]
+    out = {
+        "schema_version": 1,
+        "bench_root": str(bench_root),
+        "bench_root_name": bench_root.name,
+        "generated_at": _now_iso(),
+        "runs": {
+            "total": len(rows),
+            "analyzed": len(analyzed),
+            "analysis_failed": len(failed),
+        },
+        "overall": _quality_summary(analyzed),
+        "by_pam_variant": _grouped_quality(analyzed, ["pam_variant"]),
+        "by_task_kind": _grouped_quality(analyzed, ["task_kind"]),
+        "by_task_kind_pam_variant": _grouped_quality(
+            analyzed, ["task_kind", "pam_variant"]
+        ),
+        "by_failure_authority": _grouped_quality(analyzed, ["failure_authority"]),
+    }
+    return json.dumps(out, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -815,10 +1031,13 @@ def _render_compare(root_a: Path, root_b: Path, rows_a: list[dict], rows_b: list
 # ---------------------------------------------------------------------------
 
 
-def _cmd_report(raw_bench_root: str) -> int:
+def _cmd_report(raw_bench_root: str, output_format: str) -> int:
     bench_root = _validate_bench_root(raw_bench_root)
     _runs, rows = _gather(bench_root)
-    sys.stdout.write(_render_report(bench_root, rows))
+    if output_format == "json":
+        sys.stdout.write(_render_json_report(bench_root, rows))
+    else:
+        sys.stdout.write(_render_report(bench_root, rows))
     return 0
 
 
@@ -847,12 +1066,21 @@ def main(argv: list[str] | None = None) -> int:
         metavar=("A", "B"),
         help="Render an A/B comparison report instead of a single-root report",
     )
+    parser.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default="markdown",
+        help="Output format for a single-root report (default: markdown)",
+    )
     args = parser.parse_args(argv)
 
     if args.compare:
+        if args.format != "markdown":
+            print("error: --format json is not supported with --compare", file=sys.stderr)
+            return 1
         return _cmd_compare(args.compare[0], args.compare[1])
     if args.bench_root:
-        return _cmd_report(args.bench_root)
+        return _cmd_report(args.bench_root, args.format)
     parser.print_help(sys.stderr)
     return 1
 

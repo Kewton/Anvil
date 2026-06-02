@@ -39,6 +39,16 @@ KEYWORDS_VERSION = 1
 WRITE_EDIT_TOOLS = ["Write", "Edit"]
 DEFAULT_TASK_KIND = "coding"
 KNOWN_TASK_KINDS = {"coding", "docs", "data", "research", "ops"}
+KNOWN_FAILURE_AUTHORITIES = {
+    "contract_extraction",
+    "artifact_classification",
+    "verifier_setup",
+    "generated_test_bug",
+    "implementation_bug",
+    "repair_routing",
+    "success",
+    "unknown",
+}
 
 GAME_KEYWORDS_V1 = [
     "game",
@@ -66,6 +76,8 @@ MAX_META_JSON = 256 * 1024  # 256 KiB
 MAX_PAGE_TSX = 2 * 1024 * 1024  # 2 MiB
 MAX_LLM_IO_JSONL = 500 * 1024 * 1024  # 500 MiB overall streaming cap
 MAX_LLM_IO_LINE = 1 * 1024 * 1024  # 1 MiB per line
+MAX_EVAL_JSONL = 100 * 1024 * 1024  # 100 MiB overall cap
+MAX_EVAL_JSONL_LINE = 1 * 1024 * 1024  # 1 MiB per line
 
 CODE_EXTS = {
     ".c",
@@ -104,6 +116,24 @@ PROTECTED_PREFIXES = (
     "state/",
     "tmp-tests/metadata/",
 )
+
+FAILURE_AUTHORITY_ALIASES = {
+    "contract extraction": "contract_extraction",
+    "artifact classification": "artifact_classification",
+    "verifier setup": "verifier_setup",
+    "generated test bug": "generated_test_bug",
+    "generated-test bug": "generated_test_bug",
+    "generated_test_failure": "generated_test_bug",
+    "implementation bug": "implementation_bug",
+    "repair routing": "repair_routing",
+    "model_output_failure": "contract_extraction",
+    "verification_environment_failure": "verifier_setup",
+    "verification_failure": "implementation_bug",
+    "control_loop_failure": "repair_routing",
+    "transport_failure": "repair_routing",
+    "interrupted": "repair_routing",
+    "none": "success",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -326,14 +356,31 @@ def _safe_meta_string(data: dict[str, Any], key: str) -> str | None:
     return raw[:128]
 
 
+def _normalize_failure_authority(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    normalized = raw.strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = FAILURE_AUTHORITY_ALIASES.get(raw.strip().lower(), normalized)
+    return normalized if normalized in KNOWN_FAILURE_AUTHORITIES else None
+
+
+def _safe_bool(data: dict[str, Any], key: str) -> bool | None:
+    raw = data.get(key)
+    return raw if isinstance(raw, bool) else None
+
+
 def _read_meta(run_dir: Path) -> dict[str, Any]:
     """Return selected meta.json fields, using None/defaults on failure."""
     fallback = {
         "case": "default",
         "elapsed_s": None,
+        "failure_authority": None,
         "pam_variant": "default",
+        "postcheck_reason": None,
+        "postcheck_success": None,
         "rc": None,
         "task_kind": DEFAULT_TASK_KIND,
+        "_task_kind_source": "default",
     }
     candidate = run_dir / "meta.json"
     safe = _safe_regular_file_in(candidate, run_dir, MAX_META_JSON)
@@ -372,18 +419,27 @@ def _read_meta(run_dir: Path) -> dict[str, Any]:
     else:
         elapsed_s = None
 
+    task_kind_source = "task_kind"
     task_kind = _safe_meta_string(data, "task_kind")
     if task_kind is None:
+        task_kind_source = "category"
         task_kind = _safe_meta_string(data, "category")
     if task_kind is None or task_kind not in KNOWN_TASK_KINDS:
+        task_kind_source = "default"
         task_kind = DEFAULT_TASK_KIND
 
     return {
         "case": _safe_meta_string(data, "case") or "default",
         "elapsed_s": elapsed_s,
+        "failure_authority": _normalize_failure_authority(
+            _safe_meta_string(data, "failure_authority")
+        ),
         "pam_variant": _safe_meta_string(data, "pam_variant") or "default",
+        "postcheck_reason": _safe_meta_string(data, "postcheck_reason"),
+        "postcheck_success": _safe_bool(data, "postcheck_success"),
         "rc": rc,
         "task_kind": task_kind,
+        "_task_kind_source": task_kind_source,
     }
 
 
@@ -553,6 +609,190 @@ def _read_failure_kind(session_data: dict) -> str | None:
     if not isinstance(kind, str) or not kind:
         return None
     return kind
+
+
+def _read_eval_taxonomy(run_dir: Path) -> dict[str, str] | None:
+    """Return the last eval.jsonl evaluation_taxonomy object, if present."""
+    logs_dir = run_dir / "logs"
+    candidate = logs_dir / "eval.jsonl"
+    try:
+        if logs_dir.is_symlink():
+            return None
+    except OSError:
+        return None
+    if not logs_dir.exists():
+        return None
+    safe = _safe_regular_file_in(candidate, run_dir, MAX_EVAL_JSONL)
+    if safe is None:
+        if candidate.exists() and not candidate.is_symlink():
+            _warn(f"eval.jsonl unusable: {candidate}")
+        return None
+
+    last: dict[str, str] | None = None
+    try:
+        with safe.open("rb") as fh:
+            while True:
+                raw_line = fh.readline(MAX_EVAL_JSONL_LINE + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > MAX_EVAL_JSONL_LINE:
+                    _warn("eval.jsonl: oversized line, skipping remainder")
+                    return last
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                taxonomy = rec.get("evaluation_taxonomy")
+                if not isinstance(taxonomy, dict):
+                    continue
+                parsed: dict[str, str] = {}
+                for key in (
+                    "pam_variant",
+                    "task_kind",
+                    "anvil_terminal_class",
+                    "outcome_agreement",
+                    "failure_authority",
+                ):
+                    value = taxonomy.get(key)
+                    if isinstance(value, str) and value.strip():
+                        parsed[key] = value.strip()[:128]
+                if parsed:
+                    last = parsed
+    except OSError as e:
+        _warn(f"eval.jsonl read error: {e}")
+        return None
+    return last
+
+
+def _anvil_terminal_success(rc: Any) -> bool | None:
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        return None
+    return rc == 0
+
+
+def _anvil_terminal_class(rc: Any) -> str:
+    terminal_success = _anvil_terminal_success(rc)
+    if terminal_success is None:
+        return "unknown"
+    return "success" if terminal_success else "non_success"
+
+
+def _outcome_agreement(rc: Any, postcheck_success: Any) -> str:
+    terminal_success = _anvil_terminal_success(rc)
+    if terminal_success is None or not isinstance(postcheck_success, bool):
+        return "unknown"
+    if terminal_success and postcheck_success:
+        return "true_positive"
+    if terminal_success and not postcheck_success:
+        return "false_positive"
+    if not terminal_success and postcheck_success:
+        return "false_negative"
+    return "true_negative"
+
+
+def _score_int(score: dict | None, key: str) -> int | None:
+    if not isinstance(score, dict):
+        return None
+    raw = score.get(key)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw if raw >= 0 else None
+
+
+def _looks_like_test_path(path: str) -> bool:
+    lower = path.lower().replace("\\", "/")
+    name = Path(lower).name
+    return (
+        lower.startswith("tests/")
+        or "/tests/" in lower
+        or lower.startswith("test/")
+        or "/test/" in lower
+        or lower.startswith("tmp-tests/")
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name.endswith("_test.rs")
+        or name.endswith(".test.js")
+        or name.endswith(".test.ts")
+        or name.endswith(".test.tsx")
+        or name.endswith(".spec.js")
+        or name.endswith(".spec.ts")
+        or name.endswith(".spec.tsx")
+    )
+
+
+def _generated_test_bug_evidence(
+    failure_kind: str | None,
+    anvil_score: dict | None,
+    artifact_files: list[str],
+) -> bool:
+    test_changed = _score_int(anvil_score, "test_files_changed")
+    impl_changed = _score_int(anvil_score, "implementation_files_changed")
+    setup_changed = _score_int(anvil_score, "setup_files_changed")
+    test_failures = _score_int(anvil_score, "test_failure_count")
+    tests_passed = anvil_score.get("tests_passed") if isinstance(anvil_score, dict) else None
+    score_points_at_tests = (
+        (test_changed or 0) > 0
+        and (impl_changed or 0) == 0
+        and (setup_changed or 0) == 0
+        and (test_failures is None or test_failures > 0)
+        and (tests_passed is None or tests_passed is False)
+    )
+    paths_point_at_tests = bool(artifact_files) and all(
+        _looks_like_test_path(path) for path in artifact_files
+    )
+    return failure_kind == "test_failure" and (score_points_at_tests or paths_point_at_tests)
+
+
+def _classify_failure_authority(
+    *,
+    meta_authority: str | None,
+    eval_taxonomy: dict[str, str] | None,
+    rc: Any,
+    postcheck_success: bool | None,
+    postcheck_reason: str,
+    failure_kind: str | None,
+    anvil_score: dict | None,
+    artifact_files: list[str],
+) -> str:
+    if meta_authority is not None:
+        return meta_authority
+    if _generated_test_bug_evidence(failure_kind, anvil_score, artifact_files):
+        return "generated_test_bug"
+
+    eval_authority = _normalize_failure_authority(
+        eval_taxonomy.get("failure_authority") if eval_taxonomy else None
+    )
+    if eval_authority is not None:
+        return eval_authority
+
+    agreement = _outcome_agreement(rc, postcheck_success)
+    if agreement == "true_positive":
+        return "success"
+
+    if failure_kind == "no_verifier_available":
+        return "verifier_setup"
+    if failure_kind in {"tool_protocol_failure", "no_tool_call", "no_repo_progress"}:
+        return "contract_extraction"
+    if failure_kind in {"edit_failure", "timeout", "unsafe_command_blocked"}:
+        return "repair_routing"
+    if failure_kind in {"compile_error", "type_error", "lint_failure", "test_failure"}:
+        return "implementation_bug"
+
+    if postcheck_reason == "no_user_artifact":
+        return "contract_extraction"
+    if postcheck_reason.startswith("missing_") and postcheck_reason.endswith("_artifact"):
+        return "artifact_classification"
+    if agreement in {"false_positive", "false_negative", "true_negative"}:
+        return "implementation_bug"
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -775,12 +1015,39 @@ def main(argv: list[str]) -> int:
     page_tsx_has_keywords = _read_page_tsx_keywords(run_dir, workdir)
     anvil_score = _read_anvil_score(session)
     failure_kind = _read_failure_kind(session)
+    eval_log_taxonomy = _read_eval_taxonomy(run_dir)
     token_prompt, token_completion = _read_token_usage(run_dir)
 
     files_modified = session_metrics["files_modified"]
     artifact_files = _artifact_candidates(files_modified)
-    postcheck_success, postcheck_reason = _postcheck_success(
-        meta["task_kind"], artifact_files
+    task_kind = meta["task_kind"]
+    if meta.get("_task_kind_source") == "default" and eval_log_taxonomy:
+        taxonomy_task_kind = eval_log_taxonomy.get("task_kind")
+        if taxonomy_task_kind in KNOWN_TASK_KINDS:
+            task_kind = taxonomy_task_kind
+    pam_variant = meta["pam_variant"]
+    if pam_variant == "default" and eval_log_taxonomy:
+        taxonomy_pam_variant = eval_log_taxonomy.get("pam_variant")
+        if taxonomy_pam_variant in {"pam_on", "pam_off"}:
+            pam_variant = taxonomy_pam_variant
+
+    if isinstance(meta.get("postcheck_success"), bool):
+        postcheck_success = meta["postcheck_success"]
+        postcheck_reason = meta["postcheck_reason"] or "meta_postcheck"
+    else:
+        postcheck_success, postcheck_reason = _postcheck_success(task_kind, artifact_files)
+    anvil_terminal_success = _anvil_terminal_success(meta["rc"])
+    anvil_terminal_class = _anvil_terminal_class(meta["rc"])
+    outcome_agreement = _outcome_agreement(meta["rc"], postcheck_success)
+    failure_authority = _classify_failure_authority(
+        meta_authority=meta["failure_authority"],
+        eval_taxonomy=eval_log_taxonomy,
+        rc=meta["rc"],
+        postcheck_success=postcheck_success,
+        postcheck_reason=postcheck_reason,
+        failure_kind=failure_kind,
+        anvil_score=anvil_score,
+        artifact_files=artifact_files,
     )
     page_tsx_touched = "src/app/page.tsx" in files_modified
     tool_calls = session_metrics["tool_calls"]
@@ -788,25 +1055,36 @@ def main(argv: list[str]) -> int:
 
     out: dict[str, Any] = {
         "anvil_score": anvil_score,
+        "anvil_terminal_class": anvil_terminal_class,
+        "anvil_terminal_success": anvil_terminal_success,
         "artifact_file_count": len(artifact_files),
         "artifact_files": artifact_files,
         "case": meta["case"],
         "compact_events": session_metrics["compact_events"],
         "elapsed_s": meta["elapsed_s"],
         "error_500_count": error_500_count,
+        "evaluation_taxonomy": {
+            "anvil_terminal_class": anvil_terminal_class,
+            "failure_authority": failure_authority,
+            "outcome_agreement": outcome_agreement,
+            "pam_variant": pam_variant,
+            "task_kind": task_kind,
+        },
+        "failure_authority": failure_authority,
         "failure_kind": failure_kind,
         "files_modified": files_modified,
         "iter_count": session_metrics["iter_count"],
         "keywords_version": KEYWORDS_VERSION,
+        "outcome_agreement": outcome_agreement,
         "page_tsx_has_game_keywords": page_tsx_has_keywords,
         "page_tsx_touched": page_tsx_touched,
-        "pam_variant": meta["pam_variant"],
+        "pam_variant": pam_variant,
         "postcheck_reason": postcheck_reason,
         "postcheck_success": postcheck_success,
         "rc": meta["rc"],
         "run_id": session_metrics["run_id"],
         "schema_version": SCHEMA_VERSION,
-        "task_kind": meta["task_kind"],
+        "task_kind": task_kind,
         "token_completion": token_completion,
         "token_prompt": token_prompt,
         "tool_call_total": tool_call_total,
