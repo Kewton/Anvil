@@ -1040,6 +1040,11 @@ pub(in crate::agent::loop_run) mod tests_export {
 #[cfg(test)]
 mod pam_advisory_e2e_tests;
 
+// Issue #905: regression tests that PAM advisory metadata cannot become
+// TaskContract completion authority.
+#[cfg(test)]
+mod issue905_pam_completion_tests;
+
 /// Test seam (#[cfg(test)] only): drive
 /// `Agent::maybe_emit_job_reports_with_linkage` from
 /// `job_report_e2e_tests` without widening the production API.
