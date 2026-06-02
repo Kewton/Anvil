@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::agent::orchestration::RepoVerification;
 use crate::safety::path_guard::resolve_user_path;
-use crate::util::workspace_paths::is_ignored_workspace_display_path;
+use crate::util::workspace_paths::is_workspace_artifact_admitted_display_path;
 
 use super::repair_framework_findings::{
     missing_python_module_name_from_output, output_or_command_looks_like_pytest,
@@ -26,7 +26,7 @@ pub(super) fn changed_files_for_verifier(
     let mut files = HashSet::new();
     for verif in accumulated.iter().chain(std::iter::once(current)) {
         for file in &verif.all_changed_files {
-            if is_ignored_workspace_display_path(file) {
+            if !is_workspace_artifact_admitted_display_path(file) {
                 continue;
             }
             files.insert(file.clone());
@@ -61,7 +61,7 @@ pub(super) fn verifier_diagnostic_path_input_is_safe(raw_path: &str) -> bool {
     if path.is_empty()
         || path.contains('\0')
         || Path::new(path).is_absolute()
-        || is_ignored_workspace_display_path(path)
+        || !is_workspace_artifact_admitted_display_path(path)
     {
         return false;
     }
@@ -93,7 +93,7 @@ pub(super) fn recovery_target_hint_for_existing_path(
     }
     let relative = canonical.strip_prefix(root).ok()?;
     let path = relative.to_string_lossy().replace('\\', "/");
-    if is_ignored_workspace_display_path(&path) {
+    if !is_workspace_artifact_admitted_display_path(&path) {
         return None;
     }
     let category = super::completion_evidence::classify_repo_edit_path(Path::new(&path));
@@ -208,17 +208,6 @@ pub(super) fn recovery_target_hint_for_missing_local_module_path(
 ) -> Option<super::task_contract::RecoveryTargetHint> {
     let path = raw_path.trim();
     if !verifier_diagnostic_path_input_is_safe(path) {
-        return None;
-    }
-    if Path::new(path)
-        .components()
-        .any(|component| match component {
-            std::path::Component::Normal(name) => {
-                super::task_workspace_scope::is_workspace_ignored_dir(&name.to_string_lossy())
-            }
-            _ => false,
-        })
-    {
         return None;
     }
     if Path::new(path)
@@ -512,7 +501,7 @@ fn verifier_repair_candidate_from_path(
         resolved.strip_prefix(work_root).ok()
     }?;
     let path = relative.to_string_lossy().replace('\\', "/");
-    if is_ignored_workspace_display_path(&path) {
+    if !is_workspace_artifact_admitted_display_path(&path) {
         return None;
     }
     let category = super::completion_evidence::classify_repo_edit_path(Path::new(&path));

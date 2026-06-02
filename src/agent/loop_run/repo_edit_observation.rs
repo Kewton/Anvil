@@ -7,8 +7,8 @@
 //!
 //! 1. `workspace_relative_path_for_tool_arg` workspace-relative
 //!    normalization.
-//! 2. `is_ignored_workspace_display_path` ignored-top-dir gate (emits
-//!    `repo_edit_ignored_controller_state` and returns).
+//! 2. `WorkspacePolicy` artifact-admission gate (emits
+//!    `repo_edit_ignored_controller_state` with a rejection reason and returns).
 //! 3. `workspace_walk::is_user_deliverable_path` excludes protected
 //!    inputs and generated metadata/log files from edited-file and
 //!    completion-evidence summaries.
@@ -41,7 +41,10 @@ use super::completion_evidence::is_repo_edit_no_op;
 use super::file_excerpt::current_file_hash_for_relative_path;
 use super::tool_policy::workspace_relative_path_for_tool_arg;
 use crate::logging::stable_path_hash;
-use crate::util::workspace_paths::is_ignored_workspace_display_path;
+use crate::session::feedback::mask_secrets;
+use crate::util::workspace_paths::{
+    WorkspacePathAdmission, artifact_admission_decision_display_path,
+};
 
 /// Issue #606 (T-1.7): post-hoc observation of an Edit/Write success
 /// as `RepoEdit` completion evidence. The path is run through
@@ -53,13 +56,19 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
     let Some(relative_path) = workspace_relative_path_for_tool_arg(&agent.work_root, path) else {
         return;
     };
-    if is_ignored_workspace_display_path(&relative_path) {
+    if let WorkspacePathAdmission::Rejected { class, reason } =
+        artifact_admission_decision_display_path(&relative_path)
+    {
+        let masked = mask_secrets(&relative_path);
         crate::logging::log_completion_evidence_observed(
             agent.current_turn_index,
             0,
             "repo_edit_ignored_controller_state",
             serde_json::json!({
-                "path_hash": stable_path_hash(&relative_path),
+                "path_hash": stable_path_hash(&masked),
+                "path_len": relative_path.len() as u32,
+                "class": format!("{:?}", class),
+                "reason": reason.as_str(),
             }),
         );
         return;

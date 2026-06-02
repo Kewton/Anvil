@@ -34,8 +34,17 @@ const CONTROL_METADATA_FILES: &[&str] = &[
     "metadata.json",
     "llm-io.jsonl",
     "log.jsonl",
+    "runtime.log",
+    "run.log",
     "anvil.out",
     "anvil.err",
+    "anvil.log",
+    "sidecar.out",
+    "sidecar.err",
+    "sidecar.log",
+    "eval.out",
+    "eval.err",
+    "eval.log",
     "postcheck.out",
     "postcheck.err",
 ];
@@ -47,6 +56,30 @@ pub enum WorkspacePathClass {
     UserDeliverable,
     ProtectedInput,
     GeneratedMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePathAdmission {
+    Accepted,
+    Rejected {
+        class: WorkspacePathClass,
+        reason: WorkspacePolicyRejectReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePolicyRejectReason {
+    ProtectedInput,
+    GeneratedMetadata,
+}
+
+impl WorkspacePolicyRejectReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProtectedInput => "protected_input",
+            Self::GeneratedMetadata => "generated_metadata",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +171,43 @@ impl WorkspacePolicy {
         self.classify_relative_path(relative) != WorkspacePathClass::UserDeliverable
     }
 
+    pub fn artifact_admission_decision_relative_path(
+        self,
+        relative: &Path,
+    ) -> WorkspacePathAdmission {
+        let class = self.classify_relative_path(relative);
+        match class {
+            WorkspacePathClass::UserDeliverable => WorkspacePathAdmission::Accepted,
+            WorkspacePathClass::ProtectedInput => WorkspacePathAdmission::Rejected {
+                class,
+                reason: WorkspacePolicyRejectReason::ProtectedInput,
+            },
+            WorkspacePathClass::GeneratedMetadata => WorkspacePathAdmission::Rejected {
+                class,
+                reason: WorkspacePolicyRejectReason::GeneratedMetadata,
+            },
+        }
+    }
+
+    pub fn artifact_admission_decision_display_path(
+        self,
+        display_path: &str,
+    ) -> WorkspacePathAdmission {
+        let path = display_path
+            .strip_suffix(" (deleted)")
+            .unwrap_or(display_path);
+        self.artifact_admission_decision_relative_path(Path::new(path))
+    }
+
+    pub fn admits_artifact_relative_path(self, relative: &Path) -> bool {
+        self.artifact_admission_decision_relative_path(relative) == WorkspacePathAdmission::Accepted
+    }
+
+    pub fn admits_artifact_display_path(self, display_path: &str) -> bool {
+        self.artifact_admission_decision_display_path(display_path)
+            == WorkspacePathAdmission::Accepted
+    }
+
     pub fn allows_model_read_relative_path(self, relative: &Path) -> bool {
         self.protected_metadata_access == ProtectedMetadataAccess::Allow
             || !self.is_protected_metadata_relative_path(relative)
@@ -171,6 +241,22 @@ pub fn is_ignored_workspace_relative_path(relative: &Path) -> bool {
 
 pub fn is_ignored_workspace_display_path(display_path: &str) -> bool {
     WorkspacePolicy::default().is_ignored_display_path(display_path)
+}
+
+pub fn artifact_admission_decision_relative_path(relative: &Path) -> WorkspacePathAdmission {
+    WorkspacePolicy::default().artifact_admission_decision_relative_path(relative)
+}
+
+pub fn artifact_admission_decision_display_path(display_path: &str) -> WorkspacePathAdmission {
+    WorkspacePolicy::default().artifact_admission_decision_display_path(display_path)
+}
+
+pub fn is_workspace_artifact_admitted_relative_path(relative: &Path) -> bool {
+    WorkspacePolicy::default().admits_artifact_relative_path(relative)
+}
+
+pub fn is_workspace_artifact_admitted_display_path(display_path: &str) -> bool {
+    WorkspacePolicy::default().admits_artifact_display_path(display_path)
 }
 
 fn is_postcheck_file_name(name: &str) -> bool {
@@ -250,6 +336,9 @@ mod tests {
             "app/__pycache__/main.cpython-39.pyc"
         )));
         assert!(is_ignored_workspace_relative_path(Path::new("anvil.out")));
+        assert!(is_ignored_workspace_relative_path(Path::new("eval.out")));
+        assert!(is_ignored_workspace_relative_path(Path::new("runtime.log")));
+        assert!(is_ignored_workspace_relative_path(Path::new("sidecar.log")));
         assert!(is_ignored_workspace_relative_path(Path::new(
             "postcheck.err"
         )));
@@ -277,6 +366,35 @@ mod tests {
             ".anvil-state/verifier-python/site/foo.py (deleted)"
         ));
         assert!(!is_ignored_workspace_display_path("README.md (deleted)"));
+    }
+
+    #[test]
+    fn artifact_admission_decision_explains_policy_rejection() {
+        assert_eq!(
+            artifact_admission_decision_relative_path(Path::new("src/main.rs")),
+            WorkspacePathAdmission::Accepted
+        );
+        assert_eq!(
+            artifact_admission_decision_relative_path(Path::new("prompt.md")),
+            WorkspacePathAdmission::Rejected {
+                class: WorkspacePathClass::ProtectedInput,
+                reason: WorkspacePolicyRejectReason::ProtectedInput,
+            }
+        );
+        assert_eq!(
+            artifact_admission_decision_relative_path(Path::new("anvil.out")),
+            WorkspacePathAdmission::Rejected {
+                class: WorkspacePathClass::GeneratedMetadata,
+                reason: WorkspacePolicyRejectReason::GeneratedMetadata,
+            }
+        );
+        assert_eq!(
+            artifact_admission_decision_display_path("anvil.out (deleted)"),
+            WorkspacePathAdmission::Rejected {
+                class: WorkspacePathClass::GeneratedMetadata,
+                reason: WorkspacePolicyRejectReason::GeneratedMetadata,
+            }
+        );
     }
 
     #[test]

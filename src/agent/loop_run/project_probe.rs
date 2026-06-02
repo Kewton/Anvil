@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use crate::util::workspace_paths::is_workspace_artifact_admitted_relative_path;
 
 use super::task_contract::{ArtifactRole, TaskContract};
 use super::task_workspace_scope::TaskWorkspaceScope;
@@ -249,7 +250,7 @@ fn collect_files_inner(
         let Ok(relative) = path.strip_prefix(work_root) else {
             continue;
         };
-        if crate::util::workspace_paths::is_ignored_workspace_relative_path(relative) {
+        if !is_workspace_artifact_admitted_relative_path(relative) {
             continue;
         }
         let rel = relative.to_string_lossy().replace('\\', "/");
