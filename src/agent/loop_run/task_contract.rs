@@ -382,6 +382,9 @@ impl CompletionPolicy {
     }
 
     pub(super) fn accepts_evidence(&self, evidence: &CompletionEvidence) -> bool {
+        if !is_deterministic_completion_authority_evidence(evidence) {
+            return false;
+        }
         match evidence {
             CompletionEvidence::RepoEdit { category, .. } => {
                 self.accepts_repo_edit_category(*category)
@@ -455,6 +458,27 @@ impl Default for CompletionPolicy {
     fn default() -> Self {
         Self::legacy_generic_code()
     }
+}
+
+/// Issue #905: closed, deterministic completion-authority boundary.
+///
+/// `TaskContract` may only derive completion from evidence emitted by local
+/// tool/verifier/deliverable checkers. Advisory context such as PAM is not
+/// represented here; if a future non-deterministic variant is added to
+/// `CompletionEvidence`, this predicate fails closed until that variant is
+/// explicitly reviewed.
+pub(super) fn is_deterministic_completion_authority_evidence(
+    evidence: &CompletionEvidence,
+) -> bool {
+    matches!(
+        evidence,
+        CompletionEvidence::RepoEdit { .. }
+            | CompletionEvidence::VerifierExitZero { .. }
+            | CompletionEvidence::RequiredSectionsPass { .. }
+            | CompletionEvidence::StructuredDataPass { .. }
+            | CompletionEvidence::ReportCompletenessPass { .. }
+            | CompletionEvidence::AnswerOnly
+    )
 }
 
 fn project_intent_from_required_artifacts(
@@ -1016,41 +1040,44 @@ fn artifact_identity_observed_in_evidence(
     evidence: &EvidenceSet,
     identity: &ArtifactObligation,
 ) -> bool {
-    evidence.iter().any(|item| match item {
-        CompletionEvidence::RepoEdit {
-            category,
-            path: Some(path),
-            ..
-        } => {
-            role_from_repo_edit(*category) == Some(identity.role)
-                && normalized_artifact_path_eq(path, &identity.path)
-        }
-        CompletionEvidence::RequiredSectionsPass { path: Some(path) } => {
-            identity.role == ArtifactRole::UsageDocs
-                && normalized_artifact_path_eq(path, &identity.path)
-        }
-        CompletionEvidence::StructuredDataPass {
-            path: Some(path),
-            columns,
-        } => {
-            identity.role == ArtifactRole::DataOutput
-                && normalized_artifact_path_eq(path, &identity.path)
-                && identity
-                    .structured_record_schema
-                    .as_ref()
-                    .is_none_or(|schema| {
-                        schema
-                            .columns
-                            .iter()
-                            .all(|column| columns.iter().any(|observed| observed == column))
-                    })
-        }
-        CompletionEvidence::ReportCompletenessPass { path: Some(path) } => {
-            identity.role == ArtifactRole::UsageDocs
-                && normalized_artifact_path_eq(path, &identity.path)
-        }
-        _ => false,
-    })
+    evidence
+        .iter()
+        .filter(|item| is_deterministic_completion_authority_evidence(item))
+        .any(|item| match item {
+            CompletionEvidence::RepoEdit {
+                category,
+                path: Some(path),
+                ..
+            } => {
+                role_from_repo_edit(*category) == Some(identity.role)
+                    && normalized_artifact_path_eq(path, &identity.path)
+            }
+            CompletionEvidence::RequiredSectionsPass { path: Some(path) } => {
+                identity.role == ArtifactRole::UsageDocs
+                    && normalized_artifact_path_eq(path, &identity.path)
+            }
+            CompletionEvidence::StructuredDataPass {
+                path: Some(path),
+                columns,
+            } => {
+                identity.role == ArtifactRole::DataOutput
+                    && normalized_artifact_path_eq(path, &identity.path)
+                    && identity
+                        .structured_record_schema
+                        .as_ref()
+                        .is_none_or(|schema| {
+                            schema
+                                .columns
+                                .iter()
+                                .all(|column| columns.iter().any(|observed| observed == column))
+                        })
+            }
+            CompletionEvidence::ReportCompletenessPass { path: Some(path) } => {
+                identity.role == ArtifactRole::UsageDocs
+                    && normalized_artifact_path_eq(path, &identity.path)
+            }
+            _ => false,
+        })
 }
 
 fn recovery_target_hint_for_missing(
@@ -3126,7 +3153,10 @@ pub(super) fn normalized_artifact_path_eq(actual: &str, expected: &str) -> bool 
 
 fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
     let mut roles = Vec::new();
-    for item in evidence.iter() {
+    for item in evidence
+        .iter()
+        .filter(|item| is_deterministic_completion_authority_evidence(item))
+    {
         match item {
             CompletionEvidence::RepoEdit { category, .. } => {
                 if let Some(role) = role_from_repo_edit(*category) {
@@ -3430,6 +3460,32 @@ mod tests {
             class: BashCommandClass::BuildTest,
             command: "pytest tests/test_x.py".to_string(),
             bound_test_artifacts_count: Some(bound_count),
+        }
+    }
+
+    #[test]
+    fn issue905_completion_authority_predicate_lists_deterministic_evidence_only() {
+        let evidence = [
+            repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"),
+            build_test(),
+            CompletionEvidence::RequiredSectionsPass {
+                path: Some("README.md".to_string()),
+            },
+            CompletionEvidence::StructuredDataPass {
+                path: Some("output.csv".to_string()),
+                columns: vec!["id".to_string()],
+            },
+            CompletionEvidence::ReportCompletenessPass {
+                path: Some("report.md".to_string()),
+            },
+            CompletionEvidence::AnswerOnly,
+        ];
+
+        for item in evidence {
+            assert!(
+                is_deterministic_completion_authority_evidence(&item),
+                "existing CompletionEvidence variants are explicit deterministic authorities: {item:?}"
+            );
         }
     }
 
