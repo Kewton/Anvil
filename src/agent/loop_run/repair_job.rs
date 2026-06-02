@@ -21,7 +21,9 @@ use super::repair_attempt_outcome::{
     RepairRejectionKind, should_promote_to_exhausted_after_push,
 };
 use super::repair_brief::AllowedChangeKind;
-use super::repair_packet::{DeliverableFailureDomain, RepairPacket, obligation_id_for_parts};
+use super::repair_packet::{
+    CorrectionKind, DeliverableFailureDomain, RepairPacket, obligation_id_for_parts,
+};
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::{ArtifactRole, RecoveryTargetHint};
@@ -510,6 +512,7 @@ pub(super) struct RepairAttemptKey {
     pub(super) allowed_change_kind: Option<AllowedChangeKind>,
     pub(super) obligation_id: Option<String>,
     pub(super) failure_domain: Option<DeliverableFailureDomain>,
+    pub(super) correction_kind: Option<CorrectionKind>,
 }
 
 impl RepairAttemptKey {
@@ -523,6 +526,7 @@ impl RepairAttemptKey {
             allowed_change_kind,
             obligation_id: Some(obligation_id_for_parts(target.role, Some(&target.path))),
             failure_domain: None,
+            correction_kind: Some(CorrectionKind::Patch),
         }
     }
 
@@ -541,6 +545,7 @@ impl RepairAttemptKey {
             allowed_change_kind,
             obligation_id: Some(packet.target.obligation_id.clone()),
             failure_domain: Some(packet.target.failure_domain),
+            correction_kind: Some(packet.correction_kind),
         }
     }
 }
@@ -2757,6 +2762,8 @@ pub(super) struct ExhaustedAttemptsSummary {
     pub(super) unfulfilled_obligations: Vec<super::repair_packet::RepairObligationTarget>,
     /// Invalid controller repair proposals tied back to obligation id/domain.
     pub(super) invalid_proposal_reasons: Vec<InvalidRepairProposalSummary>,
+    /// Obligation-targeted corrections that reached an exhaustion condition.
+    pub(super) exhausted_corrections: Vec<ExhaustedCorrectionSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2765,7 +2772,18 @@ pub(super) struct InvalidRepairProposalSummary {
     pub(super) role: ArtifactRole,
     pub(super) path: String,
     pub(super) failure_domain: Option<super::repair_packet::DeliverableFailureDomain>,
+    pub(super) correction_kind: Option<super::repair_packet::CorrectionKind>,
     pub(super) reason: RejectedAttemptReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ExhaustedCorrectionSummary {
+    pub(super) obligation_id: Option<String>,
+    pub(super) role: ArtifactRole,
+    pub(super) path: String,
+    pub(super) failure_domain: Option<super::repair_packet::DeliverableFailureDomain>,
+    pub(super) correction_kind: Option<super::repair_packet::CorrectionKind>,
+    pub(super) reason: Option<RejectedAttemptReason>,
 }
 
 impl ExhaustedAttemptsSummary {
@@ -2811,9 +2829,11 @@ impl ExhaustedAttemptsSummary {
                     SAFE_STOP_PATH_CHAR_CAP,
                 ),
                 failure_domain: attempt.key.failure_domain,
+                correction_kind: attempt.key.correction_kind,
                 reason: attempt.reason,
             })
             .collect::<Vec<_>>();
+        let exhausted_corrections = exhausted_corrections_for_job(job);
         Self {
             total,
             per_cluster,
@@ -2824,8 +2844,62 @@ impl ExhaustedAttemptsSummary {
                 .cloned()
                 .collect(),
             invalid_proposal_reasons,
+            exhausted_corrections,
         }
     }
+}
+
+fn exhausted_corrections_for_job(job: &RepairJob) -> Vec<ExhaustedCorrectionSummary> {
+    let mut out = Vec::new();
+    for attempt in job.rejected_attempts.iter().rev() {
+        let repeated = job
+            .rejected_attempts
+            .iter()
+            .filter(|candidate| *candidate == attempt)
+            .count()
+            >= REPEATED_REJECTED_ATTEMPT_THRESHOLD;
+        if !repeated {
+            continue;
+        }
+        if out.iter().any(|existing: &ExhaustedCorrectionSummary| {
+            existing.obligation_id == attempt.key.obligation_id
+                && existing.role == attempt.key.role
+                && existing.path == attempt.key.path
+                && existing.failure_domain == attempt.key.failure_domain
+                && existing.correction_kind == attempt.key.correction_kind
+                && existing.reason == Some(attempt.reason)
+        }) {
+            continue;
+        }
+        out.push(ExhaustedCorrectionSummary {
+            obligation_id: attempt.key.obligation_id.clone(),
+            role: attempt.key.role,
+            path: sanitize_repair_job_text_with_char_cap(
+                &attempt.key.path,
+                SAFE_STOP_PATH_CHAR_CAP,
+            ),
+            failure_domain: attempt.key.failure_domain,
+            correction_kind: attempt.key.correction_kind,
+            reason: Some(attempt.reason),
+        });
+        if out.len() >= SAFE_STOP_INVALID_PROPOSAL_MAX {
+            return out;
+        }
+    }
+    if out.is_empty()
+        && !job.exhausted_attempts.is_empty()
+        && let Some(key) = job.current_repair_attempt_key(None)
+    {
+        out.push(ExhaustedCorrectionSummary {
+            obligation_id: key.obligation_id,
+            role: key.role,
+            path: sanitize_repair_job_text_with_char_cap(&key.path, SAFE_STOP_PATH_CHAR_CAP),
+            failure_domain: key.failure_domain,
+            correction_kind: key.correction_kind,
+            reason: None,
+        });
+    }
+    out
 }
 
 /// Issue #654 / DR1-003 — single SSOT for the "raw path string -> safe
@@ -7767,6 +7841,7 @@ mod tests {
                 allowed_change_kind: None,
                 obligation_id: Some(packet_target.obligation_id.clone()),
                 failure_domain: Some(packet_target.failure_domain),
+                correction_kind: Some(super::super::repair_packet::CorrectionKind::SectionAddition),
             },
             reason: RejectedAttemptReason::MalformedPatch,
         });
@@ -7786,6 +7861,54 @@ mod tests {
         assert_eq!(
             summary.invalid_proposal_reasons[0].failure_domain,
             Some(super::super::repair_packet::DeliverableFailureDomain::IncompleteSections)
+        );
+        assert_eq!(
+            summary.invalid_proposal_reasons[0].correction_kind,
+            Some(super::super::repair_packet::CorrectionKind::SectionAddition)
+        );
+    }
+
+    #[test]
+    fn exhausted_attempts_summary_identifies_repeated_obligation_correction() {
+        let mut job = RepairJob::new_for_test();
+        let key = RepairAttemptKey {
+            role: ArtifactRole::DataOutput,
+            path: "output.csv".to_string(),
+            allowed_change_kind: None,
+            obligation_id: Some("data_output:output.csv".to_string()),
+            failure_domain: Some(
+                super::super::repair_packet::DeliverableFailureDomain::SchemaMismatch,
+            ),
+            correction_kind: Some(super::super::repair_packet::CorrectionKind::SchemaCorrection),
+        };
+        job.rejected_attempts.push(RejectedAttempt {
+            key: key.clone(),
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+        job.rejected_attempts.push(RejectedAttempt {
+            key,
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+
+        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, None, &[]);
+
+        assert_eq!(summary.exhausted_corrections.len(), 1);
+        let correction = &summary.exhausted_corrections[0];
+        assert_eq!(
+            correction.obligation_id.as_deref(),
+            Some("data_output:output.csv")
+        );
+        assert_eq!(
+            correction.correction_kind,
+            Some(super::super::repair_packet::CorrectionKind::SchemaCorrection)
+        );
+        assert_eq!(
+            correction.failure_domain,
+            Some(super::super::repair_packet::DeliverableFailureDomain::SchemaMismatch)
+        );
+        assert_eq!(
+            correction.reason,
+            Some(RejectedAttemptReason::MalformedPatch)
         );
     }
 
