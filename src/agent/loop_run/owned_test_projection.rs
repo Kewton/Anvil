@@ -51,10 +51,15 @@ pub(super) fn owned_test_artifacts_for_verifier(
     let ledger = agent
         .artifact_ledger
         .owned_test_artifacts(super::task_contract::ArtifactRole::Test);
+    let guarded = super::generated_test_guard::filter_owned_test_artifacts_for_verifier(
+        &agent.work_root,
+        contract,
+        &ledger,
+    );
     if legacy != ledger {
         emit_owned_test_artifacts_projection_divergence(agent, &legacy, &ledger);
     }
-    ledger
+    guarded
 }
 
 /// Issue #659 (Task 3.3): masked observability emit when the legacy

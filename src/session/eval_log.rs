@@ -82,6 +82,11 @@ pub struct EvalRecord {
     /// intentionally unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_diagnostics: Option<TerminalDiagnosticsSummary>,
+    /// Issue #904: machine-readable evaluation taxonomy for no-PAM/PAM
+    /// aggregation. External postcheck agreement is intentionally explicit:
+    /// the in-process turn log cannot know the harness result unless a future
+    /// evaluator enriches the record.
+    pub evaluation_taxonomy: EvaluationTaxonomySummary,
     /// Issue #866: bounded terminal reason for completion authority.
     ///
     /// For successful turns this explains which evidence class made `done`
@@ -325,6 +330,27 @@ pub struct TerminalObligationDiagnostic {
     pub detail: String,
 }
 
+/// Issue #904: bounded taxonomy for offline quality reports.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvaluationTaxonomySummary {
+    pub pam_variant: String,
+    pub task_kind: String,
+    pub anvil_terminal_class: String,
+    pub outcome_agreement: String,
+    pub failure_authority: String,
+}
+
+impl EvalRecord {
+    pub fn refresh_evaluation_taxonomy(&mut self) {
+        self.evaluation_taxonomy = build_evaluation_taxonomy(
+            &self.task,
+            &self.final_outcome,
+            self.terminal_diagnostics.as_ref(),
+            self.pam_eval.as_ref(),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OnceLock state
 // ---------------------------------------------------------------------------
@@ -491,6 +517,9 @@ pub fn build_eval_record_with_terminal_context(
         .cloned()
         .collect();
 
+    let evaluation_taxonomy =
+        build_evaluation_taxonomy(&task, final_outcome, terminal_diagnostics.as_ref(), None);
+
     EvalRecord {
         schema_version: 1,
         session_id: session_id.to_string(),
@@ -511,6 +540,7 @@ pub fn build_eval_record_with_terminal_context(
         photon_canary: 0,
         auto_promote,
         terminal_diagnostics,
+        evaluation_taxonomy,
         completion_reason,
         final_outcome: final_outcome.to_string(),
     }
@@ -764,6 +794,73 @@ fn terminal_verifier_status(final_outcome: &str, verify_command_count: usize) ->
     }
 }
 
+fn build_evaluation_taxonomy(
+    task: &str,
+    final_outcome: &str,
+    terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
+    pam_eval: Option<&PamEvalSummary>,
+) -> EvaluationTaxonomySummary {
+    let failure_authority = terminal_diagnostics
+        .map(|diagnostics| diagnostics.classification.as_str())
+        .unwrap_or_else(|| classify_terminal_outcome_with_context(final_outcome, 0, 0));
+    EvaluationTaxonomySummary {
+        pam_variant: pam_variant_for_eval(pam_eval).to_string(),
+        task_kind: infer_eval_task_kind(task).to_string(),
+        anvil_terminal_class: if final_outcome == "done" {
+            "success".to_string()
+        } else {
+            "non_success".to_string()
+        },
+        outcome_agreement: "external_postcheck_unavailable".to_string(),
+        failure_authority: failure_authority.to_string(),
+    }
+}
+
+fn pam_variant_for_eval(pam_eval: Option<&PamEvalSummary>) -> &'static str {
+    match pam_eval {
+        Some(summary) if summary.mode != "not_used" => "pam_on",
+        Some(_) => "pam_off",
+        None => "unknown",
+    }
+}
+
+fn infer_eval_task_kind(task: &str) -> &'static str {
+    let lower = task.to_ascii_lowercase();
+    if lower.contains("readme")
+        || lower.contains("documentation")
+        || lower.contains("docs")
+        || task.contains("ドキュメント")
+        || task.contains("手順")
+    {
+        return "docs";
+    }
+    if lower.contains("csv")
+        || lower.contains("tsv")
+        || lower.contains("jsonl")
+        || lower.contains("ndjson")
+        || lower.contains("schema")
+        || task.contains("列")
+    {
+        return "data";
+    }
+    if lower.contains("research")
+        || lower.contains("compare")
+        || lower.contains("sources")
+        || task.contains("調査")
+    {
+        return "research";
+    }
+    if lower.contains("runbook")
+        || lower.contains("deploy")
+        || lower.contains("rollback")
+        || lower.contains("ops")
+        || task.contains("運用")
+    {
+        return "ops";
+    }
+    "coding"
+}
+
 fn completion_reason_for_eval(
     final_outcome: &str,
     changed_file_classes: &ChangedFileClasses,
@@ -900,6 +997,20 @@ mod tests {
                 },
                 1,
             )),
+            evaluation_taxonomy: build_evaluation_taxonomy(
+                "fix the bug",
+                "done",
+                Some(&build_terminal_diagnostics(
+                    "done",
+                    &ChangedFileClasses {
+                        test: 1,
+                        impl_files: 2,
+                        setup: 0,
+                    },
+                    1,
+                )),
+                None,
+            ),
             completion_reason: "verifier_evidence_satisfied".to_string(),
             final_outcome: "done".to_string(),
         }
@@ -950,6 +1061,49 @@ mod tests {
         assert!(
             diag.satisfied_obligations
                 .contains(&"repo_edit".to_string())
+        );
+        assert_eq!(rec.evaluation_taxonomy.pam_variant, "unknown");
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "coding");
+        assert_eq!(rec.evaluation_taxonomy.anvil_terminal_class, "success");
+        assert_eq!(
+            rec.evaluation_taxonomy.outcome_agreement,
+            "external_postcheck_unavailable"
+        );
+    }
+
+    #[test]
+    fn evaluation_taxonomy_records_pam_variant_and_task_kind() {
+        let mut rec = build_eval_record(
+            "sess-001",
+            12345,
+            "Update README.md with usage documentation",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "safe_stop_verifier_missing",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("disabled"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.pam_variant, "pam_off");
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
+        assert_eq!(rec.evaluation_taxonomy.anvil_terminal_class, "non_success");
+        assert_eq!(
+            rec.evaluation_taxonomy.failure_authority,
+            "verification_environment_failure"
         );
     }
 

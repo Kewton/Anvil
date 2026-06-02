@@ -1223,7 +1223,7 @@ impl TaskContract {
         let asks_for_tests = request_asks_for_test_artifact(request, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
-        let asks_for_data_output = request_asks_for_data_output_artifact(&lower);
+        let asks_for_data_output = request_asks_for_data_output_artifact(request, &lower);
         let task_kind = infer_task_kind(
             request,
             &lower,
@@ -2405,6 +2405,9 @@ pub(super) fn request_asks_for_implementation_artifact(
 }
 
 pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool {
+    if request_negates_test_artifacts(request, lower) {
+        return false;
+    }
     contains_any(
         lower,
         &[
@@ -2434,6 +2437,44 @@ pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool
             "テストを書く",
             "テストを作成",
             "テスト作成",
+        ],
+    )
+}
+
+pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "do not create code or tests",
+            "do not create tests",
+            "do not add tests",
+            "do not write tests",
+            "do not implement tests",
+            "don't create tests",
+            "don't add tests",
+            "don't write tests",
+            "no tests",
+            "no test files",
+            "without tests",
+            "skip tests",
+            "avoid tests",
+            "tests are not required",
+            "tests not required",
+            "test files are not required",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "テスト不要",
+            "テストは不要",
+            "テストなし",
+            "テスト無し",
+            "テストを作成しない",
+            "テストは作成しない",
+            "テストを追加しない",
+            "テストは追加しない",
+            "テストを書かない",
+            "テストは禁止",
         ],
     )
 }
@@ -2708,15 +2749,27 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
             .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
-fn request_asks_for_data_output_artifact(lower: &str) -> bool {
-    contains_any(lower, &["csv", "tsv", "jsonl", "ndjson"])
-        && contains_any(
-            lower,
-            &[
-                "output", "export", "generate", "produce", "write", "schema", "column", "columns",
-                "出力", "列",
-            ],
-        )
+fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
+    let mentions_structured_format = contains_any(lower, &["csv", "tsv", "jsonl", "ndjson"]);
+    let mentions_output_shape = contains_any(
+        lower,
+        &[
+            "output", "export", "generate", "produce", "write", "schema", "column", "columns",
+            "出力", "列",
+        ],
+    );
+    if !mentions_structured_format || !mentions_output_shape {
+        return false;
+    }
+
+    let coding_subject = request_has_explicit_coding_subject(request, lower)
+        || contains_implementation_file_hint(lower);
+    if coding_subject {
+        return false;
+    }
+
+    explicit_path_with_data_extension(request).is_some()
+        || request_asks_for_data_task(request, lower)
 }
 
 fn default_readme_required_sections() -> Vec<String> {
@@ -2893,7 +2946,7 @@ fn inferred_docs_obligations_from_request(
 }
 
 fn inferred_data_obligations_from_request(request: &str, lower: &str) -> Vec<ArtifactObligation> {
-    if !request_asks_for_data_output_artifact(lower) {
+    if !request_asks_for_data_output_artifact(request, lower) {
         return Vec::new();
     }
     let explicit_output = explicit_artifact_obligations_from_request(request)
@@ -3946,6 +3999,26 @@ mod tests {
     }
 
     #[test]
+    fn negated_code_and_tests_request_does_not_require_test_artifact() {
+        let request = "Create README.md with prerequisites, rotation, rollback, validation, and incident sections. Do not create code or tests.";
+        let contract = TaskContract::from_request(request);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        });
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert!(!contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(!contract.required_behavior.test_execution_required);
+        assert!(!contract.completion_policy.test_execution_required());
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
     fn test_only_contract_does_not_require_implementation() {
         let contract = TaskContract::from_request("FastAPIのテストコードを実装してください");
         let mut evidence = EvidenceSet::new();
@@ -4700,6 +4773,41 @@ mod tests {
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn coding_csv_cli_does_not_create_default_output_csv_obligation() {
+        let contract = TaskContract::from_request(
+            "Create a Python CLI in main.py that reads a CSV file and prints grouped totals. Add pytest tests and README usage.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::DataOutput),
+            "coding task must not treat CSV I/O as standalone output.csv deliverable"
+        );
+        assert!(
+            !contract
+                .required_artifact_identities
+                .iter()
+                .any(|identity| identity.role == ArtifactRole::DataOutput
+                    && identity.path == "output.csv"),
+            "required identities={:?}",
+            contract.required_artifact_identities
         );
     }
 

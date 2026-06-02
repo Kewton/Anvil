@@ -1159,7 +1159,11 @@ pub(super) fn workspace_has_unsupported_ui_framework(work_root: &Path) -> bool {
 
 pub(super) fn request_explicitly_requires_tests(request: &str) -> bool {
     let lower = request.to_ascii_lowercase();
-    lower.contains("test")
+    if super::task_contract::request_negates_test_artifacts(request, &lower) {
+        return false;
+    }
+    super::task_contract::request_asks_for_test_artifact(request, &lower)
+        || lower.contains("test")
         || lower.contains("pytest")
         || lower.contains("unittest")
         || request.contains("テスト")
@@ -4415,6 +4419,19 @@ export default function App(){
         let both_signals = "install and test";
         assert!(!request_is_env_setup_only(both_signals));
         assert!(request_explicitly_requires_tests(both_signals));
+    }
+
+    #[test]
+    fn request_explicitly_requires_tests_respects_negated_test_artifacts() {
+        assert!(!request_explicitly_requires_tests(
+            "Create README.md with validation steps. Do not create code or tests."
+        ));
+        assert!(!request_explicitly_requires_tests(
+            "READMEを作成してください。テストは作成しないでください。"
+        ));
+        assert!(request_explicitly_requires_tests(
+            "Implement the parser and add pytest coverage"
+        ));
     }
 
     // ---------------------------------------------------------------------
