@@ -58,6 +58,7 @@ class Column:
 
 COLUMNS: list[Column] = [
     Column("rc", "rc", False, "int"),
+    Column("postcheck_success", "postcheck", False, "bool"),
     Column("elapsed_s", "elapsed_s", True, "int"),
     Column("we_total", "we_total", True, "int"),
     Column("page_tsx_has_game_keywords", "page_game", False, "bool"),
@@ -176,8 +177,43 @@ def _run_sort_key(p: Path) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _valid_suite_dir(p: Path, bench_root: Path) -> bool:
+    if p.is_symlink() or not p.is_dir():
+        return False
+    if not MODEL_SLUG_RE.match(p.name):
+        return False
+    return _resolve_in(p, bench_root) is not None
+
+
+def _append_run(
+    runs: list[tuple[str, int, Path]],
+    bench_root: Path,
+    model_slug: str,
+    run_dir: Path,
+) -> bool:
+    if not RUN_DIR_RE.match(run_dir.name):
+        return False
+    if run_dir.is_symlink():
+        _warn(f"skipping symlink run-dir: {run_dir}")
+        return False
+    if not run_dir.is_dir():
+        return False
+    if _resolve_in(run_dir, bench_root) is None:
+        _warn(f"skipping run-dir outside BENCH_ROOT: {run_dir}")
+        return False
+    runs.append((model_slug, int(run_dir.name[4:]), run_dir))
+    return len(runs) >= MAX_RUNS
+
+
 def _discover_runs(bench_root: Path) -> list[tuple[str, int, Path]]:
-    """Walk bench_root and return sorted [(model_slug, run_n, run_dir), ...]."""
+    """Walk bench_root and return sorted [(model_slug, run_n, run_dir), ...].
+
+    Supports both legacy flat layout:
+      <root>/<model>/run-N
+
+    and suite/PAM layout:
+      <root>/<model>/<case>/<pam_variant>/run-N
+    """
     runs: list[tuple[str, int, Path]] = []
     try:
         children = sorted(bench_root.iterdir())
@@ -200,21 +236,36 @@ def _discover_runs(bench_root: Path) -> list[tuple[str, int, Path]]:
         except OSError as e:
             _warn(f"cannot list {model_dir.name}: {e}")
             continue
-        for run_dir in run_children:
-            if not RUN_DIR_RE.match(run_dir.name):
+        for child in run_children:
+            if RUN_DIR_RE.match(child.name):
+                if _append_run(runs, bench_root, model_dir.name, child):
+                    _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
+                    return runs
                 continue
-            if run_dir.is_symlink():
-                _warn(f"skipping symlink run-dir: {run_dir}")
+            if not _valid_suite_dir(child, bench_root):
                 continue
-            if not run_dir.is_dir():
+            try:
+                case_children = sorted(child.iterdir(), key=_run_sort_key)
+            except OSError as e:
+                _warn(f"cannot list {child}: {e}")
                 continue
-            if _resolve_in(run_dir, bench_root) is None:
-                _warn(f"skipping run-dir outside BENCH_ROOT: {run_dir}")
-                continue
-            runs.append((model_dir.name, int(run_dir.name[4:]), run_dir))
-            if len(runs) >= MAX_RUNS:
-                _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
-                return runs
+            for nested in case_children:
+                if RUN_DIR_RE.match(nested.name):
+                    if _append_run(runs, bench_root, model_dir.name, nested):
+                        _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
+                        return runs
+                    continue
+                if not _valid_suite_dir(nested, bench_root):
+                    continue
+                try:
+                    variant_children = sorted(nested.iterdir(), key=_run_sort_key)
+                except OSError as e:
+                    _warn(f"cannot list {nested}: {e}")
+                    continue
+                for run_dir in variant_children:
+                    if _append_run(runs, bench_root, model_dir.name, run_dir):
+                        _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
+                        return runs
     return runs
 
 
@@ -268,6 +319,15 @@ def _success_rate(rows: list[dict]) -> tuple[str, int, int]:
     success = sum(1 for rc in rcs if rc == 0)
     pct = 100 * success // len(rcs)
     return f"{pct}%", success, len(rcs)
+
+
+def _bool_success_rate(rows: list[dict], key: str) -> tuple[str, int, int]:
+    vals = [r.get(key) for r in rows if isinstance(r.get(key), bool)]
+    if not vals:
+        return "N/A", 0, 0
+    success = sum(1 for v in vals if v is True)
+    pct = 100 * success // len(vals)
+    return f"{pct}%", success, len(vals)
 
 
 def _aggregate(rows: list[dict]) -> dict:
@@ -373,12 +433,18 @@ def _gather(bench_root: Path) -> tuple[list[tuple[str, int, Path]], list[dict]]:
 
 
 def _render_run_summary(rows: list[dict]) -> list[str]:
-    headers = ["run", "model"] + [c.label for c in COLUMNS]
+    headers = ["run", "model", "case", "task_kind", "pam"] + [c.label for c in COLUMNS]
     lines: list[str] = []
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("-----" for _ in headers) + "|")
     for r in rows:
-        cells: list[str] = [str(r["_run_n"]), r["_model"]]
+        cells: list[str] = [
+            str(r["_run_n"]),
+            _md_escape_cell(r["_model"]),
+            _md_escape_cell(r.get("case", "default")),
+            _md_escape_cell(r.get("task_kind", "coding")),
+            _md_escape_cell(r.get("pam_variant", "default")),
+        ]
         if r.get("_failed"):
             # rc column shows the analyze_run.py rc; rest are N/A.
             cells.append(str(r.get("_analyze_rc", "")))
@@ -423,6 +489,23 @@ def _render_aggregate(rows: list[dict]) -> tuple[list[str], list[str]]:
                 + " |"
             )
             continue
+        if col.type == "bool":
+            rate, ok, total = _bool_success_rate(only_ok, col.key)
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"{col.label}_rate",
+                        str(total),
+                        rate,
+                        f"{ok}/{total}" if total else "-",
+                        "-",
+                        "-",
+                    ]
+                )
+                + " |"
+            )
+            continue
         stats = agg.get(col.key, {})
         label = col.label
         if stats.get("cv_warn"):
@@ -438,6 +521,75 @@ def _render_aggregate(rows: list[dict]) -> tuple[list[str], list[str]]:
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return lines, warnings
+
+
+def _terminal_postcheck_summary(rows: list[dict], group_keys: list[str]) -> list[list[str]]:
+    groups: dict[tuple[str, ...], list[dict]] = {}
+    for r in rows:
+        if r.get("_failed"):
+            continue
+        key = tuple(str(r.get(k, "default")) for k in group_keys)
+        groups.setdefault(key, []).append(r)
+
+    out: list[list[str]] = []
+    for key in sorted(groups):
+        sub = groups[key]
+        term_rate, term_ok, term_total = _success_rate(sub)
+        post_rate, post_ok, post_total = _bool_success_rate(sub, "postcheck_success")
+        both_total = 0
+        both_ok = 0
+        for r in sub:
+            if r.get("rc") is None or not isinstance(r.get("postcheck_success"), bool):
+                continue
+            both_total += 1
+            if r.get("rc") == 0 and r.get("postcheck_success") is True:
+                both_ok += 1
+        both_rate = "N/A" if both_total == 0 else f"{100 * both_ok // both_total}%"
+        out.append(
+            [
+                *[_md_escape_cell(v) for v in key],
+                str(len(sub)),
+                f"{term_rate} ({term_ok}/{term_total})",
+                f"{post_rate} ({post_ok}/{post_total})",
+                f"{both_rate} ({both_ok}/{both_total})" if both_total else "N/A",
+            ]
+        )
+    return out
+
+
+def _render_task_kind_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["task_kind"])
+    lines = ["## Task Kind Summary", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = ["task_kind", "runs", "terminal_success", "postcheck_success", "both_success"]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_pam_task_kind_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["task_kind", "pam_variant"])
+    lines = ["## PAM By Task Kind", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "task_kind",
+        "pam_variant",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
 
 
 def _render_report(bench_root: Path, rows: list[dict]) -> str:
@@ -465,6 +617,11 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
     else:
         parts.append("(no runs discovered)")
     parts.append("")
+    if rows:
+        parts.extend(_render_task_kind_summary(rows))
+        parts.append("")
+        parts.extend(_render_pam_task_kind_summary(rows))
+        parts.append("")
     return "\n".join(parts)
 
 
@@ -514,6 +671,24 @@ def _render_compare_section(model: str, rows_a: list[dict], rows_b: list[dict]) 
     lines.append("| " + " | ".join(["success_rate", sr_a, sr_b, "-", "-"]) + " |")
     for col in COLUMNS:
         if col.key == "rc":
+            continue
+        if col.type == "bool":
+            rate_a, ok_a, total_a = _bool_success_rate(only_a, col.key)
+            rate_b, ok_b, total_b = _bool_success_rate(only_b, col.key)
+            if total_a and total_b:
+                diff = (ok_b / total_b) - (ok_a / total_a)
+                sign = "+" if diff >= 0 else ""
+                diff_cell = f"{sign}{diff * 100:.1f}pt"
+            else:
+                diff_cell = "-"
+            cells = [
+                f"{col.label}_rate",
+                f"{rate_a} ({ok_a}/{total_a})" if total_a else "N/A",
+                f"{rate_b} ({ok_b}/{total_b})" if total_b else "N/A",
+                diff_cell,
+                "-",
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
             continue
         sa = agg_a.get(col.key, {})
         sb = agg_b.get(col.key, {})

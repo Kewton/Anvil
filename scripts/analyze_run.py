@@ -37,6 +37,8 @@ SCHEMA_VERSION = 1
 KEYWORDS_VERSION = 1
 
 WRITE_EDIT_TOOLS = ["Write", "Edit"]
+DEFAULT_TASK_KIND = "coding"
+KNOWN_TASK_KINDS = {"coding", "docs", "data", "research", "ops"}
 
 GAME_KEYWORDS_V1 = [
     "game",
@@ -64,6 +66,44 @@ MAX_META_JSON = 256 * 1024  # 256 KiB
 MAX_PAGE_TSX = 2 * 1024 * 1024  # 2 MiB
 MAX_LLM_IO_JSONL = 500 * 1024 * 1024  # 500 MiB overall streaming cap
 MAX_LLM_IO_LINE = 1 * 1024 * 1024  # 1 MiB per line
+
+CODE_EXTS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
+CONFIG_EXTS = {".lock", ".toml", ".yaml", ".yml"}
+DOC_EXTS = {".md", ".mdx", ".rst", ".txt"}
+DATA_EXTS = {".csv", ".json", ".jsonl", ".parquet", ".tsv", ".xlsx", ".yaml", ".yml"}
+PROTECTED_EXACT_PATHS = {
+    "meta.json",
+    "session.json",
+    "summary.tsv",
+    "stdout.log",
+    "stderr.log",
+}
+PROTECTED_PREFIXES = (
+    ".anvil/",
+    "logs/",
+    "state/",
+    "tmp-tests/metadata/",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -276,31 +316,48 @@ def _analyze_session(
 # ---------------------------------------------------------------------------
 
 
-def _read_meta(run_dir: Path) -> tuple[Any, Any]:
-    """Return (rc, elapsed_s) from meta.json, or (None, None) on any failure."""
+def _safe_meta_string(data: dict[str, Any], key: str) -> str | None:
+    raw = data.get(key)
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    return raw[:128]
+
+
+def _read_meta(run_dir: Path) -> dict[str, Any]:
+    """Return selected meta.json fields, using None/defaults on failure."""
+    fallback = {
+        "case": "default",
+        "elapsed_s": None,
+        "pam_variant": "default",
+        "rc": None,
+        "task_kind": DEFAULT_TASK_KIND,
+    }
     candidate = run_dir / "meta.json"
     safe = _safe_regular_file_in(candidate, run_dir, MAX_META_JSON)
     if safe is None:
         if candidate.exists() and not candidate.is_symlink():
             # silently missing is fine; only warn on unusable-but-present
             _warn(f"meta.json unusable: {candidate}")
-        return None, None
+        return fallback
 
     try:
         raw = safe.read_text(encoding="utf-8")
     except OSError as e:
         _warn(f"meta.json read error: {e}")
-        return None, None
+        return fallback
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         _warn(f"meta.json parse error: {e}")
-        return None, None
+        return fallback
 
     if not isinstance(data, dict):
         _warn("meta.json is not an object")
-        return None, None
+        return fallback
 
     rc = data.get("rc")
     elapsed_s = data.get("elapsed_s")
@@ -314,7 +371,105 @@ def _read_meta(run_dir: Path) -> tuple[Any, Any]:
         elapsed_s = int(elapsed_s)
     else:
         elapsed_s = None
-    return rc, elapsed_s
+
+    task_kind = _safe_meta_string(data, "task_kind")
+    if task_kind is None:
+        task_kind = _safe_meta_string(data, "category")
+    if task_kind is None or task_kind not in KNOWN_TASK_KINDS:
+        task_kind = DEFAULT_TASK_KIND
+
+    return {
+        "case": _safe_meta_string(data, "case") or "default",
+        "elapsed_s": elapsed_s,
+        "pam_variant": _safe_meta_string(data, "pam_variant") or "default",
+        "rc": rc,
+        "task_kind": task_kind,
+    }
+
+
+# ---------------------------------------------------------------------------
+# artifact-level postcheck
+# ---------------------------------------------------------------------------
+
+
+def _is_protected_artifact_path(path: str) -> bool:
+    clean = path.strip().replace("\\", "/")
+    if not clean or "\x00" in clean:
+        return True
+    while clean.startswith("./"):
+        clean = clean[2:]
+    if clean in PROTECTED_EXACT_PATHS:
+        return True
+    if clean.endswith(".log"):
+        return True
+    return any(clean.startswith(prefix) for prefix in PROTECTED_PREFIXES)
+
+
+def _artifact_candidates(files_modified: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in files_modified:
+        if not isinstance(raw, str):
+            continue
+        path = raw.strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        if not path or _is_protected_artifact_path(path) or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _suffix(path: str) -> str:
+    return Path(path).suffix.lower()
+
+
+def _postcheck_success(task_kind: str, artifacts: list[str]) -> tuple[bool | None, str]:
+    if not artifacts:
+        return False, "no_user_artifact"
+
+    lowered = [p.lower() for p in artifacts]
+    suffixes = {_suffix(p) for p in lowered}
+
+    if task_kind == "coding":
+        ok = any(ext in CODE_EXTS or ext in CONFIG_EXTS for ext in suffixes)
+        return ok, "coding_artifact" if ok else "missing_coding_artifact"
+
+    if task_kind == "docs":
+        ok = any(ext in DOC_EXTS for ext in suffixes) or any(
+            p.startswith("docs/") for p in lowered
+        )
+        return ok, "docs_artifact" if ok else "missing_docs_artifact"
+
+    if task_kind == "data":
+        ok = any(ext in DATA_EXTS for ext in suffixes) or any(
+            ext in CODE_EXTS and ("script" in p or "data" in p or "transform" in p)
+            for p in lowered
+            for ext in [_suffix(p)]
+        )
+        return ok, "data_artifact" if ok else "missing_data_artifact"
+
+    if task_kind == "research":
+        ok = any(
+            (ext in DOC_EXTS) and ("research" in p or "brief" in p or "report" in p)
+            for p in lowered
+            for ext in [_suffix(p)]
+        )
+        return ok, "research_artifact" if ok else "missing_research_artifact"
+
+    if task_kind == "ops":
+        ok = any(
+            "runbook" in p
+            or "/ops/" in p
+            or p.startswith("ops/")
+            or p.startswith("scripts/")
+            or p.startswith(".github/workflows/")
+            for p in lowered
+        )
+        return ok, "ops_artifact" if ok else "missing_ops_artifact"
+
+    return None, "unknown_task_kind"
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +770,7 @@ def main(argv: list[str]) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 3
 
-    rc, elapsed_s = _read_meta(run_dir)
+    meta = _read_meta(run_dir)
     error_500_count = _read_error_500_count(run_dir)
     page_tsx_has_keywords = _read_page_tsx_keywords(run_dir, workdir)
     anvil_score = _read_anvil_score(session)
@@ -623,14 +778,21 @@ def main(argv: list[str]) -> int:
     token_prompt, token_completion = _read_token_usage(run_dir)
 
     files_modified = session_metrics["files_modified"]
+    artifact_files = _artifact_candidates(files_modified)
+    postcheck_success, postcheck_reason = _postcheck_success(
+        meta["task_kind"], artifact_files
+    )
     page_tsx_touched = "src/app/page.tsx" in files_modified
     tool_calls = session_metrics["tool_calls"]
     tool_call_total = sum(tool_calls.values())
 
     out: dict[str, Any] = {
         "anvil_score": anvil_score,
+        "artifact_file_count": len(artifact_files),
+        "artifact_files": artifact_files,
+        "case": meta["case"],
         "compact_events": session_metrics["compact_events"],
-        "elapsed_s": elapsed_s,
+        "elapsed_s": meta["elapsed_s"],
         "error_500_count": error_500_count,
         "failure_kind": failure_kind,
         "files_modified": files_modified,
@@ -638,9 +800,13 @@ def main(argv: list[str]) -> int:
         "keywords_version": KEYWORDS_VERSION,
         "page_tsx_has_game_keywords": page_tsx_has_keywords,
         "page_tsx_touched": page_tsx_touched,
-        "rc": rc,
+        "pam_variant": meta["pam_variant"],
+        "postcheck_reason": postcheck_reason,
+        "postcheck_success": postcheck_success,
+        "rc": meta["rc"],
         "run_id": session_metrics["run_id"],
         "schema_version": SCHEMA_VERSION,
+        "task_kind": meta["task_kind"],
         "token_completion": token_completion,
         "token_prompt": token_prompt,
         "tool_call_total": tool_call_total,

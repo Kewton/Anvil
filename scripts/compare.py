@@ -46,6 +46,7 @@ UMASK = 0o077
 
 # metric-name aliases -> canonical metric key
 ALIASES: dict[str, str] = {
+    "postcheck": "postcheck_success",
     "rc0": "rc",
     "page_game": "page_tsx_has_game_keywords",
 }
@@ -53,6 +54,7 @@ ALIASES: dict[str, str] = {
 # canonical key -> aggregation spec
 METRIC_TYPE_SPEC: dict[str, dict[str, Any]] = {
     "rc": {"type": "bool_rate", "direction": "up"},
+    "postcheck_success": {"type": "bool_rate", "direction": "up"},
     "page_tsx_has_game_keywords": {"type": "bool_rate", "direction": "up"},
     "we_total": {"type": "informational", "direction": None},
     "elapsed_s": {"type": "continuous", "direction": "down"},
@@ -219,28 +221,54 @@ def _collect_run_dirs(root: Path, slug: str) -> list[Path]:
 
     - symlinks are skipped (with a warning)
     - if resulting count > MAX_RUNS -> exit 1 (security)
+    - supports both flat model/run-N and nested model/case/pam/run-N layouts
     """
     slug_dir = root / slug
     runs: list[Path] = []
+
+    def _append_if_run(p: Path) -> None:
+        if not p.name.startswith("run-"):
+            return
+        suffix = p.name[len("run-") :]
+        if not suffix.isdigit():
+            _warn(f"skipping non-numeric run-dir: {p}")
+            return
+        if p.is_symlink():
+            _warn(f"skipping symlink run-dir: {p}")
+            return
+        if not p.is_dir():
+            return
+        runs.append(p)
+
     try:
         entries = sorted(slug_dir.iterdir())
     except OSError as e:
         _die(f"cannot list {slug_dir}: {e}", 2)
         raise  # unreachable
     for p in entries:
-        if not p.name.startswith("run-"):
+        if p.name.startswith("run-"):
+            _append_if_run(p)
             continue
-        # require "run-<digits>" to avoid matching arbitrary run-abc dirs
-        suffix = p.name[len("run-") :]
-        if not suffix.isdigit():
-            _warn(f"skipping non-numeric run-dir: {p}")
+        if p.is_symlink() or not p.is_dir():
             continue
-        if p.is_symlink():
-            _warn(f"skipping symlink run-dir: {p}")
+        try:
+            nested_entries = sorted(p.iterdir())
+        except OSError as e:
+            _warn(f"cannot list {p}: {e}")
             continue
-        if not p.is_dir():
-            continue
-        runs.append(p)
+        for nested in nested_entries:
+            if nested.name.startswith("run-"):
+                _append_if_run(nested)
+                continue
+            if nested.is_symlink() or not nested.is_dir():
+                continue
+            try:
+                variant_entries = sorted(nested.iterdir())
+            except OSError as e:
+                _warn(f"cannot list {nested}: {e}")
+                continue
+            for run_dir in variant_entries:
+                _append_if_run(run_dir)
     if len(runs) > MAX_RUNS:
         _die(
             f"run-dir count {len(runs)} exceeds MAX_RUNS={MAX_RUNS} for {slug_dir}",
