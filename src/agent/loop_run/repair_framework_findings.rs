@@ -5,6 +5,7 @@ use super::repair_python_test_analysis::{
     excerpt_has_disconnected_fixture_state_assertion, line_mentions_identifier,
 };
 use super::task_contract::ArtifactRole;
+use crate::util::workspace_paths::is_workspace_artifact_admitted_relative_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifierDiagnosticFileExcerpt {
@@ -862,6 +863,9 @@ fn collect_meaningful_workspace_files(
         let Ok(relative) = path.strip_prefix(work_root) else {
             continue;
         };
+        if !is_workspace_artifact_admitted_relative_path(relative) {
+            continue;
+        }
         files.push(relative.to_path_buf());
     }
 }
@@ -886,5 +890,24 @@ mod tests {
             "",
             "error[E0432]: unresolved import"
         ));
+    }
+
+    #[test]
+    fn meaningful_workspace_files_excludes_metadata_exploration_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("prompt.md"), "task\n").unwrap();
+        std::fs::write(temp.path().join("cmd.txt"), "cargo test\n").unwrap();
+        std::fs::write(temp.path().join("anvil.out"), "stdout\n").unwrap();
+        std::fs::write(temp.path().join("postcheck.err"), "stderr\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("logs")).unwrap();
+        std::fs::write(temp.path().join("logs/llm-io.jsonl"), "{}\n").unwrap();
+        std::fs::create_dir_all(temp.path().join(".anvil")).unwrap();
+        std::fs::write(temp.path().join(".anvil/session.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/main.py"), "import app.models\n").unwrap();
+
+        let files = meaningful_workspace_files(temp.path(), 16).unwrap();
+
+        assert_eq!(files, vec![PathBuf::from("src/main.py")]);
     }
 }

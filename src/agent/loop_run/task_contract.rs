@@ -2104,18 +2104,9 @@ fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
 }
 
 fn explicit_path_with_data_extension(request: &str) -> Option<String> {
-    request
-        .split(|ch: char| {
-            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
-        })
-        .find_map(|token| {
-            let path = normalize_explicit_artifact_path(token)?;
-            let ext = std::path::Path::new(&path)
-                .extension()
-                .and_then(|ext| ext.to_str())?
-                .to_ascii_lowercase();
-            matches!(ext.as_str(), "csv" | "json" | "jsonl" | "tsv").then_some(path)
-        })
+    explicit_data_paths_from_request(request)
+        .into_iter()
+        .find(|path| data_path_has_output_context(request, path))
 }
 
 fn infer_intent(request: &str, lower: &str) -> TaskIntent {
@@ -2844,8 +2835,13 @@ fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
         return false;
     }
 
-    explicit_path_with_data_extension(request).is_some()
-        || request_asks_for_data_task(request, lower)
+    if explicit_path_with_data_extension(request).is_some() {
+        return true;
+    }
+    if request_mentions_protected_data_artifact_path(request) {
+        return false;
+    }
+    request_explicitly_requests_standalone_data_artifact(request, lower)
 }
 
 fn default_readme_required_sections() -> Vec<String> {
@@ -3025,10 +3021,7 @@ fn inferred_data_obligations_from_request(request: &str, lower: &str) -> Vec<Art
     if !request_asks_for_data_output_artifact(request, lower) {
         return Vec::new();
     }
-    let explicit_output = explicit_artifact_obligations_from_request(request)
-        .into_iter()
-        .find(|identity| identity.role == ArtifactRole::DataOutput)
-        .map(|identity| identity.path);
+    let explicit_output = explicit_path_with_data_extension(request);
     let path = explicit_output.unwrap_or_else(|| {
         if lower.contains("tsv") {
             "output.tsv".to_string()
@@ -3083,7 +3076,7 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
     for token in request.split(|ch: char| {
         !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
     }) {
-        let Some(path) = normalize_explicit_artifact_path(token) else {
+        let Some(path) = normalize_explicit_user_artifact_path(token) else {
             continue;
         };
         let category =
@@ -3091,6 +3084,9 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
         let Some(role) = role_from_repo_edit(category) else {
             continue;
         };
+        if role == ArtifactRole::DataOutput && !data_path_has_output_context(request, &path) {
+            continue;
+        }
         if !obligations
             .iter()
             .any(|existing: &ArtifactObligation| existing.role == role && existing.path == path)
@@ -3100,6 +3096,13 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
     }
     obligations.sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
     obligations
+}
+
+fn normalize_explicit_user_artifact_path(token: &str) -> Option<String> {
+    let path = normalize_explicit_artifact_path(token)?;
+    crate::util::workspace_paths::WorkspacePolicy::default()
+        .admits_artifact_display_path(&path)
+        .then_some(path)
 }
 
 fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
@@ -3183,6 +3186,158 @@ fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
             | "parquet"
     );
     recognized.then_some(path)
+}
+
+fn explicit_data_paths_from_request(request: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for token in request.split(|ch: char| {
+        !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
+    }) {
+        let Some(path) = normalize_explicit_user_artifact_path(token) else {
+            continue;
+        };
+        if !path_has_data_extension(&path) {
+            continue;
+        }
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn request_mentions_protected_data_artifact_path(request: &str) -> bool {
+    request
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
+        })
+        .filter_map(normalize_explicit_artifact_path)
+        .any(|path| {
+            path_has_data_extension(&path)
+                && !crate::util::workspace_paths::WorkspacePolicy::default()
+                    .admits_artifact_display_path(&path)
+        })
+}
+
+fn path_has_data_extension(path: &str) -> bool {
+    let Some(ext) = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        "csv" | "json" | "jsonl" | "tsv" | "ndjson" | "parquet"
+    )
+}
+
+fn data_path_has_output_context(request: &str, path: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let file_output_name = data_path_file_name_looks_like_output(path);
+    lower.match_indices(&path_lower).any(|(idx, _)| {
+        let before = bounded_context_before(&lower, idx, 48);
+        let after_idx = idx + path_lower.len();
+        let after = bounded_context_after(&lower, after_idx, 32);
+        let input_context = file_data_name_looks_like_input(path)
+            || contains_any(
+                before,
+                &[
+                    "input", "source", "sample", "example", "fixture", "from", "read", "reads",
+                    "load", "loads", "ingest",
+                ],
+            )
+            || contains_any(after, &[" as input", " input", " sample", " example"]);
+        if input_context && !file_output_name {
+            return false;
+        }
+        file_output_name
+            || contains_any(
+                before,
+                &[
+                    "output", "write", "writes", "generate", "produce", "export", "save", "create",
+                    "emit", "to", "into",
+                ],
+            )
+            || contains_any(after, &[" output", " deliverable", " artifact"])
+    })
+}
+
+fn request_explicitly_requests_standalone_data_artifact(request: &str, lower: &str) -> bool {
+    let output_action = contains_any(
+        lower,
+        &[
+            "output", "write", "generate", "produce", "export", "save", "create", "emit",
+        ],
+    ) || contains_any(request, &["出力", "生成", "作成", "書き出"]);
+    let artifact_noun = contains_any(
+        lower,
+        &[
+            "csv file",
+            "tsv file",
+            "jsonl file",
+            "ndjson file",
+            "data file",
+            "data artifact",
+            "structured output",
+            "structured data",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "CSVファイル",
+            "JSONLファイル",
+            "データファイル",
+            "構造化データ",
+        ],
+    );
+    output_action && artifact_noun
+}
+
+fn data_path_file_name_looks_like_output(path: &str) -> bool {
+    data_path_file_stem(path).is_some_and(|stem| {
+        stem.starts_with("output")
+            || stem.starts_with("summary")
+            || stem.starts_with("result")
+            || stem.starts_with("report")
+            || stem.starts_with("export")
+            || stem.starts_with("cleaned")
+    })
+}
+
+fn file_data_name_looks_like_input(path: &str) -> bool {
+    data_path_file_stem(path).is_some_and(|stem| {
+        stem.starts_with("input")
+            || stem.starts_with("sample")
+            || stem.starts_with("example")
+            || stem.starts_with("fixture")
+            || stem.starts_with("source")
+    })
+}
+
+fn data_path_file_stem(path: &str) -> Option<String> {
+    let file_name = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())?;
+    Some(file_name.to_ascii_lowercase())
+}
+
+fn bounded_context_before(text: &str, end: usize, max_bytes: usize) -> &str {
+    let mut start = end.saturating_sub(max_bytes);
+    while start < end && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..end]
+}
+
+fn bounded_context_after(text: &str, start: usize, max_bytes: usize) -> &str {
+    let mut end = (start + max_bytes).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[start..end]
 }
 
 pub(super) fn normalized_artifact_path_eq(actual: &str, expected: &str) -> bool {
@@ -3430,13 +3585,22 @@ fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
 }
 
 fn contains_implementation_file_hint(lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".go", ".java", ".kt",
-            ".swift",
-        ],
-    )
+    [
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".go", ".java", ".kt",
+        ".swift",
+    ]
+    .iter()
+    .any(|suffix| lower_contains_file_suffix(lower, suffix))
+}
+
+fn lower_contains_file_suffix(lower: &str, suffix: &str) -> bool {
+    lower.match_indices(suffix).any(|(idx, _)| {
+        let after_idx = idx + suffix.len();
+        lower[after_idx..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+    })
 }
 
 fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
@@ -4973,6 +5137,96 @@ mod tests {
                     && identity.path == "output.csv"),
             "required identities={:?}",
             contract.required_artifact_identities
+        );
+    }
+
+    #[test]
+    fn coding_jsonl_cli_does_not_create_default_output_jsonl_obligation() {
+        let contract = TaskContract::from_request(
+            "Implement a Rust CLI that reads input JSONL records and writes normalized JSONL to stdout. Add tests.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::DataOutput),
+            "coding task must not treat JSONL I/O as standalone output.jsonl deliverable"
+        );
+        assert!(
+            !contract
+                .required_artifact_identities
+                .iter()
+                .any(|identity| identity.role == ArtifactRole::DataOutput),
+            "required identities={:?}",
+            contract.required_artifact_identities
+        );
+    }
+
+    #[test]
+    fn explicit_jsonl_data_task_declares_structured_data_deliverable() {
+        let contract = TaskContract::from_request(
+            "Generate data/results.jsonl with columns id and score from input.jsonl.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::DataOutput]);
+        let obligation =
+            required_obligation(&contract, ArtifactRole::DataOutput, "data/results.jsonl");
+        assert_eq!(obligation.kind, DeliverableKind::StructuredRecord);
+        assert_eq!(obligation.format, Some(DeliverableFormat::JsonLines));
+        assert_eq!(
+            obligation
+                .structured_record_schema
+                .as_ref()
+                .map(|schema| schema.columns.as_slice()),
+            Some(["id".to_string(), "score".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn protected_metadata_paths_do_not_become_deliverable_obligations() {
+        let docs_contract =
+            TaskContract::from_request("Update prompt.md with usage documentation.");
+        assert_eq!(docs_contract.task_kind, TaskKind::Docs);
+        assert!(
+            !docs_contract
+                .required_artifact_identities
+                .iter()
+                .any(|identity| identity.path == "prompt.md"),
+            "required identities={:?}",
+            docs_contract.required_artifact_identities
+        );
+        assert!(
+            docs_contract
+                .deliverables
+                .iter()
+                .all(|deliverable| deliverable.path.as_deref() != Some("prompt.md")),
+            "deliverables={:?}",
+            docs_contract.deliverables
+        );
+
+        let data_contract =
+            TaskContract::from_request("Generate llm-io.jsonl with columns event and payload.");
+        assert!(
+            !data_contract
+                .required_artifacts
+                .contains(&ArtifactRole::DataOutput),
+            "protected log path must not synthesize a data deliverable: {data_contract:?}"
+        );
+        assert!(
+            data_contract
+                .required_artifact_identities
+                .iter()
+                .all(|identity| identity.path != "llm-io.jsonl"),
+            "required identities={:?}",
+            data_contract.required_artifact_identities
         );
     }
 
