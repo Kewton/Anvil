@@ -1131,6 +1131,14 @@ mod unit_tests {
         }
     }
 
+    fn build_test_bound(bound_count: usize) -> CompletionEvidence {
+        CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "pytest tests/test_feature.py".to_string(),
+            bound_test_artifacts_count: Some(bound_count),
+        }
+    }
+
     #[test]
     fn mode_as_str_matches_documented_vocabulary() {
         assert_eq!(PamAdvisoryMode::Shadow.as_str(), "shadow");
@@ -1459,6 +1467,91 @@ mod unit_tests {
         assert_eq!(
             contract.evaluate(&unverified_evidence),
             CompletionDecision::Done
+        );
+    }
+
+    #[test]
+    fn pam_advisory_has_no_owned_test_completion_authority() {
+        let contract = TaskContract::from_request("Implement feature X and add tests");
+        assert!(contract.required_behavior.test_execution_required);
+
+        let mut missing_test_evidence = EvidenceSet::new();
+        missing_test_evidence.push(repo_edit(RepoEditCategory::Impl));
+        let no_pam_missing =
+            contract.evaluate_with_owned_test_artifacts(&missing_test_evidence, &[]);
+
+        let blocked = HashSet::new();
+        let resp = context_pack_with_summary(
+            "pam_test_seed",
+            "Prior task added tests/test_feature.py and the verifier passed.",
+        );
+        let live_outcome = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+        assert_eq!(
+            live_outcome.decision.decision_effect.actual_injected_count,
+            1
+        );
+        assert_eq!(
+            live_outcome
+                .decision
+                .candidate_decisions
+                .first()
+                .map(|decision| decision.advisory_target),
+            Some(PamAdvisoryTarget::TaskContractCandidateGeneration),
+            "PAM may advise candidate generation, not completion judgement"
+        );
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&missing_test_evidence, &[]),
+            no_pam_missing,
+            "live PAM advice alone must not produce Done"
+        );
+        assert!(matches!(
+            no_pam_missing,
+            CompletionDecision::Continue { ref missing } if missing.contains(&ArtifactRole::Test)
+        ));
+
+        let shadow_outcome = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: true },
+        );
+        assert!(shadow_outcome.live_admitted_views.is_empty());
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&missing_test_evidence, &[]),
+            no_pam_missing,
+            "shadow PAM advice must have the same completion authority as no PAM"
+        );
+
+        let mut deterministic_evidence = EvidenceSet::new();
+        deterministic_evidence.push(repo_edit(RepoEditCategory::Impl));
+        deterministic_evidence.push(repo_edit(RepoEditCategory::Test));
+        deterministic_evidence.push(build_test_bound(1));
+        let owned = vec!["tests/test_feature.py".to_string()];
+        let no_pam_done =
+            contract.evaluate_with_owned_test_artifacts(&deterministic_evidence, &owned);
+        assert_eq!(no_pam_done, CompletionDecision::Done);
+
+        let _repair_advice = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            Some(&build_active_job_selection_artifact_recovery_for_test()),
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&deterministic_evidence, &owned),
+            no_pam_done,
+            "deterministic evidence must keep the same Done authority with or without PAM"
         );
     }
 }
