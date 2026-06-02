@@ -100,6 +100,9 @@ pub(super) enum SuppressionReason {
     /// `#665` `BehaviorContractProjection.non_goals` contained the role
     /// suggested by the memory item (判定軸 (4)).
     BehaviorNonGoalMismatch,
+    /// The memory item did not expose an artifact-role signal strong enough
+    /// to become TaskContract / repair candidate input.
+    LowRelevance,
 }
 
 impl SuppressionReason {
@@ -108,6 +111,7 @@ impl SuppressionReason {
             SuppressionReason::RoleMismatch => "role_mismatch",
             SuppressionReason::ImplExpansionBlocked => "impl_expansion_blocked",
             SuppressionReason::BehaviorNonGoalMismatch => "behavior_non_goal_mismatch",
+            SuppressionReason::LowRelevance => "low_relevance",
         }
     }
 }
@@ -132,6 +136,34 @@ impl PamCandidateAction {
 }
 
 impl serde::Serialize for PamCandidateAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Issue #878: the only downstream surfaces PAM may advise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum PamAdvisoryTarget {
+    TaskContractCandidateGeneration,
+    RepairPacketCandidateGeneration,
+    PromptContextOnly,
+}
+
+impl PamAdvisoryTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskContractCandidateGeneration => "task_contract_candidate_generation",
+            Self::RepairPacketCandidateGeneration => "repair_packet_candidate_generation",
+            Self::PromptContextOnly => "prompt_context_only",
+        }
+    }
+}
+
+impl serde::Serialize for PamAdvisoryTarget {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -187,10 +219,13 @@ pub(super) struct ShadowVsLiveDiff {
 pub(super) struct PamCandidateDecision {
     pub(super) summary_id: String,
     pub(super) action: PamCandidateAction,
+    pub(super) advisory_target: PamAdvisoryTarget,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) inferred_role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) suppression_reason: Option<SuppressionReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) unused_reason: Option<&'static str>,
     pub(super) decision_impact: &'static str,
     pub(super) context_excerpt: String,
     #[serde(default)]
@@ -313,6 +348,10 @@ impl PamAdvisoryDecision {
                 self.active_job_role.as_str(),
             );
         }
+        let unused_reason = self
+            .candidate_decisions
+            .iter()
+            .find_map(|decision| decision.unused_reason.map(str::to_string));
         crate::session::eval_log::PamEvalSummary {
             mode: self.mode.as_str().to_string(),
             decision_type: self.decision_effect.influenced_decision.to_string(),
@@ -323,7 +362,7 @@ impl PamAdvisoryDecision {
             would_inject_in_live_count: self.decision_effect.would_inject_in_live_count,
             advisory_only: true,
             completion_judgement_override: false,
-            unused_reason: None,
+            unused_reason,
         }
     }
 }
@@ -409,6 +448,13 @@ pub(super) fn classify_summary(
 ) -> SummaryClassification {
     let suggested_role = infer_role_from_view(view);
 
+    // Issue #878: PAM is no longer fail-open into generic prompt context.
+    // Without a role signal, the item cannot be bounded to TaskContract or
+    // repair-packet candidate generation, so it is logged but not injected.
+    let Some(suggested_role) = suggested_role else {
+        return SummaryClassification::Suppress(SuppressionReason::LowRelevance);
+    };
+
     // Axis (3): VerifierRepair / ArtifactRecovery suppress implementation
     // expansion. This takes precedence over (1)(2)(4) when active.
     if let Some(kind) = active_job_kind
@@ -416,24 +462,25 @@ pub(super) fn classify_summary(
             kind,
             ActiveJobKind::VerifierRepair | ActiveJobKind::ArtifactRecovery
         )
-        && matches!(suggested_role, Some(ArtifactRole::Implementation))
+        && suggested_role == ArtifactRole::Implementation
     {
         return SummaryClassification::Suppress(SuppressionReason::ImplExpansionBlocked);
     }
 
     // Axis (1)+(2): role mismatch (only fires when both sides are known
-    // and differ). Fail-open when either side is None — admit by default.
-    if let (Some(suggested), Some(hint)) = (suggested_role, current_role_hint)
-        && suggested != hint
+    // and differ). If current_role_hint is None, known-role advice is
+    // permitted as candidate-generation context only.
+    if let Some(hint) = current_role_hint
+        && suggested_role != hint
     {
         return SummaryClassification::Suppress(SuppressionReason::RoleMismatch);
     }
 
     // Axis (4): behavior.non_goals contains suggested role label.
-    if let (Some(b), Some(suggested)) = (behavior, suggested_role)
+    if let Some(b) = behavior
         && b.non_goals
             .iter()
-            .any(|ng| label_matches_role(&ng.label, suggested))
+            .any(|ng| label_matches_role(&ng.label, suggested_role))
     {
         return SummaryClassification::Suppress(SuppressionReason::BehaviorNonGoalMismatch);
     }
@@ -524,10 +571,11 @@ pub(super) fn evaluate_pam_advisory(
                     } else {
                         PamCandidateAction::Inject
                     },
+                    active_kind,
                     if mode_input.shadow {
-                        "shadow_counterfactual_not_injected"
+                        shadow_candidate_impact(suggested_role, active_kind)
                     } else {
-                        "prompt_context_injected"
+                        admitted_candidate_impact(suggested_role, active_kind)
                     },
                 );
             }
@@ -544,6 +592,7 @@ pub(super) fn evaluate_pam_advisory(
                     suggested_role,
                     Some(*reason),
                     PamCandidateAction::Suppress,
+                    active_kind,
                     suppression_impact(*reason, active_kind),
                 );
             }
@@ -595,6 +644,7 @@ pub(super) fn evaluate_pam_advisory(
             .as_ref()
             .map(|diff| diff.would_inject_in_live.len())
             .unwrap_or(0),
+        &candidate_decisions,
     );
 
     let decision = PamAdvisoryDecision {
@@ -680,12 +730,27 @@ fn pam_eval_target(
     decision: &PamCandidateDecision,
     active_job_role: &str,
 ) -> (&'static str, String) {
-    match decision.action {
-        PamCandidateAction::Inject => ("prompt_context", "context_pack_prompt".to_string()),
-        PamCandidateAction::WouldInjectInLive => {
-            ("shadow_counterfactual", "context_pack_prompt".to_string())
-        }
-        PamCandidateAction::Suppress => match decision.suppression_reason {
+    match decision.advisory_target {
+        PamAdvisoryTarget::TaskContractCandidateGeneration => match decision.suppression_reason {
+            Some(SuppressionReason::BehaviorNonGoalMismatch) => {
+                ("task_contract_candidate", "non_goal".to_string())
+            }
+            _ => {
+                let role = decision.inferred_role.unwrap_or("unknown");
+                ("task_contract_candidate", format!("deliverable:{role}"))
+            }
+        },
+        PamAdvisoryTarget::RepairPacketCandidateGeneration => match decision.suppression_reason {
+            Some(SuppressionReason::ImplExpansionBlocked) => (
+                "repair_packet_candidate",
+                "failure_domain:implementation_expansion".to_string(),
+            ),
+            _ => (
+                "repair_packet_candidate",
+                format!("repair_target:{active_job_role}"),
+            ),
+        },
+        PamAdvisoryTarget::PromptContextOnly => match decision.suppression_reason {
             Some(SuppressionReason::BehaviorNonGoalMismatch) => {
                 ("task_contract", "behavior_contract:non_goals".to_string())
             }
@@ -695,6 +760,9 @@ fn pam_eval_target(
             Some(SuppressionReason::RoleMismatch) | None => {
                 let role = decision.inferred_role.unwrap_or("unknown");
                 ("task_contract", format!("required_artifact_role:{role}"))
+            }
+            Some(SuppressionReason::LowRelevance) => {
+                ("prompt_context_only", "low_relevance".to_string())
             }
         },
     }
@@ -706,6 +774,7 @@ fn push_candidate_decision(
     inferred_role: Option<ArtifactRole>,
     suppression_reason: Option<SuppressionReason>,
     action: PamCandidateAction,
+    active_kind: Option<ActiveJobKind>,
     decision_impact: &'static str,
 ) {
     let Some(summary_id) = view.provenance.summary_id.clone() else {
@@ -713,11 +782,15 @@ fn push_candidate_decision(
     };
     let (context_excerpt, context_excerpt_truncated) =
         truncate_context_excerpt(&view.render_text, MAX_PAM_CONTEXT_EXCERPT_CHARS);
+    let advisory_target =
+        advisory_target_for_candidate(action, inferred_role, suppression_reason, active_kind);
     out.push(PamCandidateDecision {
         summary_id,
         action,
+        advisory_target,
         inferred_role: inferred_role.map(ArtifactRole::label),
         suppression_reason,
+        unused_reason: suppression_reason.map(suppression_unused_reason),
         decision_impact,
         context_excerpt,
         context_excerpt_truncated,
@@ -749,25 +822,123 @@ fn suppression_impact(
         (SuppressionReason::BehaviorNonGoalMismatch, _) => "behavior_contract_suppressed_non_goal",
         (SuppressionReason::RoleMismatch, _) => "artifact_role_mismatch_suppressed",
         (SuppressionReason::ImplExpansionBlocked, _) => "impl_expansion_suppressed",
+        (SuppressionReason::LowRelevance, _) => "low_relevance_suppressed",
+    }
+}
+
+fn suppression_unused_reason(reason: SuppressionReason) -> &'static str {
+    match reason {
+        SuppressionReason::RoleMismatch => "artifact_role_mismatch",
+        SuppressionReason::ImplExpansionBlocked => "impl_expansion_blocked",
+        SuppressionReason::BehaviorNonGoalMismatch => "behavior_non_goal",
+        SuppressionReason::LowRelevance => "low_relevance",
+    }
+}
+
+fn advisory_target_for_candidate(
+    action: PamCandidateAction,
+    inferred_role: Option<ArtifactRole>,
+    suppression_reason: Option<SuppressionReason>,
+    active_kind: Option<ActiveJobKind>,
+) -> PamAdvisoryTarget {
+    match suppression_reason {
+        Some(SuppressionReason::ImplExpansionBlocked) => {
+            PamAdvisoryTarget::RepairPacketCandidateGeneration
+        }
+        Some(SuppressionReason::RoleMismatch | SuppressionReason::BehaviorNonGoalMismatch) => {
+            PamAdvisoryTarget::TaskContractCandidateGeneration
+        }
+        Some(SuppressionReason::LowRelevance) => PamAdvisoryTarget::PromptContextOnly,
+        None if matches!(
+            active_kind,
+            Some(ActiveJobKind::VerifierRepair | ActiveJobKind::ArtifactRecovery)
+        ) =>
+        {
+            PamAdvisoryTarget::RepairPacketCandidateGeneration
+        }
+        None => match (action, inferred_role) {
+            (
+                PamCandidateAction::Inject | PamCandidateAction::WouldInjectInLive,
+                Some(ArtifactRole::Implementation | ArtifactRole::Test),
+            ) => PamAdvisoryTarget::TaskContractCandidateGeneration,
+            (PamCandidateAction::Inject | PamCandidateAction::WouldInjectInLive, Some(_)) => {
+                PamAdvisoryTarget::TaskContractCandidateGeneration
+            }
+            _ => PamAdvisoryTarget::PromptContextOnly,
+        },
+    }
+}
+
+fn admitted_candidate_impact(
+    inferred_role: Option<ArtifactRole>,
+    active_kind: Option<ActiveJobKind>,
+) -> &'static str {
+    if matches!(
+        active_kind,
+        Some(ActiveJobKind::VerifierRepair | ActiveJobKind::ArtifactRecovery)
+    ) {
+        return "repair_packet_candidate_advised";
+    }
+    if inferred_role.is_some() {
+        "task_contract_candidate_advised"
+    } else {
+        "prompt_context_only"
+    }
+}
+
+fn shadow_candidate_impact(
+    inferred_role: Option<ArtifactRole>,
+    active_kind: Option<ActiveJobKind>,
+) -> &'static str {
+    if matches!(
+        active_kind,
+        Some(ActiveJobKind::VerifierRepair | ActiveJobKind::ArtifactRecovery)
+    ) {
+        return "shadow_repair_packet_candidate_advised";
+    }
+    if inferred_role.is_some() {
+        "shadow_task_contract_candidate_advised"
+    } else {
+        "shadow_prompt_context_only"
     }
 }
 
 fn build_decision_effect(
     mode: PamAdvisoryMode,
-    injected_count: usize,
+    _injected_count: usize,
     suppressed_count: usize,
     would_inject_count: usize,
+    candidate_decisions: &[PamCandidateDecision],
 ) -> PamDecisionEffect {
     let influenced_decision = match mode {
         PamAdvisoryMode::Shadow => "shadow_counterfactual",
-        PamAdvisoryMode::Live if injected_count > 0 => "prompt_context_injection",
+        PamAdvisoryMode::Live
+            if candidate_decisions.iter().any(|decision| {
+                matches!(
+                    decision.advisory_target,
+                    PamAdvisoryTarget::RepairPacketCandidateGeneration
+                ) && matches!(decision.action, PamCandidateAction::Inject)
+            }) =>
+        {
+            "repair_packet_candidate_generation"
+        }
+        PamAdvisoryMode::Live
+            if candidate_decisions.iter().any(|decision| {
+                matches!(
+                    decision.advisory_target,
+                    PamAdvisoryTarget::TaskContractCandidateGeneration
+                ) && matches!(decision.action, PamCandidateAction::Inject)
+            }) =>
+        {
+            "task_contract_candidate_generation"
+        }
         PamAdvisoryMode::Suppressed | PamAdvisoryMode::Live if suppressed_count > 0 => {
             "advisory_suppression"
         }
         PamAdvisoryMode::Live | PamAdvisoryMode::Suppressed => "none",
     };
     PamDecisionEffect {
-        actual_injected_count: injected_count as u32,
+        actual_injected_count: _injected_count as u32,
         suppressed_count: suppressed_count as u32,
         would_inject_in_live_count: would_inject_count as u32,
         influenced_decision,
@@ -978,6 +1149,7 @@ mod unit_tests {
             SuppressionReason::BehaviorNonGoalMismatch.as_str(),
             "behavior_non_goal_mismatch"
         );
+        assert_eq!(SuppressionReason::LowRelevance.as_str(), "low_relevance");
     }
 
     #[test]
@@ -1147,8 +1319,8 @@ mod unit_tests {
         let contract_summary = contract_outcome.decision.to_eval_summary();
         assert!(
             contract_summary.affected_targets.iter().any(|target| {
-                target.target_type == "task_contract"
-                    && target.target == "required_artifact_role:implementation"
+                target.target_type == "task_contract_candidate"
+                    && target.target == "deliverable:implementation"
                     && target.summary_id.as_deref() == Some("contract_seed")
             }),
             "role mismatch must be attributable to the task contract"
@@ -1170,8 +1342,8 @@ mod unit_tests {
         let repair_summary = repair_outcome.decision.to_eval_summary();
         assert!(
             repair_summary.affected_targets.iter().any(|target| {
-                target.target_type == "repair_hint"
-                    && target.target == "ArtifactRecovery:test"
+                target.target_type == "repair_packet_candidate"
+                    && target.target == "failure_domain:implementation_expansion"
                     && target.summary_id.as_deref() == Some("repair_seed")
             }),
             "active artifact-recovery suppression must be attributable to a repair hint"
@@ -1181,7 +1353,38 @@ mod unit_tests {
     }
 
     #[test]
-    fn pam_advisory_does_not_change_task_contract_completion_decision() {
+    fn low_relevance_advice_does_not_pollute_task_contract_candidates() {
+        let blocked = HashSet::new();
+        let resp = context_pack_with_summary(
+            "generic_seed",
+            "A previous session had a similar vague issue without artifact details.",
+        );
+        let outcome = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Implementation),
+            None,
+            PamAdvisoryModeInput { shadow: false },
+        );
+
+        assert!(outcome.live_admitted_views.is_empty());
+        assert_eq!(outcome.decision.injected_summary_ids, Vec::<String>::new());
+        assert_eq!(
+            outcome.decision.suppressed_summary_ids[0].reason,
+            SuppressionReason::LowRelevance
+        );
+        let summary = outcome.decision.to_eval_summary();
+        assert_eq!(summary.unused_reason.as_deref(), Some("low_relevance"));
+        assert!(summary.affected_targets.iter().any(|target| {
+            target.target_type == "prompt_context_only"
+                && target.target == "low_relevance"
+                && target.summary_id.as_deref() == Some("generic_seed")
+        }));
+    }
+
+    #[test]
+    fn pam_advisory_modes_do_not_change_task_contract_completion_decision() {
         let contract = TaskContract::from_request("Implement feature X and add tests");
         let mut missing_test_evidence = EvidenceSet::new();
         missing_test_evidence.push(repo_edit(RepoEditCategory::Impl));
@@ -1210,6 +1413,24 @@ mod unit_tests {
             after_missing,
             CompletionDecision::Continue { missing } if missing.contains(&ArtifactRole::Test)
         ));
+        let _shadow_outcome = evaluate_pam_advisory(
+            &resp,
+            &blocked,
+            None,
+            Some(ArtifactRole::Test),
+            None,
+            PamAdvisoryModeInput { shadow: true },
+        );
+        assert_eq!(
+            before_missing,
+            contract.evaluate(&missing_test_evidence),
+            "shadow PAM must not satisfy missing required deliverables"
+        );
+        assert_eq!(
+            before_missing,
+            contract.evaluate(&missing_test_evidence),
+            "disabled/skipped PAM path has no completion input"
+        );
 
         let mut unverified_evidence = EvidenceSet::new();
         unverified_evidence.push(repo_edit(RepoEditCategory::Impl));
