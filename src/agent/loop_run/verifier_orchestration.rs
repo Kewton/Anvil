@@ -3053,11 +3053,16 @@ fn repair_attempt_key_for_target(
         return super::repair_job::RepairAttemptKey::from_target(target_hint, None);
     }
     let contract = super::task_contract::TaskContract::from_request(active_request);
-    let packet = super::repair_packet::RepairPacket::for_recovery_target(
-        &contract,
-        target_hint,
-        failure_domain,
-    );
+    let packet = if failure_domain == super::repair_packet::DeliverableFailureDomain::VerifierFailed
+    {
+        super::repair_packet::RepairPacket::for_verifier_failure(&contract, target_hint)
+    } else {
+        super::repair_packet::RepairPacket::for_recovery_target(
+            &contract,
+            target_hint,
+            failure_domain,
+        )
+    };
     super::repair_job::RepairAttemptKey::from_packet(&packet, None)
 }
 

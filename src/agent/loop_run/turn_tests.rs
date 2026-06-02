@@ -2612,6 +2612,7 @@ mod tests {
                 last_repair_hypothesis: Some(big.clone()),
                 unfulfilled_obligations: Vec::new(),
                 invalid_proposal_reasons: Vec::new(),
+                exhausted_corrections: Vec::new(),
             }),
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
@@ -3125,6 +3126,7 @@ mod tests {
                 last_repair_hypothesis: Some(big.clone()),
                 unfulfilled_obligations: Vec::new(),
                 invalid_proposal_reasons: Vec::new(),
+                exhausted_corrections: Vec::new(),
             }),
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
@@ -3214,6 +3216,7 @@ mod tests {
                 last_repair_hypothesis: Some("hypo".to_string()),
                 unfulfilled_obligations: Vec::new(),
                 invalid_proposal_reasons: Vec::new(),
+                exhausted_corrections: Vec::new(),
             }),
             diagnostic_target_missing_reason: None,
             owned_test_artifacts: vec![],

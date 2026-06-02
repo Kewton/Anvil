@@ -9,6 +9,27 @@ const MAX_EXPECTED_EVIDENCE_CHARS: usize = 160;
 const MAX_REPAIR_INSTRUCTION_CHARS: usize = 360;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CorrectionKind {
+    Patch,
+    SectionAddition,
+    SchemaCorrection,
+    CitationSupport,
+    ChecklistCompletion,
+}
+
+impl CorrectionKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::SectionAddition => "section_addition",
+            Self::SchemaCorrection => "schema_correction",
+            Self::CitationSupport => "citation_support",
+            Self::ChecklistCompletion => "checklist_completion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliverableFailureDomain {
     MissingDeliverable,
     MalformedDeliverable,
@@ -44,8 +65,11 @@ pub(super) struct RepairObligationTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairPacket {
     pub(super) target: RepairObligationTarget,
+    pub(super) correction_kind: CorrectionKind,
     pub(super) instruction: String,
 }
+
+pub(super) type CorrectionPacket = RepairPacket;
 
 impl RepairPacket {
     pub(super) fn for_obligation(
@@ -55,6 +79,7 @@ impl RepairPacket {
     ) -> Self {
         let target = target_from_obligation(obligation, failure_domain);
         Self {
+            correction_kind: correction_kind_for_target(contract.task_kind, &target),
             instruction: adapter_instruction(contract.task_kind, &target),
             target,
         }
@@ -70,9 +95,17 @@ impl RepairPacket {
         }
         let target = target_from_recovery_hint(hint, failure_domain);
         Self {
+            correction_kind: correction_kind_for_target(contract.task_kind, &target),
             instruction: adapter_instruction(contract.task_kind, &target),
             target,
         }
+    }
+
+    pub(super) fn for_verifier_failure(
+        contract: &TaskContract,
+        hint: &RecoveryTargetHint,
+    ) -> CorrectionPacket {
+        Self::for_recovery_target(contract, hint, DeliverableFailureDomain::VerifierFailed)
     }
 }
 
@@ -289,6 +322,35 @@ fn adapter_instruction(task_kind: TaskKind, target: &RepairObligationTarget) -> 
     sanitize_repair_job_text_with_char_cap(instruction, MAX_REPAIR_INSTRUCTION_CHARS)
 }
 
+fn correction_kind_for_target(
+    task_kind: TaskKind,
+    target: &RepairObligationTarget,
+) -> CorrectionKind {
+    match (task_kind, target.failure_domain, target.role) {
+        (TaskKind::Docs, DeliverableFailureDomain::IncompleteSections, _)
+        | (_, DeliverableFailureDomain::IncompleteSections, ArtifactRole::UsageDocs) => {
+            CorrectionKind::SectionAddition
+        }
+        (TaskKind::Data, DeliverableFailureDomain::SchemaMismatch, _)
+        | (_, DeliverableFailureDomain::SchemaMismatch, ArtifactRole::DataOutput) => {
+            CorrectionKind::SchemaCorrection
+        }
+        (TaskKind::Research, DeliverableFailureDomain::MissingDeliverable, _)
+        | (TaskKind::Research, DeliverableFailureDomain::MalformedDeliverable, _) => {
+            CorrectionKind::CitationSupport
+        }
+        (_, DeliverableFailureDomain::MissingDeliverable, ArtifactRole::UsageDocs) => {
+            CorrectionKind::ChecklistCompletion
+        }
+        (_, DeliverableFailureDomain::MissingDeliverable, _) => CorrectionKind::ChecklistCompletion,
+        (_, DeliverableFailureDomain::MalformedDeliverable, ArtifactRole::DataOutput) => {
+            CorrectionKind::SchemaCorrection
+        }
+        (_, DeliverableFailureDomain::UnsafeOrOutOfScope, _) => CorrectionKind::ChecklistCompletion,
+        _ => CorrectionKind::Patch,
+    }
+}
+
 fn bounded_evidence(raw: String) -> String {
     sanitize_repair_job_text_with_char_cap(&raw, MAX_EXPECTED_EVIDENCE_CHARS)
 }
@@ -329,6 +391,7 @@ mod tests {
             packet.target.failure_domain,
             DeliverableFailureDomain::IncompleteSections
         );
+        assert_eq!(packet.correction_kind, CorrectionKind::SectionAddition);
         assert_eq!(packet.target.obligation_id, "usage_docs:README.md");
         assert!(
             packet
@@ -348,6 +411,7 @@ mod tests {
             packet.target.failure_domain,
             DeliverableFailureDomain::SchemaMismatch
         );
+        assert_eq!(packet.correction_kind, CorrectionKind::SchemaCorrection);
         assert_eq!(packet.target.kind, DeliverableKind::StructuredRecord);
         assert!(
             packet
@@ -366,16 +430,13 @@ mod tests {
             path: "main.py".to_string(),
             reason: "verifier failed".to_string(),
         };
-        let packet = RepairPacket::for_recovery_target(
-            &contract,
-            &hint,
-            DeliverableFailureDomain::VerifierFailed,
-        );
+        let packet = RepairPacket::for_verifier_failure(&contract, &hint);
 
         assert_eq!(
             packet.target.failure_domain,
             DeliverableFailureDomain::VerifierFailed
         );
+        assert_eq!(packet.correction_kind, CorrectionKind::Patch);
         assert_eq!(packet.target.obligation_id, "implementation:main.py");
         assert_eq!(packet.target.role, ArtifactRole::Implementation);
     }
@@ -421,5 +482,22 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("bin entry"))
         );
+    }
+
+    #[test]
+    fn research_missing_deliverable_can_request_citation_support() {
+        let contract = TaskContract::from_request("Research battery safety and cite sources.");
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::UsageDocs,
+            path: "notes.md".to_string(),
+            reason: "research notes missing citation support".to_string(),
+        };
+        let packet = RepairPacket::for_recovery_target(
+            &contract,
+            &hint,
+            DeliverableFailureDomain::MissingDeliverable,
+        );
+
+        assert_eq!(packet.correction_kind, CorrectionKind::CitationSupport);
     }
 }
