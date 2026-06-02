@@ -259,8 +259,9 @@ slugify() {
 
 # -------- write_meta_json --------
 write_meta_json() {
-  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir
+  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant
   local _rc="$1" _elapsed="$2" _model="$3" _start_ts="$4" _run_dir="$5"
+  local _case="${6:-default}" _task_kind="${7:-coding}" _pam_variant="${8:-default}"
   if [[ -z "$_run_dir" ]]; then
     return 0
   fi
@@ -270,7 +271,18 @@ write_meta_json() {
     --argjson elapsed_s "$_elapsed" \
     --arg model "$_model" \
     --arg start_ts "$_start_ts" \
-    '{rc: $rc, elapsed_s: $elapsed_s, model: $model, start_ts: $start_ts}' \
+    --arg case "$_case" \
+    --arg task_kind "$_task_kind" \
+    --arg pam_variant "$_pam_variant" \
+    '{
+      rc: $rc,
+      elapsed_s: $elapsed_s,
+      model: $model,
+      start_ts: $start_ts,
+      case: $case,
+      task_kind: $task_kind,
+      pam_variant: $pam_variant
+    }' \
     > "$_run_dir/meta.json"
 }
 
@@ -431,6 +443,7 @@ validate_models_array
 CURRENT_RUN=""
 CURRENT_MODEL=""
 CURRENT_CASE="default"
+CURRENT_TASK_KIND="coding"
 CURRENT_PAM_VARIANT="default"
 CURRENT_RUN_DIR=""
 CURRENT_START_TS=""
@@ -445,6 +458,7 @@ on_interrupt() {
   fi
   if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
     write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
+      "${CURRENT_CASE:-default}" "${CURRENT_TASK_KIND:-coding}" "${CURRENT_PAM_VARIANT:-default}" \
       || true
   fi
   if [[ -n "$models_arg" ]]; then
@@ -473,12 +487,14 @@ for model in "${cleaned_models[@]}"; do
   for (( case_idx=0; case_idx<case_loop_count; case_idx++ )); do
     if [[ "$case_count" -eq 0 ]]; then
       case_name="default"
+      task_kind="coding"
       prompt=$(yq -r '.prompt // ""' "$BENCH_YAML")
       max_iterations=$(yq -r '.args.max_iterations // ""' "$BENCH_YAML")
       chat_retries=$(yq -r '.args.chat_retries // ""' "$BENCH_YAML")
       sidecar_model=$(yq -r '.args.sidecar_model // ""' "$BENCH_YAML")
     else
       case_name=$(yq -r ".cases[$case_idx].name // \"case-$((case_idx + 1))\"" "$BENCH_YAML")
+      task_kind=$(yq -r ".cases[$case_idx].task_kind // .cases[$case_idx].category // \"coding\"" "$BENCH_YAML")
       prompt=$(yq -r ".cases[$case_idx].prompt // \"\"" "$BENCH_YAML")
       max_iterations=$(yq -r ".cases[$case_idx].args.max_iterations // .args.max_iterations // \"\"" "$BENCH_YAML")
       chat_retries=$(yq -r ".cases[$case_idx].args.chat_retries // .args.chat_retries // \"\"" "$BENCH_YAML")
@@ -487,6 +503,10 @@ for model in "${cleaned_models[@]}"; do
 
     if [[ -z "$case_name" || "$case_name" == "null" ]]; then
       echo "Error: empty benchmark case name" >&2
+      exit 1
+    fi
+    if ! [[ "$task_kind" =~ ^(coding|docs|data|research|ops)$ ]]; then
+      echo "Error: invalid task_kind/category for case $case_name: $task_kind" >&2
       exit 1
     fi
     case_slug=$(slugify "$case_name")
@@ -512,6 +532,7 @@ for model in "${cleaned_models[@]}"; do
         CURRENT_RUN="$run"
         CURRENT_MODEL="$model"
         CURRENT_CASE="$case_name"
+        CURRENT_TASK_KIND="$task_kind"
         CURRENT_PAM_VARIANT="$pam_variant"
         RUN_LOGGED=0
         META_WRITTEN=0
@@ -641,7 +662,8 @@ for model in "${cleaned_models[@]}"; do
         fi
 
         # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
-        if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR"; then
+        if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR" \
+          "$case_name" "$task_kind" "$pam_variant"; then
           META_WRITTEN=1
         else
           echo "warning: meta.json write failed" >&2
@@ -658,6 +680,10 @@ for model in "${cleaned_models[@]}"; do
           if command -v jq &>/dev/null; then
             extras_json=$(printf '%s' "$raw_json" | jq -c '{
               anvil_score: .anvil_score,
+              task_kind: .task_kind,
+              pam_variant: .pam_variant,
+              postcheck_success: .postcheck_success,
+              postcheck_reason: .postcheck_reason,
               tool_call_count: .tool_call_total,
               failure_kind: .failure_kind,
               token_prompt: .token_prompt,

@@ -27,6 +27,9 @@
 
 ```json
 {
+  "artifact_file_count": 2,
+  "artifact_files": ["src/app/page.tsx", "src/lib/game.ts"],
+  "case": "default",
   "compact_events": 2,
   "elapsed_s": 120,
   "error_500_count": 1,
@@ -35,9 +38,13 @@
   "keywords_version": 1,
   "page_tsx_has_game_keywords": true,
   "page_tsx_touched": true,
+  "pam_variant": "default",
+  "postcheck_reason": "coding_artifact",
+  "postcheck_success": true,
   "rc": 0,
   "run_id": "test-session-id",
   "schema_version": 1,
+  "task_kind": "coding",
   "tool_calls": {"Bash": 1, "Edit": 1, "Read": 1, "Write": 1},
   "we_total": 2,
   "xml_parser_errors": null
@@ -58,6 +65,9 @@
 | `run_id` | `session.json["id"]`（存在しない、または空文字列なら `null`） |
 | `schema_version` | 固定値 `1` |
 | `keywords_version` | 固定値 `1` |
+| `case` | `meta.json["case"]`（なければ `default`） |
+| `task_kind` | `meta.json["task_kind"]` / `meta.json["category"]`（`coding/docs/data/research/ops`、なければ `coding`） |
+| `pam_variant` | `meta.json["pam_variant"]`（なければ `default`） |
 | `rc` | `meta.json["rc"]`（なければ `null`） |
 | `elapsed_s` | `meta.json["elapsed_s"]`（int、なければ `null`） |
 | `iter_count` | `len([m for m in messages if m["role"] == "assistant"])` |
@@ -67,6 +77,10 @@
 | `xml_parser_errors` | 常に `null`（未計測 — 将来 schema v2 で実装予定） |
 | `compact_events` | `len([m for m in messages if m["role"]=="system" and m["content"].startswith("[compact-summary]")])` |
 | `files_modified` | role==assistant の Write/Edit tool_call の `arguments.path`（正規化・dedup） |
+| `artifact_files` | `files_modified` から protected metadata/log/state files を除外した成果物候補 |
+| `artifact_file_count` | `len(artifact_files)` |
+| `postcheck_success` | `task_kind` 別の成果物 postcheck（`bool`、不明 task_kind は `null`） |
+| `postcheck_reason` | postcheck の理由ラベル |
 | `page_tsx_touched` | `"src/app/page.tsx" in files_modified`（厳密一致） |
 | `page_tsx_has_game_keywords` | `workdir/src/app/page.tsx` 内容に game_keywords のいずれかが含まれれば `true` |
 
@@ -101,6 +115,20 @@ Rust 側でマーカー文字列を変更する際は `analyze_run.py` と本ド
 3. `..` を含むパスは除外
 4. 変換後に dedup（初出順に保持）
 
+### task_kind postcheck
+
+`postcheck_success` は terminal outcome (`rc`) とは独立した artifact-level 指標。
+`artifact_files` は `meta.json` / `session.json` / `summary.tsv` / `stdout.log` /
+`stderr.log` / `logs/*` / `state/*` / `.anvil/*` / `tmp-tests/metadata/*` を除外する。
+
+| task_kind | 成功条件 |
+|---|---|
+| `coding` | code/config/test 系成果物がある |
+| `docs` | markdown/text/doc 系成果物、または `docs/` 配下成果物がある |
+| `data` | data file、または data/transform/script 系成果物がある |
+| `research` | research/brief/report 系 docs 成果物がある |
+| `ops` | runbook/ops/script/workflow 系成果物がある |
+
 ### xml_parser_errors の位置付け
 
 `xml_parser_errors` は schema v1 に含まれるが常に `null` を返す「未計測」フィールド。
@@ -114,7 +142,10 @@ Rust 側 (`src/ollama/xml_fallback.rs`) に structured log が実装された時
   "rc": 0,
   "elapsed_s": 120,
   "model": "qwen3:30b",
-  "start_ts": "2025-01-01T00:00:00Z"
+  "start_ts": "2025-01-01T00:00:00Z",
+  "case": "docs-cli-quickstart",
+  "task_kind": "docs",
+  "pam_variant": "pam_on"
 }
 ```
 

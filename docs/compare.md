@@ -39,6 +39,9 @@ scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
 `pam_off` の 2 variant で実行し、`summary.tsv` に `case` と
 `pam_variant` を記録する。PAM 採用 context と suppression 理由は
 各 run の `logs/eval.jsonl` / `logs/llm-io.jsonl` から追跡する。
+`scripts/report.py` は `task_kind` 別に terminal success (`rc==0`) と
+artifact-level postcheck (`postcheck_success`) を分離集計し、PAM variant 別の
+比較表も出力する。
 
 ## 2. 期待する入力レイアウト
 
@@ -53,6 +56,18 @@ scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
     └── ...
 ```
 
+suite/PAM run の場合は以下の入れ子 layout もサポートする。
+
+```
+<baseline_dir>/
+└── <model_slug>/
+    └── <case_slug>/
+        └── <pam_variant>/
+            ├── run-1/
+            ├── run-2/
+            └── ...
+```
+
 - `model_slug` ディレクトリは各 root 直下に 1 個のみ（複数/0 個は exit 1）
 - `baseline` と `experiment` の `model_slug` は一致必須（不一致は exit 1）
 - `run-*` はシンボリックリンクならスキップ
@@ -62,6 +77,7 @@ scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
 | alias | 正式キー |
 |---|---|
 | `rc0` | `rc` |
+| `postcheck` | `postcheck_success` |
 | `page_game` | `page_tsx_has_game_keywords` |
 
 正式キーは `analyze_run.py` 出力のキー。現時点で対応しているもの:
@@ -69,6 +85,7 @@ scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
 | 正式キー | 集計種別 | 改善方向 |
 |---|---|---|
 | `rc` | bool_rate (rc==0 を成功) | up |
+| `postcheck_success` | bool_rate | up |
 | `page_tsx_has_game_keywords` | bool_rate | up |
 | `we_total` | informational | - |
 | `elapsed_s` | continuous | down |
