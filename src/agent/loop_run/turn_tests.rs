@@ -2610,6 +2610,8 @@ mod tests {
                 total: 3,
                 per_cluster: vec![(big.clone(), vec!["implementation", "test"])],
                 last_repair_hypothesis: Some(big.clone()),
+                unfulfilled_obligations: Vec::new(),
+                invalid_proposal_reasons: Vec::new(),
             }),
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
@@ -3121,6 +3123,8 @@ mod tests {
                     .map(|_| (big.clone(), vec!["implementation", "test"]))
                     .collect(),
                 last_repair_hypothesis: Some(big.clone()),
+                unfulfilled_obligations: Vec::new(),
+                invalid_proposal_reasons: Vec::new(),
             }),
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
@@ -3208,6 +3212,8 @@ mod tests {
                     vec!["implementation", "test"],
                 )],
                 last_repair_hypothesis: Some("hypo".to_string()),
+                unfulfilled_obligations: Vec::new(),
+                invalid_proposal_reasons: Vec::new(),
             }),
             diagnostic_target_missing_reason: None,
             owned_test_artifacts: vec![],

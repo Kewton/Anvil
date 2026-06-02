@@ -21,6 +21,7 @@ use super::repair_attempt_outcome::{
     RepairRejectionKind, should_promote_to_exhausted_after_push,
 };
 use super::repair_brief::AllowedChangeKind;
+use super::repair_packet::{DeliverableFailureDomain, RepairPacket, obligation_id_for_parts};
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::{ArtifactRole, RecoveryTargetHint};
@@ -507,6 +508,8 @@ pub(super) struct RepairAttemptKey {
     pub(super) role: ArtifactRole,
     pub(super) path: String,
     pub(super) allowed_change_kind: Option<AllowedChangeKind>,
+    pub(super) obligation_id: Option<String>,
+    pub(super) failure_domain: Option<DeliverableFailureDomain>,
 }
 
 impl RepairAttemptKey {
@@ -518,6 +521,26 @@ impl RepairAttemptKey {
             role: target.role,
             path: sanitize_repair_job_text_with_char_cap(&target.path, 240),
             allowed_change_kind,
+            obligation_id: Some(obligation_id_for_parts(target.role, Some(&target.path))),
+            failure_domain: None,
+        }
+    }
+
+    pub(super) fn from_packet(
+        packet: &RepairPacket,
+        allowed_change_kind: Option<AllowedChangeKind>,
+    ) -> Self {
+        Self {
+            role: packet.target.role,
+            path: packet
+                .target
+                .path
+                .as_deref()
+                .map(|path| sanitize_repair_job_text_with_char_cap(path, 240))
+                .unwrap_or_default(),
+            allowed_change_kind,
+            obligation_id: Some(packet.target.obligation_id.clone()),
+            failure_domain: Some(packet.target.failure_domain),
         }
     }
 }
@@ -2652,6 +2675,12 @@ pub(super) const SAFE_STOP_PER_CLUSTER_MAX: usize = 8;
 /// Maximum number of role labels per cluster in `ExhaustedAttemptsSummary.per_cluster`.
 pub(super) const SAFE_STOP_PER_CLUSTER_ROLE_MAX: usize = 4;
 
+/// Maximum number of obligation targets retained in terminal diagnostics.
+pub(super) const SAFE_STOP_OBLIGATION_TARGET_MAX: usize = 8;
+
+/// Maximum number of invalid proposal summaries retained in terminal diagnostics.
+pub(super) const SAFE_STOP_INVALID_PROPOSAL_MAX: usize = 8;
+
 /// Issue #654 — per-turn dedup key. Each variant maps 1:1 to a `stop_reason`
 /// label that appears in the `agent.safe_stop.report` event payload.
 ///
@@ -2724,12 +2753,29 @@ pub(super) struct ExhaustedAttemptsSummary {
     pub(super) per_cluster: Vec<(String, Vec<&'static str>)>,
     /// Sanitized + 240-char-capped repair hypothesis. `None` when no plan / no hypothesis.
     pub(super) last_repair_hypothesis: Option<String>,
+    /// Obligation-level targets that remain unsatisfied at terminal repair.
+    pub(super) unfulfilled_obligations: Vec<super::repair_packet::RepairObligationTarget>,
+    /// Invalid controller repair proposals tied back to obligation id/domain.
+    pub(super) invalid_proposal_reasons: Vec<InvalidRepairProposalSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct InvalidRepairProposalSummary {
+    pub(super) obligation_id: Option<String>,
+    pub(super) role: ArtifactRole,
+    pub(super) path: String,
+    pub(super) failure_domain: Option<super::repair_packet::DeliverableFailureDomain>,
+    pub(super) reason: RejectedAttemptReason,
 }
 
 impl ExhaustedAttemptsSummary {
     /// Build a bounded summary from a `RepairJob` and an optional last
     /// hypothesis text (raw, will be sanitized + capped here).
-    pub(super) fn from_repair_job(job: &RepairJob, last_hyp: Option<&str>) -> Self {
+    pub(super) fn from_repair_job(
+        job: &RepairJob,
+        last_hyp: Option<&str>,
+        unfulfilled_obligations: &[super::repair_packet::RepairObligationTarget],
+    ) -> Self {
         let total = job.exhausted_attempts.len();
         let mut per_cluster: Vec<(String, Vec<&'static str>)> = Vec::new();
         for (cluster_key, role) in job.exhausted_attempts.iter() {
@@ -2752,10 +2798,32 @@ impl ExhaustedAttemptsSummary {
         let last_repair_hypothesis = last_hyp.map(|raw| {
             sanitize_repair_job_text_with_char_cap(raw, SAFE_STOP_LAST_REPAIR_HYPOTHESIS_CHAR_CAP)
         });
+        let invalid_proposal_reasons = job
+            .rejected_attempts
+            .iter()
+            .rev()
+            .take(SAFE_STOP_INVALID_PROPOSAL_MAX)
+            .map(|attempt| InvalidRepairProposalSummary {
+                obligation_id: attempt.key.obligation_id.clone(),
+                role: attempt.key.role,
+                path: sanitize_repair_job_text_with_char_cap(
+                    &attempt.key.path,
+                    SAFE_STOP_PATH_CHAR_CAP,
+                ),
+                failure_domain: attempt.key.failure_domain,
+                reason: attempt.reason,
+            })
+            .collect::<Vec<_>>();
         Self {
             total,
             per_cluster,
             last_repair_hypothesis,
+            unfulfilled_obligations: unfulfilled_obligations
+                .iter()
+                .take(SAFE_STOP_OBLIGATION_TARGET_MAX)
+                .cloned()
+                .collect(),
+            invalid_proposal_reasons,
         }
     }
 }
@@ -2910,6 +2978,8 @@ pub(super) struct SafeStopContext<'a> {
     pub(super) task_workspace_scope: &'a super::task_workspace_scope::TaskWorkspaceScope,
     /// Candidate paths considered during diagnostic target selection.
     pub(super) candidates: Vec<String>,
+    /// Obligation-level targets known to remain unsatisfied at terminal repair.
+    pub(super) unfulfilled_obligations: Vec<super::repair_packet::RepairObligationTarget>,
     /// For event-payload `session_id` and `turn_index` fields.
     pub(super) session_id: &'a str,
     pub(super) turn_index: u64,
@@ -2991,7 +3061,11 @@ impl SafeStopReport {
                     .semantic_plan
                     .as_ref()
                     .map(|plan| plan.repair_hypothesis.as_str());
-                let summary = Some(ExhaustedAttemptsSummary::from_repair_job(job, last_hyp));
+                let summary = Some(ExhaustedAttemptsSummary::from_repair_job(
+                    job,
+                    last_hyp,
+                    &ctx.unfulfilled_obligations,
+                ));
                 Self {
                     failure_signature: snapshot.failure_signature,
                     command: snapshot.command,
@@ -7651,7 +7725,7 @@ mod tests {
             key_b.clone(),
             super::super::task_contract::ArtifactRole::Implementation,
         ));
-        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, None);
+        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, None, &[]);
         assert_eq!(summary.total, 4);
         assert_eq!(summary.per_cluster.len(), 2);
         // Cluster A has 2 unique roles (Implementation + Test).
@@ -7669,9 +7743,50 @@ mod tests {
     fn exhausted_attempts_summary_caps_hypothesis_to_240_chars() {
         let job = RepairJob::new_for_test();
         let hyp = "h".repeat(500);
-        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, Some(&hyp));
+        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, Some(&hyp), &[]);
         let stored = summary.last_repair_hypothesis.expect("hypothesis stored");
         assert!(stored.chars().count() <= SAFE_STOP_LAST_REPAIR_HYPOTHESIS_CHAR_CAP + 3);
+    }
+
+    #[test]
+    fn exhausted_attempts_summary_includes_obligations_and_invalid_reasons() {
+        let mut job = RepairJob::new_for_test();
+        let packet_target = super::super::repair_packet::RepairObligationTarget {
+            obligation_id: "usage_docs:README.md".to_string(),
+            role: ArtifactRole::UsageDocs,
+            kind: super::super::task_contract::DeliverableKind::UsageDocs,
+            path: Some("README.md".to_string()),
+            expected_evidence: vec!["required sections: usage".to_string()],
+            failure_domain:
+                super::super::repair_packet::DeliverableFailureDomain::IncompleteSections,
+        };
+        job.rejected_attempts.push(RejectedAttempt {
+            key: RepairAttemptKey {
+                role: ArtifactRole::UsageDocs,
+                path: "README.md".to_string(),
+                allowed_change_kind: None,
+                obligation_id: Some(packet_target.obligation_id.clone()),
+                failure_domain: Some(packet_target.failure_domain),
+            },
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+
+        let summary = ExhaustedAttemptsSummary::from_repair_job(
+            &job,
+            None,
+            std::slice::from_ref(&packet_target),
+        );
+
+        assert_eq!(summary.unfulfilled_obligations, vec![packet_target]);
+        assert_eq!(summary.invalid_proposal_reasons.len(), 1);
+        assert_eq!(
+            summary.invalid_proposal_reasons[0].obligation_id.as_deref(),
+            Some("usage_docs:README.md")
+        );
+        assert_eq!(
+            summary.invalid_proposal_reasons[0].failure_domain,
+            Some(super::super::repair_packet::DeliverableFailureDomain::IncompleteSections)
+        );
     }
 
     #[test]
@@ -7774,6 +7889,7 @@ mod tests {
             latest_successful_read: None,
             task_workspace_scope: &scope,
             candidates: Vec::new(),
+            unfulfilled_obligations: Vec::new(),
             session_id: "session-1",
             turn_index: 1,
         };
@@ -7807,6 +7923,7 @@ mod tests {
             latest_successful_read: None,
             task_workspace_scope: &scope,
             candidates: Vec::new(),
+            unfulfilled_obligations: Vec::new(),
             session_id: "s",
             turn_index: 0,
         };
@@ -7839,6 +7956,7 @@ mod tests {
             latest_successful_read: None,
             task_workspace_scope: &scope,
             candidates: Vec::new(),
+            unfulfilled_obligations: Vec::new(),
             session_id: "s",
             turn_index: 0,
         };
@@ -7878,6 +7996,7 @@ mod tests {
             latest_successful_read: None,
             task_workspace_scope: &scope,
             candidates: Vec::new(),
+            unfulfilled_obligations: Vec::new(),
             session_id: "s",
             turn_index: 0,
         };

@@ -2145,6 +2145,7 @@ pub(super) fn record_controller_verifier_repair_edit(
     fingerprint: &str,
     target_hint: &RecoveryTargetHint,
 ) {
+    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     agent.session.repo_edit_succeeded_this_turn = true;
     agent
         .session
@@ -2160,7 +2161,11 @@ pub(super) fn record_controller_verifier_repair_edit(
             context.applied_repair_intents.push(fingerprint.to_string());
             context.repair_error = None;
         }
-        let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
+        let key = repair_attempt_key_for_target(
+            &active_request,
+            target_hint,
+            super::repair_packet::DeliverableFailureDomain::VerifierFailed,
+        );
         context.apply_event(super::repair_job::RepairJobEvent::PatchApplied { key });
     }
     log_llm_event(
@@ -2984,6 +2989,7 @@ pub(super) fn record_controller_verifier_repair_invalid(
         .as_ref()
         .and_then(verifier_repair_effective_target_hint)
         .cloned();
+    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     if let Some(context) = agent.repair_job.as_mut() {
         context.repair_error = Some(compact.clone());
         let mut lifecycle_reject_recorded = false;
@@ -3002,7 +3008,11 @@ pub(super) fn record_controller_verifier_repair_invalid(
                 active_target_hint.as_ref(),
                 super::repair_job::rejected_reason_for_repair_attempt_outcome_kind(&o.kind),
             ) {
-                let key = super::repair_job::RepairAttemptKey::from_target(target_hint, None);
+                let key = repair_attempt_key_for_target(
+                    &active_request,
+                    target_hint,
+                    failure_domain_for_rejected_attempt(reason),
+                );
                 context
                     .apply_event(super::repair_job::RepairJobEvent::PatchRejected { key, reason });
                 lifecycle_reject_recorded = true;
@@ -3032,6 +3042,44 @@ pub(super) fn record_controller_verifier_repair_invalid(
         }),
     );
     maybe_emit_repair_exhausted_from_promotion(agent, promotion_result);
+}
+
+fn repair_attempt_key_for_target(
+    active_request: &str,
+    target_hint: &RecoveryTargetHint,
+    failure_domain: super::repair_packet::DeliverableFailureDomain,
+) -> super::repair_job::RepairAttemptKey {
+    if active_request.is_empty() {
+        return super::repair_job::RepairAttemptKey::from_target(target_hint, None);
+    }
+    let contract = super::task_contract::TaskContract::from_request(active_request);
+    let packet = super::repair_packet::RepairPacket::for_recovery_target(
+        &contract,
+        target_hint,
+        failure_domain,
+    );
+    super::repair_job::RepairAttemptKey::from_packet(&packet, None)
+}
+
+fn failure_domain_for_rejected_attempt(
+    reason: super::repair_job::RejectedAttemptReason,
+) -> super::repair_packet::DeliverableFailureDomain {
+    match reason {
+        super::repair_job::RejectedAttemptReason::MalformedPatch => {
+            super::repair_packet::DeliverableFailureDomain::MalformedDeliverable
+        }
+        super::repair_job::RejectedAttemptReason::UnsafePatch
+        | super::repair_job::RejectedAttemptReason::WrongTarget
+        | super::repair_job::RejectedAttemptReason::NoSafeCandidate => {
+            super::repair_packet::DeliverableFailureDomain::UnsafeOrOutOfScope
+        }
+        super::repair_job::RejectedAttemptReason::ProviderTimeout
+        | super::repair_job::RejectedAttemptReason::AmbiguousAuthority
+        | super::repair_job::RejectedAttemptReason::NoopPatch
+        | super::repair_job::RejectedAttemptReason::DuplicatePatch => {
+            super::repair_packet::DeliverableFailureDomain::VerifierFailed
+        }
+    }
 }
 
 pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnosticPassOutcome {

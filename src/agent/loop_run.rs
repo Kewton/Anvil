@@ -473,7 +473,11 @@ mod repair_plan_admission;
 // v0.4.13 Phase 2: small diagnostic schema returned by the short-lived
 // diagnostic LLM. Private module; no direct provider abstraction.
 mod repair_brief;
+// Issue #877: deliverable-obligation repair packet projection. Private
+// adapter over TaskContract + RepairJob state; repair loop ownership stays
+// with the repair modules.
 mod repair_job;
+mod repair_packet;
 // Issue #653: `RepairAttemptOutcome` lifecycle ledger. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
 // in-crate consumers via `super::repair_attempt_outcome::*`.

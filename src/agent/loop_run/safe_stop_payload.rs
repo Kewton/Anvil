@@ -132,6 +132,25 @@ fn render_safe_stop_payload(report: &SafeStopReport, truncated: bool) -> serde_j
                 serde_json::json!([k, roles])
             }).collect::<Vec<_>>(),
             "last_repair_hypothesis": s.last_repair_hypothesis,
+            "unfulfilled_obligations": s.unfulfilled_obligations.iter().map(|target| {
+                serde_json::json!({
+                    "obligation_id": target.obligation_id,
+                    "role": target.role.label(),
+                    "kind": target.kind.label(),
+                    "path": target.path,
+                    "expected_evidence": target.expected_evidence,
+                    "failure_domain": target.failure_domain.as_str(),
+                })
+            }).collect::<Vec<_>>(),
+            "invalid_proposal_reasons": s.invalid_proposal_reasons.iter().map(|entry| {
+                serde_json::json!({
+                    "obligation_id": entry.obligation_id,
+                    "role": entry.role.label(),
+                    "path": entry.path,
+                    "failure_domain": entry.failure_domain.map(|domain| domain.as_str()),
+                    "reason": entry.reason.as_str(),
+                })
+            }).collect::<Vec<_>>(),
         })
     });
     serde_json::json!({
