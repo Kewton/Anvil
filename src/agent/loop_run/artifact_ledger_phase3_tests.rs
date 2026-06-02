@@ -306,7 +306,11 @@ fn owned_test_artifacts_for_verifier_matches_issue651_behavior() {
     let (mut agent, dir) = build_agent(&session_id);
     let work_root = dir.path();
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
-    std::fs::write(work_root.join("tests/test_match.py"), "x = 1\n").unwrap();
+    std::fs::write(
+        work_root.join("tests/test_match.py"),
+        "def test_fastapi_crud_api_contract():\n    assert 'FastAPI CRUD API README テスト'\n",
+    )
+    .unwrap();
     let scope = single_root_scope();
     super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
         &mut agent,
