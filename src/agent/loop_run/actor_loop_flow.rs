@@ -4067,6 +4067,7 @@ pub(super) fn run_actor_loop(
                         crate::session::eval_log::PamEvalSummary::skipped(reason.as_str())
                     })
             });
+        record.refresh_evaluation_taxonomy();
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }

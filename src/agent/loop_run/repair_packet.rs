@@ -11,6 +11,10 @@ const MAX_REPAIR_INSTRUCTION_CHARS: usize = 360;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CorrectionKind {
     Patch,
+    #[cfg(test)]
+    TestCorrection,
+    #[cfg(test)]
+    ManifestCorrection,
     SectionAddition,
     SchemaCorrection,
     CitationSupport,
@@ -21,6 +25,10 @@ impl CorrectionKind {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Patch => "patch",
+            #[cfg(test)]
+            Self::TestCorrection => "test_correction",
+            #[cfg(test)]
+            Self::ManifestCorrection => "manifest_correction",
             Self::SectionAddition => "section_addition",
             Self::SchemaCorrection => "schema_correction",
             Self::CitationSupport => "citation_support",
@@ -34,6 +42,10 @@ pub(super) enum DeliverableFailureDomain {
     MissingDeliverable,
     MalformedDeliverable,
     VerifierFailed,
+    #[cfg(test)]
+    GeneratedTestBug,
+    #[cfg(test)]
+    InvalidManifest,
     SchemaMismatch,
     IncompleteSections,
     UnsafeOrOutOfScope,
@@ -45,6 +57,10 @@ impl DeliverableFailureDomain {
             Self::MissingDeliverable => "missing_deliverable",
             Self::MalformedDeliverable => "malformed_deliverable",
             Self::VerifierFailed => "verifier_failed",
+            #[cfg(test)]
+            Self::GeneratedTestBug => "generated_test_bug",
+            #[cfg(test)]
+            Self::InvalidManifest => "invalid_manifest",
             Self::SchemaMismatch => "schema_mismatch",
             Self::IncompleteSections => "incomplete_sections",
             Self::UnsafeOrOutOfScope => "unsafe_or_out_of_scope",
@@ -106,6 +122,19 @@ impl RepairPacket {
         hint: &RecoveryTargetHint,
     ) -> CorrectionPacket {
         Self::for_recovery_target(contract, hint, DeliverableFailureDomain::VerifierFailed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_diagnostic_failure(
+        contract: &TaskContract,
+        hint: &RecoveryTargetHint,
+        failure_kind: super::VerifierDiagnosticFailureKind,
+    ) -> CorrectionPacket {
+        Self::for_recovery_target(
+            contract,
+            hint,
+            failure_domain_for_diagnostic_failure(hint, failure_kind),
+        )
     }
 }
 
@@ -309,6 +338,14 @@ fn adapter_instruction(task_kind: TaskKind, target: &RepairObligationTarget) -> 
         | (_, DeliverableFailureDomain::VerifierFailed) => {
             "repair the selected deliverable obligation while preserving verifier safety gates"
         }
+        #[cfg(test)]
+        (_, DeliverableFailureDomain::GeneratedTestBug) => {
+            "repair or replace the generated test artifact before using it as verifier authority"
+        }
+        #[cfg(test)]
+        (_, DeliverableFailureDomain::InvalidManifest) => {
+            "repair the setup or manifest artifact so verifier setup is structurally valid"
+        }
         (_, DeliverableFailureDomain::UnsafeOrOutOfScope) => {
             "discard the unsafe or out-of-scope proposal and choose an admitted obligation target"
         }
@@ -327,6 +364,10 @@ fn correction_kind_for_target(
     target: &RepairObligationTarget,
 ) -> CorrectionKind {
     match (task_kind, target.failure_domain, target.role) {
+        #[cfg(test)]
+        (_, DeliverableFailureDomain::GeneratedTestBug, _) => CorrectionKind::TestCorrection,
+        #[cfg(test)]
+        (_, DeliverableFailureDomain::InvalidManifest, _) => CorrectionKind::ManifestCorrection,
         (TaskKind::Docs, DeliverableFailureDomain::IncompleteSections, _)
         | (_, DeliverableFailureDomain::IncompleteSections, ArtifactRole::UsageDocs) => {
             CorrectionKind::SectionAddition
@@ -348,6 +389,25 @@ fn correction_kind_for_target(
         }
         (_, DeliverableFailureDomain::UnsafeOrOutOfScope, _) => CorrectionKind::ChecklistCompletion,
         _ => CorrectionKind::Patch,
+    }
+}
+
+#[cfg(test)]
+fn failure_domain_for_diagnostic_failure(
+    hint: &RecoveryTargetHint,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+) -> DeliverableFailureDomain {
+    match failure_kind {
+        super::VerifierDiagnosticFailureKind::TestBug => DeliverableFailureDomain::GeneratedTestBug,
+        super::VerifierDiagnosticFailureKind::ConfigOrVerifierError
+            if hint.role == ArtifactRole::Setup =>
+        {
+            DeliverableFailureDomain::InvalidManifest
+        }
+        super::VerifierDiagnosticFailureKind::ConfigOrVerifierError => {
+            DeliverableFailureDomain::MalformedDeliverable
+        }
+        _ => DeliverableFailureDomain::VerifierFailed,
     }
 }
 
@@ -499,5 +559,49 @@ mod tests {
         );
 
         assert_eq!(packet.correction_kind, CorrectionKind::CitationSupport);
+    }
+
+    #[test]
+    fn test_bug_diagnostic_creates_test_correction_packet() {
+        let contract = TaskContract::from_request("Create a Rust CLI and add tests.");
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/cli.rs".to_string(),
+            reason: "generated test uses a bad binary path".to_string(),
+        };
+        let packet = RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::TestBug,
+        );
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::GeneratedTestBug
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::TestCorrection);
+        assert_eq!(packet.correction_kind.as_str(), "test_correction");
+    }
+
+    #[test]
+    fn config_diagnostic_on_setup_creates_manifest_correction_packet() {
+        let contract = TaskContract::from_request("Create a Node CLI with package.json and tests.");
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::Setup,
+            path: "package.json".to_string(),
+            reason: "package.json is malformed".to_string(),
+        };
+        let packet = RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::ConfigOrVerifierError,
+        );
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::InvalidManifest
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::ManifestCorrection);
+        assert_eq!(packet.correction_kind.as_str(), "manifest_correction");
     }
 }

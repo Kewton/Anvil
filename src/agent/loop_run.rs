@@ -261,6 +261,9 @@ mod task_contract_recovery;
 // production authority. Free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod owned_test_projection;
+// Issue #901: generated tests are not verifier authority until a bounded
+// preflight rejects missing, racy, brittle, or contract-unsupported tests.
+mod generated_test_guard;
 // Tool-call execution dispatch extracted from `turn.rs` (parent #680).
 // Hosts the per-tool-call execution lifecycle: production chokepoint
 // `execute_tool_call` (policy gates → Bash vs. non-Bash dispatch) +

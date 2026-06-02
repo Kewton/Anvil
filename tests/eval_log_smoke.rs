@@ -6,8 +6,8 @@
 use anvil::session::case_retrieval::CaseScoreBreakdown;
 use anvil::session::eval_log::{
     AnvilScoreSummary, CaseRetrievalSummary, ChangedFileClasses, EvalPrecautionSnapshot,
-    EvalRecord, FeedbackFrameSummary, MAX_EVAL_LOG_RECORD_BYTES, MAX_EVAL_PRECAUTIONS,
-    MAX_EVAL_TASK_BYTES, PamEvalSummary, ToolCallSummary, build_eval_record,
+    EvalRecord, EvaluationTaxonomySummary, FeedbackFrameSummary, MAX_EVAL_LOG_RECORD_BYTES,
+    MAX_EVAL_PRECAUTIONS, MAX_EVAL_TASK_BYTES, PamEvalSummary, ToolCallSummary, build_eval_record,
     build_terminal_diagnostics, scrub_absolute_paths, write_eval_record_to,
 };
 use serde_json::Value;
@@ -460,6 +460,13 @@ fn r9_oversized_record_is_dropped() {
             },
             0,
         )),
+        evaluation_taxonomy: EvaluationTaxonomySummary {
+            pam_variant: "unknown".to_string(),
+            task_kind: "coding".to_string(),
+            anvil_terminal_class: "success".to_string(),
+            outcome_agreement: "external_postcheck_unavailable".to_string(),
+            failure_authority: "success".to_string(),
+        },
         completion_reason: "answer_or_plan_completion".to_string(),
         final_outcome: "done".to_string(),
     };
