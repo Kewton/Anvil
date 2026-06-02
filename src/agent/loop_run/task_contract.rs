@@ -234,13 +234,15 @@ impl CompletionPolicy {
             project_intent,
             CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
         );
+        let coding_verifier_required =
+            task_kind == TaskKind::Coding && !verifier_free_document_task;
         Self {
             task_kind,
             project_intent,
             required_artifacts: required_artifacts.to_vec(),
-            verification_required: verification_required && !verifier_free_document_task,
+            verification_required: verification_required && coding_verifier_required,
             test_execution_required: required_behavior.test_execution_required
-                && !verifier_free_document_task,
+                && coding_verifier_required,
         }
     }
 
@@ -3361,6 +3363,25 @@ mod tests {
     }
 
     #[test]
+    fn docs_only_readme_section_evidence_reaches_done_without_owned_test_verifier() {
+        let contract =
+            TaskContract::from_request("Update README.md with setup, usage, and test sections.");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        });
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert!(!contract.verification_required);
+        assert!(!contract.completion_policy.test_execution_required());
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
     fn docs_report_completeness_pass_satisfies_docs_completion() {
         let contract = TaskContract::from_request("Update README.md with usage documentation");
         let mut evidence = EvidenceSet::new();
@@ -3528,6 +3549,38 @@ mod tests {
                     .any(|deliverable| deliverable.kind == deliverable_kind),
                 "request={request} deliverables={:?}",
                 contract.deliverables
+            );
+        }
+    }
+
+    #[test]
+    fn non_coding_task_kinds_do_not_request_coding_verifier() {
+        let cases = [
+            (
+                "Update README.md with setup, usage, and test sections.",
+                TaskKind::Docs,
+            ),
+            (
+                "Generate output.csv with columns Category and Total from the input CSV.",
+                TaskKind::Data,
+            ),
+            (
+                "Research local LLM options and summarize sources and risks.",
+                TaskKind::Research,
+            ),
+            (
+                "Prepare a deployment runbook checklist with rollback steps.",
+                TaskKind::Ops,
+            ),
+        ];
+
+        for (request, task_kind) in cases {
+            let contract = TaskContract::from_request(request);
+            assert_eq!(contract.task_kind, task_kind, "request={request}");
+            assert!(!contract.verification_required, "request={request}");
+            assert!(
+                !contract.completion_policy.test_execution_required(),
+                "request={request}"
             );
         }
     }
