@@ -265,7 +265,8 @@ impl CompletionPolicy {
                     || self.required_artifacts.contains(&ArtifactRole::UsageDocs)
             }
             CompletionEvidence::StructuredDataPass { .. } => {
-                self.required_artifacts.contains(&ArtifactRole::DataOutput)
+                self.project_intent == CompletionProjectIntent::ArtifactOnly
+                    || self.required_artifacts.contains(&ArtifactRole::DataOutput)
             }
             CompletionEvidence::ReportCompletenessPass { .. } => {
                 self.project_intent == CompletionProjectIntent::DocsOnly
@@ -899,9 +900,21 @@ fn artifact_identity_observed_in_evidence(
             identity.role == ArtifactRole::UsageDocs
                 && normalized_artifact_path_eq(path, &identity.path)
         }
-        CompletionEvidence::StructuredDataPass { path: Some(path) } => {
+        CompletionEvidence::StructuredDataPass {
+            path: Some(path),
+            columns,
+        } => {
             identity.role == ArtifactRole::DataOutput
                 && normalized_artifact_path_eq(path, &identity.path)
+                && identity
+                    .structured_record_schema
+                    .as_ref()
+                    .is_none_or(|schema| {
+                        schema
+                            .columns
+                            .iter()
+                            .all(|column| columns.iter().any(|observed| observed == column))
+                    })
         }
         CompletionEvidence::ReportCompletenessPass { path: Some(path) } => {
             identity.role == ArtifactRole::UsageDocs
@@ -4272,10 +4285,15 @@ mod tests {
         let mut evidence = EvidenceSet::new();
         evidence.push(CompletionEvidence::StructuredDataPass {
             path: Some("output.csv".to_string()),
+            columns: vec!["Category".to_string(), "Total".to_string()],
         });
 
         assert_eq!(contract.task_kind, TaskKind::Data);
         assert_eq!(contract.required_artifacts, vec![ArtifactRole::DataOutput]);
+        assert_eq!(
+            contract.completion_policy.project_intent,
+            CompletionProjectIntent::ArtifactOnly
+        );
         assert_eq!(
             contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
             CompletionDecision::Done
@@ -4290,6 +4308,7 @@ mod tests {
         let mut evidence = EvidenceSet::new();
         evidence.push(CompletionEvidence::StructuredDataPass {
             path: Some("summary.csv".to_string()),
+            columns: vec!["Category".to_string(), "Total".to_string()],
         });
 
         assert_eq!(

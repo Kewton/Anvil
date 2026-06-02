@@ -21,7 +21,17 @@ pub(super) trait Verifier {
         bound_artifacts_count: Option<usize>,
     ) -> CompletionEvidence;
 
+    fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence>;
+
     fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket;
+}
+
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(super) struct VerifierArtifact<'a> {
+    pub(super) path: Option<&'a str>,
+    pub(super) excerpt: &'a str,
+    pub(super) required_columns: &'a [String],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -52,6 +62,10 @@ impl Verifier for CodingVerifier {
         }
     }
 
+    fn artifact_evidence(&self, _artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
+        None
+    }
+
     fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
         generic_verifier_failure_packet(command, failure_kind, output)
     }
@@ -68,6 +82,10 @@ impl Verifier for DocsVerifier {
         _bound_artifacts_count: Option<usize>,
     ) -> CompletionEvidence {
         CompletionEvidence::RequiredSectionsPass { path: None }
+    }
+
+    fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
+        self.required_sections_evidence(artifact.path.map(str::to_string), artifact.excerpt)
     }
 
     fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
@@ -132,8 +150,64 @@ impl Verifier for DataVerifier {
         }
     }
 
+    fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
+        self.structured_data_evidence(
+            artifact.path.map(str::to_string),
+            artifact.excerpt,
+            artifact.required_columns,
+        )
+    }
+
     fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
         generic_verifier_failure_packet(command, failure_kind, output)
+    }
+}
+
+impl DataVerifier {
+    #[allow(dead_code)]
+    pub(super) fn structured_data_pass(
+        &self,
+        path: Option<&str>,
+        excerpt: &str,
+        columns: &[String],
+    ) -> bool {
+        structured_data_pass(path, excerpt, columns)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn structured_data_evidence(
+        &self,
+        path: Option<String>,
+        excerpt: &str,
+        required_columns: &[String],
+    ) -> Option<CompletionEvidence> {
+        let path_ref = path.as_deref();
+        if !self.structured_data_pass(path_ref, excerpt, required_columns) {
+            return None;
+        }
+        let columns = observed_data_columns(path_ref, excerpt, required_columns);
+        Some(CompletionEvidence::StructuredDataPass { path, columns })
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn structured_data_failure_packet(
+        &self,
+        path: &str,
+        excerpt: &str,
+    ) -> FailurePacket {
+        FailurePacket::new(
+            "structured data artifact",
+            "structured_data_schema_missing",
+            excerpt,
+            Vec::new(),
+            Vec::new(),
+            vec![CandidateArtifact::new(
+                ArtifactRole::DataOutput,
+                path,
+                "structured data verifier target",
+            )],
+            Vec::new(),
+        )
     }
 }
 
@@ -227,6 +301,102 @@ fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
         .any(|token| token == needle)
 }
 
+fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[String]) -> bool {
+    let observed = observed_data_columns(path, excerpt, required_columns);
+    if observed.is_empty() {
+        return false;
+    }
+    required_columns
+        .iter()
+        .all(|column| observed.iter().any(|observed| observed == column))
+}
+
+fn observed_data_columns(
+    path: Option<&str>,
+    excerpt: &str,
+    required_columns: &[String],
+) -> Vec<String> {
+    let normalized_ext = path
+        .and_then(|path| std::path::Path::new(path).extension())
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    let columns = match normalized_ext.as_deref() {
+        Some("tsv") => delimited_header_columns(excerpt, '\t'),
+        Some("csv") => delimited_header_columns(excerpt, ','),
+        Some("json") => json_columns(excerpt),
+        Some("jsonl") | Some("ndjson") => jsonl_columns(excerpt),
+        _ => generic_data_columns(excerpt, required_columns),
+    };
+    sorted_unique(columns)
+}
+
+fn delimited_header_columns(excerpt: &str, delimiter: char) -> Vec<String> {
+    excerpt
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split(delimiter)
+                .map(clean_data_column)
+                .filter(|column| !column.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_columns(excerpt: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(excerpt) else {
+        return Vec::new();
+    };
+    value_columns(&value)
+}
+
+fn jsonl_columns(excerpt: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    for line in excerpt.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Vec::new();
+        };
+        columns.extend(value_columns(&value));
+    }
+    columns
+}
+
+fn value_columns(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Object(map) => map.keys().cloned().collect(),
+        serde_json::Value::Array(items) => items.iter().flat_map(value_columns).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn generic_data_columns(excerpt: &str, required_columns: &[String]) -> Vec<String> {
+    if excerpt.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut columns = required_columns
+        .iter()
+        .filter(|column| excerpt.contains(column.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if columns.is_empty() && required_columns.is_empty() {
+        columns.push("data".to_string());
+    }
+    columns
+}
+
+fn clean_data_column(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim()
+        .to_string()
+}
+
+fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +419,23 @@ mod tests {
     }
 
     #[test]
+    fn docs_verifier_artifact_adapter_emits_required_sections_evidence() {
+        let verifier = DocsVerifier;
+        let artifact = VerifierArtifact {
+            path: Some("README.md"),
+            excerpt: "## Setup\nInstall it.\n## Usage\nRun it.\n",
+            required_columns: &[],
+        };
+
+        assert_eq!(
+            verifier.artifact_evidence(artifact),
+            Some(CompletionEvidence::RequiredSectionsPass {
+                path: Some("README.md".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn verifier_failure_packet_is_task_kind_independent() {
         let verifier = DocsVerifier;
         let packet = verifier.required_sections_failure_packet("README.md", "only title");
@@ -256,6 +443,69 @@ mod tests {
         assert!(json.get("task_kind").is_none());
         assert_eq!(json["failure_kind"], "required_sections_missing");
         assert_eq!(json["candidate_artifacts"][0]["role"], "usage_docs");
+    }
+
+    #[test]
+    fn data_verifier_csv_columns_become_structured_data_evidence() {
+        let verifier = DataVerifier;
+        let required = vec!["Category".to_string(), "Total".to_string()];
+        let evidence = verifier
+            .structured_data_evidence(
+                Some("output.csv".to_string()),
+                "Category,Total\nA,1\n",
+                &required,
+            )
+            .expect("schema pass");
+
+        assert_eq!(
+            evidence,
+            CompletionEvidence::StructuredDataPass {
+                path: Some("output.csv".to_string()),
+                columns: required,
+            }
+        );
+    }
+
+    #[test]
+    fn data_verifier_rejects_missing_required_column() {
+        let verifier = DataVerifier;
+        let required = vec!["Category".to_string(), "Total".to_string()];
+
+        assert_eq!(
+            verifier.structured_data_evidence(
+                Some("output.csv".to_string()),
+                "Category,Amount\nA,1\n",
+                &required,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn data_verifier_jsonl_columns_become_structured_data_evidence() {
+        let verifier = DataVerifier;
+        let required = vec!["category".to_string(), "total".to_string()];
+
+        assert_eq!(
+            verifier.artifact_evidence(VerifierArtifact {
+                path: Some("output.jsonl"),
+                excerpt: "{\"category\":\"A\",\"total\":1}\n{\"category\":\"B\",\"total\":2}\n",
+                required_columns: &required,
+            }),
+            Some(CompletionEvidence::StructuredDataPass {
+                path: Some("output.jsonl".to_string()),
+                columns: required,
+            })
+        );
+    }
+
+    #[test]
+    fn data_verifier_failure_packet_targets_data_output() {
+        let verifier = DataVerifier;
+        let packet = verifier.structured_data_failure_packet("output.csv", "Category\nA\n");
+        let json = packet.to_json_value();
+        assert_eq!(json["failure_kind"], "structured_data_schema_missing");
+        assert_eq!(json["candidate_artifacts"][0]["role"], "data_output");
     }
 
     #[test]

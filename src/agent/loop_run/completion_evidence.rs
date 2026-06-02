@@ -123,13 +123,15 @@ pub(crate) enum CompletionEvidence {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
-    /// A non-shell deliverable checker proved that a structured data
-    /// artifact satisfies its requested shape, such as required CSV columns
-    /// or a structured-record schema. This keeps data completion independent
-    /// from coding verifier exits.
+    /// A non-shell task-kind verifier proved that a structured data artifact
+    /// is present and satisfies its required schema surface. This is used for
+    /// CSV / TSV / JSON / JSONL style data-output tasks that should not need
+    /// a coding build/test command to complete.
     StructuredDataPass {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<String>,
     },
     /// A non-shell deliverable checker proved that a report-like artifact is
     /// complete enough for the active obligation. This is intentionally
@@ -219,7 +221,7 @@ fn has_docs_extension(path: &Path) -> bool {
 fn has_structured_data_extension(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("csv" | "tsv" | "jsonl" | "ndjson" | "parquet")
+        Some("csv" | "tsv" | "json" | "jsonl" | "ndjson" | "parquet")
     )
 }
 
