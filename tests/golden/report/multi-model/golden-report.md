@@ -3,12 +3,12 @@ Generated: 2026-06-02T03:27:36+00:00
 
 ## Run Summary
 
-| run | model | case | task_kind | pam | rc | postcheck | elapsed_s | we_total | page_game | iter_count | error_500 | compacts |
-|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
-| 1 | llama3 | default | coding | default | 0 | yes | 200 | 3 | null | 3 | null | 1 |
-| 2 | llama3 | default | coding | default | 1 | yes | 220 | 3 | null | 3 | null | 1 |
-| 1 | qwen3 | default | coding | default | 0 | yes | 100 | 1 | null | 2 | null | 0 |
-| 2 | qwen3 | default | coding | default | 0 | yes | 110 | 1 | null | 2 | null | 0 |
+| run | model | case | task_kind | pam | agreement | failure_authority | rc | postcheck | elapsed_s | we_total | page_game | iter_count | error_500 | compacts |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| 1 | llama3 | default | coding | default | true_positive | success | 0 | yes | 200 | 3 | null | 3 | null | 1 |
+| 2 | llama3 | default | coding | default | false_negative | implementation_bug | 1 | yes | 220 | 3 | null | 3 | null | 1 |
+| 1 | qwen3 | default | coding | default | true_positive | success | 0 | yes | 100 | 1 | null | 2 | null | 0 |
+| 2 | qwen3 | default | coding | default | true_positive | success | 0 | yes | 110 | 1 | null | 2 | null | 0 |
 
 ## Aggregate Statistics
 
@@ -25,14 +25,27 @@ Generated: 2026-06-02T03:27:36+00:00
 
 > ⚠ CV > 0.3 detected for: elapsed_s, we_total
 
+## PAM Summary
+
+| pam_variant | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| default | 4 | 75% (3/4) | 100% (4/4) | 75% (3/4) | 3 | 0 | 1 | 0 |
+
 ## Task Kind Summary
 
-| task_kind | runs | terminal_success | postcheck_success | both_success |
-|-----|-----|-----|-----|-----|
-| coding | 4 | 75% (3/4) | 100% (4/4) | 75% (3/4) |
+| task_kind | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| coding | 4 | 75% (3/4) | 100% (4/4) | 75% (3/4) | 3 | 0 | 1 | 0 |
 
 ## PAM By Task Kind
 
-| task_kind | pam_variant | runs | terminal_success | postcheck_success | both_success |
-|-----|-----|-----|-----|-----|-----|
-| coding | default | 4 | 75% (3/4) | 100% (4/4) | 75% (3/4) |
+| task_kind | pam_variant | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| coding | default | 4 | 75% (3/4) | 100% (4/4) | 75% (3/4) | 3 | 0 | 1 | 0 |
+
+## Failure Authority Summary
+
+| failure_authority | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| implementation_bug | 1 | 0% (0/1) | 100% (1/1) | 0% (0/1) | 0 | 0 | 1 | 0 |
+| success | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |

@@ -345,6 +345,7 @@ impl EvalRecord {
         self.evaluation_taxonomy = build_evaluation_taxonomy(
             &self.task,
             &self.final_outcome,
+            &self.changed_file_classes,
             self.terminal_diagnostics.as_ref(),
             self.pam_eval.as_ref(),
         );
@@ -517,8 +518,13 @@ pub fn build_eval_record_with_terminal_context(
         .cloned()
         .collect();
 
-    let evaluation_taxonomy =
-        build_evaluation_taxonomy(&task, final_outcome, terminal_diagnostics.as_ref(), None);
+    let evaluation_taxonomy = build_evaluation_taxonomy(
+        &task,
+        final_outcome,
+        &changed_file_classes,
+        terminal_diagnostics.as_ref(),
+        None,
+    );
 
     EvalRecord {
         schema_version: 1,
@@ -797,12 +803,12 @@ fn terminal_verifier_status(final_outcome: &str, verify_command_count: usize) ->
 fn build_evaluation_taxonomy(
     task: &str,
     final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
     terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
     pam_eval: Option<&PamEvalSummary>,
 ) -> EvaluationTaxonomySummary {
-    let failure_authority = terminal_diagnostics
-        .map(|diagnostics| diagnostics.classification.as_str())
-        .unwrap_or_else(|| classify_terminal_outcome_with_context(final_outcome, 0, 0));
+    let failure_authority =
+        failure_authority_for_eval(final_outcome, changed_file_classes, terminal_diagnostics);
     EvaluationTaxonomySummary {
         pam_variant: pam_variant_for_eval(pam_eval).to_string(),
         task_kind: infer_eval_task_kind(task).to_string(),
@@ -813,6 +819,38 @@ fn build_evaluation_taxonomy(
         },
         outcome_agreement: "external_postcheck_unavailable".to_string(),
         failure_authority: failure_authority.to_string(),
+    }
+}
+
+fn failure_authority_for_eval(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
+) -> &'static str {
+    if final_outcome == "done" {
+        return "success";
+    }
+    let classification = terminal_diagnostics
+        .map(|diagnostics| diagnostics.classification.as_str())
+        .unwrap_or_else(|| classify_terminal_outcome_with_context(final_outcome, 0, 0));
+    if changed_file_classes.test > 0
+        && changed_file_classes.impl_files == 0
+        && changed_file_classes.setup == 0
+        && matches!(
+            classification,
+            "verification_failure" | "control_loop_failure"
+        )
+    {
+        return "generated_test_bug";
+    }
+    match classification {
+        "success" => "success",
+        "model_output_failure" => "contract_extraction",
+        "verification_environment_failure" => "verifier_setup",
+        "verification_failure" => "implementation_bug",
+        "control_loop_failure" => "repair_routing",
+        "transport_failure" | "interrupted" => "repair_routing",
+        _ => "repair_routing",
     }
 }
 
@@ -1000,6 +1038,11 @@ mod tests {
             evaluation_taxonomy: build_evaluation_taxonomy(
                 "fix the bug",
                 "done",
+                &ChangedFileClasses {
+                    test: 1,
+                    impl_files: 2,
+                    setup: 0,
+                },
                 Some(&build_terminal_diagnostics(
                     "done",
                     &ChangedFileClasses {
@@ -1101,9 +1144,43 @@ mod tests {
         assert_eq!(rec.evaluation_taxonomy.pam_variant, "pam_off");
         assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
         assert_eq!(rec.evaluation_taxonomy.anvil_terminal_class, "non_success");
+        assert_eq!(rec.evaluation_taxonomy.failure_authority, "verifier_setup");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_keeps_generated_test_bug_separate() {
+        let rec = build_eval_record(
+            "sess-001",
+            12345,
+            "Add a generated regression test for the parser",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 1,
+                impl_files: 0,
+                setup: 0,
+            },
+            &["cargo test".to_string()],
+            None,
+            None,
+            None,
+            "verifier_failed",
+        );
+
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|d| d.classification.as_str()),
+            Some("verification_failure")
+        );
         assert_eq!(
             rec.evaluation_taxonomy.failure_authority,
-            "verification_environment_failure"
+            "generated_test_bug"
         );
     }
 

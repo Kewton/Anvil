@@ -29,13 +29,24 @@
 {
   "artifact_file_count": 2,
   "artifact_files": ["src/app/page.tsx", "src/lib/game.ts"],
+  "anvil_terminal_class": "success",
+  "anvil_terminal_success": true,
   "case": "default",
   "compact_events": 2,
   "elapsed_s": 120,
   "error_500_count": 1,
+  "evaluation_taxonomy": {
+    "anvil_terminal_class": "success",
+    "failure_authority": "success",
+    "outcome_agreement": "true_positive",
+    "pam_variant": "default",
+    "task_kind": "coding"
+  },
+  "failure_authority": "success",
   "files_modified": ["src/app/page.tsx", "src/lib/game.ts"],
   "iter_count": 2,
   "keywords_version": 1,
+  "outcome_agreement": "true_positive",
   "page_tsx_has_game_keywords": true,
   "page_tsx_touched": true,
   "pam_variant": "default",
@@ -68,6 +79,11 @@
 | `case` | `meta.json["case"]`（なければ `default`） |
 | `task_kind` | `meta.json["task_kind"]` / `meta.json["category"]`（`coding/docs/data/research/ops`、なければ `coding`） |
 | `pam_variant` | `meta.json["pam_variant"]`（なければ `default`） |
+| `anvil_terminal_success` | `rc == 0` なら `true`、非 0 なら `false`、`rc == null` なら `null` |
+| `anvil_terminal_class` | `success` / `non_success` / `unknown` |
+| `outcome_agreement` | Anvil terminal result と postcheck の比較（`true_positive/false_positive/false_negative/true_negative/unknown`） |
+| `failure_authority` | 失敗責任 taxonomy（`contract_extraction/artifact_classification/verifier_setup/generated_test_bug/implementation_bug/repair_routing/success/unknown`） |
+| `evaluation_taxonomy` | `task_kind` / `pam_variant` / `anvil_terminal_class` / `outcome_agreement` / `failure_authority` の機械可読 bundle |
 | `rc` | `meta.json["rc"]`（なければ `null`） |
 | `elapsed_s` | `meta.json["elapsed_s"]`（int、なければ `null`） |
 | `iter_count` | `len([m for m in messages if m["role"] == "assistant"])` |
@@ -121,6 +137,9 @@ Rust 側でマーカー文字列を変更する際は `analyze_run.py` と本ド
 `artifact_files` は `meta.json` / `session.json` / `summary.tsv` / `stdout.log` /
 `stderr.log` / `logs/*` / `state/*` / `.anvil/*` / `tmp-tests/metadata/*` を除外する。
 
+`meta.json` に `postcheck_success` / `postcheck_reason` がある場合は外部 harness の
+postcheck として優先する。なければ従来の artifact-level heuristic を使う。
+
 | task_kind | 成功条件 |
 |---|---|
 | `coding` | code/config/test 系成果物がある |
@@ -128,6 +147,28 @@ Rust 側でマーカー文字列を変更する際は `analyze_run.py` と本ド
 | `data` | data file、または data/transform/script 系成果物がある |
 | `research` | research/brief/report 系 docs 成果物がある |
 | `ops` | runbook/ops/script/workflow 系成果物がある |
+
+### evaluation taxonomy
+
+`outcome_agreement` は Anvil terminal result (`rc`) を Anvil 判定、postcheck を外部判定として以下に分類する。
+
+| outcome_agreement | 条件 |
+|---|---|
+| `true_positive` | `rc == 0` かつ `postcheck_success == true` |
+| `false_positive` | `rc == 0` かつ `postcheck_success == false` |
+| `false_negative` | `rc != 0` かつ `postcheck_success == true` |
+| `true_negative` | `rc != 0` かつ `postcheck_success == false` |
+| `unknown` | `rc` または `postcheck_success` が不明 |
+
+`failure_authority` は `meta.json["failure_authority"]` を最優先し、次に
+`logs/eval.jsonl` の `evaluation_taxonomy.failure_authority`、最後に
+`last_feedback` / `last_anvil_score` / artifact postcheck から推定する。
+`generated_test_bug` は `implementation_bug` と別集計し、generated-test 起因の
+false negative を実装失敗として数えない。
+
+`scripts/report.py --format json BENCH_ROOT` は `overall` / `by_pam_variant` /
+`by_task_kind` / `by_task_kind_pam_variant` / `by_failure_authority` に同じ
+`outcome_agreement` counts と `failure_authority` counts を出力する。
 
 ### xml_parser_errors の位置付け
 
@@ -145,7 +186,10 @@ Rust 側 (`src/ollama/xml_fallback.rs`) に structured log が実装された時
   "start_ts": "2025-01-01T00:00:00Z",
   "case": "docs-cli-quickstart",
   "task_kind": "docs",
-  "pam_variant": "pam_on"
+  "pam_variant": "pam_on",
+  "postcheck_success": true,
+  "postcheck_reason": "external_docs_postcheck",
+  "failure_authority": "success"
 }
 ```
 
