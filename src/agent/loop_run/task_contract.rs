@@ -62,6 +62,25 @@ pub(super) enum DeliverableKind {
     ExternalReference,
 }
 
+impl DeliverableKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            DeliverableKind::Code => "code",
+            DeliverableKind::Tests => "tests",
+            DeliverableKind::UsageDocs => "usage_docs",
+            DeliverableKind::Setup => "setup",
+            DeliverableKind::Data => "data",
+            DeliverableKind::ResearchNotes => "research_notes",
+            DeliverableKind::OpsRunbook => "ops_runbook",
+            DeliverableKind::File => "file",
+            DeliverableKind::Directory => "directory",
+            DeliverableKind::CommandOutput => "command_output",
+            DeliverableKind::StructuredRecord => "structured_record",
+            DeliverableKind::ExternalReference => "external_reference",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TaskDeliverable {
     pub(super) kind: DeliverableKind,
@@ -1151,6 +1170,20 @@ impl TaskContract {
             .iter()
             .filter(|identity| identity.role == role)
             .collect()
+    }
+
+    pub(super) fn obligation_for_target(
+        &self,
+        target_hint: &RecoveryTargetHint,
+    ) -> Option<&ArtifactObligation> {
+        self.required_artifact_identities
+            .iter()
+            .find(|identity| identity.role == target_hint.role && identity.path == target_hint.path)
+            .or_else(|| {
+                self.required_artifact_identities
+                    .iter()
+                    .find(|identity| identity.role == target_hint.role)
+            })
     }
 
     /// Issue #651 Task 4.1 / PR-001: evaluate completion with awareness

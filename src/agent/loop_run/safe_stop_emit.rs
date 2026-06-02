@@ -125,6 +125,7 @@ pub(super) fn emit_safe_stop_report_for_diagnostic_target_missing(agent: &mut Ag
         latest_successful_read: latest_read.as_deref(),
         task_workspace_scope: &scope,
         candidates,
+        unfulfilled_obligations: repair_terminal_obligation_targets(agent),
         session_id: &session_id,
         turn_index,
     };
@@ -255,6 +256,7 @@ pub(super) fn emit_safe_stop_report_for_artifact_completion_failed(
         latest_successful_read: None,
         task_workspace_scope: &scope,
         candidates,
+        unfulfilled_obligations: repair_terminal_obligation_targets(agent),
         session_id: &session_id,
         turn_index,
     };
@@ -301,6 +303,7 @@ pub(super) fn emit_repair_safe_stop_report(
         latest_successful_read: None,
         task_workspace_scope: &scope,
         candidates,
+        unfulfilled_obligations: Vec::new(),
         session_id: &session_id,
         turn_index,
     };
@@ -339,10 +342,25 @@ pub(super) fn emit_safe_stop_report_for_verifier_missing(agent: &mut Agent) {
         latest_successful_read: None,
         task_workspace_scope: &scope,
         candidates: Vec::new(),
+        unfulfilled_obligations: Vec::new(),
         session_id: &session_id,
         turn_index,
     };
     record_safe_stop_report(agent, input, ctx);
+}
+
+fn repair_terminal_obligation_targets(
+    agent: &Agent,
+) -> Vec<super::repair_packet::RepairObligationTarget> {
+    let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
+    if request.is_empty() {
+        return Vec::new();
+    }
+    let contract = super::task_contract::TaskContract::from_request(&request);
+    super::repair_packet::repair_packets_for_contract(&contract)
+        .into_iter()
+        .map(|packet| packet.target)
+        .collect()
 }
 
 /// Issue #654 (DR3-002 / Task D.6) — collect Owned-validated test
