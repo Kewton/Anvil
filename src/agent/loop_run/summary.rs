@@ -1,3 +1,179 @@
+use super::repair_job::{RepairNextAction, VerifierBootstrapNextAction};
+use super::task_contract::{ArtifactRecoveryAction, ArtifactRole};
+
+#[allow(dead_code)] // Issue #888: additive generic state vocabulary for future serialized projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunState {
+    DeliverableMissing,
+    EvidenceMissing,
+    EvidenceInvalid,
+    CorrectionPlanning,
+    CorrectionApplying,
+    CompletionReady,
+    Completed,
+    SafeStopped,
+}
+
+impl RunState {
+    #[allow(dead_code)] // Issue #888 migration surface; existing wire labels stay on ExitReason.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            RunState::DeliverableMissing => "deliverable_missing",
+            RunState::EvidenceMissing => "evidence_missing",
+            RunState::EvidenceInvalid => "evidence_invalid",
+            RunState::CorrectionPlanning => "correction_planning",
+            RunState::CorrectionApplying => "correction_applying",
+            RunState::CompletionReady => "completion_ready",
+            RunState::Completed => "completed",
+            RunState::SafeStopped => "safe_stopped",
+        }
+    }
+
+    #[allow(dead_code)] // Issue #888: mapping documentation for ArtifactRecoveryAction.
+    pub(super) fn from_artifact_recovery_action(action: &ArtifactRecoveryAction) -> Self {
+        match action {
+            ArtifactRecoveryAction::Continue { .. } => RunState::DeliverableMissing,
+            ArtifactRecoveryAction::RunVerifier => RunState::CompletionReady,
+            ArtifactRecoveryAction::RepairArtifact { .. } => RunState::CorrectionApplying,
+            ArtifactRecoveryAction::Done => RunState::Completed,
+            ArtifactRecoveryAction::SafeStop { .. } => RunState::SafeStopped,
+        }
+    }
+
+    #[allow(dead_code)] // Issue #888: mapping documentation for RepairNextAction.
+    pub(super) fn from_repair_next_action(action: &RepairNextAction) -> Self {
+        match action {
+            RepairNextAction::RequestDiagnostic | RepairNextAction::Replan => {
+                RunState::CorrectionPlanning
+            }
+            RepairNextAction::RequestPatch { .. } => RunState::CorrectionApplying,
+            RepairNextAction::RerunVerifier => RunState::CompletionReady,
+            RepairNextAction::SafeStop { .. } => RunState::SafeStopped,
+            RepairNextAction::VerifiedDone => RunState::Completed,
+        }
+    }
+
+    #[allow(dead_code)] // Issue #888: mapping documentation for MissingVerifierJob.
+    pub(super) fn from_verifier_bootstrap_next_action(
+        action: &VerifierBootstrapNextAction,
+    ) -> Self {
+        match action {
+            VerifierBootstrapNextAction::RequestSetupEdit => RunState::DeliverableMissing,
+            VerifierBootstrapNextAction::RerunVerifier => RunState::CompletionReady,
+            VerifierBootstrapNextAction::SafeStop { .. } => RunState::SafeStopped,
+        }
+    }
+}
+
+#[allow(dead_code)] // Issue #888: additive context; legacy labels remain the serialized default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissingDeliverable {
+    RepositoryChange,
+    ArtifactRole(ArtifactRole),
+}
+
+impl MissingDeliverable {
+    #[allow(dead_code)] // Useful for future telemetry serialization.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            MissingDeliverable::RepositoryChange => "repository_change",
+            MissingDeliverable::ArtifactRole(role) => role.label(),
+        }
+    }
+}
+
+#[allow(dead_code)] // Issue #888: additive context; legacy labels remain the serialized default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MissingEvidence {
+    VerificationResult,
+    VerificationEnvironment,
+    ValidVerificationResult,
+}
+
+impl MissingEvidence {
+    #[allow(dead_code)] // Useful for future telemetry serialization.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            MissingEvidence::VerificationResult => "verification_result",
+            MissingEvidence::VerificationEnvironment => "verification_environment",
+            MissingEvidence::ValidVerificationResult => "valid_verification_result",
+        }
+    }
+}
+
+const NO_MISSING_DELIVERABLES: &[MissingDeliverable] = &[];
+const NO_MISSING_EVIDENCE: &[MissingEvidence] = &[];
+const REPOSITORY_CHANGE_MISSING: &[MissingDeliverable] = &[MissingDeliverable::RepositoryChange];
+const VERIFICATION_RESULT_MISSING: &[MissingEvidence] = &[MissingEvidence::VerificationResult];
+const VERIFICATION_ENVIRONMENT_MISSING: &[MissingEvidence] =
+    &[MissingEvidence::VerificationEnvironment];
+const VALID_VERIFICATION_RESULT_MISSING: &[MissingEvidence] =
+    &[MissingEvidence::ValidVerificationResult];
+
+#[allow(dead_code)] // Issue #888: terminal metadata projection for future eval-log migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RunTerminalOutcome {
+    pub(super) state: RunState,
+    pub(super) legacy_label: &'static str,
+    pub(super) missing_deliverables: &'static [MissingDeliverable],
+    pub(super) missing_evidence: &'static [MissingEvidence],
+}
+
+impl RunTerminalOutcome {
+    pub(super) fn from_exit_reason(reason: ExitReason) -> Self {
+        match reason {
+            ExitReason::Done => Self {
+                state: RunState::Completed,
+                legacy_label: "done",
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::MissingRepoEdits => Self {
+                state: RunState::DeliverableMissing,
+                legacy_label: "missing_repo_edits",
+                missing_deliverables: REPOSITORY_CHANGE_MISSING,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::MissingVerification => Self {
+                state: RunState::EvidenceMissing,
+                legacy_label: "missing_verification",
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: VERIFICATION_RESULT_MISSING,
+            },
+            ExitReason::VerifierFailed | ExitReason::SafeStopVerifierWeak => Self {
+                state: RunState::EvidenceInvalid,
+                legacy_label: reason.legacy_label(),
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: VALID_VERIFICATION_RESULT_MISSING,
+            },
+            ExitReason::SafeStopVerifierMissing => Self {
+                state: RunState::EvidenceMissing,
+                legacy_label: "safe_stop_verifier_missing",
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: VERIFICATION_ENVIRONMENT_MISSING,
+            },
+            ExitReason::RepairExhausted | ExitReason::RepairSafeStop => Self {
+                state: RunState::SafeStopped,
+                legacy_label: reason.legacy_label(),
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::MaxIterations
+            | ExitReason::EmptyResponses
+            | ExitReason::NoToolCalls
+            | ExitReason::PlanIncomplete
+            | ExitReason::ToolCallFormatError
+            | ExitReason::TransportError
+            | ExitReason::Interrupted => Self {
+                state: RunState::SafeStopped,
+                legacy_label: reason.legacy_label(),
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExitReason {
     Done,
@@ -61,6 +237,10 @@ impl ExitReason {
     }
 
     pub(super) fn label(self) -> &'static str {
+        RunTerminalOutcome::from_exit_reason(self).legacy_label
+    }
+
+    fn legacy_label(self) -> &'static str {
         match self {
             ExitReason::Done => "done",
             ExitReason::MaxIterations => "max_iterations",
@@ -285,6 +465,83 @@ mod tests {
         let labels: Vec<_> = reasons.iter().map(|r| r.label()).collect();
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(labels.len(), unique.len());
+    }
+
+    #[test]
+    fn run_terminal_outcome_describes_legacy_missing_states_generically() {
+        let deliverable = RunTerminalOutcome::from_exit_reason(ExitReason::MissingRepoEdits);
+        assert_eq!(deliverable.legacy_label, "missing_repo_edits");
+        assert_eq!(deliverable.state, RunState::DeliverableMissing);
+        assert_eq!(
+            deliverable
+                .missing_deliverables
+                .iter()
+                .map(|item| item.label())
+                .collect::<Vec<_>>(),
+            vec!["repository_change"]
+        );
+        assert!(deliverable.missing_evidence.is_empty());
+
+        let evidence = RunTerminalOutcome::from_exit_reason(ExitReason::MissingVerification);
+        assert_eq!(evidence.legacy_label, "missing_verification");
+        assert_eq!(evidence.state, RunState::EvidenceMissing);
+        assert!(evidence.missing_deliverables.is_empty());
+        assert_eq!(
+            evidence
+                .missing_evidence
+                .iter()
+                .map(|item| item.label())
+                .collect::<Vec<_>>(),
+            vec!["verification_result"]
+        );
+    }
+
+    #[test]
+    fn run_state_projects_existing_controller_actions() {
+        let continue_action = ArtifactRecoveryAction::Continue {
+            missing: vec![ArtifactRole::UsageDocs],
+            target_hint: None,
+        };
+        assert_eq!(
+            RunState::from_artifact_recovery_action(&continue_action),
+            RunState::DeliverableMissing
+        );
+        assert_eq!(
+            RunState::from_artifact_recovery_action(&ArtifactRecoveryAction::RunVerifier),
+            RunState::CompletionReady
+        );
+
+        let patch_action = RepairNextAction::RequestPatch {
+            target_hint: super::super::task_contract::RecoveryTargetHint {
+                role: ArtifactRole::Implementation,
+                path: "src/lib.rs".to_string(),
+                reason: "repair implementation".to_string(),
+            },
+        };
+        assert_eq!(
+            RunState::from_repair_next_action(&RepairNextAction::RequestDiagnostic),
+            RunState::CorrectionPlanning
+        );
+        assert_eq!(
+            RunState::from_repair_next_action(&patch_action),
+            RunState::CorrectionApplying
+        );
+        assert_eq!(
+            RunState::from_verifier_bootstrap_next_action(
+                &VerifierBootstrapNextAction::RequestSetupEdit
+            ),
+            RunState::DeliverableMissing
+        );
+    }
+
+    #[test]
+    fn exit_reason_labels_remain_legacy_compatible() {
+        assert_eq!(ExitReason::MissingRepoEdits.label(), "missing_repo_edits");
+        assert_eq!(
+            ExitReason::MissingVerification.label(),
+            "missing_verification"
+        );
+        assert_eq!(ExitReason::Done.label(), "done");
     }
 
     #[test]

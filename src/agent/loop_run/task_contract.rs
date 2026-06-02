@@ -3439,17 +3439,19 @@ mod tests {
         let repair_state = VerifierRepairState::None;
 
         assert!(!contract.verification_required);
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert_eq!(action, ArtifactRecoveryAction::Done);
         assert_eq!(
-            plan_artifact_recovery(ArtifactRecoveryInputs {
-                contract: &contract,
-                evidence: &evidence,
-                artifacts: &artifacts,
-                repair_state: &repair_state,
-                artifact_excerpts: &excerpts,
-                missing_verifier_suppress_retry: false,
-                owned_test_artifacts: &[],
-            }),
-            ArtifactRecoveryAction::Done
+            super::super::summary::RunState::from_artifact_recovery_action(&action),
+            super::super::summary::RunState::Completed
         );
     }
 
