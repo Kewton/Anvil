@@ -2195,7 +2195,7 @@ pub(super) fn task_contract_verifier_test_binding(
         return (Vec::new(), false, None);
     };
     let contract = TaskContract::from_request(&request);
-    let test_execution_required = contract.required_behavior.test_execution_required;
+    let test_execution_required = contract.completion_policy.test_execution_required();
     let owned_test_artifacts =
         super::owned_test_projection::owned_test_artifacts_for_verifier(agent, &contract);
     let scope = super::workspace_access::current_workspace_scope(agent);
