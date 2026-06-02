@@ -1,6 +1,6 @@
 use super::completion_evidence::CompletionEvidence;
 use super::failure_packet::{CandidateArtifact, FailurePacket};
-use super::task_contract::ArtifactRole;
+use super::task_contract::{ArtifactRole, TaskKind};
 use crate::tools::bash::BashCommandClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +9,8 @@ pub(super) enum VerifierTaskKind {
     Coding,
     Docs,
     Data,
+    Research,
+    Ops,
 }
 
 #[allow(dead_code)]
@@ -44,6 +46,31 @@ pub(super) struct DocsVerifier;
 #[derive(Debug, Clone, Copy, Default)]
 #[allow(dead_code)]
 pub(super) struct DataVerifier;
+
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub(super) struct ResearchVerifier;
+
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub(super) struct OpsVerifier;
+
+static CODING_VERIFIER: CodingVerifier = CodingVerifier;
+static DOCS_VERIFIER: DocsVerifier = DocsVerifier;
+static DATA_VERIFIER: DataVerifier = DataVerifier;
+static RESEARCH_VERIFIER: ResearchVerifier = ResearchVerifier;
+static OPS_VERIFIER: OpsVerifier = OpsVerifier;
+
+#[allow(dead_code)]
+pub(super) fn verifier_for_task_kind(task_kind: TaskKind) -> &'static dyn Verifier {
+    match task_kind {
+        TaskKind::Coding => &CODING_VERIFIER,
+        TaskKind::Docs => &DOCS_VERIFIER,
+        TaskKind::Data => &DATA_VERIFIER,
+        TaskKind::Research => &RESEARCH_VERIFIER,
+        TaskKind::Ops => &OPS_VERIFIER,
+    }
+}
 
 impl Verifier for CodingVerifier {
     fn task_kind(&self) -> VerifierTaskKind {
@@ -140,13 +167,12 @@ impl Verifier for DataVerifier {
 
     fn pass_evidence(
         &self,
-        command: &str,
-        bound_artifacts_count: Option<usize>,
+        _command: &str,
+        _bound_artifacts_count: Option<usize>,
     ) -> CompletionEvidence {
-        CompletionEvidence::VerifierExitZero {
-            class: BashCommandClass::BuildTest,
-            command: command.to_string(),
-            bound_test_artifacts_count: bound_artifacts_count,
+        CompletionEvidence::StructuredDataPass {
+            path: None,
+            columns: Vec::new(),
         }
     }
 
@@ -208,6 +234,80 @@ impl DataVerifier {
             )],
             Vec::new(),
         )
+    }
+}
+
+impl Verifier for ResearchVerifier {
+    fn task_kind(&self) -> VerifierTaskKind {
+        VerifierTaskKind::Research
+    }
+
+    fn pass_evidence(
+        &self,
+        _command: &str,
+        _bound_artifacts_count: Option<usize>,
+    ) -> CompletionEvidence {
+        CompletionEvidence::ReportCompletenessPass { path: None }
+    }
+
+    fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
+        self.research_report_evidence(artifact.path.map(str::to_string), artifact.excerpt)
+    }
+
+    fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
+        generic_verifier_failure_packet(command, failure_kind, output)
+    }
+}
+
+impl ResearchVerifier {
+    #[allow(dead_code)]
+    pub(super) fn research_report_evidence(
+        &self,
+        path: Option<String>,
+        excerpt: &str,
+    ) -> Option<CompletionEvidence> {
+        if research_report_pass(excerpt) {
+            Some(CompletionEvidence::ReportCompletenessPass { path })
+        } else {
+            None
+        }
+    }
+}
+
+impl Verifier for OpsVerifier {
+    fn task_kind(&self) -> VerifierTaskKind {
+        VerifierTaskKind::Ops
+    }
+
+    fn pass_evidence(
+        &self,
+        _command: &str,
+        _bound_artifacts_count: Option<usize>,
+    ) -> CompletionEvidence {
+        CompletionEvidence::ReportCompletenessPass { path: None }
+    }
+
+    fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
+        self.ops_runbook_evidence(artifact.path.map(str::to_string), artifact.excerpt)
+    }
+
+    fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
+        generic_verifier_failure_packet(command, failure_kind, output)
+    }
+}
+
+impl OpsVerifier {
+    #[allow(dead_code)]
+    pub(super) fn ops_runbook_evidence(
+        &self,
+        path: Option<String>,
+        excerpt: &str,
+    ) -> Option<CompletionEvidence> {
+        if ops_runbook_pass(excerpt) {
+            Some(CompletionEvidence::ReportCompletenessPass { path })
+        } else {
+            None
+        }
     }
 }
 
@@ -309,6 +409,43 @@ fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[S
     required_columns
         .iter()
         .all(|column| observed.iter().any(|observed| observed == column))
+}
+
+fn research_report_pass(excerpt: &str) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    let has_citation = contains_any(
+        &lower,
+        &["http://", "https://", "source", "citation", "参考"],
+    );
+    let has_claim = contains_any(&lower, &["claim", "finding", "summary", "調査", "結論"]);
+    let has_uncertainty = contains_any(
+        &lower,
+        &[
+            "uncertain",
+            "unknown",
+            "limitation",
+            "confidence",
+            "不明",
+            "制約",
+        ],
+    );
+    has_citation && has_claim && has_uncertainty
+}
+
+fn ops_runbook_pass(excerpt: &str) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    let has_checklist = contains_any(&lower, &["[ ]", "[x]", "checklist", "手順"]);
+    let has_validation = contains_any(
+        &lower,
+        &["validate", "validation", "verify", "確認", "検証"],
+    );
+    let has_rollback = contains_any(&lower, &["rollback", "roll back", "revert", "切り戻し"]);
+    let has_risk = contains_any(&lower, &["risk", "impact", "注意", "リスク"]);
+    has_checklist && has_validation && has_rollback && has_risk
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn observed_data_columns(
@@ -519,6 +656,68 @@ mod tests {
                 command: "cargo test".to_string(),
                 bound_test_artifacts_count: Some(1),
             }
+        );
+    }
+
+    #[test]
+    fn verifier_registry_selects_adapter_for_each_task_kind() {
+        let cases = [
+            (TaskKind::Coding, VerifierTaskKind::Coding),
+            (TaskKind::Docs, VerifierTaskKind::Docs),
+            (TaskKind::Data, VerifierTaskKind::Data),
+            (TaskKind::Research, VerifierTaskKind::Research),
+            (TaskKind::Ops, VerifierTaskKind::Ops),
+        ];
+
+        for (task_kind, expected) in cases {
+            assert_eq!(verifier_for_task_kind(task_kind).task_kind(), expected);
+        }
+    }
+
+    #[test]
+    fn data_verifier_pass_evidence_is_structured_data_not_build_test() {
+        let verifier = DataVerifier;
+
+        assert_eq!(
+            verifier.pass_evidence("validate output.csv", None),
+            CompletionEvidence::StructuredDataPass {
+                path: None,
+                columns: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn research_verifier_artifact_adapter_emits_report_evidence() {
+        let verifier = ResearchVerifier;
+        let evidence = verifier.artifact_evidence(VerifierArtifact {
+            path: Some("research.md"),
+            excerpt: "## Summary\nFinding: release cadence changed.\nSource: https://example.test/report\nLimitation: confidence is medium.\n",
+            required_columns: &[],
+        });
+
+        assert_eq!(
+            evidence,
+            Some(CompletionEvidence::ReportCompletenessPass {
+                path: Some("research.md".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn ops_verifier_artifact_adapter_emits_report_evidence() {
+        let verifier = OpsVerifier;
+        let evidence = verifier.artifact_evidence(VerifierArtifact {
+            path: Some("runbook.md"),
+            excerpt: "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Rollback\nRevert the deploy.\n## Risk\nImpact is low.\n",
+            required_columns: &[],
+        });
+
+        assert_eq!(
+            evidence,
+            Some(CompletionEvidence::ReportCompletenessPass {
+                path: Some("runbook.md".to_string()),
+            })
         );
     }
 }
