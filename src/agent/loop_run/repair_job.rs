@@ -26,7 +26,7 @@ use super::repair_packet::{
 };
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
-use super::task_contract::{ArtifactRole, RecoveryTargetHint};
+use super::task_contract::{ArtifactRole, DeliverableKind, RecoveryTargetHint};
 #[cfg(test)]
 use super::tool_history::{
     focused_edit_target_already_read, latest_successful_read_existing_path,
@@ -59,6 +59,7 @@ const APPLIED_IMPROVED_TARGET_EXHAUSTION_THRESHOLD: usize = 3;
 const MAX_REPAIR_LIFECYCLE_EVENTS: usize = 32;
 const MAX_REJECTED_ATTEMPTS: usize = 16;
 const REPEATED_FAILURE_SIGNATURE_STOP_THRESHOLD: usize = 3;
+const REPEATED_CORRECTION_CLASS_STOP_THRESHOLD: usize = 2;
 #[allow(dead_code)] // used by the v0.4.16 next_action migration surface.
 const REPEATED_REJECTED_ATTEMPT_THRESHOLD: usize = 2;
 
@@ -212,6 +213,9 @@ pub(super) struct RepairJob {
     pub(super) timeout_kind: Option<super::failure_packet::FailurePacketTimeoutKind>,
     pub(super) target_hint: Option<RecoveryTargetHint>,
     pub(super) repair_target_hint: Option<RecoveryTargetHint>,
+    /// Issue #903: active obligation-scoped correction selected from the
+    /// failed deliverable obligation and structured diagnostic class.
+    pub(super) correction_job: Option<CorrectionJob>,
     pub(super) changed_file_hints: Vec<RecoveryTargetHint>,
     pub(super) assessment: Option<VerifierRepairAssessment>,
     pub(super) assessment_attempts: usize,
@@ -311,6 +315,106 @@ pub(super) enum VerifierRepairState {
     WaitingForEdit {
         target_hint: Option<RecoveryTargetHint>,
     },
+}
+
+/// Issue #903: closed correction categories exposed by the controller. These
+/// are broader than `CorrectionKind` so orchestration can track budget and
+/// recovery by user-facing failure class rather than generic patch retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CorrectionJobKind {
+    Implementation,
+    Manifest,
+    Test,
+    Docs,
+    DataSchema,
+    ResearchEvidence,
+    OpsProcedure,
+}
+
+impl CorrectionJobKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Manifest => "manifest",
+            Self::Test => "test",
+            Self::Docs => "docs",
+            Self::DataSchema => "data_schema",
+            Self::ResearchEvidence => "research_evidence",
+            Self::OpsProcedure => "ops_procedure",
+        }
+    }
+
+    fn from_packet(packet: &RepairPacket) -> Self {
+        match (
+            packet.correction_kind,
+            packet.target.role,
+            packet.target.kind,
+        ) {
+            (CorrectionKind::ManifestCorrection, _, _) | (_, ArtifactRole::Setup, _) => {
+                Self::Manifest
+            }
+            (CorrectionKind::TestCorrection, _, _) | (_, ArtifactRole::Test, _) => Self::Test,
+            (_, _, DeliverableKind::OpsRunbook) | (_, _, DeliverableKind::CommandOutput) => {
+                Self::OpsProcedure
+            }
+            (CorrectionKind::SectionAddition, _, _)
+            | (CorrectionKind::ChecklistCompletion, ArtifactRole::UsageDocs, _)
+            | (_, _, DeliverableKind::UsageDocs) => Self::Docs,
+            (CorrectionKind::SchemaCorrection, _, _)
+            | (_, ArtifactRole::DataOutput, _)
+            | (_, _, DeliverableKind::StructuredRecord)
+            | (_, _, DeliverableKind::Data) => Self::DataSchema,
+            (CorrectionKind::CitationSupport, _, _)
+            | (_, _, DeliverableKind::ResearchNotes)
+            | (_, _, DeliverableKind::ExternalReference) => Self::ResearchEvidence,
+            _ => Self::Implementation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CorrectionJob {
+    pub(super) kind: CorrectionJobKind,
+    pub(super) packet: RepairPacket,
+    pub(super) failure_signature: String,
+}
+
+impl CorrectionJob {
+    pub(super) fn from_packet(packet: RepairPacket, failure_signature: &str) -> Self {
+        Self {
+            kind: CorrectionJobKind::from_packet(&packet),
+            packet,
+            failure_signature: sanitize_repair_job_text_with_char_cap(failure_signature, 220),
+        }
+    }
+
+    pub(super) fn target_hint(&self) -> Option<RecoveryTargetHint> {
+        let path = self.packet.target.path.as_ref()?;
+        if path.is_empty() {
+            return None;
+        }
+        Some(RecoveryTargetHint {
+            role: self.packet.target.role,
+            path: path.clone(),
+            reason: sanitize_repair_job_text_with_char_cap(
+                &format!(
+                    "obligation-scoped correction: obligation_id={}, correction_kind={}, failure_domain={}, instruction={}",
+                    self.packet.target.obligation_id,
+                    self.kind.as_str(),
+                    self.packet.target.failure_domain.as_str(),
+                    self.packet.instruction
+                ),
+                360,
+            ),
+        })
+    }
+
+    pub(super) fn attempt_key(
+        &self,
+        allowed_change_kind: Option<AllowedChangeKind>,
+    ) -> RepairAttemptKey {
+        RepairAttemptKey::from_packet(&self.packet, allowed_change_kind)
+    }
 }
 
 /// Issue #646 (A1): first-class state for "verifier is missing from the
@@ -867,6 +971,7 @@ impl RepairJob {
             timeout_kind: None,
             target_hint: None,
             repair_target_hint: None,
+            correction_job: None,
             changed_file_hints: Vec::new(),
             assessment: None,
             assessment_attempts: 0,
@@ -957,6 +1062,9 @@ impl RepairJob {
         if self.repeated_rejected_attempt().is_some() {
             return self.replan_or_safe_stop(RepairTerminalReason::PatchRejectedRepeatedly);
         }
+        if self.repeated_rejected_correction_class().is_some() {
+            return self.replan_or_safe_stop(RepairTerminalReason::PatchRejectedRepeatedly);
+        }
         if self.assessment.is_none() {
             return self
                 .request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable);
@@ -987,6 +1095,7 @@ impl RepairJob {
     fn prepare_for_diagnostic_step(&mut self) {
         self.assessment = None;
         self.repair_target_hint = None;
+        self.correction_job = None;
         self.diagnostic_attempted = false;
         self.assessment_bound_cluster_id = None;
     }
@@ -1136,16 +1245,45 @@ impl RepairJob {
         })
     }
 
+    fn repeated_rejected_correction_class(&self) -> Option<&RejectedAttempt> {
+        let active_key = self.active_correction_attempt_key(None)?;
+        let active_domain = active_key.failure_domain?;
+        let active_kind = active_key.correction_kind?;
+        self.rejected_attempts.iter().rev().find(|attempt| {
+            attempt.key.failure_domain == Some(active_domain)
+                && attempt.key.correction_kind == Some(active_kind)
+                && self
+                    .rejected_attempts
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.key.failure_domain == Some(active_domain)
+                            && candidate.key.correction_kind == Some(active_kind)
+                    })
+                    .count()
+                    >= REPEATED_CORRECTION_CLASS_STOP_THRESHOLD
+        })
+    }
+
     fn current_repair_attempt_key(
         &self,
         allowed_change_kind: Option<AllowedChangeKind>,
     ) -> Option<RepairAttemptKey> {
+        if let Some(key) = self.active_correction_attempt_key(allowed_change_kind) {
+            return Some(key);
+        }
         self.current_repair_target_hint_for_next_action()
             .as_ref()
             .map(|hint| RepairAttemptKey::from_target(hint, allowed_change_kind))
     }
 
     fn current_repair_target_hint_for_next_action(&self) -> Option<RecoveryTargetHint> {
+        if let Some(target) = self
+            .correction_job
+            .as_ref()
+            .and_then(CorrectionJob::target_hint)
+        {
+            return Some(target);
+        }
         self.assessment
             .as_ref()
             .and_then(|assessment| {
@@ -1161,6 +1299,19 @@ impl RepairJob {
 
     pub(super) fn begin_next_repair_step(&mut self) -> RepairStep {
         self.driver().begin_next_step()
+    }
+
+    pub(super) fn activate_correction_job(&mut self, packet: RepairPacket) {
+        self.correction_job = Some(CorrectionJob::from_packet(packet, &self.failure_signature));
+    }
+
+    pub(super) fn active_correction_attempt_key(
+        &self,
+        allowed_change_kind: Option<AllowedChangeKind>,
+    ) -> Option<RepairAttemptKey> {
+        self.correction_job
+            .as_ref()
+            .map(|correction| correction.attempt_key(allowed_change_kind))
     }
 
     /// Issue #653 (S7-003) / #662 (S5-003): ledger mutation SSOT (orchestration only)。
@@ -2489,6 +2640,8 @@ pub(super) fn verifier_repair_context_from_failure(
         timeout_kind,
         target_hint,
         repair_target_hint: previous_repair_target_hint,
+        correction_job: previous_matching_context
+            .and_then(|context| context.correction_job.clone()),
         changed_file_hints,
         assessment: previous_assessment,
         assessment_attempts: 0,
@@ -3853,6 +4006,223 @@ mod tests {
                 reason: "missing verifier retry budget exhausted"
             }
         );
+    }
+
+    #[test]
+    fn test_bug_diagnostic_activates_test_correction_job() {
+        let contract = super::super::task_contract::TaskContract::from_request(
+            "Create a Rust CLI and add tests.",
+        );
+        let hint = recovery_target(ArtifactRole::Test, "tests/cli.rs");
+        let packet = super::super::repair_packet::RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::TestBug,
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Implementation,
+                "src/main.rs",
+            ))),
+            ..RepairJob::new_for_test()
+        };
+
+        job.activate_correction_job(packet);
+
+        assert_eq!(
+            job.correction_job.as_ref().unwrap().kind,
+            CorrectionJobKind::Test
+        );
+        let RepairNextAction::RequestPatch { target_hint } = job.next_action() else {
+            panic!("expected correction patch request");
+        };
+        assert_eq!(target_hint.role, ArtifactRole::Test);
+        assert_eq!(target_hint.path, "tests/cli.rs");
+        let key = job.active_correction_attempt_key(None).unwrap();
+        assert_eq!(
+            key.failure_domain,
+            Some(super::super::repair_packet::DeliverableFailureDomain::GeneratedTestBug)
+        );
+        assert_eq!(
+            key.correction_kind,
+            Some(super::super::repair_packet::CorrectionKind::TestCorrection)
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_diagnostic_activates_manifest_correction_job() {
+        let contract = super::super::task_contract::TaskContract::from_request(
+            "Create a Node CLI with package.json and tests.",
+        );
+        let hint = recovery_target(ArtifactRole::Setup, "package.json");
+        let packet = super::super::repair_packet::RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest,
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Implementation,
+                "src/index.js",
+            ))),
+            ..RepairJob::new_for_test()
+        };
+
+        job.activate_correction_job(packet);
+
+        assert_eq!(
+            job.correction_job.as_ref().unwrap().kind,
+            CorrectionJobKind::Manifest
+        );
+        let RepairNextAction::RequestPatch { target_hint } = job.next_action() else {
+            panic!("expected manifest correction patch request");
+        };
+        assert_eq!(target_hint.role, ArtifactRole::Setup);
+        assert_eq!(target_hint.path, "package.json");
+    }
+
+    #[test]
+    fn docs_missing_section_diagnostic_activates_docs_correction_job() {
+        let contract = super::super::task_contract::TaskContract::from_request(
+            "Update README.md with setup, usage, and troubleshooting sections.",
+        );
+        let hint = recovery_target(ArtifactRole::UsageDocs, "README.md");
+        let packet = super::super::repair_packet::RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::EvidenceMissing,
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(recovery_target(
+                ArtifactRole::Implementation,
+                "src/lib.rs",
+            ))),
+            ..RepairJob::new_for_test()
+        };
+
+        job.activate_correction_job(packet);
+
+        assert_eq!(
+            job.correction_job.as_ref().unwrap().kind,
+            CorrectionJobKind::Docs
+        );
+        assert_eq!(
+            job.active_correction_attempt_key(None)
+                .unwrap()
+                .correction_kind,
+            Some(super::super::repair_packet::CorrectionKind::SectionAddition)
+        );
+        let RepairNextAction::RequestPatch { target_hint } = job.next_action() else {
+            panic!("expected docs correction patch request");
+        };
+        assert_eq!(target_hint.role, ArtifactRole::UsageDocs);
+        assert_eq!(target_hint.path, "README.md");
+    }
+
+    #[test]
+    fn repeated_same_correction_class_replans_even_when_paths_differ() {
+        let contract = super::super::task_contract::TaskContract::from_request(
+            "Generate output.csv with columns id and total.",
+        );
+        let active_hint = recovery_target(ArtifactRole::DataOutput, "output.csv");
+        let packet = super::super::repair_packet::RepairPacket::for_diagnostic_failure(
+            &contract,
+            &active_hint,
+            super::super::VerifierDiagnosticFailureKind::SchemaMismatch,
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(active_hint)),
+            ..RepairJob::new_for_test()
+        };
+        job.activate_correction_job(packet);
+
+        for path in ["output.csv", "metrics.csv"] {
+            let mut class_key = job.active_correction_attempt_key(None).unwrap();
+            class_key.path = path.to_string();
+            class_key.obligation_id = Some(format!("data_output:{path}"));
+            job.rejected_attempts.push(RejectedAttempt {
+                key: class_key,
+                reason: RejectedAttemptReason::MalformedPatch,
+            });
+        }
+
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn correction_job_kind_covers_required_obligation_categories() {
+        use super::super::repair_packet::{
+            CorrectionKind, DeliverableFailureDomain, RepairObligationTarget, RepairPacket,
+        };
+
+        let cases = [
+            (
+                CorrectionKind::Patch,
+                ArtifactRole::Implementation,
+                DeliverableKind::Code,
+                DeliverableFailureDomain::VerifierFailed,
+                CorrectionJobKind::Implementation,
+            ),
+            (
+                CorrectionKind::ManifestCorrection,
+                ArtifactRole::Setup,
+                DeliverableKind::Setup,
+                DeliverableFailureDomain::InvalidManifest,
+                CorrectionJobKind::Manifest,
+            ),
+            (
+                CorrectionKind::TestCorrection,
+                ArtifactRole::Test,
+                DeliverableKind::Tests,
+                DeliverableFailureDomain::GeneratedTestBug,
+                CorrectionJobKind::Test,
+            ),
+            (
+                CorrectionKind::SectionAddition,
+                ArtifactRole::UsageDocs,
+                DeliverableKind::UsageDocs,
+                DeliverableFailureDomain::IncompleteSections,
+                CorrectionJobKind::Docs,
+            ),
+            (
+                CorrectionKind::SchemaCorrection,
+                ArtifactRole::DataOutput,
+                DeliverableKind::StructuredRecord,
+                DeliverableFailureDomain::SchemaMismatch,
+                CorrectionJobKind::DataSchema,
+            ),
+            (
+                CorrectionKind::CitationSupport,
+                ArtifactRole::UsageDocs,
+                DeliverableKind::ResearchNotes,
+                DeliverableFailureDomain::MissingDeliverable,
+                CorrectionJobKind::ResearchEvidence,
+            ),
+            (
+                CorrectionKind::ChecklistCompletion,
+                ArtifactRole::UsageDocs,
+                DeliverableKind::OpsRunbook,
+                DeliverableFailureDomain::MissingDeliverable,
+                CorrectionJobKind::OpsProcedure,
+            ),
+        ];
+
+        for (correction_kind, role, kind, failure_domain, expected) in cases {
+            let packet = RepairPacket {
+                target: RepairObligationTarget {
+                    obligation_id: format!("{}:target.md", role.label()),
+                    role,
+                    kind,
+                    path: Some("target.md".to_string()),
+                    expected_evidence: Vec::new(),
+                    failure_domain,
+                },
+                correction_kind,
+                instruction: "repair target".to_string(),
+            };
+
+            assert_eq!(CorrectionJob::from_packet(packet, "sig").kind, expected);
+        }
     }
 
     #[test]

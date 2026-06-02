@@ -437,6 +437,11 @@ fn failure_domain_for_diagnostic_failure(
         super::VerifierDiagnosticFailureKind::InvalidManifest => {
             DeliverableFailureDomain::InvalidManifest
         }
+        super::VerifierDiagnosticFailureKind::EvidenceMissing
+            if hint.role == ArtifactRole::UsageDocs =>
+        {
+            DeliverableFailureDomain::IncompleteSections
+        }
         super::VerifierDiagnosticFailureKind::MissingFile
         | super::VerifierDiagnosticFailureKind::EvidenceMissing => {
             DeliverableFailureDomain::MissingDeliverable
@@ -673,6 +678,30 @@ mod tests {
             DeliverableFailureDomain::InvalidManifest
         );
         assert_eq!(packet.correction_kind, CorrectionKind::ManifestCorrection);
+    }
+
+    #[test]
+    fn docs_evidence_missing_diagnostic_creates_docs_section_correction_packet() {
+        let contract = TaskContract::from_request(
+            "Update README.md with setup, usage, and troubleshooting sections.",
+        );
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::UsageDocs,
+            path: "README.md".to_string(),
+            reason: "required usage section is missing".to_string(),
+        };
+        let packet = RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::EvidenceMissing,
+        );
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::IncompleteSections
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::SectionAddition);
+        assert_eq!(packet.target.obligation_id, "usage_docs:README.md");
     }
 
     #[test]
