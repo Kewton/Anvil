@@ -1245,6 +1245,24 @@ mod tests {
     }
 
     #[test]
+    fn negated_docs_only_policy_context_completes_without_tests() {
+        let request = "Create README.md with validation steps. Do not create code or tests.";
+        let completion_policy = CompletionPolicy::from_request(request);
+        let ctx = RequestContext {
+            requires_tests: completion_policy.test_execution_required(),
+            is_env_setup_only: false,
+            completion_policy,
+        };
+        let mut set = EvidenceSet::new();
+        set.push(CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        });
+
+        assert!(!ctx.requires_tests);
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
     fn completion_policy_pytest_pass_artifact_only_avoids_missing_repo_edits() {
         let ctx = RequestContext {
             requires_tests: true,

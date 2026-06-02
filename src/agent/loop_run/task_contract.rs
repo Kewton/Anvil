@@ -373,11 +373,11 @@ impl CompletionPolicy {
         &self.required_artifacts
     }
 
-    fn verification_required(&self) -> bool {
+    pub(super) fn verification_required(&self) -> bool {
         self.verification_required
     }
 
-    fn test_execution_required(&self) -> bool {
+    pub(super) fn test_execution_required(&self) -> bool {
         self.test_execution_required
     }
 
@@ -2367,6 +2367,9 @@ pub(super) fn request_asks_for_implementation_artifact(
     asks_for_usage_docs: bool,
     asks_for_setup: bool,
 ) -> bool {
+    if request_negates_implementation_artifacts(request, lower) {
+        return false;
+    }
     let support_artifact_requested = asks_for_tests || asks_for_usage_docs || asks_for_setup;
     let production_action = contains_any(
         lower,
@@ -2473,6 +2476,10 @@ pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool
         lower,
         &[
             "do not create code or tests",
+            "do not create tests or code",
+            "do not write code or tests",
+            "do not add code or tests",
+            "do not implement code or tests",
             "do not create tests",
             "do not add tests",
             "do not write tests",
@@ -2502,6 +2509,48 @@ pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool
             "テストは追加しない",
             "テストを書かない",
             "テストは禁止",
+        ],
+    )
+}
+
+pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "do not create code or tests",
+            "do not create tests or code",
+            "do not create code",
+            "do not add code",
+            "do not write code",
+            "do not implement code",
+            "do not change code",
+            "do not modify code",
+            "don't create code",
+            "don't add code",
+            "don't write code",
+            "don't implement code",
+            "no code",
+            "no code changes",
+            "without code",
+            "without code changes",
+            "code changes are not required",
+            "code changes not required",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "コード不要",
+            "コードは不要",
+            "コードなし",
+            "コード無し",
+            "コードを作成しない",
+            "コードは作成しない",
+            "コードを追加しない",
+            "コードは追加しない",
+            "コードを書かない",
+            "コード変更なし",
+            "コード変更は不要",
+            "実装しない",
         ],
     )
 }
@@ -4011,6 +4060,28 @@ mod tests {
     }
 
     #[test]
+    fn coding_task_that_requires_tests_requires_verifier_evidence() {
+        let contract = TaskContract::from_request(
+            "Implement a Python slugify helper and add pytest tests for edge cases",
+        );
+        let owned_tests = vec!["tests/test_slugify.py".to_string()];
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Impl));
+        evidence.push(repo_edit(RepoEditCategory::Test));
+
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &owned_tests),
+            CompletionDecision::Verify
+        );
+
+        evidence.push(build_test_bound(1));
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &owned_tests),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
     fn docs_only_task_records_docs_path_and_required_sections() {
         let contract = TaskContract::from_request(
             "Update README.md with installation, usage, and testing sections",
@@ -4072,6 +4143,44 @@ mod tests {
             contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
             CompletionDecision::Done
         );
+    }
+
+    #[test]
+    fn negated_code_and_tests_phrases_do_not_require_code_or_tests() {
+        let cases = [
+            "Update README.md with validation steps. Do not create code or tests.",
+            "Update README.md with validation steps. Do not create tests or code.",
+            "Update README.md with validation steps. Do not write code or tests.",
+            "Update README.md with validation steps. No code changes and no tests.",
+        ];
+
+        for request in cases {
+            let lower = request.to_ascii_lowercase();
+            let contract = TaskContract::from_request(request);
+            assert!(
+                !request_asks_for_code_work(request, &lower),
+                "request={request}"
+            );
+            assert!(
+                !request_asks_for_test_artifact(request, &lower),
+                "request={request}"
+            );
+            assert_eq!(contract.task_kind, TaskKind::Docs, "request={request}");
+            assert!(
+                !contract
+                    .required_artifacts
+                    .contains(&ArtifactRole::Implementation),
+                "request={request}"
+            );
+            assert!(
+                !contract.required_artifacts.contains(&ArtifactRole::Test),
+                "request={request}"
+            );
+            assert!(
+                !contract.completion_policy.test_execution_required(),
+                "request={request}"
+            );
+        }
     }
 
     #[test]
