@@ -51,11 +51,15 @@ pub(super) fn owned_test_artifacts_for_verifier(
     let ledger = agent
         .artifact_ledger
         .owned_test_artifacts(super::task_contract::ArtifactRole::Test);
-    let guarded = super::generated_test_guard::filter_owned_test_artifacts_for_verifier(
+    let preflight_report = super::generated_test_guard::preflight_owned_test_artifacts_for_verifier(
         &agent.work_root,
         contract,
         &ledger,
     );
+    if !preflight_report.rejected.is_empty() {
+        emit_generated_test_preflight_rejections(agent, &preflight_report.rejected);
+    }
+    let guarded = preflight_report.admitted;
     if legacy != ledger {
         emit_owned_test_artifacts_projection_divergence(agent, &legacy, &ledger);
     }
@@ -94,6 +98,41 @@ fn emit_owned_test_artifacts_projection_divergence(
             "ledger_count": ledger.len() as u32,
             "legacy_path_hashes": legacy_path_hashes,
             "ledger_path_hashes": ledger_path_hashes,
+        }),
+    );
+}
+
+fn emit_generated_test_preflight_rejections(
+    agent: &Agent,
+    diagnostics: &[super::generated_test_guard::GeneratedTestPreflightDiagnostic],
+) {
+    let mut reason_counts = std::collections::BTreeMap::<&'static str, u32>::new();
+    let mut failure_kind_counts = std::collections::BTreeMap::<&'static str, u32>::new();
+    for diagnostic in diagnostics {
+        *reason_counts
+            .entry(diagnostic.failure_kind.reason_code())
+            .or_default() += 1;
+        *failure_kind_counts
+            .entry(diagnostic.failure_kind.as_str())
+            .or_default() += 1;
+    }
+    let path_hashes = super::artifact_ledger::bounded_masked_path_hashes(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.path.as_str()),
+    );
+    log_llm_event(
+        "agent.generated_test_preflight.rejected",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "authority": "task_contract",
+            "failure_authority": "generated_test_bug",
+            "projection": "owned_test_artifacts_for_verifier",
+            "rejected_count": diagnostics.len() as u32,
+            "reason_counts": reason_counts,
+            "failure_kind_counts": failure_kind_counts,
+            "path_hashes": path_hashes,
         }),
     );
 }
