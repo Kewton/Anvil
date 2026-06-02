@@ -537,7 +537,7 @@ fn dispatch_after_repair_patch_rejection(
 pub(super) fn repair_rejection_next_action(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
     if normalized.contains("role_mismatch") {
-        return "diagnostic and patch target disagreed; narrow the requested repair target or provide the authoritative file to change";
+        return "typed correction target and patch role disagreed; retry the active correction kind's admitted role/path or fall back to a fresh diagnostic before editing another role";
     }
     if normalized.contains("ambiguous")
         || normalized.contains("authority")

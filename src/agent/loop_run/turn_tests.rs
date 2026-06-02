@@ -2439,8 +2439,8 @@ mod tests {
             "verifier_repair_pass_invalid: repair plan rejected: role_mismatch",
         );
 
-        assert!(action.contains("target disagreed"));
-        assert!(action.contains("authoritative file"));
+        assert!(action.contains("typed correction"));
+        assert!(action.contains("fresh diagnostic"));
     }
 
     #[test]
