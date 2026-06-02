@@ -148,6 +148,22 @@ pub(super) fn verifier_failure_type_for_diagnostic_kind(
     fallback: super::VerifierFailureType,
 ) -> super::VerifierFailureType {
     match kind {
+        super::VerifierDiagnosticFailureKind::MissingFile => {
+            super::VerifierFailureType::MissingVerifierOrConfig
+        }
+        super::VerifierDiagnosticFailureKind::InvalidManifest => {
+            super::VerifierFailureType::MissingVerifierOrConfig
+        }
+        super::VerifierDiagnosticFailureKind::BadTest => super::VerifierFailureType::RuntimeError,
+        super::VerifierDiagnosticFailureKind::WrongSemantics => {
+            super::VerifierFailureType::AssertionFailure
+        }
+        super::VerifierDiagnosticFailureKind::EvidenceMissing => {
+            super::VerifierFailureType::MissingVerifierOrConfig
+        }
+        super::VerifierDiagnosticFailureKind::SchemaMismatch => {
+            super::VerifierFailureType::AssertionFailure
+        }
         super::VerifierDiagnosticFailureKind::DependencyMissing => {
             super::VerifierFailureType::ImportOrDependency
         }
@@ -212,6 +228,12 @@ fn framework_finding_can_override_diagnostic_kind(
     kind: super::VerifierDiagnosticFailureKind,
 ) -> bool {
     match kind {
+        super::VerifierDiagnosticFailureKind::MissingFile
+        | super::VerifierDiagnosticFailureKind::InvalidManifest
+        | super::VerifierDiagnosticFailureKind::EvidenceMissing
+        | super::VerifierDiagnosticFailureKind::SchemaMismatch => false,
+        super::VerifierDiagnosticFailureKind::BadTest => true,
+        super::VerifierDiagnosticFailureKind::WrongSemantics => false,
         super::VerifierDiagnosticFailureKind::DependencyMissing
         | super::VerifierDiagnosticFailureKind::LocalImportContractMismatch => {
             matches!(
@@ -345,6 +367,22 @@ fn verifier_diagnostic_failure_kind_from_str(
     value: &str,
 ) -> Option<super::VerifierDiagnosticFailureKind> {
     match value.trim().to_ascii_lowercase().as_str() {
+        "missing_file" | "missing_path" | "path_missing" => {
+            Some(super::VerifierDiagnosticFailureKind::MissingFile)
+        }
+        "invalid_manifest" | "manifest_error" | "malformed_manifest" => {
+            Some(super::VerifierDiagnosticFailureKind::InvalidManifest)
+        }
+        "bad_test" => Some(super::VerifierDiagnosticFailureKind::BadTest),
+        "wrong_semantics" | "wrong_behavior" | "semantic_mismatch" => {
+            Some(super::VerifierDiagnosticFailureKind::WrongSemantics)
+        }
+        "evidence_missing" | "missing_evidence" => {
+            Some(super::VerifierDiagnosticFailureKind::EvidenceMissing)
+        }
+        "schema_mismatch" | "schema_error" | "invalid_schema" => {
+            Some(super::VerifierDiagnosticFailureKind::SchemaMismatch)
+        }
         "dependency_missing" | "import_or_dependency" | "dependency" | "missing_dependency" => {
             Some(super::VerifierDiagnosticFailureKind::DependencyMissing)
         }
@@ -358,7 +396,7 @@ fn verifier_diagnostic_failure_kind_from_str(
             Some(super::VerifierDiagnosticFailureKind::AssertionMismatch)
         }
         "runtime_error" | "runtime" => Some(super::VerifierDiagnosticFailureKind::RuntimeError),
-        "test_bug" | "bad_test" => Some(super::VerifierDiagnosticFailureKind::TestBug),
+        "test_bug" => Some(super::VerifierDiagnosticFailureKind::TestBug),
         "config_or_verifier_error"
         | "missing_verifier_or_config"
         | "missing_verifier"

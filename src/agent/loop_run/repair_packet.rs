@@ -11,9 +11,7 @@ const MAX_REPAIR_INSTRUCTION_CHARS: usize = 360;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CorrectionKind {
     Patch,
-    #[cfg(test)]
     TestCorrection,
-    #[cfg(test)]
     ManifestCorrection,
     SectionAddition,
     SchemaCorrection,
@@ -25,9 +23,7 @@ impl CorrectionKind {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Patch => "patch",
-            #[cfg(test)]
             Self::TestCorrection => "test_correction",
-            #[cfg(test)]
             Self::ManifestCorrection => "manifest_correction",
             Self::SectionAddition => "section_addition",
             Self::SchemaCorrection => "schema_correction",
@@ -37,14 +33,13 @@ impl CorrectionKind {
     }
 }
 
+#[allow(dead_code)] // Issue #902: diagnostic domains are selected when structured verifier diagnostics reach repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliverableFailureDomain {
     MissingDeliverable,
     MalformedDeliverable,
     VerifierFailed,
-    #[cfg(test)]
     GeneratedTestBug,
-    #[cfg(test)]
     InvalidManifest,
     SchemaMismatch,
     IncompleteSections,
@@ -57,9 +52,7 @@ impl DeliverableFailureDomain {
             Self::MissingDeliverable => "missing_deliverable",
             Self::MalformedDeliverable => "malformed_deliverable",
             Self::VerifierFailed => "verifier_failed",
-            #[cfg(test)]
             Self::GeneratedTestBug => "generated_test_bug",
-            #[cfg(test)]
             Self::InvalidManifest => "invalid_manifest",
             Self::SchemaMismatch => "schema_mismatch",
             Self::IncompleteSections => "incomplete_sections",
@@ -124,7 +117,24 @@ impl RepairPacket {
         Self::for_recovery_target(contract, hint, DeliverableFailureDomain::VerifierFailed)
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)] // Issue #902 migration surface; exercised by repair_packet tests.
+    pub(super) fn for_structured_diagnostic(
+        contract: &TaskContract,
+        diagnostic: &super::verifier::VerifierDiagnostic,
+    ) -> CorrectionPacket {
+        let hint = RecoveryTargetHint {
+            role: diagnostic.role,
+            path: diagnostic.path.clone().unwrap_or_default(),
+            reason: diagnostic.reason(),
+        };
+        Self::for_recovery_target(
+            contract,
+            &hint,
+            failure_domain_for_verifier_diagnostic_code(diagnostic.code),
+        )
+    }
+
+    #[allow(dead_code)] // Issue #902 migration surface; exercised by repair_packet tests.
     pub(super) fn for_diagnostic_failure(
         contract: &TaskContract,
         hint: &RecoveryTargetHint,
@@ -338,11 +348,9 @@ fn adapter_instruction(task_kind: TaskKind, target: &RepairObligationTarget) -> 
         | (_, DeliverableFailureDomain::VerifierFailed) => {
             "repair the selected deliverable obligation while preserving verifier safety gates"
         }
-        #[cfg(test)]
         (_, DeliverableFailureDomain::GeneratedTestBug) => {
             "repair or replace the generated test artifact before using it as verifier authority"
         }
-        #[cfg(test)]
         (_, DeliverableFailureDomain::InvalidManifest) => {
             "repair the setup or manifest artifact so verifier setup is structurally valid"
         }
@@ -364,9 +372,7 @@ fn correction_kind_for_target(
     target: &RepairObligationTarget,
 ) -> CorrectionKind {
     match (task_kind, target.failure_domain, target.role) {
-        #[cfg(test)]
         (_, DeliverableFailureDomain::GeneratedTestBug, _) => CorrectionKind::TestCorrection,
-        #[cfg(test)]
         (_, DeliverableFailureDomain::InvalidManifest, _) => CorrectionKind::ManifestCorrection,
         (TaskKind::Docs, DeliverableFailureDomain::IncompleteSections, _)
         | (_, DeliverableFailureDomain::IncompleteSections, ArtifactRole::UsageDocs) => {
@@ -392,13 +398,56 @@ fn correction_kind_for_target(
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)] // Issue #902 migration surface; exercised by repair_packet tests.
+pub(super) fn failure_domain_for_verifier_diagnostic_code(
+    code: super::verifier::VerifierDiagnosticCode,
+) -> DeliverableFailureDomain {
+    match code {
+        super::verifier::VerifierDiagnosticCode::MissingFile => {
+            DeliverableFailureDomain::MissingDeliverable
+        }
+        super::verifier::VerifierDiagnosticCode::InvalidManifest => {
+            DeliverableFailureDomain::InvalidManifest
+        }
+        super::verifier::VerifierDiagnosticCode::BadTest => {
+            DeliverableFailureDomain::GeneratedTestBug
+        }
+        super::verifier::VerifierDiagnosticCode::WrongSemantics => {
+            DeliverableFailureDomain::VerifierFailed
+        }
+        super::verifier::VerifierDiagnosticCode::EvidenceMissing => {
+            DeliverableFailureDomain::IncompleteSections
+        }
+        super::verifier::VerifierDiagnosticCode::SchemaMismatch => {
+            DeliverableFailureDomain::SchemaMismatch
+        }
+    }
+}
+
+#[allow(dead_code)] // Issue #902 migration surface; exercised by repair_packet tests.
 fn failure_domain_for_diagnostic_failure(
     hint: &RecoveryTargetHint,
     failure_kind: super::VerifierDiagnosticFailureKind,
 ) -> DeliverableFailureDomain {
     match failure_kind {
-        super::VerifierDiagnosticFailureKind::TestBug => DeliverableFailureDomain::GeneratedTestBug,
+        super::VerifierDiagnosticFailureKind::BadTest
+        | super::VerifierDiagnosticFailureKind::TestBug => {
+            DeliverableFailureDomain::GeneratedTestBug
+        }
+        super::VerifierDiagnosticFailureKind::InvalidManifest => {
+            DeliverableFailureDomain::InvalidManifest
+        }
+        super::VerifierDiagnosticFailureKind::MissingFile
+        | super::VerifierDiagnosticFailureKind::EvidenceMissing => {
+            DeliverableFailureDomain::MissingDeliverable
+        }
+        super::VerifierDiagnosticFailureKind::SchemaMismatch => {
+            DeliverableFailureDomain::SchemaMismatch
+        }
+        super::VerifierDiagnosticFailureKind::WrongSemantics
+        | super::VerifierDiagnosticFailureKind::AssertionMismatch => {
+            DeliverableFailureDomain::VerifierFailed
+        }
         super::VerifierDiagnosticFailureKind::ConfigOrVerifierError
             if hint.role == ArtifactRole::Setup =>
         {
@@ -603,5 +652,93 @@ mod tests {
         );
         assert_eq!(packet.correction_kind, CorrectionKind::ManifestCorrection);
         assert_eq!(packet.correction_kind.as_str(), "manifest_correction");
+    }
+
+    #[test]
+    fn invalid_manifest_diagnostic_creates_manifest_correction_packet() {
+        let contract = TaskContract::from_request("Create a Node CLI with package.json and tests.");
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::Setup,
+            path: "package.json".to_string(),
+            reason: "package.json is not valid JSON".to_string(),
+        };
+        let packet = RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest,
+        );
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::InvalidManifest
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::ManifestCorrection);
+    }
+
+    #[test]
+    fn structured_verifier_diagnostic_feeds_repair_packet_generation() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json with a bin entry, source, tests, and README.md.",
+        );
+        let obligation = contract
+            .required_identities_for_role(ArtifactRole::Setup)
+            .into_iter()
+            .find(|obligation| obligation.path == "package.json")
+            .expect("package manifest obligation");
+        let diagnostic = super::super::verifier::verifier_diagnostic_for_obligation(
+            contract.task_kind,
+            obligation,
+            Some(r#"{"bin":"#),
+            true,
+        )
+        .expect("structured manifest diagnostic");
+        let packet = RepairPacket::for_structured_diagnostic(&contract, &diagnostic);
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::InvalidManifest
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::ManifestCorrection);
+        assert_eq!(packet.target.path.as_deref(), Some("package.json"));
+    }
+
+    #[test]
+    fn schema_mismatch_diagnostic_creates_schema_correction_packet() {
+        let contract = TaskContract::from_request("Generate output.csv with columns id and total.");
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::DataOutput,
+            path: "output.csv".to_string(),
+            reason: "required column total is missing".to_string(),
+        };
+        let packet = RepairPacket::for_diagnostic_failure(
+            &contract,
+            &hint,
+            super::super::VerifierDiagnosticFailureKind::SchemaMismatch,
+        );
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::SchemaMismatch
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::SchemaCorrection);
+    }
+
+    #[test]
+    fn structured_verifier_diagnostic_creates_repair_packet() {
+        let contract = TaskContract::from_request("Generate output.csv with columns id and total.");
+        let diagnostic = super::super::verifier::VerifierDiagnostic {
+            task_kind: super::super::verifier::VerifierTaskKind::Data,
+            code: super::super::verifier::VerifierDiagnosticCode::SchemaMismatch,
+            role: ArtifactRole::DataOutput,
+            path: Some("output.csv".to_string()),
+            message: "required column total is missing".to_string(),
+        };
+        let packet = RepairPacket::for_structured_diagnostic(&contract, &diagnostic);
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::SchemaMismatch
+        );
+        assert_eq!(packet.correction_kind, CorrectionKind::SchemaCorrection);
     }
 }

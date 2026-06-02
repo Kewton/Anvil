@@ -865,6 +865,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
             inputs.contract,
             inputs.evidence,
             inputs.artifacts,
+            inputs.artifact_excerpts,
             &observed,
             *role,
         ) {
@@ -878,6 +879,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
             target_hint: recovery_target_hint_for_missing_with_contract(
                 inputs.contract,
                 inputs.artifacts,
+                inputs.artifact_excerpts,
                 &missing,
             ),
             missing,
@@ -921,6 +923,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
                     target_hint: recovery_target_hint_for_missing_with_contract(
                         inputs.contract,
                         inputs.artifacts,
+                        inputs.artifact_excerpts,
                         &missing,
                     ),
                     missing,
@@ -984,6 +987,7 @@ fn required_role_satisfied(
     contract: &TaskContract,
     evidence: &EvidenceSet,
     artifacts: &[ArtifactState],
+    artifact_excerpts: &ArtifactExcerpts,
     observed: &[ArtifactRole],
     role: ArtifactRole,
 ) -> bool {
@@ -995,12 +999,40 @@ fn required_role_satisfied(
         return true;
     }
     identities.iter().all(|identity| {
-        artifact_identity_ready_for_verification(artifacts, identity)
-            || artifact_identity_observed_in_evidence(evidence, identity)
+        artifact_identity_satisfied_for_verification(
+            contract.task_kind,
+            evidence,
+            artifacts,
+            artifact_excerpts,
+            identity,
+        )
     })
 }
 
-fn artifact_identity_ready_for_verification(
+fn artifact_identity_satisfied_for_verification(
+    task_kind: TaskKind,
+    evidence: &EvidenceSet,
+    artifacts: &[ArtifactState],
+    artifact_excerpts: &ArtifactExcerpts,
+    identity: &ArtifactObligation,
+) -> bool {
+    let path_exists = artifact_identity_path_ready_for_verification(artifacts, identity)
+        || artifact_identity_observed_in_evidence(evidence, identity);
+    let excerpt = artifact_excerpts.get(&identity.role).map(String::as_str);
+    let Some(diagnostic) = super::verifier::verifier_diagnostic_for_obligation(
+        task_kind,
+        identity,
+        excerpt,
+        path_exists,
+    ) else {
+        return true;
+    };
+    diagnostic.code == super::verifier::VerifierDiagnosticCode::EvidenceMissing
+        && excerpt.is_none()
+        && path_exists
+}
+
+fn artifact_identity_path_ready_for_verification(
     artifacts: &[ArtifactState],
     identity: &ArtifactObligation,
 ) -> bool {
@@ -1107,21 +1139,44 @@ fn recovery_target_hint_for_missing(
 fn recovery_target_hint_for_missing_with_contract(
     contract: &TaskContract,
     artifacts: &[ArtifactState],
+    artifact_excerpts: &ArtifactExcerpts,
     missing: &[ArtifactRole],
 ) -> Option<RecoveryTargetHint> {
     let role = missing.first().copied()?;
-    if let Some(identity) = contract
+    if let Some((identity, diagnostic)) = contract
         .required_identities_for_role(role)
         .into_iter()
-        .find(|identity| !artifact_identity_ready_for_verification(artifacts, identity))
+        .filter_map(|identity| {
+            let path_exists = artifact_identity_path_ready_for_verification(artifacts, identity);
+            let excerpt = artifact_excerpts.get(&identity.role).map(String::as_str);
+            let diagnostic = super::verifier::verifier_diagnostic_for_obligation(
+                contract.task_kind,
+                identity,
+                excerpt,
+                path_exists,
+            )?;
+            if diagnostic.code == super::verifier::VerifierDiagnosticCode::EvidenceMissing
+                && excerpt.is_none()
+                && path_exists
+            {
+                return None;
+            }
+            Some((identity, diagnostic))
+        })
+        .next()
     {
+        let reason = if diagnostic.code == super::verifier::VerifierDiagnosticCode::MissingFile {
+            format!(
+                "required deliverable obligation is still missing: {}",
+                obligation_report_label(identity)
+            )
+        } else {
+            diagnostic.reason()
+        };
         return Some(RecoveryTargetHint {
             role,
             path: identity.path.clone(),
-            reason: format!(
-                "required deliverable obligation is still missing: {}",
-                obligation_report_label(identity)
-            ),
+            reason,
         });
     }
     recovery_target_hint_for_missing(artifacts, missing)
@@ -5267,6 +5322,77 @@ mod tests {
         assert_eq!(
             missing_labels(&contract.evaluate_with_owned_test_artifacts(&evidence, &[])),
             vec!["data_output"]
+        );
+    }
+
+    #[test]
+    fn malformed_package_manifest_is_not_ready_just_because_path_exists() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json with a bin entry, source, tests, and README.md.",
+        );
+        let evidence = EvidenceSet::new();
+        let excerpts = build_excerpts(&[(ArtifactRole::Setup, r#"{"bin":"#)]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[
+                ArtifactState::exists(ArtifactRole::Setup, "package.json"),
+                ArtifactState::exists(ArtifactRole::Implementation, "src/index.js"),
+                ArtifactState::exists(ArtifactRole::Test, "tests/index.test.js"),
+                ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+            ],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Setup],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Setup,
+                    path: "package.json".to_string(),
+                    reason: "structured verifier diagnostic: kind=invalid_manifest, task_kind=coding, summary=package.json is not valid JSON".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn data_schema_mismatch_is_not_ready_just_because_path_exists() {
+        let contract = TaskContract::from_request(
+            "Generate output.csv with columns Category and Total from the input CSV.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
+        let excerpts = build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::DataOutput,
+                "output.csv",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::DataOutput],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::DataOutput,
+                    path: "output.csv".to_string(),
+                    reason: "structured verifier diagnostic: kind=schema_mismatch, task_kind=data, summary=structured data evidence is missing required columns or parse-ready records".to_string(),
+                }),
+            }
         );
     }
 
