@@ -264,6 +264,13 @@ impl CompletionPolicy {
                 self.project_intent == CompletionProjectIntent::DocsOnly
                     || self.required_artifacts.contains(&ArtifactRole::UsageDocs)
             }
+            CompletionEvidence::StructuredDataPass { .. } => {
+                self.required_artifacts.contains(&ArtifactRole::DataOutput)
+            }
+            CompletionEvidence::ReportCompletenessPass { .. } => {
+                self.project_intent == CompletionProjectIntent::DocsOnly
+                    || self.required_artifacts.contains(&ArtifactRole::UsageDocs)
+            }
             CompletionEvidence::AnswerOnly => {
                 self.project_intent == CompletionProjectIntent::AnswerOnly
             }
@@ -889,6 +896,14 @@ fn artifact_identity_observed_in_evidence(
                 && normalized_artifact_path_eq(path, &identity.path)
         }
         CompletionEvidence::RequiredSectionsPass { path: Some(path) } => {
+            identity.role == ArtifactRole::UsageDocs
+                && normalized_artifact_path_eq(path, &identity.path)
+        }
+        CompletionEvidence::StructuredDataPass { path: Some(path) } => {
+            identity.role == ArtifactRole::DataOutput
+                && normalized_artifact_path_eq(path, &identity.path)
+        }
+        CompletionEvidence::ReportCompletenessPass { path: Some(path) } => {
             identity.role == ArtifactRole::UsageDocs
                 && normalized_artifact_path_eq(path, &identity.path)
         }
@@ -2824,6 +2839,10 @@ fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
             } => roles.push(ArtifactRole::Setup),
             CompletionEvidence::VerifierExitZero { .. } => {}
             CompletionEvidence::RequiredSectionsPass { .. } => roles.push(ArtifactRole::UsageDocs),
+            CompletionEvidence::StructuredDataPass { .. } => roles.push(ArtifactRole::DataOutput),
+            CompletionEvidence::ReportCompletenessPass { .. } => {
+                roles.push(ArtifactRole::UsageDocs)
+            }
             CompletionEvidence::AnswerOnly => {}
         }
     }
@@ -3296,6 +3315,23 @@ mod tests {
     }
 
     #[test]
+    fn docs_report_completeness_pass_satisfies_docs_completion() {
+        let contract = TaskContract::from_request("Update README.md with usage documentation");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::ReportCompletenessPass {
+            path: Some("README.md".to_string()),
+        });
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::UsageDocs]);
+        assert!(!contract.verification_required);
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
     fn docs_only_check_request_reaches_done_without_coding_verifier() {
         let contract =
             TaskContract::from_request("Check and update the README documentation for usage");
@@ -3321,6 +3357,7 @@ mod tests {
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit_path(RepoEditCategory::Impl, "main.py"));
 
+        assert_eq!(contract.task_kind, TaskKind::Coding);
         assert!(contract.verification_required);
         assert_eq!(
             contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
@@ -4224,6 +4261,40 @@ mod tests {
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn data_structured_evidence_satisfies_data_completion() {
+        let contract = TaskContract::from_request(
+            "Generate output.csv with columns Category and Total from the input CSV.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::StructuredDataPass {
+            path: Some("output.csv".to_string()),
+        });
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::DataOutput]);
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
+    fn data_structured_evidence_must_match_required_path() {
+        let contract = TaskContract::from_request(
+            "Generate output.csv with columns Category and Total from the input CSV.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::StructuredDataPass {
+            path: Some("summary.csv".to_string()),
+        });
+
+        assert_eq!(
+            missing_labels(&contract.evaluate_with_owned_test_artifacts(&evidence, &[])),
+            vec!["data_output"]
         );
     }
 
