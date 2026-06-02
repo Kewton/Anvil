@@ -795,8 +795,8 @@ impl Agent {
 pub(in crate::agent::loop_run) mod tests_export {
     use crate::agent::loop_run::pam_advisory::{
         MAX_PAM_DECISION_LIST_LEN, PamAdvisoryDecision, PamAdvisoryDecisionPayload,
-        PamAdvisoryMode, PamCandidateAction, PamCandidateDecision, PamDecisionEffect,
-        ShadowVsLiveDiff, SuppressedSummary, SuppressionReason,
+        PamAdvisoryMode, PamAdvisoryTarget, PamCandidateAction, PamCandidateDecision,
+        PamDecisionEffect, ShadowVsLiveDiff, SuppressedSummary, SuppressionReason,
     };
 
     /// Re-export of `MemoryReport::PAYLOAD_SCHEMA_VERSION` for the
@@ -827,17 +827,21 @@ pub(in crate::agent::loop_run) mod tests_export {
                     PamCandidateDecision {
                         summary_id: "s1".to_string(),
                         action: PamCandidateAction::Inject,
+                        advisory_target: PamAdvisoryTarget::TaskContractCandidateGeneration,
                         inferred_role: Some("test"),
                         suppression_reason: None,
-                        decision_impact: "prompt_context_injected",
+                        unused_reason: None,
+                        decision_impact: "task_contract_candidate_advised",
                         context_excerpt: "tests/foo_test.py".to_string(),
                         context_excerpt_truncated: false,
                     },
                     PamCandidateDecision {
                         summary_id: "s2".to_string(),
                         action: PamCandidateAction::Suppress,
+                        advisory_target: PamAdvisoryTarget::TaskContractCandidateGeneration,
                         inferred_role: Some("implementation"),
                         suppression_reason: Some(SuppressionReason::RoleMismatch),
+                        unused_reason: Some("artifact_role_mismatch"),
                         decision_impact: "artifact_role_mismatch_suppressed",
                         context_excerpt: "src/lib.rs".to_string(),
                         context_excerpt_truncated: false,
@@ -848,7 +852,7 @@ pub(in crate::agent::loop_run) mod tests_export {
                     actual_injected_count: 1,
                     suppressed_count: 1,
                     would_inject_in_live_count: 0,
-                    influenced_decision: "prompt_context_injection",
+                    influenced_decision: "task_contract_candidate_generation",
                 },
             };
             decision.to_json_value()
@@ -869,9 +873,11 @@ pub(in crate::agent::loop_run) mod tests_export {
                 candidate_decisions: vec![PamCandidateDecision {
                     summary_id: "sX".to_string(),
                     action: PamCandidateAction::WouldInjectInLive,
+                    advisory_target: PamAdvisoryTarget::TaskContractCandidateGeneration,
                     inferred_role: Some("test"),
                     suppression_reason: None,
-                    decision_impact: "shadow_counterfactual_not_injected",
+                    unused_reason: None,
+                    decision_impact: "shadow_task_contract_candidate_advised",
                     context_excerpt: "tests/shadow_test.py".to_string(),
                     context_excerpt_truncated: false,
                 }],
@@ -908,7 +914,7 @@ pub(in crate::agent::loop_run) mod tests_export {
                 actual_injected_count: MAX_PAM_DECISION_LIST_LEN as u32,
                 suppressed_count: 0,
                 would_inject_in_live_count: 0,
-                influenced_decision: "prompt_context_injection",
+                influenced_decision: "task_contract_candidate_generation",
             },
         };
         decision.to_json_value()

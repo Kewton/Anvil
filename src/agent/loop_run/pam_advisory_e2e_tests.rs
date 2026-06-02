@@ -263,16 +263,19 @@ fn t17_pam_advisory_decision_payload_schema_pin() {
             {
                 "summary_id": "s1",
                 "action": "inject",
+                "advisory_target": "task_contract_candidate_generation",
                 "inferred_role": "test",
-                "decision_impact": "prompt_context_injected",
+                "decision_impact": "task_contract_candidate_advised",
                 "context_excerpt": "tests/foo_test.py",
                 "context_excerpt_truncated": false
             },
             {
                 "summary_id": "s2",
                 "action": "suppress",
+                "advisory_target": "task_contract_candidate_generation",
                 "inferred_role": "implementation",
                 "suppression_reason": "role_mismatch",
+                "unused_reason": "artifact_role_mismatch",
                 "decision_impact": "artifact_role_mismatch_suppressed",
                 "context_excerpt": "src/lib.rs",
                 "context_excerpt_truncated": false
@@ -283,7 +286,7 @@ fn t17_pam_advisory_decision_payload_schema_pin() {
             "actual_injected_count": 1,
             "suppressed_count": 1,
             "would_inject_in_live_count": 0,
-            "influenced_decision": "prompt_context_injection"
+            "influenced_decision": "task_contract_candidate_generation"
         }
     });
     let live_payload = PamAdvisoryDecisionPayloadShape::sample_live();
@@ -304,8 +307,9 @@ fn t17_pam_advisory_decision_payload_schema_pin() {
             {
                 "summary_id": "sX",
                 "action": "would_inject_in_live",
+                "advisory_target": "task_contract_candidate_generation",
                 "inferred_role": "test",
-                "decision_impact": "shadow_counterfactual_not_injected",
+                "decision_impact": "shadow_task_contract_candidate_advised",
                 "context_excerpt": "tests/shadow_test.py",
                 "context_excerpt_truncated": false
             }
@@ -519,7 +523,11 @@ fn issue849_decision_log_captures_context_and_decision_effect() {
     );
     assert_eq!(
         adopted.get("decision_impact").and_then(|v| v.as_str()),
-        Some("prompt_context_injected")
+        Some("repair_packet_candidate_advised")
+    );
+    assert_eq!(
+        adopted.get("advisory_target").and_then(|v| v.as_str()),
+        Some("repair_packet_candidate_generation")
     );
     assert!(
         adopted
@@ -553,7 +561,7 @@ fn issue849_decision_log_captures_context_and_decision_effect() {
             .get("decision_effect")
             .and_then(|v| v.get("influenced_decision"))
             .and_then(|v| v.as_str()),
-        Some("prompt_context_injection")
+        Some("repair_packet_candidate_generation")
     );
 }
 
@@ -1490,9 +1498,9 @@ fn infer_role_from_view_iter2_boundary_empty_oversize_ctrl_no_panic() {
         None,
         PamAdvisoryModeInput { shadow: false },
     );
-    // Heuristic returns None for items with no role token: axis (1)+(2)
-    // fail-open, so the items are admitted (injected) — NOT suppressed
-    // with RoleMismatch.
+    // Issue #878: no-role-token items are not relevant enough to become
+    // bounded TaskContract / repair candidate input, so they are suppressed
+    // with LowRelevance rather than fail-open injected.
     let suppressed_ids: Vec<&str> = outcome
         .decision
         .suppressed_summary_ids
@@ -1501,8 +1509,8 @@ fn infer_role_from_view_iter2_boundary_empty_oversize_ctrl_no_panic() {
         .collect();
     for id in ["empty-text", "big-no-role", "ctrl-no-role"] {
         assert!(
-            !suppressed_ids.contains(&id),
-            "fail-open: no-role-token item {id} must NOT be suppressed, got: {suppressed_ids:?}"
+            suppressed_ids.contains(&id),
+            "low-relevance no-role-token item {id} must be suppressed, got: {suppressed_ids:?}"
         );
     }
 }
