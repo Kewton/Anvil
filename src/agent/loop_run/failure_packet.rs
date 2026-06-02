@@ -27,6 +27,7 @@ pub(super) struct FailurePacket {
     pub(super) verifier_command: String,
     pub(super) failure_signature: String,
     pub(super) failure_kind: String,
+    pub(super) diagnostic_code: Option<String>,
     pub(super) timeout_kind: Option<FailurePacketTimeoutKind>,
     pub(super) bounded_output_excerpt: String,
     pub(super) affected_cases: Vec<String>,
@@ -174,6 +175,8 @@ impl FailurePacket {
             sanitize_repair_job_text_with_char_cap(verifier_output, MAX_OUTPUT_EXCERPT_CHARS);
         let timeout_kind = timeout_kind_from_output(&bounded_output_excerpt);
         let failure_kind = sanitize_short(failure_kind);
+        let diagnostic_code =
+            structured_diagnostic_code_from_failure_kind(&failure_kind).map(ToString::to_string);
         let affected_cases = affected_cases
             .into_iter()
             .take(MAX_CASES)
@@ -211,6 +214,7 @@ impl FailurePacket {
             ),
             failure_signature,
             failure_kind,
+            diagnostic_code,
             timeout_kind,
             bounded_output_excerpt,
             affected_cases,
@@ -238,6 +242,7 @@ impl FailurePacket {
             "verifier_command": &self.verifier_command,
             "failure_signature": &self.failure_signature,
             "failure_kind": &self.failure_kind,
+            "diagnostic_code": self.diagnostic_code.as_deref(),
             "timeout_kind": self.timeout_kind.map(FailurePacketTimeoutKind::as_str),
             "bounded_output_excerpt": &self.bounded_output_excerpt,
             "affected_cases": &self.affected_cases,
@@ -263,6 +268,20 @@ impl FailurePacket {
                 })
             }).collect::<Vec<_>>(),
         })
+    }
+}
+
+fn structured_diagnostic_code_from_failure_kind(failure_kind: &str) -> Option<&'static str> {
+    match failure_kind {
+        "missing_file" => Some("missing_file"),
+        "invalid_manifest" => Some("invalid_manifest"),
+        "bad_test" | "test_bug" => Some("bad_test"),
+        "wrong_semantics" | "assertion_mismatch" | "assertion_failure" => Some("wrong_semantics"),
+        "evidence_missing" | "missing_verifier_or_config" | "config_or_verifier_error" => {
+            Some("evidence_missing")
+        }
+        "schema_mismatch" | "structured_data_schema_missing" => Some("schema_mismatch"),
+        _ => None,
     }
 }
 
@@ -558,6 +577,25 @@ assertion `left == right` failed
         assert!(packet.observed_expected_pairs.is_empty());
         assert!(!packet.bounded_output_excerpt.is_empty());
         assert_eq!(packet.timeout_kind, None);
+    }
+
+    #[test]
+    fn failure_packet_exposes_structured_diagnostic_code() {
+        let packet = FailurePacket::new(
+            "npm test",
+            "invalid_manifest",
+            "package.json is not valid JSON",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(packet.diagnostic_code.as_deref(), Some("invalid_manifest"));
+        assert_eq!(
+            packet.to_json_value()["diagnostic_code"],
+            serde_json::json!("invalid_manifest")
+        );
     }
 
     #[test]

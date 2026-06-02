@@ -640,7 +640,13 @@ pub(super) fn parse_semantic_failure_report(
 /// failure kind continues through semantic repair planning.
 pub(super) fn dispatch_target(report: &SemanticFailureReport) -> SemanticDispatchTarget {
     match report.failure_kind {
-        VerifierDiagnosticFailureKind::DependencyMissing
+        VerifierDiagnosticFailureKind::MissingFile
+        | VerifierDiagnosticFailureKind::EvidenceMissing
+        | VerifierDiagnosticFailureKind::SchemaMismatch
+        | VerifierDiagnosticFailureKind::WrongSemantics
+        | VerifierDiagnosticFailureKind::BadTest => SemanticDispatchTarget::SemanticRepair,
+        VerifierDiagnosticFailureKind::InvalidManifest
+        | VerifierDiagnosticFailureKind::DependencyMissing
         | VerifierDiagnosticFailureKind::ConfigOrVerifierError => {
             SemanticDispatchTarget::SetupRepair
         }
@@ -652,6 +658,12 @@ pub(super) fn dispatch_target(report: &SemanticFailureReport) -> SemanticDispatc
 /// existing SSOT (`loop_run.rs::VerifierDiagnosticFailureKind::as_str`).
 fn parse_failure_kind(v: &serde_json::Value) -> Option<VerifierDiagnosticFailureKind> {
     Some(match v.as_str()? {
+        "missing_file" => VerifierDiagnosticFailureKind::MissingFile,
+        "invalid_manifest" => VerifierDiagnosticFailureKind::InvalidManifest,
+        "bad_test" => VerifierDiagnosticFailureKind::BadTest,
+        "wrong_semantics" => VerifierDiagnosticFailureKind::WrongSemantics,
+        "evidence_missing" => VerifierDiagnosticFailureKind::EvidenceMissing,
+        "schema_mismatch" => VerifierDiagnosticFailureKind::SchemaMismatch,
         "dependency_missing" => VerifierDiagnosticFailureKind::DependencyMissing,
         "local_import_contract_mismatch" => {
             VerifierDiagnosticFailureKind::LocalImportContractMismatch

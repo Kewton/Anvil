@@ -61,9 +61,11 @@ use super::verifier_driver::classify_verifier_timeout;
 use super::verifier_driver::task_contract_structured_missing_outcome;
 use super::verifier_orchestration::{
     build_task_contract_verifier_exit_zero_evidence,
-    build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
-    repair_terminal_exit_reason, verifier_repair_context_diagnostics,
-    verifier_repair_safe_stop_message, verifier_repair_transition_message,
+    build_task_contract_verifier_exit_zero_evidence_bound,
+    build_task_contract_verifier_exit_zero_evidence_for_task_kind,
+    build_verifier_exit_zero_evidence, repair_terminal_exit_reason,
+    verifier_repair_context_diagnostics, verifier_repair_safe_stop_message,
+    verifier_repair_transition_message,
 };
 use super::work_mode_confirm::{self, WorkModeConfirmOutcome};
 use super::*;
@@ -84,18 +86,19 @@ mod tests {
         PlanExplorationKey, TaskContractVerifierOutcome, answer_only_script_command_allowed,
         answer_only_script_execution_fallback_response, assistant_model_for_mode,
         build_task_contract_verifier_exit_zero_evidence,
-        build_task_contract_verifier_exit_zero_evidence_bound, build_verifier_exit_zero_evidence,
-        classify_verifier_timeout, effective_non_streaming_timeout_secs,
-        latest_tool_result_since_last_user, non_streaming_assistant_reply_timeout_secs,
-        repair_terminal_exit_reason, should_fallback_plan_model_after_timeout,
-        should_materialize_plan_after_timeout,
+        build_task_contract_verifier_exit_zero_evidence_bound,
+        build_task_contract_verifier_exit_zero_evidence_for_task_kind,
+        build_verifier_exit_zero_evidence, classify_verifier_timeout,
+        effective_non_streaming_timeout_secs, latest_tool_result_since_last_user,
+        non_streaming_assistant_reply_timeout_secs, repair_terminal_exit_reason,
+        should_fallback_plan_model_after_timeout, should_materialize_plan_after_timeout,
         should_materialize_plan_after_tool_call_format_error, should_use_streaming_transport,
         task_contract_structured_missing_outcome, verifier_repair_context_from_failure,
     };
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
     use crate::agent::loop_run::failure_packet::FailurePacketTimeoutKind;
     use crate::agent::loop_run::repair_job::RepairTerminalReason;
-    use crate::agent::loop_run::task_contract::SafeStopReason;
+    use crate::agent::loop_run::task_contract::{SafeStopReason, TaskKind};
     use crate::agent::loop_run::verifier_driver::task_contract_verifier_transport_error_to_outcome;
     use crate::modes::plan_act::{ExecutionMode, TaskProfile};
     use crate::session::store::ConversationMessage;
@@ -207,6 +210,21 @@ mod tests {
             }
             other => panic!("expected VerifierExitZero, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_kind_verifier_builder_selects_docs_adapter() {
+        let evidence = build_task_contract_verifier_exit_zero_evidence_for_task_kind(
+            TaskKind::Docs,
+            "docs evidence",
+            None,
+        )
+        .expect("docs verifier evidence");
+
+        assert_eq!(
+            evidence,
+            CompletionEvidence::RequiredSectionsPass { path: None }
+        );
     }
 
     /// VR-β-04 (i): secret-bearing install args are masked before reaching

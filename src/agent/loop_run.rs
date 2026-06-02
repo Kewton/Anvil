@@ -2434,6 +2434,12 @@ enum VerifierRepairAssessmentSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifierDiagnosticFailureKind {
+    MissingFile,
+    InvalidManifest,
+    BadTest,
+    WrongSemantics,
+    EvidenceMissing,
+    SchemaMismatch,
     DependencyMissing,
     LocalImportContractMismatch,
     CompileOrSyntaxError,
@@ -2447,6 +2453,12 @@ enum VerifierDiagnosticFailureKind {
 impl VerifierDiagnosticFailureKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::MissingFile => "missing_file",
+            Self::InvalidManifest => "invalid_manifest",
+            Self::BadTest => "bad_test",
+            Self::WrongSemantics => "wrong_semantics",
+            Self::EvidenceMissing => "evidence_missing",
+            Self::SchemaMismatch => "schema_mismatch",
             Self::DependencyMissing => "dependency_missing",
             Self::LocalImportContractMismatch => "local_import_contract_mismatch",
             Self::CompileOrSyntaxError => "compile_or_syntax_error",
@@ -2459,7 +2471,13 @@ impl VerifierDiagnosticFailureKind {
     }
 
     fn allows_setup_target(self) -> bool {
-        matches!(self, Self::DependencyMissing | Self::ConfigOrVerifierError)
+        matches!(
+            self,
+            Self::DependencyMissing
+                | Self::InvalidManifest
+                | Self::EvidenceMissing
+                | Self::ConfigOrVerifierError
+        )
     }
 }
 
@@ -2896,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_diagnostic_failure_kind_has_8_variants() {
+    fn verifier_diagnostic_failure_kind_has_14_variants() {
         // S1-001: SemanticFailureReport is an upper-layer wrapper that
         // **reuses** the existing 8-variant `VerifierDiagnosticFailureKind`
         // enum. Adding or removing a variant breaks the SSOT invariant
@@ -2904,6 +2922,12 @@ mod tests {
         // enum surface drifts.
         use super::VerifierDiagnosticFailureKind as K;
         let all = [
+            K::MissingFile,
+            K::InvalidManifest,
+            K::BadTest,
+            K::WrongSemantics,
+            K::EvidenceMissing,
+            K::SchemaMismatch,
             K::DependencyMissing,
             K::LocalImportContractMismatch,
             K::CompileOrSyntaxError,
@@ -2917,6 +2941,12 @@ mod tests {
             // Exhaustive match — extension of the enum forces this to
             // be updated (compile-time lock).
             let label: &'static str = match v {
+                K::MissingFile => "missing_file",
+                K::InvalidManifest => "invalid_manifest",
+                K::BadTest => "bad_test",
+                K::WrongSemantics => "wrong_semantics",
+                K::EvidenceMissing => "evidence_missing",
+                K::SchemaMismatch => "schema_mismatch",
                 K::DependencyMissing => "dependency_missing",
                 K::LocalImportContractMismatch => "local_import_contract_mismatch",
                 K::CompileOrSyntaxError => "compile_or_syntax_error",
@@ -2928,6 +2958,6 @@ mod tests {
             };
             assert!(!label.is_empty());
         }
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 14);
     }
 }

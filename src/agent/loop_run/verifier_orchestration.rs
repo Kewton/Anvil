@@ -82,6 +82,7 @@ use super::semantic_repair_planning::{
 use super::summary::ExitReason;
 use super::task_contract::{
     ArtifactRole, CompletionDecision, RecoveryTargetHint, RequestCarryoverKey, TaskContract,
+    TaskKind,
 };
 use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tool_history::focused_edit_target_already_read;
@@ -89,6 +90,7 @@ use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::turn_constants::{
     TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT, TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT,
 };
+use super::verifier::verifier_for_task_kind;
 use super::verifier_assessment_parser::{
     ParsedVerifierRepairAssessment, verifier_failure_type_for_diagnostic_kind,
 };
@@ -852,7 +854,7 @@ pub(super) fn verifier_diagnostic_messages(
         ),
         ConversationMessage::user(format!(
             "Diagnose the verifier failure and choose safe workspace repair targets.\n\
-Allowed failure_kind values: dependency_missing, local_import_contract_mismatch, compile_or_syntax_error, assertion_mismatch, runtime_error, test_bug, config_or_verifier_error, unknown.\n\
+Allowed failure_kind values: missing_file, invalid_manifest, bad_test, wrong_semantics, evidence_missing, schema_mismatch, dependency_missing, local_import_contract_mismatch, compile_or_syntax_error, assertion_mismatch, runtime_error, test_bug, config_or_verifier_error, unknown.\n\
 Allowed probable_cause_role values: implementation, test, setup, usage_docs, unknown.\n\
 Schema: {{\"failure_kind\":\"...\",\"probable_cause_role\":\"...\",\"repair_targets\":[{{\"path\":\"workspace-relative existing file or controller-provided missing setup candidate\",\"confidence\":0.0,\"reason\":\"short bounded reason\"}}],\"repair_plan\":[{{\"target\":\"workspace-relative existing file or controller-provided missing setup candidate\",\"intent\":\"short bounded intent\",\"confidence\":0.0}}],\"secondary_targets\":[\"workspace-relative existing file\"],\"do_not_edit_tests_without_evidence\":true,\"summary\":\"short bounded summary\"}}.\n\
 Also return a compact SemanticFailureReport in the SAME JSON object; keep these fields top-level next to the legacy fields above, not under a wrapper key:\n\
@@ -1396,30 +1398,30 @@ pub(super) fn build_task_contract_verifier_exit_zero_evidence(
     // paths. It records `bound_test_artifacts_count: None`. The structured
     // `AutoTestRunner::run_structured` path goes through
     // `build_task_contract_verifier_exit_zero_evidence_bound(command, n)`.
-    let masked = redact_verifier_command_for_storage(command);
-    if masked.trim().is_empty() {
-        return None;
-    }
-    Some(CompletionEvidence::VerifierExitZero {
-        class: BashCommandClass::BuildTest,
-        command: masked,
-        bound_test_artifacts_count: None,
-    })
+    build_task_contract_verifier_exit_zero_evidence_for_task_kind(TaskKind::Coding, command, None)
 }
 
 pub(super) fn build_task_contract_verifier_exit_zero_evidence_bound(
     command: &str,
     bound_count: usize,
 ) -> Option<CompletionEvidence> {
+    build_task_contract_verifier_exit_zero_evidence_for_task_kind(
+        TaskKind::Coding,
+        command,
+        Some(bound_count),
+    )
+}
+
+pub(super) fn build_task_contract_verifier_exit_zero_evidence_for_task_kind(
+    task_kind: TaskKind,
+    command: &str,
+    bound_count: Option<usize>,
+) -> Option<CompletionEvidence> {
     let masked = redact_verifier_command_for_storage(command);
     if masked.trim().is_empty() {
         return None;
     }
-    Some(CompletionEvidence::VerifierExitZero {
-        class: BashCommandClass::BuildTest,
-        command: masked,
-        bound_test_artifacts_count: Some(bound_count),
-    })
+    Some(verifier_for_task_kind(task_kind).pass_evidence(&masked, bound_count))
 }
 
 #[cfg(test)]

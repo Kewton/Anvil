@@ -3930,6 +3930,12 @@ mod tests {
     #[cfg(test)]
     fn kind_label(kind: VerifierDiagnosticFailureKind) -> &'static str {
         match kind {
+            VerifierDiagnosticFailureKind::MissingFile => "missing_file",
+            VerifierDiagnosticFailureKind::InvalidManifest => "invalid_manifest",
+            VerifierDiagnosticFailureKind::BadTest => "bad_test",
+            VerifierDiagnosticFailureKind::WrongSemantics => "wrong_semantics",
+            VerifierDiagnosticFailureKind::EvidenceMissing => "evidence_missing",
+            VerifierDiagnosticFailureKind::SchemaMismatch => "schema_mismatch",
             VerifierDiagnosticFailureKind::DependencyMissing => "dependency_missing",
             VerifierDiagnosticFailureKind::LocalImportContractMismatch => {
                 "local_import_contract_mismatch"

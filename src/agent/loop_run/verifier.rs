@@ -1,6 +1,8 @@
 use super::completion_evidence::CompletionEvidence;
 use super::failure_packet::{CandidateArtifact, FailurePacket};
-use super::task_contract::{ArtifactRole, TaskKind};
+use super::task_contract::{
+    ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableSchema, TaskKind,
+};
 use crate::tools::bash::BashCommandClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +13,113 @@ pub(super) enum VerifierTaskKind {
     Data,
     Research,
     Ops,
+}
+
+impl VerifierTaskKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Coding => "coding",
+            Self::Docs => "docs",
+            Self::Data => "data",
+            Self::Research => "research",
+            Self::Ops => "ops",
+        }
+    }
+
+    #[allow(dead_code)] // Issue #902 migration surface; exercised by verifier tests.
+    pub(super) fn task_kind(self) -> TaskKind {
+        match self {
+            Self::Coding => TaskKind::Coding,
+            Self::Docs => TaskKind::Docs,
+            Self::Data => TaskKind::Data,
+            Self::Research => TaskKind::Research,
+            Self::Ops => TaskKind::Ops,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VerifierDiagnosticCode {
+    MissingFile,
+    InvalidManifest,
+    BadTest,
+    WrongSemantics,
+    EvidenceMissing,
+    SchemaMismatch,
+}
+
+impl VerifierDiagnosticCode {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingFile => "missing_file",
+            Self::InvalidManifest => "invalid_manifest",
+            Self::BadTest => "bad_test",
+            Self::WrongSemantics => "wrong_semantics",
+            Self::EvidenceMissing => "evidence_missing",
+            Self::SchemaMismatch => "schema_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct VerifierDiagnostic {
+    pub(super) task_kind: VerifierTaskKind,
+    pub(super) code: VerifierDiagnosticCode,
+    pub(super) role: ArtifactRole,
+    pub(super) path: Option<String>,
+    pub(super) message: String,
+}
+
+impl VerifierDiagnostic {
+    fn new(
+        task_kind: VerifierTaskKind,
+        code: VerifierDiagnosticCode,
+        role: ArtifactRole,
+        path: Option<&str>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_kind,
+            code,
+            role,
+            path: path.map(ToString::to_string),
+            message: message.into(),
+        }
+    }
+
+    #[allow(dead_code)] // Issue #902 migration surface; exercised by verifier tests.
+    pub(super) fn to_failure_packet(&self, command: &str, output: &str) -> FailurePacket {
+        let candidate_artifacts = self
+            .path
+            .as_ref()
+            .map(|path| {
+                let reason = format!(
+                    "{} verifier diagnostic: {}",
+                    self.task_kind.as_str(),
+                    self.message
+                );
+                vec![CandidateArtifact::new(self.role, path, &reason)]
+            })
+            .unwrap_or_default();
+        FailurePacket::new(
+            command,
+            self.code.as_str(),
+            output,
+            Vec::new(),
+            Vec::new(),
+            candidate_artifacts,
+            Vec::new(),
+        )
+    }
+
+    pub(super) fn reason(&self) -> String {
+        format!(
+            "structured verifier diagnostic: kind={}, task_kind={}, summary={}",
+            self.code.as_str(),
+            self.task_kind.as_str(),
+            self.message
+        )
+    }
 }
 
 #[allow(dead_code)]
@@ -24,6 +133,19 @@ pub(super) trait Verifier {
     ) -> CompletionEvidence;
 
     fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence>;
+
+    fn diagnostic(&self, artifact: VerifierArtifact<'_>) -> Option<VerifierDiagnostic> {
+        verifier_diagnostic_for_artifact(self.task_kind(), artifact)
+    }
+
+    fn diagnose_obligation(
+        &self,
+        obligation: &ArtifactObligation,
+        excerpt: Option<&str>,
+        path_exists: bool,
+    ) -> Option<VerifierDiagnostic> {
+        verifier_diagnostic_for_obligation_parts(self.task_kind(), obligation, excerpt, path_exists)
+    }
 
     fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket;
 }
@@ -70,6 +192,15 @@ pub(super) fn verifier_for_task_kind(task_kind: TaskKind) -> &'static dyn Verifi
         TaskKind::Research => &RESEARCH_VERIFIER,
         TaskKind::Ops => &OPS_VERIFIER,
     }
+}
+
+pub(super) fn verifier_diagnostic_for_obligation(
+    task_kind: TaskKind,
+    obligation: &ArtifactObligation,
+    excerpt: Option<&str>,
+    path_exists: bool,
+) -> Option<VerifierDiagnostic> {
+    verifier_for_task_kind(task_kind).diagnose_obligation(obligation, excerpt, path_exists)
 }
 
 impl Verifier for CodingVerifier {
@@ -328,6 +459,455 @@ fn generic_verifier_failure_packet(
     )
 }
 
+fn verifier_diagnostic_for_artifact(
+    task_kind: VerifierTaskKind,
+    artifact: VerifierArtifact<'_>,
+) -> Option<VerifierDiagnostic> {
+    let Some(path) = artifact.path else {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::MissingFile,
+            default_role_for_task_kind(task_kind),
+            None,
+            "artifact path is missing",
+        ));
+    };
+    if path.trim().is_empty() {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::MissingFile,
+            default_role_for_task_kind(task_kind),
+            Some(path),
+            "artifact path is empty",
+        ));
+    }
+    if let Some(diagnostic) = manifest_readiness_diagnostic(task_kind, path, artifact.excerpt) {
+        return Some(diagnostic);
+    }
+    if artifact.excerpt.trim().is_empty() {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::EvidenceMissing,
+            role_for_path_or_task_kind(path, task_kind),
+            Some(path),
+            "artifact evidence is empty",
+        ));
+    }
+    match task_kind {
+        VerifierTaskKind::Coding => coding_artifact_diagnostic(task_kind, path, artifact.excerpt),
+        VerifierTaskKind::Docs => (!docs_required_sections_pass(artifact.excerpt)).then(|| {
+            VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                ArtifactRole::UsageDocs,
+                Some(path),
+                "documentation evidence is missing required setup/run/verify coverage",
+            )
+        }),
+        VerifierTaskKind::Data => {
+            data_artifact_diagnostic(task_kind, path, artifact.excerpt, artifact.required_columns)
+        }
+        VerifierTaskKind::Research => (!research_report_pass(artifact.excerpt)).then(|| {
+            VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                ArtifactRole::UsageDocs,
+                Some(path),
+                "research evidence is missing claim/source/limitation coverage",
+            )
+        }),
+        VerifierTaskKind::Ops => (!ops_runbook_pass(artifact.excerpt)).then(|| {
+            VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                ArtifactRole::UsageDocs,
+                Some(path),
+                "ops evidence is missing checklist/validation/rollback/risk coverage",
+            )
+        }),
+    }
+}
+
+fn verifier_diagnostic_for_obligation_parts(
+    task_kind: VerifierTaskKind,
+    obligation: &ArtifactObligation,
+    excerpt: Option<&str>,
+    path_exists: bool,
+) -> Option<VerifierDiagnostic> {
+    if !path_exists {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::MissingFile,
+            obligation.role,
+            Some(&obligation.path),
+            "required deliverable path was not observed",
+        ));
+    }
+    if obligation_requires_manifest_parse(obligation) {
+        let Some(excerpt) = excerpt else {
+            return Some(VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                obligation.role,
+                Some(&obligation.path),
+                "manifest path exists but no parse evidence is available",
+            ));
+        };
+        if let Some(detail) = manifest_readiness_diagnostic(task_kind, &obligation.path, excerpt) {
+            return Some(VerifierDiagnostic::new(
+                task_kind,
+                detail.code,
+                obligation.role,
+                Some(&obligation.path),
+                detail.message,
+            ));
+        }
+    }
+    if let Some(DeliverableSchema::JsonFields(fields)) = obligation.schema.as_ref() {
+        let Some(excerpt) = excerpt else {
+            return Some(VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                obligation.role,
+                Some(&obligation.path),
+                "JSON schema obligation has no field evidence",
+            ));
+        };
+        if !json_fields_present(excerpt, fields) {
+            return Some(VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::SchemaMismatch,
+                obligation.role,
+                Some(&obligation.path),
+                "JSON manifest is missing required field evidence",
+            ));
+        }
+    }
+    if let Some(DeliverableSchema::StructuredRecord(schema)) = obligation.schema.as_ref() {
+        let Some(excerpt) = excerpt else {
+            return Some(VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                obligation.role,
+                Some(&obligation.path),
+                "structured data schema obligation has no parse evidence",
+            ));
+        };
+        if let Some(diagnostic) =
+            data_artifact_diagnostic(task_kind, &obligation.path, excerpt, &schema.columns)
+        {
+            return Some(diagnostic);
+        }
+    }
+    if let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
+        && !sections.is_empty()
+        && let Some(excerpt) = excerpt
+        && (!required_sections_present(excerpt, sections) || !docs_required_sections_pass(excerpt))
+    {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::EvidenceMissing,
+            obligation.role,
+            Some(&obligation.path),
+            "documentation required sections are absent from the observed content",
+        ));
+    }
+    if task_kind == VerifierTaskKind::Coding
+        && obligation.role == ArtifactRole::Test
+        && let Some(excerpt) = excerpt
+        && !contains_test_assertion_shape(excerpt)
+    {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::BadTest,
+            obligation.role,
+            Some(&obligation.path),
+            "test artifact lacks a recognizable assertion or test case shape",
+        ));
+    }
+    if task_kind == VerifierTaskKind::Coding
+        && obligation.role == ArtifactRole::Implementation
+        && let Some(excerpt) = excerpt
+        && implementation_looks_semantically_wrong(excerpt)
+    {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::WrongSemantics,
+            obligation.role,
+            Some(&obligation.path),
+            "implementation artifact still looks placeholder or non-semantic",
+        ));
+    }
+    if task_kind == VerifierTaskKind::Research
+        && let Some(excerpt) = excerpt
+        && !research_report_pass(excerpt)
+    {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::EvidenceMissing,
+            obligation.role,
+            Some(&obligation.path),
+            "research evidence is missing claim/source/limitation coverage",
+        ));
+    }
+    if task_kind == VerifierTaskKind::Ops
+        && let Some(excerpt) = excerpt
+        && !ops_runbook_pass(excerpt)
+    {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::EvidenceMissing,
+            obligation.role,
+            Some(&obligation.path),
+            "ops evidence is missing checklist/validation/rollback/risk coverage",
+        ));
+    }
+    None
+}
+
+fn coding_artifact_diagnostic(
+    task_kind: VerifierTaskKind,
+    path: &str,
+    excerpt: &str,
+) -> Option<VerifierDiagnostic> {
+    if is_test_artifact_path(path) && !contains_test_assertion_shape(excerpt) {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::BadTest,
+            ArtifactRole::Test,
+            Some(path),
+            "test artifact lacks a recognizable assertion or test case shape",
+        ));
+    }
+    None
+}
+
+fn data_artifact_diagnostic(
+    task_kind: VerifierTaskKind,
+    path: &str,
+    excerpt: &str,
+    required_columns: &[String],
+) -> Option<VerifierDiagnostic> {
+    if let Some(message) = structured_data_parse_error(path, excerpt) {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            message,
+        ));
+    }
+    if !structured_data_pass(Some(path), excerpt, required_columns) {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            "structured data evidence is missing required columns or parse-ready records",
+        ));
+    }
+    None
+}
+
+fn manifest_readiness_diagnostic(
+    task_kind: VerifierTaskKind,
+    path: &str,
+    excerpt: &str,
+) -> Option<VerifierDiagnostic> {
+    let normalized = normalize_path_label(path);
+    let message = if normalized == "package.json" {
+        invalid_package_manifest_excerpt_detail(excerpt)
+    } else if normalized == "cargo.toml" {
+        invalid_cargo_manifest_excerpt_detail(excerpt)
+    } else {
+        None
+    }?;
+    Some(VerifierDiagnostic::new(
+        task_kind,
+        VerifierDiagnosticCode::InvalidManifest,
+        ArtifactRole::Setup,
+        Some(path),
+        message,
+    ))
+}
+
+fn obligation_requires_manifest_parse(obligation: &ArtifactObligation) -> bool {
+    obligation.role == ArtifactRole::Setup
+        && matches!(
+            obligation.format,
+            Some(DeliverableFormat::Json | DeliverableFormat::Toml)
+        )
+}
+
+fn json_fields_present(excerpt: &str, fields: &[String]) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(excerpt) else {
+        return false;
+    };
+    fields.iter().all(|field| value.get(field).is_some())
+}
+
+fn required_sections_present(excerpt: &str, sections: &[String]) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    sections.iter().all(|section| {
+        let normalized = section.to_ascii_lowercase();
+        lower.contains(&format!("## {normalized}"))
+            || lower.contains(&format!("# {normalized}"))
+            || lower.contains(&normalized)
+    })
+}
+
+fn implementation_looks_semantically_wrong(excerpt: &str) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "todo",
+            "placeholder",
+            "not implemented",
+            "unimplemented",
+            "dummy",
+        ],
+    )
+}
+
+fn structured_data_parse_error(path: &str, excerpt: &str) -> Option<&'static str> {
+    match path_extension(path).as_deref() {
+        Some("json") => serde_json::from_str::<serde_json::Value>(excerpt)
+            .is_err()
+            .then_some("JSON data artifact is not parse-ready"),
+        Some("jsonl") | Some("ndjson") => excerpt
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .any(|line| serde_json::from_str::<serde_json::Value>(line).is_err())
+            .then_some("JSONL data artifact contains a non-parseable record"),
+        Some("csv") => delimited_header_columns(excerpt, ',')
+            .is_empty()
+            .then_some("CSV data artifact is missing a parse-ready header"),
+        Some("tsv") => delimited_header_columns(excerpt, '\t')
+            .is_empty()
+            .then_some("TSV data artifact is missing a parse-ready header"),
+        _ => None,
+    }
+}
+
+fn invalid_package_manifest_excerpt_detail(excerpt: &str) -> Option<&'static str> {
+    serde_json::from_str::<serde_json::Value>(excerpt)
+        .is_err()
+        .then_some("package.json is not valid JSON")
+}
+
+fn invalid_cargo_manifest_excerpt_detail(excerpt: &str) -> Option<&'static str> {
+    let mut in_package = false;
+    let mut saw_package = false;
+    let mut saw_name = false;
+    for raw_line in excerpt.lines() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.starts_with('[') {
+            if !line.ends_with(']') {
+                return Some("Cargo.toml contains a malformed table header");
+            }
+            in_package = line == "[package]";
+            saw_package |= in_package;
+            continue;
+        }
+        if in_package
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "name"
+        {
+            let Some(value) = parse_toml_string_value(value.trim()) else {
+                return Some("Cargo.toml [package] name is malformed");
+            };
+            saw_name = !value.is_empty();
+        }
+    }
+    if !saw_package {
+        return Some("Cargo.toml does not contain a [package] section");
+    }
+    if !saw_name {
+        return Some("Cargo.toml [package] does not declare a non-empty name");
+    }
+    None
+}
+
+fn parse_toml_string_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !(value.starts_with('"') && value.ends_with('"')) || value.len() < 2 {
+        return None;
+    }
+    Some(value[1..value.len() - 1].trim().to_string())
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(line)
+}
+
+fn default_role_for_task_kind(task_kind: VerifierTaskKind) -> ArtifactRole {
+    match task_kind {
+        VerifierTaskKind::Coding => ArtifactRole::Implementation,
+        VerifierTaskKind::Docs | VerifierTaskKind::Research | VerifierTaskKind::Ops => {
+            ArtifactRole::UsageDocs
+        }
+        VerifierTaskKind::Data => ArtifactRole::DataOutput,
+    }
+}
+
+fn role_for_path_or_task_kind(path: &str, task_kind: VerifierTaskKind) -> ArtifactRole {
+    let normalized = normalize_path_label(path);
+    if normalized == "package.json" || normalized == "cargo.toml" {
+        return ArtifactRole::Setup;
+    }
+    if is_test_artifact_path(path) {
+        return ArtifactRole::Test;
+    }
+    default_role_for_task_kind(task_kind)
+}
+
+fn is_test_artifact_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/tests/")
+        || lower.starts_with("tests/")
+        || lower.contains("__tests__")
+        || lower.contains(".test.")
+        || lower.contains(".spec.")
+        || lower.ends_with("_test.py")
+        || lower.ends_with("test.rs")
+}
+
+fn contains_test_assertion_shape(excerpt: &str) -> bool {
+    let lower = excerpt.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "#[test]",
+            "assert!",
+            "assert_eq!",
+            "assert ",
+            "expect(",
+            "it(",
+            "test(",
+            "pytest",
+        ],
+    )
+}
+
+fn normalize_path_label(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+}
+
+fn path_extension(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
 const USAGE_DOCS_SETUP_MARKERS: &[(&str, bool)] = &[
     ("install", true),
     ("setup", false),
@@ -573,6 +1153,16 @@ mod tests {
     }
 
     #[test]
+    fn docs_verifier_pass_evidence_is_docs_only_not_build_test() {
+        let verifier = DocsVerifier;
+
+        assert_eq!(
+            verifier.pass_evidence("docs evidence", None),
+            CompletionEvidence::RequiredSectionsPass { path: None }
+        );
+    }
+
+    #[test]
     fn verifier_failure_packet_is_task_kind_independent() {
         let verifier = DocsVerifier;
         let packet = verifier.required_sections_failure_packet("README.md", "only title");
@@ -580,6 +1170,42 @@ mod tests {
         assert!(json.get("task_kind").is_none());
         assert_eq!(json["failure_kind"], "required_sections_missing");
         assert_eq!(json["candidate_artifacts"][0]["role"], "usage_docs");
+    }
+
+    #[test]
+    fn coding_verifier_diagnoses_malformed_package_manifest() {
+        let verifier = CodingVerifier;
+        let diagnostic = verifier
+            .diagnostic(VerifierArtifact {
+                path: Some("package.json"),
+                excerpt: r#"{"scripts":"#,
+                required_columns: &[],
+            })
+            .expect("malformed manifest diagnostic");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::InvalidManifest);
+        assert_eq!(diagnostic.role, ArtifactRole::Setup);
+
+        let packet = diagnostic.to_failure_packet("npm test", "package parse failed");
+        let json = packet.to_json_value();
+        assert_eq!(json["failure_kind"], "invalid_manifest");
+        assert_eq!(json["diagnostic_code"], "invalid_manifest");
+        assert_eq!(json["candidate_artifacts"][0]["role"], "setup");
+    }
+
+    #[test]
+    fn coding_verifier_diagnoses_bad_test_artifact() {
+        let verifier = CodingVerifier;
+        let diagnostic = verifier
+            .diagnostic(VerifierArtifact {
+                path: Some("tests/cli.rs"),
+                excerpt: "fn helper() {}",
+                required_columns: &[],
+            })
+            .expect("bad test diagnostic");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::BadTest);
+        assert_eq!(diagnostic.role, ArtifactRole::Test);
     }
 
     #[test]
@@ -616,6 +1242,37 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn data_verifier_diagnoses_malformed_json_before_schema_pass() {
+        let verifier = DataVerifier;
+        let required = vec!["category".to_string(), "total".to_string()];
+        let diagnostic = verifier
+            .diagnostic(VerifierArtifact {
+                path: Some("output.json"),
+                excerpt: r#"{"category":"#,
+                required_columns: &required,
+            })
+            .expect("schema diagnostic");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.role, ArtifactRole::DataOutput);
+    }
+
+    #[test]
+    fn data_verifier_diagnoses_missing_required_column() {
+        let verifier = DataVerifier;
+        let required = vec!["Category".to_string(), "Total".to_string()];
+        let diagnostic = verifier
+            .diagnostic(VerifierArtifact {
+                path: Some("output.csv"),
+                excerpt: "Category,Amount\nA,1\n",
+                required_columns: &required,
+            })
+            .expect("missing column diagnostic");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
     }
 
     #[test]
@@ -671,6 +1328,7 @@ mod tests {
 
         for (task_kind, expected) in cases {
             assert_eq!(verifier_for_task_kind(task_kind).task_kind(), expected);
+            assert_eq!(expected.task_kind(), task_kind);
         }
     }
 
