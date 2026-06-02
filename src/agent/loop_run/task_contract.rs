@@ -95,42 +95,150 @@ pub(super) struct StructuredRecordSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ArtifactObligation {
+pub(super) enum DeliverableFormat {
+    RustSource,
+    JavaScriptSource,
+    TypeScriptSource,
+    Markdown,
+    Toml,
+    Json,
+    Csv,
+    Tsv,
+    JsonLines,
+    Text,
+}
+
+impl DeliverableFormat {
+    fn from_path(path: &str) -> Option<Self> {
+        let lower = path.to_ascii_lowercase();
+        if lower == "cargo.toml" || lower.ends_with(".toml") {
+            return Some(Self::Toml);
+        }
+        if lower == "package.json" || lower.ends_with(".json") {
+            return Some(Self::Json);
+        }
+        if lower.ends_with(".rs") {
+            return Some(Self::RustSource);
+        }
+        if lower.ends_with(".ts") || lower.ends_with(".tsx") {
+            return Some(Self::TypeScriptSource);
+        }
+        if lower.ends_with(".js") || lower.ends_with(".jsx") {
+            return Some(Self::JavaScriptSource);
+        }
+        if lower.ends_with(".md") || lower.ends_with(".mdx") {
+            return Some(Self::Markdown);
+        }
+        if lower.ends_with(".csv") {
+            return Some(Self::Csv);
+        }
+        if lower.ends_with(".tsv") {
+            return Some(Self::Tsv);
+        }
+        if lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
+            return Some(Self::JsonLines);
+        }
+        if lower.ends_with(".txt") || lower.ends_with(".rst") {
+            return Some(Self::Text);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DeliverableSchema {
+    StructuredRecord(StructuredRecordSchema),
+    JsonFields(Vec<String>),
+    RequiredSections(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DeliverableObligation {
     pub(super) role: ArtifactRole,
     pub(super) kind: DeliverableKind,
     pub(super) path: String,
+    pub(super) format: Option<DeliverableFormat>,
+    pub(super) schema: Option<DeliverableSchema>,
     pub(super) required_sections: Vec<String>,
+    pub(super) acceptance_criteria: Vec<String>,
     pub(super) structured_record_schema: Option<StructuredRecordSchema>,
 }
 
-impl ArtifactObligation {
+pub(super) type ArtifactObligation = DeliverableObligation;
+
+impl DeliverableObligation {
     pub(super) fn file(role: ArtifactRole, path: impl Into<String>) -> Self {
+        let path = path.into();
         Self {
             role,
             kind: DeliverableKind::File,
-            path: path.into(),
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: None,
             required_sections: Vec::new(),
+            acceptance_criteria: Vec::new(),
             structured_record_schema: None,
         }
     }
 
     fn readme(path: impl Into<String>, required_sections: Vec<String>) -> Self {
+        let path = path.into();
         Self {
             role: ArtifactRole::UsageDocs,
             kind: DeliverableKind::File,
-            path: path.into(),
-            required_sections,
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: Some(DeliverableSchema::RequiredSections(
+                required_sections.clone(),
+            )),
+            required_sections: required_sections.clone(),
+            acceptance_criteria: required_sections
+                .iter()
+                .map(|section| format!("README includes a {section} section"))
+                .collect(),
             structured_record_schema: None,
         }
     }
 
     fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
+        let path = path.into();
+        let schema = StructuredRecordSchema { columns };
         Self {
             role: ArtifactRole::DataOutput,
             kind: DeliverableKind::StructuredRecord,
-            path: path.into(),
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: Some(DeliverableSchema::StructuredRecord(schema.clone())),
             required_sections: Vec::new(),
-            structured_record_schema: Some(StructuredRecordSchema { columns }),
+            acceptance_criteria: if schema.columns.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "structured output includes columns: {}",
+                    schema.columns.join(", ")
+                )]
+            },
+            structured_record_schema: Some(schema),
+        }
+    }
+
+    fn json_field(
+        role: ArtifactRole,
+        path: impl Into<String>,
+        field: impl Into<String>,
+        criterion: impl Into<String>,
+    ) -> Self {
+        let path = path.into();
+        let field = field.into();
+        Self {
+            role,
+            kind: DeliverableKind::StructuredRecord,
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: Some(DeliverableSchema::JsonFields(vec![field])),
+            required_sections: Vec::new(),
+            acceptance_criteria: vec![criterion.into()],
+            structured_record_schema: None,
         }
     }
 }
@@ -983,10 +1091,50 @@ fn recovery_target_hint_for_missing_with_contract(
         return Some(RecoveryTargetHint {
             role,
             path: identity.path.clone(),
-            reason: "required artifact identity is still missing".to_string(),
+            reason: format!(
+                "required deliverable obligation is still missing: {}",
+                obligation_report_label(identity)
+            ),
         });
     }
     recovery_target_hint_for_missing(artifacts, missing)
+}
+
+fn obligation_report_label(obligation: &ArtifactObligation) -> String {
+    let mut parts = vec![format!(
+        "role={}, kind={}, path={}",
+        obligation.role.label(),
+        obligation.kind.label(),
+        obligation.path
+    )];
+    if !obligation.required_sections.is_empty() {
+        parts.push(format!(
+            "required_sections={}",
+            obligation.required_sections.join("|")
+        ));
+    }
+    if !obligation.acceptance_criteria.is_empty() {
+        parts.push(format!(
+            "acceptance_criteria={}",
+            obligation.acceptance_criteria.join("|")
+        ));
+    }
+    if let Some(DeliverableSchema::JsonFields(fields)) = obligation.schema.as_ref()
+        && !fields.is_empty()
+    {
+        parts.push(format!("schema_fields={}", fields.join("|")));
+    }
+    if let Some(DeliverableSchema::StructuredRecord(schema)) = obligation.schema.as_ref()
+        && !schema.columns.is_empty()
+    {
+        parts.push(format!("schema_columns={}", schema.columns.join("|")));
+    }
+    if let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
+        && !sections.is_empty()
+    {
+        parts.push(format!("schema_sections={}", sections.join("|")));
+    }
+    parts.join(", ")
 }
 
 fn synthesized_missing_role_target_hint(
@@ -1129,12 +1277,18 @@ impl TaskContract {
         for identity in
             inferred_artifact_obligations_from_project_intent(&project_intent, &required)
         {
+            if inferred_obligation_shadowed_by_explicit_identity(
+                &required_artifact_identities,
+                &identity,
+            ) {
+                continue;
+            }
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
-        for identity in inferred_docs_obligations_from_request(&lower, &required) {
+        for identity in inferred_docs_obligations_from_request(request, &lower, &required) {
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
         for identity in inferred_data_obligations_from_request(request, &lower) {
@@ -1570,7 +1724,9 @@ pub(super) fn render_contract_recovery_note_with_hint(
     );
     if let Some(hint) = target_hint {
         note.push_str(&format!(
-            " Recovery target: role={}, path={}, reason={}. Prefer a Write/Edit tool call for this same artifact role now; scaffold-only files do not count until their content changes.",
+            " Missing obligation: role={}, path={}. Recovery target: role={}, path={}, reason={}. Prefer a Write/Edit tool call for this same deliverable obligation now; scaffold-only files do not count until their content changes.",
+            hint.role.label(),
+            hint.path,
             hint.role.label(),
             hint.path,
             hint.reason
@@ -2585,6 +2741,21 @@ fn inferred_artifact_obligations_from_project_intent(
     match project_intent.language.unwrap_or(ProjectLanguage::Unknown) {
         ProjectLanguage::Rust => {
             obligations.push(ArtifactObligation::file(ArtifactRole::Setup, "Cargo.toml"));
+            if matches!(shape, ProjectShape::Cli) {
+                obligations.push(ArtifactObligation::file(
+                    ArtifactRole::Implementation,
+                    "src/main.rs",
+                ));
+                if required_artifacts.contains(&ArtifactRole::Test) {
+                    obligations.push(ArtifactObligation::file(ArtifactRole::Test, "tests/cli.rs"));
+                }
+                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
+                    obligations.push(ArtifactObligation::readme(
+                        "README.md",
+                        default_readme_required_sections(),
+                    ));
+                }
+            }
         }
         ProjectLanguage::Node => {
             obligations.push(ArtifactObligation::file(
@@ -2592,6 +2763,12 @@ fn inferred_artifact_obligations_from_project_intent(
                 "package.json",
             ));
             if matches!(shape, ProjectShape::Cli) {
+                obligations.push(ArtifactObligation::json_field(
+                    ArtifactRole::Setup,
+                    "package.json",
+                    "bin",
+                    "package.json declares a bin entry for the CLI",
+                ));
                 obligations.push(ArtifactObligation::file(
                     ArtifactRole::Implementation,
                     "src/index.js",
@@ -2641,7 +2818,7 @@ fn push_or_merge_artifact_obligation(
 ) {
     let Some(existing) = obligations
         .iter_mut()
-        .find(|existing| existing.role == incoming.role && existing.path == incoming.path)
+        .find(|existing| should_merge_artifact_obligations(existing, &incoming))
     else {
         obligations.push(incoming);
         return;
@@ -2652,12 +2829,53 @@ fn push_or_merge_artifact_obligation(
     if existing.required_sections.is_empty() && !incoming.required_sections.is_empty() {
         existing.required_sections = incoming.required_sections;
     }
+    if existing.acceptance_criteria.is_empty() && !incoming.acceptance_criteria.is_empty() {
+        existing.acceptance_criteria = incoming.acceptance_criteria;
+    }
     if existing.structured_record_schema.is_none() {
         existing.structured_record_schema = incoming.structured_record_schema;
     }
+    if existing.schema.is_none() {
+        existing.schema = incoming.schema;
+    }
+}
+
+fn inferred_obligation_shadowed_by_explicit_identity(
+    existing: &[ArtifactObligation],
+    incoming: &ArtifactObligation,
+) -> bool {
+    matches!(
+        incoming.role,
+        ArtifactRole::Implementation | ArtifactRole::Test
+    ) && existing
+        .iter()
+        .any(|identity| identity.role == incoming.role && identity.path != incoming.path)
+}
+
+fn should_merge_artifact_obligations(
+    existing: &ArtifactObligation,
+    incoming: &ArtifactObligation,
+) -> bool {
+    if existing.role != incoming.role || existing.path != incoming.path {
+        return false;
+    }
+    if existing.role == ArtifactRole::Setup
+        && existing.path == "package.json"
+        && (matches!(
+            existing.schema.as_ref(),
+            Some(DeliverableSchema::JsonFields(_))
+        ) || matches!(
+            incoming.schema.as_ref(),
+            Some(DeliverableSchema::JsonFields(_))
+        ))
+    {
+        return false;
+    }
+    true
 }
 
 fn inferred_docs_obligations_from_request(
+    request: &str,
     lower: &str,
     required_artifacts: &[ArtifactRole],
 ) -> Vec<ArtifactObligation> {
@@ -2667,22 +2885,7 @@ fn inferred_docs_obligations_from_request(
     {
         return Vec::new();
     }
-    let mut sections = Vec::new();
-    if contains_any(lower, &["setup", "install", "dependency", "dependencies"]) {
-        sections.push("setup".to_string());
-    }
-    if contains_any(
-        lower,
-        &["usage", "run", "example", "使い方", "実行", "使用"],
-    ) {
-        sections.push("usage".to_string());
-    }
-    if contains_any(lower, &["test", "verify", "verification", "テスト", "検証"]) {
-        sections.push("test".to_string());
-    }
-    if lower.contains("section") && sections.is_empty() {
-        sections = default_readme_required_sections();
-    }
+    let sections = required_doc_sections_from_request(request);
     if sections.is_empty() {
         return Vec::new();
     }
@@ -3282,6 +3485,98 @@ mod tests {
     }
 
     #[test]
+    fn rust_cli_contract_requires_manifest_impl_test_and_readme_obligations() {
+        let contract = TaskContract::from_request(
+            "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+
+        let manifest = required_obligation(&contract, ArtifactRole::Setup, "Cargo.toml");
+        assert_eq!(manifest.format, Some(DeliverableFormat::Toml));
+        assert_eq!(manifest.kind, DeliverableKind::File);
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Implementation, "src/main.rs").format,
+            Some(DeliverableFormat::RustSource)
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Test, "tests/cli.rs").format,
+            Some(DeliverableFormat::RustSource)
+        );
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+        assert_eq!(readme.format, Some(DeliverableFormat::Markdown));
+        assert_eq!(readme.required_sections, default_readme_required_sections());
+    }
+
+    #[test]
+    fn node_cli_contract_requires_package_bin_source_test_and_readme_obligations() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json with a bin entry, source, tests, and README.md.",
+        );
+        let setup_obligations = contract.required_identities_for_role(ArtifactRole::Setup);
+
+        assert!(
+            setup_obligations
+                .iter()
+                .any(|obligation| obligation.path == "package.json"
+                    && obligation.kind == DeliverableKind::File),
+            "setup_obligations={setup_obligations:?}"
+        );
+        let bin = setup_obligations
+            .iter()
+            .find(|obligation| {
+                obligation.path == "package.json"
+                    && matches!(
+                        obligation.schema.as_ref(),
+                        Some(DeliverableSchema::JsonFields(fields)) if fields.as_slice() == ["bin"]
+                    )
+            })
+            .expect("bin entry obligation");
+        assert_eq!(bin.format, Some(DeliverableFormat::Json));
+        assert!(
+            bin.acceptance_criteria
+                .iter()
+                .any(|criterion| { criterion.contains("bin entry") })
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Implementation, "src/index.js").format,
+            Some(DeliverableFormat::JavaScriptSource)
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Test, "tests/index.test.js").format,
+            Some(DeliverableFormat::JavaScriptSource)
+        );
+        assert!(
+            required_obligation(&contract, ArtifactRole::UsageDocs, "README.md")
+                .acceptance_criteria
+                .iter()
+                .any(|criterion| criterion.contains("setup section"))
+        );
+    }
+
+    #[test]
+    fn docs_only_task_requires_sections_as_deliverable_obligation() {
+        let contract = TaskContract::from_request(
+            "Update README.md with installation, usage, and testing sections.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+        assert_eq!(
+            readme.required_sections,
+            vec![
+                "installation".to_string(),
+                "usage".to_string(),
+                "testing".to_string()
+            ]
+        );
+        assert!(matches!(
+            readme.schema.as_ref(),
+            Some(DeliverableSchema::RequiredSections(sections))
+                if sections == &readme.required_sections
+        ));
+        assert_eq!(readme.acceptance_criteria.len(), 3);
+    }
+
+    #[test]
     fn python_cli_main_py_alone_leaves_tests_and_readme_missing() {
         let contract = TaskContract::from_request(
             "Create a Python CLI in main.py with tests and README.md usage docs.",
@@ -3309,7 +3604,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::Test,
                     path: "tests/test_main.py".to_string(),
-                    reason: "required artifact identity is still missing".to_string(),
+                    reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/test_main.py".to_string(),
                 }),
             }
         );
@@ -3455,7 +3750,7 @@ mod tests {
         )];
         let excerpts = build_excerpts(&[(
             ArtifactRole::UsageDocs,
-            "# Usage\n\n## Setup\nInstall dependencies.\n\n## Usage\nRun the CLI.\n\n## Test\nRun verification checks.\n",
+            "# Usage\n\n## Installation\nInstall dependencies.\n\n## Usage\nRun the CLI.\n\n## Testing\nRun verification checks.\n",
         )]);
         let repair_state = VerifierRepairState::None;
 
@@ -3751,6 +4046,49 @@ mod tests {
     }
 
     #[test]
+    fn recovery_note_identifies_missing_deliverable_obligation_path() {
+        let contract = TaskContract::from_request(
+            "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::changed_at(ArtifactRole::Setup, "Cargo.toml")],
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        let ArtifactRecoveryAction::Continue {
+            missing,
+            target_hint,
+        } = action
+        else {
+            panic!("expected missing obligation action: {action:?}");
+        };
+        let decision = CompletionDecision::Continue { missing };
+        let hint = target_hint.expect("missing obligation target");
+        let note = render_contract_recovery_note_with_hint(
+            &decision,
+            "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
+            1,
+            4,
+            Some(&hint),
+        );
+
+        assert!(note.contains("Missing obligation"), "got: {note}");
+        assert!(note.contains("role=implementation"), "got: {note}");
+        assert!(note.contains("path=src/main.rs"), "got: {note}");
+        assert!(
+            note.contains("required deliverable obligation is still missing"),
+            "got: {note}"
+        );
+    }
+
+    #[test]
     fn readme_only_does_not_complete_implementation_contract() {
         let contract =
             TaskContract::from_request("Rust CLIを作成してREADMEに使い方も書いてください");
@@ -3816,7 +4154,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::Implementation,
                     path: "lru_cache.py".to_string(),
-                    reason: "required artifact identity is still missing".to_string(),
+                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=lru_cache.py".to_string(),
                 }),
             }
         );
@@ -3878,7 +4216,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::Setup,
                     path: "Cargo.toml".to_string(),
-                    reason: "required artifact identity is still missing".to_string(),
+                    reason: "required deliverable obligation is still missing: role=setup, kind=file, path=Cargo.toml".to_string(),
                 }),
             }
         );
@@ -3917,7 +4255,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::Setup,
                     path: "package.json".to_string(),
-                    reason: "required artifact identity is still missing".to_string(),
+                    reason: "required deliverable obligation is still missing: role=setup, kind=file, path=package.json".to_string(),
                 }),
             }
         );
@@ -4157,7 +4495,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::UsageDocs,
                     path: "README.md".to_string(),
-                    reason: "required artifact identity is still missing".to_string(),
+                    reason: "required deliverable obligation is still missing: role=usage_docs, kind=file, path=README.md".to_string(),
                 }),
             }
         );
@@ -4296,7 +4634,7 @@ mod tests {
 
         let complete = build_excerpts(&[(
             ArtifactRole::UsageDocs,
-            "# Project\n\n## Setup\ninstall\n\n## Usage\nrun it\n\n## Test\npytest\n",
+            "# Project\n\n## Installation\ninstall\n\n## Usage\nrun it\n\n## Testing\npytest\n",
         )]);
         assert_eq!(
             plan_artifact_recovery(ArtifactRecoveryInputs {

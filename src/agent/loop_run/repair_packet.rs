@@ -1,6 +1,7 @@
 use super::repair_job::sanitize_repair_job_text_with_char_cap;
 use super::task_contract::{
-    ArtifactObligation, ArtifactRole, DeliverableKind, RecoveryTargetHint, TaskContract, TaskKind,
+    ArtifactObligation, ArtifactRole, DeliverableKind, DeliverableSchema, RecoveryTargetHint,
+    TaskContract, TaskKind,
 };
 
 const MAX_EXPECTED_EVIDENCE_ITEMS: usize = 8;
@@ -80,6 +81,36 @@ pub(super) fn obligation_id_for_parts(role: ArtifactRole, path: Option<&str>) ->
     format!("{}:{path}", role.label())
 }
 
+fn obligation_id_for_obligation(obligation: &ArtifactObligation) -> String {
+    let base = obligation_id_for_parts(obligation.role, Some(&obligation.path));
+    let Some(suffix) = (match obligation.schema.as_ref() {
+        Some(DeliverableSchema::JsonFields(fields)) => fields.first(),
+        _ => None,
+    }) else {
+        return base;
+    };
+    let suffix = suffix
+        .chars()
+        .filter_map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                Some(ch.to_ascii_lowercase())
+            } else if ch.is_ascii_whitespace() || matches!(ch, '-' | '_' | '.') {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .take(40)
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if suffix.is_empty() {
+        base
+    } else {
+        format!("{base}#{suffix}")
+    }
+}
+
 pub(super) fn default_failure_domain_for_obligation(
     obligation: &ArtifactObligation,
 ) -> DeliverableFailureDomain {
@@ -88,6 +119,12 @@ pub(super) fn default_failure_domain_for_obligation(
     }
     if obligation.role == ArtifactRole::DataOutput && obligation.structured_record_schema.is_some()
     {
+        return DeliverableFailureDomain::SchemaMismatch;
+    }
+    if matches!(
+        obligation.schema.as_ref(),
+        Some(DeliverableSchema::JsonFields(_))
+    ) {
         return DeliverableFailureDomain::SchemaMismatch;
     }
     DeliverableFailureDomain::MissingDeliverable
@@ -127,7 +164,7 @@ fn target_from_obligation(
     failure_domain: DeliverableFailureDomain,
 ) -> RepairObligationTarget {
     RepairObligationTarget {
-        obligation_id: obligation_id_for_parts(obligation.role, Some(&obligation.path)),
+        obligation_id: obligation_id_for_obligation(obligation),
         role: obligation.role,
         kind: obligation.kind,
         path: Some(sanitize_repair_job_text_with_char_cap(
@@ -185,6 +222,31 @@ fn expected_evidence_for_obligation(obligation: &ArtifactObligation) -> Vec<Stri
             "required columns: {}",
             schema
                 .columns
+                .iter()
+                .take(MAX_EXPECTED_EVIDENCE_ITEMS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if let Some(DeliverableSchema::JsonFields(fields)) = obligation.schema.as_ref()
+        && !fields.is_empty()
+    {
+        evidence.push(bounded_evidence(format!(
+            "required JSON field(s): {}",
+            fields
+                .iter()
+                .take(MAX_EXPECTED_EVIDENCE_ITEMS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if !obligation.acceptance_criteria.is_empty() {
+        evidence.push(bounded_evidence(format!(
+            "acceptance criteria: {}",
+            obligation
+                .acceptance_criteria
                 .iter()
                 .take(MAX_EXPECTED_EVIDENCE_ITEMS)
                 .cloned()
@@ -316,5 +378,48 @@ mod tests {
         );
         assert_eq!(packet.target.obligation_id, "implementation:main.py");
         assert_eq!(packet.target.role, ArtifactRole::Implementation);
+    }
+
+    #[test]
+    fn node_cli_bin_entry_packet_exposes_json_field_obligation() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json with a bin entry, source, tests, and README.md.",
+        );
+        let obligation = contract
+            .required_artifact_identities
+            .iter()
+            .find(|obligation| {
+                obligation.path == "package.json"
+                    && matches!(
+                        obligation.schema.as_ref(),
+                        Some(DeliverableSchema::JsonFields(fields)) if fields.as_slice() == ["bin"]
+                    )
+            })
+            .expect("bin entry obligation");
+        let packet = RepairPacket::for_obligation(
+            &contract,
+            obligation,
+            default_failure_domain_for_obligation(obligation),
+        );
+
+        assert_eq!(
+            packet.target.failure_domain,
+            DeliverableFailureDomain::SchemaMismatch
+        );
+        assert!(packet.target.obligation_id.contains("package.json#"));
+        assert!(
+            packet
+                .target
+                .expected_evidence
+                .iter()
+                .any(|item| item.contains("required JSON field(s): bin"))
+        );
+        assert!(
+            packet
+                .target
+                .expected_evidence
+                .iter()
+                .any(|item| item.contains("bin entry"))
+        );
     }
 }
