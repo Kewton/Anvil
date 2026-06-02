@@ -4,25 +4,20 @@
 //! artifact-recovery candidates (`meaningful_workspace_files`,
 //! `collect_meaningful_workspace_files`) and the `workspace_appears_empty`
 //! probe used by the empty-workspace scaffold gate. Honours
-//! `task_workspace_scope::is_workspace_ignored_dir` as the SSOT ignore
-//! list.
+//! `WorkspacePolicy` as the SSOT for protected metadata/runtime files.
 //!
 //! `pub(super)` limited / no facade re-export (DR3-001).
 
 use std::path::{Path, PathBuf};
 
-use crate::util::workspace_paths::{WorkspacePathClass, WorkspacePolicy};
+use crate::util::workspace_paths::{WorkspacePathAdmission, WorkspacePolicy};
 
 pub(super) fn workspace_appears_empty(work_root: &Path) -> bool {
     !workspace_contains_user_deliverable(work_root, work_root).unwrap_or(true)
 }
 
 pub(super) fn is_user_deliverable_path(relative_path: &str) -> bool {
-    WorkspacePolicy::default().is_user_deliverable_relative_path(Path::new(relative_path))
-}
-
-pub(super) fn classify_workspace_relative_path(relative: &Path) -> WorkspacePathClass {
-    WorkspacePolicy::default().classify_relative_path(relative)
+    WorkspacePolicy::default().admits_artifact_display_path(relative_path)
 }
 
 fn workspace_contains_user_deliverable(root: &Path, current: &Path) -> std::io::Result<bool> {
@@ -47,7 +42,8 @@ fn workspace_contains_user_deliverable(root: &Path, current: &Path) -> std::io::
         }
         if (file_type.is_file() || file_type.is_symlink())
             && let Ok(relative) = path.strip_prefix(root)
-            && classify_workspace_relative_path(relative) == WorkspacePathClass::UserDeliverable
+            && WorkspacePolicy::default().artifact_admission_decision_relative_path(relative)
+                == WorkspacePathAdmission::Accepted
         {
             return Ok(true);
         }
@@ -83,7 +79,8 @@ fn collect_meaningful_workspace_files(
             collect_meaningful_workspace_files(root, &path, limit, files)?;
         } else if path.is_file()
             && let Ok(relative) = path.strip_prefix(root)
-            && classify_workspace_relative_path(relative) == WorkspacePathClass::UserDeliverable
+            && WorkspacePolicy::default().artifact_admission_decision_relative_path(relative)
+                == WorkspacePathAdmission::Accepted
         {
             files.push(relative.to_path_buf());
             if files.len() > limit {
@@ -109,6 +106,9 @@ mod tests {
         std::fs::write(temp.path().join("postcheck.out"), "postcheck stdout\n").unwrap();
         std::fs::write(temp.path().join("postcheck.err"), "postcheck stderr\n").unwrap();
         std::fs::write(temp.path().join("postcheck.junit.xml"), "<testsuite />\n").unwrap();
+        std::fs::write(temp.path().join("eval.out"), "eval stdout\n").unwrap();
+        std::fs::write(temp.path().join("runtime.log"), "runtime\n").unwrap();
+        std::fs::write(temp.path().join("sidecar.log"), "sidecar\n").unwrap();
         std::fs::write(temp.path().join("session.json"), "{}\n").unwrap();
         std::fs::write(temp.path().join("meta.json"), "{}\n").unwrap();
         std::fs::create_dir_all(temp.path().join("logs")).unwrap();
@@ -132,6 +132,8 @@ mod tests {
         std::fs::write(temp.path().join("anvil.out"), "controller stdout\n").unwrap();
         std::fs::write(temp.path().join("postcheck.err"), "postcheck stderr\n").unwrap();
         std::fs::write(temp.path().join("postcheck.junit.xml"), "<testsuite />\n").unwrap();
+        std::fs::write(temp.path().join("eval.log"), "eval log\n").unwrap();
+        std::fs::write(temp.path().join("runtime.log"), "runtime\n").unwrap();
         std::fs::create_dir_all(temp.path().join("logs")).unwrap();
         std::fs::write(temp.path().join("logs/run.log"), "log\n").unwrap();
         std::fs::create_dir_all(temp.path().join(".anvil")).unwrap();

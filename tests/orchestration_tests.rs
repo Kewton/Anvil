@@ -122,6 +122,11 @@ fn controller_metadata_outputs_are_ignored() {
     std::fs::write(temp.path().join("anvil.err"), "controller stderr\n").unwrap();
     std::fs::write(temp.path().join("postcheck.out"), "postcheck stdout\n").unwrap();
     std::fs::write(temp.path().join("postcheck.err"), "postcheck stderr\n").unwrap();
+    std::fs::write(temp.path().join("postcheck.junit.xml"), "<testsuite />\n").unwrap();
+    std::fs::write(temp.path().join("eval.out"), "eval stdout\n").unwrap();
+    std::fs::write(temp.path().join("eval.err"), "eval stderr\n").unwrap();
+    std::fs::write(temp.path().join("runtime.log"), "runtime log\n").unwrap();
+    std::fs::write(temp.path().join("sidecar.log"), "sidecar log\n").unwrap();
     std::fs::write(temp.path().join("prompt.md"), "task input\n").unwrap();
     std::fs::write(temp.path().join("cmd.txt"), "python calculator.py\n").unwrap();
 

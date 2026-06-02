@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
-use crate::util::workspace_paths::is_ignored_workspace_relative_path;
+use crate::util::workspace_paths::is_workspace_artifact_admitted_relative_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSnapshot {
@@ -137,7 +137,7 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 fn should_skip_path(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
-        .map(is_ignored_workspace_relative_path)
+        .map(|relative| !is_workspace_artifact_admitted_relative_path(relative))
         .unwrap_or(false)
 }
 

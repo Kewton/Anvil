@@ -17,8 +17,11 @@
 //! `pub(super)` limited / no facade re-export (DR3-001).
 
 use super::Agent;
-use crate::logging::log_llm_event;
-use crate::util::workspace_paths::is_ignored_workspace_display_path;
+use crate::logging::{log_llm_event, stable_path_hash};
+use crate::session::feedback::mask_secrets;
+use crate::util::workspace_paths::{
+    WorkspacePathAdmission, artifact_admission_decision_display_path,
+};
 
 /// Issue #659 PR-002 — per-turn reset + observability stamp. Callers
 /// pass `upcoming_turn_index` explicitly so stamp timing is decoupled
@@ -60,7 +63,7 @@ pub(super) fn seed_artifact_ledger_existing(
     role: super::task_contract::ArtifactRole,
     scope: &super::task_workspace_scope::TaskWorkspaceScope,
 ) {
-    if is_ignored_workspace_display_path(relative_path) {
+    if log_policy_rejection(agent, "artifact_ledger_existing", relative_path) {
         return;
     }
     let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&agent.work_root, scope);
@@ -80,7 +83,7 @@ pub(super) fn seed_artifact_ledger_scaffold(
     post_scaffold_delta: bool,
     scope: &super::task_workspace_scope::TaskWorkspaceScope,
 ) {
-    if is_ignored_workspace_display_path(relative_path) {
+    if log_policy_rejection(agent, "artifact_ledger_scaffold", relative_path) {
         return;
     }
     let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&agent.work_root, scope);
@@ -102,7 +105,7 @@ pub(super) fn seed_artifact_ledger_repo_edit(
     role: super::task_contract::ArtifactRole,
     scope: &super::task_workspace_scope::TaskWorkspaceScope,
 ) {
-    if is_ignored_workspace_display_path(relative_path) {
+    if log_policy_rejection(agent, "artifact_ledger_repo_edit", relative_path) {
         return;
     }
     // Write-through adapter (divergence anchor): keep the legacy set
@@ -134,7 +137,7 @@ pub(super) fn seed_artifact_ledger_verifier_observation(
     }
     let ctx = super::artifact_ledger::LedgerAdmissionContext::new(&agent.work_root, scope);
     for path in bound_paths {
-        if is_ignored_workspace_display_path(path) {
+        if log_policy_rejection(agent, "artifact_ledger_verifier_observation", path) {
             continue;
         }
         let _ = agent.artifact_ledger.record_verifier_observation(
@@ -145,6 +148,28 @@ pub(super) fn seed_artifact_ledger_verifier_observation(
                 last_outcome,
             },
         );
+    }
+}
+
+fn log_policy_rejection(agent: &Agent, component: &str, relative_path: &str) -> bool {
+    match artifact_admission_decision_display_path(relative_path) {
+        WorkspacePathAdmission::Accepted => false,
+        WorkspacePathAdmission::Rejected { class, reason } => {
+            let masked = mask_secrets(relative_path);
+            log_llm_event(
+                "agent.workspace_policy.rejected_path",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "turn_index": agent.current_turn_index,
+                    "component": component,
+                    "path_hash": stable_path_hash(&masked),
+                    "path_len": relative_path.len() as u32,
+                    "class": format!("{:?}", class),
+                    "reason": reason.as_str(),
+                }),
+            );
+            true
+        }
     }
 }
 

@@ -70,6 +70,9 @@ fn protected_workspace_metadata_is_hidden_from_normal_discovery() {
     .unwrap();
     fs::write(dir.path().join("cmd.txt"), "anvil run").unwrap();
     fs::write(dir.path().join("anvil.out"), "runtime log").unwrap();
+    fs::write(dir.path().join("eval.out"), "eval log").unwrap();
+    fs::write(dir.path().join("runtime.log"), "runtime log").unwrap();
+    fs::write(dir.path().join("sidecar.log"), "sidecar log").unwrap();
     fs::create_dir_all(dir.path().join(".anvil")).unwrap();
     fs::write(dir.path().join(".anvil/session.json"), "{}").unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -96,6 +99,9 @@ fn protected_workspace_metadata_is_hidden_from_normal_discovery() {
     assert!(!listing.contains("prompt.md"), "got: {listing}");
     assert!(!listing.contains("cmd.txt"), "got: {listing}");
     assert!(!listing.contains("anvil.out"), "got: {listing}");
+    assert!(!listing.contains("eval.out"), "got: {listing}");
+    assert!(!listing.contains("runtime.log"), "got: {listing}");
+    assert!(!listing.contains("sidecar.log"), "got: {listing}");
     assert!(!listing.contains(".anvil"), "got: {listing}");
     assert!(listing.contains("src"), "got: {listing}");
 
@@ -105,6 +111,9 @@ fn protected_workspace_metadata_is_hidden_from_normal_discovery() {
     assert!(!globbed.contains("prompt.md"), "got: {globbed}");
     assert!(!globbed.contains("cmd.txt"), "got: {globbed}");
     assert!(!globbed.contains("anvil.out"), "got: {globbed}");
+    assert!(!globbed.contains("eval.out"), "got: {globbed}");
+    assert!(!globbed.contains("runtime.log"), "got: {globbed}");
+    assert!(!globbed.contains("sidecar.log"), "got: {globbed}");
     assert!(!globbed.contains(".anvil"), "got: {globbed}");
     assert!(globbed.contains("src/main.rs"), "got: {globbed}");
 
