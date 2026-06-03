@@ -312,10 +312,14 @@ mod production_path_tests {
     /// CB-001 fix: sufficient real Writes of the required UsageDocs artifact(s),
     /// observed through the production entry point, promote each artifact to an
     /// accept-tier `ReportCompletenessPass` so the contract evaluates to `Done`
-    /// — with NO manually-injected evidence. (The TRANSLATE_REQUEST yields both
-    /// the source `README.ja.md` and the deliverable `README.md` as UsageDocs
-    /// obligations, so this also pins that the production hook promotes the
-    /// correct path for each obligation in a multi-file Authoring task.)
+    /// — with NO manually-injected evidence.
+    ///
+    /// CB2-001 fix: the TRANSLATE_REQUEST models ONLY the deliverable
+    /// `README.md` as a required UsageDocs identity — the source `README.ja.md`
+    /// is an input and is NOT required. So writing ONLY `README.md` must reach
+    /// `Done`; the source is never written nor observed. (The earlier version of
+    /// this test wrote every path in `required_identities_for_role`, including
+    /// the source, which masked CB2-001.)
     #[test]
     fn authoring_write_promotes_to_accept_tier_pass_in_production() {
         let session_id = unique_session_id("promote");
@@ -325,6 +329,12 @@ mod production_path_tests {
         let contract = TaskContract::from_request(TRANSLATE_REQUEST);
         assert_eq!(contract.task_kind, TaskKind::Authoring);
         let paths = usage_docs_paths(&contract);
+        // CB2-001: the source `README.ja.md` must NOT be a required identity.
+        assert_eq!(
+            paths,
+            vec!["README.md".to_string()],
+            "only the deliverable README.md is a required UsageDocs identity; the source README.ja.md is an input"
+        );
 
         for rel in &paths {
             std::fs::write(work_root.join(rel), SUFFICIENT_BODY).unwrap();
@@ -352,7 +362,102 @@ mod production_path_tests {
                 &[],
             ),
             CompletionDecision::Done,
-            "a sufficient Authoring write through the production path must complete without manual evidence injection"
+            "a sufficient Authoring write of ONLY the deliverable through the production path must complete without manual evidence injection"
+        );
+    }
+
+    /// CB2-001 regression: for `Translate README.ja.md into English and write
+    /// README.md`, the required UsageDocs identities are EXACTLY `["README.md"]`
+    /// — the source/input `README.ja.md` is excluded.
+    #[test]
+    fn translate_models_only_output_as_required_usagedocs() {
+        let contract = TaskContract::from_request(TRANSLATE_REQUEST);
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+        let paths: Vec<String> = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .iter()
+            .map(|id| id.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["README.md".to_string()],
+            "the translation source README.ja.md must not be a required deliverable"
+        );
+    }
+
+    /// CB2-001 regression: a translation reaches `Done` after writing ONLY the
+    /// deliverable `README.md` through the real observation path — the source
+    /// `README.ja.md` is never written nor observed.
+    #[test]
+    fn translate_completes_after_writing_only_output_in_production() {
+        let session_id = unique_session_id("translate-out");
+        let (mut agent, dir) = build_agent(&session_id, TRANSLATE_REQUEST);
+        let work_root = dir.path();
+
+        let contract = TaskContract::from_request(TRANSLATE_REQUEST);
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+
+        // Write & observe ONLY the deliverable; the source is never touched.
+        std::fs::write(work_root.join("README.md"), SUFFICIENT_BODY).unwrap();
+        observe_evidence_from_repo_edit(&mut agent, "README.md");
+
+        assert!(
+            !agent
+                .task_contract_evidence_set_this_turn
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    super::super::completion_evidence::CompletionEvidence::ReportCompletenessPass {
+                        path: Some(p),
+                    } if p == "README.ja.md"
+                )),
+            "the source README.ja.md must never receive an accept-tier pass (it was never written)"
+        );
+
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(
+                &agent.task_contract_evidence_set_this_turn,
+                &[],
+            ),
+            CompletionDecision::Done,
+            "writing only the deliverable README.md must complete the translation"
+        );
+    }
+
+    /// CB2-001 preservation: an in-place single-path authoring request models its
+    /// one path as the required deliverable (no source cue, so it is kept).
+    #[test]
+    fn in_place_authoring_keeps_single_path_required() {
+        let contract = TaskContract::from_request(
+            "Rewrite the intro paragraph in docs/intro.md to be clearer",
+        );
+        let paths: Vec<String> = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .iter()
+            .map(|id| id.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["docs/intro.md".to_string()],
+            "an in-place rewrite keeps its single docs path as the required deliverable"
+        );
+    }
+
+    /// CB2-001 preservation: a true multi-output authoring request keeps BOTH
+    /// docs paths required (neither is a source).
+    #[test]
+    fn multi_output_authoring_keeps_both_paths_required() {
+        let contract = TaskContract::from_request("Write docs/intro.md and docs/faq.md");
+        let mut paths: Vec<String> = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .iter()
+            .map(|id| id.path.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["docs/faq.md".to_string(), "docs/intro.md".to_string()],
+            "a true multi-output authoring request keeps both docs paths required"
         );
     }
 
