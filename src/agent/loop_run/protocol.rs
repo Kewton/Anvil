@@ -173,8 +173,22 @@ impl ProtocolKind {
         }
         match self {
             ProtocolKind::Docs => {
-                policy.project_intent == super::task_contract::CompletionProjectIntent::DocsOnly
-                    && self.accepts(evidence)
+                // Issue #919 (§3.4 / OR-6): admit multi-role Authoring
+                // (ArtifactOnly) but ONLY for docs-shaped passes
+                // (`RequiredSectionsPass`/`ReportCompletenessPass`), so a
+                // non-docs ArtifactOnly evidence (e.g. `StructuredDataPass`) that
+                // somehow reached the Docs protocol is NOT newly admitted. The
+                // dominant single-role docs case stays DocsOnly (unchanged).
+                self.accepts(evidence)
+                    && (policy.project_intent
+                        == super::task_contract::CompletionProjectIntent::DocsOnly
+                        || (policy.project_intent
+                            == super::task_contract::CompletionProjectIntent::ArtifactOnly
+                            && matches!(
+                                evidence,
+                                CompletionEvidence::RequiredSectionsPass { .. }
+                                    | CompletionEvidence::ReportCompletenessPass { .. }
+                            )))
             }
             ProtocolKind::AnswerOnly => {
                 matches!(
@@ -1446,5 +1460,63 @@ mod tests {
         let tests_missing = ProtocolKind::GenericCode
             .evidence_set_missing_shapes_with_context(&env_only, &tests_required_ctx());
         assert!(tests_missing.contains(&"verifier_exit_zero"));
+    }
+
+    // ----- Issue #919: ProtocolKind::Docs multi-role Authoring (§3.4 / OR-6) -----
+
+    fn authoring_multi_role_policy() -> CompletionPolicy {
+        use crate::agent::loop_run::task_contract::{ArtifactRole, TaskIntent, TaskKind};
+        let rb = crate::agent::loop_run::required_behavior::extract("translate and bundle setup");
+        // UsageDocs + Setup → more than one role → ArtifactOnly.
+        CompletionPolicy::from_contract_parts(
+            TaskKind::Authoring,
+            TaskIntent::Build,
+            &[ArtifactRole::UsageDocs, ArtifactRole::Setup],
+            false,
+            &rb,
+        )
+    }
+
+    fn data_artifact_only_policy() -> CompletionPolicy {
+        use crate::agent::loop_run::task_contract::{ArtifactRole, TaskIntent, TaskKind};
+        let rb = crate::agent::loop_run::required_behavior::extract("generate output.csv");
+        CompletionPolicy::from_contract_parts(
+            TaskKind::Data,
+            TaskIntent::Build,
+            &[ArtifactRole::DataOutput],
+            false,
+            &rb,
+        )
+    }
+
+    #[test]
+    fn protocol_docs_admits_multi_file_authoring_artifactonly() {
+        use crate::agent::loop_run::task_contract::CompletionProjectIntent;
+        let policy = authoring_multi_role_policy();
+        assert_eq!(policy.project_intent, CompletionProjectIntent::ArtifactOnly);
+        // Docs-shaped pass is admitted under the relaxed ArtifactOnly branch.
+        assert!(
+            ProtocolKind::Docs.accepts_request_policy_evidence(&policy, &ev_report_completeness())
+        );
+        assert!(
+            ProtocolKind::Docs.accepts_request_policy_evidence(&policy, &ev_required_sections())
+        );
+    }
+
+    #[test]
+    fn protocol_docs_rejects_data_structured_pass() {
+        use crate::agent::loop_run::task_contract::CompletionProjectIntent;
+        let policy = data_artifact_only_policy();
+        assert_eq!(policy.project_intent, CompletionProjectIntent::ArtifactOnly);
+        // OR-6 regression: a StructuredDataPass ArtifactOnly must NOT be admitted
+        // by ProtocolKind::Docs (evidence-variant guard rejects it).
+        let structured = CompletionEvidence::StructuredDataPass {
+            path: Some("output.csv".to_string()),
+            columns: Vec::new(),
+        };
+        assert!(
+            !ProtocolKind::Docs.accepts_request_policy_evidence(&policy, &structured),
+            "Data StructuredDataPass must not be admitted by ProtocolKind::Docs"
+        );
     }
 }

@@ -72,6 +72,40 @@ pub(super) fn suppress_success_verifier_for_context(
     ctx.is_env_setup_only && env_setup_only_satisfied && !ctx.requires_tests
 }
 
+/// Issue #919 (Decision #8 / S5-001): post-loop prose-verifier-free predicate.
+///
+/// A prose deliverable (Authoring / Docs / AnswerOnly-intent) must never
+/// re-enter the coding-verifier demand at the post-loop dispatch site. The SSOT
+/// is the #918-clamped policy fields `!verification_required() &&
+/// !test_execution_required()`; the trailing kind/intent disjunction is a
+/// belt-and-suspenders **positive identification** of prose so the suppression
+/// fires only for recognized prose shapes, not for an incidental zero-verifier
+/// contract. A `debug_assert!` (DR1-007) surfaces any divergence between the
+/// policy fields and the disjunction as a bug rather than papering over it.
+///
+/// This is **distinct** from `suppress_success_verifier_for_context` (EnvSetup
+/// only); both can apply, for different reasons.
+pub(super) fn post_loop_verifier_free_for_prose(contract: &TaskContract) -> bool {
+    use super::task_contract::{CompletionProjectIntent, TaskKind};
+    let policy = &contract.completion_policy;
+    let policy_fields_verifier_free =
+        !policy.verification_required() && !policy.test_execution_required();
+    let is_prose = matches!(contract.task_kind, TaskKind::Authoring | TaskKind::Docs)
+        || matches!(
+            policy.project_intent,
+            CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
+        );
+    // DR1-007: a recognized prose contract MUST already be verifier-free at the
+    // #918-clamped policy fields. If a future change ever produces a prose-shaped
+    // contract that still demands verification, this surfaces the divergence as a
+    // bug rather than letting the disjunction silently mask it.
+    debug_assert!(
+        !is_prose || policy_fields_verifier_free,
+        "a recognized prose contract must be verifier-free at the policy fields"
+    );
+    policy_fields_verifier_free && is_prose
+}
+
 /// Issue #607 (CB-001 fix): pure predicate. True iff the suppression of
 /// post-loop verifier dispatch is **specifically grounded** in EnvSetup
 /// evidence (i.e. the agent actually saw at least one
@@ -304,13 +338,27 @@ impl Agent {
         let suppress_success_verifier =
             suppress_success_verifier_for_context(&ctx, env_setup_only_satisfied);
 
-        let tester_candidate_some =
-            if should_dispatch_success_verifier && !suppress_success_verifier {
-                tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
-            } else {
-                false
-            };
-        let protocol_demands_verifier = !suppress_success_verifier
+        // Issue #919 (Decision #8): prose-aware suppression. When the active
+        // contract is a verifier-free prose deliverable (Authoring / Docs /
+        // AnswerOnly), collapse ALL THREE verifier inputs to false BEFORE they
+        // reach `select_success_verifier` — toggling only
+        // `protocol_demands_verifier` is insufficient because
+        // `select_success_verifier(false, false, true) == Tester` and the
+        // `TesterDelegated` fallback re-calls the raw demand. Non-prose contracts
+        // are unaffected (all three inputs computed exactly as today).
+        let prose_verifier_free = super::task_classification::task_contract_authority(self)
+            .is_some_and(|c| post_loop_verifier_free_for_prose(&c));
+
+        let tester_candidate_some = if !prose_verifier_free
+            && should_dispatch_success_verifier
+            && !suppress_success_verifier
+        {
+            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
+        } else {
+            false
+        };
+        let protocol_demands_verifier = !prose_verifier_free
+            && !suppress_success_verifier
             && self.should_run_auto_test_for_success_with_context(&ctx, env_setup_only_satisfied);
         let session_id = self.session_store.session_id().to_string();
         let model = self.models.main.clone();
@@ -494,7 +542,12 @@ impl Agent {
                 if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
                     let tester_recorded =
                         super::tester_invocation::try_invoke_tester(self, &stats.changed_files);
-                    if !tester_recorded && self.should_run_auto_test_for_success() {
+                    // Issue #919 (Decision #8): also gate the fallback raw demand
+                    // so a prose contract never records NoVerifier feedback here.
+                    if !tester_recorded
+                        && !prose_verifier_free
+                        && self.should_run_auto_test_for_success()
+                    {
                         let frame = build_feedback_for_no_verifier(&self.work_root);
                         self.session.record_feedback_if_unset(frame);
                     }
@@ -1032,6 +1085,40 @@ mod tests {
         assert_eq!(
             recent_successful_bash_commands_since_last_user(&messages),
             vec!["python3 -m pytest".to_string()]
+        );
+    }
+
+    // ----- Issue #919: post-loop prose-verifier-free predicate (Decision #8) -----
+
+    #[test]
+    fn post_loop_prose_predicate_fires_for_prose_kinds() {
+        // Authoring.
+        let authoring = TaskContract::from_request("Translate README.ja.md and write README.md");
+        assert!(post_loop_verifier_free_for_prose(&authoring));
+        // Docs.
+        let docs =
+            TaskContract::from_request("Update README.md with setup, usage, and test sections");
+        assert!(post_loop_verifier_free_for_prose(&docs));
+        // AnswerOnly intent (Explain).
+        let answer = TaskContract::from_request("Explain how the auth flow works");
+        assert!(post_loop_verifier_free_for_prose(&answer));
+    }
+
+    #[test]
+    fn post_loop_prose_predicate_false_for_coding() {
+        let coding = TaskContract::from_request("Implement slugify in Python and add pytest tests");
+        assert!(!post_loop_verifier_free_for_prose(&coding));
+    }
+
+    #[test]
+    fn non_prose_tester_still_dispatches() {
+        // Regression guard (mirrors select_success_verifier_runs_tester_*):
+        // for a non-prose contract, prose_verifier_free is false so the three
+        // inputs are computed as today; with a tester candidate present and no
+        // protocol demand, Tester is still selected.
+        assert_eq!(
+            select_success_verifier(false, false, true),
+            SuccessVerifier::Tester
         );
     }
 }

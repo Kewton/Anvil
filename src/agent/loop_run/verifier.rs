@@ -144,11 +144,26 @@ pub(super) struct ResearchVerifier;
 #[allow(dead_code)]
 pub(super) struct OpsVerifier;
 
+/// Issue #919 (P2 / Decision #3 site #1 / OR-2): a thin verifier strategy whose
+/// `task_kind()` returns `TaskKind::Authoring` (preserving the
+/// `verifier_for_task_kind` round-trip invariant verbatim) and which delegates
+/// `pass_evidence` / `artifact_evidence` / `failure_packet` to the docs
+/// free-fns. The *accept-tier* (min-length / requested-sections) is routed
+/// through `verifier_diagnostic_for_artifact`'s `Authoring` arm and the
+/// obligation-parts semantic branch (`authoring_accept_tier_diagnostic`), not
+/// here. We deliberately do NOT reuse `&DOCS_VERIFIER` because that would make
+/// `verifier_for_task_kind(Authoring).task_kind() == Docs ≠ Authoring`,
+/// breaking the #918 OCP fail-safe round-trip invariant.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub(super) struct AuthoringVerifier;
+
 static CODING_VERIFIER: CodingVerifier = CodingVerifier;
 static DOCS_VERIFIER: DocsVerifier = DocsVerifier;
 static DATA_VERIFIER: DataVerifier = DataVerifier;
 static RESEARCH_VERIFIER: ResearchVerifier = ResearchVerifier;
 static OPS_VERIFIER: OpsVerifier = OpsVerifier;
+static AUTHORING_VERIFIER: AuthoringVerifier = AuthoringVerifier;
 
 #[allow(dead_code)]
 pub(super) fn verifier_for_task_kind(task_kind: TaskKind) -> &'static dyn Verifier {
@@ -158,6 +173,7 @@ pub(super) fn verifier_for_task_kind(task_kind: TaskKind) -> &'static dyn Verifi
         TaskKind::Data => &DATA_VERIFIER,
         TaskKind::Research => &RESEARCH_VERIFIER,
         TaskKind::Ops => &OPS_VERIFIER,
+        TaskKind::Authoring => &AUTHORING_VERIFIER,
     }
 }
 
@@ -188,7 +204,11 @@ pub(super) const fn capability_for(kind: TaskKind) -> TaskCapability {
             kind,
             allows_process_exec: true,
         },
-        TaskKind::Docs | TaskKind::Data | TaskKind::Research | TaskKind::Ops => TaskCapability {
+        TaskKind::Docs
+        | TaskKind::Data
+        | TaskKind::Research
+        | TaskKind::Ops
+        | TaskKind::Authoring => TaskCapability {
             kind,
             allows_process_exec: false,
         },
@@ -223,7 +243,11 @@ impl TaskCapability {
     ) -> bool {
         match self.kind {
             TaskKind::Coding => !verifier_free_document_task,
-            TaskKind::Docs | TaskKind::Data | TaskKind::Research | TaskKind::Ops => false,
+            TaskKind::Docs
+            | TaskKind::Data
+            | TaskKind::Research
+            | TaskKind::Ops
+            | TaskKind::Authoring => false,
         }
     }
 }
@@ -322,6 +346,34 @@ impl DocsVerifier {
             )],
             Vec::new(),
         )
+    }
+}
+
+impl Verifier for AuthoringVerifier {
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Authoring
+    }
+
+    // Issue #919 (Decision #3 site #1): delegate the *how* to the docs
+    // free-fns. `pass_evidence` stays `RequiredSectionsPass` (consistent with
+    // DocsVerifier); the Authoring accept-tier (min-length / requested-sections)
+    // is enforced by `authoring_accept_tier_diagnostic` via the diagnostic path,
+    // not by overriding these strategy methods.
+    fn pass_evidence(
+        &self,
+        _command: &str,
+        _bound_artifacts_count: Option<usize>,
+    ) -> CompletionEvidence {
+        CompletionEvidence::RequiredSectionsPass { path: None }
+    }
+
+    fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
+        DOCS_VERIFIER
+            .required_sections_evidence(artifact.path.map(str::to_string), artifact.excerpt)
+    }
+
+    fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
+        generic_verifier_failure_packet(command, failure_kind, output)
     }
 }
 
@@ -559,6 +611,12 @@ fn verifier_diagnostic_for_artifact(
                 "ops evidence is missing checklist/validation/rollback/risk coverage",
             )
         }),
+        // Issue #919 (Decision #3 site #4 / Decision #4): accept-tier — empty
+        // excerpt already short-circuited at `:521`; this arm enforces min-length
+        // and any user-named sections (NOT the docs setup/run/verify gate).
+        TaskKind::Authoring => {
+            authoring_accept_tier_diagnostic(task_kind, path, artifact.excerpt, &[])
+        }
     }
 }
 
@@ -576,6 +634,28 @@ fn verifier_diagnostic_for_obligation_parts(
             Some(&obligation.path),
             "required deliverable path was not observed",
         ));
+    }
+    // Issue #919 (Decision #4 / DR3-003): the Authoring UsageDocs accept-tier,
+    // shared with the artifact-diagnostic path (`authoring_accept_tier_diagnostic`).
+    // This is the production recovery path (`task_contract.rs` artifact
+    // completion / recovery calls `verifier_diagnostic_for_obligation`). When
+    // the path exists but no excerpt is available yet, we cannot prove the
+    // accept-tier, so we report it missing (consistent with the docs path).
+    if task_kind == TaskKind::Authoring && obligation.role == ArtifactRole::UsageDocs {
+        let Some(excerpt) = excerpt else {
+            return Some(VerifierDiagnostic::new(
+                task_kind,
+                VerifierDiagnosticCode::EvidenceMissing,
+                obligation.role,
+                Some(&obligation.path),
+                "authoring artifact is too short or missing requested sections",
+            ));
+        };
+        let sections = match obligation.schema.as_ref() {
+            Some(DeliverableSchema::RequiredSections(sections)) => sections.as_slice(),
+            _ => &[],
+        };
+        return authoring_accept_tier_diagnostic(task_kind, &obligation.path, excerpt, sections);
     }
     if obligation_requires_manifest_parse(obligation) {
         let Some(excerpt) = excerpt else {
@@ -780,14 +860,37 @@ fn json_fields_present(excerpt: &str, fields: &[String]) -> bool {
     fields.iter().all(|field| value.get(field).is_some())
 }
 
+/// Issue #919 (Decision #6): OR-tolerant user-named section gate.
+///
+/// Softened from pure-AND (`.all()`) to **M-of-N (majority)** while preserving
+/// the empty-list pass semantics: an empty list is still a pass (same as
+/// `.all()`), `N=1` still requires that section (unchanged), and for `N=2` a
+/// single hit now passes (was 2). This *loosens* completion (fewer
+/// false-negatives) and never tightens. It is the single SSOT for the M-of-N
+/// predicate — the Authoring accept tier (`authoring_accept_tier_diagnostic`)
+/// calls this rather than re-implementing the majority logic inline. The
+/// `docs_required_sections_pass` `categories>=2` gate and the
+/// `verifier_diagnostic_for_obligation_parts` `:639` composition are unchanged.
 fn required_sections_present(excerpt: &str, sections: &[String]) -> bool {
+    if sections.is_empty() {
+        return true;
+    }
     let lower = excerpt.to_ascii_lowercase();
-    sections.iter().all(|section| {
-        let normalized = section.to_ascii_lowercase();
-        lower.contains(&format!("## {normalized}"))
-            || lower.contains(&format!("# {normalized}"))
-            || lower.contains(&normalized)
-    })
+    let hits = sections
+        .iter()
+        .filter(|section| section_present(&lower, section))
+        .count();
+    hits * 2 >= sections.len()
+}
+
+/// Per-section presence check (the historical `## {n}` / `# {n}` / substring
+/// logic), extracted from `required_sections_present` so the M-of-N predicate
+/// has a single per-section SSOT. `lower` must already be lowercased.
+fn section_present(lower: &str, section: &str) -> bool {
+    let normalized = section.to_ascii_lowercase();
+    lower.contains(&format!("## {normalized}"))
+        || lower.contains(&format!("# {normalized}"))
+        || lower.contains(&normalized)
 }
 
 fn implementation_looks_semantically_wrong(excerpt: &str) -> bool {
@@ -880,7 +983,9 @@ fn strip_toml_comment(line: &str) -> &str {
 fn default_role_for_task_kind(task_kind: TaskKind) -> ArtifactRole {
     match task_kind {
         TaskKind::Coding => ArtifactRole::Implementation,
-        TaskKind::Docs | TaskKind::Research | TaskKind::Ops => ArtifactRole::UsageDocs,
+        TaskKind::Docs | TaskKind::Research | TaskKind::Ops | TaskKind::Authoring => {
+            ArtifactRole::UsageDocs
+        }
         TaskKind::Data => ArtifactRole::DataOutput,
     }
 }
@@ -938,6 +1043,48 @@ fn path_extension(path: &str) -> Option<String> {
         .extension()
         .and_then(|ext| ext.to_str())
         .map(str::to_ascii_lowercase)
+}
+
+/// Issue #919 (Decision #4 / OR-4): minimum trimmed content length (in chars)
+/// for an Authoring accept-tier artifact. Dedicated SSOT — do NOT reuse an
+/// unrelated cap. Lowered to 24 (from a proposed 64) so a legitimate
+/// one-sentence translation (e.g. "Run the server.") is not false-negatived,
+/// while stubs ("TODO", "see above", "placeholder") are still rejected. The
+/// empty/whitespace short-circuit at `verifier_diagnostic_for_artifact:521`
+/// already covers truly empty artifacts.
+pub(super) const AUTHORING_MIN_CONTENT_CHARS: usize = 24;
+
+/// Issue #919 (Decision #4 / DR3-003): shared accept-tier predicate for
+/// `TaskKind::Authoring`. Called from BOTH `verifier_diagnostic_for_artifact`'s
+/// `Authoring` arm AND the `verifier_diagnostic_for_obligation_parts` Authoring
+/// UsageDocs semantic branch (the production recovery path).
+///
+/// It enforces only the accept-tier:
+/// 1. min trimmed length (`AUTHORING_MIN_CONTENT_CHARS`); and
+/// 2. if the user named sections, the **shared** Decision #6-softened
+///    `required_sections_present` (M-of-N) — it does NOT re-implement the
+///    majority logic inline and does NOT apply the docs `categories>=2` gate.
+///
+/// The diagnostic message is a static string (no path / section / excerpt
+/// interpolation — Security §5).
+pub(super) fn authoring_accept_tier_diagnostic(
+    task_kind: TaskKind,
+    path: &str,
+    excerpt: &str,
+    sections: &[String],
+) -> Option<VerifierDiagnostic> {
+    let too_short = excerpt.trim().chars().count() < AUTHORING_MIN_CONTENT_CHARS;
+    let missing_sections = !required_sections_present(excerpt, sections);
+    if too_short || missing_sections {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::EvidenceMissing,
+            ArtifactRole::UsageDocs,
+            Some(path),
+            "authoring artifact is too short or missing requested sections",
+        ));
+    }
+    None
 }
 
 const USAGE_DOCS_SETUP_MARKERS: &[(&str, bool)] = &[
@@ -1161,6 +1308,7 @@ mod tests {
             TaskKind::Data,
             TaskKind::Research,
             TaskKind::Ops,
+            TaskKind::Authoring,
         ] {
             assert!(
                 !capability_for(kind).allows_process_exec(),
@@ -1184,6 +1332,7 @@ mod tests {
             TaskKind::Data,
             TaskKind::Research,
             TaskKind::Ops,
+            TaskKind::Authoring,
         ] {
             assert!(!capability_for(kind).requires_executable_verifier(false));
             assert!(!capability_for(kind).requires_executable_verifier(true));
@@ -1193,6 +1342,9 @@ mod tests {
     // `capability_for` / `allows_process_exec` are `const fn`: assert const-eval works.
     const _CODING_CAP: TaskCapability = capability_for(TaskKind::Coding);
     const _CODING_EXEC: bool = _CODING_CAP.allows_process_exec();
+    // Issue #919: const-eval pin for the new Authoring kind.
+    const _AUTHORING_CAP: TaskCapability = capability_for(TaskKind::Authoring);
+    const _AUTHORING_EXEC: bool = _AUTHORING_CAP.allows_process_exec();
 
     #[test]
     fn docs_required_sections_pass_becomes_completion_evidence() {
@@ -1400,6 +1552,7 @@ mod tests {
             TaskKind::Data,
             TaskKind::Research,
             TaskKind::Ops,
+            TaskKind::Authoring,
         ];
 
         for task_kind in cases {
@@ -1452,5 +1605,84 @@ mod tests {
                 path: Some("runbook.md".to_string()),
             })
         );
+    }
+
+    // ----- Issue #919: accept-tier predicate (Decision #4) -----
+
+    #[test]
+    fn authoring_accept_tier_rejects_stub() {
+        let diag = authoring_accept_tier_diagnostic(TaskKind::Authoring, "README.md", "TODO", &[]);
+        let diag = diag.expect("stub must produce a diagnostic");
+        assert_eq!(diag.code, VerifierDiagnosticCode::EvidenceMissing);
+        assert_eq!(diag.role, ArtifactRole::UsageDocs);
+    }
+
+    #[test]
+    fn authoring_accept_tier_accepts_one_sentence() {
+        // >= 24 chars but < 64 — guards against an over-high floor (OR-4).
+        let excerpt = "This document describes setup.";
+        assert!(excerpt.chars().count() >= AUTHORING_MIN_CONTENT_CHARS);
+        assert!(excerpt.chars().count() < 64);
+        assert!(
+            authoring_accept_tier_diagnostic(TaskKind::Authoring, "README.md", excerpt, &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authoring_accept_tier_requested_sections_or_tolerant() {
+        // 1-of-2 named sections present → accepted via the shared softened
+        // `required_sections_present` (M-of-N), NOT a re-implemented inline gate.
+        let sections = vec!["overview".to_string(), "details".to_string()];
+        let excerpt = "## Overview\nThis is a sufficiently long overview paragraph.\n";
+        assert!(
+            authoring_accept_tier_diagnostic(TaskKind::Authoring, "README.md", excerpt, &sections)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authoring_obligation_diagnostic_uses_accept_tier() {
+        // DR3-003: the obligation-parts path runs the same accept tier. A stub
+        // excerpt at an existing path yields the static authoring diagnostic.
+        let obligation = ArtifactObligation::file(ArtifactRole::UsageDocs, "README.md".to_string());
+        let diag = verifier_diagnostic_for_obligation_parts(
+            TaskKind::Authoring,
+            &obligation,
+            Some("TODO"),
+            true,
+        );
+        let diag = diag.expect("stub obligation must produce a diagnostic");
+        assert_eq!(diag.code, VerifierDiagnosticCode::EvidenceMissing);
+        // A real paragraph passes the accept tier (no diagnostic).
+        assert!(
+            verifier_diagnostic_for_obligation_parts(
+                TaskKind::Authoring,
+                &obligation,
+                Some("This document describes the setup and usage of the project clearly."),
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    // ----- Issue #919: M-of-N required_sections_present (Decision #6) -----
+
+    #[test]
+    fn required_sections_present_empty_is_true() {
+        assert!(required_sections_present("anything", &[]));
+    }
+
+    #[test]
+    fn required_sections_present_majority_passes() {
+        let two = vec!["overview".to_string(), "details".to_string()];
+        // 1-of-2 present now passes (was all-or-nothing).
+        assert!(required_sections_present("## Overview\nstuff\n", &two));
+        // 0-of-2 fails.
+        assert!(!required_sections_present("nothing relevant here", &two));
+        // N=1 still requires that section (unchanged from `.all()`).
+        let one = vec!["usage".to_string()];
+        assert!(required_sections_present("## Usage\nrun it\n", &one));
+        assert!(!required_sections_present("no section", &one));
     }
 }

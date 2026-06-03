@@ -38,7 +38,18 @@ KEYWORDS_VERSION = 1
 
 WRITE_EDIT_TOOLS = ["Write", "Edit"]
 DEFAULT_TASK_KIND = "coding"
-KNOWN_TASK_KINDS = {"coding", "docs", "data", "research", "ops"}
+KNOWN_TASK_KINDS = {
+    "coding",
+    "docs",
+    "data",
+    "research",
+    "ops",
+    # Issue #919 (P2): production TaskKind for artifact-producing prose
+    # (translation / rewriting). `answer_only` is an eval-only label (Option B:
+    # no production TaskKind::AnswerOnly) for pure-answer tasks.
+    "authoring",
+    "answer_only",
+}
 KNOWN_FAILURE_AUTHORITIES = {
     "contract_extraction",
     "artifact_classification",
@@ -482,6 +493,12 @@ def _suffix(path: str) -> str:
 
 
 def _postcheck_success(task_kind: str, artifacts: list[str]) -> tuple[bool | None, str]:
+    # Issue #919 (P2): a pure-answer task is artifact-optional, so it must
+    # short-circuit BEFORE the `if not artifacts` failure below — a prose answer
+    # with zero artifacts must not be failed.
+    if task_kind == "answer_only":
+        return None, "answer_only_no_artifact_required"
+
     if not artifacts:
         return False, "no_user_artifact"
 
@@ -497,6 +514,13 @@ def _postcheck_success(task_kind: str, artifacts: list[str]) -> tuple[bool | Non
             p.startswith("docs/") for p in lowered
         )
         return ok, "docs_artifact" if ok else "missing_docs_artifact"
+
+    # Issue #919 (P2): authoring produces a docs-shaped artifact (mirror docs).
+    if task_kind == "authoring":
+        ok = any(ext in DOC_EXTS for ext in suffixes) or any(
+            p.startswith("docs/") for p in lowered
+        )
+        return ok, "authoring_artifact" if ok else "missing_authoring_artifact"
 
     if task_kind == "data":
         ok = any(ext in DATA_EXTS for ext in suffixes) or any(
