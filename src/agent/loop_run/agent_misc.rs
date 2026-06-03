@@ -36,8 +36,11 @@ pub(super) fn refresh_artifact_completion_satisfied(agent: &mut Agent) {
     if agent.artifact_completion_job.is_none() {
         return;
     }
-    let task_contract = match super::workspace_access::active_request_text(agent) {
-        Some(req) => super::task_contract::TaskContract::from_request(&req),
+    // Issue #917: read the per-turn classification authority instead of
+    // recomputing. `None` (no current-turn request) keeps the legacy early
+    // return. `&Rc<TaskContract>` deref-coerces to `&TaskContract`.
+    let task_contract = match super::task_classification::task_contract_authority(agent) {
+        Some(contract) => contract,
         None => return,
     };
     let projection = agent

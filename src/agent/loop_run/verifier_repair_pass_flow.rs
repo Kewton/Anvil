@@ -152,7 +152,14 @@ pub(super) fn prepare_verifier_repair_pass(
         return Err(VerifierRepairPassOutcome::Skipped);
     };
     let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
-    let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+    // Issue #917: per-turn classification authority (None → empty-input
+    // contract, matching the legacy `unwrap_or_default`).
+    let task_contract =
+        super::task_classification::task_contract_authority(agent).unwrap_or_else(|| {
+            std::rc::Rc::new(super::task_contract::TaskContract::from_request(
+                &active_request,
+            ))
+        });
     let behavior_projection = super::required_behavior::project_behavior_contract(&task_contract);
     super::active_job_emit::emit_behavior_contract_projected_if_changed(
         agent,

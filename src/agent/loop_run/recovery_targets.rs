@@ -104,9 +104,12 @@ pub(super) fn push_verifier_repair_recovery_note(agent: &mut Agent, attempt: usi
             // Issue #665 Phase 5: caller-side projection (S5-005 では
             // raw label/excerpt は system note に出さないため helper
             // 内部で metadata のみに縮退する)。
-            let active_request =
-                super::workspace_access::active_request_text(agent).unwrap_or_default();
-            let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+            // Issue #917: per-turn classification authority (None → empty-input
+            // contract, matching the legacy `unwrap_or_default`).
+            let task_contract = super::task_classification::task_contract_authority(agent)
+                .unwrap_or_else(|| {
+                    std::rc::Rc::new(super::task_contract::TaskContract::from_request(""))
+                });
             let behavior_projection =
                 super::required_behavior::project_behavior_contract(&task_contract);
             let note =

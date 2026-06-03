@@ -158,8 +158,11 @@ pub(super) fn verifier_repair_policy_message(
 }
 
 fn verifier_repair_diagnostic_policy_message(agent: &Agent) -> String {
-    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
-    let task_contract = super::task_contract::TaskContract::from_request(&active_request);
+    // Issue #917: per-turn classification authority. Preserve the legacy
+    // `unwrap_or_default()` semantics: a missing request maps to the empty-input
+    // contract (`from_request("")`).
+    let task_contract = super::task_classification::task_contract_authority(agent)
+        .unwrap_or_else(|| std::rc::Rc::new(super::task_contract::TaskContract::from_request("")));
     let behavior_projection = super::required_behavior::project_behavior_contract(&task_contract);
     agent
         .repair_job

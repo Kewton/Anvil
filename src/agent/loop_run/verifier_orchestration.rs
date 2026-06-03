@@ -2208,10 +2208,10 @@ pub(super) fn verifier_repair_pass_client(
 pub(super) fn task_contract_verifier_test_binding(
     agent: &mut Agent,
 ) -> (Vec<String>, bool, Option<TaskWorkspaceScope>) {
-    let Some(request) = super::workspace_access::active_request_text(agent) else {
+    // Issue #917: per-turn classification authority (None → no binding).
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
         return (Vec::new(), false, None);
     };
-    let contract = TaskContract::from_request(&request);
     let test_execution_required = contract.completion_policy.test_execution_required();
     let owned_test_artifacts =
         super::owned_test_projection::owned_test_artifacts_for_verifier(agent, &contract);
@@ -3220,7 +3220,14 @@ pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnos
     let correction_packet = if active_request.trim().is_empty() {
         None
     } else {
-        let contract = super::task_contract::TaskContract::from_request(&active_request);
+        // Issue #917: per-turn classification authority (fallback to the
+        // non-empty active_request keeps behavior in the unlikely None case).
+        let contract =
+            super::task_classification::task_contract_authority(agent).unwrap_or_else(|| {
+                std::rc::Rc::new(super::task_contract::TaskContract::from_request(
+                    &active_request,
+                ))
+            });
         assessment.repair_target_hint.as_ref().map(|hint| {
             super::repair_packet::RepairPacket::for_diagnostic_failure(
                 &contract,

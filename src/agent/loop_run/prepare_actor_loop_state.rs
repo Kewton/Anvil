@@ -119,8 +119,11 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     // Issue #638 (Task 1.4): clear the turn-local failure snapshot at the
     // same boundary as `repair_job` (design policy §5, A-only).
     agent.repair_failure_snapshot = None;
-    let task_contract = super::workspace_access::active_request_text(agent)
-        .map(|request| TaskContract::from_request(&request));
+    // Issue #917: read the per-turn classification authority. This fn returns
+    // an owned `Option<TaskContract>`, so clone out of the `Rc` (classification
+    // is still computed exactly once — only the result is cloned).
+    let task_contract =
+        super::task_classification::task_contract_authority(agent).map(|rc| (*rc).clone());
     if agent.session.mode_state.mode != ExecutionMode::Plan
         && let Some(contract) = task_contract.as_ref()
     {

@@ -71,7 +71,12 @@ pub(super) fn resolve_current_role_for_safe_stop(
     }
     let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
     if !request.is_empty() {
-        let contract = super::task_contract::TaskContract::from_request(&request);
+        // Issue #917: per-turn classification authority (fallback preserves the
+        // non-empty-request behavior in the unlikely None case).
+        let contract =
+            super::task_classification::task_contract_authority(agent).unwrap_or_else(|| {
+                std::rc::Rc::new(super::task_contract::TaskContract::from_request(&request))
+            });
         if let Some(role) = contract.required_artifacts.first().copied() {
             return Some(role);
         }
@@ -356,7 +361,12 @@ fn repair_terminal_obligation_targets(
     if request.is_empty() {
         return Vec::new();
     }
-    let contract = super::task_contract::TaskContract::from_request(&request);
+    // Issue #917: per-turn classification authority (fallback preserves the
+    // non-empty-request behavior in the unlikely None case).
+    let contract =
+        super::task_classification::task_contract_authority(agent).unwrap_or_else(|| {
+            std::rc::Rc::new(super::task_contract::TaskContract::from_request(&request))
+        });
     super::repair_packet::repair_packets_for_contract(&contract)
         .into_iter()
         .map(|packet| packet.target)

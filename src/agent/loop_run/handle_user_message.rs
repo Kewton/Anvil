@@ -32,6 +32,11 @@ pub(super) fn handle_user_message(
     // user message — reset here so a fresh handle_user_message can fire
     // the Reminder once even if the previous turn already did.
     agent.reminder_called_this_turn = false;
+    // Issue #917 (P0.5): reset the per-turn task-classification authority so a
+    // fresh turn re-classifies its own request. Eager-populated in `run_turn`
+    // right after `push_user_message`. (The unified confirm cap is reset in
+    // `process_line`, not here — see `work_mode_confirm_called_this_turn`.)
+    agent.task_contract_this_turn = std::cell::OnceCell::new();
     // Issue #646 (C1): per-turn ownership reset. Each user turn starts a
     // fresh task — prior-turn edits do NOT auto-confer ownership on the
     // new task. Clearing here also wipes the MissingVerifierJob so
