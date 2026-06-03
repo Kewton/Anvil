@@ -1086,6 +1086,12 @@ mod behavior_contract_projection_e2e_tests;
 // (CB-001 / DR3-001) — production binary excludes this module, no facade re-export.
 #[cfg(test)]
 mod data_capability_e2e_tests;
+// Issue #923 (P6): in-crate E2E test module for the Ops capability — the
+// OpsRunbook obligation bridge + tiered `ops_runbook_pass` through the
+// production `verifier_diagnostic_for_obligation` path. `#[cfg(test)]` keeps it
+// out of the production binary; the explicit `mod` is required (no auto-discovery).
+#[cfg(test)]
+mod ops_capability_e2e_tests;
 mod summary;
 mod task_contract;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
