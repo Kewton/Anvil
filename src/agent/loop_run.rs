@@ -746,6 +746,12 @@ mod job_report_e2e_tests;
 // precedent). Production binary does not include this module (DR3-001).
 #[cfg(test)]
 mod bash_policy_e2e_tests;
+// Issue #922 (P5): in-crate `#[cfg(test)]` E2E suite for the Research
+// capability — obligation-bridge reachability, OR-tolerant acceptance,
+// answer-only non-regression, and Docs/Ops non-regression. Production binary
+// does not include this module (DR3-001 / CB-001 pattern).
+#[cfg(test)]
+mod research_acceptance_e2e_tests;
 // Issue #667: PAM advisory adapter SSOT (pure functions + decision types).
 // Module is intentionally *not* re-exported (DR3-001) — `turn.rs` is the
 // only behavioral in-crate consumer via the `record_pam_advisory_decision`

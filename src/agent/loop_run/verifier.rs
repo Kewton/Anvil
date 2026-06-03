@@ -123,6 +123,11 @@ pub(super) struct VerifierArtifact<'a> {
     pub(super) path: Option<&'a str>,
     pub(super) excerpt: &'a str,
     pub(super) required_columns: &'a [String],
+    /// Issue #922 (P5 / DR2-001): obligation-derived required sections, mirroring
+    /// `required_columns`. Read by the research acceptance predicate so the
+    /// artifact-evidence path and the obligation path share one input contract.
+    /// Empty slice = no fixed sections (open-ended).
+    pub(super) required_sections: &'a [String],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -416,7 +421,11 @@ impl Verifier for ResearchVerifier {
     }
 
     fn artifact_evidence(&self, artifact: VerifierArtifact<'_>) -> Option<CompletionEvidence> {
-        self.research_report_evidence(artifact.path.map(str::to_string), artifact.excerpt)
+        self.research_report_evidence(
+            artifact.path.map(str::to_string),
+            artifact.excerpt,
+            artifact.required_sections,
+        )
     }
 
     fn failure_packet(&self, command: &str, failure_kind: &str, output: &str) -> FailurePacket {
@@ -430,12 +439,14 @@ impl ResearchVerifier {
         &self,
         path: Option<String>,
         excerpt: &str,
+        required_sections: &[String],
     ) -> Option<CompletionEvidence> {
-        if research_report_pass(excerpt) {
-            Some(CompletionEvidence::ReportCompletenessPass { path })
-        } else {
-            None
-        }
+        // Issue #922 (P5): SSOT predicate. OR-tolerant — sectioned coverage OR
+        // open-ended floor; no fixed citation∧claim∧uncertainty AND.
+        assess_research_report(excerpt, required_sections)
+            .tier
+            .is_accepted()
+            .then_some(CompletionEvidence::ReportCompletenessPass { path })
     }
 }
 
@@ -541,15 +552,20 @@ fn verifier_diagnostic_for_artifact(
         TaskKind::Data => {
             data_artifact_diagnostic(task_kind, path, artifact.excerpt, artifact.required_columns)
         }
-        TaskKind::Research => (!research_report_pass(artifact.excerpt)).then(|| {
-            VerifierDiagnostic::new(
-                task_kind,
-                VerifierDiagnosticCode::EvidenceMissing,
-                ArtifactRole::UsageDocs,
-                Some(path),
-                "research evidence is missing claim/source/limitation coverage",
-            )
-        }),
+        TaskKind::Research => {
+            (!assess_research_report(artifact.excerpt, artifact.required_sections)
+                .tier
+                .is_accepted())
+            .then(|| {
+                VerifierDiagnostic::new(
+                    task_kind,
+                    VerifierDiagnosticCode::EvidenceMissing,
+                    ArtifactRole::UsageDocs,
+                    Some(path),
+                    "research evidence does not meet section coverage or open-ended report floor",
+                )
+            })
+        }
         TaskKind::Ops => (!ops_runbook_pass(artifact.excerpt)).then(|| {
             VerifierDiagnostic::new(
                 task_kind,
@@ -633,7 +649,12 @@ fn verifier_diagnostic_for_obligation_parts(
             return Some(diagnostic);
         }
     }
-    if let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
+    // Issue #922 (S3-002 / DR3-002): the docs-shaped surface gate
+    // (`docs_required_sections_pass`) must NOT apply to research obligations.
+    // Research `RequiredSections` are evaluated by the research arm below via
+    // `assess_research_report`, so exclude `TaskKind::Research` here.
+    if task_kind != TaskKind::Research
+        && let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
         && !sections.is_empty()
         && let Some(excerpt) = excerpt
         && (!required_sections_present(excerpt, sections) || !docs_required_sections_pass(excerpt))
@@ -672,16 +693,21 @@ fn verifier_diagnostic_for_obligation_parts(
             "implementation artifact still looks placeholder or non-semantic",
         ));
     }
+    // Issue #922 (P5): research obligations route through the SSOT predicate
+    // with the obligation's own `required_sections` (sectioned path) or the
+    // open-ended floor when none are declared. No docs-shaped gating.
     if task_kind == TaskKind::Research
         && let Some(excerpt) = excerpt
-        && !research_report_pass(excerpt)
+        && !assess_research_report(excerpt, &obligation.required_sections)
+            .tier
+            .is_accepted()
     {
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::EvidenceMissing,
             obligation.role,
             Some(&obligation.path),
-            "research evidence is missing claim/source/limitation coverage",
+            "research evidence does not meet section coverage or open-ended report floor",
         ));
     }
     if task_kind == TaskKind::Ops
@@ -1023,25 +1049,96 @@ fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[S
         .all(|column| observed.iter().any(|observed| observed == column))
 }
 
-fn research_report_pass(excerpt: &str) -> bool {
+/// Issue #922 (P5): minimum non-empty length (chars) for an open-ended research
+/// report (no fixed `required_sections`) to clear the acceptance floor. Below
+/// this a report is treated as trivially-empty and rejected. Heuristic value,
+/// pinned by boundary tests; kept as a single SSOT const for easy tuning.
+pub(super) const RESEARCH_MIN_REPORT_CHARS: usize = 80;
+
+/// Issue #922 (P5): declarative, OR-tolerant acceptance tier for a research
+/// report. Replaces the brittle `citation ∧ claim ∧ uncertainty` conjunction.
+///
+/// Internal and intentionally exhaustive (no `#[non_exhaustive]`) so adding a
+/// tier is a compile error at every match site (OCP / fail-safe, mirroring the
+/// `capability_for` enumeration discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResearchAcceptTier {
+    /// All explicit `required_sections` are present (OR-tolerant: section
+    /// coverage alone suffices; no extra uncertainty phrase is required).
+    Sectioned,
+    /// No fixed sections; the report clears the open-ended floor.
+    OpenEnded,
+    /// Neither path is satisfied (trivially-empty / too-thin report, or
+    /// required sections absent).
+    Insufficient,
+}
+
+impl ResearchAcceptTier {
+    /// A report is accepted unless it is `Insufficient`. Single source of truth
+    /// for "accepted?" — callers must not re-derive this elsewhere (DR1-002).
+    pub(super) fn is_accepted(self) -> bool {
+        !matches!(self, ResearchAcceptTier::Insufficient)
+    }
+}
+
+/// Result of [`assess_research_report`]. The accept tier is the only field;
+/// `accepted` is derived via [`ResearchAcceptTier::is_accepted`] (DR1-002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResearchReportAssessment {
+    pub(super) tier: ResearchAcceptTier,
+}
+
+/// Issue #922 (P5): the single SSOT predicate for research report acceptance.
+///
+/// All research acceptance / diagnostic call sites route through this so the
+/// verdict is identical across the evidence and the two diagnostic paths
+/// (DR1 / S1-003). This replaces the former `research_report_pass` 3-way AND
+/// (`citation ∧ claim ∧ uncertainty`) which dead-ended sound reports that
+/// merely omitted an explicit uncertainty phrase.
+///
+/// Pure string logic — no filesystem / network / process access (DR4-003).
+/// `excerpt` / `required_sections` are read transiently; the masking and
+/// sink-boundary defence live at the diagnostic-message and telemetry layers
+/// (DR4-002), not in this predicate.
+pub(super) fn assess_research_report(
+    excerpt: &str,
+    required_sections: &[String],
+) -> ResearchReportAssessment {
+    // Sectioned path: when the obligation carries explicit sections, those
+    // drive acceptance. OR-tolerant = section coverage is sufficient; the old
+    // uncertainty requirement is dropped. Docs-specific surface gating
+    // (`docs_required_sections_pass`) is intentionally NOT applied to research
+    // (S3-002 / DR3-002 double-gate fix).
+    if !required_sections.is_empty() {
+        let tier = if required_sections_present(excerpt, required_sections) {
+            ResearchAcceptTier::Sectioned
+        } else {
+            ResearchAcceptTier::Insufficient
+        };
+        return ResearchReportAssessment { tier };
+    }
+
+    // Open-ended floor (no fixed sections): non-empty + minimum length + at
+    // least one of {source-signal, claim-signal}. A trivially-empty or too-thin
+    // report is rejected; a sound report is not dead-ended (S3-003 / S5-002).
+    let trimmed = excerpt.trim();
+    if trimmed.chars().count() < RESEARCH_MIN_REPORT_CHARS {
+        return ResearchReportAssessment {
+            tier: ResearchAcceptTier::Insufficient,
+        };
+    }
     let lower = excerpt.to_ascii_lowercase();
-    let has_citation = contains_any(
+    let has_source = contains_any(
         &lower,
         &["http://", "https://", "source", "citation", "参考"],
     );
     let has_claim = contains_any(&lower, &["claim", "finding", "summary", "調査", "結論"]);
-    let has_uncertainty = contains_any(
-        &lower,
-        &[
-            "uncertain",
-            "unknown",
-            "limitation",
-            "confidence",
-            "不明",
-            "制約",
-        ],
-    );
-    has_citation && has_claim && has_uncertainty
+    let tier = if has_source || has_claim {
+        ResearchAcceptTier::OpenEnded
+    } else {
+        ResearchAcceptTier::Insufficient
+    };
+    ResearchReportAssessment { tier }
 }
 
 fn ops_runbook_pass(excerpt: &str) -> bool {
@@ -1218,6 +1315,7 @@ mod tests {
             path: Some("README.md"),
             excerpt: "## Setup\nInstall it.\n## Usage\nRun it.\n",
             required_columns: &[],
+            required_sections: &[],
         };
 
         assert_eq!(
@@ -1256,6 +1354,7 @@ mod tests {
                 path: Some("package.json"),
                 excerpt: r#"{"scripts":"#,
                 required_columns: &[],
+                required_sections: &[],
             })
             .expect("malformed manifest diagnostic");
 
@@ -1277,6 +1376,7 @@ mod tests {
                 path: Some("tests/cli.rs"),
                 excerpt: "fn helper() {}",
                 required_columns: &[],
+                required_sections: &[],
             })
             .expect("bad test diagnostic");
 
@@ -1329,6 +1429,7 @@ mod tests {
                 path: Some("output.json"),
                 excerpt: r#"{"category":"#,
                 required_columns: &required,
+                required_sections: &[],
             })
             .expect("schema diagnostic");
 
@@ -1345,6 +1446,7 @@ mod tests {
                 path: Some("output.csv"),
                 excerpt: "Category,Amount\nA,1\n",
                 required_columns: &required,
+                required_sections: &[],
             })
             .expect("missing column diagnostic");
 
@@ -1361,6 +1463,7 @@ mod tests {
                 path: Some("output.jsonl"),
                 excerpt: "{\"category\":\"A\",\"total\":1}\n{\"category\":\"B\",\"total\":2}\n",
                 required_columns: &required,
+                required_sections: &[],
             }),
             Some(CompletionEvidence::StructuredDataPass {
                 path: Some("output.jsonl".to_string()),
@@ -1427,6 +1530,7 @@ mod tests {
             path: Some("research.md"),
             excerpt: "## Summary\nFinding: release cadence changed.\nSource: https://example.test/report\nLimitation: confidence is medium.\n",
             required_columns: &[],
+            required_sections: &[],
         });
 
         assert_eq!(
@@ -1444,6 +1548,7 @@ mod tests {
             path: Some("runbook.md"),
             excerpt: "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Rollback\nRevert the deploy.\n## Risk\nImpact is low.\n",
             required_columns: &[],
+            required_sections: &[],
         });
 
         assert_eq!(
@@ -1451,6 +1556,101 @@ mod tests {
             Some(CompletionEvidence::ReportCompletenessPass {
                 path: Some("runbook.md".to_string()),
             })
+        );
+    }
+
+    // ---- Issue #922 (P5): assess_research_report SSOT predicate ----------
+
+    #[test]
+    fn issue922_assess_research_report_sectioned_or_tolerant() {
+        let sections = vec!["findings".to_string(), "sources".to_string()];
+        // OR-tolerant: section coverage alone suffices (no uncertainty phrase).
+        let covered = "## Findings\nrelease cadence changed.\n## Sources\nhttps://example.test\n";
+        assert_eq!(
+            assess_research_report(covered, &sections).tier,
+            ResearchAcceptTier::Sectioned
+        );
+        // A required section absent → Insufficient.
+        let missing = "## Findings\nrelease cadence changed.\n";
+        assert_eq!(
+            assess_research_report(missing, &sections).tier,
+            ResearchAcceptTier::Insufficient
+        );
+    }
+
+    #[test]
+    fn issue922_assess_research_report_open_ended_floor_boundary() {
+        let no_sections: &[String] = &[];
+        // Below the floor → Insufficient even with a claim signal present
+        // (length is checked before signal coverage).
+        let prefix = "finding ";
+        let below = format!(
+            "{prefix}{}",
+            "a".repeat(RESEARCH_MIN_REPORT_CHARS - prefix.len() - 1)
+        );
+        assert!(below.chars().count() < RESEARCH_MIN_REPORT_CHARS);
+        assert_eq!(
+            assess_research_report(&below, no_sections).tier,
+            ResearchAcceptTier::Insufficient
+        );
+        // At/above the floor with a claim signal → OpenEnded.
+        let at_floor = format!("{prefix}{}", "a".repeat(RESEARCH_MIN_REPORT_CHARS));
+        assert!(at_floor.chars().count() >= RESEARCH_MIN_REPORT_CHARS);
+        assert_eq!(
+            assess_research_report(&at_floor, no_sections).tier,
+            ResearchAcceptTier::OpenEnded
+        );
+    }
+
+    #[test]
+    fn issue922_assess_research_report_open_ended_signal_or_tolerance() {
+        let no_sections: &[String] = &[];
+        let filler = "x".repeat(RESEARCH_MIN_REPORT_CHARS);
+        // claim signal only.
+        let claim_only = format!("This finding describes the outcome. {filler}");
+        assert_eq!(
+            assess_research_report(&claim_only, no_sections).tier,
+            ResearchAcceptTier::OpenEnded
+        );
+        // source signal only.
+        let source_only = format!("See https://example.test/data {filler}");
+        assert_eq!(
+            assess_research_report(&source_only, no_sections).tier,
+            ResearchAcceptTier::OpenEnded
+        );
+        // neither claim nor source → Insufficient despite clearing the length.
+        let neither = format!("General background and context overview. {filler}");
+        assert_eq!(
+            assess_research_report(&neither, no_sections).tier,
+            ResearchAcceptTier::Insufficient
+        );
+    }
+
+    #[test]
+    fn issue922_report_with_citation_and_claim_but_no_uncertainty_now_accepted() {
+        // Regression of the old `research_report_pass` dead-end: this sound
+        // report has a citation + a claim but NO uncertainty phrase, which the
+        // former 3-way AND rejected. It must now be accepted.
+        let no_sections: &[String] = &[];
+        let report =
+            "Finding: latency dropped 30%. Source: https://example.test/benchmark results page.";
+        assert!(report.chars().count() >= RESEARCH_MIN_REPORT_CHARS);
+        assert_eq!(
+            assess_research_report(report, no_sections).tier,
+            ResearchAcceptTier::OpenEnded
+        );
+    }
+
+    #[test]
+    fn issue922_empty_report_is_insufficient() {
+        let no_sections: &[String] = &[];
+        assert_eq!(
+            assess_research_report("", no_sections).tier,
+            ResearchAcceptTier::Insufficient
+        );
+        assert_eq!(
+            assess_research_report("   \n  ", no_sections).tier,
+            ResearchAcceptTier::Insufficient
         );
     }
 }
