@@ -52,12 +52,16 @@ pub(super) fn focused_edit_no_tool_note_for_target(
     target_already_read: bool,
     attempt: usize,
 ) -> String {
-    let target_display = progress_path_display(
+    // PR #930 review (High-2): mask + cap every path embedded into a recovery
+    // prompt (which does NOT pass through `mask_payload_inplace`), reusing the
+    // obligation SSOT. `mask_secrets` is a no-op on ordinary workspace paths, so
+    // actionable target paths are unchanged; a secret-bearing path cannot leak.
+    let target_display = super::task_contract::mask_and_cap_recovery_field(&progress_path_display(
         &target.display().to_string(),
         &agent.work_root,
         agent.session.mode_state.active_plan_path.as_deref(),
         120,
-    );
+    ));
     if !target.is_file() {
         recovery::focused_edit_missing_target_recovery_note(&target_display, attempt)
     } else {
@@ -71,12 +75,12 @@ pub(super) fn focused_edit_no_tool_note_for_policy(
     effective_tool_policy: &EffectiveToolPolicy,
     attempt: usize,
 ) -> String {
-    let target_display = progress_path_display(
+    let target_display = super::task_contract::mask_and_cap_recovery_field(&progress_path_display(
         &policy.target.display().to_string(),
         &agent.work_root,
         agent.session.mode_state.active_plan_path.as_deref(),
         120,
-    );
+    ));
     if effective_tool_policy.reason() == EffectiveToolPolicyReason::VerifierRepair {
         match effective_tool_policy.allowed_tool_names_for_prompt() {
             Some(["Read"]) => {
@@ -106,12 +110,12 @@ pub(super) fn artifact_directed_recovery_message(
 ) -> Option<String> {
     let policy = effective_tool_policy.artifact_directed_policy()?;
     let target = agent.current_artifact_recovery_target.as_ref()?;
-    let target_display = progress_path_display(
+    let target_display = super::task_contract::mask_and_cap_recovery_field(&progress_path_display(
         &policy.target.display().to_string(),
         &agent.work_root,
         agent.session.mode_state.active_plan_path.as_deref(),
         120,
-    );
+    ));
     let allowed = effective_tool_policy
         .allowed_tool_names_for_prompt()
         .map(|tools| tools.join(", "))
@@ -183,7 +187,10 @@ fn verifier_repair_request_patch_message(
     };
     let target = agent.work_root.join(relative);
     let target = std::fs::canonicalize(&target).unwrap_or(target);
-    let target_display = verifier_repair_target_display(&target, &agent.work_root);
+    // PR #930 review (High-2): mask + cap the displayed target path (prompt path).
+    let target_display = super::task_contract::mask_and_cap_recovery_field(
+        &verifier_repair_target_display(&target, &agent.work_root),
+    );
     if !target.is_file() {
         format!(
             "[Verifier Repair Policy] A verifier failure is pending.{diagnostics} Missing target file: {target_display}. Next required action: exactly one Write on that target. Do not use Bash, switch files, or finish with prose. Anvil will rerun the verifier after the write."
@@ -204,12 +211,15 @@ pub(super) fn artifact_directed_policy_violation_message(
     effective_tool_policy: &EffectiveToolPolicy,
 ) -> Option<String> {
     let policy = effective_tool_policy.artifact_directed_policy()?;
-    let target_display = policy
-        .target
-        .strip_prefix(&agent.work_root)
-        .unwrap_or(&policy.target)
-        .to_string_lossy()
-        .replace('\\', "/");
+    // PR #930 review (High-2): mask + cap the displayed target path (prompt path).
+    let target_display = super::task_contract::mask_and_cap_recovery_field(
+        &policy
+            .target
+            .strip_prefix(&agent.work_root)
+            .unwrap_or(&policy.target)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     focused_edit_policy_violation_feedback_note(
         &agent.session.working_memory.unresolved_errors,
         effective_tool_policy.allowed_tool_names_for_prompt(),

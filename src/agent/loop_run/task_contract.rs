@@ -1953,13 +1953,17 @@ pub(super) fn render_contract_recovery_note_with_hint(
         next_role.label()
     );
     if let Some(hint) = target_hint {
+        // PR #930 review (High-2 residual): hint.path / hint.reason are
+        // LLM/request-derived and are embedded straight into this recovery prompt
+        // (which does NOT pass through `mask_payload_inplace`). Route them through
+        // the same SSOT mask+cap that `obligation_report_label` uses so a secret in
+        // a hint path/reason cannot leak into the prompt.
+        let masked_path = mask_and_cap_recovery_field(&hint.path);
         note.push_str(&format!(
-            " Missing obligation: role={}, path={}. Recovery target: role={}, path={}, reason={}. Prefer a Write/Edit tool call for this same deliverable obligation now; scaffold-only files do not count until their content changes.",
+            " Missing obligation: role={}, path={masked_path}. Recovery target: role={}, path={masked_path}, reason={}. Prefer a Write/Edit tool call for this same deliverable obligation now; scaffold-only files do not count until their content changes.",
             hint.role.label(),
-            hint.path,
             hint.role.label(),
-            hint.path,
-            hint.reason
+            mask_and_cap_recovery_field(&hint.reason)
         ));
     }
     note
@@ -5105,6 +5109,38 @@ mod tests {
         assert!(
             note.contains("scaffold-only files do not count"),
             "got: {note}"
+        );
+    }
+
+    // PR #930 review (High-2 residual): render_contract_recovery_note_with_hint
+    // embeds hint.path / hint.reason directly into the LLM recovery prompt (which
+    // does NOT pass through mask_payload_inplace). A secret in either must be
+    // masked via the obligation mask/cap SSOT.
+    #[test]
+    fn render_contract_recovery_note_masks_secret_in_hint_path_and_reason() {
+        const SECRET: &str = "AKIASECRETXYZ0123456789";
+        let decision = CompletionDecision::Continue {
+            missing: vec![ArtifactRole::Implementation],
+        };
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: format!("app/token={SECRET}.py"),
+            reason: format!("required because token={SECRET}"),
+        };
+        let note = render_contract_recovery_note_with_hint(
+            &decision,
+            "build the feature",
+            1,
+            4,
+            Some(&hint),
+        );
+        assert!(
+            !note.contains(SECRET),
+            "secret leaked into recovery note: {note}"
+        );
+        assert!(
+            note.contains("token=***"),
+            "kv secret in hint path/reason should be masked to token=***: {note}"
         );
     }
 

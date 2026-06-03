@@ -367,7 +367,8 @@ pub(super) fn task_contract_verifier_repair_note(
         .map(|hint| {
             format!(
                 " Failure location hint: {} ({}) may be relevant, but it is not automatically the repair target.",
-                hint.path, hint.role.label()
+                super::task_contract::mask_and_cap_recovery_field(&hint.path),
+                hint.role.label()
             )
         })
         .unwrap_or_default();
@@ -376,7 +377,7 @@ pub(super) fn task_contract_verifier_repair_note(
         .map(|hint| {
             format!(
                 " Current repair target candidate: {} ({}).",
-                hint.path,
+                super::task_contract::mask_and_cap_recovery_field(&hint.path),
                 hint.role.label()
             )
         })
@@ -476,14 +477,18 @@ pub(super) fn task_contract_verifier_targeted_edit_required_note(
         .or(context.target_hint.as_ref())
         .map(|hint| hint.path.as_str())
         .unwrap_or("<unknown>");
-    let target_display = resolve_user_path(work_root, target)
-        .ok()
-        .and_then(|path| {
-            path.strip_prefix(work_root)
-                .ok()
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        })
-        .unwrap_or_else(|| target.replace('\\', "/"));
+    // PR #930 review (High-2): the repair target is derived from a hint path
+    // (LLM/request-derived) and rendered into this LLM prompt; mask + cap it.
+    let target_display = super::task_contract::mask_and_cap_recovery_field(
+        &resolve_user_path(work_root, target)
+            .ok()
+            .and_then(|path| {
+                path.strip_prefix(work_root)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            })
+            .unwrap_or_else(|| target.replace('\\', "/")),
+    );
     let line = context
         .target_hint
         .as_ref()
