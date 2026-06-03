@@ -19,27 +19,27 @@ cases:
     category: docs
     prompt: |
       Update README.md with a concise CLI quickstart section.
-      Include install, first command, configuration file location, and troubleshooting notes.
-      Do not modify implementation files unless needed to confirm command names.
+      Document install steps, first command, configuration file location, and troubleshooting notes.
+      This is a documentation-only task: do not modify code.
       Stop after confirming the documentation file is written.
   - name: data-json-to-csv
     category: data
     prompt: |
-      Create a small script or documented command that transforms input/users.json into output/users.csv.
+      Create a small documented command that transforms input/users.json into output/users.csv.
       Required columns: id, email, signup_date, active.
       Preserve row order, write a short README note for running it, and include a tiny sample fixture if none exists.
       Stop after confirming the transform artifact is present.
   - name: research-decision-brief
     category: research
     prompt: |
-      Write docs/research/cache-strategy-brief.md comparing in-memory, SQLite, and file-based cache options for a local CLI agent.
-      Include recommendation, tradeoffs, failure modes, and an explicit assumptions section.
-      Do not change runtime code.
+      Research and compare in-memory, SQLite, and file-based cache options for a local CLI agent.
+      Capture the analysis in research/cache-strategy-brief.md with a recommendation, tradeoffs, failure modes, and an explicit assumptions section.
+      Do not change code.
       Stop after confirming the report file is written.
   - name: ops-runbook
     category: ops
     prompt: |
-      Create docs/runbooks/ollama-local-agent-triage.md for diagnosing a local Ollama-backed coding agent.
-      Include symptom table, commands to collect logs, recovery steps, and escalation criteria.
+      Prepare an operational triage runbook at runbooks/ollama-local-agent-triage.md for a local Ollama-backed coding agent.
+      Include a symptom table, commands to collect logs, recovery steps, and escalation criteria.
       Keep it operational and checklist-oriented.
       Stop after confirming the runbook is written.

@@ -73,6 +73,14 @@ pub(super) struct ArtifactCompletionReport {
     pub artifact_projection_status: String,
     #[serde(default)]
     pub safe_stop: SafeStopLinkage,
+    /// Issue #925 (P8): the turn's classified `task_kind`
+    /// (`coding/docs/data/research/ops`), sourced once at the
+    /// `maybe_emit_job_reports` chokepoint from the per-turn classification
+    /// authority. `None` when no authority exists (answer-only / plan turns).
+    /// Additive — `PAYLOAD_SCHEMA_VERSION` stays 1; a fixed enum string with no
+    /// new raw-path/secret surface (the masked payload spine is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
 }
 
 impl JobReport for ArtifactCompletionReport {
@@ -98,6 +106,11 @@ pub(super) struct VerificationReport {
     pub last_invocation: Option<serde_json::Value>,
     #[serde(default)]
     pub safe_stop: SafeStopLinkage,
+    /// Issue #925 (P8): the turn's classified `task_kind`. See
+    /// `ArtifactCompletionReport::task_kind`. Additive, `None` when no
+    /// per-turn classification authority exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
 }
 
 impl JobReport for VerificationReport {
@@ -121,6 +134,11 @@ pub(super) struct RepairReport {
     pub no_progress_detected: bool,
     #[serde(default)]
     pub safe_stop: SafeStopLinkage,
+    /// Issue #925 (P8): the turn's classified `task_kind`. See
+    /// `ArtifactCompletionReport::task_kind`. Additive, `None` when no
+    /// per-turn classification authority exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
 }
 
 impl JobReport for RepairReport {
@@ -146,6 +164,11 @@ pub(super) struct MemoryReport {
     pub adopted_item_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injection_skipped_reason: Option<String>,
+    /// Issue #925 (P8): the turn's classified `task_kind`. See
+    /// `ArtifactCompletionReport::task_kind`. Additive, `None` when no
+    /// per-turn classification authority exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
 }
 
 impl JobReport for MemoryReport {
@@ -291,6 +314,13 @@ impl super::Agent {
         linkage_reason_override: Option<String>,
     ) {
         let turn_index = self.current_turn_index as u64;
+        // Issue #925 (P8): the turn's classified task_kind — derived ONCE here
+        // (DR1-007 derivation SSOT) and cloned into each Report below. `None`
+        // when no per-turn classification authority exists (answer-only / plan
+        // turns). A fixed enum string (`coding/docs/data/research/ops`); it
+        // still traverses the masked payload spine via `record_job_report`.
+        let task_kind = super::task_classification::task_contract_authority(self)
+            .map(|contract| contract.task_kind.as_str().to_string());
         let safe_stop = match linkage_reason_override {
             Some(reason) => SafeStopLinkage {
                 reason: Some(reason),
@@ -368,6 +398,7 @@ impl super::Agent {
                 budget_state,
                 artifact_projection_status: default_projection_status(),
                 safe_stop: safe_stop.clone(),
+                task_kind: task_kind.clone(),
             };
             if let Some(env) = self.record_job_report(acr) {
                 self.persist_job_report_to_session(ArtifactCompletionReport::EVENT_NAME, &env);
@@ -388,6 +419,7 @@ impl super::Agent {
                 command_hash: None,
                 last_invocation: None,
                 safe_stop: safe_stop.clone(),
+                task_kind: task_kind.clone(),
             };
             if let Some(env) = self.record_job_report(vr) {
                 self.persist_job_report_to_session(VerificationReport::EVENT_NAME, &env);
@@ -406,6 +438,7 @@ impl super::Agent {
                 exhausted_promotion: None,
                 no_progress_detected: false,
                 safe_stop: safe_stop.clone(),
+                task_kind: task_kind.clone(),
             };
             if let Some(env) = self.record_job_report(rr) {
                 self.persist_job_report_to_session(RepairReport::EVENT_NAME, &env);
@@ -441,6 +474,7 @@ impl super::Agent {
                 context_pack_binding: None,
                 adopted_item_count: self.last_injected_summary_ids.len() as u32,
                 injection_skipped_reason: None,
+                task_kind,
             };
             if let Some(env) = self.record_job_report(mr) {
                 self.persist_job_report_to_session(MemoryReport::EVENT_NAME, &env);
@@ -581,6 +615,7 @@ mod tests {
             budget_state: None,
             artifact_projection_status: default_projection_status(),
             safe_stop: SafeStopLinkage::default(),
+            task_kind: None,
         }
     }
 
@@ -630,6 +665,7 @@ mod tests {
             budget_state: None,
             artifact_projection_status: default_projection_status(),
             safe_stop: SafeStopLinkage::default(),
+            task_kind: None,
         };
         let mut env = build_envelope(&r);
         let (overflowed, truncated) = enforce_bounds(&mut env);
@@ -668,6 +704,7 @@ mod tests {
             exhausted_promotion: None,
             no_progress_detected: false,
             safe_stop: SafeStopLinkage::default(),
+            task_kind: None,
         };
         let mut env = build_envelope(&r);
         let (overflowed, _truncated) = enforce_bounds(&mut env);
@@ -703,6 +740,7 @@ mod tests {
             context_pack_binding: None,
             adopted_item_count: 0,
             injection_skipped_reason: None,
+            task_kind: None,
         };
         let env = build_envelope(&m);
         assert!(env["payload"].get("safe_stop").is_none());

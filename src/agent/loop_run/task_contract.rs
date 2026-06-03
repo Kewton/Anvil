@@ -3937,6 +3937,103 @@ fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    // ---- Issue #925 (P8): classifier ⇔ eval-category divergence guard --------
+    //
+    // R5 (misroute fail-closed) compares the agent's CLASSIFIED `task_kind`
+    // against each eval case's EXPECTED kind (the YAML `category`). If the
+    // benchmark prompts classify to a different kind than their declared
+    // `category`, R5 would fail correct runs ("red on day one"). This test
+    // pins `TaskContract::from_request(prompt).task_kind == category` for every
+    // case in the real benchmark suite, so any prompt edit that breaks routing
+    // is caught here (not in a live eval). It reads the actual file the harness
+    // runs (`benchmarks/pam-ab-general.yaml`) via `include_str!` — zero drift.
+
+    /// Minimal parser for the fixed, simple structure of pam-ab-general.yaml.
+    /// Returns `(case_name, category, prompt)` triples. Only understands the
+    /// `- name:` / `category:` / `prompt: |` block-scalar shape used by that
+    /// file; it is a test helper, not a general YAML parser.
+    fn parse_benchmark_cases(yaml: &str) -> Vec<(String, String, String)> {
+        let mut cases = Vec::new();
+        let mut name: Option<String> = None;
+        let mut category: Option<String> = None;
+        let mut prompt = String::new();
+        let mut in_prompt = false;
+        let mut prompt_indent = 0usize;
+
+        let flush = |cases: &mut Vec<(String, String, String)>,
+                     name: &mut Option<String>,
+                     category: &mut Option<String>,
+                     prompt: &mut String| {
+            if let (Some(n), Some(c)) = (name.take(), category.take()) {
+                cases.push((n, c, std::mem::take(prompt).trim_end().to_string()));
+            } else {
+                prompt.clear();
+            }
+        };
+
+        for line in yaml.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+
+            if in_prompt {
+                // Prompt body = blank lines or lines indented deeper than the
+                // `prompt:` key. A key at/under that indent ends the block.
+                if trimmed.is_empty() || indent > prompt_indent {
+                    prompt.push_str(line.trim_start_matches(' '));
+                    prompt.push('\n');
+                    continue;
+                }
+                in_prompt = false;
+            }
+
+            if let Some(rest) = trimmed.strip_prefix("- name:") {
+                flush(&mut cases, &mut name, &mut category, &mut prompt);
+                name = Some(rest.trim().to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("name:") {
+                name = Some(rest.trim().to_string());
+            } else if let Some(rest) = trimmed.strip_prefix("category:") {
+                category = Some(rest.trim().to_string());
+            } else if trimmed.starts_with("prompt:") {
+                in_prompt = true;
+                prompt_indent = indent;
+                prompt.clear();
+            }
+        }
+        flush(&mut cases, &mut name, &mut category, &mut prompt);
+        cases
+    }
+
+    #[test]
+    fn issue925_benchmark_categories_match_agent_classifier() {
+        const YAML: &str = include_str!("../../../benchmarks/pam-ab-general.yaml");
+        let cases = parse_benchmark_cases(YAML);
+        assert_eq!(
+            cases.len(),
+            5,
+            "expected the 5 pam-ab-general cases, parsed {}: {:?}",
+            cases.len(),
+            cases.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+        );
+        for (name, category, prompt) in &cases {
+            // Every benchmark category must be one of the 5 known kinds (the set
+            // the harness, eval heuristic, and bench.sh regex all share).
+            assert!(
+                ["coding", "docs", "data", "research", "ops"].contains(&category.as_str()),
+                "case `{name}` has unknown category `{category}`"
+            );
+            let classified = TaskContract::from_request(prompt).task_kind;
+            assert_eq!(
+                classified.as_str(),
+                category.as_str(),
+                "case `{name}`: agent classified `{}` but eval category is `{}` — \
+                 a misroute would make R5 fail a correct run. Adjust the prompt \
+                 wording or the category so they agree (no new YAML key).",
+                classified.as_str(),
+                category
+            );
+        }
+    }
+
     // ---- Issue #917 Phase 1: classification confidence / needs_confirm -----
 
     #[test]

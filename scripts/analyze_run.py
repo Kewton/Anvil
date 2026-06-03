@@ -672,6 +672,79 @@ def _read_eval_taxonomy(run_dir: Path) -> dict[str, str] | None:
     return last
 
 
+def _read_classified_task_kind(run_dir: Path) -> str | None:
+    """Return the last eval.jsonl top-level ``classified_task_kind`` (Issue #925).
+
+    This is the agent's CLASSIFIED task_kind, surfaced from the agent layer and
+    kept DISTINCT from the eval-heuristic ``evaluation_taxonomy.task_kind``; the
+    existing :func:`_read_eval_taxonomy` (the 5-key allowlist) is intentionally
+    left untouched.
+
+    Fail-closed (DR4-001/DR4-003): only one of the known 5 kinds is accepted.
+    Anything else — absent, wrong type, unknown/over-long string, malformed JSON,
+    oversized line, symlinked or unreadable file — yields ``None`` so the R5 gate
+    treats it as a *missing* classification rather than silently passing. This
+    function never raises and never fails open.
+    """
+    logs_dir = run_dir / "logs"
+    candidate = logs_dir / "eval.jsonl"
+    try:
+        if logs_dir.is_symlink():
+            return None
+    except OSError:
+        return None
+    if not logs_dir.exists():
+        return None
+    safe = _safe_regular_file_in(candidate, run_dir, MAX_EVAL_JSONL)
+    if safe is None:
+        return None
+
+    # The last record carrying the field is authoritative (turn-level log).
+    # Fail-closed (CB-001): ANY structural corruption — oversized line, decode
+    # failure, malformed JSON, or a non-object record — abandons the whole file
+    # and returns None, rather than trusting a stale value read before the
+    # corruption. A truncated/DoS/tampered tail must NOT let an earlier valid
+    # classification slip through as a pass (DR4-003).
+    last_raw: Any = None
+    try:
+        with safe.open("rb") as fh:
+            while True:
+                raw_line = fh.readline(MAX_EVAL_JSONL_LINE + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > MAX_EVAL_JSONL_LINE:
+                    _warn("eval.jsonl: oversized line, failing classified read closed")
+                    return None
+                try:
+                    line = raw_line.decode("utf-8", errors="strict").strip()
+                except UnicodeDecodeError:
+                    _warn("eval.jsonl: undecodable line, failing classified read closed")
+                    return None
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    _warn("eval.jsonl: malformed JSON line, failing classified read closed")
+                    return None
+                if not isinstance(rec, dict):
+                    _warn("eval.jsonl: non-object record, failing classified read closed")
+                    return None
+                if "classified_task_kind" in rec:
+                    last_raw = rec.get("classified_task_kind")
+    except OSError as e:
+        _warn(f"eval.jsonl read error: {e}")
+        return None
+
+    if isinstance(last_raw, str):
+        stripped = last_raw.strip()
+        # Membership in the 5-kind set is the strict validator (it also bounds
+        # length: the longest known kind is "research"). Unknown => None.
+        if stripped in KNOWN_TASK_KINDS:
+            return stripped
+    return None
+
+
 def _anvil_terminal_success(rc: Any) -> bool | None:
     if isinstance(rc, bool) or not isinstance(rc, int):
         return None
@@ -1036,6 +1109,31 @@ def main(argv: list[str]) -> int:
         postcheck_reason = meta["postcheck_reason"] or "meta_postcheck"
     else:
         postcheck_success, postcheck_reason = _postcheck_success(task_kind, artifact_files)
+
+    # Issue #925 (P8) — R5 misroute fail-closed gate.
+    # Compare the agent's CLASSIFIED kind against the EXPECTED kind (the raw meta
+    # `category`/`task_kind`, NOT the inferred-merged `task_kind` variable above /
+    # DR1-003). Only non-coding cases with a real expected kind are gated (coding
+    # bypasses R5). A misroute — classified differs, or is missing/unknown —
+    # forces `postcheck_success=False` (fail-closed; default-to-pass prohibited).
+    classified_task_kind = _read_classified_task_kind(run_dir)
+    expected_kind = (
+        meta["task_kind"]
+        if meta.get("_task_kind_source") in ("task_kind", "category")
+        else None
+    )
+    task_kind_misroute = False
+    if expected_kind is not None and expected_kind != "coding":
+        if classified_task_kind is None:
+            task_kind_misroute = True
+            r5_reason = "missing_classification"
+        elif classified_task_kind != expected_kind:
+            task_kind_misroute = True
+            r5_reason = "task_kind_misroute"
+        if task_kind_misroute:
+            postcheck_success = False
+            postcheck_reason = r5_reason
+
     anvil_terminal_success = _anvil_terminal_success(meta["rc"])
     anvil_terminal_class = _anvil_terminal_class(meta["rc"])
     outcome_agreement = _outcome_agreement(meta["rc"], postcheck_success)
@@ -1061,6 +1159,15 @@ def main(argv: list[str]) -> int:
         "artifact_files": artifact_files,
         "case": meta["case"],
         "compact_events": session_metrics["compact_events"],
+        # Issue #925: surface the agent's classified kind + R5 verdict. Emitted
+        # conditionally (omit when absent / not-a-misroute) so pre-#925 records
+        # and coding cases keep their existing output shape verbatim.
+        **(
+            {"classified_task_kind": classified_task_kind}
+            if classified_task_kind is not None
+            else {}
+        ),
+        **({"task_kind_misroute": True} if task_kind_misroute else {}),
         "elapsed_s": meta["elapsed_s"],
         "error_500_count": error_500_count,
         "evaluation_taxonomy": {

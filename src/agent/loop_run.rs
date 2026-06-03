@@ -1024,6 +1024,7 @@ pub(in crate::agent::loop_run) mod tests_export {
             context_pack_binding: None,
             adopted_item_count: 0,
             injection_skipped_reason: None,
+            task_kind: None,
         };
         let mut envelope = build_envelope(&report);
         let (overflowed, truncated) = enforce_bounds(&mut envelope);
