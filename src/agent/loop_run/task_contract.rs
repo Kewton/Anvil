@@ -998,16 +998,12 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
                 // behavior through expected values rather than domain words.
                 ArtifactRole::Test => true,
                 ArtifactRole::UsageDocs => {
-                    // Issue #923 (DR3-002): an OpsRunbook obligation rides on the
-                    // UsageDocs role but is content-validated by the ops tier
-                    // predicate in the missing loop above, not by the docs
-                    // section-coverage check. Treat it as covered here so the
-                    // behavior-coverage gate does not re-judge a runbook as docs.
-                    inputs
-                        .contract
-                        .required_identities_for_role(*role)
-                        .iter()
-                        .any(|identity| identity.kind == DeliverableKind::OpsRunbook)
+                    // Issue #923 (plan item 1): an Ops task's UsageDocs role is the
+                    // OpsRunbook runbook, already content-validated by the ops tier
+                    // predicate in the missing loop above (the obligation is the
+                    // completion authority). Gate the docs section-coverage on
+                    // `task_kind != Ops` so a runbook is not re-judged as docs.
+                    inputs.contract.task_kind == TaskKind::Ops
                         || usage_docs_excerpt_satisfies_obligations(inputs.contract, excerpt)
                 }
                 ArtifactRole::Setup => true,
@@ -1093,15 +1089,14 @@ fn required_role_satisfied(
     if identities.is_empty() {
         return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
     }
-    // Issue #923 (DR3-002): an OpsRunbook obligation is carried on the UsageDocs
-    // role but must still satisfy the Ops tier predicate, so it cannot take the
-    // docs observed-role shortcut — only true UsageDocs (non-OpsRunbook)
-    // identities may short-circuit on a mere observation.
+    // Issue #923 (plan item 1): an Ops task's UsageDocs role carries the
+    // OpsRunbook obligation, which is the completion authority and must satisfy
+    // the ops tier predicate — it cannot take the docs observed-role shortcut.
+    // Gate the shortcut on `task_kind != Ops` (OpsRunbook obligations only ever
+    // exist on Ops tasks).
     if role == ArtifactRole::UsageDocs
         && observed.contains(&role)
-        && !identities
-            .iter()
-            .any(|identity| identity.kind == DeliverableKind::OpsRunbook)
+        && contract.task_kind != TaskKind::Ops
     {
         return true;
     }
@@ -1167,17 +1162,16 @@ fn required_role_satisfied_by_evidence(
     if identities.is_empty() {
         return observed_artifacts(evidence).contains(&role);
     }
-    // Issue #923 (CB-001 / DR3-002): the evidence-only completion authority must
-    // mirror `required_role_satisfied`. An OpsRunbook obligation rides on the
-    // UsageDocs role, so the docs observed-role shortcut would otherwise let any
-    // foreign UsageDocs evidence (e.g. a README edit) satisfy it without
-    // observing the runbook identity. Exclude OpsRunbook identities so they fall
-    // through to the path-specific `artifact_identity_observed_in_evidence` check.
+    // Issue #923 (plan item 1 / High): the evaluate() completion authority must
+    // mirror `required_role_satisfied`. The docs observed-role shortcut would
+    // otherwise let any foreign UsageDocs evidence (e.g. a README edit) complete
+    // an Ops task without observing the runbook identity / running the tier
+    // predicate. Gate the shortcut on `task_kind != Ops` so the OpsRunbook
+    // obligation stays the completion authority (it falls through to the
+    // path-specific `artifact_identity_observed_in_evidence` check).
     if role == ArtifactRole::UsageDocs
         && observed_artifacts(evidence).contains(&role)
-        && !identities
-            .iter()
-            .any(|identity| identity.kind == DeliverableKind::OpsRunbook)
+        && contract.task_kind != TaskKind::Ops
     {
         return true;
     }
