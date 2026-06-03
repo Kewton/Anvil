@@ -95,6 +95,17 @@ pub struct EvalRecord {
     /// from free-text summaries.
     pub completion_reason: String,
     pub final_outcome: String,
+    /// Issue #925 (P8): the agent's CLASSIFIED task_kind for this turn
+    /// (`TaskContract.task_kind.as_str()`), post-set from the agent layer.
+    ///
+    /// DR3-002: the session layer never imports the agent `TaskKind` enum; the
+    /// agent passes a plain string. This is deliberately DISTINCT from
+    /// `evaluation_taxonomy.task_kind` (the eval-side prompt heuristic) — it is
+    /// the agent's actual routing decision. `None` when no per-turn
+    /// classification authority existed (e.g. answer-only / plan turns).
+    /// `analyze_run.py` reads this top-level field for the R5 misroute gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified_task_kind: Option<String>,
 }
 
 /// Summary of a single LLM-requested tool call (no result).
@@ -549,6 +560,10 @@ pub fn build_eval_record_with_terminal_context(
         evaluation_taxonomy,
         completion_reason,
         final_outcome: final_outcome.to_string(),
+        // Issue #925: post-set by the agent layer (actor_loop_flow), like
+        // `pam_eval`. The session layer cannot derive the classified kind
+        // (DR3-002), so the builder leaves it `None`.
+        classified_task_kind: None,
     }
 }
 
@@ -1056,6 +1071,7 @@ mod tests {
             ),
             completion_reason: "verifier_evidence_satisfied".to_string(),
             final_outcome: "done".to_string(),
+            classified_task_kind: None,
         }
     }
 
