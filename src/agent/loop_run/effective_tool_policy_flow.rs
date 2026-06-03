@@ -238,8 +238,9 @@ fn setup_bootstrap_candidate(agent: &Agent) -> Option<JobCandidate> {
     ) {
         return None;
     }
-    let request = super::workspace_access::active_request_text(agent)?;
-    let task_contract = super::task_contract::TaskContract::from_request(&request);
+    // Issue #917: per-turn classification authority (`None` keeps the legacy
+    // early return via `?`). `&Rc<TaskContract>` deref-coerces to `&TaskContract`.
+    let task_contract = super::task_classification::task_contract_authority(agent)?;
     let behavior_projection = super::required_behavior::project_behavior_contract(&task_contract);
     let verifier_signal = super::task_contract::VerifierPrerequisiteSignal::from_sources(
         agent.owned_test_verifier_missing_observed_this_turn,

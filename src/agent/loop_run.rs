@@ -1074,6 +1074,10 @@ pub(crate) fn maybe_emit_job_reports_for_test(agent: &mut Agent) {
 mod behavior_contract_projection_e2e_tests;
 mod summary;
 mod task_contract;
+// Issue #917 (P0.5): per-turn single classification authority accessor.
+// Private module, not re-exported (DR3-001) — the 18 former `from_request`
+// sites and `run_turn` consume it via `super::task_classification::*`.
+mod task_classification;
 // Issue #646: task workspace scope detection. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` is the only in-crate consumer
 // via `super::task_workspace_scope::*`.
@@ -1920,6 +1924,16 @@ pub struct Agent {
     /// `handle_user_message`, set to `true` only when an actual sidecar call
     /// was attempted (Completed/Failed); Skipped does not consume the cap.
     reminder_called_this_turn: bool,
+    /// Issue #917 (P0.5): per-turn single task-classification authority. The
+    /// `OnceCell` enforces "classify exactly once per turn" at the type level;
+    /// eager-populated right after `push_user_message` (run_turn) and shared by
+    /// the 18 former `TaskContract::from_request` sites via
+    /// `task_classification::task_contract_authority`. Reset (`OnceCell::new()`)
+    /// at the top of every `handle_user_message`. `std::cell::OnceCell` + `Rc`
+    /// suit the synchronous single-thread agent loop; if `Agent: Send` is ever
+    /// required, switch to `std::sync::OnceLock` + `Arc`.
+    pub(in crate::agent::loop_run) task_contract_this_turn:
+        std::cell::OnceCell<std::rc::Rc<task_contract::TaskContract>>,
     /// Issue #459: per-turn cap for the Tester Skill. Reset at the top of every
     /// `handle_user_message`. Consumed only when a Tester smoke run actually
     /// dispatched (Recorded / Aborted); NotInvoked does not consume the cap.
@@ -2576,6 +2590,7 @@ impl Agent {
             repo_context_cache: None,
             footer,
             reminder_called_this_turn: false,
+            task_contract_this_turn: std::cell::OnceCell::new(),
             tester_called_this_turn: false,
             work_mode_confirm_called_this_turn: false,
             feedback_kind_confirm_called_this_turn: false,
@@ -2666,8 +2681,8 @@ impl Agent {
         // `first_missing_required_role` is evidence-aware and not available
         // here, so we fall back to the first required role hint
         // (DR3-004 — same pattern as `refresh_artifact_completion_satisfied`).
-        let task_contract = workspace_access::active_request_text(self)
-            .map(|text| task_contract::TaskContract::from_request(&text));
+        // Issue #917: per-turn classification authority (None → no role hint).
+        let task_contract = task_classification::task_contract_authority(self);
         let role_hint_from_contract = task_contract
             .as_ref()
             .and_then(|tc| tc.required_artifacts.first().copied());
@@ -2678,7 +2693,7 @@ impl Agent {
 
         let behavior = task_contract
             .as_ref()
-            .and_then(required_behavior::project_behavior_contract);
+            .and_then(|tc| required_behavior::project_behavior_contract(tc));
 
         pam_advisory::PamAdvisoryInputs {
             role_hint,

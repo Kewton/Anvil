@@ -1297,6 +1297,8 @@ mod tests {
             verification_required: true,
             completion_policy,
             required_behavior,
+            // Issue #917: synthetic test contract — neutral matched confidence.
+            classification_confidence: 1.0,
         };
         ledger.required_artifacts_completed_projection(&contract)
     }

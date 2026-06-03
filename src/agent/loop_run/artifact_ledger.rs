@@ -1056,6 +1056,8 @@ mod tests {
             verification_required,
             completion_policy,
             required_behavior,
+            // Issue #917: synthetic test contract — neutral matched confidence.
+            classification_confidence: 1.0,
         }
     }
 

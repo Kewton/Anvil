@@ -45,6 +45,48 @@ impl TaskKind {
     }
 }
 
+/// Issue #917 (P0.5): result of [`infer_task_kind`]. `matched` records whether
+/// a keyword branch actually fired; `matched == false` is reached *only* by the
+/// no-keyword-match fallthrough (the historical silent `TaskKind::Coding`
+/// default). This is the single signal that distinguishes a genuine `Coding`
+/// match from "we gave up and defaulted to Coding" — the root of the v0.4.35
+/// non-coding misroute. See design policy §4 D1/D2 (DR2-002).
+struct TaskKindInference {
+    kind: TaskKind,
+    matched: bool,
+}
+
+/// Issue #917 (P0.5): per-turn classification head, projected from
+/// [`TaskContract`] via [`TaskContract::classification`]. The P0.5 frozen shape
+/// is `{ task_kind, confidence }`; `needs_confirm()` is *derived* (no
+/// independent bool) so `confidence` is the single source of truth (DR1-004).
+/// `#[non_exhaustive]` keeps the P1 additions (coding sub-profile / behavior
+/// flags) additive (DR1-003).
+// Issue #917: `#[allow(dead_code)]` is transient — the per-turn authority
+// accessor (`task_classification.rs`, Phase 2) and the confirm path (Phase 4)
+// are the production consumers; the allow is removed once they are wired.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub(super) struct TaskClassification {
+    pub(super) task_kind: TaskKind,
+    /// 0.0..=1.0. P0.5 is a 2-value approximation (matched → 1.0, no-match →
+    /// 0.0); the f32 type leaves room for additive refinement toward
+    /// `ModeClassification.confidence`'s continuous scale.
+    pub(super) confidence: f32,
+}
+
+impl TaskClassification {
+    /// "Unknown" signal (D1/D5): a no-keyword-match request (`confidence` below
+    /// the confirm threshold) routes to the confirm path instead of silently
+    /// staying `Coding`. Reuses the WorkMode confirm threshold (DR2-001 path:
+    /// `crate::modes::plan_act`, not `super::super::modes`).
+    #[allow(dead_code)] // Issue #917: wired by the confirm path (Phase 4).
+    pub(super) fn needs_confirm(&self) -> bool {
+        self.confidence < crate::modes::plan_act::WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
+    }
+}
+
 #[allow(dead_code)] // Issue #864: generic deliverable variants are part of the model before every producer is wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliverableKind {
@@ -526,6 +568,12 @@ pub(super) struct TaskContract {
     // existing `required_artifacts` gate based on it (non-destructive).
     #[allow(dead_code)]
     pub(super) required_behavior: RequiredBehaviorContract,
+    // Issue #917 (P0.5): classification confidence captured at construction.
+    // 1.0 when `infer_task_kind` matched a keyword branch, 0.0 when it hit the
+    // no-keyword-match fallthrough. Projected via `classification()` and read
+    // by the per-turn authority's `needs_confirm()` gate. The `task_kind` above
+    // is UNCHANGED by this field (D6: verifier gate does not regress).
+    pub(super) classification_confidence: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1306,7 +1354,10 @@ impl TaskContract {
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
         let asks_for_data_output = request_asks_for_data_output_artifact(request, &lower);
-        let task_kind = infer_task_kind(
+        let TaskKindInference {
+            kind: task_kind,
+            matched: task_kind_matched,
+        } = infer_task_kind(
             request,
             &lower,
             intent,
@@ -1314,6 +1365,10 @@ impl TaskContract {
             asks_for_usage_docs,
             asks_for_setup,
         );
+        // Issue #917: 2-value confidence from the keyword-match signal. Only the
+        // no-keyword-match fallthrough (matched == false) lands below the
+        // confirm threshold and triggers `needs_confirm()`.
+        let classification_confidence = if task_kind_matched { 1.0 } else { 0.0 };
         let mut required = Vec::new();
         let mut optional = Vec::new();
 
@@ -1415,6 +1470,17 @@ impl TaskContract {
             verification_required: completion_policy.verification_required(),
             completion_policy,
             required_behavior,
+            classification_confidence,
+        }
+    }
+
+    /// Issue #917 (P0.5): project the per-turn classification head. No added
+    /// state — reads the existing `task_kind` plus `classification_confidence`.
+    #[allow(dead_code)] // Issue #917: wired by the per-turn authority (Phase 2).
+    pub(super) fn classification(&self) -> TaskClassification {
+        TaskClassification {
+            task_kind: self.task_kind,
+            confidence: self.classification_confidence,
         }
     }
 
@@ -1842,7 +1908,11 @@ fn infer_task_kind(
     asks_for_tests: bool,
     asks_for_usage_docs: bool,
     asks_for_setup: bool,
-) -> TaskKind {
+) -> TaskKindInference {
+    // Issue #917: every keyword branch sets `matched: true`; only the final
+    // no-keyword-match fallthrough is `matched: false`. The returned `kind` is
+    // byte-for-byte identical to the pre-#917 `TaskKind` so downstream artifact
+    // derivation / verifier gating is unchanged (D6).
     let code_work = request_asks_for_code_work(request, lower);
     let data_task = request_asks_for_data_task(request, lower);
     let implementation_artifact = request_asks_for_implementation_artifact(
@@ -1853,27 +1923,53 @@ fn infer_task_kind(
         asks_for_setup,
     );
     if asks_for_tests {
-        return TaskKind::Coding;
+        return TaskKindInference {
+            kind: TaskKind::Coding,
+            matched: true,
+        };
     }
     if asks_for_usage_docs && !implementation_artifact {
-        return TaskKind::Docs;
+        return TaskKindInference {
+            kind: TaskKind::Docs,
+            matched: true,
+        };
     }
     if data_task && !request_has_explicit_coding_subject(request, lower) {
-        return TaskKind::Data;
+        return TaskKindInference {
+            kind: TaskKind::Data,
+            matched: true,
+        };
     }
     if code_work {
-        return TaskKind::Coding;
+        return TaskKindInference {
+            kind: TaskKind::Coding,
+            matched: true,
+        };
     }
     if request_asks_for_research_task(request, lower, intent) {
-        return TaskKind::Research;
+        return TaskKindInference {
+            kind: TaskKind::Research,
+            matched: true,
+        };
     }
     if request_asks_for_ops_task(request, lower) || asks_for_setup {
-        return TaskKind::Ops;
+        return TaskKindInference {
+            kind: TaskKind::Ops,
+            matched: true,
+        };
     }
     if asks_for_usage_docs {
-        return TaskKind::Docs;
+        return TaskKindInference {
+            kind: TaskKind::Docs,
+            matched: true,
+        };
     }
-    TaskKind::Coding
+    // No keyword matched: the historical silent `Coding` default. `matched:
+    // false` is the single signal that drives `needs_confirm()` → confirm path.
+    TaskKindInference {
+        kind: TaskKind::Coding,
+        matched: false,
+    }
 }
 
 fn deliverables_from_contract_parts(
@@ -3692,6 +3788,123 @@ fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Issue #917 Phase 1: classification confidence / needs_confirm -----
+
+    #[test]
+    fn issue917_no_keyword_match_yields_zero_confidence_and_needs_confirm() {
+        // A greeting matches no TaskKind keyword branch — historically a silent
+        // `Coding` default. The classification must now flag low confidence so
+        // it routes to confirm instead of silently staying Coding.
+        let contract = TaskContract::from_request("こんにちは");
+        assert_eq!(contract.task_kind, TaskKind::Coding, "kind unchanged (D6)");
+        assert_eq!(contract.classification_confidence, 0.0);
+        assert!(
+            contract.classification().needs_confirm(),
+            "no-keyword-match must route to confirm"
+        );
+
+        let en = TaskContract::from_request("hello there");
+        assert_eq!(en.classification_confidence, 0.0);
+        assert!(en.classification().needs_confirm());
+    }
+
+    #[test]
+    fn issue917_keyword_match_yields_full_confidence_no_confirm() {
+        // A real coding request matches a keyword branch → high confidence → no
+        // confirm. This is the case that must NOT be perturbed.
+        let contract = TaskContract::from_request("Create a Rust CLI word counter");
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert_eq!(contract.classification_confidence, 1.0);
+        assert!(!contract.classification().needs_confirm());
+
+        // Non-coding keyword matches also classify with full confidence.
+        let docs = TaskContract::from_request("Update README.md with usage documentation");
+        assert_eq!(docs.task_kind, TaskKind::Docs);
+        assert_eq!(docs.classification_confidence, 1.0);
+        assert!(!docs.classification().needs_confirm());
+    }
+
+    #[test]
+    fn issue917_en_jp_task_kind_parity() {
+        // AC4: per-language eval cases assert the same `task_kind`. This guards
+        // the *authority* classifier (`infer_task_kind`); the separate
+        // `infer_eval_task_kind` (session layer) is scope-out per D8.
+        // Each pair is (EN request, JP request, expected TaskKind).
+        let cases: &[(&str, &str, TaskKind)] = &[
+            (
+                "Implement a Rust library feature X",
+                "Rustのライブラリ機能Xを実装してください",
+                TaskKind::Coding,
+            ),
+            (
+                "Update README.md with usage documentation",
+                "READMEに使い方のドキュメントを記載してください",
+                TaskKind::Docs,
+            ),
+            (
+                "Generate output.csv with columns id and total",
+                "idとtotalの列を持つoutput.csvを生成してください",
+                TaskKind::Data,
+            ),
+            (
+                "Research battery safety and compare sources",
+                "バッテリー安全性を調査して比較レポートにまとめてください",
+                TaskKind::Research,
+            ),
+            (
+                "Deploy the service and set up monitoring",
+                "サービスをデプロイして監視を設定してください",
+                TaskKind::Ops,
+            ),
+        ];
+        for (en, jp, expected) in cases {
+            let en_kind = TaskContract::from_request(en).task_kind;
+            let jp_kind = TaskContract::from_request(jp).task_kind;
+            assert_eq!(en_kind, *expected, "EN `{en}` should be {expected:?}");
+            assert_eq!(jp_kind, *expected, "JP `{jp}` should be {expected:?}");
+            assert_eq!(en_kind, jp_kind, "EN/JP parity for {expected:?}");
+        }
+    }
+
+    #[test]
+    fn issue917_classification_projection_matches_contract_fields() {
+        let contract = TaskContract::from_request("Create a Python CLI in main.py");
+        let projected = contract.classification();
+        assert_eq!(projected.task_kind, contract.task_kind);
+        assert_eq!(projected.confidence, contract.classification_confidence);
+    }
+
+    #[test]
+    fn issue917_d6_no_match_keeps_coding_kind_and_verifier_gate_intact() {
+        // D6 regression guard. The `classification_confidence` field is purely
+        // additive: it must not change `task_kind` (the input to the
+        // `coding_verifier_required` gate) nor relax test gating.
+        //
+        // (a) a no-keyword-match request still classifies as `Coding`, so the
+        //     gate's task_kind input is unchanged.
+        let ambiguous = TaskContract::from_request("Build feature X");
+        assert_eq!(ambiguous.task_kind, TaskKind::Coding);
+        assert!(
+            ambiguous.classification().needs_confirm()
+                || ambiguous.classification_confidence == 1.0,
+            "confidence is well-formed (0.0 or 1.0)"
+        );
+
+        // (b) the verifier/test gate still fires for an explicit coding+tests
+        //     request — the field addition did not disable it.
+        let coding_tests =
+            TaskContract::from_request("Implement a Rust library feature X and add tests");
+        assert_eq!(coding_tests.task_kind, TaskKind::Coding);
+        assert!(
+            coding_tests.completion_policy.verification_required(),
+            "coding+tests request must still require verification (gate intact)"
+        );
+        assert!(
+            coding_tests.completion_policy.test_execution_required(),
+            "coding+tests request must still require test execution (gate intact)"
+        );
+    }
 
     fn repo_edit(category: RepoEditCategory) -> CompletionEvidence {
         CompletionEvidence::RepoEdit {

@@ -152,11 +152,9 @@ impl Agent {
         if project_unit.is_some_and(|unit| !unit.verifier_candidates.is_empty()) {
             return true;
         }
-        super::workspace_access::active_request_text(self).is_some_and(|request| {
-            TaskContract::from_request(&request)
-                .completion_policy
-                .test_execution_required()
-        })
+        // Issue #917: per-turn classification authority (None → false).
+        super::task_classification::task_contract_authority(self)
+            .is_some_and(|contract| contract.completion_policy.test_execution_required())
     }
 
     /// Issue #607 (DR1-001 SSOT): build the current `RequestContext` from
@@ -165,10 +163,14 @@ impl Agent {
     /// `evidence_set_missing_shapes_with_context`, and
     /// `should_run_auto_test_for_success_with_context`.
     pub(super) fn current_request_context(&self) -> RequestContext {
+        // Issue #917: per-turn classification authority. `request` is still
+        // needed for `request_is_env_setup_only`; the contract comes from the
+        // memo (None → empty-input contract, matching `unwrap_or_default`).
         let request = super::workspace_access::active_request_text(self).unwrap_or_default();
-        let contract = TaskContract::from_request(&request);
+        let contract = super::task_classification::task_contract_authority(self)
+            .unwrap_or_else(|| std::rc::Rc::new(TaskContract::from_request(&request)));
         let requires_tests = contract.completion_policy.test_execution_required();
-        let completion_policy = contract.completion_policy;
+        let completion_policy = contract.completion_policy.clone();
         RequestContext {
             requires_tests,
             is_env_setup_only: super::quality::request_is_env_setup_only(&request),
@@ -204,10 +206,10 @@ impl Agent {
     /// structured Weak/Missing branch is then skipped and the legacy
     /// `detect_with_recent_successes -> run` path runs verbatim.
     fn success_verifier_test_binding(&mut self) -> (Vec<String>, bool) {
-        let Some(request) = super::workspace_access::active_request_text(self) else {
+        // Issue #917: per-turn classification authority (None → no binding).
+        let Some(contract) = super::task_classification::task_contract_authority(self) else {
             return (Vec::new(), false);
         };
-        let contract = TaskContract::from_request(&request);
         let test_execution_required = contract.completion_policy.test_execution_required();
         let owned_test_artifacts =
             super::owned_test_projection::owned_test_artifacts_for_verifier(self, &contract);

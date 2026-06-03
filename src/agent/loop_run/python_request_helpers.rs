@@ -18,16 +18,15 @@
 
 use super::Agent;
 use super::auto_test::{AutoTestKind, AutoTestRunner};
-use super::task_contract::TaskContract;
 use crate::modes::plan_act::WorkMode;
 
 pub(super) fn active_python_request_requires_tests(agent: &Agent) -> bool {
+    // Issue #917: read the per-turn classification authority (CB-001). The
+    // `WorkMode::Python` gate short-circuits first, preserving prior behavior;
+    // `None` (no current-turn request) keeps `false`.
     agent.session.mode_state.work_mode == WorkMode::Python
-        && super::workspace_access::active_request_text(agent).is_some_and(|request| {
-            TaskContract::from_request(&request)
-                .completion_policy
-                .test_execution_required()
-        })
+        && super::task_classification::task_contract_authority(agent)
+            .is_some_and(|contract| contract.completion_policy.test_execution_required())
 }
 
 pub(super) fn python_verifier_available_for_requested_tests(agent: &Agent) -> bool {

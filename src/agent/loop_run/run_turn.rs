@@ -28,6 +28,11 @@ pub(super) fn run_turn(
     monitor: &mut InterruptMonitor,
 ) -> LoopResult {
     super::message_push::push_user_message(agent, input.to_string());
+    // Issue #917 (P0.5): eager-populate the per-turn classification authority at
+    // this single known point — right after the request is set, before any
+    // reader and regardless of mode. `active_request_text` strips the auto-plan
+    // wrapper so the memo classifies the original user request (D7/D9).
+    super::task_classification::populate_task_contract_authority(agent);
     if agent.session.mode_state.mode != ExecutionMode::Plan {
         // Issue #576: replace direct `classify_work_mode_json` + event
         // emit with the shared `classify_with_confirmation` wrapper. The
