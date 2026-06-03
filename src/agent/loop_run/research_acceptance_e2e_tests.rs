@@ -264,3 +264,40 @@ fn report_output_context_is_token_boundary_aware() {
             .contains(&ArtifactRole::UsageDocs)
     );
 }
+
+// Codex-High (#922): an output-LOOKING file name (report.md / summary.md /
+// findings.md) referenced for reading/comparison — with NO output verb — must
+// NOT be treated as an output target. Such requests are answer-only and must
+// stay obligation-free, so `classify_confirm_flow` cannot flip AnswerOnly->Docs
+// and enable file edits.
+#[test]
+fn output_looking_input_reference_is_not_an_output_target() {
+    for request in [
+        "Compare report.md and summary.md",
+        "Review findings.md",
+        "Summarize report.md and report any discrepancies",
+        "What does summary.md conclude?",
+    ] {
+        let contract = TaskContract::from_request(request);
+        assert!(
+            contract.required_artifacts.is_empty(),
+            "an output-looking file read/compared (no output verb) must not create an obligation: {request:?}"
+        );
+        assert!(
+            !report_intended_research(request),
+            "no output context → must not be report-intended (AnswerOnly->Docs stays closed): {request:?}"
+        );
+    }
+
+    // Contrast: an explicit output verb directed at the same file name DOES
+    // create the obligation (non-regression of the genuine output path).
+    for request in [
+        "Investigate the options and produce a report in report.md",
+        "調査結果を report.md にまとめて出力してください",
+    ] {
+        assert!(
+            report_intended_research(request),
+            "an explicit output target must be report-intended: {request:?}"
+        );
+    }
+}

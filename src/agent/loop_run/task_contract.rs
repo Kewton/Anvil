@@ -2334,43 +2334,38 @@ fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
     output_verb && report_noun
 }
 
-/// Issue #922 (PR-003): the file name of a doc-like path looks like an output
-/// target (report/summary/findings/…), disambiguating an output target from an
-/// input reference even without a surrounding output verb.
-fn report_file_name_looks_like_output(path: &str) -> bool {
-    std::path::Path::new(path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|stem| {
-            [
-                "report", "summary", "findings", "result", "results", "analysis", "research",
-                "output",
-            ]
-            .iter()
-            .any(|prefix| stem.starts_with(prefix))
-        })
-}
-
-/// Issue #922 (PR-003): a doc-like path counts as a research *report output
-/// target* only in an output context — mirrors `data_path_has_output_context`.
-/// A bare read-only input reference ("summarize notes.txt for me") is `false`.
+/// Issue #922 (PR-003 / Codex-High): a doc-like path counts as a research
+/// *report output target* only in an **output context** — there must be an
+/// explicit intent to WRITE content to it. A bare read / comparison / input
+/// reference is `false`, EVEN for an output-looking file name (`report.md`,
+/// `summary.md`): "Compare report.md and summary.md" and "Review findings.md"
+/// are answer-only and must NOT create an obligation. Mirrors
+/// `data_path_has_output_context`.
 fn report_path_in_output_context(request: &str, path: &str) -> bool {
     let lower = request.to_ascii_lowercase();
     let path_lower = path.to_ascii_lowercase();
-    let name_output = report_file_name_looks_like_output(path);
+    // An explicit output verb anywhere in the request signals intent to write
+    // content (vs. read/compare an existing file). Required for the neutral
+    // preposition case so an output-looking file NAME alone never suffices.
+    let has_output_verb = contains_any(
+        &lower,
+        &[
+            "write", "writes", "produce", "produces", "generate", "generates", "create",
+            "creates", "export", "exports", "save", "saves", "output", "compile", "draft",
+            "prepare", "emit", "emits",
+        ],
+    ) || contains_any(request, &["作成", "出力", "書き出", "まとめ", "書いて"]);
     lower.match_indices(&path_lower).any(|(idx, _)| {
-        // Issue #922 (PR2-002): token-boundary aware — inspect the WORD
-        // immediately before the path, not a raw substring window (so
-        // "investigate" no longer matches the preposition "in").
+        // Token-boundary aware: the WORD immediately before the path (so
+        // "investigate" never matches the preposition "in").
         let prev_word = lower[..idx]
             .rsplit(|ch: char| !ch.is_ascii_alphanumeric())
             .find(|word| !word.is_empty())
             .unwrap_or("");
         let after = bounded_context_after(&lower, idx + path_lower.len(), 24);
 
-        // Explicit input / read-only context wins — even for an output-looking
-        // file name ("summarize report.md for me" is a read, not a write).
+        // Explicit input / read / comparison position wins — the path is being
+        // read or compared, not written — even for an output-looking name.
         if matches!(
             prev_word,
             "input"
@@ -2385,14 +2380,21 @@ fn report_path_in_output_context(request: &str, path: &str) -> bool {
                 | "analyse"
                 | "sample"
                 | "fixture"
+                | "compare"
+                | "compares"
+                | "review"
+                | "reviews"
+                | "and"
+                | "or"
+                | "vs"
+                | "versus"
+                | "between"
         ) {
             return false;
         }
 
-        // Output context: an output verb/preposition immediately before the
-        // path, OR a file name that looks like an output, OR a trailing
-        // Japanese output marker.
-        matches!(
+        // Explicit output verb / preposition immediately before the path.
+        if matches!(
             prev_word,
             "to" | "into"
                 | "output"
@@ -2410,8 +2412,14 @@ fn report_path_in_output_context(request: &str, path: &str) -> bool {
                 | "creates"
                 | "emit"
                 | "emits"
-        ) || name_output
-            || contains_any(after, &["まとめ", "出力", "書"])
+        ) {
+            return true;
+        }
+
+        // Neutral preposition (e.g. "in"): require an explicit output verb in
+        // the request, or a trailing Japanese output marker. A bare
+        // output-looking file NAME is NOT sufficient (Codex-High fix).
+        has_output_verb || contains_any(after, &["まとめ", "出力", "書"])
     })
 }
 
