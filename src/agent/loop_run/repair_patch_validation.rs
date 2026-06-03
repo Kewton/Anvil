@@ -1779,6 +1779,7 @@ mod tests {
             super::super::task_contract::TaskKind::Data,
             super::super::task_contract::TaskKind::Research,
             super::super::task_contract::TaskKind::Ops,
+            super::super::task_contract::TaskKind::Authoring,
         ] {
             // `print(` is valid python — if the gate were bypassed the cheap-check
             // would spawn python3 and return Ok; instead it must return Unavailable
