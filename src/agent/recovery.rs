@@ -276,8 +276,9 @@ pub fn focused_edit_timeout_recovery_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
+    let path = mask_recovery_path(path);
     if already_read {
-        let anchor_hint = page_component_anchor_hint(path);
+        let anchor_hint = page_component_anchor_hint(&path);
         return format!(
             "Focused edit recovery on {path} timed out before any tool call returned. Do not rethink the whole feature. Emit exactly one compact Edit tool call now on that file, anchored to the last Read, and change only one contiguous block.{anchor_hint} focused_edit_timeout_attempt={attempt}"
         );
@@ -292,8 +293,9 @@ pub fn focused_edit_truncated_tool_call_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
+    let path = mask_recovery_path(path);
     if already_read {
-        let anchor_hint = page_component_anchor_hint(path);
+        let anchor_hint = page_component_anchor_hint(&path);
         return format!(
             "Focused edit recovery on {path} produced a truncated tool call. Do not call Read again. Emit exactly one Edit tool call now on that file, copy old_string exactly from the last Read, replace one contiguous block only, and keep new_string compact enough to fit in a single response.{anchor_hint} focused_edit_truncated_attempt={attempt}"
         );
@@ -308,8 +310,9 @@ pub fn focused_edit_unterminated_tool_call_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
+    let path = mask_recovery_path(path);
     if already_read {
-        let anchor_hint = page_component_anchor_hint(path);
+        let anchor_hint = page_component_anchor_hint(&path);
         return format!(
             "Focused edit recovery on {path} produced an unterminated tool call block. Do not call Read again. Emit exactly one Edit tool call now on that file, with no prose before or after the tool call. Copy old_string exactly from the last Read, replace one contiguous block only, and keep the JSON body minimal so the wrapper closes cleanly.{anchor_hint} focused_edit_unterminated_attempt={attempt}"
         );
@@ -320,18 +323,21 @@ pub fn focused_edit_unterminated_tool_call_note(
 }
 
 pub fn first_scaffold_shell_edit_note(path: &str) -> String {
+    let path = mask_recovery_path(path);
     format!(
         "The first repository edit after scaffolding must stay microscopic. On {path}, replace only the existing `<h1>` headline block with a compact task-specific title. Keep the import lines, parent wrappers, component signature, and nearby paragraph unchanged for now. Use the existing `<h1` through its matching `</h1>` as the exact Edit anchor. Keep new_string to roughly 1-3 lines and under about 240 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn."
     )
 }
 
 pub fn first_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
+    let path = mask_recovery_path(path);
     format!(
         "The first repository edit after scaffolding must stay microscopic. On {path}, emit exactly one Edit now and replace only the already-read `<h1>` headline block with a compact task-specific title. Keep the surrounding layout, imports, component signature, and nearby paragraph unchanged. Copy the following small block byte-for-byte as old_string and replace only this contiguous block. Reuse the same `h1` tag and className string. Keep new_string to roughly 1-3 lines and under about 240 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact block below>\",\"new_string\":\"<compact title only>\"}}}}.\n```tsx\n{old_string}\n```"
     )
 }
 
 pub fn second_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
+    let path = mask_recovery_path(path);
     format!(
         "The first scaffold edit already changed the page title. On {path}, emit exactly one Edit now and replace only the already-read intro copy line with a compact task-specific description line. Keep imports, the component signature, parent wrappers, buttons/links, paragraph tags, and every other block unchanged for now. Copy the following single line byte-for-byte as old_string and replace only that line. Keep new_string to one line and under about 180 characters. Do not add runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact line below>\",\"new_string\":\"<compact description line only>\"}}}}.\n```tsx\n{old_string}\n```"
     )
@@ -519,6 +525,41 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 // `#[deprecated]` for SetupBootstrap policy projection but retain legacy
 // semantics for recovery-side regression coverage.
 mod tests {
+    // PR #930 review (High-2): every path-taking recovery-note builder renders the
+    // path into an LLM prompt that does NOT pass through mask_payload_inplace, so a
+    // secret-shaped path must be masked at the render point (mask_recovery_path).
+    #[test]
+    fn recovery_notes_mask_secret_shaped_paths() {
+        const SECRET: &str = "AKIASECRETPATH0123456789";
+        let p = format!("app/token={SECRET}.tsx");
+        let notes = [
+            super::artifact_directed_recovery_note("test", &p, 1),
+            super::forced_small_edit_recovery_note(&p, 1),
+            super::post_scaffold_edit_recovery_note(&p, true, 1),
+            super::post_scaffold_continuation_note(&p, 1),
+            super::focused_edit_no_tool_recovery_note(&p, true, 1),
+            super::focused_edit_missing_target_recovery_note(&p, 1),
+            super::focused_edit_timeout_recovery_note(&p, true, 1),
+            super::focused_edit_truncated_tool_call_note(&p, false, 1),
+            super::focused_edit_unterminated_tool_call_note(&p, true, 1),
+            super::first_scaffold_shell_edit_note(&p),
+            super::first_scaffold_shell_edit_exact_anchor_note(&p, "<h1>x</h1>"),
+            super::second_scaffold_shell_edit_exact_anchor_note(&p, "<p>x</p>"),
+            super::repo_change_after_read_no_edit_note(&p, 1),
+            super::repo_change_quality_gate_note("req", &p, "issue", 1),
+        ];
+        for note in &notes {
+            assert!(
+                !note.contains(SECRET),
+                "secret leaked into recovery note: {note}"
+            );
+            assert!(
+                note.contains("token=***"),
+                "kv secret in path must be masked to token=***: {note}"
+            );
+        }
+    }
+
     use super::{
         artifact_directed_recovery_note, empty_workspace_scaffold_note,
         first_scaffold_shell_edit_exact_anchor_note, first_scaffold_shell_edit_note,

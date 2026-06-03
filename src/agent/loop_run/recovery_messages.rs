@@ -232,6 +232,8 @@ pub(super) fn push_deterministic_ui_recovery_continuation_note(
     target_path: &str,
     attempt: usize,
 ) {
+    // PR #930 review (High-2): mask + cap the path embedded into this recovery prompt.
+    let target_path = super::task_contract::mask_and_cap_recovery_field(target_path);
     super::message_push::push_system_note(
         agent,
         format!(
