@@ -756,7 +756,7 @@ mod tests {
     fn structured_verifier_diagnostic_creates_repair_packet() {
         let contract = TaskContract::from_request("Generate output.csv with columns id and total.");
         let diagnostic = super::super::verifier::VerifierDiagnostic {
-            task_kind: super::super::verifier::VerifierTaskKind::Data,
+            task_kind: TaskKind::Data,
             code: super::super::verifier::VerifierDiagnosticCode::SchemaMismatch,
             role: ArtifactRole::DataOutput,
             path: Some("output.csv".to_string()),

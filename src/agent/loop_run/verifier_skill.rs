@@ -108,6 +108,12 @@ pub struct VerifierInputs<'a> {
     /// The skills framework crate does not need to read this field —
     /// `VerifierSkill::execute` is the sole in-crate consumer.
     pub(crate) workspace_scope: &'a TaskWorkspaceScope,
+    /// Issue #918 (P1): the active task kind, threaded into `run_structured` so
+    /// the process-spawn capability gate can fail closed for non-coding kinds.
+    /// Visibility is `pub(super)` (narrower than the `pub struct`) to match
+    /// `TaskKind`'s `pub(super)` visibility (DR1-002, E0446) — the skills
+    /// framework crate must not read it. `TaskKind` is NOT widened (DR3-001).
+    pub(super) task_kind: super::task_contract::TaskKind,
 }
 
 /// VerifierSkill::execute の出力. turn.rs facade が解釈して side-effect を適用する.
@@ -265,6 +271,7 @@ impl AgentSkill for VerifierSkill {
                         inputs.workspace_scope,
                         &command,
                         &display_command,
+                        inputs.task_kind,
                     ) {
                         Ok(result) => {
                             let summary = build_anvil_test_summary_for_skill(&plan, &result);
@@ -568,6 +575,7 @@ impl VerifierSkill {
                     inputs.workspace_scope,
                     &command,
                     &display_command,
+                    inputs.task_kind,
                 ) {
                     Ok(result) => {
                         let summary = build_anvil_test_summary_for_skill(&plan, &result);
@@ -741,6 +749,7 @@ impl VerifierSkill {
                     inputs.workspace_scope,
                     &command,
                     &display_command,
+                    inputs.task_kind,
                 ) {
                     Ok(result) => {
                         // CB-012 step (3b): post-execution stdout/stderr scan.

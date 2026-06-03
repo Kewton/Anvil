@@ -353,6 +353,11 @@ impl Agent {
             project_unit: project_unit.as_ref(),
             test_execution_required,
             workspace_scope: &workspace_scope,
+            // Issue #918 (P1) DR3-003: real task kind for the spawn gate;
+            // `None => Coding` 1:1-preserves the historical always-Coding path.
+            task_kind: super::task_classification::task_contract_authority(self)
+                .map(|c| c.task_kind)
+                .unwrap_or(super::task_contract::TaskKind::Coding),
         };
 
         let started = std::time::Instant::now();

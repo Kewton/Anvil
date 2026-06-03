@@ -178,6 +178,9 @@ pub(super) struct StructuredTaskContractVerifierRun {
     pub(super) display_command: String,
     pub(super) bound_test_artifacts_count: usize,
     pub(super) bound_test_artifacts_paths: Vec<String>,
+    /// Issue #918 (P1): active task kind, carried to `run_structured` so the
+    /// process-spawn capability gate can fail closed for non-coding kinds.
+    pub(super) task_kind: TaskKind,
 }
 
 pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -364,7 +367,8 @@ pub(super) fn task_contract_verifier_repair_note(
         .map(|hint| {
             format!(
                 " Failure location hint: {} ({}) may be relevant, but it is not automatically the repair target.",
-                hint.path, hint.role.label()
+                super::task_contract::mask_and_cap_recovery_field(&hint.path),
+                hint.role.label()
             )
         })
         .unwrap_or_default();
@@ -373,7 +377,7 @@ pub(super) fn task_contract_verifier_repair_note(
         .map(|hint| {
             format!(
                 " Current repair target candidate: {} ({}).",
-                hint.path,
+                super::task_contract::mask_and_cap_recovery_field(&hint.path),
                 hint.role.label()
             )
         })
@@ -412,19 +416,31 @@ pub(super) fn verifier_repair_diagnostic_pending_note(
     context: &RepairJob,
     behavior_projection: Option<&BehaviorContractProjection>,
 ) -> String {
+    // PR #930 review (High-2): hint paths are LLM/request-derived and are rendered
+    // straight into the LLM request body (a path that does NOT pass through
+    // `mask_payload_inplace`). Route every rendered hint path through the same
+    // SSOT mask+cap that `obligation_report_label` uses, so a secret embedded in a
+    // hint path/criterion cannot leak into the recovery prompt.
+    let render_hint = |hint: &super::task_contract::RecoveryTargetHint| {
+        format!(
+            "{} ({})",
+            super::task_contract::mask_and_cap_recovery_field(&hint.path),
+            hint.role.label()
+        )
+    };
     let failure_location = context
         .target_hint
         .as_ref()
-        .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
+        .map(&render_hint)
         .unwrap_or_else(|| "<unknown>".to_string());
     let repair_target = verifier_repair_effective_target_hint(context)
-        .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
+        .map(&render_hint)
         .unwrap_or_else(|| "<unknown>".to_string());
     let changed = context
         .changed_file_hints
         .iter()
         .take(8)
-        .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
+        .map(&render_hint)
         .collect::<Vec<_>>()
         .join(", ");
     // Issue #665 (S5-005): system note には raw label / excerpt を載せない。
@@ -461,14 +477,18 @@ pub(super) fn task_contract_verifier_targeted_edit_required_note(
         .or(context.target_hint.as_ref())
         .map(|hint| hint.path.as_str())
         .unwrap_or("<unknown>");
-    let target_display = resolve_user_path(work_root, target)
-        .ok()
-        .and_then(|path| {
-            path.strip_prefix(work_root)
-                .ok()
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        })
-        .unwrap_or_else(|| target.replace('\\', "/"));
+    // PR #930 review (High-2): the repair target is derived from a hint path
+    // (LLM/request-derived) and rendered into this LLM prompt; mask + cap it.
+    let target_display = super::task_contract::mask_and_cap_recovery_field(
+        &resolve_user_path(work_root, target)
+            .ok()
+            .and_then(|path| {
+                path.strip_prefix(work_root)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            })
+            .unwrap_or_else(|| target.replace('\\', "/")),
+    );
     let line = context
         .target_hint
         .as_ref()
@@ -1490,13 +1510,22 @@ pub(super) fn validate_verifier_repair_intents(
     target_hint: &super::task_contract::RecoveryTargetHint,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
-    validate_verifier_repair_intents_inner(work_root, context, target_hint, None, intents)
+    // Test-only path: existing tests exercise the Coding repair flow.
+    validate_verifier_repair_intents_inner(
+        work_root,
+        context,
+        target_hint,
+        super::task_contract::TaskKind::Coding,
+        None,
+        intents,
+    )
 }
 
 pub(super) fn validate_verifier_repair_intents_with_accepted_plan(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
+    task_kind: super::task_contract::TaskKind,
     accepted_plan: &super::repair_plan::AcceptedRepairPlan,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
@@ -1504,6 +1533,7 @@ pub(super) fn validate_verifier_repair_intents_with_accepted_plan(
         work_root,
         context,
         target_hint,
+        task_kind,
         Some(accepted_plan),
         intents,
     )
@@ -1665,6 +1695,7 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
     original_contents: &str,
     contents: &str,
     used_whitespace_fallback: bool,
+    task_kind: super::task_contract::TaskKind,
 ) -> Result<(), ValidationFailure> {
     let weakening_detection =
         super::repair_patch_validation::detect_repair_candidate_weakening_patterns(
@@ -1702,6 +1733,7 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
         relative_path,
         contents,
         used_whitespace_fallback,
+        task_kind,
     )
     .map_err(
         super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
@@ -1709,10 +1741,12 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_verifier_repair_intents_inner(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
+    task_kind: super::task_contract::TaskKind,
     accepted_plan: Option<&super::repair_plan::AcceptedRepairPlan>,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
@@ -1759,6 +1793,7 @@ pub(super) fn validate_verifier_repair_intents_inner(
         &original_contents,
         &contents,
         used_whitespace_fallback,
+        task_kind,
     )?;
 
     // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran
@@ -2545,18 +2580,27 @@ pub(super) fn run_task_contract_verifier_once(
             display_command,
             bound_test_artifacts_count,
             bound_test_artifacts_paths,
-        } => handle_structured_task_contract_verifier_selection(
-            agent,
-            changed_files,
-            workspace_scope_opt.as_ref(),
-            StructuredTaskContractVerifierRun {
-                plan,
-                command,
-                display_command,
-                bound_test_artifacts_count,
-                bound_test_artifacts_paths,
-            },
-        ),
+        } => {
+            // Issue #918 (P1) DR3-003: derive the real task kind from the active
+            // contract; `None => Coding` 1:1-preserves the historical always-Coding
+            // structured-verifier path (the gate only fails closed for non-coding).
+            let task_kind = super::task_classification::task_contract_authority(agent)
+                .map(|c| c.task_kind)
+                .unwrap_or(TaskKind::Coding);
+            handle_structured_task_contract_verifier_selection(
+                agent,
+                changed_files,
+                workspace_scope_opt.as_ref(),
+                StructuredTaskContractVerifierRun {
+                    plan,
+                    command,
+                    display_command,
+                    bound_test_artifacts_count,
+                    bound_test_artifacts_paths,
+                    task_kind,
+                },
+            )
+        }
         super::verifier_driver::TaskContractVerifierSelection::StructuredWeak {
             detected_source,
             owned_test_artifacts_count,
@@ -2695,6 +2739,7 @@ pub(super) fn handle_structured_task_contract_verifier_selection(
             workspace_scope,
             &selection.command,
             &selection.display_command,
+            selection.task_kind,
         )
     };
     match result {

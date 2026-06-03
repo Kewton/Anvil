@@ -1802,7 +1802,27 @@ impl AutoTestRunner {
         scope: &TaskWorkspaceScope,
         command: &VerifierCommand,
         display_command: &str,
+        task_kind: super::task_contract::TaskKind,
     ) -> Result<AutoTestResult, String> {
+        // Issue #918 (P1): fail-closed process-spawn gate. Only the Coding
+        // capability may spawn a structured-verifier child process. This is a
+        // defense-in-depth backstop — the §5.1 invariant (the verification gate
+        // in CompletionPolicy::from_contract_parts) already prevents a non-coding
+        // task from ever requiring test execution and reaching here. The guard is
+        // PROFILE-SYMMETRIC (a real `Err` in both debug and release, no
+        // `debug_assert!`) so it is observable in the repo's debug `cargo test` CI
+        // and a §5.1 regression fails closed rather than panicking / spawning.
+        if !super::verifier::capability_for(task_kind).allows_process_exec() {
+            tracing::error!(
+                target: "agent.verifier",
+                ?task_kind,
+                "non-coding verifier process spawn blocked; failing closed"
+            );
+            return Err(format!(
+                "structured verifier process spawn is not permitted for task kind {task_kind:?} \
+                 (only Coding may spawn a verifier process)"
+            ));
+        }
         validate_bound_test_artifacts_for_execution(work_root, scope, command)?;
 
         // Issue #661 iteration-5 Task 6.1 / 6.2 / 6.4 + CB-008 fail-closed:
@@ -3758,8 +3778,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::task_contract::TaskKind;
     use super::*;
     use tempfile::tempdir;
+
+    // Issue #918 (P1) Task 6+7: the structured-verifier process-spawn gate.
+    // Every non-coding kind must fail closed with an Err (no process spawned),
+    // observable in the repo's DEBUG `cargo test` CI (the gate is a real `Err`,
+    // not a `debug_assert!` panic). This is the security backstop for High gap #2.
+    #[test]
+    fn run_structured_blocks_non_coding_process_spawn_fail_closed() {
+        let dir = tempdir().expect("tempdir");
+        let scope = TaskWorkspaceScope::detect(dir.path(), "");
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&["tests/test_main.py".to_string()])
+                .expect("pytest command");
+
+        for kind in [
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
+        ] {
+            let result =
+                AutoTestRunner::run_structured(dir.path(), &scope, &command, "pytest -q", kind);
+            let err = result.expect_err("non-coding kind must fail closed at the spawn gate");
+            assert!(
+                err.contains("not permitted for task kind"),
+                "{kind:?}: expected spawn-gate Err, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn detects_cargo_test_first() {

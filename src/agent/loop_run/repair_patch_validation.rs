@@ -728,6 +728,7 @@ pub(super) fn validate_repair_candidate_contents(
     relative_path: &str,
     candidate_contents: &str,
     used_whitespace_fallback: bool,
+    task_kind: super::task_contract::TaskKind,
 ) -> Result<(), RepairCandidateContentError> {
     use super::project_verifier::{ProjectVerifier, ProjectVerifierOutcome};
 
@@ -738,15 +739,31 @@ pub(super) fn validate_repair_candidate_contents(
             }
             Ok(())
         }
-        Some(verifier) => match verifier.check(relative_path, candidate_contents) {
-            ProjectVerifierOutcome::Ok => Ok(()),
-            ProjectVerifierOutcome::Failed(err) => {
-                Err(RepairCandidateContentError::CheapCheckFailed(format!(
-                    "repair candidate cheap check failed for {relative_path}: {err}"
-                )))
+        Some(verifier) => {
+            // Issue #918 / #928 (DR4-001): the `ProjectVerifier::check` cheap-check
+            // spawns a `python3` child process. This is the SECOND verifier-triggered
+            // process-spawn site (the first is `run_structured`). Gate it with the
+            // same capability spine — only the Coding capability may spawn. Non-coding
+            // kinds fail closed (NO spawn) and defer to the full verifier rerun
+            // (`Unavailable`), mirroring the existing no-safe-verifier path. The §5.1
+            // invariant makes this unreachable in production (non-coding never enters
+            // the verifier/repair flow); the gate is a release-effective backstop that
+            // holds even if §5.1 regresses.
+            if !super::verifier::capability_for(task_kind).allows_process_exec() {
+                return Err(RepairCandidateContentError::Unavailable);
             }
-            ProjectVerifierOutcome::Unavailable => Err(RepairCandidateContentError::Unavailable),
-        },
+            match verifier.check(relative_path, candidate_contents) {
+                ProjectVerifierOutcome::Ok => Ok(()),
+                ProjectVerifierOutcome::Failed(err) => {
+                    Err(RepairCandidateContentError::CheapCheckFailed(format!(
+                        "repair candidate cheap check failed for {relative_path}: {err}"
+                    )))
+                }
+                ProjectVerifierOutcome::Unavailable => {
+                    Err(RepairCandidateContentError::Unavailable)
+                }
+            }
+        }
     }
 }
 
@@ -1727,14 +1744,65 @@ mod tests {
 
     #[test]
     fn candidate_content_validation_allows_plain_text_without_verifier() {
-        assert!(validate_repair_candidate_contents("README.md", "# Docs\n", false).is_ok());
+        assert!(
+            validate_repair_candidate_contents(
+                "README.md",
+                "# Docs\n",
+                false,
+                super::super::task_contract::TaskKind::Coding,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn candidate_content_validation_defers_whitespace_sensitive_fallback() {
         assert_eq!(
-            validate_repair_candidate_contents("config.yaml", "name: test\n", true).unwrap_err(),
+            validate_repair_candidate_contents(
+                "config.yaml",
+                "name: test\n",
+                true,
+                super::super::task_contract::TaskKind::Coding,
+            )
+            .unwrap_err(),
             RepairCandidateContentError::Unavailable
+        );
+    }
+
+    // Issue #918 / #928 (DR4-001): non-coding kinds must NOT spawn the python3
+    // cheap-check. Even with a `.py` target (where for_path returns Some), a
+    // non-coding kind fails closed with Unavailable (no process spawned).
+    #[test]
+    fn candidate_content_validation_non_coding_python_target_fails_closed_no_spawn() {
+        for kind in [
+            super::super::task_contract::TaskKind::Docs,
+            super::super::task_contract::TaskKind::Data,
+            super::super::task_contract::TaskKind::Research,
+            super::super::task_contract::TaskKind::Ops,
+        ] {
+            // `print(` is valid python — if the gate were bypassed the cheap-check
+            // would spawn python3 and return Ok; instead it must return Unavailable
+            // WITHOUT spawning (the gate precedes ProjectVerifier::check).
+            let result =
+                validate_repair_candidate_contents("app/main.py", "print('hi')\n", false, kind);
+            assert_eq!(
+                result.unwrap_err(),
+                RepairCandidateContentError::Unavailable,
+                "{kind:?}: python3 cheap-check must be gated (fail closed, no spawn)"
+            );
+        }
+        // Coding still reaches the cheap-check (valid python -> Ok, or skipped if
+        // python3 is absent the check would Fail — but for_path/gate let it through).
+        // We only assert the gate does NOT short-circuit Coding to Unavailable.
+        let coding = validate_repair_candidate_contents(
+            "app/main.py",
+            "print('hi')\n",
+            false,
+            super::super::task_contract::TaskKind::Coding,
+        );
+        assert!(
+            !matches!(coding, Err(RepairCandidateContentError::Unavailable)),
+            "Coding must not be blocked by the spawn gate (got {coding:?})"
         );
     }
 

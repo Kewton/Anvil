@@ -4620,6 +4620,7 @@ mod tests {
             project_unit: project_unit.as_ref(),
             test_execution_required: true,
             workspace_scope: &scope,
+            task_kind: TaskKind::Coding,
         };
 
         let mut callback_runner: Option<RunnerKind> = None;
@@ -4682,6 +4683,7 @@ mod tests {
             project_unit: project_unit.as_ref(),
             test_execution_required: true,
             workspace_scope: &scope,
+            task_kind: TaskKind::Coding,
         };
 
         let mut callback_calls: u32 = 0;
@@ -4747,6 +4749,7 @@ mod tests {
             project_unit: project_unit.as_ref(),
             test_execution_required: true,
             workspace_scope: &scope,
+            task_kind: TaskKind::Coding,
         };
 
         // Set PYTHONPATH to an external path so the env_plan flags it.

@@ -35,11 +35,14 @@ pub(super) fn focused_edit_guidance_note(
     work_root: &Path,
     target_already_read: bool,
 ) -> String {
-    let path = target
-        .strip_prefix(work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
+    // PR #930 review (High-2): mask + cap the path embedded into this recovery prompt.
+    let path = super::task_contract::mask_and_cap_recovery_field(
+        &target
+            .strip_prefix(work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     if target_already_read {
         format!(
             "[Focused Edit Recovery] The target file {path} has already been read. The only available tool for this turn is Edit. Do not call Read again. Use exactly one compact Edit on that file now. Replace only one contiguous block from the last Read. Do not attempt a full-file rewrite, multi-file change, scaffold command, or dev-server command."
@@ -62,11 +65,13 @@ pub(super) fn focused_edit_guidance_note_for_policy(
     target_already_read: bool,
 ) -> String {
     if policy.reason() == EffectiveToolPolicyReason::VerifierRepair {
-        let path = target
-            .strip_prefix(work_root)
-            .unwrap_or(target)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let path = super::task_contract::mask_and_cap_recovery_field(
+            &target
+                .strip_prefix(work_root)
+                .unwrap_or(target)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
         match policy.allowed_tool_names_for_prompt() {
             Some(["Read"]) => {
                 return format!(
@@ -90,11 +95,13 @@ pub(super) fn focused_edit_guidance_note_for_policy(
 }
 
 pub(super) fn focused_edit_compact_anchor_note(target: &Path, work_root: &Path) -> String {
-    let path = target
-        .strip_prefix(work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let path = super::task_contract::mask_and_cap_recovery_field(
+        &target
+            .strip_prefix(work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     format!(
         "[Focused Edit Recovery / Compact Anchor] The Read result for {path} is intentionally only a tiny exact anchor from the real file, not the whole file. Use that anchor only for `old_string`. Keep `new_string` similarly small: at most 3 lines and under 240 characters. Do not insert imports, hooks, component definitions, or full-file content. If the anchor is CTA or placeholder text, replace only that text with a short task-specific label or copy."
     )

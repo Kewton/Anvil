@@ -33,8 +33,15 @@ pub(super) enum TaskKind {
 }
 
 impl TaskKind {
-    #[cfg(test)]
-    pub(super) fn label(self) -> &'static str {
+    /// Stable lowercase identifier for this task kind.
+    ///
+    /// Issue #918 (P1): promoted from the former `#[cfg(test)]`-only `label()`
+    /// to a production accessor so the collapsed `VerifierDiagnostic.reason()`
+    /// can format `task_kind={as_str}` directly off `TaskKind` (the per-verifier
+    /// task-kind enum was folded into this one). The returned strings are
+    /// byte-stable (`coding/docs/data/research/ops`) so reason/label goldens
+    /// stay green.
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             TaskKind::Coding => "coding",
             TaskKind::Docs => "docs",
@@ -42,6 +49,11 @@ impl TaskKind {
             TaskKind::Research => "research",
             TaskKind::Ops => "ops",
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn label(self) -> &'static str {
+        self.as_str()
     }
 }
 
@@ -210,7 +222,7 @@ pub(super) type ArtifactObligation = DeliverableObligation;
 
 impl DeliverableObligation {
     pub(super) fn file(role: ArtifactRole, path: impl Into<String>) -> Self {
-        let path = path.into();
+        let path = validated_obligation_path(path.into());
         Self {
             role,
             kind: DeliverableKind::File,
@@ -224,7 +236,7 @@ impl DeliverableObligation {
     }
 
     fn readme(path: impl Into<String>, required_sections: Vec<String>) -> Self {
-        let path = path.into();
+        let path = validated_obligation_path(path.into());
         Self {
             role: ArtifactRole::UsageDocs,
             kind: DeliverableKind::File,
@@ -243,7 +255,7 @@ impl DeliverableObligation {
     }
 
     fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
-        let path = path.into();
+        let path = validated_obligation_path(path.into());
         let schema = StructuredRecordSchema { columns };
         Self {
             role: ArtifactRole::DataOutput,
@@ -270,7 +282,7 @@ impl DeliverableObligation {
         field: impl Into<String>,
         criterion: impl Into<String>,
     ) -> Self {
-        let path = path.into();
+        let path = validated_obligation_path(path.into());
         let field = field.into();
         Self {
             role,
@@ -384,8 +396,14 @@ impl CompletionPolicy {
             project_intent,
             CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
         );
-        let coding_verifier_required =
-            task_kind == TaskKind::Coding && !verifier_free_document_task;
+        // Issue #918 (P1): the verification-requirement gate now routes through the
+        // single `capability_for(TaskKind)` dispatch spine. `requires_executable_verifier`
+        // is a 1:1 replacement for the old `coding_verifier_required` bare gate
+        // (`task_kind == Coding && !verifier_free_document_task`); it is ANDed into each
+        // of the two fields *separately*, exactly as before, so no inter-field dependency
+        // is introduced and non-coding kinds remain verifier-free (§5.1 invariant).
+        let coding_verifier_required = super::verifier::capability_for(task_kind)
+            .requires_executable_verifier(verifier_free_document_task);
         Self {
             task_kind,
             project_intent,
@@ -1230,39 +1248,103 @@ fn recovery_target_hint_for_missing_with_contract(
     recovery_target_hint_for_missing(artifacts, missing)
 }
 
+/// Issue #918 (P1): display cap (chars) for a single section/schema label.
+/// Applied ONLY to the display projection here — NOT to the stored
+/// `required_sections` (which `required_sections_present` substring-matches; a
+/// truncated stored value would make completion permanently false-negative).
+const MAX_SECTION_LABEL_LEN: usize = 256;
+/// Issue #918 (P1): display cap (count) on acceptance criteria. Applied only at
+/// this projection — never to the stored `acceptance_criteria` field, which is
+/// also read by repair_packet expected-evidence and is `PartialEq`-compared.
+const MAX_ACCEPTANCE_CRITERIA: usize = 32;
+
+/// Per-value `mask_secrets` for a free-text obligation field.
+///
+/// Issue #918 (P1): masks each value BEFORE it is assembled into the label, so
+/// the `role=/kind=/path=` structure (and the exact-string goldens) survive and
+/// secrets in any LLM-derived field cannot leak. This is the SOLE defense on the
+/// prompt path (the label is rendered into the LLM request body via recovery
+/// messages, which is not a serde `Value` and does not pass through
+/// `mask_payload_inplace`); persisted/logged copies additionally pass through
+/// `mask_payload_inplace` as the final defense line.
+fn mask_obligation_value(value: &str) -> String {
+    crate::session::feedback::mask_secrets(value)
+}
+
+/// Mask then char-boundary-cap a section/schema label for display.
+fn mask_and_cap_label(value: &str) -> String {
+    let masked = mask_obligation_value(value);
+    if masked.chars().count() <= MAX_SECTION_LABEL_LEN {
+        masked
+    } else {
+        masked.chars().take(MAX_SECTION_LABEL_LEN).collect()
+    }
+}
+
+/// Issue #918 (P1) follow-up (PR #930 review): SSOT mask+cap for any
+/// obligation/hint-derived free-text rendered into a **recovery prompt**.
+///
+/// Recovery notes (verifier-repair / artifact-directed) render `RecoveryTargetHint`
+/// path/reason — which can carry LLM/request-derived text — directly into the LLM
+/// request body, a path that does NOT pass through `mask_payload_inplace`. This is
+/// the same masking + length cap [`obligation_report_label`] applies, exposed so
+/// the recovery-note builders reuse it instead of emitting raw values.
+pub(super) fn mask_and_cap_recovery_field(value: &str) -> String {
+    mask_and_cap_label(value)
+}
+
+fn join_masked_labels(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|v| mask_and_cap_label(v))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 fn obligation_report_label(obligation: &ArtifactObligation) -> String {
     let mut parts = vec![format!(
         "role={}, kind={}, path={}",
         obligation.role.label(),
         obligation.kind.label(),
-        obligation.path
+        mask_obligation_value(&obligation.path)
     )];
     if !obligation.required_sections.is_empty() {
         parts.push(format!(
             "required_sections={}",
-            obligation.required_sections.join("|")
+            join_masked_labels(&obligation.required_sections)
         ));
     }
     if !obligation.acceptance_criteria.is_empty() {
-        parts.push(format!(
-            "acceptance_criteria={}",
-            obligation.acceptance_criteria.join("|")
-        ));
+        // Count-cap the criteria list AND per-value mask+length-cap each entry at
+        // the display projection (never the stored field). PR #930 review (Medium):
+        // each criterion now also gets the MAX_SECTION_LABEL_LEN char cap via
+        // `mask_and_cap_label`, not just `mask_secrets`.
+        let shown = obligation
+            .acceptance_criteria
+            .iter()
+            .take(MAX_ACCEPTANCE_CRITERIA)
+            .map(|c| mask_and_cap_label(c))
+            .collect::<Vec<_>>()
+            .join("|");
+        parts.push(format!("acceptance_criteria={shown}"));
     }
     if let Some(DeliverableSchema::JsonFields(fields)) = obligation.schema.as_ref()
         && !fields.is_empty()
     {
-        parts.push(format!("schema_fields={}", fields.join("|")));
+        parts.push(format!("schema_fields={}", join_masked_labels(fields)));
     }
     if let Some(DeliverableSchema::StructuredRecord(schema)) = obligation.schema.as_ref()
         && !schema.columns.is_empty()
     {
-        parts.push(format!("schema_columns={}", schema.columns.join("|")));
+        parts.push(format!(
+            "schema_columns={}",
+            join_masked_labels(&schema.columns)
+        ));
     }
     if let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
         && !sections.is_empty()
     {
-        parts.push(format!("schema_sections={}", sections.join("|")));
+        parts.push(format!("schema_sections={}", join_masked_labels(sections)));
     }
     parts.join(", ")
 }
@@ -1871,13 +1953,17 @@ pub(super) fn render_contract_recovery_note_with_hint(
         next_role.label()
     );
     if let Some(hint) = target_hint {
+        // PR #930 review (High-2 residual): hint.path / hint.reason are
+        // LLM/request-derived and are embedded straight into this recovery prompt
+        // (which does NOT pass through `mask_payload_inplace`). Route them through
+        // the same SSOT mask+cap that `obligation_report_label` uses so a secret in
+        // a hint path/reason cannot leak into the prompt.
+        let masked_path = mask_and_cap_recovery_field(&hint.path);
         note.push_str(&format!(
-            " Missing obligation: role={}, path={}. Recovery target: role={}, path={}, reason={}. Prefer a Write/Edit tool call for this same deliverable obligation now; scaffold-only files do not count until their content changes.",
+            " Missing obligation: role={}, path={masked_path}. Recovery target: role={}, path={masked_path}, reason={}. Prefer a Write/Edit tool call for this same deliverable obligation now; scaffold-only files do not count until their content changes.",
             hint.role.label(),
-            hint.path,
             hint.role.label(),
-            hint.path,
-            hint.reason
+            mask_and_cap_recovery_field(&hint.reason)
         ));
     }
     note
@@ -3256,6 +3342,68 @@ fn normalize_explicit_user_artifact_path(token: &str) -> Option<String> {
         .then_some(path)
 }
 
+/// Issue #918 (P1): hard cap (bytes) on a stored obligation path.
+pub(super) const MAX_OBLIGATION_PATH_BYTES: usize = 4096;
+
+/// Issue #918 (P1): SSOT path validator that every `DeliverableObligation`
+/// constructor routes its `path` through, so a raw unvalidated traversal /
+/// oversized path can never be stored.
+///
+/// The validation *predicate* is [`normalize_explicit_user_artifact_path`]
+/// (normalize + `WorkspacePolicy` admit) — the SAME predicate parse-time
+/// admission uses, so the two cannot diverge. They differ only in their
+/// *failure action*: parse-time rejects (returns `None`); construction here is
+/// infallible and falls back to a sanitized, non-traversing display string.
+///
+/// The obligation path is a display + string-comparison label only — it is
+/// never resolved against the filesystem (the Write/Edit tool registry enforces
+/// work_root containment independently), so the fallback's job is to keep it a
+/// safe display string (no traversal, no control chars, masked, length-capped),
+/// not to gate FS access. Valid builder paths pass the predicate and are stored
+/// verbatim, so existing obligation goldens / equality fixtures are unchanged.
+fn validated_obligation_path(raw: String) -> String {
+    match normalize_explicit_user_artifact_path(&raw) {
+        Some(normalized) => truncate_obligation_path(normalized),
+        None => sanitize_rejected_obligation_path(&raw),
+    }
+}
+
+/// Fail-closed sanitizer for a path that did not pass the validation predicate.
+/// Strips traversal (`..`/`.`/leading-`/`), neutralizes control characters,
+/// masks secrets, and caps length — guaranteeing a workspace-relative-looking
+/// display string that can never traverse or break a log line / recovery prompt.
+fn sanitize_rejected_obligation_path(raw: &str) -> String {
+    let normalized_sep = raw.replace('\\', "/");
+    let mut out = String::new();
+    for segment in normalized_sep.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        for ch in segment.chars() {
+            out.push(if ch.is_control() { '_' } else { ch });
+        }
+    }
+    // mask BEFORE truncation so a length cap can never split an unmasked secret.
+    let masked = crate::session::feedback::mask_secrets(&out);
+    truncate_obligation_path(masked)
+}
+
+/// Char-boundary-safe truncation to [`MAX_OBLIGATION_PATH_BYTES`].
+fn truncate_obligation_path(mut path: String) -> String {
+    if path.len() <= MAX_OBLIGATION_PATH_BYTES {
+        return path;
+    }
+    let mut end = MAX_OBLIGATION_PATH_BYTES;
+    while end > 0 && !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    path.truncate(end);
+    path
+}
+
 fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
     let trimmed = token.trim_matches(|ch: char| {
         ch.is_ascii_whitespace()
@@ -3903,6 +4051,253 @@ mod tests {
         assert!(
             coding_tests.completion_policy.test_execution_required(),
             "coding+tests request must still require test execution (gate intact)"
+        );
+    }
+
+    // Issue #918 (P1) §5.1: the highest-risk invariant. `test_execution_required`
+    // is derived from request text (kind-independent), so a NON-coding request that
+    // mentions "test" already carries the flag in RequiredBehaviorContract. The
+    // capability gate (`requires_executable_verifier == false` for non-coding) is the
+    // only thing that must clamp it back to false. This pins that no non-coding kind
+    // can be lifted into executable verification / test execution.
+    #[test]
+    fn non_coding_kinds_never_require_executable_verifier_even_with_test_keyword() {
+        // A request whose text asks for tests: extract sets test_execution_required=true.
+        let rb = super::super::required_behavior::extract(
+            "Produce the report and add tests for the examples",
+        );
+        assert!(
+            rb.test_execution_required,
+            "precondition: request text must set test_execution_required (kind-independent)"
+        );
+
+        for kind in [
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
+        ] {
+            // Build intent + no required artifacts => project_intent is NOT a
+            // verifier-free document task, so verifier_free_document_task=false.
+            // The clamp must still force both fields false purely by kind.
+            let policy = CompletionPolicy::from_contract_parts(
+                kind,
+                TaskIntent::Build,
+                &[],
+                true, // verification_required input = true
+                &rb,
+            );
+            assert!(
+                !policy.verification_required(),
+                "{kind:?}: verification_required must stay false (non-coding clamp)"
+            );
+            assert!(
+                !policy.test_execution_required(),
+                "{kind:?}: test_execution_required must stay false despite test keyword (§5.1)"
+            );
+        }
+    }
+
+    // Issue #918 (P1): the DocsOnly/AnswerOnly suppression for Coding is preserved —
+    // a verifier-free document Coding task stays verifier-free (no regression).
+    #[test]
+    fn coding_doc_only_intent_stays_verifier_free() {
+        let rb = super::super::required_behavior::extract("Write the README and add tests");
+        // DocsOnly project intent for a Coding kind => verifier_free_document_task=true
+        // => requires_executable_verifier(true)=false => both fields false.
+        let answer_only = CompletionPolicy::from_contract_parts(
+            TaskKind::Coding,
+            TaskIntent::Explain, // Explain => AnswerOnly (verifier-free document task)
+            &[ArtifactRole::UsageDocs],
+            true,
+            &rb,
+        );
+        assert_eq!(
+            answer_only.project_intent,
+            CompletionProjectIntent::AnswerOnly
+        );
+        assert!(
+            !answer_only.verification_required(),
+            "AnswerOnly Coding must stay verifier-free"
+        );
+        assert!(
+            !answer_only.test_execution_required(),
+            "AnswerOnly Coding must not require test execution"
+        );
+
+        // DocsOnly: a non-Explain intent with exactly [UsageDocs].
+        let docs_only = CompletionPolicy::from_contract_parts(
+            TaskKind::Coding,
+            TaskIntent::Build,
+            &[ArtifactRole::UsageDocs],
+            true,
+            &rb,
+        );
+        assert_eq!(docs_only.project_intent, CompletionProjectIntent::DocsOnly);
+        assert!(
+            !docs_only.verification_required(),
+            "DocsOnly Coding must stay verifier-free"
+        );
+        assert!(
+            !docs_only.test_execution_required(),
+            "DocsOnly Coding must not require test execution"
+        );
+    }
+
+    // Issue #918 (P1) Task 4: validated_obligation_path SSOT.
+    #[test]
+    fn validated_obligation_path_keeps_builder_corpus_verbatim() {
+        // DR3-007: every path the default-obligation builders pass must take the
+        // Some/verbatim branch so obligation goldens / .contains(&ctor) equality
+        // never drift. If a future builder path falls to the sanitized fallback,
+        // this fails CI instead of silently changing stored path identity.
+        for p in [
+            "Cargo.toml",
+            "src/main.rs",
+            "tests/cli.rs",
+            "README.md",
+            "package.json",
+            "src/index.js",
+            "tests/index.test.js",
+            "main.py",
+            "tests/test_main.py",
+            "output.csv",
+            "output.tsv",
+            "output.jsonl",
+        ] {
+            assert_eq!(
+                super::validated_obligation_path(p.to_string()),
+                p,
+                "builder path {p} must be stored verbatim (predicate Some branch)"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_obligation_path_sanitizes_traversal_and_control() {
+        for raw in [
+            "../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "/etc/shadow",
+            "./../secret.key",
+        ] {
+            let got = super::validated_obligation_path(raw.to_string());
+            assert!(
+                !got.contains(".."),
+                "{raw:?} -> {got:?} must not contain a traversal segment"
+            );
+            assert!(
+                !got.starts_with('/'),
+                "{raw:?} -> {got:?} must not be absolute"
+            );
+        }
+        // Control characters (newline used for log-line / prompt spoofing) are
+        // neutralized so a rejected path can't break a recovery message.
+        let spoof = super::validated_obligation_path("a\nb\rc.txt".to_string());
+        assert!(!spoof.contains('\n') && !spoof.contains('\r'));
+    }
+
+    #[test]
+    fn validated_obligation_path_caps_length() {
+        let long = format!("dir/{}.txt", "a".repeat(8000));
+        let got = super::validated_obligation_path(long);
+        assert!(
+            got.len() <= super::MAX_OBLIGATION_PATH_BYTES,
+            "path must be capped to MAX_OBLIGATION_PATH_BYTES"
+        );
+    }
+
+    #[test]
+    fn deliverable_obligation_file_ctor_sanitizes_raw_traversal_path() {
+        let ob = DeliverableObligation::file(ArtifactRole::Implementation, "../../etc/passwd");
+        assert!(
+            !ob.path.contains(".."),
+            "ctor stored a traversal path: {}",
+            ob.path
+        );
+    }
+
+    // Issue #918 (P1) Task 5: per-value masking in obligation_report_label.
+    // A secret embedded in ANY LLM-derived field must be masked in the label
+    // (the SOLE defense on the prompt path), while the structure survives.
+    #[test]
+    fn obligation_report_label_masks_secrets_in_every_field() {
+        const SECRET: &str = "AKIAEXAMPLESECRETVALUE12345";
+        // acceptance_criteria + schema_fields (JsonFields) via json_field ctor.
+        let json = DeliverableObligation::json_field(
+            ArtifactRole::DataOutput,
+            "output.jsonl",
+            format!("token={SECRET}"), // schema_fields value
+            format!("criterion needs token={SECRET}"), // acceptance_criteria value
+        );
+        let json_label = super::obligation_report_label(&json);
+        assert!(
+            !json_label.contains(SECRET),
+            "secret leaked in label: {json_label}"
+        );
+        assert!(
+            json_label.contains("token=***"),
+            "kv secret should be masked to token=***: {json_label}"
+        );
+        // Structure preserved.
+        assert!(json_label.starts_with("role=data_output, kind="));
+
+        // required_sections via readme ctor.
+        let readme =
+            DeliverableObligation::readme("README.md", vec![format!("Setup with token={SECRET}")]);
+        let readme_label = super::obligation_report_label(&readme);
+        assert!(
+            !readme_label.contains(SECRET),
+            "secret leaked in required_sections label: {readme_label}"
+        );
+    }
+
+    // PR #930 review (Medium): each acceptance_criteria value also gets the
+    // MAX_SECTION_LABEL_LEN char cap at the display projection (not just count).
+    #[test]
+    fn acceptance_criteria_per_value_length_cap_applied_at_display() {
+        let mut ob = DeliverableObligation::file(ArtifactRole::Implementation, "src/main.rs");
+        ob.acceptance_criteria = vec!["x".repeat(1000)];
+        // Stored value untouched.
+        assert_eq!(ob.acceptance_criteria[0].len(), 1000);
+        let label = super::obligation_report_label(&ob);
+        let shown = label
+            .split("acceptance_criteria=")
+            .nth(1)
+            .unwrap()
+            .split(", ")
+            .next()
+            .unwrap();
+        assert!(
+            shown.chars().count() <= super::MAX_SECTION_LABEL_LEN,
+            "criterion display must be capped to MAX_SECTION_LABEL_LEN, got {}",
+            shown.chars().count()
+        );
+    }
+
+    // Issue #918 (P1) Task 5: the count cap is display-only — the stored field
+    // is never truncated (preserves PartialEq + repair_packet .take(8)).
+    #[test]
+    fn acceptance_criteria_count_cap_is_display_only() {
+        let mut ob = DeliverableObligation::file(ArtifactRole::Implementation, "src/main.rs");
+        ob.acceptance_criteria = (0..50).map(|i| format!("criterion {i}")).collect();
+        // Stored field is untouched.
+        assert_eq!(ob.acceptance_criteria.len(), 50);
+        // Display label shows at most MAX_ACCEPTANCE_CRITERIA entries.
+        let label = super::obligation_report_label(&ob);
+        let shown = label
+            .split("acceptance_criteria=")
+            .nth(1)
+            .unwrap()
+            .split(", ")
+            .next()
+            .unwrap()
+            .split('|')
+            .count();
+        assert!(
+            shown <= super::MAX_ACCEPTANCE_CRITERIA,
+            "display showed {shown} criteria, cap is {}",
+            super::MAX_ACCEPTANCE_CRITERIA
         );
     }
 
@@ -4714,6 +5109,38 @@ mod tests {
         assert!(
             note.contains("scaffold-only files do not count"),
             "got: {note}"
+        );
+    }
+
+    // PR #930 review (High-2 residual): render_contract_recovery_note_with_hint
+    // embeds hint.path / hint.reason directly into the LLM recovery prompt (which
+    // does NOT pass through mask_payload_inplace). A secret in either must be
+    // masked via the obligation mask/cap SSOT.
+    #[test]
+    fn render_contract_recovery_note_masks_secret_in_hint_path_and_reason() {
+        const SECRET: &str = "AKIASECRETXYZ0123456789";
+        let decision = CompletionDecision::Continue {
+            missing: vec![ArtifactRole::Implementation],
+        };
+        let hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: format!("app/token={SECRET}.py"),
+            reason: format!("required because token={SECRET}"),
+        };
+        let note = render_contract_recovery_note_with_hint(
+            &decision,
+            "build the feature",
+            1,
+            4,
+            Some(&hint),
+        );
+        assert!(
+            !note.contains(SECRET),
+            "secret leaked into recovery note: {note}"
+        );
+        assert!(
+            note.contains("token=***"),
+            "kv secret in hint path/reason should be masked to token=***: {note}"
         );
     }
 
