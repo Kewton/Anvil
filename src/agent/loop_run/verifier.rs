@@ -559,7 +559,7 @@ fn verifier_diagnostic_for_artifact(
                 VerifierDiagnosticCode::EvidenceMissing,
                 ArtifactRole::UsageDocs,
                 Some(path),
-                "ops runbook is missing required sections (need a checklist + validation core and at least 3 of checklist/validation/rollback/risk)",
+                OPS_RUNBOOK_DIAGNOSTIC_MESSAGE,
             )
         }),
     }
@@ -701,7 +701,7 @@ fn verifier_diagnostic_for_obligation_parts(
             VerifierDiagnosticCode::EvidenceMissing,
             obligation.role,
             Some(&obligation.path),
-            "ops runbook is missing required sections (need a checklist + validation core and at least 3 of checklist/validation/rollback/risk)",
+            OPS_RUNBOOK_DIAGNOSTIC_MESSAGE,
         ));
     }
     None
@@ -1051,6 +1051,11 @@ fn research_report_pass(excerpt: &str) -> bool {
     );
     has_citation && has_claim && has_uncertainty
 }
+
+/// Issue #923 (P6): SSOT for the Ops runbook EvidenceMissing diagnostic so the
+/// artifact-diagnostic and obligation-diagnostic paths describe the tier rule
+/// identically (no drift, S1-005 diagnostic parity).
+const OPS_RUNBOOK_DIAGNOSTIC_MESSAGE: &str = "ops runbook is missing required sections (need a checklist + validation core and at least 3 of checklist/validation/rollback/risk)";
 
 /// Issue #923 (P6): an Ops runbook section. SSOT for both excerpt-keyword
 /// detection and request-label mapping (DRY, DSR1-001). `Checklist` and
