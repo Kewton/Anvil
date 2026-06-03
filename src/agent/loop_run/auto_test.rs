@@ -3799,6 +3799,7 @@ mod tests {
             TaskKind::Data,
             TaskKind::Research,
             TaskKind::Ops,
+            TaskKind::Authoring,
         ] {
             let result =
                 AutoTestRunner::run_structured(dir.path(), &scope, &command, "pytest -q", kind);

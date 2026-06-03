@@ -30,6 +30,12 @@ pub(super) enum TaskKind {
     Data,
     Research,
     Ops,
+    /// Issue #919 (P2): translation / content writing / rewriting that
+    /// *produces an artifact file* (`summarize`/`要約` deliberately excluded).
+    /// Non-coding (verifier-free via `capability_for`), accept-tier completion
+    /// (artifact present + non-empty + `AUTHORING_MIN_CONTENT_CHARS` + softened
+    /// `required_sections_present`), routed through the thin `AuthoringVerifier`.
+    Authoring,
 }
 
 impl TaskKind {
@@ -48,6 +54,7 @@ impl TaskKind {
             TaskKind::Data => "data",
             TaskKind::Research => "research",
             TaskKind::Ops => "ops",
+            TaskKind::Authoring => "authoring",
         }
     }
 
@@ -1082,8 +1089,11 @@ fn artifact_identity_satisfied_for_verification(
     artifact_excerpts: &ArtifactExcerpts,
     identity: &ArtifactObligation,
 ) -> bool {
+    // Issue #919: path-existence observation must still see a raw repo edit
+    // (DR3-002 only governs *completion authority*, not whether the path exists);
+    // the Authoring accept-tier is enforced by `verifier_diagnostic_for_obligation`.
     let path_exists = artifact_identity_path_ready_for_verification(artifacts, identity)
-        || artifact_identity_observed_in_evidence(evidence, identity);
+        || artifact_identity_observed_in_evidence(evidence, identity, false);
     let excerpt = artifact_excerpts.get(&identity.role).map(String::as_str);
     let Some(diagnostic) = super::verifier::verifier_diagnostic_for_obligation(
         task_kind,
@@ -1122,21 +1132,33 @@ fn required_role_satisfied_by_evidence(
     evidence: &EvidenceSet,
     role: ArtifactRole,
 ) -> bool {
+    // Issue #919 (DR3-002): for an Authoring contract the UsageDocs role is
+    // completion authority ONLY through a path-matched accept-tier pass
+    // (`ReportCompletenessPass`/`RequiredSectionsPass`). Raw `RepoEdit(Docs)` is
+    // existence/progress evidence, not completion authority, so we must NOT take
+    // either the `observed_artifacts` short-circuit (which `RepoEdit(Docs)`
+    // trips) nor allow `RepoEdit(Docs)` to satisfy an identity.
+    let authoring = contract.task_kind == TaskKind::Authoring;
     let identities = contract.required_identities_for_role(role);
     if identities.is_empty() {
+        if authoring && role == ArtifactRole::UsageDocs {
+            return false;
+        }
         return observed_artifacts(evidence).contains(&role);
     }
-    if role == ArtifactRole::UsageDocs && observed_artifacts(evidence).contains(&role) {
+    if role == ArtifactRole::UsageDocs && !authoring && observed_artifacts(evidence).contains(&role)
+    {
         return true;
     }
     identities
         .iter()
-        .all(|identity| artifact_identity_observed_in_evidence(evidence, identity))
+        .all(|identity| artifact_identity_observed_in_evidence(evidence, identity, authoring))
 }
 
 fn artifact_identity_observed_in_evidence(
     evidence: &EvidenceSet,
     identity: &ArtifactObligation,
+    authoring: bool,
 ) -> bool {
     evidence
         .iter()
@@ -1147,7 +1169,10 @@ fn artifact_identity_observed_in_evidence(
                 path: Some(path),
                 ..
             } => {
-                role_from_repo_edit(*category) == Some(identity.role)
+                // DR3-002: a raw repo edit never satisfies an Authoring UsageDocs
+                // identity — the accept tier must observe a path-matched pass.
+                !(authoring && identity.role == ArtifactRole::UsageDocs)
+                    && role_from_repo_edit(*category) == Some(identity.role)
                     && normalized_artifact_path_eq(path, &identity.path)
             }
             CompletionEvidence::RequiredSectionsPass { path: Some(path) } => {
@@ -1431,7 +1456,7 @@ impl TaskContract {
     pub(super) fn from_request(request: &str) -> Self {
         let lower = request.to_ascii_lowercase();
         let project_intent = ProjectIntent::from_request(request);
-        let intent = project_intent.intent;
+        let mut intent = project_intent.intent;
         let asks_for_tests = request_asks_for_test_artifact(request, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
@@ -1447,6 +1472,14 @@ impl TaskContract {
             asks_for_usage_docs,
             asks_for_setup,
         );
+        // Issue #919 (Decision #5(a)): Authoring contracts never carry the
+        // Explain intent. Trigger B may have classified `intent = Explain` (e.g.
+        // `summarize`); override it to `Build` so the contract acquires a
+        // non-empty `required_artifacts = [UsageDocs]` and can never take either
+        // Explain early-return (`evaluate_inner` / `plan_artifact_recovery`).
+        if task_kind == TaskKind::Authoring {
+            intent = TaskIntent::Build;
+        }
         // Issue #917: 2-value confidence from the keyword-match signal. Only the
         // no-keyword-match fallthrough (matched == false) lands below the
         // confirm threshold and triggers `needs_confirm()`.
@@ -1469,6 +1502,14 @@ impl TaskContract {
             required.push(ArtifactRole::Test);
         }
         if asks_for_usage_docs {
+            required.push(ArtifactRole::UsageDocs);
+        }
+        // Issue #919 (Decision #5(a)): Authoring requires the UsageDocs role even
+        // when no docs *topic* word was present (Trigger B). Pushing it here lets
+        // the explicit `summary.md`/`README.md` obligation survive the
+        // `required_artifact_identities.retain(|id| required.contains(&id.role))`
+        // below — without it the obligation is dropped exactly as it is today.
+        if task_kind == TaskKind::Authoring {
             required.push(ArtifactRole::UsageDocs);
         }
         if asks_for_setup {
@@ -2014,6 +2055,28 @@ fn infer_task_kind(
             matched: true,
         };
     }
+    // Issue #919 (Decision #1): Authoring pre-check, placed BEFORE the first Docs
+    // branch (README/docs-path authoring would otherwise be claimed by Docs) AND
+    // before Research (`request_asks_for_research_task` absorbs any Explain
+    // intent, so Trigger B `summarize → summary.md` must be evaluated first).
+    // Code work still wins by predicate: the pre-check requires
+    // `!implementation_artifact` — the docs-aware code-work signal (the same one
+    // the first Docs branch uses), so a request that produces an implementation
+    // artifact alongside docs stays on the Coding branch, while a docs-path
+    // "write README.md" (not production code work) is eligible for Authoring.
+    if request_asks_for_authoring_task(
+        request,
+        lower,
+        intent,
+        implementation_artifact,
+        data_task,
+        asks_for_setup,
+    ) {
+        return TaskKindInference {
+            kind: TaskKind::Authoring,
+            matched: true,
+        };
+    }
     if asks_for_usage_docs && !implementation_artifact {
         return TaskKindInference {
             kind: TaskKind::Docs,
@@ -2141,6 +2204,16 @@ fn generic_task_deliverable(request: &str, task_kind: TaskKind) -> TaskDeliverab
             kind: DeliverableKind::Code,
             role: Some(ArtifactRole::Implementation),
             path: None,
+            required_sections: Vec::new(),
+        },
+        // Issue #919 (Decision #3 site #7): reuse the Docs deliverable shape but
+        // with **empty `required_sections`** so the docs section gate is not
+        // imposed — Authoring completion is accept-tier only (present + non-empty
+        // + min length + softened user-named sections).
+        TaskKind::Authoring => TaskDeliverable {
+            kind: DeliverableKind::UsageDocs,
+            role: Some(ArtifactRole::UsageDocs),
+            path: Some(default_docs_path_from_request(request)),
             required_sections: Vec::new(),
         },
     }
@@ -2294,6 +2367,75 @@ fn request_has_explicit_coding_subject(request: &str, lower: &str) -> bool {
         ],
     ) || mentions_stack_as_build_target(request, lower)
         || contains_implementation_file_hint(lower)
+}
+
+/// Issue #919 (Decision #1): does the request name an explicit user-provided
+/// output docs artifact path (`UsageDocs`-role obligation with a recognized
+/// docs extension `.md`/`.txt`/`.rst`/`.mdx`)? This is the §2.6 load-bearing
+/// discriminator that separates an *artifact-producing* prose request from a
+/// *pure-answer* one. It proves the user named a normalized deliverable path —
+/// NOT that the file exists or is safe to read (that authority lives in the
+/// repo-edit / ledger admission path; see Decision #4 security note).
+fn request_names_explicit_output_docs(request: &str) -> bool {
+    explicit_artifact_obligations_from_request(request)
+        .iter()
+        .any(|identity| identity.role == ArtifactRole::UsageDocs)
+}
+
+/// Issue #919 (Decision #1): does the request match an Authoring keyword?
+/// `summarize`/`要約`/`summary` are deliberately EXCLUDED (owned by
+/// `infer_intent`→Explain and by the Research goldens). The set is disjoint
+/// from the existing Explain/Research/Docs goldens.
+fn request_matches_authoring_keyword(lower: &str, request: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "translate",
+            "translation",
+            "rewrite",
+            "reword",
+            "paraphrase",
+            "proofread",
+            "copyedit",
+            "draft",
+        ],
+    ) || contains_any(
+        request,
+        &["翻訳", "書き直", "言い換え", "校正", "清書", "推敲"],
+    )
+}
+
+/// Issue #919 (Decision #1): the Authoring classification predicate. Fires
+/// under EITHER of two disjoint triggers (both require `!code_work`,
+/// `!data_task`, `!asks_for_setup` — code/data/setup keep their branches):
+///
+/// - **Trigger A** (keyword + explicit-output path): an authoring keyword AND
+///   an explicit `UsageDocs` output obligation AND `intent != Explain`. The
+///   explicit-output requirement is mandatory (DR3-005): `infer_intent` does
+///   not classify `translate`/`rewrite` as Explain, so a keyword-only Trigger A
+///   would misroute no-output requests like "translate this paragraph".
+/// - **Trigger B** (explicit-output-path, the OR-5 primary fix): an explicit
+///   `UsageDocs` output obligation AND prose-output-shaped (`intent == Explain`
+///   from `summarize`/`要約` etc. OR an authoring keyword). Fires even when
+///   `intent == Explain` — the explicit output path is itself the
+///   artifact-producing signal that an Explain keyword would otherwise mask.
+fn request_asks_for_authoring_task(
+    request: &str,
+    lower: &str,
+    intent: TaskIntent,
+    implementation_artifact: bool,
+    data_task: bool,
+    asks_for_setup: bool,
+) -> bool {
+    if implementation_artifact || data_task || asks_for_setup {
+        return false;
+    }
+    let keyword = request_matches_authoring_keyword(lower, request);
+    let explicit_output = request_names_explicit_output_docs(request);
+    let trigger_a = keyword && explicit_output && !matches!(intent, TaskIntent::Explain);
+    let prose_output_shaped = matches!(intent, TaskIntent::Explain) || keyword;
+    let trigger_b = explicit_output && prose_output_shaped;
+    trigger_a || trigger_b
 }
 
 fn request_asks_for_research_task(request: &str, lower: &str, intent: TaskIntent) -> bool {
@@ -7168,5 +7310,203 @@ mod tests {
                 "positive phrasing {phrasing:?} regressed to false"
             );
         }
+    }
+
+    // ----- Issue #919: Authoring classification (Decision #1 Trigger A/B) -----
+
+    #[test]
+    fn infer_task_kind_routes_authoring() {
+        // Trigger A: authoring keyword + explicit output docs path + non-Explain.
+        let a1 =
+            TaskContract::from_request("Translate README.ja.md into English and write README.md");
+        assert_eq!(a1.task_kind, TaskKind::Authoring, "Trigger A (translate)");
+        let a2 = TaskContract::from_request(
+            "Rewrite the intro paragraph in docs/intro.md to be clearer",
+        );
+        assert_eq!(a2.task_kind, TaskKind::Authoring, "Trigger A (rewrite)");
+
+        // Trigger B: explicit output docs path + Explain (summarize) → Authoring,
+        // intent overridden to Build (OR-5 hole closure).
+        let b = TaskContract::from_request("summarize the design into summary.md");
+        assert_eq!(
+            b.task_kind,
+            TaskKind::Authoring,
+            "Trigger B (summarize→file)"
+        );
+        assert_eq!(b.intent, TaskIntent::Build, "Trigger B forces intent=Build");
+    }
+
+    #[test]
+    fn summarize_with_artifact_classifies_authoring() {
+        let contract = TaskContract::from_request("summarize the design into summary.md");
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+        assert_eq!(contract.intent, TaskIntent::Build);
+        // The explicit obligation survives the retain → UsageDocs is required.
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        // evaluate(empty) must NOT be Done — the OR-5 hole is closed.
+        let empty = EvidenceSet::new();
+        assert_eq!(
+            contract.evaluate(&empty),
+            CompletionDecision::Continue {
+                missing: vec![ArtifactRole::UsageDocs]
+            }
+        );
+    }
+
+    #[test]
+    fn no_output_translation_not_authoring() {
+        // No explicit output artifact path → not Authoring (DR3-005).
+        let t = TaskContract::from_request("translate this paragraph into English");
+        assert_ne!(t.task_kind, TaskKind::Authoring);
+        let r = TaskContract::from_request("rewrite this sentence to be clearer");
+        assert_ne!(r.task_kind, TaskKind::Authoring);
+    }
+
+    #[test]
+    fn explain_topic_word_stays_done() {
+        // "explain and review the documentation": topic word but no explicit
+        // output path obligation → stays Explain → Done (regression guard,
+        // explicit-output-path discriminator does NOT misroute it).
+        let contract = TaskContract::from_request("explain and review the documentation");
+        assert_ne!(contract.task_kind, TaskKind::Authoring);
+        assert_eq!(contract.intent, TaskIntent::Explain);
+        assert_eq!(
+            contract.evaluate(&EvidenceSet::new()),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
+    fn explicit_output_path_discriminator_inert_without_path() {
+        let contract = TaskContract::from_request("explain how the auth flow works");
+        assert_ne!(contract.task_kind, TaskKind::Authoring);
+        assert_eq!(contract.intent, TaskIntent::Explain);
+        assert_eq!(
+            contract.evaluate(&EvidenceSet::new()),
+            CompletionDecision::Done
+        );
+    }
+
+    #[test]
+    fn update_readme_setup_usage_test_stays_docs() {
+        // Docs-maintenance: explicit docs path but no authoring keyword and no
+        // prose-output (Explain) intent → stays Docs (DR3-001).
+        let contract =
+            TaskContract::from_request("Update README.md with setup, usage, and test sections");
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+    }
+
+    #[test]
+    fn authoring_classification_does_not_flip_research_goldens() {
+        let r1 = TaskContract::from_request(
+            "Research and compare local LLM options, include sources and a recommendation",
+        );
+        assert_eq!(r1.task_kind, TaskKind::Research);
+        let r2 = TaskContract::from_request(
+            "Research local LLM options and summarize sources and risks.",
+        );
+        assert_eq!(r2.task_kind, TaskKind::Research);
+    }
+
+    #[test]
+    fn authoring_both_gates_verifier_free() {
+        let contract = TaskContract::from_request("Translate README.ja.md and write README.md");
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+        assert!(!contract.completion_policy.verification_required());
+        assert!(!contract.completion_policy.test_execution_required());
+    }
+
+    // ----- Issue #919: Accept-tier authority (Decision #4 / DR3-002) -----
+
+    #[test]
+    fn authoring_artifact_not_done_on_empty_evidence() {
+        let contract = TaskContract::from_request("Translate README.ja.md and write README.md");
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+        assert_eq!(
+            contract.evaluate(&EvidenceSet::new()),
+            CompletionDecision::Continue {
+                missing: vec![ArtifactRole::UsageDocs]
+            }
+        );
+    }
+
+    #[test]
+    fn authoring_artifact_done_after_accept_tier_evidence() {
+        let contract = TaskContract::from_request("Translate README.ja.md and write README.md");
+        let paths: Vec<String> = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .iter()
+            .map(|id| id.path.clone())
+            .collect();
+        assert!(!paths.is_empty(), "UsageDocs obligation");
+        let mut evidence = EvidenceSet::new();
+        for path in paths {
+            evidence.push(CompletionEvidence::ReportCompletenessPass { path: Some(path) });
+        }
+        assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn authoring_stub_repo_edit_does_not_complete() {
+        // DR3-002: raw RepoEdit(Docs) is existence/progress only — it must NOT
+        // bypass the accept tier for an Authoring contract.
+        let contract = TaskContract::from_request("Translate README.ja.md and write README.md");
+        let path = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .first()
+            .map(|id| id.path.clone())
+            .expect("UsageDocs obligation");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Docs,
+            count: 1,
+            path: Some(path),
+        });
+        assert_eq!(
+            contract.evaluate(&evidence),
+            CompletionDecision::Continue {
+                missing: vec![ArtifactRole::UsageDocs]
+            },
+            "raw RepoEdit(Docs) must not complete Authoring"
+        );
+    }
+
+    #[test]
+    fn authoring_multi_file_requires_all_paths() {
+        let contract = TaskContract::from_request(
+            "Translate the docs: write intro.md and faq.md from the originals",
+        );
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+        let identities = contract.required_identities_for_role(ArtifactRole::UsageDocs);
+        assert!(
+            identities.len() >= 2,
+            "expected multiple UsageDocs identities, got {identities:?}"
+        );
+        // Recording a pass for only one path must not complete.
+        let first = identities[0].path.clone();
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::ReportCompletenessPass { path: Some(first) });
+        assert!(
+            matches!(
+                contract.evaluate(&evidence),
+                CompletionDecision::Continue { .. }
+            ),
+            "partial multi-file evidence must not complete Authoring"
+        );
+        // Recording a pass for every path completes.
+        let all_paths: Vec<String> = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .iter()
+            .map(|id| id.path.clone())
+            .collect();
+        let mut all_evidence = EvidenceSet::new();
+        for p in all_paths {
+            all_evidence.push(CompletionEvidence::ReportCompletenessPass { path: Some(p) });
+        }
+        assert_eq!(contract.evaluate(&all_evidence), CompletionDecision::Done);
     }
 }

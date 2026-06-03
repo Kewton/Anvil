@@ -864,6 +864,42 @@ fn pam_variant_for_eval(pam_eval: Option<&PamEvalSummary>) -> &'static str {
 
 fn infer_eval_task_kind(task: &str) -> &'static str {
     let lower = task.to_ascii_lowercase();
+    // Issue #919 (P2): heuristic eval labels (production authority is
+    // `TaskContract`; this second classifier approximates from text). DR3-002:
+    // this fn does NOT import `crate::agent`.
+    //
+    // Mentions an explicit output file/path token (a recognized extension)?
+    let mentions_output_path = lower.contains(".md")
+        || lower.contains(".txt")
+        || lower.contains(".rst")
+        || lower.contains(".mdx");
+    let is_research = lower.contains("research")
+        || lower.contains("compare")
+        || lower.contains("sources")
+        || task.contains("調査");
+    // `answer_only`: pure-answer prose with no output path and not research.
+    // Placed first so it precedes the docs branch; the research gate keeps
+    // "summarize sources" on research.
+    if !mentions_output_path
+        && !is_research
+        && (lower.contains("explain")
+            || lower.contains("summarize")
+            || task.contains("説明")
+            || task.contains("要約"))
+    {
+        return "answer_only";
+    }
+    // `authoring`: translation / rewriting / proofreading. Placed before docs
+    // so "rewrite docs/x.md" maps to authoring (matches the production
+    // Authoring-before-Docs order intent).
+    if lower.contains("translate")
+        || lower.contains("rewrite")
+        || lower.contains("proofread")
+        || task.contains("翻訳")
+        || task.contains("校正")
+    {
+        return "authoring";
+    }
     if lower.contains("readme")
         || lower.contains("documentation")
         || lower.contains("docs")
@@ -881,11 +917,7 @@ fn infer_eval_task_kind(task: &str) -> &'static str {
     {
         return "data";
     }
-    if lower.contains("research")
-        || lower.contains("compare")
-        || lower.contains("sources")
-        || task.contains("調査")
-    {
+    if is_research {
         return "research";
     }
     if lower.contains("runbook")
@@ -1565,5 +1597,32 @@ mod tests {
         let truncated_jp = truncate_bytes(jp, 7);
         // 7 bytes: 日(3) + 本(3) = 6 < 7, テ(3) would overflow → truncate at 6
         assert!(std::str::from_utf8(truncated_jp.trim_end_matches('…').as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn infer_eval_task_kind_authoring_and_answer_only() {
+        // Issue #919: heuristic eval labels.
+        assert_eq!(
+            infer_eval_task_kind("Translate README.ja.md into English and write README.md"),
+            "authoring"
+        );
+        assert_eq!(
+            infer_eval_task_kind("Rewrite docs/intro.md to be clearer"),
+            "authoring"
+        );
+        assert_eq!(
+            infer_eval_task_kind("Explain how the auth flow works"),
+            "answer_only"
+        );
+        // "summarize sources" stays research (research gate wins).
+        assert_eq!(
+            infer_eval_task_kind("Research local LLM options and summarize sources"),
+            "research"
+        );
+        // Plain docs maintenance stays docs.
+        assert_eq!(
+            infer_eval_task_kind("Update README.md with usage documentation"),
+            "docs"
+        );
     }
 }
