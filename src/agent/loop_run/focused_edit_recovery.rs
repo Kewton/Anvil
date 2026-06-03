@@ -419,3 +419,35 @@ pub(super) fn format_numbered_read_block(contents: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{focused_edit_compact_anchor_note, focused_edit_guidance_note};
+    use std::path::Path;
+
+    // PR #930 review (High-2): focused-edit recovery notes embed the target path
+    // (RecoveryTargetHint/policy-derived) into an LLM prompt that does NOT pass
+    // through mask_payload_inplace. A secret-shaped path must be masked via the
+    // single SSOT mask_and_cap_recovery_field.
+    #[test]
+    fn focused_edit_recovery_notes_mask_secret_in_target_path() {
+        const SECRET: &str = "AKIASECRETFOCUSED01234567";
+        let work_root = Path::new("/work");
+        let target = work_root.join(format!("app/token={SECRET}.tsx"));
+
+        for note in [
+            focused_edit_guidance_note(&target, work_root, true),
+            focused_edit_guidance_note(&target, work_root, false),
+            focused_edit_compact_anchor_note(&target, work_root),
+        ] {
+            assert!(
+                !note.contains(SECRET),
+                "secret leaked into focused-edit recovery note: {note}"
+            );
+            assert!(
+                note.contains("token=***"),
+                "kv secret in target path must be masked to token=***: {note}"
+            );
+        }
+    }
+}

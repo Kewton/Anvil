@@ -7,7 +7,7 @@ use crate::modes::plan_act::PlanStage;
 /// LLM-derived, so mask it (secrets) and length-cap it at the single render
 /// point here — no current or future caller can bypass it. `mask_secrets` is a
 /// no-op on ordinary workspace paths, so actionable target paths are unchanged.
-fn mask_recovery_path(path: &str) -> String {
+pub(crate) fn mask_and_cap_recovery_field(path: &str) -> String {
     const CAP: usize = 256;
     let masked = crate::session::feedback::mask_secrets(path);
     if masked.chars().count() <= CAP {
@@ -152,14 +152,14 @@ pub fn repo_change_no_tool_recovery_note(attempt: usize) -> String {
 }
 
 pub fn repo_change_after_read_no_edit_note(path: &str, attempt: usize) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "The user asked for an actual repository change, and {path} has already been inspected. Do not answer in prose and do not call Read again. Emit exactly one Edit tool call now on {path}. Use an exact old_string from the previous Read and make the smallest change that satisfies the request. repo_change_after_read_no_edit_attempt={attempt}"
     )
 }
 
 pub fn artifact_directed_recovery_note(role: &str, path: &str, attempt: usize) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "Artifact-directed recovery is active for missing role {role} at {path}. Do not answer in prose. Emit exactly one tool call now on that same path using Read, Write, or Edit only. Use Write when a small scaffold file should be replaced, or Edit when an exact local change is enough. Do not call Bash, Glob, Grep, or switch files. artifact_directed_attempt={attempt}"
     )
@@ -181,7 +181,7 @@ pub fn repo_change_quality_gate_note(
     issue: &str,
     attempt: usize,
 ) -> String {
-    let target_path = mask_recovery_path(target_path);
+    let target_path = mask_and_cap_recovery_field(target_path);
     let request_data = serde_json::to_string(request).unwrap_or_else(|_| "\"<invalid>\"".into());
     let target_data =
         serde_json::to_string(&target_path).unwrap_or_else(|_| "\"<invalid>\"".into());
@@ -222,14 +222,14 @@ pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
 }
 
 pub fn forced_small_edit_recovery_note(path: &str, attempt: usize) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "Recovery mode is active after repeated truncated tool calls. The target file has already been read, and the only available tool for the next turn is Edit on this existing file: {path}. Do not use Read, Write, Bash, Glob, or Grep until one Edit succeeds. Emit exactly one small Edit that changes one contiguous block, anchored to exact text from the last Read. Keep the edited block compact and self-contained. forced_small_edit_attempt={attempt}"
     )
 }
 
 pub fn post_scaffold_edit_recovery_note(path: &str, already_read: bool, attempt: usize) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     if already_read {
         return format!(
             "Framework scaffolding already succeeded, but the requested implementation change is still missing. The target file has already been read, and the only available tool for the next turn is Edit on this existing file: {path}. Do not use Read, Write, Bash, Glob, or Grep until one concrete Edit succeeds. Emit exactly one compact Edit that moves the implementation forward. post_scaffold_edit_attempt={attempt}"
@@ -241,7 +241,7 @@ pub fn post_scaffold_edit_recovery_note(path: &str, already_read: bool, attempt:
 }
 
 pub fn post_scaffold_continuation_note(path: &str, attempt: usize) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "The first scaffold edit landed, but the feature is not complete yet. Stay on {path} for the next turn. Emit exactly one compact Edit on that file now, keep the change anchored to the last Read, and continue implementation before any verification shell commands. post_scaffold_continue_attempt={attempt}"
     )
@@ -252,7 +252,7 @@ pub fn focused_edit_no_tool_recovery_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     if already_read {
         format!(
             "Focused edit recovery is active on {path}. Do not answer in prose. Emit exactly one Edit tool call now on that file. Copy old_string exactly from the last Read, replace one contiguous block only, and keep the change small. Do not call Read again. focused_edit_no_tool_attempt={attempt}"
@@ -265,7 +265,7 @@ pub fn focused_edit_no_tool_recovery_note(
 }
 
 pub fn focused_edit_missing_target_recovery_note(path: &str, attempt: usize) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "Focused edit recovery is active on missing target {path}. Do not answer in prose. Emit exactly one Write tool call now on that exact path, with complete JSON and no prose before or after the tool call. Do not call Read, Bash, Glob, or Grep. focused_edit_missing_target_attempt={attempt}"
     )
@@ -276,7 +276,7 @@ pub fn focused_edit_timeout_recovery_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     if already_read {
         let anchor_hint = page_component_anchor_hint(&path);
         return format!(
@@ -293,7 +293,7 @@ pub fn focused_edit_truncated_tool_call_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     if already_read {
         let anchor_hint = page_component_anchor_hint(&path);
         return format!(
@@ -310,7 +310,7 @@ pub fn focused_edit_unterminated_tool_call_note(
     already_read: bool,
     attempt: usize,
 ) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     if already_read {
         let anchor_hint = page_component_anchor_hint(&path);
         return format!(
@@ -323,21 +323,21 @@ pub fn focused_edit_unterminated_tool_call_note(
 }
 
 pub fn first_scaffold_shell_edit_note(path: &str) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "The first repository edit after scaffolding must stay microscopic. On {path}, replace only the existing `<h1>` headline block with a compact task-specific title. Keep the import lines, parent wrappers, component signature, and nearby paragraph unchanged for now. Use the existing `<h1` through its matching `</h1>` as the exact Edit anchor. Keep new_string to roughly 1-3 lines and under about 240 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn."
     )
 }
 
 pub fn first_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "The first repository edit after scaffolding must stay microscopic. On {path}, emit exactly one Edit now and replace only the already-read `<h1>` headline block with a compact task-specific title. Keep the surrounding layout, imports, component signature, and nearby paragraph unchanged. Copy the following small block byte-for-byte as old_string and replace only this contiguous block. Reuse the same `h1` tag and className string. Keep new_string to roughly 1-3 lines and under about 240 characters. Do not add complex runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact block below>\",\"new_string\":\"<compact title only>\"}}}}.\n```tsx\n{old_string}\n```"
     )
 }
 
 pub fn second_scaffold_shell_edit_exact_anchor_note(path: &str, old_string: &str) -> String {
-    let path = mask_recovery_path(path);
+    let path = mask_and_cap_recovery_field(path);
     format!(
         "The first scaffold edit already changed the page title. On {path}, emit exactly one Edit now and replace only the already-read intro copy line with a compact task-specific description line. Keep imports, the component signature, parent wrappers, buttons/links, paragraph tags, and every other block unchanged for now. Copy the following single line byte-for-byte as old_string and replace only that line. Keep new_string to one line and under about 180 characters. Do not add runtime logic, keyboard handlers, animation, extra sections, or a full-file rewrite in this turn. Return only one Edit tool call with this shape and no prose before or after it: {{\"name\":\"Edit\",\"arguments\":{{\"path\":\"{path}\",\"old_string\":\"<use the exact line below>\",\"new_string\":\"<compact description line only>\"}}}}.\n```tsx\n{old_string}\n```"
     )
@@ -527,7 +527,7 @@ pub fn should_block_restart_discovery(tool_name: &str, progress_exists: bool) ->
 mod tests {
     // PR #930 review (High-2): every path-taking recovery-note builder renders the
     // path into an LLM prompt that does NOT pass through mask_payload_inplace, so a
-    // secret-shaped path must be masked at the render point (mask_recovery_path).
+    // secret-shaped path must be masked at the render point (mask_and_cap_recovery_field).
     #[test]
     fn recovery_notes_mask_secret_shaped_paths() {
         const SECRET: &str = "AKIASECRETPATH0123456789";

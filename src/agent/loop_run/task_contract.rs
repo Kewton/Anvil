@@ -1281,17 +1281,17 @@ fn mask_and_cap_label(value: &str) -> String {
     }
 }
 
-/// Issue #918 (P1) follow-up (PR #930 review): SSOT mask+cap for any
-/// obligation/hint-derived free-text rendered into a **recovery prompt**.
+/// Issue #918 (P1) follow-up (PR #930 review): the SINGLE crate-wide SSOT for
+/// mask+cap of any obligation/hint/target-derived free-text rendered into a
+/// **recovery prompt** (which does NOT pass through `mask_payload_inplace`).
 ///
-/// Recovery notes (verifier-repair / artifact-directed) render `RecoveryTargetHint`
-/// path/reason — which can carry LLM/request-derived text — directly into the LLM
-/// request body, a path that does NOT pass through `mask_payload_inplace`. This is
-/// the same masking + length cap [`obligation_report_label`] applies, exposed so
-/// the recovery-note builders reuse it instead of emitting raw values.
-pub(super) fn mask_and_cap_recovery_field(value: &str) -> String {
-    mask_and_cap_label(value)
-}
+/// The implementation lives in [`crate::agent::recovery::mask_and_cap_recovery_field`]
+/// (the lowest common module — `loop_run` already depends on `agent::recovery`),
+/// and is re-exported here so every `loop_run` recovery-note renderer routes
+/// through the exact same masking + 256-char cap the `recovery.rs` builders use.
+/// `mask_secrets` is a no-op on ordinary workspace paths, so actionable target
+/// paths and obligation goldens are unchanged.
+pub(super) use crate::agent::recovery::mask_and_cap_recovery_field;
 
 fn join_masked_labels(values: &[String]) -> String {
     values
