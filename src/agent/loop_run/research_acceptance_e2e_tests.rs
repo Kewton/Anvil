@@ -140,25 +140,22 @@ fn docs_completion_unchanged_by_research_changes() {
     );
 }
 
-// PR-003: a read-only input file reference ("summarize notes.txt for me") is
-// NOT an output target — it must stay answer-only and NOT gain a report
-// obligation. An explicit output target ("...produce a report in report.md")
-// does gain one.
+// PR-003: a read-only input file reference is NOT an output target — it must
+// stay obligation-free. An explicit output target ("...produce a report in
+// report.md") does gain one. (Build-intent research phrasing — an Explain-intent
+// summarize-to-doc is owned by #919 Authoring, a separate kind, not Research.)
 #[test]
 fn input_file_reference_does_not_force_report_obligation() {
-    let input_ref = TaskContract::from_request("Summarize notes.txt for me");
+    let input_ref = TaskContract::from_request("Investigate notes.txt for me");
     assert_eq!(input_ref.task_kind, TaskKind::Research);
     assert!(
         input_ref.required_artifacts.is_empty(),
         "a read-only input file reference must not create a report obligation"
     );
-    assert_eq!(
-        input_ref.completion_policy.project_intent,
-        CompletionProjectIntent::AnswerOnly
-    );
 
     let output_target =
         TaskContract::from_request("Investigate the options and produce a report in report.md");
+    assert_eq!(output_target.task_kind, TaskKind::Research);
     assert!(
         output_target
             .required_artifacts
@@ -174,7 +171,7 @@ fn input_file_reference_does_not_force_report_obligation() {
 #[test]
 fn report_intended_research_ssot() {
     assert!(report_intended_research(
-        "調査結果をレポートにまとめて report.md に出力してください"
+        "選択肢を比較して結果を findings.md に出力する"
     ));
     assert!(report_intended_research(
         "Investigate the options and produce a report in report.md"
@@ -182,7 +179,9 @@ fn report_intended_research_ssot() {
     assert!(!report_intended_research(
         "Summarize the latest news for me"
     ));
-    assert!(!report_intended_research("Summarize notes.txt for me"));
+    assert!(!report_intended_research(
+        "Compare report.md and summary.md"
+    ));
 }
 
 // PR2-001 (#922 remediation): an explicit no-edit / "do not edit files"
@@ -214,7 +213,7 @@ fn explicit_no_edit_research_report_stays_answer_only() {
     // Covers both EN ("do not edit any files") and JP ("ファイルは変更しないで").
     for request in [
         "Investigate the options and produce a report in report.md, but do not edit any files",
-        "調査結果をレポートにまとめて report.md に出力して。ただしファイルは変更しないで",
+        "選択肢を比較して結果を report.md に出力。ただしファイルは変更しないで",
     ] {
         let contract = TaskContract::from_request(request);
         assert_eq!(
@@ -249,11 +248,12 @@ fn report_output_context_is_token_boundary_aware() {
         invn.required_artifacts.is_empty(),
         "substring 'in' inside 'investigate' must not create a report obligation"
     );
-    // input verb wins even though the file name looks like output.
-    let read_report = TaskContract::from_request("Summarize report.md for me");
+    // input/comparison position wins even though the file name looks like output.
+    let read_report = TaskContract::from_request("Compare report.md and summary.md");
+    assert_eq!(read_report.task_kind, TaskKind::Research);
     assert!(
         read_report.required_artifacts.is_empty(),
-        "reading an output-named file is not a report output target"
+        "comparing output-named files is not a report output target"
     );
     // genuine output target still detected.
     let produce =
@@ -272,13 +272,16 @@ fn report_output_context_is_token_boundary_aware() {
 // and enable file edits.
 #[test]
 fn output_looking_input_reference_is_not_an_output_target() {
+    // Research requests whose output-looking files are read/compared (no output
+    // verb directed at them) → `report_path_in_output_context` returns false →
+    // no obligation. (Build-intent comparison stays Research; Explain-intent
+    // summarize-to-doc is owned by #919 Authoring.)
     for request in [
         "Compare report.md and summary.md",
-        "Review findings.md",
-        "Summarize report.md and report any discrepancies",
-        "What does summary.md conclude?",
+        "Compare findings in report.md and summary.md",
     ] {
         let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Research, "{request:?}");
         assert!(
             contract.required_artifacts.is_empty(),
             "an output-looking file read/compared (no output verb) must not create an obligation: {request:?}"
@@ -293,7 +296,7 @@ fn output_looking_input_reference_is_not_an_output_target() {
     // create the obligation (non-regression of the genuine output path).
     for request in [
         "Investigate the options and produce a report in report.md",
-        "調査結果を report.md にまとめて出力してください",
+        "選択肢を比較して結果を findings.md に出力する",
     ] {
         assert!(
             report_intended_research(request),
