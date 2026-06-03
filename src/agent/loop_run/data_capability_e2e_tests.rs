@@ -345,3 +345,26 @@ fn explicit_json_data_output_is_obligated_and_validated() {
         "valid .json with declared columns must complete"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR-001 — `.parquet` is binary/columnar and unverifiable from a text excerpt,
+// so it must NOT be inferred as a schema-validated DataOutput obligation (which
+// would "complete" on any non-empty text with no parse-readiness check). It may
+// still classify as a Data task, but no structured_record DataOutput identity
+// is synthesized for it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parquet_output_is_not_a_structured_data_obligation() {
+    let contract = TaskContract::from_request("Generate output.parquet with columns id and score.");
+    let parquet_schema_obligation = contract
+        .required_artifact_identities
+        .iter()
+        .any(|identity| {
+            identity.role == ArtifactRole::DataOutput && identity.structured_record_schema.is_some()
+        });
+    assert!(
+        !parquet_schema_obligation,
+        "unparseable .parquet must not become a schema-validated DataOutput obligation: {contract:?}"
+    );
+}

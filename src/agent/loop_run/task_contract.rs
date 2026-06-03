@@ -3550,10 +3550,16 @@ fn path_has_data_extension(path: &str) -> bool {
     else {
         return false;
     };
-    matches!(
-        ext.as_str(),
-        "csv" | "json" | "jsonl" | "tsv" | "ndjson" | "parquet"
-    )
+    // Issue #921 (P4 / PR-001): this gate drives DataOutput structured_record
+    // obligation inference, so it is restricted to the formats the acceptance
+    // SSOT (`verifier::assess_structured_data`) can actually parse-check from a
+    // text excerpt. `.parquet` is binary/columnar and unverifiable from an
+    // excerpt; admitting it here created a structured-data obligation that would
+    // "complete" on any non-empty text with no parse-readiness guarantee. It is
+    // still recognized as a data file for ownership/telemetry classification
+    // (artifact_ledger / project_probe / completion_evidence), just not as a
+    // schema-validated DataOutput obligation.
+    matches!(ext.as_str(), "csv" | "json" | "jsonl" | "tsv" | "ndjson")
 }
 
 fn data_path_has_output_context(request: &str, path: &str) -> bool {
