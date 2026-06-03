@@ -6,39 +6,6 @@ use super::task_contract::{
 use crate::tools::bash::BashCommandClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum VerifierTaskKind {
-    Coding,
-    Docs,
-    Data,
-    Research,
-    Ops,
-}
-
-impl VerifierTaskKind {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::Coding => "coding",
-            Self::Docs => "docs",
-            Self::Data => "data",
-            Self::Research => "research",
-            Self::Ops => "ops",
-        }
-    }
-
-    #[allow(dead_code)] // Issue #902 migration surface; exercised by verifier tests.
-    pub(super) fn task_kind(self) -> TaskKind {
-        match self {
-            Self::Coding => TaskKind::Coding,
-            Self::Docs => TaskKind::Docs,
-            Self::Data => TaskKind::Data,
-            Self::Research => TaskKind::Research,
-            Self::Ops => TaskKind::Ops,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VerifierDiagnosticCode {
     MissingFile,
     InvalidManifest,
@@ -63,7 +30,7 @@ impl VerifierDiagnosticCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VerifierDiagnostic {
-    pub(super) task_kind: VerifierTaskKind,
+    pub(super) task_kind: TaskKind,
     pub(super) code: VerifierDiagnosticCode,
     pub(super) role: ArtifactRole,
     pub(super) path: Option<String>,
@@ -72,7 +39,7 @@ pub(super) struct VerifierDiagnostic {
 
 impl VerifierDiagnostic {
     fn new(
-        task_kind: VerifierTaskKind,
+        task_kind: TaskKind,
         code: VerifierDiagnosticCode,
         role: ArtifactRole,
         path: Option<&str>,
@@ -124,7 +91,7 @@ impl VerifierDiagnostic {
 
 #[allow(dead_code)]
 pub(super) trait Verifier {
-    fn task_kind(&self) -> VerifierTaskKind;
+    fn task_kind(&self) -> TaskKind;
 
     fn pass_evidence(
         &self,
@@ -194,6 +161,73 @@ pub(super) fn verifier_for_task_kind(task_kind: TaskKind) -> &'static dyn Verifi
     }
 }
 
+/// Issue #918 (P1): the single `capability_for(TaskKind)` dispatch spine.
+///
+/// A small `Copy` descriptor (no allocation, no boxing) that answers two
+/// per-kind capability questions used by the verification-requirement gates
+/// and the structured-verifier process-spawn guard. This is intentionally a
+/// separate concern from [`verifier_for_task_kind`] (which selects the
+/// `&'static dyn Verifier` *strategy*): the capability describes *whether* a
+/// kind requires executable verification / may spawn a process, the strategy
+/// describes *how* it verifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TaskCapability {
+    kind: TaskKind,
+    /// Only `TaskKind::Coding` may spawn a structured-verifier process.
+    allows_process_exec: bool,
+}
+
+/// SSOT static `match` mapping each [`TaskKind`] to its [`TaskCapability`].
+///
+/// The non-coding arm is written as an explicit enumeration (never a `_`
+/// wildcard) so that adding a sixth `TaskKind` is a compile error here,
+/// forcing the capability of any new kind to be reviewed (OCP / fail-safe).
+pub(super) const fn capability_for(kind: TaskKind) -> TaskCapability {
+    match kind {
+        TaskKind::Coding => TaskCapability {
+            kind,
+            allows_process_exec: true,
+        },
+        TaskKind::Docs | TaskKind::Data | TaskKind::Research | TaskKind::Ops => TaskCapability {
+            kind,
+            allows_process_exec: false,
+        },
+    }
+}
+
+impl TaskCapability {
+    /// Whether the structured verifier for this kind may spawn a child process.
+    /// Only `CodingCapability` (`TaskKind::Coding`) returns `true`.
+    pub(super) const fn allows_process_exec(self) -> bool {
+        self.allows_process_exec
+    }
+
+    /// 1:1 replacement for the historical `coding_verifier_required` gate
+    /// (`task_kind == Coding && !verifier_free_document_task`).
+    ///
+    /// This is a **bare gate**: it depends only on `verifier_free_document_task`
+    /// (the DocsOnly/AnswerOnly suppression derived from project intent), NOT on
+    /// `verification_required` or `test_execution_required`. Callers AND this
+    /// result into each of those two fields *separately* — exactly as the
+    /// pre-#918 code did — so no new inter-field dependency is introduced.
+    ///
+    /// Non-coding kinds are enumerated explicitly and always return `false`,
+    /// preserving today's effective behavior (a sixth kind would be a compile
+    /// error). See design policy §5.1 (the non-coding behavior-preservation
+    /// invariant): `test_execution_required` is derived from request text and is
+    /// kind-independent, so this clamp is the primary guard against a non-coding
+    /// task ever requiring executable verification.
+    pub(super) const fn requires_executable_verifier(
+        self,
+        verifier_free_document_task: bool,
+    ) -> bool {
+        match self.kind {
+            TaskKind::Coding => !verifier_free_document_task,
+            TaskKind::Docs | TaskKind::Data | TaskKind::Research | TaskKind::Ops => false,
+        }
+    }
+}
+
 pub(super) fn verifier_diagnostic_for_obligation(
     task_kind: TaskKind,
     obligation: &ArtifactObligation,
@@ -204,8 +238,8 @@ pub(super) fn verifier_diagnostic_for_obligation(
 }
 
 impl Verifier for CodingVerifier {
-    fn task_kind(&self) -> VerifierTaskKind {
-        VerifierTaskKind::Coding
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Coding
     }
 
     fn pass_evidence(
@@ -230,8 +264,8 @@ impl Verifier for CodingVerifier {
 }
 
 impl Verifier for DocsVerifier {
-    fn task_kind(&self) -> VerifierTaskKind {
-        VerifierTaskKind::Docs
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Docs
     }
 
     fn pass_evidence(
@@ -292,8 +326,8 @@ impl DocsVerifier {
 }
 
 impl Verifier for DataVerifier {
-    fn task_kind(&self) -> VerifierTaskKind {
-        VerifierTaskKind::Data
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Data
     }
 
     fn pass_evidence(
@@ -369,8 +403,8 @@ impl DataVerifier {
 }
 
 impl Verifier for ResearchVerifier {
-    fn task_kind(&self) -> VerifierTaskKind {
-        VerifierTaskKind::Research
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Research
     }
 
     fn pass_evidence(
@@ -406,8 +440,8 @@ impl ResearchVerifier {
 }
 
 impl Verifier for OpsVerifier {
-    fn task_kind(&self) -> VerifierTaskKind {
-        VerifierTaskKind::Ops
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Ops
     }
 
     fn pass_evidence(
@@ -460,7 +494,7 @@ fn generic_verifier_failure_packet(
 }
 
 fn verifier_diagnostic_for_artifact(
-    task_kind: VerifierTaskKind,
+    task_kind: TaskKind,
     artifact: VerifierArtifact<'_>,
 ) -> Option<VerifierDiagnostic> {
     let Some(path) = artifact.path else {
@@ -494,8 +528,8 @@ fn verifier_diagnostic_for_artifact(
         ));
     }
     match task_kind {
-        VerifierTaskKind::Coding => coding_artifact_diagnostic(task_kind, path, artifact.excerpt),
-        VerifierTaskKind::Docs => (!docs_required_sections_pass(artifact.excerpt)).then(|| {
+        TaskKind::Coding => coding_artifact_diagnostic(task_kind, path, artifact.excerpt),
+        TaskKind::Docs => (!docs_required_sections_pass(artifact.excerpt)).then(|| {
             VerifierDiagnostic::new(
                 task_kind,
                 VerifierDiagnosticCode::EvidenceMissing,
@@ -504,10 +538,10 @@ fn verifier_diagnostic_for_artifact(
                 "documentation evidence is missing required setup/run/verify coverage",
             )
         }),
-        VerifierTaskKind::Data => {
+        TaskKind::Data => {
             data_artifact_diagnostic(task_kind, path, artifact.excerpt, artifact.required_columns)
         }
-        VerifierTaskKind::Research => (!research_report_pass(artifact.excerpt)).then(|| {
+        TaskKind::Research => (!research_report_pass(artifact.excerpt)).then(|| {
             VerifierDiagnostic::new(
                 task_kind,
                 VerifierDiagnosticCode::EvidenceMissing,
@@ -516,7 +550,7 @@ fn verifier_diagnostic_for_artifact(
                 "research evidence is missing claim/source/limitation coverage",
             )
         }),
-        VerifierTaskKind::Ops => (!ops_runbook_pass(artifact.excerpt)).then(|| {
+        TaskKind::Ops => (!ops_runbook_pass(artifact.excerpt)).then(|| {
             VerifierDiagnostic::new(
                 task_kind,
                 VerifierDiagnosticCode::EvidenceMissing,
@@ -529,7 +563,7 @@ fn verifier_diagnostic_for_artifact(
 }
 
 fn verifier_diagnostic_for_obligation_parts(
-    task_kind: VerifierTaskKind,
+    task_kind: TaskKind,
     obligation: &ArtifactObligation,
     excerpt: Option<&str>,
     path_exists: bool,
@@ -612,7 +646,7 @@ fn verifier_diagnostic_for_obligation_parts(
             "documentation required sections are absent from the observed content",
         ));
     }
-    if task_kind == VerifierTaskKind::Coding
+    if task_kind == TaskKind::Coding
         && obligation.role == ArtifactRole::Test
         && let Some(excerpt) = excerpt
         && !contains_test_assertion_shape(excerpt)
@@ -625,7 +659,7 @@ fn verifier_diagnostic_for_obligation_parts(
             "test artifact lacks a recognizable assertion or test case shape",
         ));
     }
-    if task_kind == VerifierTaskKind::Coding
+    if task_kind == TaskKind::Coding
         && obligation.role == ArtifactRole::Implementation
         && let Some(excerpt) = excerpt
         && implementation_looks_semantically_wrong(excerpt)
@@ -638,7 +672,7 @@ fn verifier_diagnostic_for_obligation_parts(
             "implementation artifact still looks placeholder or non-semantic",
         ));
     }
-    if task_kind == VerifierTaskKind::Research
+    if task_kind == TaskKind::Research
         && let Some(excerpt) = excerpt
         && !research_report_pass(excerpt)
     {
@@ -650,7 +684,7 @@ fn verifier_diagnostic_for_obligation_parts(
             "research evidence is missing claim/source/limitation coverage",
         ));
     }
-    if task_kind == VerifierTaskKind::Ops
+    if task_kind == TaskKind::Ops
         && let Some(excerpt) = excerpt
         && !ops_runbook_pass(excerpt)
     {
@@ -666,7 +700,7 @@ fn verifier_diagnostic_for_obligation_parts(
 }
 
 fn coding_artifact_diagnostic(
-    task_kind: VerifierTaskKind,
+    task_kind: TaskKind,
     path: &str,
     excerpt: &str,
 ) -> Option<VerifierDiagnostic> {
@@ -683,7 +717,7 @@ fn coding_artifact_diagnostic(
 }
 
 fn data_artifact_diagnostic(
-    task_kind: VerifierTaskKind,
+    task_kind: TaskKind,
     path: &str,
     excerpt: &str,
     required_columns: &[String],
@@ -710,7 +744,7 @@ fn data_artifact_diagnostic(
 }
 
 fn manifest_readiness_diagnostic(
-    task_kind: VerifierTaskKind,
+    task_kind: TaskKind,
     path: &str,
     excerpt: &str,
 ) -> Option<VerifierDiagnostic> {
@@ -843,17 +877,15 @@ fn strip_toml_comment(line: &str) -> &str {
         .unwrap_or(line)
 }
 
-fn default_role_for_task_kind(task_kind: VerifierTaskKind) -> ArtifactRole {
+fn default_role_for_task_kind(task_kind: TaskKind) -> ArtifactRole {
     match task_kind {
-        VerifierTaskKind::Coding => ArtifactRole::Implementation,
-        VerifierTaskKind::Docs | VerifierTaskKind::Research | VerifierTaskKind::Ops => {
-            ArtifactRole::UsageDocs
-        }
-        VerifierTaskKind::Data => ArtifactRole::DataOutput,
+        TaskKind::Coding => ArtifactRole::Implementation,
+        TaskKind::Docs | TaskKind::Research | TaskKind::Ops => ArtifactRole::UsageDocs,
+        TaskKind::Data => ArtifactRole::DataOutput,
     }
 }
 
-fn role_for_path_or_task_kind(path: &str, task_kind: VerifierTaskKind) -> ArtifactRole {
+fn role_for_path_or_task_kind(path: &str, task_kind: TaskKind) -> ArtifactRole {
     let normalized = normalize_path_label(path);
     if normalized == "package.json" || normalized == "cargo.toml" {
         return ArtifactRole::Setup;
@@ -1118,6 +1150,50 @@ fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
 
+    // Issue #918 (P1): exhaustive capability spine coverage. Every method is
+    // exercised here for all 5 kinds in the SAME commit that introduces them, so
+    // `-D warnings` dead_code never fires and the non-coding invariant is pinned.
+    #[test]
+    fn capability_for_allows_process_exec_only_for_coding() {
+        assert!(capability_for(TaskKind::Coding).allows_process_exec());
+        for kind in [
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
+        ] {
+            assert!(
+                !capability_for(kind).allows_process_exec(),
+                "non-coding kind {kind:?} must not allow process exec"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_executable_verifier_is_coding_only_and_respects_doc_suppression() {
+        // Coding requires an executable verifier unless the task is a verifier-free
+        // document task (DocsOnly/AnswerOnly), exactly reproducing the old
+        // `coding_verifier_required = Coding && !verifier_free_document_task` gate.
+        assert!(capability_for(TaskKind::Coding).requires_executable_verifier(false));
+        assert!(!capability_for(TaskKind::Coding).requires_executable_verifier(true));
+        // Non-coding kinds are always false, regardless of the doc-suppression flag
+        // (§5.1: the request-text-derived test_execution_required flag must not be
+        // able to lift a non-coding task into executable verification).
+        for kind in [
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
+        ] {
+            assert!(!capability_for(kind).requires_executable_verifier(false));
+            assert!(!capability_for(kind).requires_executable_verifier(true));
+        }
+    }
+
+    // `capability_for` / `allows_process_exec` are `const fn`: assert const-eval works.
+    const _CODING_CAP: TaskCapability = capability_for(TaskKind::Coding);
+    const _CODING_EXEC: bool = _CODING_CAP.allows_process_exec();
+
     #[test]
     fn docs_required_sections_pass_becomes_completion_evidence() {
         let verifier = DocsVerifier;
@@ -1305,7 +1381,7 @@ mod tests {
     #[test]
     fn coding_verifier_pass_evidence_is_build_test() {
         let verifier = CodingVerifier;
-        assert_eq!(verifier.task_kind(), VerifierTaskKind::Coding);
+        assert_eq!(verifier.task_kind(), TaskKind::Coding);
         assert_eq!(
             verifier.pass_evidence("cargo test", Some(1)),
             CompletionEvidence::VerifierExitZero {
@@ -1319,16 +1395,15 @@ mod tests {
     #[test]
     fn verifier_registry_selects_adapter_for_each_task_kind() {
         let cases = [
-            (TaskKind::Coding, VerifierTaskKind::Coding),
-            (TaskKind::Docs, VerifierTaskKind::Docs),
-            (TaskKind::Data, VerifierTaskKind::Data),
-            (TaskKind::Research, VerifierTaskKind::Research),
-            (TaskKind::Ops, VerifierTaskKind::Ops),
+            TaskKind::Coding,
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
         ];
 
-        for (task_kind, expected) in cases {
-            assert_eq!(verifier_for_task_kind(task_kind).task_kind(), expected);
-            assert_eq!(expected.task_kind(), task_kind);
+        for task_kind in cases {
+            assert_eq!(verifier_for_task_kind(task_kind).task_kind(), task_kind);
         }
     }
 

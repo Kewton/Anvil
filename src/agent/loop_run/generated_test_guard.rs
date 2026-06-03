@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-use super::task_contract::{ArtifactRole, TaskContract, TaskKind};
+use super::task_contract::{ArtifactRole, TaskContract};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct GeneratedTestPreflightDiagnostic {
@@ -531,7 +531,13 @@ fn command_new_literals(source: &str) -> Vec<String> {
 }
 
 fn asserts_unsupported_non_ascii_contract(contract: &TaskContract, source: &str) -> bool {
-    if contract.task_kind != TaskKind::Coding || contract_mentions_non_ascii(contract) {
+    // Issue #918 (P1): route the coding-only gate through the capability spine
+    // instead of a hardcoded `task_kind == Coding` comparison. `allows_process_exec()`
+    // is the canonical "this is the Coding kind (the only kind with executable
+    // verification tooling)" predicate, so this is a 1:1 behavior-preserving swap.
+    if !super::verifier::capability_for(contract.task_kind).allows_process_exec()
+        || contract_mentions_non_ascii(contract)
+    {
         return false;
     }
     double_quoted_literals(source).any(|literal| !literal.is_ascii())
@@ -607,7 +613,9 @@ fn generated_suite_contract_coverage_gap(
     contract: &TaskContract,
     sources: &[(String, String)],
 ) -> Option<String> {
-    if contract.task_kind != TaskKind::Coding
+    // Issue #918 (P1): coding-only gate via the capability spine (see
+    // `asserts_unsupported_non_ascii_contract`). `allows_process_exec()` ⟺ Coding.
+    if !super::verifier::capability_for(contract.task_kind).allows_process_exec()
         || !contract.completion_policy.test_execution_required()
         || sources.is_empty()
     {

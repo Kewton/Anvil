@@ -178,6 +178,9 @@ pub(super) struct StructuredTaskContractVerifierRun {
     pub(super) display_command: String,
     pub(super) bound_test_artifacts_count: usize,
     pub(super) bound_test_artifacts_paths: Vec<String>,
+    /// Issue #918 (P1): active task kind, carried to `run_structured` so the
+    /// process-spawn capability gate can fail closed for non-coding kinds.
+    pub(super) task_kind: TaskKind,
 }
 
 pub(super) struct TaskContractVerifierFlowArgs<'a, 'b> {
@@ -2545,18 +2548,27 @@ pub(super) fn run_task_contract_verifier_once(
             display_command,
             bound_test_artifacts_count,
             bound_test_artifacts_paths,
-        } => handle_structured_task_contract_verifier_selection(
-            agent,
-            changed_files,
-            workspace_scope_opt.as_ref(),
-            StructuredTaskContractVerifierRun {
-                plan,
-                command,
-                display_command,
-                bound_test_artifacts_count,
-                bound_test_artifacts_paths,
-            },
-        ),
+        } => {
+            // Issue #918 (P1) DR3-003: derive the real task kind from the active
+            // contract; `None => Coding` 1:1-preserves the historical always-Coding
+            // structured-verifier path (the gate only fails closed for non-coding).
+            let task_kind = super::task_classification::task_contract_authority(agent)
+                .map(|c| c.task_kind)
+                .unwrap_or(TaskKind::Coding);
+            handle_structured_task_contract_verifier_selection(
+                agent,
+                changed_files,
+                workspace_scope_opt.as_ref(),
+                StructuredTaskContractVerifierRun {
+                    plan,
+                    command,
+                    display_command,
+                    bound_test_artifacts_count,
+                    bound_test_artifacts_paths,
+                    task_kind,
+                },
+            )
+        }
         super::verifier_driver::TaskContractVerifierSelection::StructuredWeak {
             detected_source,
             owned_test_artifacts_count,
@@ -2695,6 +2707,7 @@ pub(super) fn handle_structured_task_contract_verifier_selection(
             workspace_scope,
             &selection.command,
             &selection.display_command,
+            selection.task_kind,
         )
     };
     match result {

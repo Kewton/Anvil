@@ -285,8 +285,15 @@ pub(super) fn run_structured_task_contract_verifier(
     workspace_scope: &TaskWorkspaceScope,
     command: &VerifierCommand,
     display_command: &str,
+    task_kind: super::task_contract::TaskKind,
 ) -> Result<AutoTestResult, String> {
-    AutoTestRunner::run_structured(work_root, workspace_scope, command, display_command)
+    AutoTestRunner::run_structured(
+        work_root,
+        workspace_scope,
+        command,
+        display_command,
+        task_kind,
+    )
 }
 
 pub(super) fn run_legacy_task_contract_verifier(
