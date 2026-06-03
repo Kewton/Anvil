@@ -185,42 +185,55 @@ fn report_intended_research_ssot() {
     assert!(!report_intended_research("Summarize notes.txt for me"));
 }
 
-// PR2-001: an explicit no-edit / read-only instruction must fail closed — even
-// when the request is a Research report request — so it is never forced into a
-// file-edit obligation and the WorkMode AnswerOnly->Docs override (which keys
-// off `report_intended_research`) stays closed.
+// PR2-001 (#922 remediation): an explicit no-edit / "do not edit files"
+// instruction must be honored by the Research capability — the request is still
+// classified Research, but it generates NO obligation and stays answer-only
+// (the implementation/report artifact is suppressed, matching the WorkMode
+// classifier which routes such requests to AnswerOnly). A normal
+// research-with-output request (no no-edit clause) is non-regressed.
 #[test]
 fn explicit_no_edit_research_report_stays_answer_only() {
-    // Baseline (no no-edit clause): a Research report request gets the
-    // obligation and is report-intended.
+    // Baseline (no no-edit clause): a Research report request DOES get the
+    // obligation and is report-intended — non-regression control.
     let baseline =
         TaskContract::from_request("Investigate the options and produce a report in report.md");
     assert_eq!(baseline.task_kind, TaskKind::Research);
     assert!(
         baseline
             .required_artifacts
-            .contains(&ArtifactRole::UsageDocs)
+            .contains(&ArtifactRole::UsageDocs),
+        "a normal research-with-output request must still get the report obligation"
     );
     assert!(report_intended_research(
         "Investigate the options and produce a report in report.md"
     ));
 
-    // Same request + an explicit read-only / no-edit instruction → fails closed:
-    // still classified Research, but no report obligation and not report-intended
-    // (so the AnswerOnly->Docs override cannot fire). Covers both EN and JP.
+    // Same request + an explicit no-edit / read-only instruction → fails closed:
+    // classified Research, NO obligation, not report-intended (so the
+    // AnswerOnly->Docs override cannot fire), and WorkMode stays AnswerOnly.
+    // Covers both EN ("do not edit any files") and JP ("ファイルは変更しないで").
     for request in [
-        "Investigate the options and produce a report in report.md. Keep it read-only.",
-        "調査して結果を report.md にまとめて出力。読み取り専用で。",
+        "Investigate the options and produce a report in report.md, but do not edit any files",
+        "調査結果をレポートにまとめて report.md に出力して。ただしファイルは変更しないで",
     ] {
         let contract = TaskContract::from_request(request);
-        assert_eq!(contract.task_kind, TaskKind::Research, "{request:?}");
+        assert_eq!(
+            contract.task_kind,
+            TaskKind::Research,
+            "explicit no-edit research must stay Research, not Coding: {request:?}"
+        );
         assert!(
             contract.required_artifacts.is_empty(),
-            "explicit no-edit must not create a report obligation: {request:?}"
+            "explicit no-edit must not create any artifact obligation: {request:?}"
         );
         assert!(
             !report_intended_research(request),
             "explicit no-edit must keep the AnswerOnly->Docs override closed: {request:?}"
+        );
+        assert_eq!(
+            crate::modes::plan_act::classify_work_mode_json(request).work_mode,
+            crate::modes::plan_act::WorkMode::AnswerOnly,
+            "explicit no-edit request must stay WorkMode::AnswerOnly: {request:?}"
         );
     }
 }

@@ -2844,7 +2844,16 @@ pub(super) fn request_asks_for_implementation_artifact(
     asks_for_usage_docs: bool,
     asks_for_setup: bool,
 ) -> bool {
-    if request_negates_implementation_artifacts(request, lower) {
+    // Issue #922 (PR2-001 / remediation): an explicit "do not edit / read-only"
+    // instruction negates implementation artifacts too (you cannot create code
+    // if no file may change). Reusing the WorkMode-classifier SSOT keeps the two
+    // axes consistent (the classifier already routes such requests to
+    // AnswerOnly), so a research request like "produce a report … but do not
+    // edit any files" classifies as Research, not Coding, and then stays
+    // answer-only with no obligation.
+    if request_negates_implementation_artifacts(request, lower)
+        || crate::modes::plan_act::request_has_explicit_no_edit(request)
+    {
         return false;
     }
     let support_artifact_requested = asks_for_tests || asks_for_usage_docs || asks_for_setup;
