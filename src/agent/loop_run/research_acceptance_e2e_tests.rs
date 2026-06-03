@@ -184,3 +184,70 @@ fn report_intended_research_ssot() {
     ));
     assert!(!report_intended_research("Summarize notes.txt for me"));
 }
+
+// PR2-001: an explicit no-edit / read-only instruction must fail closed — even
+// when the request is a Research report request — so it is never forced into a
+// file-edit obligation and the WorkMode AnswerOnly->Docs override (which keys
+// off `report_intended_research`) stays closed.
+#[test]
+fn explicit_no_edit_research_report_stays_answer_only() {
+    // Baseline (no no-edit clause): a Research report request gets the
+    // obligation and is report-intended.
+    let baseline =
+        TaskContract::from_request("Investigate the options and produce a report in report.md");
+    assert_eq!(baseline.task_kind, TaskKind::Research);
+    assert!(
+        baseline
+            .required_artifacts
+            .contains(&ArtifactRole::UsageDocs)
+    );
+    assert!(report_intended_research(
+        "Investigate the options and produce a report in report.md"
+    ));
+
+    // Same request + an explicit read-only / no-edit instruction → fails closed:
+    // still classified Research, but no report obligation and not report-intended
+    // (so the AnswerOnly->Docs override cannot fire). Covers both EN and JP.
+    for request in [
+        "Investigate the options and produce a report in report.md. Keep it read-only.",
+        "調査して結果を report.md にまとめて出力。読み取り専用で。",
+    ] {
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Research, "{request:?}");
+        assert!(
+            contract.required_artifacts.is_empty(),
+            "explicit no-edit must not create a report obligation: {request:?}"
+        );
+        assert!(
+            !report_intended_research(request),
+            "explicit no-edit must keep the AnswerOnly->Docs override closed: {request:?}"
+        );
+    }
+}
+
+// PR2-002: token-boundary aware output context. A word merely *containing* a
+// preposition substring ("investigate" ⊃ "in") is not an output context, and an
+// explicit input verb wins even for an output-looking file name.
+#[test]
+fn report_output_context_is_token_boundary_aware() {
+    // "investigate" must not match the preposition "in" → no obligation.
+    let invn = TaskContract::from_request("Investigate notes.txt for me");
+    assert!(
+        invn.required_artifacts.is_empty(),
+        "substring 'in' inside 'investigate' must not create a report obligation"
+    );
+    // input verb wins even though the file name looks like output.
+    let read_report = TaskContract::from_request("Summarize report.md for me");
+    assert!(
+        read_report.required_artifacts.is_empty(),
+        "reading an output-named file is not a report output target"
+    );
+    // genuine output target still detected.
+    let produce =
+        TaskContract::from_request("Investigate the options and produce a report in report.md");
+    assert!(
+        produce
+            .required_artifacts
+            .contains(&ArtifactRole::UsageDocs)
+    );
+}

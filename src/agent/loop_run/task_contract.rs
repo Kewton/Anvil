@@ -2312,6 +2312,14 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
 /// input reference like "summarize notes.txt for me" stay answer-only and are
 /// NOT routed into a file-edit obligation (regression guard / S7-001 / PR-003).
 fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
+    // Issue #922 (PR2-001): an explicit "do not edit / read-only" instruction
+    // must never be turned into a file-edit report obligation, even if the
+    // request also asks for a "report". Fail closed → stays answer-only, and the
+    // WorkMode AnswerOnly->Docs override (which keys off `report_intended_research`)
+    // also stays closed.
+    if crate::modes::plan_act::request_has_explicit_no_edit(request) {
+        return false;
+    }
     if research_report_output_path_from_request(request).is_some() {
         return true;
     }
@@ -2352,35 +2360,58 @@ fn report_path_in_output_context(request: &str, path: &str) -> bool {
     let path_lower = path.to_ascii_lowercase();
     let name_output = report_file_name_looks_like_output(path);
     lower.match_indices(&path_lower).any(|(idx, _)| {
-        let before = bounded_context_before(&lower, idx, 48);
-        let after = bounded_context_after(&lower, idx + path_lower.len(), 32);
-        let input_context = contains_any(
-            before,
-            &[
-                "input",
-                "source",
-                "from",
-                "read",
-                "reads",
-                "based on",
-                "summarize",
-                "summarise",
-                "analyze",
-                "analyse",
-            ],
-        ) || contains_any(after, &[" as input", " input"]);
-        if input_context && !name_output {
+        // Issue #922 (PR2-002): token-boundary aware — inspect the WORD
+        // immediately before the path, not a raw substring window (so
+        // "investigate" no longer matches the preposition "in").
+        let prev_word = lower[..idx]
+            .rsplit(|ch: char| !ch.is_ascii_alphanumeric())
+            .find(|word| !word.is_empty())
+            .unwrap_or("");
+        let after = bounded_context_after(&lower, idx + path_lower.len(), 24);
+
+        // Explicit input / read-only context wins — even for an output-looking
+        // file name ("summarize report.md for me" is a read, not a write).
+        if matches!(
+            prev_word,
+            "input"
+                | "source"
+                | "from"
+                | "read"
+                | "reads"
+                | "of"
+                | "summarize"
+                | "summarise"
+                | "analyze"
+                | "analyse"
+                | "sample"
+                | "fixture"
+        ) {
             return false;
         }
-        name_output
-            || contains_any(
-                before,
-                &[
-                    "output", "write", "writes", "generate", "produce", "export", "save", "create",
-                    "to", "into", "in",
-                ],
-            )
-            || contains_any(after, &[" output", " report", "まとめ", "出力", "書"])
+
+        // Output context: an output verb/preposition immediately before the
+        // path, OR a file name that looks like an output, OR a trailing
+        // Japanese output marker.
+        matches!(
+            prev_word,
+            "to" | "into"
+                | "output"
+                | "write"
+                | "writes"
+                | "produce"
+                | "produces"
+                | "generate"
+                | "generates"
+                | "export"
+                | "exports"
+                | "save"
+                | "saves"
+                | "create"
+                | "creates"
+                | "emit"
+                | "emits"
+        ) || name_output
+            || contains_any(after, &["まとめ", "出力", "書"])
     })
 }
 

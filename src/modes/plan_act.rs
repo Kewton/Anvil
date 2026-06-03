@@ -177,6 +177,41 @@ pub fn should_request_confirmation(c: &ModeClassification, raw_input: &str) -> b
     c.ambiguity || c.confidence < WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
 }
 
+/// Issue #922 (PR2-001): SSOT for detecting an explicit "do not edit /
+/// read-only" instruction. Imperative prohibitive phrases only (not the bare
+/// substring "no changes", which matches descriptive text — CB2-001). Reused by
+/// the WorkMode classifier and the research report-intent gate so an explicit
+/// no-edit request can never be upgraded to an editing mode nor forced into a
+/// file obligation.
+pub fn request_has_explicit_no_edit(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "do not modify",
+            "don't modify",
+            "do not edit",
+            "don't edit",
+            "do not change",
+            "don't change",
+            "no edits",
+            "no changes please",
+            "make no changes",
+            "without changes",
+            "no file changes",
+            "without changing files",
+            "read only",
+            "read-only",
+            "変更しない",
+            "編集しない",
+            "ファイルは変更しない",
+            "変更せず",
+            "編集せず",
+            "読み取り専用",
+        ],
+    )
+}
+
 pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     let lower = raw.to_ascii_lowercase();
     let explicit_edit = contains_any(
@@ -211,31 +246,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     // contexts like "the app says no changes detected" and incorrectly route
     // legitimate edit requests to `AnswerOnly`. The phrases below all encode an
     // imperative "do not make changes" intent.
-    let explicit_no_edit = contains_any(
-        &lower,
-        &[
-            "do not modify",
-            "don't modify",
-            "do not edit",
-            "don't edit",
-            "do not change",
-            "don't change",
-            "no edits",
-            "no changes please",
-            "make no changes",
-            "without changes",
-            "no file changes",
-            "without changing files",
-            "read only",
-            "read-only",
-            "変更しない",
-            "編集しない",
-            "ファイルは変更しない",
-            "変更せず",
-            "編集せず",
-            "読み取り専用",
-        ],
-    );
+    let explicit_no_edit = request_has_explicit_no_edit(raw);
     let answer_request = contains_any(
         &lower,
         &[
