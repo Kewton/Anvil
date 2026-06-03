@@ -810,22 +810,27 @@ fn data_artifact_diagnostic(
     excerpt: &str,
     required_columns: &[String],
 ) -> Option<VerifierDiagnostic> {
-    if let Some(message) = structured_data_parse_error(path, excerpt) {
+    // Issue #921 (P4 / DD2 / DR1-004): route through the OR-tolerant SSOT and
+    // return a BLOCKING diagnostic ONLY when the tier is `Insufficient`. For
+    // `SchemaSatisfied` / `AcceptTier` we MUST return strictly `None` — not
+    // `EvidenceMissing` — because `artifact_identity_satisfied_for_verification`
+    // only treats a diagnostic as a pass when it is `EvidenceMissing &&
+    // excerpt.is_none()`. With a present excerpt that whitelist fails, so any
+    // non-None diagnostic here would re-block the accept tier and make it
+    // unreachable. The parse-error path stays `Insufficient` (→ blocking) and
+    // keeps its specific message for better recovery hints.
+    if let StructuredDataTier::Insufficient =
+        assess_structured_data(Some(path), excerpt, required_columns)
+    {
+        let message = structured_data_parse_error(path, excerpt).unwrap_or(
+            "structured data evidence is missing required columns or parse-ready records",
+        );
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::SchemaMismatch,
             ArtifactRole::DataOutput,
             Some(path),
             message,
-        ));
-    }
-    if !structured_data_pass(Some(path), excerpt, required_columns) {
-        return Some(VerifierDiagnostic::new(
-            task_kind,
-            VerifierDiagnosticCode::SchemaMismatch,
-            ArtifactRole::DataOutput,
-            Some(path),
-            "structured data evidence is missing required columns or parse-ready records",
         ));
     }
     None
@@ -1168,14 +1173,133 @@ fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
         .any(|token| token == needle)
 }
 
-fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[String]) -> bool {
-    let observed = observed_data_columns(path, excerpt, required_columns);
-    if observed.is_empty() {
-        return false;
+/// Issue #921 (P4): minimum trimmed `chars().count()` an excerpt must clear to
+/// qualify for the OR-tolerant `AcceptTier` (declared-but-missing columns).
+///
+/// Rationale: a structured-data artifact that has a parse-ready header plus at
+/// least one record is the smallest honest deliverable. A single CSV header row
+/// plus one record such as a two-column comma header with one value row is
+/// already above this floor, and even a minimal two-line `id` + `1` file clears
+/// it. The unit is **chars** (`chars().count()`), not bytes, so CJK
+/// headers/records are not unfairly penalized (DR1-003 / DR2-003). The floor is
+/// applied ONLY in the `AcceptTier` branch, never to `SchemaSatisfied`, so it
+/// cannot regress any artifact the historical column-conjunctive
+/// `structured_data_pass` already accepted (DR1-002).
+pub(super) const STRUCTURED_DATA_MIN_CHARS: usize = 16;
+
+/// Issue #921 (P4): the three-tier outcome of the single OR-tolerant
+/// structured-data acceptance predicate ([`assess_structured_data`]).
+///
+/// Intentionally a CLOSED enum (NOT `#[non_exhaustive]`): the completion gate is
+/// a closed decision and callers exhaustively match all tiers, so adding a tier
+/// must be a deliberate, compile-checked change (DR1-006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StructuredDataTier {
+    /// Declared columns all observed, OR no columns declared — parse-ready and
+    /// non-empty. No floor is applied (regression-free w.r.t. the old pass).
+    SchemaSatisfied,
+    /// Parse-ready, non-empty, floor-satisfied, but some declared column is not
+    /// observed. This tier resolves the old conjunctive-AND dead-end.
+    AcceptTier,
+    /// Empty / not parse-ready / an `AcceptTier` candidate below the char floor.
+    Insufficient,
+}
+
+impl StructuredDataTier {
+    /// Both `SchemaSatisfied` and `AcceptTier` count as accepted; only
+    /// `Insufficient` blocks completion.
+    pub(super) fn is_accepted(self) -> bool {
+        !matches!(self, StructuredDataTier::Insufficient)
     }
-    required_columns
+}
+
+/// Issue #921 (P4): the single OR-tolerant structured-data acceptance SSOT that
+/// both production gates (the free-fn `structured_data_pass` / diagnostic side
+/// and `task_contract::structured_record_excerpt_satisfies_obligations` /
+/// completion side) route through.
+///
+/// Pure string predicate (DR4-003): no filesystem / network / process spawn, no
+/// `unsafe`. `path` is used ONLY for extension dispatch in
+/// `structured_data_parse_error` / `observed_data_columns`; it is never opened,
+/// logged, or projected to a prompt/recovery sink (DR4-001). The caller must
+/// only pass a `validated_obligation_path`-checked path or `None`.
+///
+/// Tier rules (DD1):
+/// - parse error (only checked when `path` is `Some`) → `Insufficient`.
+/// - empty trimmed excerpt → `Insufficient`.
+/// - no declared columns + parse-ready non-empty → `SchemaSatisfied` (no floor).
+/// - all declared columns observed → `SchemaSatisfied` (no floor; preserves the
+///   old `structured_data_pass` accept set exactly / DR1-002).
+/// - declared-but-missing columns + trimmed `chars().count() >= MIN_CHARS` →
+///   `AcceptTier`; otherwise `Insufficient`.
+pub(super) fn assess_structured_data(
+    path: Option<&str>,
+    excerpt: &str,
+    required_columns: &[String],
+) -> StructuredDataTier {
+    // Parse-readiness is extension-driven, so it is only meaningful with a path
+    // (DD1): for `path == None` the floor/empty checks below carry the load.
+    if let Some(path) = path
+        && structured_data_parse_error(path, excerpt).is_some()
+    {
+        return StructuredDataTier::Insufficient;
+    }
+    if excerpt.trim().is_empty() {
+        return StructuredDataTier::Insufficient;
+    }
+    if required_columns.is_empty() {
+        return StructuredDataTier::SchemaSatisfied;
+    }
+    let observed = observed_data_columns(path, excerpt, required_columns);
+    let all_observed = required_columns
         .iter()
-        .all(|column| observed.iter().any(|observed| observed == column))
+        .all(|column| observed.iter().any(|seen| seen == column));
+    if all_observed {
+        return StructuredDataTier::SchemaSatisfied;
+    }
+    // Issue #921 (P4 / CB-001): the AcceptTier fallback admits a parse-ready
+    // artifact whose declared columns are not all observed. It MUST NOT promote
+    // a format we cannot parse-check (e.g. binary/columnar `.parquet`, which
+    // `observed_data_columns`/`structured_data_parse_error` do not special-case
+    // and which falls through to generic substring matching). For such a format
+    // a missing-column excerpt is arbitrary text with no parse-readiness
+    // guarantee, so it stays `Insufficient`. Parse-checkable text formats
+    // (csv/tsv/json/jsonl/ndjson) and the path-less completion case keep the
+    // accept tier.
+    if !accept_tier_format_is_parse_checkable(path) {
+        return StructuredDataTier::Insufficient;
+    }
+    if excerpt.trim().chars().count() >= STRUCTURED_DATA_MIN_CHARS {
+        StructuredDataTier::AcceptTier
+    } else {
+        StructuredDataTier::Insufficient
+    }
+}
+
+/// Issue #921 (P4 / CB-001): whether the AcceptTier fallback may apply to this
+/// path's format. `None` (the path-less completion case) and the parse-checkable
+/// text formats are allowed; any other recognized extension (e.g. binary
+/// `.parquet`) is not, because parse-readiness cannot be established from a text
+/// excerpt. Mirrors the extension dispatch in [`observed_data_columns`] /
+/// [`structured_data_parse_error`].
+fn accept_tier_format_is_parse_checkable(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None => true,
+        Some("csv" | "tsv" | "json" | "jsonl" | "ndjson") => true,
+        Some(_) => false,
+    }
+}
+
+fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[String]) -> bool {
+    assess_structured_data(path, excerpt, required_columns).is_accepted()
 }
 
 fn research_report_pass(excerpt: &str) -> bool {
@@ -1619,17 +1743,177 @@ mod tests {
     }
 
     #[test]
-    fn data_verifier_rejects_missing_required_column() {
+    fn data_verifier_accepts_missing_required_column_when_parse_ready() {
+        // Issue #921 (P4): the old conjunctive AND rejected a parse-ready CSV
+        // whose header was missing a declared column. The OR-tolerant SSOT now
+        // accepts it via `AcceptTier` (parse-ready, non-empty, above the char
+        // floor) so legitimate structured output no longer dead-ends. The
+        // surviving rejection paths (empty / unparseable / below-floor) are
+        // pinned by `data_verifier_rejects_unparseable_or_empty_structured_data`.
         let verifier = DataVerifier;
         let required = vec!["Category".to_string(), "Total".to_string()];
 
+        // 19 trimmed chars (>= STRUCTURED_DATA_MIN_CHARS) → AcceptTier → Some.
+        assert!(
+            verifier
+                .structured_data_evidence(
+                    Some("output.csv".to_string()),
+                    "Category,Amount\nA,1\n",
+                    &required,
+                )
+                .is_some(),
+            "parse-ready CSV missing a declared column must accept-tier complete"
+        );
+    }
+
+    #[test]
+    fn data_verifier_rejects_unparseable_or_empty_structured_data() {
+        // Issue #921 (P4 / DD3): parse-error and empty stay `Insufficient` even
+        // under the OR-tolerant SSOT — a truly broken/empty artifact is not done.
+        let verifier = DataVerifier;
+        let required = vec!["Category".to_string(), "Total".to_string()];
+
+        // Malformed JSON → parse error → Insufficient.
         assert_eq!(
             verifier.structured_data_evidence(
-                Some("output.csv".to_string()),
-                "Category,Amount\nA,1\n",
+                Some("output.json".to_string()),
+                r#"{"Category":"#,
                 &required,
             ),
             None
+        );
+        // Empty excerpt → Insufficient.
+        assert_eq!(
+            verifier.structured_data_evidence(Some("output.csv".to_string()), "   \n", &required,),
+            None
+        );
+    }
+
+    // Issue #921 (P4): tier-boundary unit tests for the OR-tolerant SSOT.
+    #[test]
+    fn assess_structured_data_no_columns_accepts_nonempty() {
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), "a,b\n1,2\n", &[]),
+            StructuredDataTier::SchemaSatisfied
+        );
+        assert_eq!(
+            assess_structured_data(None, "anything", &[]),
+            StructuredDataTier::SchemaSatisfied
+        );
+    }
+
+    #[test]
+    fn assess_structured_data_empty_is_insufficient() {
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), "   \n\t", &[]),
+            StructuredDataTier::Insufficient
+        );
+        let cols = vec!["a".to_string()];
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), "", &cols),
+            StructuredDataTier::Insufficient
+        );
+    }
+
+    #[test]
+    fn assess_structured_data_all_columns_observed_is_schema_satisfied_no_floor() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        // "a,b\n1" trimmed = 5 chars < floor, but all declared columns observed →
+        // SchemaSatisfied (NO floor / DR1-002 regression-free).
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), "a,b\n1", &cols),
+            StructuredDataTier::SchemaSatisfied
+        );
+    }
+
+    #[test]
+    fn assess_structured_data_missing_column_floor_boundary() {
+        let cols = vec!["zzz".to_string()];
+        // 15 chars, missing column → below floor → Insufficient.
+        let fifteen = "abcd,efgh\n12345"; // 15 chars
+        assert_eq!(fifteen.trim().chars().count(), 15);
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), fifteen, &cols),
+            StructuredDataTier::Insufficient
+        );
+        // 16 chars, missing column → at floor → AcceptTier.
+        let sixteen = "abcd,efgh\n123456"; // 16 chars
+        assert_eq!(sixteen.trim().chars().count(), 16);
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), sixteen, &cols),
+            StructuredDataTier::AcceptTier
+        );
+        // 17 chars, missing column → above floor → AcceptTier.
+        let seventeen = "abcd,efgh\n1234567"; // 17 chars
+        assert_eq!(seventeen.trim().chars().count(), 17);
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), seventeen, &cols),
+            StructuredDataTier::AcceptTier
+        );
+    }
+
+    #[test]
+    fn assess_structured_data_parse_error_is_insufficient() {
+        let cols = vec!["category".to_string()];
+        // Malformed JSON (long enough to clear the floor) is still Insufficient
+        // because parse-error is never promoted to AcceptTier (DD3).
+        assert_eq!(
+            assess_structured_data(Some("output.json"), r#"{"category": broken broken"#, &cols),
+            StructuredDataTier::Insufficient
+        );
+        // CSV with no parse-ready header → Insufficient.
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), "\n\n   \n", &cols),
+            StructuredDataTier::Insufficient
+        );
+    }
+
+    #[test]
+    fn assess_structured_data_path_none_skips_parse_error_check() {
+        let cols = vec!["category".to_string()];
+        // With path=None, the parse-error check is skipped (no extension to
+        // dispatch on); the floor/empty path carries the decision. A long blob
+        // that does NOT contain the declared column (so `generic_data_columns`
+        // observes nothing for it) accept-tiers above the floor.
+        let excerpt = "totally unrelated long content here";
+        assert!(excerpt.trim().chars().count() >= STRUCTURED_DATA_MIN_CHARS);
+        assert_eq!(
+            assess_structured_data(None, excerpt, &cols),
+            StructuredDataTier::AcceptTier
+        );
+        // Below floor with no observed declared column → Insufficient.
+        assert_eq!(
+            assess_structured_data(None, "short", &cols),
+            StructuredDataTier::Insufficient
+        );
+    }
+
+    #[test]
+    fn assess_structured_data_unparseable_format_does_not_accept_tier() {
+        // Issue #921 (CB-001): `.parquet` is admitted as a DataOutput path but is
+        // a binary format the SSOT cannot parse-check (no special-case in
+        // `observed_data_columns`/`structured_data_parse_error`). A long excerpt
+        // whose declared columns are NOT observed must stay `Insufficient` — it
+        // must NOT be promoted to AcceptTier on arbitrary text.
+        let cols = vec!["zzz".to_string()];
+        let long_blob = "this is a long text blob well over the char floor"; // > MIN_CHARS
+        assert!(long_blob.trim().chars().count() >= STRUCTURED_DATA_MIN_CHARS);
+        assert_eq!(
+            assess_structured_data(Some("output.parquet"), long_blob, &cols),
+            StructuredDataTier::Insufficient,
+            "unparseable parquet with missing columns must not accept-tier arbitrary text"
+        );
+        // Same content/columns on a parse-checkable CSV path DOES accept-tier
+        // (regression guard that the CB-001 gate is format-scoped, not blanket).
+        assert_eq!(
+            assess_structured_data(Some("output.csv"), long_blob, &cols),
+            StructuredDataTier::AcceptTier
+        );
+        // No declared columns: parquet still accepted as non-empty (no schema to
+        // verify) — the gate only governs the declared-but-missing AcceptTier path.
+        assert_eq!(
+            assess_structured_data(Some("output.parquet"), long_blob, &[]),
+            StructuredDataTier::SchemaSatisfied
         );
     }
 
@@ -1650,18 +1934,42 @@ mod tests {
     }
 
     #[test]
-    fn data_verifier_diagnoses_missing_required_column() {
+    fn data_verifier_does_not_diagnose_missing_column_when_parse_ready() {
+        // Issue #921 (P4 / DD2 / DR1-004): a parse-ready CSV that is missing a
+        // declared column is now `AcceptTier`, so the diagnostic side must
+        // return strictly `None` (NOT a non-blocking `EvidenceMissing`). A
+        // lingering diagnostic would re-block the accept tier via the
+        // `artifact_identity_satisfied_for_verification` whitelist.
         let verifier = DataVerifier;
         let required = vec!["Category".to_string(), "Total".to_string()];
-        let diagnostic = verifier
-            .diagnostic(VerifierArtifact {
+        assert_eq!(
+            verifier.diagnostic(VerifierArtifact {
                 path: Some("output.csv"),
                 excerpt: "Category,Amount\nA,1\n",
                 required_columns: &required,
-            })
-            .expect("missing column diagnostic");
+            }),
+            None,
+            "accept-tier artifact must yield no blocking diagnostic"
+        );
+    }
 
+    #[test]
+    fn data_verifier_diagnoses_below_floor_structured_data() {
+        // Issue #921 (P4): a missing-column excerpt that is also below the char
+        // floor stays `Insufficient` → blocking SchemaMismatch diagnostic.
+        let verifier = DataVerifier;
+        let required = vec!["Category".to_string(), "Total".to_string()];
+        // "a,b\n1" trimmed = 5 chars < STRUCTURED_DATA_MIN_CHARS, no declared
+        // column observed → Insufficient.
+        let diagnostic = verifier
+            .diagnostic(VerifierArtifact {
+                path: Some("output.csv"),
+                excerpt: "a,b\n1",
+                required_columns: &required,
+            })
+            .expect("below-floor diagnostic");
         assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.role, ArtifactRole::DataOutput);
     }
 
     #[test]

@@ -1196,6 +1196,41 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_taxonomy_records_data_task_kind() {
+        // Issue #921 (P4): eval data case. Drives the real `infer_eval_task_kind`
+        // + `refresh_evaluation_taxonomy` so the emitted `task_kind` is asserted
+        // (not a hand-written fixture row). P8/#925 owns per-kind pass-rate
+        // aggregation; this case only pins that a structured-data request is
+        // classified as "data" in the eval taxonomy.
+        let mut rec = build_eval_record(
+            "sess-data-001",
+            12345,
+            "Generate output.csv with columns id and score from the input data",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "success",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("disabled"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "data");
+    }
+
+    #[test]
     fn evaluation_taxonomy_keeps_generated_test_bug_separate() {
         let rec = build_eval_record(
             "sess-001",
