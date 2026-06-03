@@ -893,22 +893,33 @@ fn usage_docs_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &s
 }
 
 fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
-    let schemas = contract
+    // Issue #921 (P4 / DD1 / DR2-004): route the completion side through the same
+    // OR-tolerant SSOT the diagnostic side uses. Each schema-bearing DataOutput
+    // obligation is assessed with ITS OWN `validated_obligation_path`-checked
+    // path so non-CSV formats (.jsonl/.tsv/.json) get extension-based column
+    // observation instead of the old CSV-comma heuristic (the intended
+    // unification). The `path` reaches `assess_structured_data` only for
+    // extension dispatch — never as an fs/log/prompt sink (DR4-001).
+    let schema_identities = contract
         .required_identities_for_role(ArtifactRole::DataOutput)
         .into_iter()
-        .filter_map(|identity| identity.structured_record_schema.as_ref())
+        .filter(|identity| identity.structured_record_schema.is_some())
         .collect::<Vec<_>>();
-    if schemas.is_empty() {
-        return !excerpt.trim().is_empty();
+    if schema_identities.is_empty() {
+        // No declared schema: parse-ready non-empty content is accepted. This
+        // subsumes the historical `!excerpt.trim().is_empty()` accept-tier;
+        // with no columns + `path = None`, `assess_structured_data` returns
+        // `SchemaSatisfied` for any non-empty excerpt.
+        return super::verifier::assess_structured_data(None, excerpt, &[]).is_accepted();
     }
-    schemas.iter().all(|schema| {
-        schema.columns.iter().all(|column| {
-            excerpt
-                .lines()
-                .next()
-                .is_some_and(|header| header.split(',').any(|cell| cell.trim() == column))
-                || excerpt.contains(column)
-        })
+    schema_identities.iter().all(|identity| {
+        let columns = identity
+            .structured_record_schema
+            .as_ref()
+            .map(|schema| schema.columns.as_slice())
+            .unwrap_or(&[]);
+        super::verifier::assess_structured_data(Some(&identity.path), excerpt, columns)
+            .is_accepted()
     })
 }
 
@@ -3054,7 +3065,6 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
 }
 
 fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
-    let mentions_structured_format = contains_any(lower, &["csv", "tsv", "jsonl", "ndjson"]);
     let mentions_output_shape = contains_any(
         lower,
         &[
@@ -3062,7 +3072,7 @@ fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
             "出力", "列",
         ],
     );
-    if !mentions_structured_format || !mentions_output_shape {
+    if !mentions_output_shape {
         return false;
     }
 
@@ -3072,8 +3082,22 @@ fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
         return false;
     }
 
+    // Issue #921 (P4 / CB-002): an explicit data-extension output path is itself
+    // sufficient structured-format evidence. The keyword gate below omits
+    // `.json` (only csv/tsv/jsonl/ndjson), yet `path_has_data_extension` admits
+    // `.json` and the SSOT (`assess_structured_data`) parses it; without this an
+    // explicit `.json`/`.tsv` output path never synthesized a DataOutput
+    // obligation and was never schema-validated. `explicit_path_with_data_extension`
+    // already requires `data_path_has_output_context`, so output context is
+    // enforced. Kept BEFORE the protected-path guard to preserve the original
+    // precedence (an explicit output path wins).
     if explicit_path_with_data_extension(request).is_some() {
         return true;
+    }
+
+    let mentions_structured_format = contains_any(lower, &["csv", "tsv", "jsonl", "ndjson"]);
+    if !mentions_structured_format {
+        return false;
     }
     if request_mentions_protected_data_artifact_path(request) {
         return false;
@@ -5767,22 +5791,27 @@ mod tests {
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
         let repair_state = VerifierRepairState::None;
-        let wrong_columns = build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
-        assert!(matches!(
+
+        // Issue #921 (P4): a parse-ready CSV missing a declared column ("Total")
+        // used to dead-end as Continue under the conjunctive AND. The OR-tolerant
+        // SSOT now accept-tiers it (parse-ready, non-empty, above the char floor)
+        // so the Data task completes instead of looping. Truly broken/empty
+        // artifacts are still rejected (see `data_*_is_not_ready_*` /
+        // `data_*_unparseable_*` tests).
+        let parse_ready_missing_column =
+            build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
+        assert_eq!(
             plan_artifact_recovery(ArtifactRecoveryInputs {
                 contract: &contract,
                 evidence: &evidence,
                 artifacts: &[],
                 repair_state: &repair_state,
-                artifact_excerpts: &wrong_columns,
+                artifact_excerpts: &parse_ready_missing_column,
                 missing_verifier_suppress_retry: false,
                 owned_test_artifacts: &[],
             }),
-            ArtifactRecoveryAction::Continue {
-                missing,
-                ..
-            } if missing == vec![ArtifactRole::DataOutput]
-        ));
+            ArtifactRecoveryAction::Done
+        );
 
         let matching_columns =
             build_excerpts(&[(ArtifactRole::DataOutput, "Category,Total\nA,1\n")]);
@@ -6003,12 +6032,19 @@ mod tests {
 
     #[test]
     fn data_schema_mismatch_is_not_ready_just_because_path_exists() {
+        // Issue #921 (P4 / DD3): a missing-column excerpt that is ALSO below the
+        // char floor stays `Insufficient` and must keep dead-ending as Continue
+        // with a blocking schema_mismatch diagnostic. (Parse-ready missing-column
+        // excerpts now accept-tier complete — see
+        // `data_task_tracks_output_file_columns_as_structured_record_obligation`.)
         let contract = TaskContract::from_request(
             "Generate output.csv with columns Category and Total from the input CSV.",
         );
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
-        let excerpts = build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
+        // "x,y\n1" = 5 trimmed chars < STRUCTURED_DATA_MIN_CHARS, neither declared
+        // column observed → Insufficient → still blocking.
+        let excerpts = build_excerpts(&[(ArtifactRole::DataOutput, "x,y\n1")]);
         let repair_state = VerifierRepairState::None;
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
@@ -6034,6 +6070,36 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn data_parse_ready_missing_column_completes_via_accept_tier() {
+        // Issue #921 (P4 / DD1 / DD2): the production end-to-end pin that the
+        // S7-001 two-gate flow (required_role_satisfied → diagnostic None, then
+        // structured_record_excerpt_satisfies_obligations → accept) both pass for
+        // a parse-ready CSV missing a declared column, reaching completion.
+        let contract = TaskContract::from_request(
+            "Generate output.csv with columns Category and Total from the input CSV.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
+        // Parse-ready, missing "Total", 19 trimmed chars >= floor → AcceptTier.
+        let excerpts = build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::DataOutput,
+                "output.csv",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(action, ArtifactRecoveryAction::Done);
     }
 
     #[test]

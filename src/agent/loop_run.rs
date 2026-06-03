@@ -1072,6 +1072,12 @@ pub(crate) fn maybe_emit_job_reports_for_test(agent: &mut Agent) {
 // this explicit `mod` declaration is REQUIRED.
 #[cfg(test)]
 mod behavior_contract_projection_e2e_tests;
+// Issue #921 (P4): in-crate `#[cfg(test)]` E2E suite for the OR-tolerant Data
+// capability acceptance spine (`assess_structured_data` SSOT routed through both
+// production gates). Mirrors `safe_stop_e2e_tests.rs` / `pam_advisory_e2e_tests.rs`
+// (CB-001 / DR3-001) — production binary excludes this module, no facade re-export.
+#[cfg(test)]
+mod data_capability_e2e_tests;
 mod summary;
 mod task_contract;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
