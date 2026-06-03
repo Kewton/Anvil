@@ -9,7 +9,7 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet};
 use super::task_contract::{
     ArtifactRole, CompletionDecision, CompletionProjectIntent, DeliverableSchema, TaskContract,
-    TaskKind,
+    TaskKind, report_intended_research,
 };
 use super::verifier::{VerifierDiagnosticCode, verifier_diagnostic_for_obligation};
 
@@ -138,4 +138,49 @@ fn docs_completion_unchanged_by_research_changes() {
         contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
         CompletionDecision::Done
     );
+}
+
+// PR-003: a read-only input file reference ("summarize notes.txt for me") is
+// NOT an output target — it must stay answer-only and NOT gain a report
+// obligation. An explicit output target ("...produce a report in report.md")
+// does gain one.
+#[test]
+fn input_file_reference_does_not_force_report_obligation() {
+    let input_ref = TaskContract::from_request("Summarize notes.txt for me");
+    assert_eq!(input_ref.task_kind, TaskKind::Research);
+    assert!(
+        input_ref.required_artifacts.is_empty(),
+        "a read-only input file reference must not create a report obligation"
+    );
+    assert_eq!(
+        input_ref.completion_policy.project_intent,
+        CompletionProjectIntent::AnswerOnly
+    );
+
+    let output_target =
+        TaskContract::from_request("Investigate the options and produce a report in report.md");
+    assert!(
+        output_target
+            .required_artifacts
+            .contains(&ArtifactRole::UsageDocs),
+        "an explicit output target must create the report obligation"
+    );
+}
+
+// PR-002 / DR3-004: the WorkMode consumption-side SSOT (`report_intended_research`)
+// that gates the AnswerOnly -> Docs override. Report-intended research (incl.
+// Japanese レポート / 出力) is flagged true; genuine answer-only research and a
+// read-only input reference are false.
+#[test]
+fn report_intended_research_ssot() {
+    assert!(report_intended_research(
+        "調査結果をレポートにまとめて report.md に出力してください"
+    ));
+    assert!(report_intended_research(
+        "Investigate the options and produce a report in report.md"
+    ));
+    assert!(!report_intended_research(
+        "Summarize the latest news for me"
+    ));
+    assert!(!report_intended_research("Summarize notes.txt for me"));
 }

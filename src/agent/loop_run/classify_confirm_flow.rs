@@ -39,7 +39,7 @@ use super::work_mode_confirm::{
     run_work_mode_confirm_with_strategy,
 };
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::{ModeClassification, classify_work_mode_json};
+use crate::modes::plan_act::{ModeClassification, WorkMode, classify_work_mode_json};
 use crate::session::feedback::FeedbackKind;
 use crate::session::store::ConversationMessage;
 
@@ -67,7 +67,21 @@ pub(super) fn classify_with_confirmation(
     input: &str,
     stage_label: &'static str,
 ) -> ModeClassification {
-    let classification = classify_work_mode_json(input);
+    let mut classification = classify_work_mode_json(input);
+    // Issue #922 (PR-002 / DR3-004): a report-intended research request must not
+    // stay `AnswerOnly` — that mode blocks Write/Edit and `ProtocolKind::AnswerOnly`
+    // rejects the report's RepoEdit / ReportCompletenessPass evidence, so the
+    // contract-side report obligation could never be satisfied. Map AnswerOnly ->
+    // Docs (`ProtocolKind::Docs` accepts the report and allows edits) for this
+    // case ONLY; every other mode/request is untouched. The trigger reuses the
+    // contract-side SSOT so it stays in lock-step with the completion gates.
+    if classification.work_mode == WorkMode::AnswerOnly
+        && super::task_contract::report_intended_research(input)
+    {
+        classification.work_mode = WorkMode::Docs;
+        classification.allows_file_edits = true;
+        classification.requires_tests = false;
+    }
     // CB-001: only write back the first-pass result when the per-turn cap
     // has NOT yet been consumed. Otherwise the previous call already
     // resolved the final mode and we must keep it.

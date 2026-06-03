@@ -911,6 +911,21 @@ fn usage_docs_surface_satisfied(excerpt: &str) -> bool {
 }
 
 fn usage_docs_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
+    // Issue #922 (PR-001): a research `UsageDocs` obligation is evaluated by the
+    // research acceptance predicate (sectioned coverage OR open-ended floor),
+    // NOT the docs setup/run/verify surface gate. This keeps the recovery path
+    // consistent with `verifier_diagnostic_for_obligation_parts` (DR3-002) so a
+    // valid research report is not forced back to `Continue` here.
+    if contract.task_kind == TaskKind::Research {
+        let sections = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .into_iter()
+            .flat_map(|identity| identity.required_sections.iter().cloned())
+            .collect::<Vec<_>>();
+        return super::verifier::assess_research_report(excerpt, &sections)
+            .tier
+            .is_accepted();
+    }
     let section_obligations = contract
         .required_identities_for_role(ArtifactRole::UsageDocs)
         .into_iter()
@@ -2289,46 +2304,123 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
     sections
 }
 
-/// Issue #922 (P5 / DD4): a research request *intends a written report artifact*
-/// (vs. a genuine answer-only Q&A) when it explicitly names a report / notes /
-/// document or an explicit doc file path. Conservative on purpose: plain
-/// "summarize this for me" stays answer-only (no file signal) and is NOT routed
-/// into a file-edit obligation (regression guard / S7-001).
+/// Issue #922 (P5 / DD4 / PR-003): a research request *intends a written report
+/// artifact* (vs. a genuine answer-only Q&A) when EITHER (a) a doc-like path is
+/// used as an output target (output verb / preposition directing content to it,
+/// not a read-only input reference), or (b) an output verb co-occurs with a
+/// report noun. Conservative on purpose: "summarize this for me" and a bare
+/// input reference like "summarize notes.txt for me" stay answer-only and are
+/// NOT routed into a file-edit obligation (regression guard / S7-001 / PR-003).
 fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
-    contains_any(
+    if research_report_output_path_from_request(request).is_some() {
+        return true;
+    }
+    let output_verb = contains_any(
         lower,
         &[
-            "report",
-            "write-up",
-            "writeup",
-            "notes",
-            "document",
-            ".md",
-            ".markdown",
-            ".rst",
-            ".txt",
+            "write", "produce", "generate", "create", "compile", "draft", "prepare",
         ],
-    ) || contains_any(request, &["レポート", "報告書", "ドキュメント", "文書"])
+    ) || contains_any(request, &["作成", "まとめ", "書いて", "出力"]);
+    let report_noun = contains_any(lower, &["report", "write-up", "writeup"])
+        || contains_any(request, &["レポート", "報告書"]);
+    output_verb && report_noun
 }
 
-/// Issue #922 (P5 / DD3 / DR4-001): the report artifact path for a research
-/// obligation. Prefers an explicit doc-like path from the request (admitted via
-/// the SSOT `normalize_explicit_user_artifact_path`), else defaults to
-/// `report.md`. Never stores a raw/unadmitted path.
-fn research_report_path_from_request(request: &str) -> String {
+/// Issue #922 (PR-003): the file name of a doc-like path looks like an output
+/// target (report/summary/findings/…), disambiguating an output target from an
+/// input reference even without a surrounding output verb.
+fn report_file_name_looks_like_output(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|stem| {
+            [
+                "report", "summary", "findings", "result", "results", "analysis", "research",
+                "output",
+            ]
+            .iter()
+            .any(|prefix| stem.starts_with(prefix))
+        })
+}
+
+/// Issue #922 (PR-003): a doc-like path counts as a research *report output
+/// target* only in an output context — mirrors `data_path_has_output_context`.
+/// A bare read-only input reference ("summarize notes.txt for me") is `false`.
+fn report_path_in_output_context(request: &str, path: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let name_output = report_file_name_looks_like_output(path);
+    lower.match_indices(&path_lower).any(|(idx, _)| {
+        let before = bounded_context_before(&lower, idx, 48);
+        let after = bounded_context_after(&lower, idx + path_lower.len(), 32);
+        let input_context = contains_any(
+            before,
+            &[
+                "input",
+                "source",
+                "from",
+                "read",
+                "reads",
+                "based on",
+                "summarize",
+                "summarise",
+                "analyze",
+                "analyse",
+            ],
+        ) || contains_any(after, &[" as input", " input"]);
+        if input_context && !name_output {
+            return false;
+        }
+        name_output
+            || contains_any(
+                before,
+                &[
+                    "output", "write", "writes", "generate", "produce", "export", "save", "create",
+                    "to", "into", "in",
+                ],
+            )
+            || contains_any(after, &[" output", " report", "まとめ", "出力", "書"])
+    })
+}
+
+/// Issue #922 (PR-003 / DD3 / DR4-001): the first doc-like path used as an
+/// output target, admitted via the SSOT `normalize_explicit_user_artifact_path`.
+fn research_report_output_path_from_request(request: &str) -> Option<String> {
     request
         .split(|ch: char| {
             !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
         })
         .filter_map(normalize_explicit_user_artifact_path)
-        .find(|path| {
+        .filter(|path| {
             let lower = path.to_ascii_lowercase();
             lower.ends_with(".md")
                 || lower.ends_with(".markdown")
                 || lower.ends_with(".rst")
                 || lower.ends_with(".txt")
         })
-        .unwrap_or_else(|| "report.md".to_string())
+        .find(|path| report_path_in_output_context(request, path))
+}
+
+/// Issue #922 (P5 / DD3 / DR4-001): the report artifact path for a research
+/// obligation — the output-context path if present, else the `report.md`
+/// default. Never stores a raw/unadmitted path.
+fn research_report_path_from_request(request: &str) -> String {
+    research_report_output_path_from_request(request).unwrap_or_else(|| "report.md".to_string())
+}
+
+/// Issue #922 (PR-002 / DR3-004): SSOT for the WorkMode consumption-side hook.
+/// True when the request resolves to a Research task carrying a required report
+/// obligation — exactly the contract-side condition that relaxes the Explain
+/// short-circuit — so the WorkMode correction and the completion gates stay in
+/// lock-step. Builds the contract so the determination cannot diverge from
+/// `from_request` (Coding/Data/Docs precedence included).
+pub(super) fn report_intended_research(request: &str) -> bool {
+    let contract = TaskContract::from_request(request);
+    contract.task_kind == TaskKind::Research
+        && contract
+            .required_artifacts
+            .contains(&ArtifactRole::UsageDocs)
 }
 
 fn required_research_sections_from_request(request: &str) -> Vec<String> {
@@ -5407,6 +5499,60 @@ mod tests {
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn issue922_research_report_recovery_is_not_docs_surface_gated() {
+        // PR-001: a valid research report (findings + sources, NO docs
+        // setup/run/verify surface) must NOT be forced back to `Continue` by the
+        // docs surface gate in the recovery path. With the report observed as
+        // evidence + an artifact, the covered report reaches `Done`; a thin
+        // report still gates (negative control proving gating is intact).
+        let contract = TaskContract::from_request(
+            "Investigate the deployment options and produce a report in report.md",
+        );
+        assert_eq!(contract.task_kind, TaskKind::Research);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::ReportCompletenessPass {
+            path: Some("report.md".to_string()),
+        });
+        let artifacts = vec![ArtifactState::exists(ArtifactRole::UsageDocs, "report.md")];
+        let repair_state = VerifierRepairState::None;
+
+        let covered = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "## Findings\nrelease cadence changed.\n## Sources\nhttps://example.test\n",
+        )]);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &covered,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done,
+            "covered research report must not be docs-surface-gated back to Continue"
+        );
+
+        let thin = build_excerpts(&[(ArtifactRole::UsageDocs, "just a single sentence")]);
+        assert!(
+            matches!(
+                plan_artifact_recovery(ArtifactRecoveryInputs {
+                    contract: &contract,
+                    evidence: &evidence,
+                    artifacts: &artifacts,
+                    repair_state: &repair_state,
+                    artifact_excerpts: &thin,
+                    missing_verifier_suppress_retry: false,
+                    owned_test_artifacts: &[],
+                }),
+                ArtifactRecoveryAction::Continue { .. }
+            ),
+            "thin research report must still be gated"
         );
     }
 
