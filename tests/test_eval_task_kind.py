@@ -19,6 +19,12 @@ def _write_json(path: pathlib.Path, obj: object) -> None:
     path.write_text(json.dumps(obj), encoding="utf-8")
 
 
+# Issue #925: sentinel meaning "classified == task_kind" (the common, R5-clean
+# case). Pass an explicit kind to simulate a misroute, or None to simulate a
+# missing classification (which R5 must fail closed for non-coding cases).
+_MATCH_TASK_KIND = object()
+
+
 def _make_run(
     run_dir: pathlib.Path,
     *,
@@ -31,6 +37,7 @@ def _make_run(
     failure_authority: str | None = None,
     last_feedback_kind: str | None = None,
     anvil_score: dict[str, object] | None = None,
+    classified_task_kind: object = _MATCH_TASK_KIND,
 ) -> None:
     session: dict[str, object] = {
         "id": f"{task_kind}-{pam_variant}",
@@ -73,6 +80,23 @@ def _make_run(
         run_dir / "meta.json",
         meta,
     )
+
+    # Issue #925: surface the agent's classified kind via a top-level
+    # `classified_task_kind` in logs/eval.jsonl (the field analyze_run.py reads
+    # for R5). Default = match task_kind (no misroute). `None` => omit the file
+    # entirely (simulates a missing classification).
+    effective_classified = (
+        task_kind
+        if classified_task_kind is _MATCH_TASK_KIND
+        else classified_task_kind
+    )
+    if effective_classified is not None:
+        logs_dir = run_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "eval.jsonl").write_text(
+            json.dumps({"classified_task_kind": effective_classified}) + "\n",
+            encoding="utf-8",
+        )
 
 
 class TestTaskKindEvalReporting(unittest.TestCase):
@@ -268,6 +292,112 @@ class TestTaskKindEvalReporting(unittest.TestCase):
         self.assertEqual(implementation["runs"], 1)
         self.assertEqual(data["overall"]["failure_authority"]["generated_test_bug"], 1)
         self.assertEqual(data["overall"]["failure_authority"]["implementation_bug"], 1)
+
+    # ---- Issue #925 (P8): R5 misroute fail-closed gate ---------------------
+
+    def _analyze(self, run_dir: pathlib.Path) -> dict:
+        result = subprocess.run(
+            [sys.executable, str(ANALYZE), str(run_dir)],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            check=True,
+        )
+        return json.loads(result.stdout)
+
+    def test_r5_misroute_fails_noncoding_case(self) -> None:
+        """A non-coding case whose classified kind differs from the expected
+        kind is a misroute: postcheck is forced False even though the docs
+        artifact is present."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="docs",
+                pam_variant="pam_on",
+                modified_path="README.md",
+                classified_task_kind="coding",  # agent misrouted docs -> coding
+            )
+            data = self._analyze(run_dir)
+        self.assertEqual(data["classified_task_kind"], "coding")
+        self.assertTrue(data["task_kind_misroute"])
+        self.assertFalse(data["postcheck_success"])
+        self.assertEqual(data["postcheck_reason"], "task_kind_misroute")
+
+    def test_r5_missing_classification_fails_noncoding_case(self) -> None:
+        """A non-coding case with NO classified kind fails closed (default-to-
+        pass is prohibited); the absent field is omitted from output."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="data",
+                pam_variant="pam_off",
+                modified_path="output/users.csv",
+                classified_task_kind=None,  # no eval.jsonl classified field
+            )
+            data = self._analyze(run_dir)
+        self.assertNotIn("classified_task_kind", data)
+        self.assertTrue(data["task_kind_misroute"])
+        self.assertFalse(data["postcheck_success"])
+        self.assertEqual(data["postcheck_reason"], "missing_classification")
+
+    def test_r5_match_passes_and_surfaces_classified(self) -> None:
+        """When classified == expected, R5 does not fire: postcheck reflects the
+        artifact, the classified kind is surfaced, and no misroute flag is set."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="data",
+                pam_variant="pam_on",
+                modified_path="output/users.csv",  # data artifact present
+            )
+            data = self._analyze(run_dir)
+        self.assertEqual(data["classified_task_kind"], "data")
+        self.assertNotIn("task_kind_misroute", data)
+        self.assertTrue(data["postcheck_success"])
+        self.assertEqual(data["postcheck_reason"], "data_artifact")
+
+    def test_r5_bypasses_coding_case(self) -> None:
+        """Coding cases bypass R5 entirely: even a divergent classified kind
+        does not flip the verdict (the field is still surfaced)."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",  # coding artifact present
+                classified_task_kind="docs",  # divergent, but coding bypasses R5
+            )
+            data = self._analyze(run_dir)
+        self.assertEqual(data["classified_task_kind"], "docs")
+        self.assertNotIn("task_kind_misroute", data)
+        self.assertTrue(data["postcheck_success"])
+        self.assertEqual(data["postcheck_reason"], "coding_artifact")
+
+    def test_r5_corrupt_tail_after_valid_classified_fails_closed(self) -> None:
+        """CB-001 regression: a malformed line AFTER a valid classified line must
+        NOT let the earlier (stale) value pass. The reader fails closed, so a
+        non-coding run is treated as a missing classification (fail-closed)."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="data",
+                pam_variant="pam_on",
+                modified_path="output/users.csv",  # valid classified=data line
+            )
+            # Append a malformed JSON line after the valid record.
+            eval_path = run_dir / "logs" / "eval.jsonl"
+            with eval_path.open("a", encoding="utf-8") as fh:
+                fh.write("{not valid json\n")
+            data = self._analyze(run_dir)
+        self.assertNotIn("classified_task_kind", data)
+        self.assertTrue(data["task_kind_misroute"])
+        self.assertFalse(data["postcheck_success"])
+        self.assertEqual(data["postcheck_reason"], "missing_classification")
 
 
 if __name__ == "__main__":

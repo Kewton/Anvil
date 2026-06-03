@@ -1024,6 +1024,7 @@ pub(in crate::agent::loop_run) mod tests_export {
             context_pack_binding: None,
             adopted_item_count: 0,
             injection_skipped_reason: None,
+            task_kind: None,
         };
         let mut envelope = build_envelope(&report);
         let (overflowed, truncated) = enforce_bounds(&mut envelope);
@@ -1044,6 +1045,13 @@ mod pam_advisory_e2e_tests;
 // TaskContract completion authority.
 #[cfg(test)]
 mod issue905_pam_completion_tests;
+
+// Issue #919 (P2 / Decision #7 + #8): in-crate `#[cfg(test)]` per-kind matrix
+// pinning that verifier-free prose tasks (AnswerOnly / Authoring / Docs) never
+// route to a coding-verifier ExitReason / verifier-missing SafeStop. Production
+// binary excludes this module (DR3-001 / CB-001 pattern).
+#[cfg(test)]
+mod authoring_prose_verifier_free_e2e_tests;
 
 /// Test seam (#[cfg(test)] only): drive
 /// `Agent::maybe_emit_job_reports_with_linkage` from

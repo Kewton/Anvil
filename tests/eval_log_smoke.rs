@@ -469,6 +469,7 @@ fn r9_oversized_record_is_dropped() {
         },
         completion_reason: "answer_or_plan_completion".to_string(),
         final_outcome: "done".to_string(),
+        classified_task_kind: None,
     };
 
     // Confirm the record would exceed the byte cap
@@ -584,4 +585,59 @@ fn r12_anvil_score_summary_all_fields() {
     assert_eq!(summary.unsafe_actions_blocked, 1);
     assert_eq!(summary.consecutive_no_progress_turns, 3);
     assert!(!summary.user_visible_artifact);
+}
+
+/// Issue #925 (P8): `EvalRecord.classified_task_kind` is additive and
+/// serializes as a TOP-LEVEL field distinct from `evaluation_taxonomy`.
+/// `None` is omitted (so old readers / old records stay compatible); `Some`
+/// emits the key. This is the field `analyze_run.py` reads for the R5 gate.
+#[test]
+fn issue925_classified_task_kind_serde_smoke() {
+    let mut rec = build_eval_record(
+        "sess-925",
+        0,
+        "task",
+        "m",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        ChangedFileClasses {
+            test: 0,
+            impl_files: 0,
+            setup: 0,
+        },
+        &[],
+        None,
+        None,
+        None,
+        "done",
+    );
+
+    // The builder leaves it None (post-set by the agent layer); None is omitted.
+    assert!(rec.classified_task_kind.is_none());
+    let json_none: Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+    assert!(
+        json_none.get("classified_task_kind").is_none(),
+        "None classified_task_kind must be omitted (additive / backward-compatible)"
+    );
+
+    // Some serializes under the TOP-LEVEL key, not inside evaluation_taxonomy.
+    rec.classified_task_kind = Some("docs".to_string());
+    let json_some: Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+    assert_eq!(
+        json_some
+            .get("classified_task_kind")
+            .and_then(|v| v.as_str()),
+        Some("docs"),
+        "Some classified_task_kind must serialize as a top-level string"
+    );
+    assert!(
+        json_some["evaluation_taxonomy"]
+            .get("classified_task_kind")
+            .is_none(),
+        "classified_task_kind must stay distinct from evaluation_taxonomy.task_kind"
+    );
 }
