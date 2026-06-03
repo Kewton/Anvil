@@ -197,3 +197,233 @@ mod tests {
         assert!(reason.contains("authoring artifact is too short or missing requested sections"));
     }
 }
+
+/// Issue #919 (CB-001): integration-style coverage of the **production**
+/// Write/Edit observation path (`observe_evidence_from_repo_edit`). The earlier
+/// `#[cfg(test)] mod tests` block above proves the DR3-002 gate by *manually
+/// injecting* `ReportCompletenessPass` into the evidence set — which masked the
+/// real defect: the production observation path never promoted an edited
+/// Authoring artifact to that pass, so a genuine "translate README.ja.md →
+/// write README.md" stayed `Continue { UsageDocs }` until retry exhaustion.
+///
+/// These tests drive the real entry point (build a live `Agent` with a temp
+/// `work_root`, seed an Authoring request, write a file, call
+/// `observe_evidence_from_repo_edit`) and assert completion **without** any
+/// manually-pushed pass. Deterministic / Ollama-free (the mockito URL is never
+/// hit). Precedent: `artifact_ledger_phase5_tests.rs` / `bash_policy_e2e_tests.rs`.
+#[cfg(test)]
+mod production_path_tests {
+    use std::sync::OnceLock;
+
+    use tempfile::{TempDir, tempdir};
+
+    use super::super::repo_edit_observation::observe_evidence_from_repo_edit;
+    use super::super::task_contract::{ArtifactRole, CompletionDecision, TaskContract, TaskKind};
+    use crate::agent::Agent;
+    use crate::agent::loop_run::FooterHandle;
+    use crate::config::Config;
+    use crate::model_registry::RuntimeModels;
+    use crate::ollama::client::OllamaClient;
+    use crate::session::store::{SessionSnapshot, SessionStore};
+
+    static LOG_DIR: OnceLock<TempDir> = OnceLock::new();
+
+    fn ensure_logging() {
+        let _ = LOG_DIR.get_or_init(|| {
+            let dir = tempdir().expect("tempdir for shared log");
+            let log_path = dir.path().join("llm-io.jsonl");
+            let _ = crate::logging::init_logging(crate::config::LogLevel::Info, &log_path);
+            dir
+        });
+    }
+
+    fn unique_session_id(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("919cb001-{prefix}-{nanos}")
+    }
+
+    /// Build a live `Agent` whose `work_root` is a fresh temp dir and whose
+    /// active task is `request` (so `task_contract_authority` resolves to the
+    /// Authoring contract the production observation hook reads).
+    fn build_agent(session_id: &str, request: &str) -> (Agent, TempDir) {
+        ensure_logging();
+        let dir = tempdir().expect("tempdir for agent");
+        let state_root = dir.path().join("state");
+        std::fs::create_dir_all(state_root.join("sessions").join(session_id)).unwrap();
+
+        let config = Config {
+            cwd: dir.path().to_path_buf(),
+            requested_model: Some("test-model".to_string()),
+            state_dir_override: Some(state_root.clone()),
+            yes_mode: true,
+            max_iterations: 1,
+            ..Config::default()
+        };
+
+        let workspace_key = format!("anvil-919cb001-{session_id}");
+        let mut session = SessionSnapshot {
+            id: session_id.to_string(),
+            workspace_key: workspace_key.clone(),
+            active_root: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        session.working_memory.active_task = Some(request.to_string());
+
+        let server = mockito::Server::new();
+        let agent = Agent::new(
+            config,
+            RuntimeModels {
+                main: "test-model".to_string(),
+                sidecar: None,
+            },
+            OllamaClient::new(server.url()).unwrap(),
+            SessionStore::new(&state_root, session_id, &workspace_key),
+            session,
+            FooterHandle::disabled(),
+        );
+        (agent, dir)
+    }
+
+    /// The verbatim production request from the bug report. We assert it
+    /// classifies as Authoring and exposes at least one UsageDocs obligation so
+    /// the rest of the scenario is meaningful.
+    const TRANSLATE_REQUEST: &str = "Translate README.ja.md into English and write README.md";
+
+    fn usage_docs_paths(contract: &TaskContract) -> Vec<String> {
+        let paths: Vec<String> = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .iter()
+            .map(|id| id.path.clone())
+            .collect();
+        assert!(
+            !paths.is_empty(),
+            "Authoring request must yield a UsageDocs obligation"
+        );
+        paths
+    }
+
+    /// A sufficient translation body (>= AUTHORING_MIN_CONTENT_CHARS; the
+    /// TRANSLATE_REQUEST obligations carry no requested sections).
+    const SUFFICIENT_BODY: &str = "# Project\n\nRun the server with `cargo run`. This is the English translation of the original README.\n";
+
+    /// CB-001 fix: sufficient real Writes of the required UsageDocs artifact(s),
+    /// observed through the production entry point, promote each artifact to an
+    /// accept-tier `ReportCompletenessPass` so the contract evaluates to `Done`
+    /// — with NO manually-injected evidence. (The TRANSLATE_REQUEST yields both
+    /// the source `README.ja.md` and the deliverable `README.md` as UsageDocs
+    /// obligations, so this also pins that the production hook promotes the
+    /// correct path for each obligation in a multi-file Authoring task.)
+    #[test]
+    fn authoring_write_promotes_to_accept_tier_pass_in_production() {
+        let session_id = unique_session_id("promote");
+        let (mut agent, dir) = build_agent(&session_id, TRANSLATE_REQUEST);
+        let work_root = dir.path();
+
+        let contract = TaskContract::from_request(TRANSLATE_REQUEST);
+        assert_eq!(contract.task_kind, TaskKind::Authoring);
+        let paths = usage_docs_paths(&contract);
+
+        for rel in &paths {
+            std::fs::write(work_root.join(rel), SUFFICIENT_BODY).unwrap();
+            // Drive the REAL production observation path. No manual evidence push.
+            observe_evidence_from_repo_edit(&mut agent, rel);
+        }
+
+        // Every required obligation must have a path-matched accept-tier pass
+        // pushed by the production hook (not injected).
+        for rel in &paths {
+            assert!(
+                agent.task_contract_evidence_set_this_turn.iter().any(|e| matches!(
+                    e,
+                    super::super::completion_evidence::CompletionEvidence::ReportCompletenessPass {
+                        path: Some(p),
+                    } if p == rel
+                )),
+                "production hook must push an accept-tier pass for {rel}"
+            );
+        }
+
+        assert_eq!(
+            contract.evaluate_with_owned_test_artifacts(
+                &agent.task_contract_evidence_set_this_turn,
+                &[],
+            ),
+            CompletionDecision::Done,
+            "a sufficient Authoring write through the production path must complete without manual evidence injection"
+        );
+    }
+
+    /// A stub write ("TODO") fails the accept tier (< AUTHORING_MIN_CONTENT_CHARS),
+    /// so the production path pushes NO pass and the contract stays
+    /// `Continue { UsageDocs }` — the correct behavior the fix must preserve.
+    #[test]
+    fn authoring_write_stub_stays_continue_in_production() {
+        let session_id = unique_session_id("stub");
+        let (mut agent, dir) = build_agent(&session_id, TRANSLATE_REQUEST);
+        let work_root = dir.path();
+
+        let contract = TaskContract::from_request(TRANSLATE_REQUEST);
+        let paths = usage_docs_paths(&contract);
+
+        for rel in &paths {
+            std::fs::write(work_root.join(rel), "TODO").unwrap();
+            observe_evidence_from_repo_edit(&mut agent, rel);
+        }
+
+        // No accept-tier pass may be pushed for any path.
+        assert!(
+            !agent.task_contract_evidence_set_this_turn.iter().any(|e| matches!(
+                e,
+                super::super::completion_evidence::CompletionEvidence::ReportCompletenessPass { .. }
+            )),
+            "a stub Authoring write must NOT promote to an accept-tier pass"
+        );
+        assert!(
+            matches!(
+                contract.evaluate_with_owned_test_artifacts(
+                    &agent.task_contract_evidence_set_this_turn,
+                    &[],
+                ),
+                CompletionDecision::Continue {
+                    missing,
+                } if missing == vec![ArtifactRole::UsageDocs]
+            ),
+            "a stub Authoring write must keep the contract on Continue {{ UsageDocs }}"
+        );
+    }
+
+    /// Behavior preservation: a Docs contract (NOT Authoring) writing the same
+    /// README.md must NOT get an Authoring accept-tier pass pushed — Docs
+    /// completes through its own `RepoEdit(Docs)` authority and the Authoring
+    /// hook must be inert for non-Authoring kinds.
+    #[test]
+    fn docs_write_does_not_get_authoring_pass_in_production() {
+        let request = "Update README.md with setup, usage, and test sections";
+        let session_id = unique_session_id("docs");
+        let (mut agent, dir) = build_agent(&session_id, request);
+        let work_root = dir.path();
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        let paths = usage_docs_paths(&contract);
+
+        let body =
+            "# README\n\n## Setup\nInstall deps.\n\n## Usage\nRun it.\n\n## Test\nRun the tests.\n";
+        for rel in &paths {
+            std::fs::write(work_root.join(rel), body).unwrap();
+            observe_evidence_from_repo_edit(&mut agent, rel);
+        }
+
+        // The Authoring hook must NOT have fired: no ReportCompletenessPass.
+        assert!(
+            !agent.task_contract_evidence_set_this_turn.iter().any(|e| matches!(
+                e,
+                super::super::completion_evidence::CompletionEvidence::ReportCompletenessPass { .. }
+            )),
+            "the Authoring accept-tier hook must be inert for a Docs contract"
+        );
+    }
+}
