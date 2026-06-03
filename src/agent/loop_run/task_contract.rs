@@ -302,6 +302,28 @@ impl DeliverableObligation {
             structured_record_schema: None,
         }
     }
+
+    /// Issue #923 (P6): an Ops runbook deliverable obligation. Carried on the
+    /// `UsageDocs` role (no dedicated `OpsRunbook` role until #920) but tagged
+    /// `kind = OpsRunbook` so the obligation diagnostic routes to the Ops tier
+    /// predicate, not the docs gate (DR3-002). `schema = None` deliberately
+    /// avoids the `DeliverableSchema::RequiredSections` docs branch; the Ops
+    /// predicate reads `required_sections` directly. Path goes through
+    /// `validated_obligation_path` like every other ctor (DR4-001), and
+    /// `required_sections` holds canonical `OpsSection` labels only (DR4-002).
+    fn ops_runbook(path: impl Into<String>, required_sections: Vec<String>) -> Self {
+        let path = validated_obligation_path(path.into());
+        Self {
+            role: ArtifactRole::UsageDocs,
+            kind: DeliverableKind::OpsRunbook,
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: None,
+            required_sections,
+            acceptance_criteria: Vec::new(),
+            structured_record_schema: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,7 +1005,13 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
                 // behavior through expected values rather than domain words.
                 ArtifactRole::Test => true,
                 ArtifactRole::UsageDocs => {
-                    usage_docs_excerpt_satisfies_obligations(inputs.contract, excerpt)
+                    // Issue #923 (plan item 1): an Ops task's UsageDocs role is the
+                    // OpsRunbook runbook, already content-validated by the ops tier
+                    // predicate in the missing loop above (the obligation is the
+                    // completion authority). Gate the docs section-coverage on
+                    // `task_kind != Ops` so a runbook is not re-judged as docs.
+                    inputs.contract.task_kind == TaskKind::Ops
+                        || usage_docs_excerpt_satisfies_obligations(inputs.contract, excerpt)
                 }
                 ArtifactRole::Setup => true,
                 ArtifactRole::DataOutput => {
@@ -1068,7 +1096,15 @@ fn required_role_satisfied(
     if identities.is_empty() {
         return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
     }
-    if role == ArtifactRole::UsageDocs && observed.contains(&role) {
+    // Issue #923 (plan item 1): an Ops task's UsageDocs role carries the
+    // OpsRunbook obligation, which is the completion authority and must satisfy
+    // the ops tier predicate — it cannot take the docs observed-role shortcut.
+    // Gate the shortcut on `task_kind != Ops` (OpsRunbook obligations only ever
+    // exist on Ops tasks).
+    if role == ArtifactRole::UsageDocs
+        && observed.contains(&role)
+        && contract.task_kind != TaskKind::Ops
+    {
         return true;
     }
     identities.iter().all(|identity| {
@@ -1146,7 +1182,15 @@ fn required_role_satisfied_by_evidence(
         }
         return observed_artifacts(evidence).contains(&role);
     }
-    if role == ArtifactRole::UsageDocs && !authoring && observed_artifacts(evidence).contains(&role)
+    // Issue #923 (plan item 1 / High) + #919 (DR3-002): the evaluate() completion
+    // authority must not let the docs observed-role shortcut satisfy a UsageDocs
+    // role for either an Ops task (OpsRunbook obligation is the authority; needs
+    // the tier predicate) or an Authoring task (needs the accept-tier pass). For
+    // both, fall through to the path-specific `artifact_identity_observed_in_evidence`.
+    if role == ArtifactRole::UsageDocs
+        && !authoring
+        && observed_artifacts(evidence).contains(&role)
+        && contract.task_kind != TaskKind::Ops
     {
         return true;
     }
@@ -1552,6 +1596,12 @@ impl TaskContract {
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
         for identity in inferred_data_obligations_from_request(request, &lower) {
+            if !required.contains(&identity.role) {
+                required.push(identity.role);
+            }
+            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+        }
+        for identity in inferred_ops_obligations_from_request(request, &lower, task_kind) {
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
@@ -2157,6 +2207,21 @@ fn deliverable_for_role(
     required_artifact_identities: &[ArtifactObligation],
     optional: bool,
 ) -> TaskDeliverable {
+    // Issue #923: an OpsRunbook obligation rides on the `UsageDocs` role (no
+    // dedicated role until #920) but is a runbook deliverable, not docs. Surface
+    // it with its `OpsRunbook` kind and carry its canonical `required_sections`
+    // so the deliverable view matches the obligation (DR3-002).
+    if let Some(identity) = required_artifact_identities
+        .iter()
+        .find(|identity| identity.role == role && identity.kind == DeliverableKind::OpsRunbook)
+    {
+        return TaskDeliverable {
+            kind: DeliverableKind::OpsRunbook,
+            role: Some(role),
+            path: Some(identity.path.clone()),
+            required_sections: identity.required_sections.clone(),
+        };
+    }
     let path = required_artifact_identities
         .iter()
         .find(|identity| identity.role == role)
@@ -2290,24 +2355,43 @@ fn required_research_sections_from_request(request: &str) -> Vec<String> {
     sections
 }
 
+/// Issue #923 (P6): the explicit-override carrier for Ops runbooks. Emits only
+/// canonical `OpsSection` labels (DR4-002: never raw request substrings), so the
+/// values are safe to store on the obligation and surface in diagnostics /
+/// repair packets. `push_section_if` dedups; the four fixed calls cap the result
+/// at four labels (DR4-003). The empty fallback is `checklist` (the core), which
+/// is harmless because the core is mandatory regardless.
 fn required_ops_sections_from_request(request: &str) -> Vec<String> {
     let lower = request.to_ascii_lowercase();
     let mut sections = Vec::new();
+    use super::verifier::OpsSection;
     push_section_if(
         &mut sections,
         contains_any(
             &lower,
             &["runbook", "procedure", "checklist", "deploy", "deployment"],
         ) || contains_any(request, &["手順", "チェックリスト", "デプロイ"]),
-        "procedure",
+        OpsSection::Checklist.label(),
     );
     push_section_if(
         &mut sections,
-        contains_any(&lower, &["rollback", "restore"]) || contains_any(request, &["ロールバック"]),
-        "rollback",
+        contains_any(&lower, &["validate", "validation", "verify"])
+            || contains_any(request, &["確認", "検証"]),
+        OpsSection::Validation.label(),
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["rollback", "restore", "roll back", "revert"])
+            || contains_any(request, &["ロールバック", "切り戻し"]),
+        OpsSection::Rollback.label(),
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["risk", "impact"]) || contains_any(request, &["リスク", "注意"]),
+        OpsSection::Risk.label(),
     );
     if sections.is_empty() {
-        sections.push("procedure".to_string());
+        sections.push(OpsSection::Checklist.label().to_string());
     }
     sections
 }
@@ -3394,6 +3478,44 @@ fn inferred_docs_obligations_from_request(
         return Vec::new();
     }
     vec![ArtifactObligation::readme("README.md", sections)]
+}
+
+/// Issue #923 (P6): the OpsRunbook obligation bridge. Without this, an Ops
+/// request produces only a `TaskDeliverable` (no obligation), so the production
+/// obligation diagnostic never runs `ops_runbook_pass` and loosening the
+/// predicate would be a no-op (Codex DR3-001).
+///
+/// Only genuine runbook/deploy/operation requests get an obligation. A pure
+/// setup/install request reaches `TaskKind::Ops` via `asks_for_setup` (not the
+/// ops keywords), so gating on `request_asks_for_ops_task` leaves setup-only
+/// completion to the Setup evidence / SetupBootstrap path (DR3-003). Path falls
+/// back to a literal `runbook.md` (validated in the ctor, DR4-001).
+fn inferred_ops_obligations_from_request(
+    request: &str,
+    lower: &str,
+    task_kind: TaskKind,
+) -> Vec<ArtifactObligation> {
+    if task_kind != TaskKind::Ops || !request_asks_for_ops_task(request, lower) {
+        return Vec::new();
+    }
+    vec![ArtifactObligation::ops_runbook(
+        default_ops_runbook_path_from_request(request),
+        required_ops_sections_from_request(request),
+    )]
+}
+
+/// Issue #923 (CB-002 / DR4-001): honor an explicit markdown path the user named
+/// (e.g. `deployment-runbook.md`) so the obligation matches the artifact the
+/// agent will actually write, instead of always demanding a literal `runbook.md`.
+/// Explicit paths come from `explicit_artifact_obligations_from_request` (already
+/// `validated_obligation_path`-sanitized); the fallback is the literal
+/// `runbook.md`. Mirrors `default_docs_path_from_request`.
+fn default_ops_runbook_path_from_request(request: &str) -> String {
+    explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .find(|identity| identity.role == ArtifactRole::UsageDocs)
+        .map(|identity| identity.path)
+        .unwrap_or_else(|| "runbook.md".to_string())
 }
 
 fn inferred_data_obligations_from_request(request: &str, lower: &str) -> Vec<ArtifactObligation> {
@@ -5117,6 +5239,103 @@ mod tests {
         assert_eq!(
             super::super::summary::RunState::from_artifact_recovery_action(&action),
             super::super::summary::RunState::Completed
+        );
+    }
+
+    // ---- Issue #923 (P6): Ops capability through the production
+    // `plan_artifact_recovery` authority (CB-003) + evidence-path guard (CB-001) ----
+
+    #[test]
+    fn ops_runbook_rollback_omitted_completes_via_recovery() {
+        // No explicit rollback request → rollback optional. A 3/4 runbook
+        // (rollback omitted) FAILED under the old 4-way AND but completes under
+        // the new tier, proved through the production recovery authority.
+        let contract = TaskContract::from_request("Prepare a deployment runbook checklist");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "runbook.md"));
+        let artifacts = vec![ArtifactState::changed_at(
+            ArtifactRole::UsageDocs,
+            "runbook.md",
+        )];
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "## Checklist\n[x] deploy\n## Validation\nVerify health endpoint.\n## Risk\nImpact low.",
+        )]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert_eq!(action, ArtifactRecoveryAction::Done);
+    }
+
+    #[test]
+    fn ops_runbook_explicit_rollback_omitted_continues_via_recovery() {
+        // Request explicitly asks for rollback → rollback mandatory; a
+        // rollback-omitted runbook must NOT complete (Continue) via recovery.
+        let contract =
+            TaskContract::from_request("Prepare a deployment runbook with rollback steps");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "runbook.md"));
+        let artifacts = vec![ArtifactState::changed_at(
+            ArtifactRole::UsageDocs,
+            "runbook.md",
+        )];
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "## Checklist\n[x] deploy\n## Validation\nVerify health endpoint.\n## Risk\nImpact low.",
+        )]);
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert!(
+            matches!(action, ArtifactRecoveryAction::Continue { .. }),
+            "explicit rollback omission must Continue, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn ops_runbook_not_satisfied_by_foreign_usagedocs_evidence() {
+        // CB-001: a README edit (foreign UsageDocs evidence) must NOT satisfy the
+        // OpsRunbook obligation via the evidence-only completion authority.
+        let contract = TaskContract::from_request("Prepare a deployment runbook checklist");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &[]);
+        match decision {
+            CompletionDecision::Continue { missing } => {
+                assert!(
+                    missing.contains(&ArtifactRole::UsageDocs),
+                    "OpsRunbook obligation should remain unmet, missing={missing:?}"
+                );
+            }
+            other => panic!("foreign UsageDocs evidence must not complete ops, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ops_runbook_honors_explicit_markdown_path() {
+        // CB-002: an explicitly named markdown path is honored instead of the
+        // literal runbook.md fallback; absent one, the literal is used.
+        assert_eq!(
+            default_ops_runbook_path_from_request("Write the deploy runbook to deploy-runbook.md"),
+            "deploy-runbook.md"
+        );
+        assert_eq!(
+            default_ops_runbook_path_from_request("Prepare a deployment runbook checklist"),
+            "runbook.md"
         );
     }
 
