@@ -1,7 +1,8 @@
 use super::completion_evidence::CompletionEvidence;
 use super::failure_packet::{CandidateArtifact, FailurePacket};
 use super::task_contract::{
-    ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableSchema, TaskKind,
+    ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
+    TaskKind,
 };
 use crate::tools::bash::BashCommandClass;
 
@@ -468,7 +469,9 @@ impl OpsVerifier {
         path: Option<String>,
         excerpt: &str,
     ) -> Option<CompletionEvidence> {
-        if ops_runbook_pass(excerpt) {
+        // Test-only artifact adapter: no request context, so the context-free
+        // (core + >=3/4) predicate applies (DSR1-003).
+        if ops_runbook_pass(excerpt, &[]) {
             Some(CompletionEvidence::ReportCompletenessPass { path })
         } else {
             None
@@ -550,13 +553,13 @@ fn verifier_diagnostic_for_artifact(
                 "research evidence is missing claim/source/limitation coverage",
             )
         }),
-        TaskKind::Ops => (!ops_runbook_pass(artifact.excerpt)).then(|| {
+        TaskKind::Ops => (!ops_runbook_pass(artifact.excerpt, &[])).then(|| {
             VerifierDiagnostic::new(
                 task_kind,
                 VerifierDiagnosticCode::EvidenceMissing,
                 ArtifactRole::UsageDocs,
                 Some(path),
-                "ops evidence is missing checklist/validation/rollback/risk coverage",
+                "ops runbook is missing required sections (need a checklist + validation core and at least 3 of checklist/validation/rollback/risk)",
             )
         }),
     }
@@ -684,16 +687,21 @@ fn verifier_diagnostic_for_obligation_parts(
             "research evidence is missing claim/source/limitation coverage",
         ));
     }
+    // Issue #923 (DR3-003): the tiered Ops gate applies only to OpsRunbook
+    // obligations, so a setup/install artifact routed to `TaskKind::Ops` is not
+    // judged as a runbook. `obligation.required_sections` carries the
+    // request-derived mandatory sections (canonical labels, DR4-002).
     if task_kind == TaskKind::Ops
+        && obligation.kind == DeliverableKind::OpsRunbook
         && let Some(excerpt) = excerpt
-        && !ops_runbook_pass(excerpt)
+        && !ops_runbook_pass(excerpt, &obligation.required_sections)
     {
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::EvidenceMissing,
             obligation.role,
             Some(&obligation.path),
-            "ops evidence is missing checklist/validation/rollback/risk coverage",
+            "ops runbook is missing required sections (need a checklist + validation core and at least 3 of checklist/validation/rollback/risk)",
         ));
     }
     None
@@ -1044,16 +1052,164 @@ fn research_report_pass(excerpt: &str) -> bool {
     has_citation && has_claim && has_uncertainty
 }
 
-fn ops_runbook_pass(excerpt: &str) -> bool {
+/// Issue #923 (P6): an Ops runbook section. SSOT for both excerpt-keyword
+/// detection and request-label mapping (DRY, DSR1-001). `Checklist` and
+/// `Validation` form the mandatory core; `Rollback` and `Risk` are optional
+/// unless the request explicitly asks for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpsSection {
+    Checklist,
+    Validation,
+    Rollback,
+    Risk,
+}
+
+impl OpsSection {
+    /// All four sections in deterministic order.
+    const ALL: [OpsSection; 4] = [
+        OpsSection::Checklist,
+        OpsSection::Validation,
+        OpsSection::Rollback,
+        OpsSection::Risk,
+    ];
+
+    /// Canonical label — the only string ever stored in
+    /// `ArtifactObligation.required_sections` (DR4-002: never raw request text).
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            OpsSection::Checklist => "checklist",
+            OpsSection::Validation => "validation",
+            OpsSection::Rollback => "rollback",
+            OpsSection::Risk => "risk",
+        }
+    }
+
+    /// Bilingual excerpt keywords (SSOT, replaces the former inline lists). JP
+    /// coverage preserved (手順 / 確認 / 検証 / 切り戻し / リスク / 注意).
+    fn excerpt_keywords(self) -> &'static [&'static str] {
+        match self {
+            OpsSection::Checklist => &["[ ]", "[x]", "checklist", "手順"],
+            OpsSection::Validation => &["validate", "validation", "verify", "確認", "検証"],
+            OpsSection::Rollback => &["rollback", "roll back", "revert", "切り戻し"],
+            OpsSection::Risk => &["risk", "impact", "注意", "リスク"],
+        }
+    }
+
+    /// Map a request-derived section label (canonical or alias) onto a section.
+    /// Unknown labels return `None` and are ignored (DR4-003 fail-safe).
+    fn from_label(label: &str) -> Option<OpsSection> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "checklist" | "procedure" | "手順" => Some(OpsSection::Checklist),
+            "validation" | "validate" | "verify" | "確認" | "検証" => {
+                Some(OpsSection::Validation)
+            }
+            "rollback" | "restore" | "切り戻し" | "ロールバック" => {
+                Some(OpsSection::Rollback)
+            }
+            "risk" | "impact" | "リスク" | "注意" => Some(OpsSection::Risk),
+            _ => None,
+        }
+    }
+}
+
+/// Dependency-free set of Ops sections (DSR2-001 — no external crate). The fixed
+/// 4-bit width bounds the input regardless of label-list length (DR4-003 DoS
+/// boundary).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct OpsSectionSet {
+    checklist: bool,
+    validation: bool,
+    rollback: bool,
+    risk: bool,
+}
+
+impl OpsSectionSet {
+    /// The mandatory core: a runbook missing either never accepts (core floor,
+    /// Codex S3-001 — prevents a pure-OR predicate from passing empty content).
+    const CORE: OpsSectionSet = OpsSectionSet {
+        checklist: true,
+        validation: true,
+        rollback: false,
+        risk: false,
+    };
+
+    fn with(mut self, section: OpsSection) -> Self {
+        match section {
+            OpsSection::Checklist => self.checklist = true,
+            OpsSection::Validation => self.validation = true,
+            OpsSection::Rollback => self.rollback = true,
+            OpsSection::Risk => self.risk = true,
+        }
+        self
+    }
+
+    fn contains(self, section: OpsSection) -> bool {
+        match section {
+            OpsSection::Checklist => self.checklist,
+            OpsSection::Validation => self.validation,
+            OpsSection::Rollback => self.rollback,
+            OpsSection::Risk => self.risk,
+        }
+    }
+
+    fn count(self) -> usize {
+        [self.checklist, self.validation, self.rollback, self.risk]
+            .into_iter()
+            .filter(|present| *present)
+            .count()
+    }
+
+    fn is_superset_of(self, required: OpsSectionSet) -> bool {
+        OpsSection::ALL
+            .iter()
+            .all(|section| !required.contains(*section) || self.contains(*section))
+    }
+}
+
+/// Detect which Ops sections an excerpt covers (pure, linear, no regex —
+/// DR4-003). Uses the `OpsSection` excerpt-keyword SSOT.
+fn detect_present_sections(excerpt: &str) -> OpsSectionSet {
     let lower = excerpt.to_ascii_lowercase();
-    let has_checklist = contains_any(&lower, &["[ ]", "[x]", "checklist", "手順"]);
-    let has_validation = contains_any(
-        &lower,
-        &["validate", "validation", "verify", "確認", "検証"],
-    );
-    let has_rollback = contains_any(&lower, &["rollback", "roll back", "revert", "切り戻し"]);
-    let has_risk = contains_any(&lower, &["risk", "impact", "注意", "リスク"]);
-    has_checklist && has_validation && has_rollback && has_risk
+    let mut present = OpsSectionSet::default();
+    for section in OpsSection::ALL {
+        if contains_any(&lower, section.excerpt_keywords()) {
+            present = present.with(section);
+        }
+    }
+    present
+}
+
+/// Map request-derived required-section labels onto a set unioned with the
+/// mandatory core. Unknown labels are ignored; the 4-bit width caps the result
+/// at 4 sections regardless of input length (DR4-003).
+fn ops_required_sections(required_sections: &[String]) -> OpsSectionSet {
+    let mut required = OpsSectionSet::CORE;
+    for label in required_sections {
+        if let Some(section) = OpsSection::from_label(label) {
+            required = required.with(section);
+        }
+    }
+    required
+}
+
+/// OR-tolerant tier acceptance (Issue #923): the mandatory core must be present,
+/// every explicitly-required section must be present, and at least 3 of the 4
+/// sections must be covered. Replaces the historical strict 4-way AND.
+fn accept_ops_tier(present: OpsSectionSet, required: OpsSectionSet) -> bool {
+    present.is_superset_of(OpsSectionSet::CORE)
+        && present.is_superset_of(required)
+        && present.count() >= 3
+}
+
+/// Issue #923: tiered Ops runbook acceptance. `required_sections` carries the
+/// request-derived mandatory sections — empty for the context-free, test-only
+/// artifact paths, and populated from `obligation.required_sections` on the
+/// production obligation path (DR3-001/DR3-003).
+fn ops_runbook_pass(excerpt: &str, required_sections: &[String]) -> bool {
+    accept_ops_tier(
+        detect_present_sections(excerpt),
+        ops_required_sections(required_sections),
+    )
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1452,5 +1608,100 @@ mod tests {
                 path: Some("runbook.md".to_string()),
             })
         );
+    }
+
+    // ---- Issue #923 (P6): Ops tier predicate ----
+
+    #[test]
+    fn ops_section_labels_are_canonical() {
+        assert_eq!(OpsSection::Checklist.label(), "checklist");
+        assert_eq!(OpsSection::Validation.label(), "validation");
+        assert_eq!(OpsSection::Rollback.label(), "rollback");
+        assert_eq!(OpsSection::Risk.label(), "risk");
+    }
+
+    #[test]
+    fn ops_section_from_label_maps_aliases_and_ignores_unknown() {
+        assert_eq!(
+            OpsSection::from_label("procedure"),
+            Some(OpsSection::Checklist)
+        );
+        assert_eq!(
+            OpsSection::from_label("CHECKLIST"),
+            Some(OpsSection::Checklist)
+        );
+        assert_eq!(
+            OpsSection::from_label("verify"),
+            Some(OpsSection::Validation)
+        );
+        assert_eq!(
+            OpsSection::from_label("restore"),
+            Some(OpsSection::Rollback)
+        );
+        assert_eq!(OpsSection::from_label("impact"), Some(OpsSection::Risk));
+        assert_eq!(OpsSection::from_label("リスク"), Some(OpsSection::Risk));
+        assert_eq!(OpsSection::from_label("totally-unknown"), None);
+    }
+
+    #[test]
+    fn ops_tier_accepts_three_of_four_with_core_present() {
+        // rollback omitted, core (checklist+validation) present, 3/4 → pass.
+        let excerpt = "## Checklist\n[x] deploy\n## Validation\nVerify health endpoint.\n## Risk\nImpact low.";
+        assert!(ops_runbook_pass(excerpt, &[]));
+    }
+
+    #[test]
+    fn ops_tier_rejects_missing_core() {
+        // checklist + risk only: validation core absent → fail (core floor).
+        let excerpt = "## Checklist\n[ ] deploy\n## Risk\nlow";
+        assert!(!ops_runbook_pass(excerpt, &[]));
+    }
+
+    #[test]
+    fn ops_tier_rejects_pure_or_single_section() {
+        // A single section can never satisfy the core floor + >=3 threshold.
+        assert!(!ops_runbook_pass("## Checklist\n[x] deploy", &[]));
+        assert!(!ops_runbook_pass("Some prose with rollback mentioned", &[]));
+    }
+
+    #[test]
+    fn ops_tier_explicit_required_section_must_be_present() {
+        // Request explicitly required rollback: a 3/4 runbook that omits
+        // rollback must FAIL even though it would otherwise pass.
+        let rollback_omitted =
+            "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Risk\nImpact low.";
+        let required = vec!["rollback".to_string()];
+        assert!(!ops_runbook_pass(rollback_omitted, &required));
+
+        // Same explicit requirement, but rollback present and risk omitted → pass.
+        let rollback_present =
+            "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Rollback\nRevert deploy.";
+        assert!(ops_runbook_pass(rollback_present, &required));
+    }
+
+    #[test]
+    fn ops_tier_bilingual_japanese_runbook_passes() {
+        // 手順 / 検証 / リスク present (切り戻し omitted), 3/4 → pass.
+        let excerpt = "## 手順\n[x] デプロイ\n## 検証\nヘルスチェック確認。\n## リスク\n影響は小。";
+        assert!(ops_runbook_pass(excerpt, &[]));
+    }
+
+    #[test]
+    fn ops_tier_unknown_required_labels_are_ignored() {
+        // Unknown labels do not raise the bar (DR4-003 fail-safe): a normal 3/4
+        // runbook still passes.
+        let excerpt =
+            "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Risk\nImpact low.";
+        let required = vec!["totally-unknown".to_string(), "checklist".to_string()];
+        assert!(ops_runbook_pass(excerpt, &required));
+    }
+
+    #[test]
+    fn ops_detect_present_sections_counts_correctly() {
+        let excerpt = "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Rollback\nRevert.\n## Risk\nlow.";
+        let present = detect_present_sections(excerpt);
+        assert_eq!(present.count(), 4);
+        assert!(present.contains(OpsSection::Rollback));
+        assert!(present.is_superset_of(OpsSectionSet::CORE));
     }
 }
