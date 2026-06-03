@@ -415,19 +415,31 @@ pub(super) fn verifier_repair_diagnostic_pending_note(
     context: &RepairJob,
     behavior_projection: Option<&BehaviorContractProjection>,
 ) -> String {
+    // PR #930 review (High-2): hint paths are LLM/request-derived and are rendered
+    // straight into the LLM request body (a path that does NOT pass through
+    // `mask_payload_inplace`). Route every rendered hint path through the same
+    // SSOT mask+cap that `obligation_report_label` uses, so a secret embedded in a
+    // hint path/criterion cannot leak into the recovery prompt.
+    let render_hint = |hint: &super::task_contract::RecoveryTargetHint| {
+        format!(
+            "{} ({})",
+            super::task_contract::mask_and_cap_recovery_field(&hint.path),
+            hint.role.label()
+        )
+    };
     let failure_location = context
         .target_hint
         .as_ref()
-        .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
+        .map(&render_hint)
         .unwrap_or_else(|| "<unknown>".to_string());
     let repair_target = verifier_repair_effective_target_hint(context)
-        .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
+        .map(&render_hint)
         .unwrap_or_else(|| "<unknown>".to_string());
     let changed = context
         .changed_file_hints
         .iter()
         .take(8)
-        .map(|hint| format!("{} ({})", hint.path, hint.role.label()))
+        .map(&render_hint)
         .collect::<Vec<_>>()
         .join(", ");
     // Issue #665 (S5-005): system note には raw label / excerpt を載せない。
@@ -1493,13 +1505,22 @@ pub(super) fn validate_verifier_repair_intents(
     target_hint: &super::task_contract::RecoveryTargetHint,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
-    validate_verifier_repair_intents_inner(work_root, context, target_hint, None, intents)
+    // Test-only path: existing tests exercise the Coding repair flow.
+    validate_verifier_repair_intents_inner(
+        work_root,
+        context,
+        target_hint,
+        super::task_contract::TaskKind::Coding,
+        None,
+        intents,
+    )
 }
 
 pub(super) fn validate_verifier_repair_intents_with_accepted_plan(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
+    task_kind: super::task_contract::TaskKind,
     accepted_plan: &super::repair_plan::AcceptedRepairPlan,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
@@ -1507,6 +1528,7 @@ pub(super) fn validate_verifier_repair_intents_with_accepted_plan(
         work_root,
         context,
         target_hint,
+        task_kind,
         Some(accepted_plan),
         intents,
     )
@@ -1668,6 +1690,7 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
     original_contents: &str,
     contents: &str,
     used_whitespace_fallback: bool,
+    task_kind: super::task_contract::TaskKind,
 ) -> Result<(), ValidationFailure> {
     let weakening_detection =
         super::repair_patch_validation::detect_repair_candidate_weakening_patterns(
@@ -1705,6 +1728,7 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
         relative_path,
         contents,
         used_whitespace_fallback,
+        task_kind,
     )
     .map_err(
         super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
@@ -1712,10 +1736,12 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_verifier_repair_intents_inner(
     work_root: &Path,
     context: &super::repair_job::RepairJob,
     target_hint: &super::task_contract::RecoveryTargetHint,
+    task_kind: super::task_contract::TaskKind,
     accepted_plan: Option<&super::repair_plan::AcceptedRepairPlan>,
     intents: Vec<VerifierRepairIntent>,
 ) -> Result<ValidatedVerifierRepairEdit, ValidationFailure> {
@@ -1762,6 +1788,7 @@ pub(super) fn validate_verifier_repair_intents_inner(
         &original_contents,
         &contents,
         used_whitespace_fallback,
+        task_kind,
     )?;
 
     // Issue #662 (Codex CB-001): the duplicate fingerprint check already ran

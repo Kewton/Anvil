@@ -277,10 +277,17 @@ fn handle_verifier_repair_pass_reply(
         .map_err(|message| {
             ValidationFailure::failed_with_signal(message, RepairRejectionSignal::Malformed)
         })?;
+        // Issue #918 / #928 (DR4-001): thread the real task kind so the
+        // ProjectVerifier python3 cheap-check spawn is capability-gated.
+        // `None => Coding` 1:1-preserves the historical always-Coding repair path.
+        let repair_task_kind = super::task_classification::task_contract_authority(agent)
+            .map(|c| c.task_kind)
+            .unwrap_or(super::task_contract::TaskKind::Coding);
         let validation = validate_verifier_repair_intents_with_accepted_plan(
             &agent.work_root,
             &prepared.context,
             target_hint,
+            repair_task_kind,
             &prepared.accepted_plan,
             intents,
         );

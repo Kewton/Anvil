@@ -1075,6 +1075,27 @@ mod inner {
         }
     }
 
+    // PR #930 review (High-2): a secret embedded in a recovery hint path must be
+    // masked in the verifier-repair diagnostic note (rendered into the LLM prompt,
+    // which does NOT pass through mask_payload_inplace). The note's hint-path
+    // rendering must reuse the obligation mask/cap SSOT.
+    #[test]
+    fn verifier_repair_diagnostic_note_masks_secret_in_hint_path() {
+        const SECRET: &str = "AKIASECRETVALUE0123456789";
+        let context = verifier_context_for(&format!("app/token={SECRET}.py"));
+        let note = super::super::verifier_orchestration::verifier_repair_diagnostic_pending_note(
+            &context, None,
+        );
+        assert!(
+            !note.contains(SECRET),
+            "secret leaked into recovery diagnostic note: {note}"
+        );
+        assert!(
+            note.contains("token=***"),
+            "kv secret in hint path should be masked to token=***: {note}"
+        );
+    }
+
     #[test]
     fn verifier_repair_intent_parser_rejects_markup_and_accepts_json() {
         let parsed = parse_verifier_repair_intent_reply(
@@ -2947,6 +2968,7 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
             work_root,
             &context,
             &target,
+            super::super::task_contract::TaskKind::Coding,
             &accepted_plan,
             vec![intent],
         )

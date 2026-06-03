@@ -1281,6 +1281,18 @@ fn mask_and_cap_label(value: &str) -> String {
     }
 }
 
+/// Issue #918 (P1) follow-up (PR #930 review): SSOT mask+cap for any
+/// obligation/hint-derived free-text rendered into a **recovery prompt**.
+///
+/// Recovery notes (verifier-repair / artifact-directed) render `RecoveryTargetHint`
+/// path/reason — which can carry LLM/request-derived text — directly into the LLM
+/// request body, a path that does NOT pass through `mask_payload_inplace`. This is
+/// the same masking + length cap [`obligation_report_label`] applies, exposed so
+/// the recovery-note builders reuse it instead of emitting raw values.
+pub(super) fn mask_and_cap_recovery_field(value: &str) -> String {
+    mask_and_cap_label(value)
+}
+
 fn join_masked_labels(values: &[String]) -> String {
     values
         .iter()
@@ -1303,12 +1315,15 @@ fn obligation_report_label(obligation: &ArtifactObligation) -> String {
         ));
     }
     if !obligation.acceptance_criteria.is_empty() {
-        // Count-cap the criteria at the display projection (never the stored field).
+        // Count-cap the criteria list AND per-value mask+length-cap each entry at
+        // the display projection (never the stored field). PR #930 review (Medium):
+        // each criterion now also gets the MAX_SECTION_LABEL_LEN char cap via
+        // `mask_and_cap_label`, not just `mask_secrets`.
         let shown = obligation
             .acceptance_criteria
             .iter()
             .take(MAX_ACCEPTANCE_CRITERIA)
-            .map(|c| mask_obligation_value(c))
+            .map(|c| mask_and_cap_label(c))
             .collect::<Vec<_>>()
             .join("|");
         parts.push(format!("acceptance_criteria={shown}"));
@@ -4230,6 +4245,29 @@ mod tests {
         assert!(
             !readme_label.contains(SECRET),
             "secret leaked in required_sections label: {readme_label}"
+        );
+    }
+
+    // PR #930 review (Medium): each acceptance_criteria value also gets the
+    // MAX_SECTION_LABEL_LEN char cap at the display projection (not just count).
+    #[test]
+    fn acceptance_criteria_per_value_length_cap_applied_at_display() {
+        let mut ob = DeliverableObligation::file(ArtifactRole::Implementation, "src/main.rs");
+        ob.acceptance_criteria = vec!["x".repeat(1000)];
+        // Stored value untouched.
+        assert_eq!(ob.acceptance_criteria[0].len(), 1000);
+        let label = super::obligation_report_label(&ob);
+        let shown = label
+            .split("acceptance_criteria=")
+            .nth(1)
+            .unwrap()
+            .split(", ")
+            .next()
+            .unwrap();
+        assert!(
+            shown.chars().count() <= super::MAX_SECTION_LABEL_LEN,
+            "criterion display must be capped to MAX_SECTION_LABEL_LEN, got {}",
+            shown.chars().count()
         );
     }
 
