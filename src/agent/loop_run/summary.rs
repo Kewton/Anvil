@@ -65,6 +65,42 @@ impl RunState {
     }
 }
 
+#[allow(dead_code)] // Issue #947: generic terminal vocabulary before every caller migrates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GenericTerminalState {
+    Completed,
+    MissingDeliverable,
+    MissingEvidence,
+    EvidenceFailed,
+    EvidenceBindingFailed,
+    EvidenceRunnerMissing,
+    EvidenceRepairExhausted,
+    EvidenceRepairSafeStop,
+    ControlLoopExhausted,
+    ModelOutputFailure,
+    TransportFailure,
+    Interrupted,
+}
+
+impl GenericTerminalState {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            GenericTerminalState::Completed => "completed",
+            GenericTerminalState::MissingDeliverable => "missing_deliverable",
+            GenericTerminalState::MissingEvidence => "missing_evidence",
+            GenericTerminalState::EvidenceFailed => "evidence_failed",
+            GenericTerminalState::EvidenceBindingFailed => "evidence_binding_failed",
+            GenericTerminalState::EvidenceRunnerMissing => "evidence_runner_missing",
+            GenericTerminalState::EvidenceRepairExhausted => "evidence_repair_exhausted",
+            GenericTerminalState::EvidenceRepairSafeStop => "evidence_repair_safe_stop",
+            GenericTerminalState::ControlLoopExhausted => "control_loop_exhausted",
+            GenericTerminalState::ModelOutputFailure => "model_output_failure",
+            GenericTerminalState::TransportFailure => "transport_failure",
+            GenericTerminalState::Interrupted => "interrupted",
+        }
+    }
+}
+
 #[allow(dead_code)] // Issue #888: additive context; legacy labels remain the serialized default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MissingDeliverable {
@@ -114,6 +150,7 @@ const VALID_VERIFICATION_RESULT_MISSING: &[MissingEvidence] =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RunTerminalOutcome {
     pub(super) state: RunState,
+    pub(super) generic_state: GenericTerminalState,
     pub(super) legacy_label: &'static str,
     pub(super) missing_deliverables: &'static [MissingDeliverable],
     pub(super) missing_evidence: &'static [MissingEvidence],
@@ -124,53 +161,101 @@ impl RunTerminalOutcome {
         match reason {
             ExitReason::Done => Self {
                 state: RunState::Completed,
+                generic_state: GenericTerminalState::Completed,
                 legacy_label: "done",
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: NO_MISSING_EVIDENCE,
             },
             ExitReason::MissingRepoEdits => Self {
                 state: RunState::DeliverableMissing,
+                generic_state: GenericTerminalState::MissingDeliverable,
                 legacy_label: "missing_repo_edits",
                 missing_deliverables: REPOSITORY_CHANGE_MISSING,
                 missing_evidence: NO_MISSING_EVIDENCE,
             },
             ExitReason::MissingVerification => Self {
                 state: RunState::EvidenceMissing,
+                generic_state: GenericTerminalState::MissingEvidence,
                 legacy_label: "missing_verification",
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: VERIFICATION_RESULT_MISSING,
             },
-            ExitReason::VerifierFailed | ExitReason::SafeStopVerifierWeak => Self {
+            ExitReason::VerifierFailed => Self {
                 state: RunState::EvidenceInvalid,
+                generic_state: GenericTerminalState::EvidenceFailed,
                 legacy_label: reason.legacy_label(),
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: VALID_VERIFICATION_RESULT_MISSING,
+            },
+            ExitReason::SafeStopVerifierWeak => Self {
+                state: RunState::EvidenceInvalid,
+                generic_state: GenericTerminalState::EvidenceBindingFailed,
+                legacy_label: "safe_stop_verifier_weak",
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: VALID_VERIFICATION_RESULT_MISSING,
             },
             ExitReason::SafeStopVerifierMissing => Self {
                 state: RunState::EvidenceMissing,
+                generic_state: GenericTerminalState::EvidenceRunnerMissing,
                 legacy_label: "safe_stop_verifier_missing",
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: VERIFICATION_ENVIRONMENT_MISSING,
             },
-            ExitReason::RepairExhausted | ExitReason::RepairSafeStop => Self {
+            ExitReason::RepairExhausted => Self {
                 state: RunState::SafeStopped,
+                generic_state: GenericTerminalState::EvidenceRepairExhausted,
+                legacy_label: "repair_exhausted",
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::RepairSafeStop => Self {
+                state: RunState::SafeStopped,
+                generic_state: GenericTerminalState::EvidenceRepairSafeStop,
+                legacy_label: "repair_safe_stop",
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::MaxIterations | ExitReason::PlanIncomplete => Self {
+                state: RunState::SafeStopped,
+                generic_state: GenericTerminalState::ControlLoopExhausted,
                 legacy_label: reason.legacy_label(),
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: NO_MISSING_EVIDENCE,
             },
-            ExitReason::MaxIterations
-            | ExitReason::EmptyResponses
+            ExitReason::EmptyResponses
             | ExitReason::NoToolCalls
-            | ExitReason::PlanIncomplete
-            | ExitReason::ToolCallFormatError
-            | ExitReason::TransportError
-            | ExitReason::Interrupted => Self {
+            | ExitReason::ToolCallFormatError => Self {
                 state: RunState::SafeStopped,
+                generic_state: GenericTerminalState::ModelOutputFailure,
                 legacy_label: reason.legacy_label(),
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::TransportError => Self {
+                state: RunState::SafeStopped,
+                generic_state: GenericTerminalState::TransportFailure,
+                legacy_label: "transport_error",
+                missing_deliverables: NO_MISSING_DELIVERABLES,
+                missing_evidence: NO_MISSING_EVIDENCE,
+            },
+            ExitReason::Interrupted => Self {
+                state: RunState::SafeStopped,
+                generic_state: GenericTerminalState::Interrupted,
+                legacy_label: "interrupted",
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: NO_MISSING_EVIDENCE,
             },
         }
+    }
+
+    #[allow(dead_code)] // Issue #947: compatibility projection for eval/report migrations.
+    pub(super) fn generic_label(self) -> &'static str {
+        self.generic_state.label()
+    }
+
+    #[allow(dead_code)] // Issue #947: keeps legacy evaluation labels explicit.
+    pub(super) fn legacy_label_for_eval(self) -> &'static str {
+        self.legacy_label
     }
 }
 
@@ -238,6 +323,16 @@ impl ExitReason {
 
     pub(super) fn label(self) -> &'static str {
         RunTerminalOutcome::from_exit_reason(self).legacy_label
+    }
+
+    #[allow(dead_code)] // Issue #947: generic internal terminal vocabulary.
+    pub(super) fn generic_terminal_state(self) -> GenericTerminalState {
+        RunTerminalOutcome::from_exit_reason(self).generic_state
+    }
+
+    #[allow(dead_code)] // Issue #947: generic internal terminal vocabulary.
+    pub(super) fn generic_label(self) -> &'static str {
+        self.generic_terminal_state().label()
     }
 
     fn legacy_label(self) -> &'static str {
@@ -471,6 +566,7 @@ mod tests {
     fn run_terminal_outcome_describes_legacy_missing_states_generically() {
         let deliverable = RunTerminalOutcome::from_exit_reason(ExitReason::MissingRepoEdits);
         assert_eq!(deliverable.legacy_label, "missing_repo_edits");
+        assert_eq!(deliverable.generic_label(), "missing_deliverable");
         assert_eq!(deliverable.state, RunState::DeliverableMissing);
         assert_eq!(
             deliverable
@@ -484,6 +580,7 @@ mod tests {
 
         let evidence = RunTerminalOutcome::from_exit_reason(ExitReason::MissingVerification);
         assert_eq!(evidence.legacy_label, "missing_verification");
+        assert_eq!(evidence.generic_label(), "missing_evidence");
         assert_eq!(evidence.state, RunState::EvidenceMissing);
         assert!(evidence.missing_deliverables.is_empty());
         assert_eq!(
@@ -494,6 +591,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["verification_result"]
         );
+    }
+
+    #[test]
+    fn terminal_outcome_projects_generic_states_and_legacy_eval_labels() {
+        let cases = [
+            (
+                ExitReason::MissingRepoEdits,
+                GenericTerminalState::MissingDeliverable,
+                "missing_deliverable",
+                "missing_repo_edits",
+            ),
+            (
+                ExitReason::MissingVerification,
+                GenericTerminalState::MissingEvidence,
+                "missing_evidence",
+                "missing_verification",
+            ),
+            (
+                ExitReason::SafeStopVerifierMissing,
+                GenericTerminalState::EvidenceRunnerMissing,
+                "evidence_runner_missing",
+                "safe_stop_verifier_missing",
+            ),
+            (
+                ExitReason::SafeStopVerifierWeak,
+                GenericTerminalState::EvidenceBindingFailed,
+                "evidence_binding_failed",
+                "safe_stop_verifier_weak",
+            ),
+            (
+                ExitReason::RepairExhausted,
+                GenericTerminalState::EvidenceRepairExhausted,
+                "evidence_repair_exhausted",
+                "repair_exhausted",
+            ),
+            (
+                ExitReason::RepairSafeStop,
+                GenericTerminalState::EvidenceRepairSafeStop,
+                "evidence_repair_safe_stop",
+                "repair_safe_stop",
+            ),
+        ];
+
+        for (reason, generic_state, generic_label, legacy_label) in cases {
+            let outcome = RunTerminalOutcome::from_exit_reason(reason);
+            assert_eq!(outcome.generic_state, generic_state, "reason={reason:?}");
+            assert_eq!(outcome.generic_label(), generic_label, "reason={reason:?}");
+            assert_eq!(
+                outcome.legacy_label_for_eval(),
+                legacy_label,
+                "reason={reason:?}"
+            );
+            assert_eq!(reason.generic_terminal_state(), generic_state);
+            assert_eq!(reason.generic_label(), generic_label);
+            assert_eq!(reason.label(), legacy_label);
+        }
     }
 
     #[test]
