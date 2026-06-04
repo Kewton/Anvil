@@ -217,11 +217,19 @@ pub(super) fn focused_edit_tool_policy_error(
     work_root: &Path,
     target_already_read: bool,
 ) -> Option<String> {
-    let path_display = target
-        .strip_prefix(work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
+    // Issue #931 (Choke C): this error string is retained in `unresolved_errors`
+    // and rendered verbatim into a model-facing system note by
+    // `focused_edit_policy_violation_feedback_note`, a path that does NOT pass
+    // through `mask_payload_inplace`. Mask the path token at the render point so a
+    // secret-shaped path cannot leak; `mask_secrets` is a no-op on ordinary paths
+    // so the instruction sentence stays byte-identical for actionable targets.
+    let path_display = super::task_contract::mask_and_cap_recovery_field(
+        &target
+            .strip_prefix(work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     let path_matches = arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
@@ -301,13 +309,20 @@ pub(super) fn effective_tool_policy_error_for_call_with_scope(
         // string and the BashOutOfPolicy branch would be unreachable.
         if policy.reason() == EffectiveToolPolicyReason::ArtifactDirectedRecovery && name == "Bash"
         {
+            // Issue #931 (Choke C, CB-001): this rejection string is retained in
+            // `unresolved_errors` and surfaced to the model as a tool result, so
+            // mask the path token at the render point (symmetric with the other
+            // policy-error producers and the masked filter target so the follow-up
+            // policy-violation note still fires). No-op on ordinary paths.
             let target_display = policy_target_path(policy)
                 .map(|target| {
-                    target
-                        .strip_prefix(work_root)
-                        .unwrap_or(target)
-                        .to_string_lossy()
-                        .replace('\\', "/")
+                    super::task_contract::mask_and_cap_recovery_field(
+                        &target
+                            .strip_prefix(work_root)
+                            .unwrap_or(target)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    )
                 })
                 .unwrap_or_else(|| "the active target".to_string());
             return Some(format!(
@@ -408,11 +423,16 @@ pub(super) fn artifact_directed_tool_policy_error(
     }
 
     let rejected_tool = compact_tool_name_for_policy_feedback(name);
-    let path_display = target
-        .strip_prefix(work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
+    // Issue #931 (Choke C): mask the path token at the render point — this string
+    // reaches a model-facing system note via `unresolved_errors` →
+    // `focused_edit_policy_violation_feedback_note`. No-op on ordinary paths.
+    let path_display = super::task_contract::mask_and_cap_recovery_field(
+        &target
+            .strip_prefix(work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     Some(format!(
         "artifact-directed recovery rejected {rejected_tool}; only allows Read, Write, or Edit on {path_display}"
     ))
@@ -470,11 +490,16 @@ fn restricted_tool_policy_error(
         policy.reason().as_str()
     );
     if let Some(target) = policy_target_path(policy) {
-        let path_display = target
-            .strip_prefix(work_root)
-            .unwrap_or(target)
-            .to_string_lossy()
-            .replace('\\', "/");
+        // Issue #931 (Choke C): mask the path token at the render point — this
+        // string can reach a model-facing system note via `unresolved_errors`.
+        // No-op on ordinary paths, so byte-identical for actionable targets.
+        let path_display = super::task_contract::mask_and_cap_recovery_field(
+            &target
+                .strip_prefix(work_root)
+                .unwrap_or(target)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
         message.push_str("; target: ");
         message.push_str(&path_display);
     }
