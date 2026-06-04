@@ -304,3 +304,163 @@ fn output_looking_input_reference_is_not_an_output_target() {
         );
     }
 }
+
+// ===========================================================================
+// Issue #937: robust output-context detection — research surface pins.
+// ===========================================================================
+
+/// R1 (filename pollution, BOTH research entry paths). Same form as the green
+/// baseline `Compare findings in report.md and summary.md` (Research, empty) but
+/// with a filename whose stem embeds an output verb substring (`generated`).
+/// Today the global `has_output_verb` scan (path A) and `output_verb &&
+/// report_noun` (path B) both fire on the file NAME. After masking, neither does.
+/// (`draft_report.md` would route to Authoring — out of scope §9 — so a
+/// non-authoring output-verb stem is used to genuinely reach the research surface.)
+#[test]
+fn r1_filename_substring_pollution_creates_no_obligation() {
+    for request in [
+        "Compare findings in generated_report.md and summary.md",
+        "Compare the trade-offs in export_summary.md and notes.md",
+    ] {
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Research, "{request:?}");
+        assert!(
+            contract.required_artifacts.is_empty(),
+            "a filename-internal verb substring must not fabricate an obligation: {request:?} got {:?}",
+            contract.required_artifacts
+        );
+        assert!(
+            !report_intended_research(request),
+            "filename pollution must not flip report-intended: {request:?}"
+        );
+    }
+}
+
+/// R5 (multi-path attribution). `...source_report.md and produce findings.md`:
+/// only `findings.md` (prev_word = `produce`) is the output target; the neutral
+/// input reference `source_report.md` must NOT absorb the downstream verb. Both
+/// `.md` identities remain (research has no docs source prune); the assertion is
+/// on the *bridge path* — it must be `findings.md`, not `source_report.md`.
+#[test]
+fn r5_multi_path_attribution_picks_the_directed_output() {
+    let request = "Investigate the notes in source_report.md and produce findings.md";
+    let contract = TaskContract::from_request(request);
+    assert_eq!(contract.task_kind, TaskKind::Research);
+    assert!(report_intended_research(request));
+    // The research report bridge obligation must target the directed output.
+    let usage_docs: Vec<&str> = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|o| o.role == ArtifactRole::UsageDocs)
+        .map(|o| o.path.as_str())
+        .collect();
+    assert!(
+        usage_docs.contains(&"findings.md"),
+        "the directed output `findings.md` must be a UsageDocs obligation: {usage_docs:?}"
+    );
+    // Exactly one of the two paths carries the research-report (ResearchNotes)
+    // bridge schema, and it must be `findings.md`.
+    let bridged: Vec<&str> = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|o| o.role == ArtifactRole::UsageDocs)
+        .filter(|o| matches!(o.schema, Some(DeliverableSchema::RequiredSections(_))))
+        .map(|o| o.path.as_str())
+        .collect();
+    assert_eq!(
+        bridged,
+        vec!["findings.md"],
+        "the research report bridge must target `findings.md`, not the input `source_report.md`"
+    );
+}
+
+/// R5-JP (Issue #937 CB-001, JP multi-path attribution). The JP analogue of R5:
+/// `source_report.mdを読んで findings.md に出力する` reads `source_report.md` and
+/// directs output at `findings.md` (the `に出力` cue is in the after-window of
+/// `findings.md`). Before the CB-001 fix the whole-request JP scan let the later
+/// `出力` leak backward onto the earlier neutral input `source_report.md`, so the
+/// `.find()` bridge mis-targeted the input path. Now the JP markers are checked
+/// only in the directional after-window, so the bridge must target `findings.md`.
+#[test]
+fn r5_jp_multi_path_attribution_picks_the_directed_output() {
+    let request = "source_report.mdを読んで findings.md に出力する";
+    let contract = TaskContract::from_request(request);
+    assert_eq!(contract.task_kind, TaskKind::Research);
+    assert!(report_intended_research(request));
+    // Both `.md` identities remain (research has no docs source prune).
+    let usage_docs: Vec<&str> = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|o| o.role == ArtifactRole::UsageDocs)
+        .map(|o| o.path.as_str())
+        .collect();
+    assert!(
+        usage_docs.contains(&"findings.md"),
+        "the directed output `findings.md` must be a UsageDocs obligation: {usage_docs:?}"
+    );
+    // Exactly one path carries the research-report (RequiredSections) bridge
+    // schema, and it must be the directed output `findings.md`, not the input
+    // `source_report.md` (the misattribution CB-001 fixes).
+    let bridged: Vec<&str> = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|o| o.role == ArtifactRole::UsageDocs)
+        .filter(|o| matches!(o.schema, Some(DeliverableSchema::RequiredSections(_))))
+        .map(|o| o.path.as_str())
+        .collect();
+    assert_eq!(
+        bridged,
+        vec!["findings.md"],
+        "the JP research report bridge must target `findings.md`, not the input `source_report.md`"
+    );
+}
+
+/// N6 (no-path research): `Research local LLM options and draft a report` →
+/// UsageDocs obligation, fallback path `report.md`, `report_intended==true`. The
+/// masked whole-request mode-2 scan keeps `draft`/`report` (real words, no path).
+#[test]
+fn n6_no_path_research_draft_a_report_still_obligated() {
+    let request = "Research local LLM options and draft a report";
+    let contract = TaskContract::from_request(request);
+    assert_eq!(contract.task_kind, TaskKind::Research);
+    assert!(report_intended_research(request));
+    let report = contract
+        .required_artifact_identities
+        .iter()
+        .find(|o| o.role == ArtifactRole::UsageDocs)
+        .expect("no-path research must still create a UsageDocs report obligation");
+    assert_eq!(report.path, "report.md", "fallback path must be report.md");
+}
+
+/// N1 (genuine EN output) non-regression after the only-loosens verb change.
+#[test]
+fn n1_genuine_en_output_obligated() {
+    let request = "Investigate the options and produce a report in report.md";
+    let contract = TaskContract::from_request(request);
+    assert_eq!(contract.task_kind, TaskKind::Research);
+    assert!(
+        contract
+            .required_artifacts
+            .contains(&ArtifactRole::UsageDocs),
+        "genuine EN output must keep its UsageDocs obligation"
+    );
+}
+
+/// N10 (only-loosens guard): widening the research output verb to a stem +
+/// plural matcher must not break any existing no-obligation pin. A plural-verb
+/// COMPARISON (no path directed at it) stays obligation-free.
+#[test]
+fn n10_only_loosens_does_not_break_no_obligation_pins() {
+    // `generates`/`creates` now match the stem; an input-reference comparison
+    // (output-looking file read/compared, no directed output) stays empty.
+    for request in [
+        "Compare report.md and summary.md",
+        "Compare findings in report.md and summary.md",
+    ] {
+        let contract = TaskContract::from_request(request);
+        assert!(
+            contract.required_artifacts.is_empty(),
+            "no-obligation comparison pin must stay empty: {request:?}"
+        );
+    }
+}

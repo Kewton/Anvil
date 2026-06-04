@@ -1641,12 +1641,17 @@ impl From<CompletionDecision> for ArtifactRecoveryAction {
 impl TaskContract {
     pub(super) fn from_request(request: &str) -> Self {
         let lower = request.to_ascii_lowercase();
+        // Issue #937 (DS3-001): the output-context mask is allocated exactly ONCE
+        // per request and threaded by reference into every output-context surface
+        // (research / data / docs / default-DataOutput inference). Transient,
+        // judgement-only, never stored.
+        let scan = OutputContextScan::new(request);
         let project_intent = ProjectIntent::from_request(request);
         let mut intent = project_intent.intent;
         let asks_for_tests = request_asks_for_test_artifact(request, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
         let asks_for_setup = request_asks_for_setup(request, &lower);
-        let asks_for_data_output = request_asks_for_data_output_artifact(request, &lower);
+        let asks_for_data_output = request_asks_for_data_output_artifact_with_scan(&scan, request);
         let TaskKindInference {
             kind: task_kind,
             matched: task_kind_matched,
@@ -1714,15 +1719,16 @@ impl TaskContract {
         // `assess_research_report` and gates completion (instead of completing
         // answer-only or trivially). Added to `required` BEFORE the `retain`
         // below so any explicit report path obligation survives (DR3-002).
-        let research_report_intended =
-            task_kind == TaskKind::Research && research_report_artifact_intended(request, &lower);
+        let research_report_intended = task_kind == TaskKind::Research
+            && research_report_artifact_intended_with_scan(&scan, request);
         if research_report_intended {
             required.push(ArtifactRole::UsageDocs);
         }
 
         optional.sort();
         optional.dedup();
-        let mut required_artifact_identities = explicit_artifact_obligations_from_request(request);
+        let mut required_artifact_identities =
+            explicit_artifact_obligations_from_request_with_scan(&scan, request);
         if asks_for_data_output
             && required_artifact_identities
                 .iter()
@@ -1754,13 +1760,13 @@ impl TaskContract {
         // (S7-002) + `ResearchNotes` kind + research sections; path is admitted.
         if research_report_intended {
             let sections = required_research_sections_from_request(request);
-            let path = research_report_path_from_request(request);
+            let path = research_report_path_from_request_with_scan(&scan, request);
             push_or_merge_artifact_obligation(
                 &mut required_artifact_identities,
                 ArtifactObligation::research_report(path, sections),
             );
         }
-        for identity in inferred_data_obligations_from_request(request, &lower) {
+        for identity in inferred_data_obligations_from_request_with_scan(&scan, request) {
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
@@ -2520,6 +2526,171 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
     sections
 }
 
+// ============================================================================
+// === Issue #937: output-context detection SSOT ===
+//
+// Output-context judgement (does a request create a UsageDocs/DataOutput
+// obligation?) used to be pure substring matching over the WHOLE request,
+// filenames included, so a filename token (`draft_report.md`, `output_data.csv`)
+// fabricated false obligations. This block consolidates the shared primitives:
+//
+//   1. `split_path_tokens`  — the single tokenizer SSOT (path-char split + byte
+//      offsets). `mask_path_tokens` and the path extractors share it so the
+//      split boundary cannot drift (DS1-006).
+//   2. `mask_path_tokens`   — blank recognized-extension path tokens to EQUAL
+//      length spaces (index-preserving), so verb/noun scans run over a
+//      filename-stripped string without a filename leaking a false cue.
+//   3. cue-vocabulary `const`s — per-domain cue sets stay parameterized; only
+//      the vocabulary + boundary matcher + masking are shared. Each surface
+//      keeps its OWN aggregation (any/every) and polarity (ADD/DROP).
+//   4. `OutputContextScan { lower, lower_masked }` — built once per
+//      `from_request` and threaded by `&str` (DS3-001, no O(N²) re-masking).
+//
+// The masked string is a TRANSIENT local: never stored on the contract, logged,
+// or persisted (§5 Security). Obligation paths still go through
+// `normalize_explicit_user_artifact_path` / `validated_obligation_path`.
+// ============================================================================
+
+/// Issue #937 (DS1-006): the single tokenizer SSOT. Splits on any character that
+/// is NOT a path-construction char (`[alnum _ - . / \]`) and yields each token's
+/// byte offset in `s`. Both `mask_path_tokens` and the path extractors share
+/// this so the split boundary can never drift between mask and extraction.
+fn split_path_tokens(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    s.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\')))
+        .scan(0usize, move |cursor, token| {
+            // Reconstruct the byte offset: tokens come back in order, and the
+            // delimiters between them are single non-path chars. `find` from the
+            // cursor recovers the precise start (tokens may repeat).
+            let start = if token.is_empty() {
+                *cursor
+            } else {
+                // SAFETY of indices: token is a sub-slice produced by split, so a
+                // forward `find` from the cursor lands on this exact occurrence.
+                let rel = s[*cursor..].find(token).map(|r| *cursor + r);
+                let start = rel.unwrap_or(*cursor);
+                *cursor = start + token.len();
+                start
+            };
+            Some((start, token))
+        })
+}
+
+/// Issue #937 (DS1-005 案A): is `token` a recognized artifact path? Mask + extraction
+/// share this exact predicate so the "what is a path" set cannot drift. A token
+/// counts when it normalizes to an explicit artifact path (recognized-extension
+/// allowlist, identical to `normalize_explicit_artifact_path`) OR contains a
+/// path separator. The trailing-`.` run is trimmed before the extension test so a
+/// sentence-final `output_data.csv.` still recognizes (M6).
+fn path_token_is_maskable(token: &str) -> bool {
+    let trimmed = token.trim_end_matches('.');
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return true;
+    }
+    normalize_explicit_artifact_path(trimmed).is_some()
+}
+
+/// Issue #937 (DS1-005 / 判断#1): blank every recognized path token to an
+/// EQUAL-LENGTH run of spaces, preserving every byte index so callers can locate
+/// occurrences via the original `lower` and read context windows on the masked
+/// copy. Non-path tokens (real verbs/nouns, `v1.2.3`, `3.14`, `e.g`, JP) are kept
+/// verbatim — only authentic path tokens are erased (no over-masking). The
+/// masked string is judgement-only and never persisted.
+fn mask_path_tokens(lower: &str) -> String {
+    // Collect the byte spans of maskable path tokens; every such span is
+    // ASCII-only (alnum/_-./\\), so blanking each byte to a space is index- and
+    // UTF-8-stable. No `unsafe`: rebuild the string byte-wise, substituting
+    // spaces inside a span and copying every other byte verbatim.
+    let spans: Vec<(usize, usize)> = split_path_tokens(lower)
+        .filter(|(_, token)| path_token_is_maskable(token))
+        .map(|(start, token)| (start, start + token.len()))
+        .collect();
+    if spans.is_empty() {
+        return lower.to_string();
+    }
+    let bytes = lower.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut span_iter = spans.iter().peekable();
+    for (idx, &b) in bytes.iter().enumerate() {
+        while span_iter.peek().is_some_and(|(_, end)| idx >= *end) {
+            span_iter.next();
+        }
+        let in_span = span_iter
+            .peek()
+            .is_some_and(|(start, end)| idx >= *start && idx < *end);
+        out.push(if in_span { b' ' } else { b });
+    }
+    // SAFETY-free: spans cover ASCII path chars only, so the length and all
+    // char boundaries are preserved; the result is valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| lower.to_string())
+}
+
+// --- shared cue vocabulary (SSOT) -----------------------------------------
+// ASCII verb STEMS only; the matcher (`contains_output_verb`) absorbs an
+// optional trailing plural `s`. JP markers are substring (no word boundary).
+const OUTPUT_VERB_STEMS_ASCII: &[&str] = &[
+    "write", "produce", "generate", "create", "export", "save", "output", "compile", "draft",
+    "prepare", "emit",
+];
+const OUTPUT_PREP_ASCII: &[&str] = &["to", "into"];
+const OUTPUT_AFTER_ASCII: &[&str] = &[" output", " deliverable", " artifact"];
+const INPUT_VERBS_ASCII: &[&str] = &["input", "source", "from", "read", "reads", "load", "loads"];
+/// Shared JP output markers (substring). **bare `書` is intentionally excluded**
+/// (DS1-003): it lives only in research's `RESEARCH_OUTPUT_AFTER_JP` so `文書`
+/// (document) never fabricates a data output cue.
+const JP_OUTPUT_MARKERS: &[&str] = &["生成", "出力", "作成", "書き出", "まとめ"];
+/// `mentions_output_shape` noun part only (DS1-002/004); verbs are NOT replaced.
+const DATA_SHAPE_NOUNS: &[&str] = &["schema", "column", "columns", "出力", "列"];
+/// research-only **directional after-window** JP output markers (DS1-001). Bare
+/// `書` is isolated here (DS1-003) and substring-covers `書き出`/`書いて`. Issue
+/// #937 CB-001: this is the directional after-window set — it is **no longer
+/// byte-identical** to the pre-#937 `:2654` whole-request set `[作成,出力,書き出,
+/// まとめ,書いて]`, by design. The whole-request JP scan (which leaked a later
+/// `出力`/`作成` backward onto an earlier neutral input path) was removed from
+/// `report_path_in_output_context_with_scan`; its `作成` capability was folded
+/// into this after-window so the full original JP output vocabulary is preserved
+/// directionally (the rest — `出力`/`まとめ`/`書き出`/`書いて` — was already here).
+const RESEARCH_OUTPUT_AFTER_JP: &[&str] = &["まとめ", "出力", "書", "作成"];
+/// data-only extra input cues, appended to `INPUT_VERBS_ASCII`.
+const DATA_INPUT_EXTRA: &[&str] = &["sample", "example", "fixture", "ingest"];
+/// docs-only output after-window JP markers (判断#5, polarity-preserving).
+const DOCS_OUTPUT_AFTER_JP: &[&str] = &["に書いて", "に出力", "として保存"];
+
+/// Issue #937 (DS1-002): match an ASCII output verb STEM at a word boundary,
+/// absorbing an optional trailing plural `s` (so `generates`/`writes` match the
+/// `generate`/`write` stem). Runs over filename-stripped text supplied by caller.
+fn contains_output_verb(text: &str, stems: &[&str]) -> bool {
+    stems.iter().any(|stem| {
+        contains_ascii_token(text, stem) || {
+            let mut plural = String::with_capacity(stem.len() + 1);
+            plural.push_str(stem);
+            plural.push('s');
+            contains_ascii_token(text, &plural)
+        }
+    })
+}
+
+/// Issue #937 (DS3-001): the per-`from_request` output-context scan. Built once;
+/// threaded by `&str` into every surface so the (expensive) mask allocation
+/// happens exactly once per top-level request. Stack-only, never stored.
+struct OutputContextScan {
+    lower: String,
+    lower_masked: String,
+}
+
+impl OutputContextScan {
+    fn new(request: &str) -> Self {
+        let lower = request.to_ascii_lowercase();
+        let lower_masked = mask_path_tokens(&lower);
+        Self {
+            lower,
+            lower_masked,
+        }
+    }
+}
+
 /// Issue #922 (P5 / DD4 / PR-003): a research request *intends a written report
 /// artifact* (vs. a genuine answer-only Q&A) when EITHER (a) a doc-like path is
 /// used as an output target (output verb / preposition directing content to it,
@@ -2527,7 +2698,20 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
 /// report noun. Conservative on purpose: "summarize this for me" and a bare
 /// input reference like "summarize notes.txt for me" stay answer-only and are
 /// NOT routed into a file-edit obligation (regression guard / S7-001 / PR-003).
+#[cfg(test)]
 fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
+    let scan = OutputContextScan::new(request);
+    debug_assert_eq!(scan.lower, lower, "scan.lower must equal request lowercase");
+    research_report_artifact_intended_with_scan(&scan, request)
+}
+
+/// Issue #937 (mode 2, DS3-001): the no-path research entry path scanned over the
+/// **filename-stripped** request. A filename-internal substring (`draft` inside
+/// `draft_report.md`, `report` inside `output_report.md`) is masked, so the
+/// `output_verb && report_noun` co-occurrence can no longer be satisfied by a
+/// file NAME. A genuine no-path request (`Research ... and draft a report`,
+/// where `draft`/`report` are real words) is unmasked and still fires.
+fn research_report_artifact_intended_with_scan(scan: &OutputContextScan, request: &str) -> bool {
     // Issue #922 (PR2-001): an explicit "do not edit / read-only" instruction
     // must never be turned into a file-edit report obligation, even if the
     // request also asks for a "report". Fail closed → stays answer-only, and the
@@ -2536,16 +2720,16 @@ fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
     if crate::modes::plan_act::request_has_explicit_no_edit(request) {
         return false;
     }
-    if research_report_output_path_from_request(request).is_some() {
+    if research_report_output_path_from_request_with_scan(scan, request).is_some() {
         return true;
     }
-    let output_verb = contains_any(
-        lower,
-        &[
-            "write", "produce", "generate", "create", "compile", "draft", "prepare",
-        ],
-    ) || contains_any(request, &["作成", "まとめ", "書いて", "出力"]);
-    let report_noun = contains_any(lower, &["report", "write-up", "writeup"])
+    // Issue #937 (jud断#2 only-loosens): evaluate over the masked text so a
+    // filename can never supply the verb/noun; the verb scan also gains the
+    // plural matcher (`generates`/`creates`) which is strictly more correct.
+    let masked = scan.lower_masked.as_str();
+    let output_verb = contains_output_verb(masked, OUTPUT_VERB_STEMS_ASCII)
+        || contains_any(request, &["作成", "まとめ", "書いて", "出力"]);
+    let report_noun = contains_any(masked, &["report", "write-up", "writeup"])
         || contains_any(request, &["レポート", "報告書"]);
     output_verb && report_noun
 }
@@ -2557,47 +2741,41 @@ fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
 /// `summary.md`): "Compare report.md and summary.md" and "Review findings.md"
 /// are answer-only and must NOT create an obligation. Mirrors
 /// `data_path_has_output_context`.
+#[cfg(test)]
 fn report_path_in_output_context(request: &str, path: &str) -> bool {
-    let lower = request.to_ascii_lowercase();
+    let scan = OutputContextScan::new(request);
+    report_path_in_output_context_with_scan(&scan, path)
+}
+
+/// Issue #937 (mode 1, DS1-001 / DS2-003): per-occurrence **directional** output
+/// detection. The immediate prev_word input/output guards keep their fast
+/// decisions; the former *global* `has_output_verb` neutral-preposition fallback
+/// is replaced by a **masked, bounded (≤48B) before-window** ASCII output
+/// verb/prep scan, so a filename anywhere in the request (and any adjacent path)
+/// can no longer attribute output intent to a neutral input reference. The
+/// after-window carries JP markers + `OUTPUT_AFTER_ASCII` nouns ONLY — never an
+/// ASCII output VERB — so `...source_report.md and produce findings.md` cannot
+/// leak `produce` backward onto `source_report.md` (R5). Issue #937 CB-001: the
+/// JP markers are likewise after-window-only, so the function reads exclusively
+/// from `scan` (masked + lower) and no longer needs the raw `request`.
+fn report_path_in_output_context_with_scan(scan: &OutputContextScan, path: &str) -> bool {
+    let lower = scan.lower.as_str();
+    let masked = scan.lower_masked.as_str();
     let path_lower = path.to_ascii_lowercase();
-    // An explicit output verb anywhere in the request signals intent to write
-    // content (vs. read/compare an existing file). Required for the neutral
-    // preposition case so an output-looking file NAME alone never suffices.
-    let has_output_verb =
-        contains_any(
-            &lower,
-            &[
-                "write",
-                "writes",
-                "produce",
-                "produces",
-                "generate",
-                "generates",
-                "create",
-                "creates",
-                "export",
-                "exports",
-                "save",
-                "saves",
-                "output",
-                "compile",
-                "draft",
-                "prepare",
-                "emit",
-                "emits",
-            ],
-        ) || contains_any(request, &["作成", "出力", "書き出", "まとめ", "書いて"]);
     lower.match_indices(&path_lower).any(|(idx, _)| {
         // Token-boundary aware: the WORD immediately before the path (so
-        // "investigate" never matches the preposition "in").
-        let prev_word = lower[..idx]
+        // "investigate" never matches the preposition "in"). Read from masked so
+        // an adjacent path token can never be mistaken for a prev_word verb.
+        let prev_word = masked[..idx]
             .rsplit(|ch: char| !ch.is_ascii_alphanumeric())
             .find(|word| !word.is_empty())
             .unwrap_or("");
-        let after = bounded_context_after(&lower, idx + path_lower.len(), 24);
+        let after_idx = idx + path_lower.len();
+        let after = bounded_context_after(masked, after_idx, 24);
 
         // Explicit input / read / comparison position wins — the path is being
         // read or compared, not written — even for an output-looking name.
+        // (`RESEARCH_INPUT_PREVWORD`, incl. the `and/or/vs/between` guard.)
         if matches!(
             prev_word,
             "input"
@@ -2605,6 +2783,8 @@ fn report_path_in_output_context(request: &str, path: &str) -> bool {
                 | "from"
                 | "read"
                 | "reads"
+                | "load"
+                | "loads"
                 | "of"
                 | "summarize"
                 | "summarise"
@@ -2648,16 +2828,33 @@ fn report_path_in_output_context(request: &str, path: &str) -> bool {
             return true;
         }
 
-        // Neutral preposition (e.g. "in"): require an explicit output verb in
-        // the request, or a trailing Japanese output marker. A bare
-        // output-looking file NAME is NOT sufficient (Codex-High fix).
-        has_output_verb || contains_any(after, &["まとめ", "出力", "書"])
+        // Neutral preposition (e.g. "in"): require an output verb/prep in THIS
+        // occurrence's masked before-window (filename-stripped, directional), or
+        // a trailing JP output marker / `OUTPUT_AFTER_ASCII` noun in the LOCAL
+        // after-window. A bare output-looking file NAME (or a verb/marker
+        // elsewhere in the request) is NOT sufficient — the cue must attach to
+        // this path. Issue #937 CB-001: the JP output markers are checked ONLY
+        // in `RESEARCH_OUTPUT_AFTER_JP` (directional after-window), never via a
+        // whole-`request` scan, so a later `出力`/`作成` cannot leak backward onto
+        // an earlier neutral input reference (the JP analogue of the R5 fix).
+        let before = bounded_context_before(masked, idx, 48);
+        contains_output_verb(before, OUTPUT_VERB_STEMS_ASCII)
+            || OUTPUT_PREP_ASCII
+                .iter()
+                .any(|prep| contains_ascii_token(before, prep))
+            || contains_any(after, RESEARCH_OUTPUT_AFTER_JP)
+            || contains_any(after, OUTPUT_AFTER_ASCII)
     })
 }
 
 /// Issue #922 (PR-003 / DD3 / DR4-001): the first doc-like path used as an
 /// output target, admitted via the SSOT `normalize_explicit_user_artifact_path`.
-fn research_report_output_path_from_request(request: &str) -> Option<String> {
+/// Issue #937 (DS3-001): scan-threaded variant — masks once, reuses for every
+/// candidate path so the per-path `.find()` loop never re-masks.
+fn research_report_output_path_from_request_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> Option<String> {
     request
         .split(|ch: char| {
             !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
@@ -2670,14 +2867,15 @@ fn research_report_output_path_from_request(request: &str) -> Option<String> {
                 || lower.ends_with(".rst")
                 || lower.ends_with(".txt")
         })
-        .find(|path| report_path_in_output_context(request, path))
+        .find(|path| report_path_in_output_context_with_scan(scan, path))
 }
 
 /// Issue #922 (P5 / DD3 / DR4-001): the report artifact path for a research
 /// obligation — the output-context path if present, else the `report.md`
 /// default. Never stores a raw/unadmitted path.
-fn research_report_path_from_request(request: &str) -> String {
-    research_report_output_path_from_request(request).unwrap_or_else(|| "report.md".to_string())
+fn research_report_path_from_request_with_scan(scan: &OutputContextScan, request: &str) -> String {
+    research_report_output_path_from_request_with_scan(scan, request)
+        .unwrap_or_else(|| "report.md".to_string())
 }
 
 /// Issue #922 (PR-002 / DR3-004): SSOT for the WorkMode consumption-side hook.
@@ -2918,9 +3116,19 @@ fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
 }
 
 fn explicit_path_with_data_extension(request: &str) -> Option<String> {
+    let scan = OutputContextScan::new(request);
+    explicit_path_with_data_extension_with_scan(&scan, request)
+}
+
+/// Issue #937 (DS3-001): scan-threaded — the per-path `.find()` reuses the single
+/// mask instead of re-masking per candidate.
+fn explicit_path_with_data_extension_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> Option<String> {
     explicit_data_paths_from_request(request)
         .into_iter()
-        .find(|path| data_path_has_output_context(request, path))
+        .find(|path| data_path_has_output_context_with_scan(scan, path))
 }
 
 fn infer_intent(request: &str, lower: &str) -> TaskIntent {
@@ -3639,14 +3847,23 @@ pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
             .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
 }
 
-fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
-    let mentions_output_shape = contains_any(
-        lower,
-        &[
-            "output", "export", "generate", "produce", "write", "schema", "column", "columns",
-            "出力", "列",
-        ],
-    );
+/// Issue #937 (判断#6, DS3-001): the default/standalone DataOutput gate, evaluated
+/// over the **masked** request. `mentions_output_shape` (output VERB OR shape
+/// NOUN) and `output_action` no longer count a filename token (`output_data.csv`
+/// → `output`); a true shape noun (`columns`) still counts. `What columns are in
+/// output_data.csv, a CSV file?` therefore reaches `output_action=false`
+/// (masked) → no default `output.csv` (R4), while `Generate a CSV file with
+/// columns id and total` keeps `generate` (real verb) → default `output.csv`.
+fn request_asks_for_data_output_artifact_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> bool {
+    let lower = scan.lower.as_str();
+    let masked = scan.lower_masked.as_str();
+    // mentions_output_shape = output VERB (boundary, masked) OR shape NOUN
+    // (masked; `columns`/`列` survive masking). Verbs are NOT dropped (DS2-002).
+    let mentions_output_shape = contains_output_verb(masked, OUTPUT_VERB_STEMS_ASCII)
+        || contains_any(masked, DATA_SHAPE_NOUNS);
     if !mentions_output_shape {
         return false;
     }
@@ -3666,7 +3883,7 @@ fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
     // already requires `data_path_has_output_context`, so output context is
     // enforced. Kept BEFORE the protected-path guard to preserve the original
     // precedence (an explicit output path wins).
-    if explicit_path_with_data_extension(request).is_some() {
+    if explicit_path_with_data_extension_with_scan(scan, request).is_some() {
         return true;
     }
 
@@ -3677,7 +3894,7 @@ fn request_asks_for_data_output_artifact(request: &str, lower: &str) -> bool {
     if request_mentions_protected_data_artifact_path(request) {
         return false;
     }
-    request_explicitly_requests_standalone_data_artifact(request, lower)
+    request_explicitly_requests_standalone_data_artifact_with_scan(scan, request)
 }
 
 fn default_readme_required_sections() -> Vec<String> {
@@ -3891,11 +4108,16 @@ fn default_ops_runbook_path_from_request(request: &str) -> String {
         .unwrap_or_else(|| "runbook.md".to_string())
 }
 
-fn inferred_data_obligations_from_request(request: &str, lower: &str) -> Vec<ArtifactObligation> {
-    if !request_asks_for_data_output_artifact(request, lower) {
+/// Issue #937 (DS3-001): scan-threaded variant called from `from_request`.
+fn inferred_data_obligations_from_request_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> Vec<ArtifactObligation> {
+    if !request_asks_for_data_output_artifact_with_scan(scan, request) {
         return Vec::new();
     }
-    let explicit_output = explicit_path_with_data_extension(request);
+    let lower = scan.lower.as_str();
+    let explicit_output = explicit_path_with_data_extension_with_scan(scan, request);
     let path = explicit_output.unwrap_or_else(|| {
         if lower.contains("tsv") {
             "output.tsv".to_string()
@@ -3946,6 +4168,16 @@ fn extract_required_columns_from_request(request: &str) -> Vec<String> {
 }
 
 pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<ArtifactObligation> {
+    let scan = OutputContextScan::new(request);
+    explicit_artifact_obligations_from_request_with_scan(&scan, request)
+}
+
+/// Issue #937 (DS3-001): scan-threaded variant. The DataOutput identity gate
+/// reuses the single mask for `data_path_has_output_context` per path candidate.
+fn explicit_artifact_obligations_from_request_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> Vec<ArtifactObligation> {
     let mut obligations = Vec::new();
     for token in request.split(|ch: char| {
         !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
@@ -3958,7 +4190,8 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
         let Some(role) = role_from_repo_edit(category) else {
             continue;
         };
-        if role == ArtifactRole::DataOutput && !data_path_has_output_context(request, &path) {
+        if role == ArtifactRole::DataOutput && !data_path_has_output_context_with_scan(scan, &path)
+        {
             continue;
         }
         if !obligations
@@ -3977,7 +4210,7 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
     // itself a source/input (a real output) is also present. In-place authoring
     // (`rewrite docs/intro.md ...`) keeps its single path; true multi-output
     // (`write intro.md and faq.md`) keeps both (neither is a source).
-    retain_docs_outputs_when_distinct_source(request, &mut obligations);
+    retain_docs_outputs_when_distinct_source(scan, &mut obligations);
     obligations.sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
     obligations
 }
@@ -3994,13 +4227,13 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
 /// invent new output heuristics: an output is simply "any docs path that is not
 /// classified as a source/input".
 fn retain_docs_outputs_when_distinct_source(
-    request: &str,
+    scan: &OutputContextScan,
     obligations: &mut Vec<ArtifactObligation>,
 ) {
     let docs_sources: Vec<String> = obligations
         .iter()
         .filter(|o| o.role == ArtifactRole::UsageDocs)
-        .filter(|o| docs_path_is_clearly_source_input(request, &o.path))
+        .filter(|o| docs_path_is_clearly_source_input_with_scan(scan, &o.path))
         .map(|o| o.path.clone())
         .collect();
     if docs_sources.is_empty() {
@@ -4020,48 +4253,54 @@ fn retain_docs_outputs_when_distinct_source(
 /// in `request` with a clear source/input cue and never with an output cue —
 /// mirroring the `input_context && !output` branch of
 /// [`data_path_has_output_context`], extended for translation/authoring.
+#[cfg(test)]
 fn docs_path_is_clearly_source_input(request: &str, path: &str) -> bool {
-    let lower = request.to_ascii_lowercase();
+    let scan = OutputContextScan::new(request);
+    docs_path_is_clearly_source_input_with_scan(&scan, path)
+}
+
+/// Issue #937 (判断#5, DS3-001): the docs/authoring source discriminator, hardened
+/// for masking + word-boundary + a JP output marker. Polarity is PRESERVED:
+/// `true` = DROP as source, requiring `saw_occurrence && every(source) &&
+/// !any(output)`. The before/after windows run on the **masked** text so an
+/// adjacent path cannot supply a false cue; ASCII verbs are word-boundary
+/// matched; the new `DOCS_OUTPUT_AFTER_JP` after-window (`に書いて`/`に出力`/
+/// `として保存`) lets `...README.mdに書いてください` count `README.md` as an
+/// OUTPUT (so it is kept, not pruned as source) — required to keep the polarity
+/// correct (N8).
+fn docs_path_is_clearly_source_input_with_scan(scan: &OutputContextScan, path: &str) -> bool {
+    let lower = scan.lower.as_str();
+    let masked = scan.lower_masked.as_str();
     let path_lower = path.to_ascii_lowercase();
     let filename_source = docs_path_file_name_looks_like_source(path);
     let mut saw_occurrence = false;
     let mut every_occurrence_is_source = true;
     for (idx, _) in lower.match_indices(&path_lower) {
         saw_occurrence = true;
-        let before = bounded_context_before(&lower, idx, 48);
+        let before = bounded_context_before(masked, idx, 48);
         let after_idx = idx + path_lower.len();
-        let after = bounded_context_after(&lower, after_idx, 32);
-        // Output cues take precedence: if this occurrence is written/saved/into
-        // an output position, it is a deliverable, not a source.
-        let output_context = contains_any(
-            before,
-            &[
-                "output", "write", "writes", "generate", "produce", "export", "save", "create",
-                "emit", "into", " to ",
-            ],
-        ) || contains_any(after, &[" output", " deliverable", " artifact"]);
-        let input_context = contains_any(
-            before,
-            &[
-                "input",
-                "source",
-                "original",
-                "from",
-                "read",
-                "reads",
-                "load",
-                "loads",
-                "translate",
-                "translates",
-                "translating",
-                "translation of",
-                "翻訳",
-                "英訳",
-            ],
-        ) || contains_any(
-            after,
-            &[" as input", " input", " 翻訳", " を英訳", " を翻訳"],
-        );
+        let after = bounded_context_after(masked, after_idx, 32);
+        // Output cues take precedence: a written/saved/into position makes this a
+        // deliverable, not a source. ASCII output verbs/preps (boundary) +
+        // `OUTPUT_AFTER_ASCII` nouns + JP output markers (judgement #5).
+        let output_context = contains_output_verb(before, OUTPUT_VERB_STEMS_ASCII)
+            || OUTPUT_PREP_ASCII
+                .iter()
+                .any(|prep| contains_ascii_token(before, prep))
+            || contains_any(after, OUTPUT_AFTER_ASCII)
+            || contains_any(after, DOCS_OUTPUT_AFTER_JP);
+        let input_context = INPUT_VERBS_ASCII
+            .iter()
+            .any(|cue| contains_ascii_token(before, cue))
+            || contains_ascii_token(before, "original")
+            || contains_ascii_token(before, "translate")
+            || contains_ascii_token(before, "translates")
+            || contains_ascii_token(before, "translating")
+            || contains_any(before, &["translation of", "翻訳", "英訳"])
+            || contains_any(
+                after,
+                &[" as input", " input", " 翻訳", " を英訳", " を翻訳"],
+            );
         let occurrence_is_source = (filename_source || input_context) && !output_context;
         if !occurrence_is_source {
             every_occurrence_is_source = false;
@@ -4300,47 +4539,95 @@ fn path_has_data_extension(path: &str) -> bool {
     matches!(ext.as_str(), "csv" | "json" | "jsonl" | "tsv" | "ndjson")
 }
 
+#[cfg(test)]
 fn data_path_has_output_context(request: &str, path: &str) -> bool {
-    let lower = request.to_ascii_lowercase();
+    let scan = OutputContextScan::new(request);
+    data_path_has_output_context_with_scan(&scan, path)
+}
+
+/// Issue #937 (判断#3, DS3-001): per-occurrence data output detection over the
+/// **masked** request. The `file_output_name` stem look-alike is DEMOTED from an
+/// unconditional override to a mere auxiliary signal: output is now decided by
+/// (a) a masked before-window ASCII output verb/prep (boundary), or (b) an
+/// after-window `JP_OUTPUT_MARKERS` substring, or (c) an `OUTPUT_AFTER_ASCII`
+/// noun. So `Summarize the trends in output_data.csv` (input reference) no longer
+/// fabricates a DataOutput obligation, while `...output.csvを生成してください`
+/// stays an obligation via the JP `生成` after-window marker (#921). The
+/// `input.jsonl` input-filename drop is preserved.
+fn data_path_has_output_context_with_scan(scan: &OutputContextScan, path: &str) -> bool {
+    let masked = scan.lower_masked.as_str();
+    let lower = scan.lower.as_str();
     let path_lower = path.to_ascii_lowercase();
-    let file_output_name = data_path_file_name_looks_like_output(path);
+    let file_input_name = file_data_name_looks_like_input(path);
+    // Issue #937 (判断#3): the output-looking stem (`output_data.csv`) is DEMOTED
+    // from an unconditional override to an AUXILIARY signal — it no longer makes a
+    // bare input reference an output (R3/R4/R6), but it DOES still protect a
+    // genuine output path from a downstream `from ... input` phrase being read as
+    // its input cue (`Generate report output.csv from the input data`). So it
+    // survives ONLY as the input-drop guard, never as a standalone positive.
+    let file_output_name_aux = data_path_stem_looks_like_output(path);
     lower.match_indices(&path_lower).any(|(idx, _)| {
-        let before = bounded_context_before(&lower, idx, 48);
+        let before = bounded_context_before(masked, idx, 48);
         let after_idx = idx + path_lower.len();
-        let after = bounded_context_after(&lower, after_idx, 32);
-        let input_context = file_data_name_looks_like_input(path)
-            || contains_any(
-                before,
-                &[
-                    "input", "source", "sample", "example", "fixture", "from", "read", "reads",
-                    "load", "loads", "ingest",
-                ],
-            )
+        let after = bounded_context_after(masked, after_idx, 32);
+        // Input position (incl. the `input.jsonl` input-filename drop) wins,
+        // unless the filename itself is output-looking (auxiliary guard).
+        let input_context = file_input_name
+            || INPUT_VERBS_ASCII
+                .iter()
+                .chain(DATA_INPUT_EXTRA.iter())
+                .any(|cue| contains_ascii_token(before, cue))
             || contains_any(after, &[" as input", " input", " sample", " example"]);
-        if input_context && !file_output_name {
+        if input_context && !file_output_name_aux {
             return false;
         }
-        file_output_name
-            || contains_any(
-                before,
-                &[
-                    "output", "write", "writes", "generate", "produce", "export", "save", "create",
-                    "emit", "to", "into",
-                ],
-            )
-            || contains_any(after, &[" output", " deliverable", " artifact"])
+        // Output position: masked before-window verb/prep (boundary), after-window
+        // JP markers (substring), or `OUTPUT_AFTER_ASCII` nouns. The output-looking
+        // stem is NOT a standalone positive trigger (判断#3 demotion): a bare input
+        // reference whose file merely *looks* like output stays neutral.
+        contains_output_verb(before, OUTPUT_VERB_STEMS_ASCII)
+            || OUTPUT_PREP_ASCII
+                .iter()
+                .any(|prep| contains_ascii_token(before, prep))
+            || contains_any(after, JP_OUTPUT_MARKERS)
+            || contains_any(after, OUTPUT_AFTER_ASCII)
     })
 }
 
+/// Issue #937 (判断#3): auxiliary "the filename stem looks like an output"
+/// signal, used ONLY to protect a genuine output path from a downstream input
+/// phrase (never as a standalone output trigger). Mirrors the historical
+/// `data_path_file_name_looks_like_output` stems.
+fn data_path_stem_looks_like_output(path: &str) -> bool {
+    data_path_file_stem(path).is_some_and(|stem| {
+        stem.starts_with("output")
+            || stem.starts_with("summary")
+            || stem.starts_with("result")
+            || stem.starts_with("report")
+            || stem.starts_with("export")
+            || stem.starts_with("cleaned")
+    })
+}
+
+#[cfg(test)]
 fn request_explicitly_requests_standalone_data_artifact(request: &str, lower: &str) -> bool {
-    let output_action = contains_any(
-        lower,
-        &[
-            "output", "write", "generate", "produce", "export", "save", "create", "emit",
-        ],
-    ) || contains_any(request, &["出力", "生成", "作成", "書き出"]);
+    let scan = OutputContextScan::new(request);
+    debug_assert_eq!(scan.lower, lower, "scan.lower must equal request lowercase");
+    request_explicitly_requests_standalone_data_artifact_with_scan(&scan, request)
+}
+
+/// Issue #937 (判断#6, DS1-004): `output_action` is the gate that closes R4. It
+/// is evaluated over the **masked** request, so a filename `output_data.csv`
+/// (`output` substring) can no longer satisfy it; a real output verb still does.
+fn request_explicitly_requests_standalone_data_artifact_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> bool {
+    let masked = scan.lower_masked.as_str();
+    let output_action = contains_output_verb(masked, OUTPUT_VERB_STEMS_ASCII)
+        || contains_any(request, &["出力", "生成", "作成", "書き出"]);
     let artifact_noun = contains_any(
-        lower,
+        masked,
         &[
             "csv file",
             "tsv file",
@@ -4363,17 +4650,12 @@ fn request_explicitly_requests_standalone_data_artifact(request: &str, lower: &s
     output_action && artifact_noun
 }
 
-fn data_path_file_name_looks_like_output(path: &str) -> bool {
-    data_path_file_stem(path).is_some_and(|stem| {
-        stem.starts_with("output")
-            || stem.starts_with("summary")
-            || stem.starts_with("result")
-            || stem.starts_with("report")
-            || stem.starts_with("export")
-            || stem.starts_with("cleaned")
-    })
-}
-
+// Issue #937 (判断#3): `data_path_file_name_looks_like_output` was removed — the
+// filename stem look-alike is no longer an output trigger (it used to be an
+// unconditional override that fabricated false DataOutput obligations from an
+// input reference like `Summarize the trends in output_data.csv`). Output is now
+// decided by the masked before/after windows + JP markers. The *input* filename
+// drop (`input.jsonl`) is retained below as a genuine input signal.
 fn file_data_name_looks_like_input(path: &str) -> bool {
     data_path_file_stem(path).is_some_and(|stem| {
         stem.starts_with("input")
@@ -8515,5 +8797,302 @@ mod tests {
             all_evidence.push(CompletionEvidence::ReportCompletenessPass { path: Some(p) });
         }
         assert_eq!(contract.evaluate(&all_evidence), CompletionDecision::Done);
+    }
+
+    // ===================================================================
+    // Issue #937: output-context SSOT primitive unit pins (M1-M7)
+    // ===================================================================
+
+    /// M1: equal-length / index-preserving masking (all cases).
+    #[test]
+    fn mask_path_tokens_preserves_length_m1() {
+        for s in [
+            "compare findings in draft_report.md and summary.md",
+            "idとtotalの列を持つoutput.csvを生成してください",
+            "what columns are in output_data.csv, a csv file?",
+            "generate data/results.jsonl with columns id from input.jsonl",
+            "v1.2.3 and 3.14 and e.g and i.e are not paths",
+            "",
+            "no paths here at all",
+        ] {
+            assert_eq!(
+                mask_path_tokens(s).len(),
+                s.len(),
+                "mask must be byte-length preserving: {s:?}"
+            );
+        }
+    }
+
+    /// M2: JP / non-ASCII content survives verbatim (never masked).
+    #[test]
+    fn mask_path_tokens_keeps_japanese_verbatim_m2() {
+        let masked = mask_path_tokens("idとtotalの列を持つoutput.csvを生成してください");
+        assert!(masked.contains("生成"), "JP verb must survive: {masked:?}");
+        assert!(masked.contains('列'), "JP noun must survive: {masked:?}");
+        // The path token IS blanked.
+        assert!(
+            !masked.contains("output.csv"),
+            "path must be blanked: {masked:?}"
+        );
+    }
+
+    /// M3: multiple path tokens are all blanked in one pass.
+    #[test]
+    fn mask_path_tokens_blanks_all_paths_m3() {
+        let masked = mask_path_tokens("a report.md and b data.csv");
+        assert!(
+            !masked.contains("report.md"),
+            "first path blanked: {masked:?}"
+        );
+        assert!(
+            !masked.contains("data.csv"),
+            "second path blanked: {masked:?}"
+        );
+        // Non-path words stay.
+        assert!(masked.contains(" and "), "connective stays: {masked:?}");
+    }
+
+    /// M4: a filename-internal verb is blanked with the path; a standalone verb
+    /// (not inside a recognized path) stays.
+    #[test]
+    fn mask_path_tokens_filename_internal_vs_standalone_m4() {
+        let masked = mask_path_tokens("draft a report into draft_report.md now");
+        // The standalone `draft` (a real word) survives.
+        assert!(
+            contains_ascii_token(&masked, "draft"),
+            "standalone draft must survive: {masked:?}"
+        );
+        // The filename `draft_report.md` is fully blanked.
+        assert!(
+            !masked.contains("draft_report.md"),
+            "filename blanked: {masked:?}"
+        );
+    }
+
+    /// M5: only recognized-extension / separator path tokens are masked; numeric
+    /// version / abbreviation tokens are NOT.
+    #[test]
+    fn mask_path_tokens_recognized_extension_only_m5() {
+        let masked = mask_path_tokens("v1.2.3 release, see e.g output_data.csv and readme.ja.md");
+        assert!(masked.contains("v1.2.3"), "version verbatim: {masked:?}");
+        assert!(masked.contains("e.g"), "abbreviation verbatim: {masked:?}");
+        assert!(
+            !masked.contains("output_data.csv"),
+            "csv path blanked: {masked:?}"
+        );
+        assert!(
+            !masked.contains("readme.ja.md"),
+            "md path blanked: {masked:?}"
+        );
+        // separator path masks too.
+        let with_sep = mask_path_tokens("write data/results.jsonl now");
+        assert!(
+            !with_sep.contains("data/results.jsonl"),
+            "separator path blanked: {with_sep:?}"
+        );
+    }
+
+    /// M6: a sentence-final trailing-dot path still masks.
+    #[test]
+    fn mask_path_tokens_trailing_dot_edge_m6() {
+        let masked = mask_path_tokens("summarize the trends in output_data.csv.");
+        assert!(
+            !masked.contains("output_data.csv"),
+            "trailing-dot path blanked: {masked:?}"
+        );
+        assert_eq!(
+            masked.len(),
+            "summarize the trends in output_data.csv.".len()
+        );
+    }
+
+    /// M7: the mask allowlist MUST byte-match `normalize_explicit_artifact_path`'s
+    /// recognized-extension set. `path_token_is_maskable` defers to that exact
+    /// predicate, so every recognized extension masks and any non-recognized one
+    /// does not. If the two diverge (a new extension added to one only), this pin
+    /// fails (DS2-005).
+    #[test]
+    fn mask_path_tokens_allowlist_equals_normalize_m7() {
+        let recognized = [
+            "py", "rs", "ts", "tsx", "js", "jsx", "csv", "tsv", "jsonl", "md", "mdx", "txt", "rst",
+            "toml", "json", "yaml", "yml", "lock", "ndjson", "parquet",
+        ];
+        for ext in recognized {
+            let token = format!("file.{ext}");
+            assert!(
+                normalize_explicit_artifact_path(&token).is_some(),
+                "normalize must accept recognized .{ext}"
+            );
+            assert!(
+                path_token_is_maskable(&token),
+                "mask allowlist must accept recognized .{ext}"
+            );
+        }
+        // A non-recognized extension is masked by NEITHER.
+        for token in ["file.exe", "file.bin", "file.markdown", "3.14", "e.g"] {
+            assert_eq!(
+                normalize_explicit_artifact_path(token).is_some(),
+                path_token_is_maskable(token),
+                "mask allowlist must agree with normalize for {token:?}"
+            );
+        }
+        // A separator path is maskable even though normalize may reject extension.
+        assert!(path_token_is_maskable("dir/sub/file.csv"));
+    }
+
+    // ===================================================================
+    // Issue #937: directional / docs surface in-module pins (N2/N7/N8 +
+    // mode-1 directional unit pins).
+    // ===================================================================
+
+    /// N2 (genuine JP research output): an explicit JP output verb directed at a
+    /// path keeps the obligation. `report_path_in_output_context` returns true via
+    /// the whole-request JP marker `出力` in the neutral-preposition fallback.
+    #[test]
+    fn report_path_in_output_context_jp_output_marker_n2() {
+        assert!(report_path_in_output_context(
+            "選択肢を比較して結果を findings.md に出力する",
+            "findings.md"
+        ));
+    }
+
+    /// Mode-1 directional: a filename-internal output-verb substring no longer
+    /// fabricates output context for a neutral input reference.
+    #[test]
+    fn report_path_in_output_context_directional_unit_pins() {
+        // Filename pollution (generated_report.md) read in a comparison → false.
+        assert!(!report_path_in_output_context(
+            "Compare findings in generated_report.md and summary.md",
+            "generated_report.md"
+        ));
+        // Multi-path attribution: produce attaches to findings.md only.
+        assert!(report_path_in_output_context(
+            "Investigate the notes in source_report.md and produce findings.md",
+            "findings.md"
+        ));
+        assert!(!report_path_in_output_context(
+            "Investigate the notes in source_report.md and produce findings.md",
+            "source_report.md"
+        ));
+        // Directional before-window: an output verb in the before-window of a
+        // neutral preposition counts (genuine EN output).
+        assert!(report_path_in_output_context(
+            "Produce the summary in report.md",
+            "report.md"
+        ));
+        // A bare output-looking name with no directed verb stays false.
+        assert!(!report_path_in_output_context(
+            "Compare report.md and summary.md",
+            "report.md"
+        ));
+    }
+
+    /// N7 (authoring EN): `Translate README.ja.md and write README.md` →
+    /// `README.ja.md` is a clear source (pruned), `README.md` is the lone output.
+    #[test]
+    fn docs_source_discriminator_en_n7() {
+        let req = "Translate README.ja.md and write README.md";
+        assert!(
+            docs_path_is_clearly_source_input(req, "README.ja.md"),
+            "language-stamped translation source must be a clear source"
+        );
+        assert!(
+            !docs_path_is_clearly_source_input(req, "README.md"),
+            "the written output README.md must not be classified as source"
+        );
+    }
+
+    /// N8 (authoring JP): `README.ja.mdを翻訳してREADME.mdに書いてください` →
+    /// `README.ja.md` is the translation source (pruned via `翻訳`), `README.md`
+    /// is the lone output (kept via the `に書いて` DOCS_OUTPUT_AFTER_JP marker).
+    #[test]
+    fn docs_source_discriminator_jp_n8() {
+        let req = "README.ja.mdを翻訳してREADME.mdに書いてください";
+        assert!(
+            docs_path_is_clearly_source_input(req, "README.ja.md"),
+            "JP translation source must be a clear source"
+        );
+        assert!(
+            !docs_path_is_clearly_source_input(req, "README.md"),
+            "the `に書いて` output target README.md must not be classified as source"
+        );
+        // End-to-end: the contract keeps exactly README.md as the UsageDocs id.
+        let contract = TaskContract::from_request(req);
+        let docs: Vec<&str> = contract
+            .required_artifact_identities
+            .iter()
+            .filter(|o| o.role == ArtifactRole::UsageDocs)
+            .map(|o| o.path.as_str())
+            .collect();
+        assert_eq!(
+            docs,
+            vec!["README.md"],
+            "JP translation must prune the source and keep only README.md"
+        );
+    }
+
+    /// Data mode-1 demotion: `data_path_has_output_context` no longer treats an
+    /// output-looking stem as a standalone output; a directed verb/JP marker
+    /// does, and the auxiliary stem still protects against a downstream input.
+    #[test]
+    fn data_path_has_output_context_demotion_unit_pins() {
+        // Input reference, output-looking stem → false (demotion).
+        assert!(!data_path_has_output_context(
+            "Summarize the trends in output_data.csv",
+            "output_data.csv"
+        ));
+        // Directed EN verb in before-window → true.
+        assert!(data_path_has_output_context(
+            "Generate output.csv with columns id and score",
+            "output.csv"
+        ));
+        // JP after-window marker → true (#921).
+        assert!(data_path_has_output_context(
+            "idとtotalの列を持つoutput.csvを生成してください",
+            "output.csv"
+        ));
+        // Auxiliary stem guard: output stem + downstream `from ... input` → true.
+        assert!(data_path_has_output_context(
+            "Generate report output.csv from the input data.",
+            "output.csv"
+        ));
+        // input.jsonl filename is dropped as input.
+        assert!(!data_path_has_output_context(
+            "Generate data/results.jsonl from input.jsonl",
+            "input.jsonl"
+        ));
+    }
+
+    /// Fifth-surface gate: the masked `output_action` closes R4 while keeping N4.
+    #[test]
+    fn standalone_data_artifact_masked_output_action_pins() {
+        // R4: filename `output` is masked; no real output verb → false.
+        assert!(!request_explicitly_requests_standalone_data_artifact(
+            "What columns are in output_data.csv, a CSV file?",
+            &"What columns are in output_data.csv, a CSV file?".to_ascii_lowercase()
+        ));
+        // N4: real `generate` verb survives masking → true.
+        assert!(request_explicitly_requests_standalone_data_artifact(
+            "Generate a CSV file with columns id and total",
+            &"Generate a CSV file with columns id and total".to_ascii_lowercase()
+        ));
+    }
+
+    /// Mode-2 (no-path): `research_report_artifact_intended` over masked text.
+    /// A filename-internal `draft`+`report` (draft_report.md) no longer fires;
+    /// a genuine no-path `draft a report` still does.
+    #[test]
+    fn research_report_artifact_intended_masked_mode2() {
+        // No-path genuine output → true.
+        assert!(research_report_artifact_intended(
+            "Research local LLM options and draft a report",
+            &"Research local LLM options and draft a report".to_ascii_lowercase()
+        ));
+        // Filename-only draft+report (no other output verb/noun) → false.
+        let req = "Compare findings in draft_report.md and notes.md";
+        assert!(!research_report_artifact_intended(
+            req,
+            &req.to_ascii_lowercase()
+        ));
     }
 }
