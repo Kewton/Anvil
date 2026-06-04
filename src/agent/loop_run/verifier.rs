@@ -256,6 +256,23 @@ impl TaskCapability {
             | TaskKind::Authoring => false,
         }
     }
+
+    /// Whether the active task is a coding task — the gate for scaffold /
+    /// deterministic-fallback materialization and the shared manifest-readiness
+    /// diagnostic (Issue #924). Distinct from `allows_process_exec` (verifier
+    /// child-process spawn): scaffold is file materialization, not a spawn.
+    /// Non-coding kinds are enumerated explicitly so a 6th `TaskKind` is a
+    /// compile error here (OCP / fail-safe, mirrors `capability_for`).
+    pub(super) const fn is_coding(self) -> bool {
+        match self.kind {
+            TaskKind::Coding => true,
+            TaskKind::Docs
+            | TaskKind::Data
+            | TaskKind::Research
+            | TaskKind::Ops
+            | TaskKind::Authoring => false,
+        }
+    }
 }
 
 pub(super) fn verifier_diagnostic_for_obligation(
@@ -581,7 +598,14 @@ fn verifier_diagnostic_for_artifact(
             "artifact path is empty",
         ));
     }
-    if let Some(diagnostic) = manifest_readiness_diagnostic(task_kind, path, artifact.excerpt) {
+    // Issue #924: the shared manifest-readiness diagnostic is coding-only on the
+    // artifact path. The obligation path (`verifier_diagnostic_for_obligation_parts`)
+    // stays ungated — it is already scoped to `role == Setup` manifests, so a
+    // non-coding install task with an explicit Setup package.json/Cargo.toml
+    // obligation still gets InvalidManifest detection.
+    if capability_for(task_kind).is_coding()
+        && let Some(diagnostic) = manifest_readiness_diagnostic(task_kind, path, artifact.excerpt)
+    {
         return Some(diagnostic);
     }
     if artifact.excerpt.trim().is_empty() {

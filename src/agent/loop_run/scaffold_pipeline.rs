@@ -57,7 +57,7 @@ use super::quality::{
     package_json_with_requested_port, react_dev_wrapper_for_requested_port,
 };
 use super::read_target_helpers::{last_read_tool_path, latest_turn_preferred_read_edit_target};
-use super::task_contract::{ArtifactObligation, ArtifactRole, CompletionDecision};
+use super::task_contract::{ArtifactObligation, ArtifactRole, CompletionDecision, TaskKind};
 use super::tool_display::progress_path_display;
 use super::tool_history::{
     focused_edit_target_already_read, has_successful_non_plan_repo_edit, latest_user_turn_slice,
@@ -1195,15 +1195,50 @@ pub(super) fn python_csv_names_from_request_and_anvil(
     )
 }
 
+/// Issue #924: SSOT predicate gating coding-shaped scaffold / deterministic
+/// fallback. Non-coding kinds (Docs/Data/Research/Ops/Authoring) are demoted
+/// out of coding-shaped scaffold. `unwrap_or(Coding)` preserves the historical
+/// always-Coding behavior for turns without an active task contract
+/// (plan mode / first turn / pre-classification) — identical to #918/#921/#923.
+/// Security posture: in the scaffold context this is a compatibility fail-open
+/// default (Coding permits coding-shaped materialization), not a fail-closed
+/// default. Existing active-request / mode / config / target gates remain the
+/// bounded reachability controls; changing this default is out of scope for #924.
+pub(super) fn scaffold_allowed_for_active_task(agent: &Agent) -> bool {
+    let task_kind = super::task_classification::task_contract_authority(agent)
+        .map(|contract| contract.task_kind)
+        .unwrap_or(TaskKind::Coding);
+    if !super::verifier::capability_for(task_kind).is_coding() {
+        // AC5: observable skip — kind enum only, no path (no masking needed).
+        tracing::debug!(
+            target: "anvil::scaffold",
+            task_kind = task_kind.as_str(),
+            "scaffold gated: non-coding task_kind demoted out of coding-shaped scaffold"
+        );
+        return false;
+    }
+    true
+}
+
 pub(super) fn mode_deterministic_scaffold_spec(
     agent: &Agent,
     request: &str,
     policy: &ModePolicy,
 ) -> Option<DeterministicScaffoldSpec> {
-    if let Some(plan) = project_skeleton_plan_for_request(request) {
+    // Issue #924 branch-local gate: the coding-shaped branches (project_skeleton +
+    // python/fastapi) only fire for coding tasks. `scaffold_allowed_for_active_task`
+    // is evaluated lazily (left-to-right `&&` short-circuit) — only after a
+    // coding-shaped candidate is found — so a Docs-only request never triggers the
+    // gate's `task_contract_authority` init / debug-skip log (DR3-001). Non-coding
+    // kinds fall through to the Docs branch below.
+    if let Some(plan) = project_skeleton_plan_for_request(request)
+        && scaffold_allowed_for_active_task(agent)
+    {
         return Some(plan.into());
     }
-    if super::policy_allows_python_specialized_fallback(policy, &agent.config) {
+    if super::policy_allows_python_specialized_fallback(policy, &agent.config)
+        && scaffold_allowed_for_active_task(agent)
+    {
         if let Some(files) = deterministic::fastapi_scaffold_files(request) {
             return Some(DeterministicScaffoldSpec {
                 label: "FastAPI scaffold",
@@ -1337,6 +1372,9 @@ pub(super) fn maybe_apply_deterministic_nextjs_scaffold(
     last_iter: usize,
     interrupt_flag: &InterruptFlag,
 ) -> ScaffoldFallbackResult {
+    if !scaffold_allowed_for_active_task(agent) {
+        return ScaffoldFallbackResult::NotApplicable;
+    }
     if !agent
         .config
         .deterministic_fallback
@@ -1540,6 +1578,9 @@ pub(super) fn maybe_materialize_task_contract_fallback(
     decision: &CompletionDecision,
     last_iter: usize,
 ) -> bool {
+    if !scaffold_allowed_for_active_task(agent) {
+        return false;
+    }
     if !super::policy_allows_python_specialized_fallback(
         &agent.session.mode_state.policy(),
         &agent.config,
@@ -1591,6 +1632,9 @@ pub(super) fn maybe_materialize_framework_game_fallback(
     agent: &mut Agent,
     last_iter: usize,
 ) -> bool {
+    if !scaffold_allowed_for_active_task(agent) {
+        return false;
+    }
     if !agent.config.deterministic_fallback.allows_hint_only() {
         return false;
     }
@@ -1717,6 +1761,9 @@ pub(super) fn maybe_materialize_framework_game_fallback(
 pub(super) fn maybe_materialize_python_test_fallback(
     agent: &mut Agent,
 ) -> Result<Option<String>, String> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return Ok(None);
+    }
     if !super::policy_allows_python_specialized_fallback(
         &agent.session.mode_state.policy(),
         &agent.config,
@@ -1828,6 +1875,9 @@ pub(super) fn maybe_apply_deterministic_polish_fallback(
     request: &str,
     relative_target: &str,
 ) -> Result<bool, String> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return Ok(false);
+    }
     if !agent
         .config
         .deterministic_fallback
@@ -1861,6 +1911,9 @@ pub(super) fn maybe_apply_local_llm_small_edit_fallback(
     agent: &mut Agent,
     request: &str,
 ) -> Result<Option<String>, String> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return Ok(None);
+    }
     if !agent
         .config
         .deterministic_fallback
@@ -1938,6 +1991,9 @@ pub(super) fn maybe_apply_deterministic_quality_fallback(
     request: &str,
     relative_target: &str,
 ) -> Result<bool, String> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return Ok(false);
+    }
     if !agent
         .config
         .deterministic_fallback
@@ -2049,6 +2105,9 @@ pub(super) fn maybe_apply_deterministic_quality_fallback_after_timeout(
     agent: &Agent,
     err: &str,
 ) -> Option<AssistantReply> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return None;
+    }
     if !err.to_ascii_lowercase().contains("timed out")
         || !super::quality_gate::current_request_needs_playable_ui_quality_gate(agent)
     {
@@ -2061,6 +2120,9 @@ pub(super) fn maybe_apply_deterministic_polish_fallback_after_timeout(
     agent: &Agent,
     err: &str,
 ) -> Option<AssistantReply> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return None;
+    }
     if !err.to_ascii_lowercase().contains("timed out")
         || !super::quality_gate::current_request_needs_playable_ui_quality_gate(agent)
     {
@@ -2073,6 +2135,9 @@ pub(super) fn maybe_apply_deterministic_edit_after_format_error(
     agent: &mut Agent,
     err: &str,
 ) -> Result<Option<AssistantReply>, String> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return Ok(None);
+    }
     if !agent.config.specialized_fallback_enabled() {
         return Ok(None);
     }
