@@ -10,10 +10,12 @@
 //! Free functions (not `impl Agent`) match the dominant `loop_run` convention
 //! (DR2-003). Private module, not re-exported (DR3-001).
 //!
-//! Phase 2 scope: deterministic first-pass populate + read accessor. The
-//! low-confidence TaskKind confirm second-pass (which can rebuild the contract
-//! before `OnceCell::set`) is layered on in Phase 4 and is the reason the
-//! populate entry point is the only mutation-capable path.
+//! Phase 2 scope: deterministic first-pass populate + read accessor. Issue #926
+//! (P0.5b) wired the low-confidence TaskKind confirm second-pass — it rebuilds
+//! the contract via `from_request_with_kind` before `OnceCell::set`, which is
+//! why the eager populate entry point (`&mut Agent`) is the only
+//! mutation-capable path; the lazy read accessor (`&Agent`) is a
+//! deterministic-first-pass edge backstop and never dispatches the confirm.
 
 use std::rc::Rc;
 
@@ -28,18 +30,83 @@ use super::task_contract::TaskContract;
 /// `agent_misc::refresh_artifact_completion_satisfied`, which runs *after*
 /// `run_turn` returns) observes a memo that was built from the original
 /// user request — `active_request_text` strips any auto-plan wrapper (D9).
-pub(super) fn populate_task_contract_authority(agent: &Agent) {
+pub(super) fn populate_task_contract_authority(agent: &mut Agent) {
+    // Issue #926 (DR3-001): a pre-set cell at the eager-populate entry means a
+    // production reader called `task_contract_authority()` for this turn's
+    // request BEFORE `run_turn`'s eager populate — an ordering bug, because the
+    // lazy net would have sealed an un-confirmed first-pass contract that the
+    // confirm second-pass can no longer override (`OnceCell` is single-set).
+    // We no-op in release (idempotent), but assert in debug to surface it. This
+    // is NOT a "make early lazy read safe" path; the invariant is that no such
+    // early read happens (the lazy `get_or_init` is an edge backstop only).
+    debug_assert!(
+        agent.task_contract_this_turn.get().is_none()
+            || super::workspace_access::active_request_text(agent).is_none(),
+        "task_contract_this_turn was sealed before run_turn's eager populate \
+         (lazy-net ordering bug — the confirm override can no longer apply)"
+    );
     if agent.task_contract_this_turn.get().is_some() {
         return;
     }
     let Some(request) = super::workspace_access::active_request_text(agent) else {
         return;
     };
-    // `set` returns `Err` only if another path won the race within this turn;
-    // both produce the same deterministic first-pass contract, so ignore it.
-    let _ = agent
-        .task_contract_this_turn
-        .set(Rc::new(TaskContract::from_request(&request)));
+    // Deterministic first pass.
+    let first_pass = TaskContract::from_request(&request);
+    // Issue #926 (D1/D4): only a no-keyword-match default (`needs_confirm`, i.e.
+    // `matched == false`) is eligible for the confirm second pass; a
+    // high-confidence (`matched == true`) classification is immutable and never
+    // dispatches. The confirm runs BEFORE `OnceCell::set` so every downstream
+    // reader and the divergence assert observe the (possibly overridden)
+    // contract. The dispatcher returns `Some(kind)` only on an actual override
+    // (different kind); agree / skip / fallback return `None`.
+    let forced_kind = if first_pass.classification().needs_confirm() {
+        let first_pass_class = first_pass.classification();
+        let turn_index = agent.current_turn_index;
+        super::classify_confirm_flow::maybe_invoke_task_kind_confirm(
+            agent,
+            &first_pass_class,
+            &request,
+            turn_index,
+        )
+    } else {
+        None
+    };
+    // Single `set`: the overridden contract (rebuilt coherently via
+    // `from_request_with_kind`, D2) when the confirm overrode the kind, else the
+    // deterministic first pass. `set` returns `Err` only if another path won the
+    // race within this turn, which is harmless here.
+    let contract = match forced_kind {
+        Some(kind) => Rc::new(TaskContract::from_request_with_kind(&request, Some(kind))),
+        None => Rc::new(first_pass),
+    };
+    let _ = agent.task_contract_this_turn.set(contract);
+}
+
+/// Issue #926 test seam (DR1-005): deterministically apply a confirmed kind
+/// override to the per-turn authority, exercising the REAL populate-side
+/// override path (`from_request_with_kind` + single `OnceCell::set` + per-turn
+/// cap consume) without a live sidecar (which is `None` in all tests, so the
+/// confirm dispatcher itself never overrides). The cell must be unset (call
+/// before any read / `populate_*`). `forced_kind` must differ from the
+/// deterministic first-pass kind (production only overrides on disagreement),
+/// otherwise the divergence assert's same-kind branch would compare a
+/// confidence-1.0 override against the confidence-0.0 recompute.
+#[cfg(test)]
+pub(crate) fn task_kind_confirm_apply_for_test(
+    agent: &mut Agent,
+    forced_kind: super::task_contract::TaskKind,
+) {
+    let request = super::workspace_access::active_request_text(agent)
+        .expect("active request required for the confirm override seam");
+    // Simulate the dispatch having occurred (cap consumed) and seal the
+    // coherently-rebuilt overridden contract with a single `set`.
+    agent.task_kind_confirm_called_this_turn = true;
+    let contract = Rc::new(TaskContract::from_request_with_kind(
+        &request,
+        Some(forced_kind),
+    ));
+    let _ = agent.task_contract_this_turn.set(contract);
 }
 
 /// Per-turn classification authority read by the former `from_request` sites.
