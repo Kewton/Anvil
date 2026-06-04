@@ -169,6 +169,111 @@ impl TaskClassification {
     }
 }
 
+#[allow(dead_code)] // Issue #947: projection vocabulary before all telemetry consumers are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectiveDeliverableKind {
+    SourceFiles,
+    DocumentSections,
+    OutputFile,
+    ResearchNotes,
+    CommandObservation,
+    ProseArtifact,
+    Answer,
+}
+
+impl ObjectiveDeliverableKind {
+    #[allow(dead_code)] // Issue #947: label projection is currently test/telemetry migration surface.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ObjectiveDeliverableKind::SourceFiles => "source_files",
+            ObjectiveDeliverableKind::DocumentSections => "document_sections",
+            ObjectiveDeliverableKind::OutputFile => "output_file",
+            ObjectiveDeliverableKind::ResearchNotes => "research_notes",
+            ObjectiveDeliverableKind::CommandObservation => "command_observation",
+            ObjectiveDeliverableKind::ProseArtifact => "prose_artifact",
+            ObjectiveDeliverableKind::Answer => "answer",
+        }
+    }
+}
+
+#[allow(dead_code)] // Issue #947: projection vocabulary before all telemetry consumers are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectiveEvidenceKind {
+    TestRun,
+    ContentCheck,
+    SchemaCheck,
+    SourceFetchEvidence,
+    SafetyBoundaryEvidence,
+    ContentAcceptance,
+}
+
+impl ObjectiveEvidenceKind {
+    #[allow(dead_code)] // Issue #947: label projection is currently test/telemetry migration surface.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ObjectiveEvidenceKind::TestRun => "test_run",
+            ObjectiveEvidenceKind::ContentCheck => "content_check",
+            ObjectiveEvidenceKind::SchemaCheck => "schema_check",
+            ObjectiveEvidenceKind::SourceFetchEvidence => "source_fetch_evidence",
+            ObjectiveEvidenceKind::SafetyBoundaryEvidence => "safety_boundary_evidence",
+            ObjectiveEvidenceKind::ContentAcceptance => "content_acceptance",
+        }
+    }
+}
+
+#[allow(dead_code)] // Issue #947: read-only ObjectiveContract projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ObjectiveContract {
+    pub(super) task_kind: TaskKind,
+    pub(super) deliverable_kind: ObjectiveDeliverableKind,
+    pub(super) evidence_kind: ObjectiveEvidenceKind,
+}
+
+impl ObjectiveContract {
+    fn from_task_contract(contract: &TaskContract) -> Self {
+        if contract.completion_policy.project_intent == CompletionProjectIntent::AnswerOnly {
+            return Self {
+                task_kind: contract.task_kind,
+                deliverable_kind: ObjectiveDeliverableKind::Answer,
+                evidence_kind: ObjectiveEvidenceKind::ContentAcceptance,
+            };
+        }
+
+        let (deliverable_kind, evidence_kind) = match contract.task_kind {
+            TaskKind::Coding => (
+                ObjectiveDeliverableKind::SourceFiles,
+                ObjectiveEvidenceKind::TestRun,
+            ),
+            TaskKind::Docs => (
+                ObjectiveDeliverableKind::DocumentSections,
+                ObjectiveEvidenceKind::ContentCheck,
+            ),
+            TaskKind::Data => (
+                ObjectiveDeliverableKind::OutputFile,
+                ObjectiveEvidenceKind::SchemaCheck,
+            ),
+            TaskKind::Research => (
+                ObjectiveDeliverableKind::ResearchNotes,
+                ObjectiveEvidenceKind::SourceFetchEvidence,
+            ),
+            TaskKind::Ops => (
+                ObjectiveDeliverableKind::CommandObservation,
+                ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+            ),
+            TaskKind::Authoring => (
+                ObjectiveDeliverableKind::ProseArtifact,
+                ObjectiveEvidenceKind::ContentAcceptance,
+            ),
+        };
+
+        Self {
+            task_kind: contract.task_kind,
+            deliverable_kind,
+            evidence_kind,
+        }
+    }
+}
+
 #[allow(dead_code)] // Issue #864: generic deliverable variants are part of the model before every producer is wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeliverableKind {
@@ -1883,6 +1988,14 @@ impl TaskContract {
             task_kind: self.task_kind,
             confidence: self.classification_confidence,
         }
+    }
+
+    /// Issue #947: project the existing coding-centered `TaskContract` into
+    /// generic objective lifecycle vocabulary. This is read-only; the legacy
+    /// artifact and verifier gates above remain the completion authority.
+    #[allow(dead_code)] // First consumer is focused tests; telemetry wiring is additive follow-up.
+    pub(super) fn objective_contract(&self) -> ObjectiveContract {
+        ObjectiveContract::from_task_contract(self)
     }
 
     /// Back-compat entrypoint that bypasses the Issue #651 test-execution
@@ -6359,6 +6472,103 @@ mod tests {
                 contract.deliverables
             );
         }
+    }
+
+    #[test]
+    fn objective_contract_projects_deliverable_and_evidence_kinds() {
+        let cases = [
+            (
+                "Implement a Rust library feature X and add tests",
+                TaskKind::Coding,
+                ObjectiveDeliverableKind::SourceFiles,
+                ObjectiveEvidenceKind::TestRun,
+                "source_files",
+                "test_run",
+            ),
+            (
+                "Update README.md with installation, usage, and testing sections",
+                TaskKind::Docs,
+                ObjectiveDeliverableKind::DocumentSections,
+                ObjectiveEvidenceKind::ContentCheck,
+                "document_sections",
+                "content_check",
+            ),
+            (
+                "Clean data.csv and write summary.csv with grouped totals",
+                TaskKind::Data,
+                ObjectiveDeliverableKind::OutputFile,
+                ObjectiveEvidenceKind::SchemaCheck,
+                "output_file",
+                "schema_check",
+            ),
+            (
+                "Research and compare local LLM options, include sources and a recommendation",
+                TaskKind::Research,
+                ObjectiveDeliverableKind::ResearchNotes,
+                ObjectiveEvidenceKind::SourceFetchEvidence,
+                "research_notes",
+                "source_fetch_evidence",
+            ),
+            (
+                "Prepare a deployment runbook checklist with rollback steps",
+                TaskKind::Ops,
+                ObjectiveDeliverableKind::CommandObservation,
+                ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+                "command_observation",
+                "safety_boundary_evidence",
+            ),
+        ];
+
+        for (
+            request,
+            task_kind,
+            deliverable_kind,
+            evidence_kind,
+            deliverable_label,
+            evidence_label,
+        ) in cases
+        {
+            let projection = TaskContract::from_request(request).objective_contract();
+            assert_eq!(projection.task_kind, task_kind, "request={request}");
+            assert_eq!(
+                projection.deliverable_kind, deliverable_kind,
+                "request={request}"
+            );
+            assert_eq!(projection.evidence_kind, evidence_kind, "request={request}");
+            assert_eq!(projection.deliverable_kind.label(), deliverable_label);
+            assert_eq!(projection.evidence_kind.label(), evidence_label);
+        }
+    }
+
+    #[test]
+    fn objective_contract_distinguishes_authoring_artifact_from_answer_only() {
+        let authoring =
+            TaskContract::from_request("Translate README.ja.md into English and write README.md");
+        let authoring_projection = authoring.objective_contract();
+        assert_eq!(authoring_projection.task_kind, TaskKind::Authoring);
+        assert_eq!(
+            authoring_projection.deliverable_kind,
+            ObjectiveDeliverableKind::ProseArtifact
+        );
+        assert_eq!(
+            authoring_projection.evidence_kind,
+            ObjectiveEvidenceKind::ContentAcceptance
+        );
+
+        let answer = TaskContract::from_request("Explain how Rust ownership works");
+        let answer_projection = answer.objective_contract();
+        assert_eq!(
+            answer.completion_policy.project_intent,
+            CompletionProjectIntent::AnswerOnly
+        );
+        assert_eq!(
+            answer_projection.deliverable_kind,
+            ObjectiveDeliverableKind::Answer
+        );
+        assert_eq!(
+            answer_projection.evidence_kind,
+            ObjectiveEvidenceKind::ContentAcceptance
+        );
     }
 
     #[test]
