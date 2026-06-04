@@ -348,12 +348,22 @@ mod inner {
     }
 
     #[test]
-    fn synthesized_missing_test_target_for_rust_uses_rust_test_path() {
+    fn synthesized_missing_test_target_for_rust_cli_uses_cli_test_path() {
+        assert_eq!(
+            super::synthesized_missing_test_target_path_for_request(
+                "Rust CLIを作成し、cargo testで動くテストコードも実装してください。"
+            ),
+            Some(("tests/cli.rs", "rust"))
+        );
+    }
+
+    #[test]
+    fn synthesized_missing_test_target_for_rust_library_uses_lib_test_path() {
         assert_eq!(
             super::synthesized_missing_test_target_path_for_request(
                 "Rustライブラリを作成し、cargo testで動くテストコードも実装してください。"
             ),
-            Some(("tests/main.rs", "rust"))
+            Some(("tests/lib.rs", "rust"))
         );
     }
 
@@ -431,6 +441,10 @@ mod inner {
     fn python_test_target_is_not_compatible_with_rust_request() {
         assert!(!super::test_target_path_compatible_with_request(
             "tests/test_main.py",
+            "Rustでライブラリを実装し、cargo testで確認してください"
+        ));
+        assert!(super::test_target_path_compatible_with_request(
+            "tests/cli.rs",
             "Rustでライブラリを実装し、cargo testで確認してください"
         ));
         assert!(super::test_target_path_compatible_with_request(

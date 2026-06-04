@@ -2101,7 +2101,15 @@ pub(super) fn synthesized_missing_test_target_path_for_request(
 ) -> Option<(&'static str, &'static str)> {
     let lower = request.to_ascii_lowercase();
     if request_matches_family(&lower, request, RUST_REQUEST_PATTERNS, &["Rustで"]) {
-        return Some(("tests/main.rs", "rust"));
+        if request_matches_family(
+            &lower,
+            request,
+            RUST_LIBRARY_REQUEST_PATTERNS,
+            RUST_LIBRARY_REQUEST_JA_PATTERNS,
+        ) {
+            return Some(("tests/lib.rs", "rust"));
+        }
+        return Some(("tests/cli.rs", "rust"));
     }
     if lower_contains_any(&lower, TYPESCRIPT_REQUEST_PATTERNS) {
         return Some(("tests/main.test.ts", "typescript"));
