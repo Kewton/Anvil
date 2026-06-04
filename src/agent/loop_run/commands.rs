@@ -1312,6 +1312,13 @@ impl Agent {
         // returns) so a Plan-approved-via-`execute_approved_plan` turn does
         // not inherit a stale `true` from the previous turn (DR3-003).
         self.work_mode_confirm_called_this_turn = false;
+        // Issue #926 (DR2-001): reset the TaskKind confirm per-user-input cap on
+        // the same boundary as the WorkMode cap (before `maybe_auto_plan_prompt`
+        // and the Plan early-returns) so an `execute_approved_plan` turn does not
+        // inherit a stale `true`. The `task_contract_this_turn` OnceCell (the
+        // classification memo, not a cap) is reset separately in
+        // `handle_user_message`.
+        self.task_kind_confirm_called_this_turn = false;
         // Issue #592: reset the photon user-feedback per-turn cap on the same
         // boundary. Must run BEFORE Plan-mode early returns so the thumbs/
         // correct/rule commands are dispatchable even from Plan mode.

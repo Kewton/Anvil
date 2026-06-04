@@ -145,10 +145,10 @@ struct TaskKindInference {
 /// independent bool) so `confidence` is the single source of truth (DR1-004).
 /// `#[non_exhaustive]` keeps the P1 additions (coding sub-profile / behavior
 /// flags) additive (DR1-003).
-// Issue #917: `#[allow(dead_code)]` is transient — the per-turn authority
-// accessor (`task_classification.rs`, Phase 2) and the confirm path (Phase 4)
-// are the production consumers; the allow is removed once they are wired.
-#[allow(dead_code)]
+// Issue #926: production consumers wired — the per-turn authority accessor
+// (`task_classification.rs`) and the TaskKind confirm path
+// (`classify_confirm_flow::maybe_invoke_task_kind_confirm`) read this; the
+// transient `#[allow(dead_code)]` has been removed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub(super) struct TaskClassification {
@@ -164,7 +164,6 @@ impl TaskClassification {
     /// the confirm threshold) routes to the confirm path instead of silently
     /// staying `Coding`. Reuses the WorkMode confirm threshold (DR2-001 path:
     /// `crate::modes::plan_act`, not `super::super::modes`).
-    #[allow(dead_code)] // Issue #917: wired by the confirm path (Phase 4).
     pub(super) fn needs_confirm(&self) -> bool {
         self.confidence < crate::modes::plan_act::WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
     }
@@ -1672,6 +1671,27 @@ impl From<CompletionDecision> for ArtifactRecoveryAction {
 
 impl TaskContract {
     pub(super) fn from_request(request: &str) -> Self {
+        Self::from_request_with_kind(request, None)
+    }
+
+    /// Issue #926 (P0.5b / D2): the single contract-construction SSOT, with an
+    /// optional `forced_kind` override applied by the TaskKind confirm
+    /// second-pass. `from_request` is `from_request_with_kind(request, None)`
+    /// (byte-identical to the pre-#926 behavior, so all existing `from_request`
+    /// callers are preserved).
+    ///
+    /// When `forced_kind == Some(k)`, the deterministically-inferred kind is
+    /// replaced by `k` *before* the whole kind-gated cascade (intent override,
+    /// `required` artifact roles, obligations, `completion_policy`, verification
+    /// gates) runs — so the rebuilt contract is coherent with `k` rather than a
+    /// bare field swap (which would desync the capability gates). The override
+    /// is also treated as authoritative: `classification_confidence = 1.0`
+    /// (`needs_confirm()==false`, idempotent — a re-read cannot re-trigger the
+    /// confirm; DR1-002 / DR2-002). The confirm dispatcher only passes `Some(k)`
+    /// when `k` differs from the first-pass kind, so the divergence assert in
+    /// `task_classification.rs` takes its ELSE (kind-differs) branch and never
+    /// runs the full-struct equality against the deterministic recompute.
+    pub(super) fn from_request_with_kind(request: &str, forced_kind: Option<TaskKind>) -> Self {
         let lower = request.to_ascii_lowercase();
         let project_intent = ProjectIntent::from_request(request);
         let mut intent = project_intent.intent;
@@ -1680,8 +1700,8 @@ impl TaskContract {
         let asks_for_setup = request_asks_for_setup(request, &lower);
         let asks_for_data_output = request_asks_for_data_output_artifact(request, &lower);
         let TaskKindInference {
-            kind: task_kind,
-            matched: task_kind_matched,
+            kind: inferred_kind,
+            matched: inferred_matched,
         } = infer_task_kind(
             request,
             &lower,
@@ -1690,6 +1710,16 @@ impl TaskContract {
             asks_for_usage_docs,
             asks_for_setup,
         );
+        // Issue #926 (D2): a confirmed override substitutes the kind at the
+        // single bind point so the entire cascade below rebuilds from it; an
+        // override is treated as high-confidence (1.0). Without an override the
+        // #917 2-value confidence applies (matched → 1.0 / no-match → 0.0; only
+        // the no-keyword-match fallthrough lands below the confirm threshold and
+        // triggers `needs_confirm()`).
+        let (task_kind, classification_confidence) = match forced_kind {
+            Some(k) => (k, 1.0_f32),
+            None => (inferred_kind, if inferred_matched { 1.0 } else { 0.0 }),
+        };
         // Issue #919 (Decision #5(a)): Authoring contracts never carry the
         // Explain intent. Trigger B may have classified `intent = Explain` (e.g.
         // `summarize`); override it to `Build` so the contract acquires a
@@ -1698,10 +1728,6 @@ impl TaskContract {
         if task_kind == TaskKind::Authoring {
             intent = TaskIntent::Build;
         }
-        // Issue #917: 2-value confidence from the keyword-match signal. Only the
-        // no-keyword-match fallthrough (matched == false) lands below the
-        // confirm threshold and triggers `needs_confirm()`.
-        let classification_confidence = if task_kind_matched { 1.0 } else { 0.0 };
         let mut required = Vec::new();
         let mut optional = Vec::new();
 
@@ -1846,7 +1872,6 @@ impl TaskContract {
 
     /// Issue #917 (P0.5): project the per-turn classification head. No added
     /// state — reads the existing `task_kind` plus `classification_confidence`.
-    #[allow(dead_code)] // Issue #917: wired by the per-turn authority (Phase 2).
     pub(super) fn classification(&self) -> TaskClassification {
         TaskClassification {
             task_kind: self.task_kind,

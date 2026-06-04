@@ -1125,12 +1125,24 @@ mod scaffold_coding_guard_e2e_tests;
 // Task 9 (the SRP trait split) is recorded as not-warranted in the design-policy.
 #[cfg(test)]
 mod capability_matrix_e2e_tests;
+// Issue #926 (P0.5b): in-crate E2E suite for the TaskKind confirm sidecar —
+// drives the production populate / confirm-override path (capability + scaffold
+// gate propagation, sidecar-None determinism, matched==true immutability, lazy
+// -net no-override) without Ollama. `#[cfg(test)]` keeps it out of the
+// production binary; the explicit `mod` is required. No facade re-export (DR3-001).
 mod summary;
 mod task_contract;
+#[cfg(test)]
+mod task_kind_confirm_e2e_tests;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
 // Private module, not re-exported (DR3-001) — the 18 former `from_request`
 // sites and `run_turn` consume it via `super::task_classification::*`.
 mod task_classification;
+// Issue #926 (P0.5b): TaskKind second-pass confirm adapter (mirrors the
+// `work_mode_confirm` surface, CB-001 visibility). `pub(super)` limited / no
+// facade re-export (DR3-001) — driven from `task_classification::populate`
+// via `classify_confirm_flow::maybe_invoke_task_kind_confirm`.
+mod task_kind_confirm;
 // Issue #646: task workspace scope detection. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` is the only in-crate consumer
 // via `super::task_workspace_scope::*`.
@@ -1995,6 +2007,16 @@ pub struct Agent {
     /// the cap is consumed (`true`), the value already in the session is the
     /// authoritative resolved mode and must not be clobbered.
     pub(super) work_mode_confirm_called_this_turn: bool,
+    /// Issue #926 (P0.5b): per-turn cap for the TaskKind second-pass confirm.
+    /// Reset in `process_line` (commands.rs) adjacent to
+    /// `work_mode_confirm_called_this_turn`, before the Plan early-returns, so
+    /// an `execute_approved_plan` turn does not inherit a stale `true`
+    /// (DR2-001). Consumed only when the orchestrator actually dispatches to the
+    /// sidecar LLM (`model.is_some()`); the `sidecar: None` no-op does not
+    /// consume it. The dispatch site is single (`populate_task_contract_authority`
+    /// via `run_turn`), so the OnceCell idempotency + this cap together
+    /// guarantee one dispatch per turn.
+    pub(super) task_kind_confirm_called_this_turn: bool,
     /// Issue #579: per-turn cap for the FeedbackKind second-pass confirmation.
     /// Reset at the top of every `run_turn` (DR2-005), consumed only when the
     /// orchestrator actually dispatches to the sidecar LLM (i.e.
@@ -2639,6 +2661,7 @@ impl Agent {
             task_contract_this_turn: std::cell::OnceCell::new(),
             tester_called_this_turn: false,
             work_mode_confirm_called_this_turn: false,
+            task_kind_confirm_called_this_turn: false,
             feedback_kind_confirm_called_this_turn: false,
             quality_confirm_called_this_turn: false,
             last_quality_confirm_result: None,

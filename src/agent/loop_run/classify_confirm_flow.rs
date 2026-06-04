@@ -33,6 +33,12 @@ use super::quality_confirm::{
     QualityConfirmation, QualityConfirmationSource, run_quality_confirm_with_strategy,
     should_request_quality_confirmation,
 };
+use super::task_contract::{TaskClassification, TaskKind};
+use super::task_kind_confirm::{
+    self, TASK_KIND_CONFIRM_TIMEOUT_SECS, TaskKindConfirmInputs, TaskKindConfirmOutcome,
+    TaskKindConfirmationSource, build_task_kind_confirm_log_payload,
+    run_task_kind_confirm_with_strategy,
+};
 use super::turn_helpers::quality_confirm_cache_key;
 use super::work_mode_confirm::{
     self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
@@ -415,5 +421,188 @@ fn resolve_quality_confirm_issue(
             }
             observation.issue.clone()
         }
+    }
+}
+
+// ===========================================================================
+// Issue #926 (P0.5b): TaskKind second-pass confirm dispatch.
+// ===========================================================================
+
+/// Skip reason for the TaskKind confirm before any LLM dispatch (cap / Plan /
+/// env). Mirrors `preflight_work_mode_skip_reason`; the high-confidence gate
+/// (`!needs_confirm()`) is checked by the populate caller and, defensively, by
+/// the orchestrator (`Skip(HighConfidence)`).
+fn preflight_task_kind_skip_reason(
+    task_kind_confirm_called_this_turn: bool,
+    mode: crate::modes::plan_act::ExecutionMode,
+    env_disabled: bool,
+) -> Option<task_kind_confirm::TaskKindSkipReason> {
+    if task_kind_confirm_called_this_turn {
+        Some(task_kind_confirm::TaskKindSkipReason::PerTurnCapConsumed)
+    } else if mode == crate::modes::plan_act::ExecutionMode::Plan {
+        Some(task_kind_confirm::TaskKindSkipReason::PlanMode)
+    } else if env_disabled {
+        Some(task_kind_confirm::TaskKindSkipReason::EnvDisabled)
+    } else {
+        None
+    }
+}
+
+/// Emit the `agent.task_kind.classified` event for one confirm outcome.
+fn log_task_kind_confirm_outcome(
+    outcome: &TaskKindConfirmOutcome,
+    session_id: &str,
+    sidecar_model: Option<&str>,
+    turn_index: usize,
+    first_pass: &TaskClassification,
+    latency_ms: Option<u64>,
+) {
+    let (event, payload) = build_task_kind_confirm_log_payload(
+        outcome,
+        session_id,
+        sidecar_model,
+        turn_index,
+        first_pass,
+        latency_ms,
+    );
+    log_llm_event(event, payload);
+}
+
+/// Issue #926: gate + dispatch the TaskKind second-pass confirmation.
+///
+/// Returns `Some(kind)` ONLY when the confirm overrode the first-pass kind with
+/// a *different* allowlisted kind (`SecondPassOverridden`); every other outcome
+/// (agree / skip / fallback) returns `None`, leaving the first-pass contract
+/// untouched (DR2-002). The caller (`populate_task_contract_authority`) rebuilds
+/// the contract via `from_request_with_kind(req, Some(kind))` on `Some`.
+///
+/// Must NOT be re-entrant into `task_contract_authority` / `populate_*`
+/// (DR3-001): all inputs are threaded in by the caller.
+pub(super) fn maybe_invoke_task_kind_confirm(
+    agent: &mut Agent,
+    first_pass: &TaskClassification,
+    raw_input: &str,
+    turn_index: usize,
+) -> Option<TaskKind> {
+    let session_id = agent.session_store.session_id().to_string();
+    let sidecar_model = agent.models.sidecar.clone();
+    let env_disabled = task_kind_confirm::task_kind_confirm_disabled(|k: &str| std::env::var(k));
+    if let Some(reason) = preflight_task_kind_skip_reason(
+        agent.task_kind_confirm_called_this_turn,
+        agent.session.mode_state.mode,
+        env_disabled,
+    ) {
+        let outcome = TaskKindConfirmOutcome::Skipped { reason };
+        log_task_kind_confirm_outcome(
+            &outcome,
+            &session_id,
+            sidecar_model.as_deref(),
+            turn_index,
+            first_pass,
+            None,
+        );
+        return None;
+    }
+
+    let inputs = TaskKindConfirmInputs {
+        first_pass,
+        raw_input,
+        model: sidecar_model.as_deref(),
+    };
+
+    let attempt_started = Instant::now();
+    let outcome = run_task_kind_confirm_attempt(agent, inputs, &sidecar_model);
+    let latency_ms = attempt_started.elapsed().as_millis() as u64;
+
+    let forced = match &outcome {
+        TaskKindConfirmOutcome::Confirmed(c)
+            if c.source == TaskKindConfirmationSource::SecondPassOverridden =>
+        {
+            Some(c.task_kind)
+        }
+        _ => None,
+    };
+
+    log_task_kind_confirm_outcome(
+        &outcome,
+        &session_id,
+        sidecar_model.as_deref(),
+        turn_index,
+        first_pass,
+        Some(latency_ms),
+    );
+    forced
+}
+
+/// Inner attempt: consumes the per-turn cap and drives the sidecar client when
+/// a model is configured; otherwise returns `Fallback(SidecarUnavailable)`
+/// without consuming the cap (D3 — the `sidecar: None` no-op that keeps the
+/// ~3400 lib tests deterministic).
+fn run_task_kind_confirm_attempt(
+    agent: &mut Agent,
+    inputs: TaskKindConfirmInputs<'_>,
+    sidecar_model: &Option<String>,
+) -> TaskKindConfirmOutcome {
+    if let Some(sidecar_name) = sidecar_model.as_ref() {
+        // We are about to dispatch — consume the per-turn cap regardless of
+        // success/failure so a timeout / malformed / oversized response cannot
+        // re-trigger another dispatch in the same user-input.
+        agent.task_kind_confirm_called_this_turn = true;
+        let confirm_client = agent
+            .client
+            .clone_with_overrides(TASK_KIND_CONFIRM_TIMEOUT_SECS, 384)
+            .ok();
+        run_task_kind_confirm_with_strategy(inputs, |prompt| match confirm_client.as_ref() {
+            Some(c) => c
+                .chat_text(
+                    sidecar_name,
+                    &[ConversationMessage::user(prompt.to_string())],
+                )
+                .map(|reply| reply.content),
+            None => Err("client clone_with_overrides failed".to_string()),
+        })
+    } else {
+        // sidecar_model is None — orchestrator returns Fallback(SidecarUnavailable)
+        // without invoking the closure and without consuming the cap.
+        run_task_kind_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod task_kind_preflight_tests {
+    use super::preflight_task_kind_skip_reason;
+    use super::task_kind_confirm::TaskKindSkipReason;
+    use crate::modes::plan_act::ExecutionMode;
+
+    /// Issue #926 (AC7 / AC2 per-turn cap / DR2-001): the preflight gate skips
+    /// (before any sidecar dispatch) on a consumed cap, Plan mode, or the env
+    /// disable, and only otherwise allows the attempt. Cap takes precedence over
+    /// Plan over env (the order the WorkMode mirror uses).
+    #[test]
+    fn preflight_skip_reason_precedence_and_pass_through() {
+        // Cap consumed wins regardless of mode/env.
+        assert_eq!(
+            preflight_task_kind_skip_reason(true, ExecutionMode::Act, false),
+            Some(TaskKindSkipReason::PerTurnCapConsumed)
+        );
+        assert_eq!(
+            preflight_task_kind_skip_reason(true, ExecutionMode::Plan, true),
+            Some(TaskKindSkipReason::PerTurnCapConsumed)
+        );
+        // AC7: Plan mode skips (cap not yet consumed).
+        assert_eq!(
+            preflight_task_kind_skip_reason(false, ExecutionMode::Plan, false),
+            Some(TaskKindSkipReason::PlanMode)
+        );
+        // Env disable skips in Act mode.
+        assert_eq!(
+            preflight_task_kind_skip_reason(false, ExecutionMode::Act, true),
+            Some(TaskKindSkipReason::EnvDisabled)
+        );
+        // Otherwise: no skip → the attempt proceeds.
+        assert_eq!(
+            preflight_task_kind_skip_reason(false, ExecutionMode::Act, false),
+            None
+        );
     }
 }
