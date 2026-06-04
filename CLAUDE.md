@@ -70,6 +70,7 @@ Rust 版 local-first coding agent (Ollama 専用、`workspace/v0.1.0` ベース)
 - 永続化 / log payload は `logging::mask_payload_inplace` を **最終防衛線** として通す
 - summary_id 系の正規化は `src/photon/prompt.rs::sanitize_summary_id` を **SSOT** として注入側 / 評価側の双方で必ず通す (DR4-002)
 - localhost / credential なし URL 制約: `validate_localhost_url`
+- **recovery/repair prompt masking (Issue #931)**: model-facing な recovery/repair prompt・system note・tool-result error・`json!` wire payload に載る LLM/request 由来の path/reason は **render point で必ず mask する** (これらは `mask_payload_inplace` を通らない)。許可された 3 経路のみ: (A) `recovery.rs::mask_recovery_path` (builder 内部)、(B) `task_contract.rs::mask_and_cap_recovery_field` (convention doc SSOT、loop_run inline / Choke C error producer、mask+256cap)、(C) `json!` の path-identity は `mask_secrets` のみ (cap なし、ordinary path は no-op で exact 維持)・reason/free-text は (B)。新 renderer が raw 値を直接埋め込むと in-crate source-scan guard (`recovery_masking_source_scan.rs`: function-scoped allowlist + intra-function taint pass + broad smoke) が fail する。`mask_and_cap_label`/`mask_obligation_value` は obligation label と共有 SSOT で byte-identical 維持。
 
 ## Development Expectations
 

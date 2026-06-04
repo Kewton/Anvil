@@ -1098,6 +1098,15 @@ mod data_capability_e2e_tests;
 // out of the production binary; the explicit `mod` is required (no auto-discovery).
 #[cfg(test)]
 mod ops_capability_e2e_tests;
+// Issue #931 (P1c): in-crate `#[cfg(test)]` suite for the recovery-prompt
+// masking convention — enumerated mask + byte-equality golden tests for the
+// Choke B/C renderers and Choke D `json!` wire payloads, the shared-SSOT
+// (`obligation_report_label`) byte-identity regression, and the structural
+// source-scan guard (function-scoped allowlist + intra-function taint pass +
+// broad smoke). `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). No facade re-export (DR3-001).
+#[cfg(test)]
+mod recovery_masking_tests;
 // Issue #924 (P7): in-crate E2E test module for the scaffold/manifest coding
 // guard — `scaffold_allowed_for_active_task` SSOT + the 10 fn-entry gates +
 // `mode_deterministic_scaffold_spec` branch-local gate + the artifact-path

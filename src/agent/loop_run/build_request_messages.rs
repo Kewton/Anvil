@@ -322,11 +322,17 @@ fn append_focused_edit_request_messages(
         })
         .flatten();
     let exact_anchor = recovery_anchor.or_else(|| compact_anchor.clone());
-    let target_display = target
-        .strip_prefix(&agent.work_root)
-        .unwrap_or(target)
-        .to_string_lossy()
-        .replace('\\', "/");
+    // Issue #931 (Choke C / DR4-003): mask the filter target so it matches the
+    // now-masked path token in the retained policy error (symmetric with
+    // `artifact_directed_policy_violation_message`). A secret-shaped target then
+    // still fires this note with masked content; ordinary paths are unchanged.
+    let target_display = super::task_contract::mask_and_cap_recovery_field(
+        &target
+            .strip_prefix(&agent.work_root)
+            .unwrap_or(target)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     if let Some(note) = focused_edit_policy_violation_feedback_note(
         &agent.session.working_memory.unresolved_errors,
         effective_tool_policy.allowed_tool_names_for_prompt(),
