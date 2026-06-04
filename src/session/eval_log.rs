@@ -82,6 +82,13 @@ pub struct EvalRecord {
     /// intentionally unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_diagnostics: Option<TerminalDiagnosticsSummary>,
+    /// Issue #950: distinct controller recovery strategies attempted during
+    /// delegated local-LLM persistence. Labels are static controller-owned
+    /// strings, never raw commands, paths, tool args, or approval details.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub recovery_strategy_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_strategies: Vec<String>,
     /// Issue #904: machine-readable evaluation taxonomy for no-PAM/PAM
     /// aggregation. External postcheck agreement is intentionally explicit:
     /// the in-process turn log cannot know the harness result unless a future
@@ -363,6 +370,10 @@ impl EvalRecord {
     }
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 // ---------------------------------------------------------------------------
 // OnceLock state
 // ---------------------------------------------------------------------------
@@ -557,6 +568,8 @@ pub fn build_eval_record_with_terminal_context(
         photon_canary: 0,
         auto_promote,
         terminal_diagnostics,
+        recovery_strategy_count: 0,
+        recovery_strategies: Vec::new(),
         evaluation_taxonomy,
         completion_reason,
         final_outcome: final_outcome.to_string(),
@@ -1082,6 +1095,8 @@ mod tests {
                 },
                 1,
             )),
+            recovery_strategy_count: 0,
+            recovery_strategies: Vec::new(),
             evaluation_taxonomy: build_evaluation_taxonomy(
                 "fix the bug",
                 "done",
