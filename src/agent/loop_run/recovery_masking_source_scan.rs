@@ -19,22 +19,31 @@
 //      sample and PASSES on a masked sample (so the scanner cannot silently
 //      no-op).
 
+// Calls that sanitize a value at the render point. `recovery::` is a sanitize
+// boundary (Issue #931 PR-review High-2): every path-taking `recovery.rs` builder
+// (Choke A) masks its argument internally via `mask_recovery_path`, so a value
+// passed into a `recovery::<builder>(...)` call is masked by construction. This
+// keeps the double-protected callers (reply_retry / recovery_targets /
+// forced_small_edit / scaffold_pipeline, which hand `progress_path_display`
+// output to a `recovery::` builder) from being false positives.
 const MASK_CALLS: &[&str] = &[
     "mask_and_cap_recovery_field",
     "mask_recovery_path",
     "mask_secrets",
+    "recovery::",
 ];
 
 // Raw, LLM/request-derived values that must be masked before reaching a prompt
-// sink. `policy_target_path(` is included (Issue #931 CB-002): the artifact-
-// directed Bash-rejection branch and `restricted_tool_policy_error` derive a
-// model-facing target path from it. Direct `policy.target` field access is
-// already covered because it reaches prompts via `progress_path_display(` (also
-// a source here) and the allowlisted helpers.
+// sink. `policy_target_path(` (Issue #931 CB-002): the artifact-directed Bash-
+// rejection branch + `restricted_tool_policy_error` derive a model-facing target
+// path from it. Bare `.reason` is intentionally NOT a source: it over-matches any
+// `.reason` field in the now repo-wide broad smoke (Issue #931 PR-review High-1);
+// every recovery reason value is a `hint.reason` / `target_hint.reason`, both
+// caught by the `hint.reason` token, so coverage is unchanged for recovery code.
+// Direct `policy.target` reaches prompts via `progress_path_display(` (also here).
 const RAW_TAINT_SOURCES: &[&str] = &[
     "hint.path",
     "hint.reason",
-    ".reason",
     "progress_path_display(",
     "policy_target_path(",
 ];
@@ -46,6 +55,14 @@ const PROMPT_SINKS: &[&str] = &[
     "push_system_note",
     "ConversationMessage",
 ];
+
+// Sinks that put text in front of the MODEL (the request body), as opposed to a
+// `log_llm_event(json!{...})` logging payload — which IS masked by the
+// `mask_payload_inplace` last line of defense and so is NOT a wire leak. The
+// repo-wide broad smoke (Issue #931 PR-review High-1) qualifies a function only
+// when it reaches one of these, so logging `json!`/`format!` builders are not
+// false positives.
+const MODEL_SINKS: &[&str] = &["ConversationMessage", "push_system_note"];
 
 const MASK_ANNOTATION: &str = "// #931-mask-checked:";
 
@@ -301,6 +318,169 @@ fn taint_scan(body: &str) -> Option<String> {
                 ));
             }
         }
+    }
+    // Multi-line sink-macro span pass (Issue #931 PR-review High-2): the line-based
+    // pass above only flags a raw source when it shares a logical line with the
+    // sink token, so a `json!({ ... })` / multi-line `format!(...)` whose raw
+    // `hint.path` / `hint.reason` field lands on its OWN line (the field/arg line
+    // does NOT contain `json!` / `format!`) is missed. Scan each paren-balanced
+    // `json!` / `format!` invocation span and require every physical line bearing
+    // a raw source to carry a render-point mask call (or annotation) on that line.
+    macro_span_leaks(body)
+}
+
+/// Scan each paren-balanced `json!(...)` / `format!(...)` invocation in `body`. A
+/// physical line inside a span that references a raw source (outside string prose)
+/// must apply a render-point mask on that same line, else it is a leak. Per-line
+/// granularity matches the one-field-per-line `json!` and one-arg-per-line
+/// `format!` shapes the recovery/repair renderers use. Returns the first leak.
+fn macro_span_leaks(body: &str) -> Option<String> {
+    let body_lines: Vec<&str> = body.lines().collect();
+    for macro_token in ["json!", "format!"] {
+        let mut from = 0;
+        while let Some(rel) = body[from..].find(macro_token) {
+            let tok_start = from + rel;
+            from = tok_start + macro_token.len();
+            // Skip a `json!`/`format!` that is an argument to a LOGGING call
+            // (`log_llm_event(...)` / `tracing::...`): those payloads are masked by
+            // the `mask_payload_inplace` last line of defense and never reach the
+            // model wire, so a raw `target_hint.path` there is not a leak (Issue
+            // #931 PR-review High-1). A model-facing `let payload = json!({...})`
+            // that is later embedded into a `ConversationMessage` has no logging
+            // call in its statement prefix and is still checked.
+            if macro_in_logging_context(body, tok_start) {
+                continue;
+            }
+            // The span starts at the `(` (or `{` for `json!{...}`) that opens the
+            // macro invocation; extract its delimiter-balanced text.
+            let Some(span) = balanced_call_span(&body[tok_start..]) else {
+                continue;
+            };
+            // Annotation whitelisting (DR3-002, standalone preceding line). The
+            // whole invocation is whitelisted if its own line or the immediately
+            // preceding physical line carries the annotation.
+            let macro_line_idx = body[..tok_start].matches('\n').count();
+            let macro_line = body_lines.get(macro_line_idx).copied().unwrap_or("");
+            let line_before_macro = macro_line_idx
+                .checked_sub(1)
+                .and_then(|i| body_lines.get(i).copied())
+                .unwrap_or("");
+            if macro_line.contains(MASK_ANNOTATION)
+                || line_before_macro.trim().starts_with(MASK_ANNOTATION)
+            {
+                continue;
+            }
+            let span_lines: Vec<&str> = span.lines().collect();
+            for (k, raw_line) in span_lines.iter().enumerate() {
+                if raw_line.contains(MASK_ANNOTATION) {
+                    continue;
+                }
+                let code = strip_string_literals_keep_interpolations(raw_line);
+                if !RAW_TAINT_SOURCES.iter().any(|s| code.contains(s)) {
+                    continue;
+                }
+                if body_contains_mask_call(raw_line) {
+                    continue;
+                }
+                // A standalone annotation on the line preceding this field/arg
+                // (within the span, or the macro line for the first span line).
+                let prev = if k > 0 {
+                    span_lines[k - 1]
+                } else {
+                    macro_line
+                };
+                if prev.trim().starts_with(MASK_ANNOTATION) {
+                    continue;
+                }
+                return Some(format!(
+                    "raw taint source reaches `{macro_token}` sink (multi-line span): {}",
+                    raw_line.trim()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Calls whose `json!`/`format!` argument is a LOGGING payload (masked by
+/// `mask_payload_inplace`), not a model-facing prompt.
+const LOGGING_CALLS: &[&str] = &["log_llm_event", "tracing::"];
+
+/// Whether the `json!`/`format!` at `tok_start` is an argument to a logging call.
+/// Heuristic: scan the current statement (back to the previous `;` / `{` / `}`)
+/// up to the macro token for a `LOGGING_CALLS` name. A model-facing
+/// `let payload = serde_json::json!({...})` has no such name in its statement
+/// prefix and is therefore still scanned.
+fn macro_in_logging_context(body: &str, tok_start: usize) -> bool {
+    let stmt_start = body[..tok_start]
+        .rfind([';', '{', '}'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let prefix = &body[stmt_start..tok_start];
+    LOGGING_CALLS.iter().any(|c| prefix.contains(c))
+}
+
+/// Given source starting at a macro token (e.g. `json!({...})`), return the text
+/// from the opening delimiter (`(` or `{`) through its matched close, ignoring
+/// braces/parens inside string/char literals and comments. `None` if not found.
+fn balanced_call_span(src: &str) -> Option<String> {
+    let chars: Vec<char> = src.chars().collect();
+    // Find the first `(` or `{` that opens the invocation.
+    let mut open_idx = None;
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '(' || ch == '{' {
+            open_idx = Some(i);
+            break;
+        }
+        // A non-delimiter, non-whitespace, non-`!` char before the opener means
+        // this `format!`/`json!` was a substring of an identifier — bail.
+        if !ch.is_whitespace() && ch != '!' && !ch.is_alphanumeric() && ch != '_' {
+            return None;
+        }
+    }
+    let open = open_idx?;
+    let opener = chars[open];
+    let closer = if opener == '(' { ')' } else { '}' };
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut in_char = false;
+    let mut i = open;
+    let mut byte_idx: usize = src.char_indices().nth(open).map(|(b, _)| b).unwrap_or(0);
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied().unwrap_or('\0');
+        if in_str || in_char {
+            if ch == '\\' {
+                byte_idx += ch.len_utf8() + next.len_utf8();
+                i += 2;
+                continue;
+            }
+            if in_str && ch == '"' {
+                in_str = false;
+            } else if in_char && ch == '\'' {
+                in_char = false;
+            }
+        } else {
+            match ch {
+                '"' => in_str = true,
+                '\'' => {
+                    let two = chars.get(i + 2).copied().unwrap_or('\0');
+                    if next == '\\' || two == '\'' {
+                        in_char = true;
+                    }
+                }
+                c if c == opener => depth += 1,
+                c if c == closer => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(src[..byte_idx + ch.len_utf8()].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        byte_idx += ch.len_utf8();
+        i += 1;
     }
     None
 }
@@ -567,6 +747,34 @@ fn source_scan_allowlisted_renderers_exist_and_mask() {
 // Layer 2: broad smoke scan over src/agent/loop_run/*.rs.
 // ---------------------------------------------------------------------------
 
+/// Read EVERY `src/agent/loop_run/*.rs` source file at test time (Issue #931
+/// PR-review High-1). The broad smoke runs over the whole directory — not a fixed
+/// include_str! list — so a NEW renderer added in any loop_run module is linted
+/// without anyone remembering to register it. Test-only modules (`*_tests.rs`,
+/// the `recovery_masking_*` scan/test files) are excluded: they are not
+/// production renderers and legitimately reference raw fixture paths.
+fn all_loop_run_sources() -> Vec<(String, String)> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent/loop_run");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("read loop_run dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.ends_with("_tests.rs") || name.starts_with("recovery_masking_") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("read loop_run source");
+        out.push((name, src));
+    }
+    out
+}
+
 #[test]
 fn source_scan_broad_smoke_catches_unmasked_renderers() {
     // For each scanned file, find every non-allowlisted fn whose body co-occurs a
@@ -577,14 +785,19 @@ fn source_scan_broad_smoke_catches_unmasked_renderers() {
     // enough — e.g. a `log_llm_event(json!{ "reason": validation.reason })` with a
     // static-str `.reason` and a hashed path is a LOGGING event, not a leak.)
     let mut qualifying_fns = 0usize;
-    for (file, source) in loop_run_sources() {
-        for fn_name in enumerate_fn_names(source) {
-            let Some(body) = extract_fn_body(source, &fn_name) else {
+    for (file, source) in all_loop_run_sources() {
+        let file = file.as_str();
+        for fn_name in enumerate_fn_names(&source) {
+            let Some(body) = extract_fn_body(&source, &fn_name) else {
                 continue;
             };
             let has_raw_source = RAW_TAINT_SOURCES.iter().any(|s| body.contains(s));
-            let has_sink = PROMPT_SINKS.iter().any(|s| body.contains(s));
-            if !has_raw_source || !has_sink {
+            // Only MODEL-facing functions qualify: a function that builds a `json!`
+            // / `format!` solely for `log_llm_event` (no ConversationMessage /
+            // push_system_note) is masked by `mask_payload_inplace` and is not a
+            // wire leak (Issue #931 PR-review High-1).
+            let has_model_sink = MODEL_SINKS.iter().any(|s| body.contains(s));
+            if !has_raw_source || !has_model_sink {
                 continue;
             }
             qualifying_fns += 1;
@@ -744,6 +957,47 @@ fn source_scan_self_verifies_on_fixtures() {
     assert!(
         taint_scan(&policy_masked_body).is_none(),
         "self-verify: a policy_target_path value masked inside a multi-line .map must PASS"
+    );
+
+    // Issue #931 PR-review High-2: a MULTI-LINE `json!` whose raw `hint.path` field
+    // lands on its OWN line (the field line does not contain the `json!` token) MUST
+    // be flagged by the macro-span pass — the line-based pass alone misses it.
+    let multiline_json_raw = "fn ml_raw(hint: &H) -> M {\n    \
+        let payload = serde_json::json!({\n        \
+            \"path\": hint.path,\n    \
+        });\n    \
+        ConversationMessage::user(format!(\"{payload}\"))\n}";
+    let ml_raw_body = extract_fn_body(multiline_json_raw, "ml_raw").expect("fixture body");
+    assert!(
+        taint_scan(&ml_raw_body).is_some(),
+        "self-verify: a raw hint.path on its own line inside a multi-line json! must FLAG"
+    );
+
+    // The same multi-line `json!` with the field masked MUST pass.
+    let multiline_json_masked = "fn ml_masked(hint: &H) -> M {\n    \
+        let payload = serde_json::json!({\n        \
+            \"path\": mask_secrets(&hint.path),\n    \
+        });\n    \
+        ConversationMessage::user(format!(\"{payload}\"))\n}";
+    let ml_masked_body = extract_fn_body(multiline_json_masked, "ml_masked").expect("fixture body");
+    assert!(
+        taint_scan(&ml_masked_body).is_none(),
+        "self-verify: a masked field inside a multi-line json! must PASS"
+    );
+
+    // A multi-line `json!` that is an argument to a LOGGING call is masked by
+    // `mask_payload_inplace` and must NOT be flagged even with a raw field.
+    let logging_json = "fn lg(hint: &H) {\n    \
+        log_llm_event(\n        \
+            \"event.name\",\n        \
+            serde_json::json!({\n            \
+                \"path\": hint.path,\n        \
+            }),\n    \
+        );\n}";
+    let lg_body = extract_fn_body(logging_json, "lg").expect("fixture body");
+    assert!(
+        taint_scan(&lg_body).is_none(),
+        "self-verify: a raw field inside a log_llm_event json! must PASS (logging defense)"
     );
 }
 

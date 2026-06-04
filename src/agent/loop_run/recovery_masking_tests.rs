@@ -6,9 +6,13 @@
 //! - **Enumerated mask tests** (AC1): every Choke-B / Choke-C renderer and every
 //!   Choke-D `json!` wire field, fed a secret-shaped path/reason, must not leak
 //!   the secret substring.
-//! - **Byte-equality goldens** (AC5): every renderer arm, fed an ORDINARY path,
-//!   must be byte-identical to the pinned snapshot (proves `mask_secrets` /
-//!   `mask_and_cap_recovery_field` are no-ops on ordinary input).
+//! - **Byte-stability** (AC5): the extracted Choke-B pure helpers
+//!   (`recovery_messages` / `focused_edit_recovery`) are pinned byte-identical to a
+//!   golden across ALL their arms on an ORDINARY path; the verifier-orchestration
+//!   note builders, the `tool_policy` error producers, and the diagnostic + repair
+//!   `json!` wire payloads each assert the ordinary path/reason survives verbatim.
+//!   Together these prove `mask_secrets` / `mask_and_cap_recovery_field` are no-ops
+//!   on ordinary input, so masking never alters a real prompt.
 //! - **Shared-SSOT regression** (AC5 / Phase F): `obligation_report_label` output
 //!   is byte-identical to its pinned snapshot (proves `mask_and_cap_label` /
 //!   `mask_obligation_value` / `mask_secrets` are unchanged).
@@ -313,6 +317,11 @@ fn verifier_repair_diagnostic_pending_note_masks_secret() {
     let note =
         super::verifier_orchestration::verifier_repair_diagnostic_pending_note(&context, None);
     assert_masked("verifier_repair_diagnostic_pending_note", &note);
+    // Byte-stability: an ordinary path survives verbatim (the mask is a no-op).
+    let ordinary = verifier_context_for("app/page.tsx", "test");
+    let ord =
+        super::verifier_orchestration::verifier_repair_diagnostic_pending_note(&ordinary, None);
+    assert!(ord.contains("app/page.tsx"), "ordinary path altered: {ord}");
 }
 
 #[test]
@@ -326,6 +335,15 @@ fn task_contract_verifier_repair_note_masks_secret() {
         Some(&context),
     );
     assert_masked("task_contract_verifier_repair_note", &note);
+    let ordinary = verifier_context_for("app/page.tsx", "test");
+    let ord = super::verifier_orchestration::task_contract_verifier_repair_note(
+        "python3 -m pytest",
+        "out",
+        1,
+        3,
+        Some(&ordinary),
+    );
+    assert!(ord.contains("app/page.tsx"), "ordinary path altered: {ord}");
 }
 
 #[test]
@@ -339,6 +357,15 @@ fn task_contract_verifier_targeted_edit_required_note_masks_secret() {
         3,
     );
     assert_masked("task_contract_verifier_targeted_edit_required_note", &note);
+    let ordinary = verifier_context_for("app/page.tsx", "test");
+    let ord = super::verifier_orchestration::task_contract_verifier_targeted_edit_required_note(
+        &ordinary,
+        Path::new("/work"),
+        false,
+        1,
+        3,
+    );
+    assert!(ord.contains("app/page.tsx"), "ordinary path altered: {ord}");
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +401,15 @@ fn artifact_directed_tool_policy_error_masks_path_in_error() {
     )
     .expect("policy error should fire");
     assert_masked("artifact_directed_tool_policy_error", &err);
+    // Byte-stability: an ordinary path survives verbatim (the mask is a no-op).
+    let ord = super::tool_policy::artifact_directed_tool_policy_error(
+        "Bash",
+        &serde_json::json!({"command": "ls"}),
+        &work_root.join("app/page.tsx"),
+        work_root,
+    )
+    .expect("policy error should fire");
+    assert!(ord.contains("app/page.tsx"), "ordinary path altered: {ord}");
 }
 
 #[test]
@@ -534,6 +570,43 @@ fn repair_wire_payload_masks_secret_path_and_reason() {
     assert!(
         !serialized.contains(SECRET),
         "secret leaked into repair wire payload: {serialized}"
+    );
+}
+
+#[test]
+fn repair_wire_payload_byte_stable_for_ordinary_path() {
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let work_root = temp.path();
+    fs::create_dir_all(work_root.join("app")).unwrap();
+    let rel = "app/page.tsx";
+    fs::write(work_root.join(rel), "value = 1\n").unwrap();
+    let context = verifier_context_for(rel, "short bounded reason");
+    let target_hint = RecoveryTargetHint {
+        role: ArtifactRole::Implementation,
+        path: rel.to_string(),
+        reason: "short bounded reason".to_string(),
+    };
+    let messages = super::verifier_orchestration::verifier_repair_pass_messages(
+        work_root,
+        &context,
+        &target_hint,
+        "do the task",
+        None,
+    )
+    .expect("repair pass messages should build");
+    let serialized = messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        serialized.contains(rel),
+        "ordinary path must survive byte-exact on the repair wire: {serialized}"
+    );
+    assert!(
+        serialized.contains("short bounded reason"),
+        "ordinary reason must survive byte-exact on the repair wire: {serialized}"
     );
 }
 
