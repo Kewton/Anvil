@@ -1098,6 +1098,14 @@ mod data_capability_e2e_tests;
 // out of the production binary; the explicit `mod` is required (no auto-discovery).
 #[cfg(test)]
 mod ops_capability_e2e_tests;
+// Issue #924 (P7): in-crate E2E test module for the scaffold/manifest coding
+// guard — `scaffold_allowed_for_active_task` SSOT + the 10 fn-entry gates +
+// `mode_deterministic_scaffold_spec` branch-local gate + the artifact-path
+// manifest gate. `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). Mirrors `data_capability_e2e_tests.rs`
+// (CB-001 / DR3-001) — no facade re-export.
+#[cfg(test)]
+mod scaffold_coding_guard_e2e_tests;
 mod summary;
 mod task_contract;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
