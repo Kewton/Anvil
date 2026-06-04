@@ -6572,6 +6572,45 @@ mod tests {
     }
 
     #[test]
+    fn non_coding_docs_deliverable_gap_projects_to_generic_missing_deliverable_job() {
+        let contract = TaskContract::from_request(
+            "Update README.md with installation, usage, and testing sections",
+        );
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(
+            contract.objective_contract().deliverable_kind,
+            ObjectiveDeliverableKind::DocumentSections
+        );
+        let evidence = EvidenceSet::new();
+        let excerpts = ArtifactExcerpts::new();
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                ref missing,
+                ..
+            } if missing == &[ArtifactRole::UsageDocs]
+        ));
+        assert_eq!(
+            super::super::active_job_arbiter::recovery_job_kind_for_artifact_recovery_action(
+                &action
+            ),
+            Some(super::super::active_job_arbiter::RecoveryJobKind::MissingDeliverableJob)
+        );
+    }
+
+    #[test]
     fn non_coding_task_kinds_do_not_request_coding_verifier() {
         let cases = [
             (

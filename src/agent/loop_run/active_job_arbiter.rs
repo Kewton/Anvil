@@ -114,6 +114,31 @@ pub(super) fn loop_control_action_requires_missing_verifier_setup(
     )
 }
 
+/// Generic recovery job categories introduced by Issue #948.
+///
+/// These are a projection over the existing controller-specific jobs. They let
+/// coding and non-coding objective gaps share a lifecycle vocabulary while the
+/// legacy job/terminal labels remain available for compatibility consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::enum_variant_names)] // Issue #948 names are the compatibility vocabulary.
+pub(super) enum RecoveryJobKind {
+    MissingDeliverableJob,
+    MissingEvidenceJob,
+    EvidenceFailedJob,
+    ToolFailureJob,
+}
+
+impl RecoveryJobKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            RecoveryJobKind::MissingDeliverableJob => "MissingDeliverableJob",
+            RecoveryJobKind::MissingEvidenceJob => "MissingEvidenceJob",
+            RecoveryJobKind::EvidenceFailedJob => "EvidenceFailedJob",
+            RecoveryJobKind::ToolFailureJob => "ToolFailureJob",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RecoveryOwner {
     None,
@@ -149,6 +174,15 @@ impl RecoveryOwner {
                     | None => Self::None,
                 }
             }
+        }
+    }
+
+    pub(super) fn recovery_job_kind(self) -> Option<RecoveryJobKind> {
+        match self {
+            Self::None => None,
+            Self::ArtifactCompletion => Some(RecoveryJobKind::MissingDeliverableJob),
+            Self::RepairJob => Some(RecoveryJobKind::EvidenceFailedJob),
+            Self::MissingVerifierJob => Some(RecoveryJobKind::MissingEvidenceJob),
         }
     }
 
@@ -189,6 +223,11 @@ impl RecoveryDispatchGate {
 
     pub(super) fn allows_deterministic_fallback(self) -> bool {
         self.owner.allows_deterministic_fallback()
+    }
+
+    #[allow(dead_code)] // Issue #948: generic job projection for telemetry/report callers.
+    pub(super) fn recovery_job_kind(self) -> Option<RecoveryJobKind> {
+        self.owner.recovery_job_kind()
     }
 }
 
@@ -248,6 +287,17 @@ impl ActiveJobKind {
             ActiveJobKind::SetupBootstrap => "SetupBootstrap",
             ActiveJobKind::FocusedEditRecovery => "FocusedEditRecovery",
             ActiveJobKind::LocalLlmSmallEditAfterRead => "LocalLlmSmallEditAfterRead",
+        }
+    }
+
+    fn default_recovery_job_kind(self) -> RecoveryJobKind {
+        match self {
+            ActiveJobKind::VerifierRepair => RecoveryJobKind::EvidenceFailedJob,
+            ActiveJobKind::ForcedSmallEditRecovery
+            | ActiveJobKind::ArtifactRecovery
+            | ActiveJobKind::FocusedEditRecovery
+            | ActiveJobKind::LocalLlmSmallEditAfterRead => RecoveryJobKind::MissingDeliverableJob,
+            ActiveJobKind::SetupBootstrap => RecoveryJobKind::ToolFailureJob,
         }
     }
 }
@@ -413,6 +463,16 @@ pub(super) struct JobCandidate {
     /// `artifact_directed` / `focused_edit` / ...) was used.
     pub(super) policy: EffectiveToolPolicy,
     pub(super) budget: Budget,
+}
+
+impl JobCandidate {
+    pub(super) fn recovery_job_kind(&self) -> RecoveryJobKind {
+        match &self.desired_action {
+            DesiredAction::MissingVerifierCreate => RecoveryJobKind::MissingEvidenceJob,
+            DesiredAction::SetupBash => RecoveryJobKind::ToolFailureJob,
+            _ => self.kind.default_recovery_job_kind(),
+        }
+    }
 }
 
 /// Arbitration result. `selected.is_none()` projects to
@@ -604,6 +664,19 @@ pub(super) fn should_install_setup_bootstrap(
     false
 }
 
+#[allow(dead_code)] // Issue #948: projection seam; first production consumers are telemetry/reporting follow-ups.
+pub(super) fn recovery_job_kind_for_artifact_recovery_action(
+    action: &ArtifactRecoveryAction,
+) -> Option<RecoveryJobKind> {
+    match action {
+        ArtifactRecoveryAction::Continue { .. } => Some(RecoveryJobKind::MissingDeliverableJob),
+        ArtifactRecoveryAction::RunVerifier => Some(RecoveryJobKind::MissingEvidenceJob),
+        ArtifactRecoveryAction::RepairArtifact { .. } => Some(RecoveryJobKind::EvidenceFailedJob),
+        ArtifactRecoveryAction::Done => None,
+        ArtifactRecoveryAction::SafeStop { .. } => Some(RecoveryJobKind::ToolFailureJob),
+    }
+}
+
 /// Pure projection: `ActiveJobSelection` → `EffectiveToolPolicy`.
 ///
 /// DR1-001: `JobCandidate.policy` already IS the `EffectiveToolPolicy`
@@ -671,6 +744,8 @@ pub(super) fn build_active_job_selected_payload(
                 .unwrap_or(serde_json::Value::Null);
             serde_json::json!({
                 "job_kind": candidate.kind.as_str(),
+                "legacy_job_kind": candidate.kind.as_str(),
+                "recovery_job_kind": candidate.recovery_job_kind().as_str(),
                 "desired_action": candidate.desired_action.label(),
                 "policy_reason": candidate.policy.reason().as_str(),
                 "allowed_tools_count": candidate
@@ -683,6 +758,8 @@ pub(super) fn build_active_job_selected_payload(
         }
         None => serde_json::json!({
             "job_kind": "None",
+            "legacy_job_kind": "None",
+            "recovery_job_kind": serde_json::Value::Null,
             "desired_action": serde_json::Value::Null,
             "policy_reason": projected_policy.reason().as_str(),
             "allowed_tools_count": allowed_tool_kinds,
@@ -1007,6 +1084,29 @@ mod tests {
         assert_eq!(policy, EffectiveToolPolicy::unrestricted());
     }
 
+    #[test]
+    fn active_job_payload_preserves_legacy_job_label_and_adds_recovery_job_kind() {
+        let selection = ActiveJobSelection {
+            selected: Some(candidate(ActiveJobKind::VerifierRepair, Budget::Unbounded)),
+            rejected: vec![],
+        };
+        let payload = build_active_job_selected_payload(&selection, 9, 0, 0);
+        let selected = payload.get("selected").expect("selected block");
+
+        assert_eq!(
+            selected.get("job_kind").and_then(|v| v.as_str()),
+            Some("VerifierRepair")
+        );
+        assert_eq!(
+            selected.get("legacy_job_kind").and_then(|v| v.as_str()),
+            Some("VerifierRepair")
+        );
+        assert_eq!(
+            selected.get("recovery_job_kind").and_then(|v| v.as_str()),
+            Some("EvidenceFailedJob")
+        );
+    }
+
     // -------- project_policy: 5 kinds --------
 
     fn project_kind_policy(kind: ActiveJobKind) {
@@ -1065,6 +1165,55 @@ mod tests {
             ActiveJobKind::LocalLlmSmallEditAfterRead.as_str(),
             "LocalLlmSmallEditAfterRead"
         );
+    }
+
+    #[test]
+    fn recovery_job_kind_labels_are_stable() {
+        assert_eq!(
+            RecoveryJobKind::MissingDeliverableJob.as_str(),
+            "MissingDeliverableJob"
+        );
+        assert_eq!(
+            RecoveryJobKind::MissingEvidenceJob.as_str(),
+            "MissingEvidenceJob"
+        );
+        assert_eq!(
+            RecoveryJobKind::EvidenceFailedJob.as_str(),
+            "EvidenceFailedJob"
+        );
+        assert_eq!(RecoveryJobKind::ToolFailureJob.as_str(), "ToolFailureJob");
+    }
+
+    #[test]
+    fn active_job_candidates_project_generic_recovery_jobs() {
+        let verifier = candidate(ActiveJobKind::VerifierRepair, Budget::Unbounded);
+        assert_eq!(
+            verifier.recovery_job_kind(),
+            RecoveryJobKind::EvidenceFailedJob
+        );
+
+        let missing_verifier = JobCandidate {
+            kind: ActiveJobKind::VerifierRepair,
+            desired_action: DesiredAction::MissingVerifierCreate,
+            policy: EffectiveToolPolicy::restricted(
+                EffectiveToolPolicyReason::VerifierRepair,
+                vec!["Read", "Edit"],
+            ),
+            budget: Budget::Unbounded,
+        };
+        assert_eq!(
+            missing_verifier.recovery_job_kind(),
+            RecoveryJobKind::MissingEvidenceJob
+        );
+
+        let artifact = candidate(ActiveJobKind::ArtifactRecovery, Budget::Unbounded);
+        assert_eq!(
+            artifact.recovery_job_kind(),
+            RecoveryJobKind::MissingDeliverableJob
+        );
+
+        let setup = candidate(ActiveJobKind::SetupBootstrap, Budget::Unbounded);
+        assert_eq!(setup.recovery_job_kind(), RecoveryJobKind::ToolFailureJob);
     }
 
     #[test]
@@ -1441,6 +1590,35 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_missing_evidence_setup_beats_safe_stop_action() {
+        let next_action = VerifierBootstrapNextAction::RequestSetupEdit;
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_verifier_repair_pending: true,
+            missing_verifier_next_action: Some(next_action.clone()),
+            task_contract_action: Some(ArtifactRecoveryAction::SafeStop {
+                reason: super::super::task_contract::SafeStopReason::VerifierMissing,
+            }),
+            ..loop_inputs()
+        });
+
+        assert_eq!(
+            action,
+            LoopControlAction::ContinueMissingVerifierJob { next_action }
+        );
+        let owner = RecoveryOwner::from_control_action(
+            &action,
+            Some(&ArtifactRecoveryAction::SafeStop {
+                reason: super::super::task_contract::SafeStopReason::VerifierMissing,
+            }),
+        );
+        assert_eq!(
+            owner.recovery_job_kind(),
+            Some(RecoveryJobKind::MissingEvidenceJob)
+        );
+        assert!(loop_control_action_requires_missing_verifier_setup(&action));
+    }
+
+    #[test]
     fn loop_control_plan_mode_never_dispatches_controller_jobs() {
         let action = determine_loop_control_action(LoopControlInputs {
             mode: ExecutionMode::Plan,
@@ -1591,6 +1769,34 @@ mod tests {
                     assert!(gate.allows_deterministic_fallback(), "{label}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn recovery_owners_project_to_generic_job_kinds() {
+        let cases = [
+            (
+                RecoveryOwner::ArtifactCompletion,
+                Some(RecoveryJobKind::MissingDeliverableJob),
+            ),
+            (
+                RecoveryOwner::RepairJob,
+                Some(RecoveryJobKind::EvidenceFailedJob),
+            ),
+            (
+                RecoveryOwner::MissingVerifierJob,
+                Some(RecoveryJobKind::MissingEvidenceJob),
+            ),
+            (RecoveryOwner::None, None),
+        ];
+
+        for (owner, expected) in cases {
+            assert_eq!(owner.recovery_job_kind(), expected, "owner={owner:?}");
+            assert_eq!(
+                RecoveryDispatchGate::from_owner(owner).recovery_job_kind(),
+                expected,
+                "gate owner={owner:?}"
+            );
         }
     }
 

@@ -1,3 +1,4 @@
+use super::active_job_arbiter::RecoveryJobKind;
 use super::repair_job::{RepairNextAction, VerifierBootstrapNextAction};
 use super::task_contract::{ArtifactRecoveryAction, ArtifactRole};
 
@@ -257,6 +258,28 @@ impl RunTerminalOutcome {
     pub(super) fn legacy_label_for_eval(self) -> &'static str {
         self.legacy_label
     }
+
+    #[allow(dead_code)] // Issue #948: generic recovery jobs before every caller migrates.
+    pub(super) fn recovery_job_kind(self) -> Option<RecoveryJobKind> {
+        match self.generic_state {
+            GenericTerminalState::Completed
+            | GenericTerminalState::ControlLoopExhausted
+            | GenericTerminalState::Interrupted => None,
+            GenericTerminalState::MissingDeliverable => {
+                Some(RecoveryJobKind::MissingDeliverableJob)
+            }
+            GenericTerminalState::MissingEvidence => Some(RecoveryJobKind::MissingEvidenceJob),
+            GenericTerminalState::EvidenceFailed
+            | GenericTerminalState::EvidenceBindingFailed
+            | GenericTerminalState::EvidenceRepairExhausted
+            | GenericTerminalState::EvidenceRepairSafeStop => {
+                Some(RecoveryJobKind::EvidenceFailedJob)
+            }
+            GenericTerminalState::EvidenceRunnerMissing
+            | GenericTerminalState::ModelOutputFailure
+            | GenericTerminalState::TransportFailure => Some(RecoveryJobKind::ToolFailureJob),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +356,11 @@ impl ExitReason {
     #[allow(dead_code)] // Issue #947: generic internal terminal vocabulary.
     pub(super) fn generic_label(self) -> &'static str {
         self.generic_terminal_state().label()
+    }
+
+    #[allow(dead_code)] // Issue #948: generic recovery jobs before every caller migrates.
+    pub(super) fn recovery_job_kind(self) -> Option<RecoveryJobKind> {
+        RunTerminalOutcome::from_exit_reason(self).recovery_job_kind()
     }
 
     fn legacy_label(self) -> &'static str {
@@ -645,6 +673,55 @@ mod tests {
             );
             assert_eq!(reason.generic_terminal_state(), generic_state);
             assert_eq!(reason.generic_label(), generic_label);
+            assert_eq!(reason.label(), legacy_label);
+        }
+    }
+
+    #[test]
+    fn terminal_outcome_projects_current_failures_to_recovery_jobs() {
+        let cases = [
+            (
+                ExitReason::MissingRepoEdits,
+                Some(RecoveryJobKind::MissingDeliverableJob),
+                "missing_repo_edits",
+            ),
+            (
+                ExitReason::MissingVerification,
+                Some(RecoveryJobKind::MissingEvidenceJob),
+                "missing_verification",
+            ),
+            (
+                ExitReason::VerifierFailed,
+                Some(RecoveryJobKind::EvidenceFailedJob),
+                "verifier_failed",
+            ),
+            (
+                ExitReason::SafeStopVerifierMissing,
+                Some(RecoveryJobKind::ToolFailureJob),
+                "safe_stop_verifier_missing",
+            ),
+            (
+                ExitReason::RepairExhausted,
+                Some(RecoveryJobKind::EvidenceFailedJob),
+                "repair_exhausted",
+            ),
+            (
+                ExitReason::RepairSafeStop,
+                Some(RecoveryJobKind::EvidenceFailedJob),
+                "repair_safe_stop",
+            ),
+            (
+                ExitReason::ToolCallFormatError,
+                Some(RecoveryJobKind::ToolFailureJob),
+                "tool_call_format_error",
+            ),
+        ];
+
+        for (reason, recovery_job_kind, legacy_label) in cases {
+            let outcome = RunTerminalOutcome::from_exit_reason(reason);
+            assert_eq!(outcome.recovery_job_kind(), recovery_job_kind);
+            assert_eq!(reason.recovery_job_kind(), recovery_job_kind);
+            assert_eq!(outcome.legacy_label_for_eval(), legacy_label);
             assert_eq!(reason.label(), legacy_label);
         }
     }
