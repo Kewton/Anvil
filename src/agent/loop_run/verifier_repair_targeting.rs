@@ -514,7 +514,10 @@ fn verifier_repair_candidate_from_path(
         super::task_contract::ArtifactRole::Setup => 25,
         super::task_contract::ArtifactRole::Test => 15,
         super::task_contract::ArtifactRole::DataOutput => 10,
-        super::task_contract::ArtifactRole::UsageDocs => 5,
+        // Issue #920 (Tier A, cascade-free default): UsageDocs and any future
+        // role get the lowest repair-targeting score (5). Unknown/new roles are
+        // targeted last among same-tier candidates — the conservative default.
+        _ => 5,
     };
     let import_provider_score = if from_verifier_output
         && role == super::task_contract::ArtifactRole::Implementation

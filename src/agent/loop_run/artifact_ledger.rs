@@ -979,6 +979,29 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    // Issue #920 (DR4-001): accepting the `data_output` LLM role-label via
+    // `from_label` must NOT let a non-data path be admitted as a DataOutput
+    // artifact. `role_matches_path` is the Tier-B path-local admission guard and
+    // stays exhaustive (no `_ =>`): a DataOutput role only matches a data file.
+    #[test]
+    fn data_output_role_cannot_admit_non_data_path() {
+        // Non-data paths must NOT be admitted as DataOutput, even though the
+        // role label now round-trips through from_label.
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "src/main.py"));
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "app/main.py"));
+        assert!(!role_matches_path(
+            ArtifactRole::DataOutput,
+            "tests/test_x.py"
+        ));
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "README.md"));
+        // Genuine data files are admitted.
+        assert!(role_matches_path(ArtifactRole::DataOutput, "out.csv"));
+        assert!(role_matches_path(
+            ArtifactRole::DataOutput,
+            "data/records.jsonl"
+        ));
+    }
+
     fn single_root_scope() -> TaskWorkspaceScope {
         TaskWorkspaceScope {
             mode: ScopeMode::SingleProjectRoot,
