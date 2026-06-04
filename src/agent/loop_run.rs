@@ -1098,6 +1098,15 @@ mod data_capability_e2e_tests;
 // out of the production binary; the explicit `mod` is required (no auto-discovery).
 #[cfg(test)]
 mod ops_capability_e2e_tests;
+// Issue #931 (P1c): in-crate `#[cfg(test)]` suite for the recovery-prompt
+// masking convention — enumerated mask + byte-equality golden tests for the
+// Choke B/C renderers and Choke D `json!` wire payloads, the shared-SSOT
+// (`obligation_report_label`) byte-identity regression, and the structural
+// source-scan guard (function-scoped allowlist + intra-function taint pass +
+// broad smoke). `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). No facade re-export (DR3-001).
+#[cfg(test)]
+mod recovery_masking_tests;
 // Issue #924 (P7): in-crate E2E test module for the scaffold/manifest coding
 // guard — `scaffold_allowed_for_active_task` SSOT + the 10 fn-entry gates +
 // `mode_deterministic_scaffold_spec` branch-local gate + the artifact-path
@@ -1106,6 +1115,16 @@ mod ops_capability_e2e_tests;
 // (CB-001 / DR3-001) — no facade re-export.
 #[cfg(test)]
 mod scaffold_coding_guard_e2e_tests;
+// Issue #929 (P1b): combined 6-kind capability-invariant matrix. Consolidates
+// the cross-kind invariants (allows_process_exec / requires_executable_verifier
+// / is_coding / verifier_for_task_kind round-trip) otherwise scattered across
+// verifier.rs `mod tests` + the per-kind capability E2E mods into one canonical
+// table-driven SSOT, with a wildcard-free `expected` match that compile-forces a
+// 7th-kind update. `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). No facade re-export (DR3-001).
+// Task 9 (the SRP trait split) is recorded as not-warranted in the design-policy.
+#[cfg(test)]
+mod capability_matrix_e2e_tests;
 mod summary;
 mod task_contract;
 // Issue #917 (P0.5): per-turn single classification authority accessor.

@@ -7,6 +7,12 @@ use crate::modes::plan_act::PlanStage;
 /// LLM-derived, so mask it (secrets) and length-cap it at the single render
 /// point here — no current or future caller can bypass it. `mask_secrets` is a
 /// no-op on ordinary workspace paths, so actionable target paths are unchanged.
+///
+/// Issue #931: this is Choke A of the recovery-prompt masking convention. The
+/// canonical statement of that convention (all three render-point masks, the
+/// `CAP`=256 vs `MAX_SECTION_LABEL_LEN`=256 separate-constant note, and the
+/// structural source-scan guard) lives on
+/// `crate::agent::loop_run::task_contract::mask_and_cap_recovery_field`'s doc.
 fn mask_recovery_path(path: &str) -> String {
     const CAP: usize = 256;
     let masked = crate::session::feedback::mask_secrets(path);

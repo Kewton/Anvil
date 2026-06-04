@@ -1497,6 +1497,38 @@ fn mask_and_cap_label(value: &str) -> String {
 /// request body, a path that does NOT pass through `mask_payload_inplace`. This is
 /// the same masking + length cap [`obligation_report_label`] applies, exposed so
 /// the recovery-note builders reuse it instead of emitting raw values.
+///
+/// # Issue #931 — recovery-prompt masking convention (SSOT)
+///
+/// This doc comment is the canonical statement of the masking convention for
+/// every recovery/repair model-facing prompt. **The ONLY sanctioned way to put
+/// an LLM/request-derived path or reason into a recovery/repair prompt or onto
+/// the LLM wire is one of these three render-point masks:**
+///
+/// 1. [`mask_and_cap_recovery_field`] (this fn, `loop_run`) — `mask_secrets` +
+///    `MAX_SECTION_LABEL_LEN`=256 char cap. Use for free-text / reason / path
+///    rendered into a `loop_run` recovery note (the `format!`/`push_system_note`
+///    prompt path that bypasses `mask_payload_inplace`).
+/// 2. [`crate::agent::recovery::mask_recovery_path`] (`recovery.rs`) —
+///    `mask_secrets` + a SEPARATE local `CAP`=256 char cap. Used INTERNALLY by
+///    the 14 `recovery.rs` note builders so no caller can bypass it.
+/// 3. [`crate::session::feedback::mask_secrets`] — for the `json!` LLM-wire
+///    path-identity fields ONLY (NO length cap): the model must act on the exact
+///    workspace-relative path, and `mask_secrets` is a no-op on ordinary paths,
+///    so an ordinary path stays byte-exact while a secret-shaped path is redacted.
+///
+/// The mask must be applied **at the render point — inside the function that
+/// builds the prompt string** — so the masking shape is identical across all
+/// three chokes (Choke A `recovery.rs`, Choke B `loop_run`, Choke C
+/// `tool_policy.rs`/`json!` wire) and no new or future renderer can bypass it.
+///
+/// **Cap note (DR1-003):** the `CAP`=256 in [`crate::agent::recovery::mask_recovery_path`]
+/// and `MAX_SECTION_LABEL_LEN`=256 used here are SEPARATE constants whose equality
+/// is a *convention*, not a mechanical share. The shared SSOT is `mask_secrets`
+/// itself, not the cap value — if one cap changes, verify the other deliberately.
+///
+/// A source-scan `#[cfg(test)]` guard (Issue #931 Phase E) enforces this
+/// convention structurally for new renderers.
 pub(super) fn mask_and_cap_recovery_field(value: &str) -> String {
     mask_and_cap_label(value)
 }
@@ -5593,6 +5625,34 @@ mod tests {
         assert!(
             !readme_label.contains(SECRET),
             "secret leaked in required_sections label: {readme_label}"
+        );
+    }
+
+    // Issue #931 (Phase F / AC5): byte-identity regression on the shared-SSOT
+    // (`obligation_report_label` → `mask_and_cap_label` → `mask_obligation_value`
+    // → `mask_secrets`). #931 must NOT perturb the signature / cap / behavior of
+    // the obligation label path. An ordinary-value obligation snapshot is pinned;
+    // if any #931 edit accidentally changed the shared mask helpers, this fails.
+    #[test]
+    fn obligation_report_label_byte_identity_regression_issue931() {
+        let mut readme = DeliverableObligation::readme(
+            "docs/usage.md",
+            vec!["Overview".to_string(), "Examples".to_string()],
+        );
+        // Pin acceptance_criteria deterministically (readme ctor derives them from
+        // sections) so the snapshot is stable and independent of derivation order.
+        readme.acceptance_criteria =
+            vec!["covers overview".to_string(), "covers examples".to_string()];
+        assert_eq!(
+            super::obligation_report_label(&readme),
+            "role=usage_docs, kind=file, path=docs/usage.md, required_sections=Overview|Examples, acceptance_criteria=covers overview|covers examples, schema_sections=Overview|Examples"
+        );
+
+        // Also pin a plain file obligation (no sections / criteria / schema).
+        let file = DeliverableObligation::file(ArtifactRole::Implementation, "src/main.rs");
+        assert_eq!(
+            super::obligation_report_label(&file),
+            "role=implementation, kind=file, path=src/main.rs"
         );
     }
 

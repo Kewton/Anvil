@@ -786,11 +786,16 @@ pub(super) fn verifier_diagnostic_messages(
         &framework_signal,
         &diagnostic_excerpts,
     );
+    // Issue #931 (AC4): every LLM/request-derived path / reason rendered into the
+    // `json!` wire payload below is masked BEFORE construction. Path-identity uses
+    // `mask_secrets` with NO cap (the model must act on the exact path; ordinary
+    // paths are a no-op so stay byte-exact). Free-text reason uses
+    // `mask_and_cap_recovery_field` (mask + 256 cap).
     let excerpts = diagnostic_excerpts
         .iter()
         .map(|excerpt| {
             serde_json::json!({
-                "path": excerpt.path.as_str(),
+                "path": mask_secrets(&excerpt.path),
                 "role": excerpt.role.label(),
                 "excerpt": excerpt.excerpt.as_str(),
             })
@@ -801,7 +806,7 @@ pub(super) fn verifier_diagnostic_messages(
         .map(|finding| {
             serde_json::json!({
                 "kind": finding.kind.as_str(),
-                "path": finding.path.as_str(),
+                "path": mask_secrets(&finding.path),
                 "role": finding.role.label(),
                 "summary": finding.summary.as_str(),
             })
@@ -809,9 +814,9 @@ pub(super) fn verifier_diagnostic_messages(
         .collect::<Vec<_>>();
     let failure_location = context.target_hint.as_ref().map(|hint| {
         serde_json::json!({
-            "path": hint.path,
+            "path": mask_secrets(&hint.path),
             "role": hint.role.label(),
-            "reason": hint.reason,
+            "reason": super::task_contract::mask_and_cap_recovery_field(&hint.reason),
         })
     });
     let mut changed_candidates = context
@@ -820,19 +825,20 @@ pub(super) fn verifier_diagnostic_messages(
         .take(12)
         .map(|hint| {
             serde_json::json!({
-                "path": hint.path,
+                "path": mask_secrets(&hint.path),
                 "role": hint.role.label(),
             })
         })
         .collect::<Vec<_>>();
     for hint in verifier_diagnostic_missing_setup_candidates(work_root, context, active_request) {
+        let masked_path = mask_secrets(&hint.path);
         if changed_candidates.iter().any(|candidate| {
-            candidate.get("path").and_then(serde_json::Value::as_str) == Some(hint.path.as_str())
+            candidate.get("path").and_then(serde_json::Value::as_str) == Some(masked_path.as_str())
         }) {
             continue;
         }
         changed_candidates.push(serde_json::json!({
-            "path": hint.path,
+            "path": masked_path,
             "role": hint.role.label(),
             "candidate_kind": "missing_setup_artifact",
         }));
@@ -843,7 +849,7 @@ pub(super) fn verifier_diagnostic_messages(
         .take(12)
         .map(|target| {
             serde_json::json!({
-                "path": target.path.as_str(),
+                "path": mask_secrets(&target.path),
                 "role": target.role.label(),
             })
         })
@@ -920,8 +926,9 @@ pub(super) fn verifier_repair_pass_messages(
                     let target_line = verifier_repair_context_line_for_path(context, &hint.path);
                     safe_verifier_repair_file_excerpt(work_root, &hint.path, target_line).map(
                         |excerpt| {
+                            // Issue #931 (AC4): path-identity → mask_secrets (no cap).
                             serde_json::json!({
-                                "path": hint.path,
+                                "path": mask_secrets(&hint.path),
                                 "role": hint.role.label(),
                                 "excerpt": excerpt,
                             })
@@ -943,10 +950,12 @@ pub(super) fn verifier_repair_pass_messages(
                 .repair_plan
                 .iter()
                 .map(|hint| {
+                    // Issue #931 (AC4): path-identity → mask_secrets (no cap);
+                    // free-text reason → mask_and_cap_recovery_field (mask + cap).
                     serde_json::json!({
-                        "path": hint.path,
+                        "path": mask_secrets(&hint.path),
                         "role": hint.role.label(),
-                        "reason": hint.reason,
+                        "reason": super::task_contract::mask_and_cap_recovery_field(&hint.reason),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -992,9 +1001,11 @@ pub(super) fn verifier_repair_pass_messages(
         "semantic_plan": semantic_plan_payload,
         "repair_action": repair_action,
         "selected_target": {
-            "path": target_hint.path,
+            // Issue #931 (AC4): path-identity → mask_secrets (no cap, model edits
+            // the exact path); free-text reason → mask_and_cap_recovery_field.
+            "path": mask_secrets(&target_hint.path),
             "role": target_hint.role.label(),
-            "reason": target_hint.reason,
+            "reason": super::task_contract::mask_and_cap_recovery_field(&target_hint.reason),
         },
         "target_excerpt": target_excerpt,
         "related_excerpts": related,
@@ -1026,11 +1037,16 @@ fn verifier_repair_repeated_failure_invariant(
     if !repeated {
         return None;
     }
+    // Issue #931 (AC4 / Task D.3): mask the LLM/request-derived hint path BEFORE it
+    // is interpolated into this wire-bound invariant string. `mask_secrets` is a
+    // no-op on ordinary paths so the model still sees the exact target; the
+    // existing 320-cap is preserved by `compact_verifier_failure_text`.
+    let masked_path = super::task_contract::mask_and_cap_recovery_field(&target_hint.path);
     Some(compact_verifier_failure_text(
         &format!(
             "same failure signature recurred; change only the selected {role} target {path} to break signature {signature}",
             role = target_hint.role.label(),
-            path = target_hint.path,
+            path = masked_path,
             signature = context.failure_signature,
         ),
         320,
