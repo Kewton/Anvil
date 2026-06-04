@@ -209,6 +209,7 @@ fn data_manifest_named_path_does_not_leak_invalid_manifest() {
             path: Some("data/manifest.jsonl"),
             excerpt: r#"{"key": broken"#,
             required_columns: &required,
+            required_sections: &[],
         })
         .expect("malformed JSONL yields a blocking diagnostic");
     assert_eq!(
@@ -237,6 +238,7 @@ fn docs_research_ops_acceptance_is_unchanged() {
             path: Some("README.md"),
             excerpt: "## Setup\nInstall it.\n## Usage\nRun it.\n",
             required_columns: &[],
+            required_sections: &[],
         }),
         None,
         "docs acceptance regressed"
@@ -247,6 +249,7 @@ fn docs_research_ops_acceptance_is_unchanged() {
             path: Some("research.md"),
             excerpt: "## Summary\nFinding: cadence changed.\nSource: https://example.test/r\nLimitation: confidence is medium.\n",
             required_columns: &[],
+            required_sections: &[],
         }),
         None,
         "research acceptance regressed"
@@ -257,6 +260,7 @@ fn docs_research_ops_acceptance_is_unchanged() {
             path: Some("runbook.md"),
             excerpt: "## Checklist\n[x] deploy\n## Validation\nVerify health.\n## Rollback\nRevert the deploy.\n## Risk\nImpact is low.\n",
             required_columns: &[],
+            required_sections: &[],
         }),
         None,
         "ops acceptance regressed"

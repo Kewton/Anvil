@@ -1195,6 +1195,38 @@ mod tests {
         assert_eq!(rec.evaluation_taxonomy.failure_authority, "verifier_setup");
     }
 
+    // Issue #922 (P5): eval research case — a research/report task is recorded
+    // with `task_kind = "research"` in the evaluation taxonomy.
+    #[test]
+    fn evaluation_taxonomy_records_research_task_kind() {
+        let mut rec = build_eval_record(
+            "sess-922",
+            12345,
+            "Research and compare the HTTP client libraries and report sources",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "success",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("disabled"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "research");
+    }
+
     #[test]
     fn evaluation_taxonomy_records_data_task_kind() {
         // Issue #921 (P4): eval data case. Drives the real `infer_eval_task_kind`

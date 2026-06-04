@@ -261,6 +261,30 @@ impl DeliverableObligation {
         }
     }
 
+    /// Issue #922 (P5 / DD3): research report obligation. Reuses the
+    /// `UsageDocs` role (no new role → no cascade, S7-002) but carries
+    /// `ResearchNotes` kind and a `RequiredSections` schema so the research
+    /// acceptance predicate (`assess_research_report`) — not the docs surface
+    /// gate — drives verification. `path` is admitted via `validated_obligation_path`.
+    fn research_report(path: impl Into<String>, required_sections: Vec<String>) -> Self {
+        let path = validated_obligation_path(path.into());
+        Self {
+            role: ArtifactRole::UsageDocs,
+            kind: DeliverableKind::ResearchNotes,
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: Some(DeliverableSchema::RequiredSections(
+                required_sections.clone(),
+            )),
+            required_sections: required_sections.clone(),
+            acceptance_criteria: required_sections
+                .iter()
+                .map(|section| format!("research report covers the {section} section"))
+                .collect(),
+            structured_record_schema: None,
+        }
+    }
+
     fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
         let path = validated_obligation_path(path.into());
         let schema = StructuredRecordSchema { columns };
@@ -420,7 +444,8 @@ impl CompletionPolicy {
         verification_required: bool,
         required_behavior: &RequiredBehaviorContract,
     ) -> Self {
-        let project_intent = project_intent_from_required_artifacts(intent, required_artifacts);
+        let project_intent =
+            project_intent_from_required_artifacts(task_kind, intent, required_artifacts);
         let verifier_free_document_task = matches!(
             project_intent,
             CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
@@ -571,10 +596,21 @@ pub(super) fn is_deterministic_completion_authority_evidence(
 }
 
 fn project_intent_from_required_artifacts(
+    task_kind: TaskKind,
     intent: TaskIntent,
     required_artifacts: &[ArtifactRole],
 ) -> CompletionProjectIntent {
-    if matches!(intent, TaskIntent::Explain) {
+    // Issue #922 (DD4 / S7-001 / DR1-001): the `Explain` → `AnswerOnly`
+    // short-circuit is relaxed ONLY for a research task that carries a required
+    // report obligation, so the report flows through `assess_research_report`
+    // instead of completing answer-only. Every other kind (Coding/Docs/Data/Ops)
+    // keeps its exact pre-#922 behavior — Explain always short-circuits — so the
+    // §5.1 verifier-free invariant and existing goldens are unchanged. This is
+    // the single shared signal (`research_report_obligation`) used by every
+    // Explain short-circuit gate (`plan_artifact_recovery`, `evaluate_inner`).
+    let research_report_obligation =
+        task_kind == TaskKind::Research && !required_artifacts.is_empty();
+    if matches!(intent, TaskIntent::Explain) && !research_report_obligation {
         return CompletionProjectIntent::AnswerOnly;
     }
     let has_impl = required_artifacts.contains(&ArtifactRole::Implementation);
@@ -904,6 +940,21 @@ fn usage_docs_surface_satisfied(excerpt: &str) -> bool {
 }
 
 fn usage_docs_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
+    // Issue #922 (PR-001): a research `UsageDocs` obligation is evaluated by the
+    // research acceptance predicate (sectioned coverage OR open-ended floor),
+    // NOT the docs setup/run/verify surface gate. This keeps the recovery path
+    // consistent with `verifier_diagnostic_for_obligation_parts` (DR3-002) so a
+    // valid research report is not forced back to `Continue` here.
+    if contract.task_kind == TaskKind::Research {
+        let sections = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .into_iter()
+            .flat_map(|identity| identity.required_sections.iter().cloned())
+            .collect::<Vec<_>>();
+        return super::verifier::assess_research_report(excerpt, &sections)
+            .tier
+            .is_accepted();
+    }
     let section_obligations = contract
         .required_identities_for_role(ArtifactRole::UsageDocs)
         .into_iter()
@@ -953,7 +1004,12 @@ fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, exce
 }
 
 pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> ArtifactRecoveryAction {
-    if matches!(inputs.contract.intent, TaskIntent::Explain) {
+    // Issue #922 (DD4 / S7-001 / DR1-001): relax the Explain short-circuit only
+    // for a research task with a required report obligation (shared signal with
+    // `project_intent_from_required_artifacts`); all other kinds unchanged.
+    let research_report_obligation = inputs.contract.task_kind == TaskKind::Research
+        && !inputs.contract.required_artifacts.is_empty();
+    if matches!(inputs.contract.intent, TaskIntent::Explain) && !research_report_obligation {
         return ArtifactRecoveryAction::Done;
     }
 
@@ -1107,14 +1163,17 @@ fn required_role_satisfied(
     if identities.is_empty() {
         return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
     }
-    // Issue #923 (plan item 1): an Ops task's UsageDocs role carries the
-    // OpsRunbook obligation, which is the completion authority and must satisfy
-    // the ops tier predicate — it cannot take the docs observed-role shortcut.
-    // Gate the shortcut on `task_kind != Ops` (OpsRunbook obligations only ever
-    // exist on Ops tasks).
+    // The `UsageDocs` fast-path must NOT bypass per-identity verification for
+    // kinds whose UsageDocs obligation carries a content gate:
+    //  - Research (#922 DR3-001): a `ReportCompletenessPass{path:None}` must not
+    //    falsely satisfy the section / open-ended-floor check (`assess_research_report`).
+    //  - Ops (#923): the OpsRunbook obligation is completion authority and must
+    //    satisfy the ops tier predicate.
+    // Docs/Authoring keep the existing fast-path here (no regression).
     if role == ArtifactRole::UsageDocs
-        && observed.contains(&role)
+        && contract.task_kind != TaskKind::Research
         && contract.task_kind != TaskKind::Ops
+        && observed.contains(&role)
     {
         return true;
     }
@@ -1193,15 +1252,20 @@ fn required_role_satisfied_by_evidence(
         }
         return observed_artifacts(evidence).contains(&role);
     }
-    // Issue #923 (plan item 1 / High) + #919 (DR3-002): the evaluate() completion
-    // authority must not let the docs observed-role shortcut satisfy a UsageDocs
-    // role for either an Ops task (OpsRunbook obligation is the authority; needs
-    // the tier predicate) or an Authoring task (needs the accept-tier pass). For
-    // both, fall through to the path-specific `artifact_identity_observed_in_evidence`.
+    // The evaluate() completion authority must NOT let the docs observed-role
+    // shortcut satisfy a UsageDocs role for any kind whose UsageDocs obligation
+    // carries a content gate — fall through to the path-specific
+    // `artifact_identity_observed_in_evidence` instead:
+    //  - Research (#922 DR3-001): an unconditional `ReportCompletenessPass{path:None}`
+    //    must not falsely satisfy the section / open-ended-floor check.
+    //  - Authoring (#919 DR3-002): raw `RepoEdit(Docs)` is not completion authority;
+    //    needs the accept-tier pass.
+    //  - Ops (#923): the OpsRunbook obligation is the authority; needs the tier predicate.
     if role == ArtifactRole::UsageDocs
+        && contract.task_kind != TaskKind::Research
         && !authoring
-        && observed_artifacts(evidence).contains(&role)
         && contract.task_kind != TaskKind::Ops
+        && observed_artifacts(evidence).contains(&role)
     {
         return true;
     }
@@ -1578,6 +1642,17 @@ impl TaskContract {
             required.push(ArtifactRole::DataOutput);
         }
 
+        // Issue #922 (P5 / DD3): a research task that intends a written report
+        // gets a required `UsageDocs` obligation so the report flows through
+        // `assess_research_report` and gates completion (instead of completing
+        // answer-only or trivially). Added to `required` BEFORE the `retain`
+        // below so any explicit report path obligation survives (DR3-002).
+        let research_report_intended =
+            task_kind == TaskKind::Research && research_report_artifact_intended(request, &lower);
+        if research_report_intended {
+            required.push(ArtifactRole::UsageDocs);
+        }
+
         optional.sort();
         optional.dedup();
         let mut required_artifact_identities = explicit_artifact_obligations_from_request(request);
@@ -1605,6 +1680,18 @@ impl TaskContract {
         }
         for identity in inferred_docs_obligations_from_request(request, &lower, &required) {
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+        }
+        // Issue #922 (P5 / DD3): bridge the research report obligation. Merges
+        // into an explicit same-path `file` obligation (absorbing its
+        // `RequiredSections` schema) or is added fresh. UsageDocs role reuse
+        // (S7-002) + `ResearchNotes` kind + research sections; path is admitted.
+        if research_report_intended {
+            let sections = required_research_sections_from_request(request);
+            let path = research_report_path_from_request(request);
+            push_or_merge_artifact_obligation(
+                &mut required_artifact_identities,
+                ArtifactObligation::research_report(path, sections),
+            );
         }
         for identity in inferred_data_obligations_from_request(request, &lower) {
             if !required.contains(&identity.role) {
@@ -1767,7 +1854,12 @@ impl TaskContract {
     }
 
     fn evaluate_inner(&self, evidence: &EvidenceSet, mode: EvaluateMode<'_>) -> CompletionDecision {
-        if matches!(self.intent, TaskIntent::Explain) {
+        // Issue #922 (DD4 / S7-001 / DR1-001): relax the Explain short-circuit
+        // only for a research task with a required report obligation (shared
+        // signal with the other Explain gates); all other kinds unchanged.
+        let research_report_obligation =
+            self.task_kind == TaskKind::Research && !self.required_artifacts.is_empty();
+        if matches!(self.intent, TaskIntent::Explain) && !research_report_obligation {
             return CompletionDecision::Done;
         }
         let policy = &self.completion_policy;
@@ -2354,6 +2446,180 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
     sections
 }
 
+/// Issue #922 (P5 / DD4 / PR-003): a research request *intends a written report
+/// artifact* (vs. a genuine answer-only Q&A) when EITHER (a) a doc-like path is
+/// used as an output target (output verb / preposition directing content to it,
+/// not a read-only input reference), or (b) an output verb co-occurs with a
+/// report noun. Conservative on purpose: "summarize this for me" and a bare
+/// input reference like "summarize notes.txt for me" stay answer-only and are
+/// NOT routed into a file-edit obligation (regression guard / S7-001 / PR-003).
+fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
+    // Issue #922 (PR2-001): an explicit "do not edit / read-only" instruction
+    // must never be turned into a file-edit report obligation, even if the
+    // request also asks for a "report". Fail closed → stays answer-only, and the
+    // WorkMode AnswerOnly->Docs override (which keys off `report_intended_research`)
+    // also stays closed.
+    if crate::modes::plan_act::request_has_explicit_no_edit(request) {
+        return false;
+    }
+    if research_report_output_path_from_request(request).is_some() {
+        return true;
+    }
+    let output_verb = contains_any(
+        lower,
+        &[
+            "write", "produce", "generate", "create", "compile", "draft", "prepare",
+        ],
+    ) || contains_any(request, &["作成", "まとめ", "書いて", "出力"]);
+    let report_noun = contains_any(lower, &["report", "write-up", "writeup"])
+        || contains_any(request, &["レポート", "報告書"]);
+    output_verb && report_noun
+}
+
+/// Issue #922 (PR-003 / Codex-High): a doc-like path counts as a research
+/// *report output target* only in an **output context** — there must be an
+/// explicit intent to WRITE content to it. A bare read / comparison / input
+/// reference is `false`, EVEN for an output-looking file name (`report.md`,
+/// `summary.md`): "Compare report.md and summary.md" and "Review findings.md"
+/// are answer-only and must NOT create an obligation. Mirrors
+/// `data_path_has_output_context`.
+fn report_path_in_output_context(request: &str, path: &str) -> bool {
+    let lower = request.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    // An explicit output verb anywhere in the request signals intent to write
+    // content (vs. read/compare an existing file). Required for the neutral
+    // preposition case so an output-looking file NAME alone never suffices.
+    let has_output_verb =
+        contains_any(
+            &lower,
+            &[
+                "write",
+                "writes",
+                "produce",
+                "produces",
+                "generate",
+                "generates",
+                "create",
+                "creates",
+                "export",
+                "exports",
+                "save",
+                "saves",
+                "output",
+                "compile",
+                "draft",
+                "prepare",
+                "emit",
+                "emits",
+            ],
+        ) || contains_any(request, &["作成", "出力", "書き出", "まとめ", "書いて"]);
+    lower.match_indices(&path_lower).any(|(idx, _)| {
+        // Token-boundary aware: the WORD immediately before the path (so
+        // "investigate" never matches the preposition "in").
+        let prev_word = lower[..idx]
+            .rsplit(|ch: char| !ch.is_ascii_alphanumeric())
+            .find(|word| !word.is_empty())
+            .unwrap_or("");
+        let after = bounded_context_after(&lower, idx + path_lower.len(), 24);
+
+        // Explicit input / read / comparison position wins — the path is being
+        // read or compared, not written — even for an output-looking name.
+        if matches!(
+            prev_word,
+            "input"
+                | "source"
+                | "from"
+                | "read"
+                | "reads"
+                | "of"
+                | "summarize"
+                | "summarise"
+                | "analyze"
+                | "analyse"
+                | "sample"
+                | "fixture"
+                | "compare"
+                | "compares"
+                | "review"
+                | "reviews"
+                | "and"
+                | "or"
+                | "vs"
+                | "versus"
+                | "between"
+        ) {
+            return false;
+        }
+
+        // Explicit output verb / preposition immediately before the path.
+        if matches!(
+            prev_word,
+            "to" | "into"
+                | "output"
+                | "write"
+                | "writes"
+                | "produce"
+                | "produces"
+                | "generate"
+                | "generates"
+                | "export"
+                | "exports"
+                | "save"
+                | "saves"
+                | "create"
+                | "creates"
+                | "emit"
+                | "emits"
+        ) {
+            return true;
+        }
+
+        // Neutral preposition (e.g. "in"): require an explicit output verb in
+        // the request, or a trailing Japanese output marker. A bare
+        // output-looking file NAME is NOT sufficient (Codex-High fix).
+        has_output_verb || contains_any(after, &["まとめ", "出力", "書"])
+    })
+}
+
+/// Issue #922 (PR-003 / DD3 / DR4-001): the first doc-like path used as an
+/// output target, admitted via the SSOT `normalize_explicit_user_artifact_path`.
+fn research_report_output_path_from_request(request: &str) -> Option<String> {
+    request
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
+        })
+        .filter_map(normalize_explicit_user_artifact_path)
+        .filter(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.ends_with(".md")
+                || lower.ends_with(".markdown")
+                || lower.ends_with(".rst")
+                || lower.ends_with(".txt")
+        })
+        .find(|path| report_path_in_output_context(request, path))
+}
+
+/// Issue #922 (P5 / DD3 / DR4-001): the report artifact path for a research
+/// obligation — the output-context path if present, else the `report.md`
+/// default. Never stores a raw/unadmitted path.
+fn research_report_path_from_request(request: &str) -> String {
+    research_report_output_path_from_request(request).unwrap_or_else(|| "report.md".to_string())
+}
+
+/// Issue #922 (PR-002 / DR3-004): SSOT for the WorkMode consumption-side hook.
+/// True when the request resolves to a Research task carrying a required report
+/// obligation — exactly the contract-side condition that relaxes the Explain
+/// short-circuit — so the WorkMode correction and the completion gates stay in
+/// lock-step. Builds the contract so the determination cannot diverge from
+/// `from_request` (Coding/Data/Docs precedence included).
+pub(super) fn report_intended_research(request: &str) -> bool {
+    let contract = TaskContract::from_request(request);
+    contract.task_kind == TaskKind::Research
+        && contract
+            .required_artifacts
+            .contains(&ArtifactRole::UsageDocs)
+}
+
 fn required_research_sections_from_request(request: &str) -> Vec<String> {
     let lower = request.to_ascii_lowercase();
     let mut sections = vec!["findings".to_string(), "sources".to_string()];
@@ -2832,7 +3098,16 @@ pub(super) fn request_asks_for_implementation_artifact(
     asks_for_usage_docs: bool,
     asks_for_setup: bool,
 ) -> bool {
-    if request_negates_implementation_artifacts(request, lower) {
+    // Issue #922 (PR2-001 / remediation): an explicit "do not edit / read-only"
+    // instruction negates implementation artifacts too (you cannot create code
+    // if no file may change). Reusing the WorkMode-classifier SSOT keeps the two
+    // axes consistent (the classifier already routes such requests to
+    // AnswerOnly), so a research request like "produce a report … but do not
+    // edit any files" classifies as Research, not Coding, and then stays
+    // answer-only with no obligation.
+    if request_negates_implementation_artifacts(request, lower)
+        || crate::modes::plan_act::request_has_explicit_no_edit(request)
+    {
         return false;
     }
     let support_artifact_requested = asks_for_tests || asks_for_usage_docs || asks_for_setup;
@@ -5894,6 +6169,60 @@ mod tests {
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn issue922_research_report_recovery_is_not_docs_surface_gated() {
+        // PR-001: a valid research report (findings + sources, NO docs
+        // setup/run/verify surface) must NOT be forced back to `Continue` by the
+        // docs surface gate in the recovery path. With the report observed as
+        // evidence + an artifact, the covered report reaches `Done`; a thin
+        // report still gates (negative control proving gating is intact).
+        let contract = TaskContract::from_request(
+            "Investigate the deployment options and produce a report in report.md",
+        );
+        assert_eq!(contract.task_kind, TaskKind::Research);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::ReportCompletenessPass {
+            path: Some("report.md".to_string()),
+        });
+        let artifacts = vec![ArtifactState::exists(ArtifactRole::UsageDocs, "report.md")];
+        let repair_state = VerifierRepairState::None;
+
+        let covered = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "## Findings\nrelease cadence changed.\n## Sources\nhttps://example.test\n",
+        )]);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &covered,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done,
+            "covered research report must not be docs-surface-gated back to Continue"
+        );
+
+        let thin = build_excerpts(&[(ArtifactRole::UsageDocs, "just a single sentence")]);
+        assert!(
+            matches!(
+                plan_artifact_recovery(ArtifactRecoveryInputs {
+                    contract: &contract,
+                    evidence: &evidence,
+                    artifacts: &artifacts,
+                    repair_state: &repair_state,
+                    artifact_excerpts: &thin,
+                    missing_verifier_suppress_retry: false,
+                    owned_test_artifacts: &[],
+                }),
+                ArtifactRecoveryAction::Continue { .. }
+            ),
+            "thin research report must still be gated"
         );
     }
 
