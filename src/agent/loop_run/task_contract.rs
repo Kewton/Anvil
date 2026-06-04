@@ -2292,7 +2292,6 @@ fn infer_task_kind(
     // "write README.md" (not production code work) is eligible for Authoring.
     if request_asks_for_authoring_task(
         request,
-        lower,
         intent,
         implementation_artifact,
         data_task,
@@ -2657,6 +2656,46 @@ const RESEARCH_OUTPUT_AFTER_JP: &[&str] = &["まとめ", "出力", "書", "作�
 const DATA_INPUT_EXTRA: &[&str] = &["sample", "example", "fixture", "ingest"];
 /// docs-only output after-window JP markers (判断#5, polarity-preserving).
 const DOCS_OUTPUT_AFTER_JP: &[&str] = &["に書いて", "に出力", "として保存"];
+/// Issue #937 (Codex High): shared input-reference (reading/comparison) verbs.
+/// A docs/report path governed by one of these in its (masked) before-window is
+/// being CONSUMED — read or compared — not produced, so it is obligation-free
+/// for the Research AND Authoring entry points (`Compare findings in
+/// draft_report.md`, `Review draft_report.md`). `read`/`reads` already live in
+/// `INPUT_VERBS_ASCII`; this set adds the reading/comparison verbs that the
+/// authoring gate previously ignored. Word-boundary matched over masked text.
+const INPUT_REFERENCE_VERBS_ASCII: &[&str] = &[
+    "compare",
+    "compares",
+    "compared",
+    "comparing",
+    "review",
+    "reviews",
+    "reviewed",
+    "reviewing",
+    "summarize",
+    "summarise",
+    "summarizes",
+    "summarises",
+    "analyze",
+    "analyse",
+    "analyzes",
+    "analyses",
+];
+/// Issue #919 / #937 (Codex High): ASCII authoring-verb needles (SSOT). Used by
+/// `request_matches_authoring_keyword` (substring over masked text) and by the
+/// directional nearest-cue scan (`docs_path_is_input_reference_with_scan`, token
+/// `starts_with`) so an authoring verb like `rewrite`/`proofread` that governs a
+/// neutral in-place docs target overrides an earlier `review`/`compare` cue.
+const AUTHORING_KEYWORD_NEEDLES_ASCII: &[&str] = &[
+    "translate",
+    "translation",
+    "rewrite",
+    "reword",
+    "paraphrase",
+    "proofread",
+    "copyedit",
+    "draft",
+];
 
 /// Issue #937 (DS1-002): match an ASCII output verb STEM at a word boundary,
 /// absorbing an optional trailing plural `s` (so `generates`/`writes` match the
@@ -3009,33 +3048,96 @@ fn request_has_explicit_coding_subject(request: &str, lower: &str) -> bool {
 /// *pure-answer* one. It proves the user named a normalized deliverable path —
 /// NOT that the file exists or is safe to read (that authority lives in the
 /// repo-edit / ledger admission path; see Decision #4 security note).
-fn request_names_explicit_output_docs(request: &str) -> bool {
-    explicit_artifact_obligations_from_request(request)
+/// Issue #919 / #937 (Codex High): true iff the request names an explicit
+/// `UsageDocs` path that is an **output** target — produced (`write README.md`)
+/// or edited in place (`rewrite ... in docs/intro.md`, a neutral context) — and
+/// NOT a pure input reference (`Compare findings in draft_report.md`, `Review
+/// draft_report.md`). Shares the directional output/input judgement with the
+/// Research entry (`report_path_in_output_context`) so an input-reference docs
+/// path no longer fabricates an Authoring output obligation. The
+/// `explicit_artifact_obligations_from_request_with_scan` source-prune
+/// (`retain_docs_outputs_when_distinct_source`) already removed translation
+/// *sources*; this gate additionally excludes read/compare/review references.
+fn request_names_explicit_output_docs(scan: &OutputContextScan, request: &str) -> bool {
+    explicit_artifact_obligations_from_request_with_scan(scan, request)
         .iter()
-        .any(|identity| identity.role == ArtifactRole::UsageDocs)
+        .filter(|identity| identity.role == ArtifactRole::UsageDocs)
+        .any(|identity| !docs_path_is_input_reference_with_scan(scan, &identity.path))
+}
+
+/// Issue #937 (Codex High): directional "is this docs path a READ/COMPARE input
+/// reference?" — the shared discriminator that keeps `Compare findings in
+/// draft_report.md` / `Review draft_report.md` obligation-free WITHOUT
+/// suppressing in-place authoring (`rewrite ... in docs/intro.md`, which has no
+/// directional output verb but is a legitimate output). Output context wins (an
+/// output-directed occurrence is never an input reference, preserving Trigger B
+/// `summarize ... into summary.md`). Otherwise the verdict is **directional**
+/// (Codex High round 2): scan tokens backward from the path occurrence and let
+/// the NEAREST governing cue decide — an authoring/output verb (`rewrite`,
+/// `proofread`, or an `OUTPUT_VERB_STEMS_ASCII` verb) nearer than any
+/// input-reference verb means the path is produced/edited in place (NOT an input
+/// reference), so `Review source.md and rewrite intro.md` keeps `intro.md` as an
+/// authoring output even though `review` sits within the window. The first
+/// input-reference / input cue (`INPUT_REFERENCE_VERBS_ASCII` / `INPUT_VERBS_ASCII`)
+/// means it is consumed. A neutral context (no cue) is NOT an input reference, so
+/// in-place authoring is preserved (fail-open to "required", matching #919).
+fn docs_path_is_input_reference_with_scan(scan: &OutputContextScan, path: &str) -> bool {
+    if report_path_in_output_context_with_scan(scan, path) {
+        return false;
+    }
+    let path_lower = path.to_ascii_lowercase();
+    scan.lower.match_indices(&path_lower).any(|(idx, _)| {
+        let before = bounded_context_before(&scan.lower_masked, idx, 64);
+        nearest_governing_cue_is_input_reference(before)
+    })
+}
+
+/// Issue #937 (Codex High round 2): walk `before` (the masked text preceding a
+/// docs-path occurrence) token-by-token from the path BACKWARD; the nearest
+/// governing cue wins. Returns `true` only if an input-reference/input cue is
+/// reached before any authoring/output cue. No cue in range → `false` (neutral
+/// → in-place authoring output).
+fn nearest_governing_cue_is_input_reference(before: &str) -> bool {
+    for token in before
+        .rsplit(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+    {
+        // Authoring / output verb governs this path → produced or edited, NOT an
+        // input reference. (`rewrite`/`proofread` are recognized here because
+        // `report_path_in_output_context` only knows `OUTPUT_VERB_STEMS_ASCII`.)
+        if contains_output_verb(token, OUTPUT_VERB_STEMS_ASCII)
+            || AUTHORING_KEYWORD_NEEDLES_ASCII
+                .iter()
+                .any(|stem| token.starts_with(stem))
+        {
+            return false;
+        }
+        // Reading / comparison verb governs this path → consumed.
+        if INPUT_REFERENCE_VERBS_ASCII.contains(&token) || INPUT_VERBS_ASCII.contains(&token) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Issue #919 (Decision #1): does the request match an Authoring keyword?
 /// `summarize`/`要約`/`summary` are deliberately EXCLUDED (owned by
 /// `infer_intent`→Explain and by the Research goldens). The set is disjoint
 /// from the existing Explain/Research/Docs goldens.
-fn request_matches_authoring_keyword(lower: &str, request: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "translate",
-            "translation",
-            "rewrite",
-            "reword",
-            "paraphrase",
-            "proofread",
-            "copyedit",
-            "draft",
-        ],
-    ) || contains_any(
-        request,
-        &["翻訳", "書き直", "言い換え", "校正", "清書", "推敲"],
-    )
+/// Issue #937 (Codex High): scan the **masked** lower so an authoring verb that
+/// exists only INSIDE a filename (`draft` in `draft_report.md`,
+/// `translate`/`rewrite` in a path token) no longer fires the Authoring
+/// pre-check. Substring (not word-boundary) matching is retained over the masked
+/// text so inflections (`drafting`, `translating`) still match a standalone
+/// verb; only the filename-embedded false positives are removed by masking. JP
+/// keywords run on the raw request — JP never appears in an ASCII path token, so
+/// masking is a no-op for them.
+fn request_matches_authoring_keyword(scan: &OutputContextScan, request: &str) -> bool {
+    contains_any(&scan.lower_masked, AUTHORING_KEYWORD_NEEDLES_ASCII)
+        || contains_any(
+            request,
+            &["翻訳", "書き直", "言い換え", "校正", "清書", "推敲"],
+        )
 }
 
 /// Issue #919 (Decision #1): the Authoring classification predicate. Fires
@@ -3054,7 +3156,6 @@ fn request_matches_authoring_keyword(lower: &str, request: &str) -> bool {
 ///   artifact-producing signal that an Explain keyword would otherwise mask.
 fn request_asks_for_authoring_task(
     request: &str,
-    lower: &str,
     intent: TaskIntent,
     implementation_artifact: bool,
     data_task: bool,
@@ -3063,8 +3164,13 @@ fn request_asks_for_authoring_task(
     if implementation_artifact || data_task || asks_for_setup {
         return false;
     }
-    let keyword = request_matches_authoring_keyword(lower, request);
-    let explicit_output = request_names_explicit_output_docs(request);
+    // Issue #937 (Codex High): one mask per pre-check, threaded into both the
+    // keyword scan (filename-excluded) and the explicit-output-docs gate
+    // (input-reference-excluded) so the Authoring entry uses the same
+    // intent-based output-context judgement as Research.
+    let scan = OutputContextScan::new(request);
+    let keyword = request_matches_authoring_keyword(&scan, request);
+    let explicit_output = request_names_explicit_output_docs(&scan, request);
     let trigger_a = keyword && explicit_output && !matches!(intent, TaskIntent::Explain);
     let prose_output_shaped = matches!(intent, TaskIntent::Explain) || keyword;
     let trigger_b = explicit_output && prose_output_shaped;
@@ -8707,6 +8813,109 @@ mod tests {
         assert_eq!(contract.task_kind, TaskKind::Authoring);
         assert!(!contract.completion_policy.verification_required());
         assert!(!contract.completion_policy.test_execution_required());
+    }
+
+    // ----- Issue #937 (Codex High): Authoring pre-check output-context -----
+
+    /// An input-reference docs path (read/compare/review of an existing doc),
+    /// INCLUDING one whose filename embeds an authoring verb (`draft` in
+    /// `draft_report.md`), must NOT be misrouted to Authoring and must NOT
+    /// fabricate a `UsageDocs` obligation. Mirrors the Research input-reference
+    /// guard via the shared output-context judgement (the Authoring pre-check
+    /// runs before Research, so this is the analogue at the Authoring entry).
+    #[test]
+    fn authoring_input_reference_docs_path_is_obligation_free() {
+        for request in [
+            // filename embeds the authoring verb `draft` — must not fire keyword
+            "Compare findings in draft_report.md and notes.md",
+            // read/compare/review input references with output-looking docs paths
+            "Review draft_report.md",
+            "Compare report.md and summary.md",
+            "Summarize the findings in draft_report.md",
+        ] {
+            let contract = TaskContract::from_request(request);
+            assert_ne!(
+                contract.task_kind,
+                TaskKind::Authoring,
+                "input reference must not route to Authoring: {request:?}"
+            );
+            assert!(
+                !contract
+                    .required_artifacts
+                    .contains(&ArtifactRole::UsageDocs),
+                "input reference must not fabricate a UsageDocs obligation: {request:?}"
+            );
+            assert!(
+                !report_intended_research(request),
+                "input reference must not flip AnswerOnly->Docs: {request:?}"
+            );
+        }
+    }
+
+    /// Non-regression: genuine authoring — in-place edits (no directional output
+    /// verb, neutral context) and output-directed writes — must STILL route to
+    /// Authoring with a `UsageDocs` obligation. The fix must not over-prune.
+    #[test]
+    fn authoring_genuine_output_still_fires_after_input_reference_fix() {
+        for request in [
+            // in-place authoring: docs path is the target, no output verb on it
+            "Rewrite the intro paragraph in docs/intro.md to be clearer",
+            // output-directed write
+            "Translate README.ja.md into English and write README.md",
+            // Trigger B: explicit output path + Explain (summarize→file)
+            "summarize the design into summary.md",
+            // Codex High round 2: an earlier input-reference verb (`review`/
+            // `compare`/`summarize`) must NOT over-prune a LATER in-place authoring
+            // target governed by `proofread`/`reword` (nearest-cue is directional).
+            // (Phrasings that reach the Authoring gate, i.e. not coding-shaped.)
+            "Review the design notes and proofread README.md",
+            "Compare the options and proofread docs/guide.md",
+            "Summarize the notes and reword README.md",
+        ] {
+            let contract = TaskContract::from_request(request);
+            assert_eq!(
+                contract.task_kind,
+                TaskKind::Authoring,
+                "genuine authoring must still route to Authoring: {request:?}"
+            );
+            assert!(
+                contract
+                    .required_artifacts
+                    .contains(&ArtifactRole::UsageDocs),
+                "genuine authoring must keep a UsageDocs obligation: {request:?}"
+            );
+        }
+    }
+
+    /// Issue #937 (Codex High round 2): the directional nearest-cue function in
+    /// isolation. The before-window text is masked (path tokens already blanked).
+    #[test]
+    fn nearest_governing_cue_is_input_reference_is_directional() {
+        // Pure input reference → consumed.
+        assert!(nearest_governing_cue_is_input_reference(
+            "compare findings in "
+        ));
+        assert!(nearest_governing_cue_is_input_reference("review "));
+        assert!(nearest_governing_cue_is_input_reference(
+            "summarize the notes in "
+        ));
+        // Nearest cue is an authoring verb (even with an earlier input verb in
+        // range) → produced/edited in place, NOT consumed. The masked path is a
+        // run of spaces between the two verbs.
+        assert!(!nearest_governing_cue_is_input_reference(
+            "review            and rewrite "
+        ));
+        assert!(!nearest_governing_cue_is_input_reference(
+            "compare           and proofread "
+        ));
+        // Output verb nearest → not input reference.
+        assert!(!nearest_governing_cue_is_input_reference("and write "));
+        // Neutral (no cue) → not an input reference (in-place authoring default).
+        assert!(!nearest_governing_cue_is_input_reference(
+            "rewrite the intro in "
+        ));
+        assert!(!nearest_governing_cue_is_input_reference(""));
+        assert!(!nearest_governing_cue_is_input_reference("the design "));
     }
 
     // ----- Issue #919: Accept-tier authority (Decision #4 / DR3-002) -----
