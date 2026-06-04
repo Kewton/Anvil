@@ -372,3 +372,122 @@ fn parquet_output_is_not_a_structured_data_obligation() {
         "unparseable .parquet must not become a schema-validated DataOutput obligation: {contract:?}"
     );
 }
+
+// ===========================================================================
+// Issue #937: robust output-context detection — data surface pins.
+// ===========================================================================
+
+fn data_output_roles(contract: &TaskContract) -> Vec<String> {
+    contract
+        .required_artifact_identities
+        .iter()
+        .filter(|o| o.role == ArtifactRole::DataOutput)
+        .map(|o| o.path.clone())
+        .collect()
+}
+
+/// R3 (input reference, output-looking filename). `Summarize the trends in
+/// output_data.csv` reads/summarizes the file; today the `file_output_name`
+/// override fabricated a DataOutput obligation. After the demotion (no directed
+/// output verb/prep/JP near the path), it stays obligation-free.
+#[test]
+fn r3_input_reference_with_output_looking_filename_creates_no_obligation() {
+    let contract = TaskContract::from_request("Summarize the trends in output_data.csv");
+    assert!(
+        !contract
+            .required_artifacts
+            .contains(&ArtifactRole::DataOutput),
+        "an input-reference (no directed output) must not create a DataOutput obligation: {:?}",
+        data_output_roles(&contract)
+    );
+    assert!(data_output_roles(&contract).is_empty());
+}
+
+/// R4 (fifth/default surface). `What columns are in output_data.csv, a CSV
+/// file?` must NOT synthesize a default `output.csv`. The masked `output_action`
+/// gate drops it (the filename `output` is masked); `columns`/`csv file` alone
+/// cannot drive the standalone default.
+#[test]
+fn r4_question_about_columns_creates_no_default_output() {
+    let contract = TaskContract::from_request("What columns are in output_data.csv, a CSV file?");
+    assert!(
+        data_output_roles(&contract).is_empty(),
+        "a question about an existing file must not synthesize a default output.csv: {:?}",
+        data_output_roles(&contract)
+    );
+    // No default `output.csv` and no explicit `output_data.csv` obligation.
+    assert!(
+        !data_output_roles(&contract)
+            .iter()
+            .any(|p| p == "output.csv" || p == "output_data.csv")
+    );
+}
+
+/// R6 (JP false-positive). `この文書を要約して output_data.csv の列を確認`:
+/// the bare `書` inside `文書` (document) must not be a data output marker (it is
+/// isolated to the research-only after-window vocabulary). No DataOutput.
+#[test]
+fn r6_jp_document_substring_is_not_a_data_output_marker() {
+    let contract = TaskContract::from_request("この文書を要約して output_data.csv の列を確認");
+    assert!(
+        data_output_roles(&contract).is_empty(),
+        "`文書` must not be read as a data output cue: {:?}",
+        data_output_roles(&contract)
+    );
+}
+
+/// N3 (#921 central risk). `idとtotalの列を持つoutput.csvを生成してください` keeps
+/// its DataOutput obligation with identity `output.csv` via the JP `生成`
+/// after-window marker (survives the `file_output_name` demotion).
+#[test]
+fn n3_jp_generate_output_csv_keeps_obligation() {
+    let contract = TaskContract::from_request("idとtotalの列を持つoutput.csvを生成してください");
+    assert!(
+        data_output_roles(&contract).contains(&"output.csv".to_string()),
+        "JP genuine output must keep DataOutput identity output.csv: {:?}",
+        data_output_roles(&contract)
+    );
+}
+
+/// N4 (no-path default) + N5 (explicit / input.jsonl-dropped) non-regression.
+#[test]
+fn n4_n5_genuine_data_output_obligations_preserved() {
+    // N4: no explicit path → default output.csv.
+    let n4 = TaskContract::from_request("Generate a CSV file with columns id and total");
+    assert!(
+        data_output_roles(&n4).contains(&"output.csv".to_string()),
+        "N4 default output.csv must be synthesized: {:?}",
+        data_output_roles(&n4)
+    );
+
+    // N5a: explicit adjacent-verb output.
+    let n5a = TaskContract::from_request("Generate output.csv with columns id and score");
+    assert!(
+        data_output_roles(&n5a).contains(&"output.csv".to_string()),
+        "N5a explicit output.csv must be obligated: {:?}",
+        data_output_roles(&n5a)
+    );
+
+    // N5b: explicit output path; the `input.jsonl` source is dropped as input.
+    let n5b = TaskContract::from_request(
+        "Generate data/results.jsonl with columns id and score from input.jsonl",
+    );
+    let n5b_paths = data_output_roles(&n5b);
+    assert!(
+        n5b_paths.contains(&"data/results.jsonl".to_string()),
+        "N5b output path must be obligated: {n5b_paths:?}"
+    );
+    assert!(
+        !n5b_paths.contains(&"input.jsonl".to_string()),
+        "N5b input.jsonl must be dropped as input, not obligated: {n5b_paths:?}"
+    );
+
+    // Genuine output whose stem looks like output AND has a downstream `from ...
+    // input` phrase must still be obligated (auxiliary stem guard).
+    let aux = TaskContract::from_request("Generate report output.csv from the input data.");
+    assert!(
+        data_output_roles(&aux).contains(&"output.csv".to_string()),
+        "an output-looking stem with a directed verb must stay obligated: {:?}",
+        data_output_roles(&aux)
+    );
+}
