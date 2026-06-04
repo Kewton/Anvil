@@ -678,16 +678,13 @@ fn parse_failure_kind(v: &serde_json::Value) -> Option<VerifierDiagnosticFailure
     })
 }
 
-/// Parse the closed set of `ArtifactRole` labels from
-/// `task_contract::ArtifactRole::label`.
+/// Parse the closed set of canonical `ArtifactRole` labels.
+///
+/// Issue #920: delegates to the `ArtifactRole::from_label` SSOT (the strict
+/// reverse of `label()`), so `data_output` now round-trips here too (it was
+/// previously dropped). This is a strict-label-only parser — no LLM aliases.
 fn parse_artifact_role(s: &str) -> Option<ArtifactRole> {
-    Some(match s {
-        "implementation" => ArtifactRole::Implementation,
-        "test" => ArtifactRole::Test,
-        "usage_docs" => ArtifactRole::UsageDocs,
-        "setup" => ArtifactRole::Setup,
-        _ => return None,
-    })
+    ArtifactRole::from_label(s)
 }
 
 /// Emit a `SchemaError` validation failure with **metadata only** — never the

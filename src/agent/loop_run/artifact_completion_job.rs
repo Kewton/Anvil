@@ -1229,10 +1229,15 @@ mod tests {
         };
         let mut ledger = ArtifactLedger::new();
         if completed {
+            // Issue #920: exhaustive (no `_ =>`) so a new role forces an
+            // intentional fixture-path decision. Behavior-preserving — every
+            // non-test role used the impl fixture file before and still does.
             let path = match role {
                 ArtifactRole::Test => "tests/test_a.py",
-                ArtifactRole::Implementation => "src/lib.rs",
-                _ => "src/lib.rs",
+                ArtifactRole::Implementation
+                | ArtifactRole::UsageDocs
+                | ArtifactRole::Setup
+                | ArtifactRole::DataOutput => "src/lib.rs",
             };
             ledger.record_repo_edit_event(
                 &LedgerAdmissionContext::new(dir.path(), &scope),

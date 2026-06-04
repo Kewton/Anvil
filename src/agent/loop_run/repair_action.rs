@@ -97,6 +97,14 @@ pub(super) fn build_repair_action(
     })
 }
 
+/// Whether `kind` is permitted to target an artifact of `role`.
+///
+/// Issue #920: this is a predicate (equality / `matches!`), not an exhaustive
+/// `match` over `ArtifactRole`, so a *new* role does NOT compile-error here —
+/// it silently fails CLOSED (no change kind matches it ⇒ `false`). That is the
+/// intentional safe default: an unrecognised role is denied as a repair target
+/// until an explicit arm grants it. `data_output` is already in this state and
+/// the `data_output_role_is_denied_by_every_change_kind` regression test pins it.
 pub(super) fn allowed_change_kind_allows_target_role(
     kind: AllowedChangeKind,
     role: ArtifactRole,
@@ -126,7 +134,32 @@ mod tests {
     use super::super::repair_brief::{
         AllowedChangeKind, RepairBrief, RepairBriefSource, RepairBriefTarget, SourceOfTruth,
     };
+    use super::super::task_contract::ArtifactRole;
     use super::*;
+
+    // Issue #920 (AC: repair role-policy fail-closed is intentional and tested):
+    // no `AllowedChangeKind` targets `DataOutput` today, and a future role would
+    // likewise fall through to `false`. This pins that silent fail-closed as the
+    // deliberate safe default (an unrecognised role is never an allowed target).
+    #[test]
+    fn data_output_role_is_denied_by_every_change_kind() {
+        let kinds = [
+            AllowedChangeKind::FixImplementationBehavior,
+            AllowedChangeKind::FixGeneratedTestExpectation,
+            AllowedChangeKind::FixTestIsolation,
+            AllowedChangeKind::FixTestImportOrSetup,
+            AllowedChangeKind::ConnectExistingTestSetupToSut,
+            AllowedChangeKind::FixDependencyOrConfig,
+            AllowedChangeKind::FixVerifierCommand,
+            AllowedChangeKind::InsufficientEvidence,
+        ];
+        for kind in kinds {
+            assert!(
+                !allowed_change_kind_allows_target_role(kind, ArtifactRole::DataOutput),
+                "DataOutput must be denied as a repair target by {kind:?} (intentional fail-closed)"
+            );
+        }
+    }
 
     fn packet() -> FailurePacket {
         FailurePacket::new(

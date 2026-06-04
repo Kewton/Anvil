@@ -1424,13 +1424,10 @@ pub(crate) fn drive_record_repair_attempt_outcomes_for_test(
     use semantic_failure::{cluster_key_for_test, parse_semantic_failure_report};
     use spec_authority::SpecAuthority;
 
-    let role = match role_label {
-        "test" => task_contract::ArtifactRole::Test,
-        "setup" => task_contract::ArtifactRole::Setup,
-        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
-        // Implementation is the deterministic fallback for unknown labels.
-        _ => task_contract::ArtifactRole::Implementation,
-    };
+    // Issue #920: canonical labels via the `from_label` SSOT; Implementation
+    // is the deterministic fallback for unknown labels.
+    let role = task_contract::ArtifactRole::from_label(role_label)
+        .unwrap_or(task_contract::ArtifactRole::Implementation);
 
     // Build a minimal semantic_report with exactly one cluster bound to
     // `cluster_label` so `next_repairable_cluster` returns `None` (= all
@@ -1527,12 +1524,10 @@ pub(crate) fn emit_safe_stop_report_artifact_completion_failed_for_test(
     role_label: &str,
     expected_target: Option<String>,
 ) {
-    let role = match role_label {
-        "test" => task_contract::ArtifactRole::Test,
-        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
-        "setup" => task_contract::ArtifactRole::Setup,
-        _ => task_contract::ArtifactRole::Implementation,
-    };
+    // Issue #920: canonical labels via the `from_label` SSOT; Implementation
+    // is the deterministic fallback for unknown labels.
+    let role = task_contract::ArtifactRole::from_label(role_label)
+        .unwrap_or(task_contract::ArtifactRole::Implementation);
     crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
         agent,
         role,
@@ -1625,12 +1620,10 @@ pub(crate) fn seed_artifact_completion_job_pending_for_test(
     relative_path: &str,
 ) {
     use std::fs;
-    let role = match role_label {
-        "test" => task_contract::ArtifactRole::Test,
-        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
-        "setup" => task_contract::ArtifactRole::Setup,
-        _ => task_contract::ArtifactRole::Implementation,
-    };
+    // Issue #920: canonical labels via the `from_label` SSOT; Implementation
+    // is the deterministic fallback for unknown labels.
+    let role = task_contract::ArtifactRole::from_label(role_label)
+        .unwrap_or(task_contract::ArtifactRole::Implementation);
 
     // Materialise the file under work_root so `ArtifactCompletionJob::new`
     // accepts the target. Parent directories are created best-effort.
