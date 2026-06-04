@@ -415,12 +415,19 @@ fn first_repair_step_field<'a>(
 }
 
 fn artifact_role_from_str(value: &str) -> Option<ArtifactRole> {
-    match normalize_enum(value).as_str() {
-        "implementation" | "impl" => Some(ArtifactRole::Implementation),
-        "test" | "tests" => Some(ArtifactRole::Test),
-        "usage_docs" | "docs" | "readme" => Some(ArtifactRole::UsageDocs),
-        "setup" | "dependency" | "config" => Some(ArtifactRole::Setup),
-        "data_output" | "data" | "output" => Some(ArtifactRole::DataOutput),
+    let normalized = normalize_enum(value);
+    // Issue #920: 2-tier — canonical labels via the `from_label` SSOT, LLM
+    // aliases stay local. Behavior-preserving (this parser already accepted
+    // `data_output`; the canonical arm now flows through the SSOT).
+    if let Some(role) = ArtifactRole::from_label(&normalized) {
+        return Some(role);
+    }
+    match normalized.as_str() {
+        "impl" => Some(ArtifactRole::Implementation),
+        "tests" => Some(ArtifactRole::Test),
+        "docs" | "readme" => Some(ArtifactRole::UsageDocs),
+        "dependency" | "config" => Some(ArtifactRole::Setup),
+        "data" | "output" => Some(ArtifactRole::DataOutput),
         _ => None,
     }
 }
@@ -434,6 +441,9 @@ pub(super) fn legacy_kind_to_allowed_change_kind_for_role(
     target_role: Option<ArtifactRole>,
 ) -> AllowedChangeKind {
     let normalized = normalize_enum(value);
+    // Issue #920: intentional decision point — this is an EXHAUSTIVE `match` over
+    // `Option<ArtifactRole>` (every variant + `None`), so adding a role
+    // compile-errors here and forces a deliberate change-kind policy.
     match target_role {
         Some(ArtifactRole::Test) => match normalized.as_str() {
             "compile_or_syntax_error"
@@ -505,6 +515,49 @@ fn normalize_enum(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #920: 2-tier delegation is behavior-preserving — this parser already
+    // accepted `data_output`/`data`/`output`; the canonical arm now flows through
+    // the `from_label` SSOT and every alias is retained.
+    #[test]
+    fn artifact_role_from_str_canonical_via_ssot_and_aliases_preserved() {
+        for r in ArtifactRole::all() {
+            assert_eq!(artifact_role_from_str(r.label()), Some(r));
+        }
+        // data_output already worked here — must stay working.
+        assert_eq!(
+            artifact_role_from_str("data_output"),
+            Some(ArtifactRole::DataOutput)
+        );
+        assert_eq!(
+            artifact_role_from_str("data"),
+            Some(ArtifactRole::DataOutput)
+        );
+        assert_eq!(
+            artifact_role_from_str("output"),
+            Some(ArtifactRole::DataOutput)
+        );
+        // Aliases preserved.
+        assert_eq!(
+            artifact_role_from_str("impl"),
+            Some(ArtifactRole::Implementation)
+        );
+        assert_eq!(artifact_role_from_str("tests"), Some(ArtifactRole::Test));
+        assert_eq!(
+            artifact_role_from_str("docs"),
+            Some(ArtifactRole::UsageDocs)
+        );
+        assert_eq!(
+            artifact_role_from_str("readme"),
+            Some(ArtifactRole::UsageDocs)
+        );
+        assert_eq!(
+            artifact_role_from_str("dependency"),
+            Some(ArtifactRole::Setup)
+        );
+        assert_eq!(artifact_role_from_str("config"), Some(ArtifactRole::Setup));
+        assert_eq!(artifact_role_from_str("nonsense"), None);
+    }
 
     #[test]
     fn repair_brief_extracts_last_json_after_prose() {

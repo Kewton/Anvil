@@ -407,18 +407,20 @@ fn verifier_diagnostic_failure_kind_from_str(
 }
 
 fn artifact_role_from_assessment_str(value: &str) -> Option<super::task_contract::ArtifactRole> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "implementation" | "impl" | "code" | "source" => {
-            Some(super::task_contract::ArtifactRole::Implementation)
-        }
-        "test" | "tests" => Some(super::task_contract::ArtifactRole::Test),
-        "usage_docs" | "docs" | "documentation" | "readme" => {
-            Some(super::task_contract::ArtifactRole::UsageDocs)
-        }
-        "setup" | "config" | "dependency" | "dependencies" => {
-            Some(super::task_contract::ArtifactRole::Setup)
-        }
-        "unknown" => None,
+    use super::task_contract::ArtifactRole;
+    let normalized = value.trim().to_ascii_lowercase();
+    // Issue #920: 2-tier — canonical labels go through the `from_label` SSOT
+    // (so `data_output` now round-trips here, previously dropped); LLM-origin
+    // aliases stay local to this parser.
+    if let Some(role) = ArtifactRole::from_label(&normalized) {
+        return Some(role);
+    }
+    match normalized.as_str() {
+        "impl" | "code" | "source" => Some(ArtifactRole::Implementation),
+        "tests" => Some(ArtifactRole::Test),
+        "docs" | "documentation" | "readme" => Some(ArtifactRole::UsageDocs),
+        "config" | "dependency" | "dependencies" => Some(ArtifactRole::Setup),
+        // "unknown" and anything else are intentionally unmapped.
         _ => None,
     }
 }
@@ -438,5 +440,63 @@ fn truncate(s: &str, max: usize) -> String {
             out
         }
         None => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::task_contract::ArtifactRole;
+    use super::*;
+
+    // Issue #920: canonical labels (incl. the previously-dropped `data_output`)
+    // round-trip via the `from_label` SSOT, while every pre-existing LLM alias
+    // is preserved by the 2-tier `.or_else()` fallback (regression guard).
+    #[test]
+    fn assessment_role_parser_canonical_round_trips_and_keeps_aliases() {
+        // Canonical labels — now flow through from_label (data_output is the fix).
+        for r in ArtifactRole::all() {
+            assert_eq!(artifact_role_from_assessment_str(r.label()), Some(r));
+        }
+        assert_eq!(
+            artifact_role_from_assessment_str("data_output"),
+            Some(ArtifactRole::DataOutput),
+            "data_output must now round-trip (was previously dropped)"
+        );
+        // Aliases preserved.
+        assert_eq!(
+            artifact_role_from_assessment_str("impl"),
+            Some(ArtifactRole::Implementation)
+        );
+        assert_eq!(
+            artifact_role_from_assessment_str("code"),
+            Some(ArtifactRole::Implementation)
+        );
+        assert_eq!(
+            artifact_role_from_assessment_str("source"),
+            Some(ArtifactRole::Implementation)
+        );
+        assert_eq!(
+            artifact_role_from_assessment_str("tests"),
+            Some(ArtifactRole::Test)
+        );
+        assert_eq!(
+            artifact_role_from_assessment_str("documentation"),
+            Some(ArtifactRole::UsageDocs)
+        );
+        assert_eq!(
+            artifact_role_from_assessment_str("readme"),
+            Some(ArtifactRole::UsageDocs)
+        );
+        assert_eq!(
+            artifact_role_from_assessment_str("dependency"),
+            Some(ArtifactRole::Setup)
+        );
+        // Case-insensitive trim preserved; unknown stays None.
+        assert_eq!(
+            artifact_role_from_assessment_str("  IMPL "),
+            Some(ArtifactRole::Implementation)
+        );
+        assert_eq!(artifact_role_from_assessment_str("unknown"), None);
+        assert_eq!(artifact_role_from_assessment_str("nonsense"), None);
     }
 }

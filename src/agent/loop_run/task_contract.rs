@@ -2,7 +2,24 @@ use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCatego
 use super::required_behavior::{self, RequiredBehaviorContract};
 use crate::tools::bash::BashCommandClass;
 
+/// The role an artifact plays in satisfying a task contract.
+///
+/// Issue #920: `#[non_exhaustive]` here is a **forward-marker only**.
+/// `ArtifactRole` is `pub(super)` and never crosses the crate boundary, so the
+/// attribute has **no effect on in-crate `match` exhaustiveness** — it does NOT
+/// provide the extensibility this issue targets. Cascade-freedom comes from the
+/// documented `_ =>` default arms at the Tier-A sites (e.g.
+/// `default_deliverable_path`, `synthesized_missing_role_target_hint`,
+/// `role_score`); the genuine 1:1 decision points (`label`/`from_label`,
+/// `deliverable_kind_for_role`, `suggested_next_action`, the security guards
+/// `file_matches_role`/`role_matches_path`, and the repair-priority ranks)
+/// deliberately stay exhaustive so a new role compile-errors into a decision.
+///
+/// New variants MUST be **APPENDED after `DataOutput`** (never inserted): the
+/// `Ord` derive drives `BTreeMap`/`BTreeSet`/`Vec<ArtifactRole>.sort()` ordering
+/// and the `required_artifacts_completed_returns_btreemap_ordered` golden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
+#[non_exhaustive]
 pub(super) enum ArtifactRole {
     Implementation,
     Test,
@@ -12,6 +29,28 @@ pub(super) enum ArtifactRole {
 }
 
 impl ArtifactRole {
+    /// All variants in declaration (`Ord`) order. Issue #920: this is the
+    /// totality SSOT so round-trip / Tier-A totality tests need no hand-listed
+    /// variant set — adding a role updates only this one arm and the tests
+    /// auto-cover it. New variants MUST be APPENDED after `DataOutput` (the
+    /// `Ord` derive drives `BTreeMap`/`BTreeSet`/`Vec<ArtifactRole>.sort()`
+    /// ordering and the `required_artifacts_completed_returns_btreemap_ordered`
+    /// golden in `artifact_ledger.rs`).
+    ///
+    /// Test-only infrastructure (`#[cfg(test)]`): the production paths match on
+    /// `ArtifactRole` directly; `all()` exists so the round-trip / Tier-A
+    /// totality tests enumerate variants from a single source.
+    #[cfg(test)]
+    pub(super) const fn all() -> [ArtifactRole; 5] {
+        [
+            ArtifactRole::Implementation,
+            ArtifactRole::Test,
+            ArtifactRole::UsageDocs,
+            ArtifactRole::Setup,
+            ArtifactRole::DataOutput,
+        ]
+    }
+
     pub(super) fn label(self) -> &'static str {
         match self {
             ArtifactRole::Implementation => "implementation",
@@ -20,6 +59,31 @@ impl ArtifactRole {
             ArtifactRole::Setup => "setup",
             ArtifactRole::DataOutput => "data_output",
         }
+    }
+
+    /// Strict reverse of [`ArtifactRole::label`] — accepts ONLY the canonical
+    /// label strings that `label()` emits. Round-trip symmetric:
+    /// `from_label(r.label()) == Some(r)` for every variant (incl.
+    /// `data_output`); any other input returns `None` (Issue #920, Tier B: no
+    /// `_ =>` default — a new role must declare its canonical string here).
+    ///
+    /// SRP boundary: LLM-origin *aliases* (`impl`/`code`/`docs`/`readme`/`data`
+    /// /`output`, …) are NOT this function's responsibility. Alias-rich callers
+    /// layer `from_label(normalized).or_else(|| <alias arm>)` so only the
+    /// canonical vocabulary flows through this SSOT.
+    ///
+    /// SYNC: this canonical vocabulary must stay in sync with the LLM prompt
+    /// allowed-values in `verifier_orchestration.rs` (string literals, so the
+    /// link is manual; a drift golden test pins it).
+    pub(super) fn from_label(s: &str) -> Option<ArtifactRole> {
+        Some(match s {
+            "implementation" => ArtifactRole::Implementation,
+            "test" => ArtifactRole::Test,
+            "usage_docs" => ArtifactRole::UsageDocs,
+            "setup" => ArtifactRole::Setup,
+            "data_output" => ArtifactRole::DataOutput,
+            _ => return None,
+        })
     }
 }
 
@@ -1533,7 +1597,10 @@ fn synthesized_missing_role_target_hint(
         ArtifactRole::Test => synthesized_test_target_path(artifacts)?,
         ArtifactRole::UsageDocs => "README.md".to_string(),
         ArtifactRole::DataOutput => "output.csv".to_string(),
-        ArtifactRole::Implementation | ArtifactRole::Setup => return None,
+        // Issue #920 (Tier A, cascade-free default): roles with no conventional
+        // synthesizable path (Implementation / Setup today, and any future role)
+        // produce no hint — there is nothing deterministic to create for them.
+        _ => return None,
     };
     Some(RecoveryTargetHint {
         role,
@@ -2419,6 +2486,9 @@ fn generic_task_deliverable(request: &str, task_kind: TaskKind) -> TaskDeliverab
     }
 }
 
+/// Issue #920: intentional 1:1 decision point — there is no sensible default
+/// `DeliverableKind` for an unknown role, so this match stays exhaustive (no
+/// `_ =>`). Adding a role MUST compile-error here to force an explicit kind.
 fn deliverable_kind_for_role(role: ArtifactRole) -> DeliverableKind {
     match role {
         ArtifactRole::Implementation => DeliverableKind::Code,
@@ -2433,7 +2503,11 @@ fn default_deliverable_path(role: ArtifactRole) -> Option<&'static str> {
     match role {
         ArtifactRole::UsageDocs => Some("README.md"),
         ArtifactRole::DataOutput => Some("output.csv"),
-        ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup => None,
+        // Issue #920 (Tier A, cascade-free default): roles without a canonical
+        // default artifact path (Implementation / Test / Setup today, and any
+        // future role) have no deterministic default path. A new role inherits
+        // `None` here and only needs a dedicated arm if it gains a convention.
+        _ => None,
     }
 }
 
@@ -4628,6 +4702,10 @@ fn lower_contains_file_suffix(lower: &str, suffix: &str) -> bool {
     })
 }
 
+/// Issue #920: intentional 1:1 decision point — every role has a distinct,
+/// role-specific instruction, so a generic `_ =>` default would silently mislead
+/// recovery for `Setup`/`DataOutput`/a future role. Kept exhaustive (no `_ =>`)
+/// so adding a role compile-errors here and forces a deliberate instruction.
 fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
     let lower = request.to_ascii_lowercase();
     let fastapi = lower.contains("fastapi");
@@ -4662,6 +4740,93 @@ fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Issue #920 (P3): ArtifactRole round-trip / totality / append-only ----
+    //
+    // `all()` is the totality SSOT; `from_label` is the strict canonical reverse
+    // of `label()`. These tests are driven by `all()` so adding a role updates
+    // exactly one arm and the coverage follows automatically (cascade-free).
+
+    #[test]
+    fn artifact_role_label_from_label_round_trip() {
+        for r in ArtifactRole::all() {
+            assert_eq!(
+                ArtifactRole::from_label(r.label()),
+                Some(r),
+                "label()/from_label() must round-trip for {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_role_from_label_rejects_unknown_and_aliases() {
+        // Strict canonical-only: unknown and LLM aliases are NOT this fn's job.
+        for bad in [
+            "",
+            "unknown",
+            "impl",
+            "code",
+            "docs",
+            "readme",
+            "data",
+            "output",
+            "DATA_OUTPUT",
+        ] {
+            assert_eq!(
+                ArtifactRole::from_label(bad),
+                None,
+                "from_label must reject non-canonical {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_role_tier_a_default_path_is_total_with_documented_fallback() {
+        // Cascade-free Tier-A site: `default_deliverable_path` keeps explicit
+        // arms only for the roles with a canonical path; every other role (and
+        // any future one) falls through the documented `_ => None` default.
+        for r in ArtifactRole::all() {
+            let path = default_deliverable_path(r);
+            match r {
+                ArtifactRole::UsageDocs => assert_eq!(path, Some("README.md")),
+                ArtifactRole::DataOutput => assert_eq!(path, Some("output.csv")),
+                // Implementation / Test / Setup share the `None` default.
+                _ => assert_eq!(path, None, "Tier-A default path must be None for {r:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn artifact_role_decision_point_kinds_are_distinct_per_role() {
+        // 1:1 decision-point site: every role maps to a distinct DeliverableKind
+        // (no default), so adding a role compile-errors here on purpose.
+        let kinds: Vec<DeliverableKind> = ArtifactRole::all()
+            .iter()
+            .map(|&r| deliverable_kind_for_role(r))
+            .collect();
+        assert_eq!(kinds.len(), 5);
+        assert_eq!(
+            deliverable_kind_for_role(ArtifactRole::DataOutput),
+            DeliverableKind::Data
+        );
+        assert_eq!(
+            deliverable_kind_for_role(ArtifactRole::UsageDocs),
+            DeliverableKind::UsageDocs
+        );
+    }
+
+    #[test]
+    fn artifact_role_all_is_append_only_declaration_order() {
+        // Guards the Ord/append-only invariant: DataOutput stays last, count is 5.
+        let all = ArtifactRole::all();
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], ArtifactRole::Implementation);
+        assert_eq!(all[4], ArtifactRole::DataOutput);
+        // `all()` order matches Ord (declaration) order.
+        let mut sorted = all;
+        sorted.sort();
+        assert_eq!(sorted, all, "all() must already be in Ord order");
+    }
 
     // ---- Issue #925 (P8): classifier ⇔ eval-category divergence guard --------
     //

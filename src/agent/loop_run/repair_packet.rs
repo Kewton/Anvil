@@ -371,6 +371,10 @@ fn correction_kind_for_target(
     task_kind: TaskKind,
     target: &RepairObligationTarget,
 ) -> CorrectionKind {
+    // Issue #920: `role` is matched with `_` wildcards keyed on failure domain,
+    // so a new role falls through to the domain-based default (e.g.
+    // `MalformedDeliverable`/`MissingDeliverable` ⇒ generic correction) — a
+    // documented, safe fallback rather than a silent mis-classification.
     match (task_kind, target.failure_domain, target.role) {
         (_, DeliverableFailureDomain::GeneratedTestBug, _) => CorrectionKind::TestCorrection,
         (_, DeliverableFailureDomain::InvalidManifest, _) => CorrectionKind::ManifestCorrection,
@@ -469,6 +473,9 @@ fn bounded_evidence(raw: String) -> String {
     sanitize_repair_job_text_with_char_cap(&raw, MAX_EXPECTED_EVIDENCE_CHARS)
 }
 
+/// Issue #920: intentional 1:1 decision point (twin of
+/// `task_contract::deliverable_kind_for_role`) — no sensible default
+/// `DeliverableKind` for an unknown role, so this stays exhaustive (no `_ =>`).
 fn default_kind_for_role(role: ArtifactRole) -> DeliverableKind {
     match role {
         ArtifactRole::Implementation => DeliverableKind::Code,

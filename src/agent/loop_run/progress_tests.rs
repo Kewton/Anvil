@@ -3680,6 +3680,46 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
     }
 
     #[test]
+    fn verifier_diagnostic_prompt_vocabulary_stays_in_sync_with_from_label() {
+        // Issue #920 (DR1-007): the verifier diagnostic prompt's role vocabulary
+        // is a string literal, so it must be kept in sync with the canonical
+        // `ArtifactRole::from_label` set by hand. This drift guard fails if a
+        // canonical role label (e.g. the previously-missing `data_output`) is
+        // not present as an allowed value in the prompt.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "x = 1\n").unwrap();
+        let context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest",
+            "tests/test_x.py:1: AssertionError\n",
+            &["app/main.py".to_string()],
+            1,
+            None,
+        );
+        let messages = verifier_diagnostic_messages(&work_root, &context, "build api", None);
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // data_output is the role that was historically dropped — pin it.
+        assert!(
+            prompt.contains("data_output"),
+            "prompt must list data_output as an allowed role: {prompt}"
+        );
+        for r in super::super::task_contract::ArtifactRole::all() {
+            assert!(
+                prompt.contains(r.label()),
+                "prompt missing canonical role label {}: {prompt}",
+                r.label()
+            );
+        }
+    }
+
+    #[test]
     fn verifier_diagnostic_payload_includes_pytest_lifecycle_finding() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
