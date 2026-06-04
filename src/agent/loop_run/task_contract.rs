@@ -1171,6 +1171,72 @@ fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, exce
     })
 }
 
+fn missing_owned_test_artifact_action(
+    inputs: &ArtifactRecoveryInputs<'_>,
+) -> Option<ArtifactRecoveryAction> {
+    if !inputs.contract.completion_policy.test_execution_required()
+        || !inputs
+            .contract
+            .required_artifacts
+            .contains(&ArtifactRole::Test)
+        || inputs.missing_verifier_suppress_retry
+        || !inputs.owned_test_artifacts.is_empty()
+    {
+        return None;
+    }
+
+    let missing = vec![ArtifactRole::Test];
+    let target_hint = owned_test_artifact_gap_target_hint(inputs).or_else(|| {
+        recovery_target_hint_for_missing_with_contract(
+            inputs.contract,
+            inputs.artifacts,
+            inputs.artifact_excerpts,
+            &missing,
+        )
+    });
+    Some(ArtifactRecoveryAction::Continue {
+        missing,
+        target_hint,
+    })
+}
+
+fn owned_test_artifact_gap_target_hint(
+    inputs: &ArtifactRecoveryInputs<'_>,
+) -> Option<RecoveryTargetHint> {
+    let reason =
+        "test execution is required but no owned test artifact is bindable as verifier evidence"
+            .to_string();
+    if let Some(identity) = inputs
+        .contract
+        .required_identities_for_role(ArtifactRole::Test)
+        .first()
+    {
+        return Some(RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: identity.path.clone(),
+            reason,
+        });
+    }
+    inputs
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.role == ArtifactRole::Test
+                && matches!(
+                    artifact.kind,
+                    ArtifactStateKind::ExistsButUnverified
+                        | ArtifactStateKind::ChangedThisTurn
+                        | ArtifactStateKind::ScaffoldUnchanged
+                )
+        })
+        .and_then(|artifact| artifact.path.clone())
+        .map(|path| RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path,
+            reason,
+        })
+}
+
 pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> ArtifactRecoveryAction {
     // Issue #922 (DD4 / S7-001 / DR1-001): relax the Explain short-circuit only
     // for a research task with a required report obligation (shared signal with
@@ -1214,6 +1280,10 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
             ),
             missing,
         };
+    }
+
+    if let Some(action) = missing_owned_test_artifact_action(&inputs) {
+        return action;
     }
 
     // Issue #636: behavior-coverage gate. When the contract carries
@@ -4209,6 +4279,20 @@ fn inferred_artifact_obligations_from_project_intent(
                         default_readme_required_sections(),
                     ));
                 }
+            } else if matches!(shape, ProjectShape::Library) {
+                obligations.push(ArtifactObligation::file(
+                    ArtifactRole::Implementation,
+                    "src/lib.rs",
+                ));
+                if required_artifacts.contains(&ArtifactRole::Test) {
+                    obligations.push(ArtifactObligation::file(ArtifactRole::Test, "tests/lib.rs"));
+                }
+                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
+                    obligations.push(ArtifactObligation::readme(
+                        "README.md",
+                        default_readme_required_sections(),
+                    ));
+                }
             }
         }
         ProjectLanguage::Node => {
@@ -6034,6 +6118,29 @@ mod tests {
     }
 
     #[test]
+    fn rust_library_contract_requires_manifest_impl_test_and_readme_obligations() {
+        let contract = TaskContract::from_request(
+            "Create a Rust library. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Setup, "Cargo.toml").format,
+            Some(DeliverableFormat::Toml)
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Implementation, "src/lib.rs").format,
+            Some(DeliverableFormat::RustSource)
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Test, "tests/lib.rs").format,
+            Some(DeliverableFormat::RustSource)
+        );
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+        assert_eq!(readme.format, Some(DeliverableFormat::Markdown));
+        assert_eq!(readme.required_sections, default_readme_required_sections());
+    }
+
+    #[test]
     fn node_cli_contract_requires_package_bin_source_test_and_readme_obligations() {
         let contract = TaskContract::from_request(
             "Create a Node CLI. Include package.json with a bin entry, source, tests, and README.md.",
@@ -6132,6 +6239,76 @@ mod tests {
                     role: ArtifactRole::Test,
                     path: "tests/test_main.py".to_string(),
                     reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/test_main.py".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rust_cli_setup_only_partial_state_targets_missing_implementation() {
+        let contract = TaskContract::from_request(
+            "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        let artifacts = vec![ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing: vec![
+                    ArtifactRole::Implementation,
+                    ArtifactRole::Test,
+                    ArtifactRole::UsageDocs
+                ],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "src/main.rs".to_string(),
+                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/main.rs".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn rust_cli_impl_only_partial_state_targets_contract_test_path() {
+        let contract = TaskContract::from_request(
+            "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/main.rs"));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+            ArtifactState::exists(ArtifactRole::Implementation, "src/main.rs"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Test, ArtifactRole::UsageDocs],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/cli.rs".to_string(),
+                    reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/cli.rs".to_string(),
                 }),
             }
         );
@@ -7053,7 +7230,7 @@ mod tests {
                 repair_state: &repair_state,
                 artifact_excerpts: &ArtifactExcerpts::new(),
                 missing_verifier_suppress_retry: false,
-                owned_test_artifacts: &[],
+                owned_test_artifacts: &["tests/test_lru_cache.py".to_string()],
             }),
             ArtifactRecoveryAction::RunVerifier
         );
@@ -7261,9 +7438,198 @@ mod tests {
                 repair_state: &repair_state,
                 artifact_excerpts: &ArtifactExcerpts::new(),
                 missing_verifier_suppress_retry: false,
-                owned_test_artifacts: &[],
+                owned_test_artifacts: &["tests/test_todos.py".to_string()],
             }),
             ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn issue951_setup_only_package_json_routes_to_missing_deliverable_job() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json, implementation, tests, and README.md.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "package.json"));
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "package.json")],
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![
+                    ArtifactRole::Implementation,
+                    ArtifactRole::Test,
+                    ArtifactRole::UsageDocs
+                ],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "src/index.js".to_string(),
+                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/index.js".to_string(),
+                }),
+            }
+        );
+        assert_eq!(
+            super::super::active_job_arbiter::recovery_job_kind_for_artifact_recovery_action(
+                &action
+            ),
+            Some(super::super::active_job_arbiter::RecoveryJobKind::MissingDeliverableJob)
+        );
+    }
+
+    #[test]
+    fn issue951_rust_implementation_only_routes_to_missing_manifest_before_safe_stop() {
+        let contract =
+            TaskContract::from_request("Create a Rust CLI word counter with cargo tests.");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/main.rs"));
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::Implementation,
+                "src/main.rs",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Test, ArtifactRole::Setup],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/cli.rs".to_string(),
+                    reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/cli.rs".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn issue951_no_bindable_owned_test_routes_to_deterministic_test_completion() {
+        let contract =
+            TaskContract::from_request("Create a Rust CLI word counter with cargo tests.");
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/main.rs"));
+        evidence.push(repo_edit_path(RepoEditCategory::Test, "tests/cli.rs"));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+            ArtifactState::exists(ArtifactRole::Implementation, "src/main.rs"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/cli.rs"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Test],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/cli.rs".to_string(),
+                    reason: "test execution is required but no owned test artifact is bindable as verifier evidence".to_string(),
+                }),
+            }
+        );
+        assert_eq!(
+            super::super::active_job_arbiter::recovery_job_kind_for_artifact_recovery_action(
+                &action
+            ),
+            Some(super::super::active_job_arbiter::RecoveryJobKind::MissingDeliverableJob)
+        );
+    }
+
+    #[test]
+    fn issue951_docs_partial_sections_route_to_completion_target() {
+        let contract = TaskContract::from_request(
+            "Update README.md with installation, usage, and testing sections.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        let excerpts = build_excerpts(&[(ArtifactRole::UsageDocs, "## Installation\ninstall\n")]);
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(ArtifactRole::UsageDocs, "README.md")],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::UsageDocs],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::UsageDocs,
+                    path: "README.md".to_string(),
+                    reason: "structured verifier diagnostic: kind=evidence_missing, task_kind=docs, summary=documentation required sections are absent from the observed content".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn issue951_data_partial_schema_failure_routes_to_completion_target() {
+        let contract = TaskContract::from_request(
+            "Generate output.csv with columns Category and Total from the input CSV.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
+        let excerpts = build_excerpts(&[(ArtifactRole::DataOutput, "x,y\n1")]);
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::DataOutput,
+                "output.csv",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::DataOutput],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::DataOutput,
+                    path: "output.csv".to_string(),
+                    reason: "structured verifier diagnostic: kind=schema_mismatch, task_kind=data, summary=structured data evidence is missing required columns or parse-ready records".to_string(),
+                }),
+            }
         );
     }
 
@@ -7318,7 +7684,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &ArtifactExcerpts::new(),
             missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
+            owned_test_artifacts: &["tests/test_main.py".to_string()],
         });
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
@@ -7982,8 +8348,8 @@ mod tests {
     fn implementation_excerpt_non_placeholder_is_allowed_to_reach_verifier() {
         let contract = TaskContract::from_request("Build a slugify Rust library. Add tests.");
         let mut evidence = EvidenceSet::new();
-        evidence.push(repo_edit(RepoEditCategory::Impl));
-        evidence.push(repo_edit(RepoEditCategory::Test));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"));
+        evidence.push(repo_edit_path(RepoEditCategory::Test, "tests/lib.rs"));
         let excerpts = build_excerpts(&[
             (
                 ArtifactRole::Implementation,
@@ -7998,11 +8364,15 @@ mod tests {
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
+            artifacts: &[
+                ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+                ArtifactState::exists(ArtifactRole::Implementation, "src/lib.rs"),
+                ArtifactState::exists(ArtifactRole::Test, "tests/lib.rs"),
+            ],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
+            owned_test_artifacts: &["tests/lib.rs".to_string()],
         });
 
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
@@ -8039,7 +8409,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
+            owned_test_artifacts: &["tests/test_task.py".to_string()],
         });
         // With coverage satisfied + tests required, the planner falls
         // through to verifier execution.
@@ -8071,7 +8441,7 @@ mod tests {
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
+            owned_test_artifacts: &["tests/test_task.py".to_string()],
         });
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
     }
@@ -8082,9 +8452,9 @@ mod tests {
             "Build a Task Rust library that can create tasks. Document usage in README. Add tests.",
         );
         let mut evidence = EvidenceSet::new();
-        evidence.push(repo_edit(RepoEditCategory::Impl));
-        evidence.push(repo_edit(RepoEditCategory::Test));
-        evidence.push(repo_edit(RepoEditCategory::Docs));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"));
+        evidence.push(repo_edit_path(RepoEditCategory::Test, "tests/lib.rs"));
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
         let excerpts = build_excerpts(&[
             (
                 ArtifactRole::Implementation,
@@ -8096,18 +8466,23 @@ mod tests {
             ),
             (
                 ArtifactRole::UsageDocs,
-                "## Usage\nExample code is shown below.\n## Test\ncargo test\n",
+                "## Setup\ncargo add tasklib\n## Usage\nExample code is shown below.\n## Test\ncargo test\n",
             ),
         ]);
         let repair_state = VerifierRepairState::None;
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
+            artifacts: &[
+                ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+                ArtifactState::exists(ArtifactRole::Implementation, "src/lib.rs"),
+                ArtifactState::exists(ArtifactRole::Test, "tests/lib.rs"),
+                ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+            ],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
+            owned_test_artifacts: &["tests/lib.rs".to_string()],
         });
 
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
@@ -8159,10 +8534,16 @@ mod tests {
         let contract = TaskContract::from_request(
             "Build a Task Rust library. Document usage in README. Add tests.",
         );
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
         let mut evidence = EvidenceSet::new();
-        evidence.push(repo_edit(RepoEditCategory::Impl));
-        evidence.push(repo_edit(RepoEditCategory::Test));
-        evidence.push(repo_edit(RepoEditCategory::Docs));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"));
+        evidence.push(repo_edit_path(RepoEditCategory::Test, "tests/lib.rs"));
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
         let excerpts = build_excerpts(&[
             (
                 ArtifactRole::Implementation,
@@ -8174,18 +8555,31 @@ mod tests {
             ),
             (
                 ArtifactRole::UsageDocs,
-                "# Task\n\n## 使用例\nCargo.toml に依存を追加します。\n\n```rust\nuse tasklib::create_task;\n```\n\n```bash\ncargo test\n```\n",
+                "# Task\n\n## Setup\nCargo.toml に依存を追加します。\n\n## Usage\n使用例:\n\n```rust\nuse tasklib::create_task;\n```\n\n## Test\n```bash\ncargo test\n```\n",
             ),
         ]);
+        let docs_excerpt = excerpts
+            .get(&ArtifactRole::UsageDocs)
+            .expect("docs excerpt");
+        assert!(
+            usage_docs_excerpt_satisfies_obligations(&contract, docs_excerpt),
+            "docs excerpt must satisfy obligations: identities={:?}",
+            contract.required_identities_for_role(ArtifactRole::UsageDocs)
+        );
         let repair_state = VerifierRepairState::None;
         let action = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &evidence,
-            artifacts: &[ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml")],
+            artifacts: &[
+                ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+                ArtifactState::exists(ArtifactRole::Implementation, "src/lib.rs"),
+                ArtifactState::exists(ArtifactRole::Test, "tests/lib.rs"),
+                ArtifactState::exists(ArtifactRole::UsageDocs, "README.md"),
+            ],
             repair_state: &repair_state,
             artifact_excerpts: &excerpts,
             missing_verifier_suppress_retry: false,
-            owned_test_artifacts: &[],
+            owned_test_artifacts: &["tests/lib.rs".to_string()],
         });
 
         assert_eq!(action, ArtifactRecoveryAction::RunVerifier);
