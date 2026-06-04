@@ -424,6 +424,10 @@ pub mod commands;
 // reaching into private module state — see `is_completion_verifier_command`
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
+// Issue #950: delegated local-LLM persistence policy. Records static
+// controller recovery strategy labels and gates prose-only recovery exits
+// without widening provider abstractions.
+mod controller_policy;
 mod deterministic;
 pub(crate) mod feedback_kind_confirm;
 mod footer;
@@ -2185,6 +2189,11 @@ pub struct Agent {
     /// projection_recovery_target()` at the same call sites — there is no
     /// divergent independent assignment outside of `set_artifact_recovery_target_from_hint`.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
+    /// Issue #950: turn-local controller strategy ledger for delegated
+    /// local-LLM persistence. Static labels only; no commands, paths, tool
+    /// args, or approval details. Reset at every user turn and actor-loop
+    /// entry, consumed by eval logging and focused controller tests.
+    controller_policy_ledger: crate::agent::loop_run::controller_policy::ControllerPolicyLedger,
     /// Issue #652: in-flight artifact-completion job (role-specific retry
     /// budget, sanitized attempt history, wrong-target / no-tool / prose-only
     /// / role-policy-violation taxonomy). Reset at every
@@ -2685,6 +2694,7 @@ impl Agent {
             evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
+            controller_policy_ledger: controller_policy::ControllerPolicyLedger::default(),
             artifact_completion_job: None,
             artifact_completion_exhausted_this_turn: false,
             artifact_completion_failed_diagnostic_emitted_this_turn: false,

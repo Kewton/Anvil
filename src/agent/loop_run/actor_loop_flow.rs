@@ -54,6 +54,7 @@ use crate::tools::registry::resolve_plan_mode_write_target;
 
 use super::Agent;
 use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, RecoveryOwner};
+use super::controller_policy::ControllerRecoveryStrategy;
 use super::interrupt::{InterruptFlag, InterruptMonitor};
 use super::lifecycle;
 use super::path_helpers::normalize_exploration_path;
@@ -503,6 +504,9 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         &target_path,
     ) {
         Ok(true) => {
+            agent
+                .controller_policy_ledger
+                .record(ControllerRecoveryStrategy::DeterministicFallback);
             super::turn_helpers::write_stdout_rendered(
                 &format_iteration_status(
                     args.last_iter,
@@ -533,6 +537,9 @@ pub(super) fn maybe_handle_repo_change_quality_gate_recovery(
         }
     }
     *args.repo_change_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     if *args.repo_change_retries >= 3 {
         return Some(PostReplyRecoveryOutcome::Finalize {
             final_prose: String::new(),
@@ -578,6 +585,9 @@ pub(super) fn maybe_handle_repo_change_partial_progress_recovery(
         return None;
     }
     *args.repo_change_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolFirstRetry);
     if *args.repo_change_retries >= 3 {
         return Some(PostReplyRecoveryOutcome::Finalize {
             final_prose: String::new(),
@@ -616,6 +626,9 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
         return None;
     }
     *args.python_test_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     if *args.python_test_retries >= 2 {
         let (final_prose, exit_reason, error_text) =
             match super::scaffold_pipeline::maybe_materialize_python_test_fallback(agent) {
@@ -670,6 +683,9 @@ pub(super) fn maybe_handle_missing_repo_edit_recovery(
         return Some(outcome);
     }
     *args.repo_change_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolFirstRetry);
     if *args.repo_change_retries >= 3 {
         return Some(finalize_missing_repo_edit_retry_exhausted(agent));
     }
@@ -700,6 +716,9 @@ pub(super) fn maybe_continue_missing_repo_framework_fallback(
         return false;
     }
     *args.framework_app_fallback_materialized = true;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::DeterministicFallback);
     super::message_push::push_system_note(
         agent,
         framework_app_fallback_continuation_note().to_string(),
@@ -718,11 +737,17 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
     ) {
         super::scaffold_pipeline::ScaffoldFallbackResult::Applied => {
             *args.repo_change_retries = 0;
+            agent
+                .controller_policy_ledger
+                .record(ControllerRecoveryStrategy::DeterministicFallback);
             Some(PostReplyRecoveryOutcome::Continue)
         }
         super::scaffold_pipeline::ScaffoldFallbackResult::Failed
         | super::scaffold_pipeline::ScaffoldFallbackResult::Skipped => {
             *args.repo_change_retries += 1;
+            agent
+                .controller_policy_ledger
+                .record(ControllerRecoveryStrategy::ToolFirstRetry);
             if *args.repo_change_retries >= 3 {
                 return Some(missing_repo_edits_finalize_outcome());
             }
@@ -738,6 +763,9 @@ pub(super) fn maybe_continue_missing_repo_scaffold_fallback(
 
 pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usize) {
     if let Some(target) = super::recovery_targets::focused_edit_recovery_target(agent) {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
         let target_already_read =
             focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
         let note = super::recovery_messages::focused_edit_no_tool_note_for_target(
@@ -751,6 +779,10 @@ pub(super) fn push_missing_repo_edit_retry_note(agent: &mut Agent, attempt: usiz
     }
     if !super::artifact_completion_record::push_artifact_directed_recovery_note(agent, attempt) {
         super::message_push::push_system_note(agent, recovery::repo_change_recovery_note(attempt));
+    } else {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     }
 }
 
@@ -1047,6 +1079,9 @@ fn handle_generic_prose_only_retry(
     no_tool_retries: &mut usize,
 ) -> ActorLoopNoToolReplyOutcome {
     *no_tool_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolFirstRetry);
     if *no_tool_retries >= 3 {
         agent
             .session
@@ -1127,6 +1162,9 @@ fn handle_empty_missing_repo_change_retry(
     agent: &mut Agent,
     repo_change_retries: usize,
 ) -> ActorLoopNoToolReplyOutcome {
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolFirstRetry);
     if !super::artifact_completion_record::push_artifact_directed_recovery_note(
         agent,
         repo_change_retries,
@@ -1138,6 +1176,10 @@ fn handle_empty_missing_repo_change_retry(
             agent,
             recovery::repo_change_recovery_note(repo_change_retries),
         );
+    } else {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     }
     if super::artifact_completion_record::record_artifact_completion_attempt(
         agent,
@@ -1153,7 +1195,13 @@ fn handle_prose_only_missing_repo_change_retry(
     agent: &mut Agent,
     repo_change_retries: usize,
 ) -> ActorLoopNoToolReplyOutcome {
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolFirstRetry);
     if let Some(target) = super::recovery_targets::focused_edit_recovery_target(agent) {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
         let target_already_read =
             focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
         let note = super::recovery_messages::focused_edit_no_tool_note_for_target(
@@ -1174,6 +1222,10 @@ fn handle_prose_only_missing_repo_change_retry(
             agent,
             recovery::repo_change_no_tool_recovery_note(repo_change_retries),
         );
+    } else {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     }
     if super::artifact_completion_record::record_artifact_completion_attempt(
         agent,
@@ -1222,6 +1274,9 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
             };
         }
     };
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::DeterministicFallback);
     if let Some(relative) = fallback {
         return ActorLoopNoToolReplyOutcome::Done {
             final_prose: format!(
@@ -1236,6 +1291,9 @@ fn handle_actor_loop_missing_repo_change_retry_exhausted(
         )
     {
         *args.framework_app_fallback_materialized = true;
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::DeterministicFallback);
         super::message_push::push_system_note(
             agent,
             framework_app_fallback_continuation_note().to_string(),
@@ -1407,6 +1465,16 @@ pub(super) fn handle_actor_loop_completion(
             );
             return ActorLoopCompletionOutcome::Continue;
         }
+    }
+    if matches!(
+        super::controller_policy::prose_only_terminal_decision(
+            args.task_contract_action,
+            &agent.controller_policy_ledger,
+        ),
+        super::controller_policy::ProseOnlyTerminalDecision::BlockForRecovery
+    ) {
+        push_controller_persistence_retry_note(agent, args.last_iter);
+        return ActorLoopCompletionOutcome::Continue;
     }
     if let Some((reason, error_text)) =
         task_contract_action_completion_exit(args.task_contract_action)
@@ -2204,6 +2272,9 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         Some(args.action),
         args.current_reply_tool_call_count,
     ) {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::ToolFirstRetry);
         return handle_actor_loop_task_contract_tool_recovery(
             agent,
             ActorLoopTaskContractToolRecoveryArgs {
@@ -2226,6 +2297,9 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         )
     {
         *args.contract_deterministic_fallback_materialized = true;
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::DeterministicFallback);
         super::set_artifact_recovery_target::set_artifact_recovery_target_for_decision(
             agent,
             &decision,
@@ -2254,6 +2328,9 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
     args: ActorLoopTaskContractToolRecoveryArgs<'_, '_>,
 ) -> ActorLoopTaskContractReplyOutcome {
     *args.contract_completion_retries = (*args.contract_completion_retries).saturating_add(1);
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolFirstRetry);
     let role = args
         .missing
         .first()
@@ -2269,6 +2346,10 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
         kind,
         Vec::new(),
     ) {
+        if !agent.controller_policy_ledger.persistent_failure_allowed() {
+            push_controller_persistence_retry_note(agent, args.last_iter);
+            return ActorLoopTaskContractReplyOutcome::Continue;
+        }
         return ActorLoopTaskContractReplyOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: ARTIFACT_COMPLETION_BUDGET_EXHAUSTED_TEXT.to_string(),
@@ -2276,8 +2357,15 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
     }
     let artifact_attempt =
         increment_artifact_completion_role_attempt(args.contract_completion_role_retries, role);
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     let attempt_limit = args.contract.artifact_completion_attempt_limit();
     if artifact_attempt >= attempt_limit {
+        if !agent.controller_policy_ledger.persistent_failure_allowed() {
+            push_controller_persistence_retry_note(agent, args.last_iter);
+            return ActorLoopTaskContractReplyOutcome::Continue;
+        }
         let expected_target = args
             .target_hint
             .as_ref()
@@ -2325,6 +2413,10 @@ pub(super) fn handle_actor_loop_task_contract_tool_recovery(
             args.target_hint.as_ref(),
         );
         super::message_push::push_system_note(agent, note);
+    } else {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     }
     ActorLoopTaskContractReplyOutcome::Continue
 }
@@ -2334,6 +2426,9 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
     args: ActorLoopTaskContractIncompleteArgs<'_, '_>,
 ) -> ActorLoopTaskContractReplyOutcome {
     *args.contract_completion_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     let missing_labels = args
         .missing
         .iter()
@@ -2348,6 +2443,10 @@ pub(super) fn handle_actor_loop_task_contract_incomplete_artifacts(
         increment_artifact_completion_role_attempt(args.contract_completion_role_retries, role);
     let attempt_limit = args.contract.artifact_completion_attempt_limit();
     if artifact_attempt >= attempt_limit {
+        if !agent.controller_policy_ledger.persistent_failure_allowed() {
+            push_controller_persistence_retry_note(agent, args.last_iter);
+            return ActorLoopTaskContractReplyOutcome::Continue;
+        }
         let expected_target = args
             .target_hint
             .as_ref()
@@ -2412,10 +2511,17 @@ pub(super) fn handle_actor_loop_task_contract_repair_artifact(
     verifier_repair_retries: &mut usize,
 ) -> ActorLoopTaskContractReplyOutcome {
     agent.repair_job_artifact_attempts = agent.repair_job_artifact_attempts.saturating_add(1);
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::VerifierRepairEdit);
     *verifier_repair_retries = agent.repair_job_artifact_attempts;
     if agent.repair_job_artifact_attempts
         >= super::turn_constants::TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT
     {
+        if !agent.controller_policy_ledger.persistent_failure_allowed() {
+            push_controller_persistence_retry_note(agent, last_iter);
+            return ActorLoopTaskContractReplyOutcome::Continue;
+        }
         let role = agent
             .current_artifact_recovery_target
             .as_ref()
@@ -2473,6 +2579,9 @@ pub(super) fn handle_actor_loop_task_contract_run_verifier(
     agent: &mut Agent,
     args: ActorLoopTaskContractReplyArgs<'_, '_>,
 ) -> ActorLoopTaskContractReplyOutcome {
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::EvidenceAction);
     match super::verifier_orchestration::drive_task_contract_verifier(
         agent,
         super::verifier_orchestration::TaskContractVerifierFlowArgs {
@@ -2523,10 +2632,32 @@ pub(super) fn handle_actor_loop_task_contract_safe_stop(
     }
 }
 
+fn push_controller_persistence_retry_note(agent: &mut Agent, last_iter: usize) {
+    let strategy = agent.controller_policy_ledger.record_next_for_prose_block();
+    let strategy_count = agent.controller_policy_ledger.distinct_strategy_count();
+    super::turn_helpers::write_stdout_rendered(
+        &format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            "Recovery required",
+            "Persistent recoverable failure needs another distinct local strategy before reporting failure.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    super::message_push::push_system_note(
+        agent,
+        super::controller_policy::prose_block_recovery_note(strategy, strategy_count),
+    );
+}
+
 pub(super) fn handle_actor_loop_rejected_tool_batch(
     agent: &mut Agent,
     args: ActorLoopRejectedToolBatchArgs<'_, '_>,
 ) -> ActorLoopToolPreparationOutcome {
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::ToolPolicyRetry);
     let focused_retry = args.effective_tool_policy.focused_edit_policy().cloned();
     let artifact_retry = args
         .effective_tool_policy
@@ -2605,6 +2736,9 @@ pub(super) fn maybe_handle_rejected_tool_batch_missing_verifier(
     if !missing_verifier_setup_turn {
         return None;
     }
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::MissingVerifierSetup);
     if super::agent_misc::record_missing_verifier_setup_failure(
         agent,
         last_iter,
@@ -2630,6 +2764,9 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
     if !artifact_retry_present {
         return None;
     }
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
     let role = agent
         .current_artifact_recovery_target
         .as_ref()
@@ -2640,6 +2777,10 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
         super::artifact_completion_job::ArtifactAttemptOutcomeKind::RolePolicyViolation,
         vec!["focused_edit_batch_reject".to_string()],
     ) {
+        if !agent.controller_policy_ledger.persistent_failure_allowed() {
+            push_controller_persistence_retry_note(agent, last_iter);
+            return Some(ActorLoopToolPreparationOutcome::Continue);
+        }
         return Some(ActorLoopToolPreparationOutcome::Exit {
             reason: ExitReason::MissingRepoEdits,
             error_text: format!(
@@ -2655,6 +2796,10 @@ pub(super) fn maybe_handle_rejected_tool_batch_artifact(
         .map(|contract| contract.artifact_completion_attempt_limit())
         .unwrap_or(4);
     if artifact_attempt >= attempt_limit {
+        if !agent.controller_policy_ledger.persistent_failure_allowed() {
+            push_controller_persistence_retry_note(agent, last_iter);
+            return Some(ActorLoopToolPreparationOutcome::Continue);
+        }
         let expected_target = agent
             .current_artifact_recovery_target
             .as_ref()
@@ -2727,6 +2872,9 @@ pub(super) fn maybe_handle_rejected_tool_batch_focused_retry_exhausted(
             });
         }
     };
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::DeterministicFallback);
     if let Some(relative) = fallback {
         return Some(ActorLoopToolPreparationOutcome::Done {
             final_prose: format!(
@@ -3612,6 +3760,9 @@ pub(super) fn run_actor_loop(
 
         let final_reply = reply_content.trim().to_string();
         if missing_verifier_setup_turn {
+            agent
+                .controller_policy_ledger
+                .record(ControllerRecoveryStrategy::MissingVerifierSetup);
             if super::agent_misc::record_missing_verifier_setup_failure(
                 agent,
                 last_iter,
@@ -4055,6 +4206,8 @@ pub(super) fn run_actor_loop(
             exit_reason.label(),
             last_failure_signature.as_deref(),
         );
+        record.recovery_strategy_count = agent.controller_policy_ledger.distinct_strategy_count();
+        record.recovery_strategies = agent.controller_policy_ledger.strategy_labels();
         record.pam_eval = agent
             .last_pam_decision_this_turn
             .as_ref()

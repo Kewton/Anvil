@@ -103,6 +103,10 @@ pub(super) fn handle_user_message(
     // it gives a within-turn single-emit guarantee that does NOT bleed
     // across turn boundaries.
     agent.artifact_completion_failed_diagnostic_emitted_this_turn = false;
+    // Issue #950: turn-local delegated-persistence strategy ledger. Reset
+    // beside artifact completion / active-job state so recovery attempts never
+    // bleed across independent user turns.
+    agent.controller_policy_ledger.clear();
     // Issue #456: AnvilScore compute happens once per turn, post-loop.
     // The flag flips after the compute so the post-loop Reminder hook
     // sees `CurrentTurn` while the iteration-internal hook sees

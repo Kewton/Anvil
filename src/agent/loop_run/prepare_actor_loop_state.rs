@@ -94,6 +94,10 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     // current turn never observes a previous turn's edits.
     agent.task_contract_excerpts.clear();
     agent.current_artifact_recovery_target = None;
+    // Issue #950: the strategy ledger is actor-loop-local. Reset here as a
+    // defensive mirror for tests or future entry points that call the actor
+    // loop without passing through `handle_user_message`.
+    agent.controller_policy_ledger.clear();
     // Issue #652: per-turn reset of the artifact completion job state
     // (DR3-003 / per-turn cap pattern). A job is only reconstructed
     // through `set_artifact_recovery_target_from_hint`, so dropping it

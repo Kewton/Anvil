@@ -185,6 +185,40 @@ fn r1c_pam_eval_summary_serializes_unused_reason() {
     assert_eq!(json["pam_eval"]["completion_judgement_override"], false);
 }
 
+#[test]
+fn issue950_recovery_strategy_fields_serialize_when_present() {
+    let mut rec = build_eval_record(
+        "sess-950",
+        1_700_000_000_003,
+        "recover from a local test failure",
+        "qwen3:14b",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        make_classes(),
+        &[],
+        None,
+        None,
+        None,
+        "missing_evidence",
+    );
+    rec.recovery_strategy_count = 3;
+    rec.recovery_strategies = vec![
+        "tool_first_retry".to_string(),
+        "targeted_artifact_retry".to_string(),
+        "evidence_action".to_string(),
+    ];
+
+    let json = serde_json::to_value(&rec).unwrap();
+    assert_eq!(json["recovery_strategy_count"], 3);
+    assert_eq!(json["recovery_strategies"][0], "tool_first_retry");
+    assert_eq!(json["recovery_strategies"][1], "targeted_artifact_retry");
+    assert_eq!(json["recovery_strategies"][2], "evidence_action");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // R2: task secret is masked
 // ─────────────────────────────────────────────────────────────────────────────
@@ -460,6 +494,8 @@ fn r9_oversized_record_is_dropped() {
             },
             0,
         )),
+        recovery_strategy_count: 0,
+        recovery_strategies: vec![],
         evaluation_taxonomy: EvaluationTaxonomySummary {
             pam_variant: "unknown".to_string(),
             task_kind: "coding".to_string(),
