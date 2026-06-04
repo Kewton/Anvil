@@ -26,8 +26,6 @@
 
 #![cfg(test)]
 
-use std::path::PathBuf;
-
 use tempfile::{TempDir, tempdir};
 
 use crate::agent::Agent;
@@ -723,12 +721,9 @@ fn bash_out_of_policy_recorded_under_artifact_recovery() {
 
     // Install an ArtifactCompletionJob via the test seam — the
     // `artifact_directed_from_job` policy below reads its target from
-    // this job.
-    let _ = std::fs::create_dir_all(PathBuf::from(
-        crate::agent::loop_run::agent_session_ref(&agent)
-            .workspace_key
-            .clone(),
-    ));
+    // this job. The seam materialises the target file (and its parents)
+    // under `agent.work_root` (the per-test tempdir), so no workspace
+    // directory needs to be pre-created here.
     seed_artifact_completion_job_pending_for_test(&mut agent, "test", "tests/cb2_003_target.rs");
 
     // Drive a Bash call under the artifact-directed policy. Before the
@@ -868,14 +863,10 @@ fn seed_artifact_completion_job_pending_for_test_installs_job_under_work_root() 
     let server = mockito::Server::new();
     let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
 
-    // The seam materialises the target under `agent.work_root` and installs
-    // a fresh `ArtifactCompletionJob`. The seam accepts the role as a
-    // string (primitives only) so `ArtifactRole` stays `pub(super)`.
-    let _ = std::fs::create_dir_all(PathBuf::from(
-        crate::agent::loop_run::agent_session_ref(&agent)
-            .workspace_key
-            .clone(),
-    ));
+    // The seam materialises the target under `agent.work_root` (the
+    // per-test tempdir) and installs a fresh `ArtifactCompletionJob`. The
+    // seam accepts the role as a string (primitives only) so `ArtifactRole`
+    // stays `pub(super)`. No workspace directory needs to be pre-created.
     seed_artifact_completion_job_pending_for_test(&mut agent, "test", "tests/seeded_artifact.rs");
 
     // Drive `build_arbiter_candidates_for_test` again to confirm the
