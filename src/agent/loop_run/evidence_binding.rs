@@ -1,1207 +1,1045 @@
-//! Issue #988 (parent #974): EvidenceBinding / NoProgressRecovery lifecycle
-//! boundary.
+//! Issue #988 umbrella plus child issues #989/#993: evidence binding lifecycle.
 //!
-//! v0.6.4 left `repair_exhausted` as the single most common terminal state
-//! (7/20) and all three Rust cases failed, even though the iteration budget was
-//! never exhausted. The bottleneck is not the model: it is that the controller
-//! rounds distinct failure shapes into the same coarse terminals
-//! (`safe_stop_verifier_missing` / `missing_repo_edits` / generic
-//! `repair_exhausted`) and re-attacks the same target with the same diagnostic.
+//! Structures the binding between a deliverable's evidence runner and the
+//! artifacts it depends on *before* the runner executes, so a binding gap is
+//! classified as a structured `evidence_binding_failed` observation instead of
+//! being rolled up into `safe_stop_verifier_missing` or a generic
+//! `repair_exhausted`.
 //!
-//! This module owns the **Binding** and **Recovery-classification** stages of
-//! the generic `Objective -> Deliverable -> Evidence -> Binding -> Observation
-//! -> Recovery -> TerminalProjection` lifecycle (#974). It is the structural
-//! boundary the child issues (#989-#994) build on:
+//! The core types (`EvidenceBindingPlan` / `BindingCheck` /
+//! `EvidenceBindingStatus` / `BindingCheckKind`) are runtime-neutral so the same
+//! shape extends to Node manifest/test ordering, docs content, data schema, and
+//! research citation binding. Runtime differences live in adapters (`rust_*`
+//! free functions) and the generic [`BindingFailureCheck`] recovery routing
+//! axis, not in provider-specific control flow.
 //!
-//! - [`EvidenceBindingPlan`] structures the deliverable<->evidence-runner
-//!   binding for a task kind and classifies mismatches through one path for
-//!   Rust *and* Node (and an extension axis for docs/data/research). It calls
-//!   the existing deterministic operators' pure cores
-//!   ([`super::cargo_dependency_repair`], [`super::node_runner_manifest`]) so
-//!   the binding classification is genuinely unified, not a parallel copy.
-//! - [`RepairOperatorId`] is the small operator-registry boundary that names
-//!   the deterministic operators behind one enum (the implicit dispatch order
-//!   in `repair_job_dispatch::handle_repair_job_patch_provider_step`).
-//! - [`RepairExhaustionClass`] decomposes `repair_exhausted` into
-//!   `same_target_exhausted` / `operator_missing` / `binding_failed_after_repair`
-//!   / `contract_conflict`, each projecting back to the legacy label and the
-//!   generic terminal vocabulary ([`GenericTerminalState`]) for eval
-//!   compatibility.
-//! - [`NoProgressRecoveryPolicy`] turns a same-target/same-role no-progress
-//!   signal (the #987 `TargetReassessmentRequired` shape) into a structured ban
-//!   payload plus a forced role switch, instead of a blind replan.
-//!
-//! Scope: this is the extension-seam foundation (mirrors `evidence_runner.rs`
-//! #949 and `summary::GenericTerminalState` #947). It is pure and fully
-//! unit-tested; the broad caller wiring into the live repair loop is owned by
-//! the child issues. `pub(super)` limited / no facade re-export (DR3-001).
+//! Like `evidence_runner.rs`, this module is an extension seam: the focused
+//! in-crate tests pin the shape before broad callers are wired, so the
+//! production-facing functions are `#[allow(dead_code)]` for now. `pub(super)`
+//! limited / no facade re-export (DR3-001).
 
-#![allow(dead_code)] // Extension seam; focused tests pin the shape before wiring broad callers.
+#![allow(dead_code)] // Extension seam (parent #988); focused tests pin the shape.
 
-use super::cargo_dependency_repair::{complete_cargo_dependencies, undeclared_known_crates};
-use super::evidence_runner::EvidenceRunnerKind;
-use super::node_runner_manifest::{NodeManifestAction, complete_node_test_runner_manifest};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use super::active_job_arbiter::RecoveryJobKind;
+use super::evidence_runner::{EvidenceRunnerError, EvidenceRunnerKind};
+use super::generated_test_guard::{parse_toml_string_value, strip_toml_comment};
 use super::summary::GenericTerminalState;
-use super::task_contract::{ArtifactRole, TaskKind};
-use crate::session::feedback::mask_secrets;
+use super::task_contract::TaskKind;
 
-/// Repeated no-progress occurrences before [`NoProgressRecoveryPolicy`] bans the
-/// target/role and forces a role switch. Two consecutive same-target failures
-/// (post-edit, same diagnostic) is the same threshold the #987 target
-/// reassessment uses (`repair_attempt >= 2`).
-const NO_PROGRESS_THRESHOLD: u32 = 2;
+/// Whether a single binding check (or the whole plan) resolved.
+///
+/// Runtime-neutral: a docs/data/research adapter reuses the same three states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EvidenceBindingStatus {
+    /// The referenced symbol/handle/identity binds to a declared one.
+    Bound,
+    /// A required binding could not be resolved (a mismatch).
+    Unbound,
+    /// Not enough information to decide (no manifest reference, no checks).
+    /// Neutral — never routes to a failure.
+    Indeterminate,
+}
 
-/// A single binding-check identity in the generic lifecycle. Extensible across
-/// runtimes (Rust / Node) and task kinds (docs / data / research) so a new
-/// runtime adds variants here rather than a bespoke lifecycle (#988 non-goal:
-/// no Rust-only / Node-only lifecycle).
+impl EvidenceBindingStatus {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            EvidenceBindingStatus::Bound => "bound",
+            EvidenceBindingStatus::Unbound => "unbound",
+            EvidenceBindingStatus::Indeterminate => "indeterminate",
+        }
+    }
+}
+
+/// The kind of binding a check covers. Generic vocabulary so non-coding
+/// adapters can map their own bindings onto the same enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BindingCheckKind {
-    /// `Cargo.toml` exists for a Rust verifier run.
-    CargoManifestPresent,
-    /// Declared crates (serde-family allowlist) resolve in `[dependencies]`.
-    CargoDependencyDeclared,
-    /// `[lib] name` binds the expected crate name.
-    CargoLibTargetName,
-    /// `[[bin]] name` binds every `CARGO_BIN_EXE_*` an integration test uses.
-    CargoBinTargetName,
-    /// An expected `tests/*.rs` integration target is present.
-    CargoIntegrationTestPresent,
-    /// `package.json` exists for a Node verifier run.
-    NodeManifestPresent,
-    /// `package.json` declares a usable `scripts.test`.
-    NodeTestScriptDeclared,
-    /// Docs deliverable content is bound to its content check (#993).
-    DocsContentBound,
-    /// Data deliverable is bound to its schema check (#993).
-    DataSchemaBound,
-    /// Research deliverable is bound to its citation check (#993).
-    ResearchCitationBound,
+    /// The project descriptor declares a usable identity.
+    /// Rust: `Cargo.toml` has a non-empty `[package] name`.
+    ManifestIdentity,
+    /// A referenced import/symbol resolves to a declared identity.
+    /// Rust: `use <crate>::…` ↔ `[lib] name` (default lib = package name).
+    ImportSymbol,
+    /// A referenced executable handle resolves to a declared target.
+    /// Rust: `env!("CARGO_BIN_EXE_<name>")` / `cargo_bin("<name>")` ↔ `[[bin]] name`
+    /// (default bin = package name).
+    ExecutableHandle,
 }
 
 impl BindingCheckKind {
     pub(super) fn as_str(self) -> &'static str {
         match self {
-            BindingCheckKind::CargoManifestPresent => "cargo_manifest_present",
-            BindingCheckKind::CargoDependencyDeclared => "cargo_dependency_declared",
-            BindingCheckKind::CargoLibTargetName => "cargo_lib_target_name",
-            BindingCheckKind::CargoBinTargetName => "cargo_bin_target_name",
-            BindingCheckKind::CargoIntegrationTestPresent => "cargo_integration_test_present",
-            BindingCheckKind::NodeManifestPresent => "node_manifest_present",
-            BindingCheckKind::NodeTestScriptDeclared => "node_test_script_declared",
-            BindingCheckKind::DocsContentBound => "docs_content_bound",
-            BindingCheckKind::DataSchemaBound => "data_schema_bound",
-            BindingCheckKind::ResearchCitationBound => "research_citation_bound",
-        }
-    }
-
-    /// The evidence runner this check gates. Projects onto the existing runner
-    /// vocabulary (#949) so the binding stage and the runner stage share one
-    /// language rather than drifting.
-    pub(super) fn evidence_runner_kind(self) -> EvidenceRunnerKind {
-        match self {
-            BindingCheckKind::CargoManifestPresent
-            | BindingCheckKind::CargoDependencyDeclared
-            | BindingCheckKind::CargoLibTargetName
-            | BindingCheckKind::CargoBinTargetName
-            | BindingCheckKind::CargoIntegrationTestPresent
-            | BindingCheckKind::NodeManifestPresent
-            | BindingCheckKind::NodeTestScriptDeclared => EvidenceRunnerKind::CodingBuildTest,
-            BindingCheckKind::DocsContentBound => EvidenceRunnerKind::DocsContentCheck,
-            BindingCheckKind::DataSchemaBound => EvidenceRunnerKind::DataSchemaCheck,
-            BindingCheckKind::ResearchCitationBound => EvidenceRunnerKind::ResearchSourceFetch,
-        }
-    }
-
-    /// The deterministic operator that can repair this binding mismatch, if any.
-    /// SSOT for the check->operator mapping used by [`EvidenceBindingPlan::bind`];
-    /// checks without a deterministic operator defer to the LLM repair pass but
-    /// are still classified as binding mismatches (not generic
-    /// `repair_exhausted`).
-    pub(super) fn recommended_operator(self) -> Option<RepairOperatorId> {
-        match self {
-            BindingCheckKind::CargoDependencyDeclared => Some(RepairOperatorId::CargoDependency),
-            BindingCheckKind::NodeManifestPresent | BindingCheckKind::NodeTestScriptDeclared => {
-                Some(RepairOperatorId::NodeManifest)
-            }
-            BindingCheckKind::CargoManifestPresent
-            | BindingCheckKind::CargoLibTargetName
-            | BindingCheckKind::CargoBinTargetName
-            | BindingCheckKind::CargoIntegrationTestPresent
-            | BindingCheckKind::DocsContentBound
-            | BindingCheckKind::DataSchemaBound
-            | BindingCheckKind::ResearchCitationBound => None,
+            BindingCheckKind::ManifestIdentity => "manifest_identity",
+            BindingCheckKind::ImportSymbol => "import_symbol",
+            BindingCheckKind::ExecutableHandle => "executable_handle",
         }
     }
 }
 
-/// Registry of deterministic repair operators. Names the operators behind one
-/// enum (vs. one giant runtime job), mirroring the dispatch order in
-/// `repair_job_dispatch::handle_repair_job_patch_provider_step`
-/// (cargo dependency -> mechanical compile -> LLM). docs/data/research
-/// operators are future registry entries (#993), not new lifecycles.
+/// Which deliverable -> evidence-runner family cannot bind.
+///
+/// This is separate from [`BindingCheck`], which is the structured per-reference
+/// observation used by [`EvidenceBindingPlan`]. `BindingFailureCheck` is the
+/// generic recovery routing axis for Node/docs/data/research binding-order
+/// failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RepairOperatorId {
-    /// [`super::cargo_dependency_repair`] (#986): completes missing
-    /// serde-family `[dependencies]`.
-    CargoDependency,
-    /// [`super::mechanical_compile_repair`]: deterministic compile-error edit.
-    MechanicalCompile,
-    /// [`super::node_runner_manifest`] (#984): completes the Node test-runner
-    /// manifest.
-    NodeManifest,
+pub(super) enum BindingFailureCheck {
+    /// Coding / Node: a test deliverable exists but no test runner manifest
+    /// binds it.
+    RunnerManifest,
+    /// Docs: a document exists but the content check cannot bind to a target
+    /// document / section.
+    DocumentSection,
+    /// Data: an output exists but the schema check cannot bind to an output
+    /// file.
+    SchemaOutput,
+    /// Research: notes exist but the citation check cannot bind to source
+    /// notes.
+    SourceCitation,
 }
 
-impl RepairOperatorId {
+impl BindingFailureCheck {
     pub(super) fn as_str(self) -> &'static str {
         match self {
-            RepairOperatorId::CargoDependency => "cargo_dependency",
-            RepairOperatorId::MechanicalCompile => "mechanical_compile",
-            RepairOperatorId::NodeManifest => "node_manifest",
+            BindingFailureCheck::RunnerManifest => "runner_manifest",
+            BindingFailureCheck::DocumentSection => "document_section",
+            BindingFailureCheck::SchemaOutput => "schema_output",
+            BindingFailureCheck::SourceCitation => "source_citation",
         }
     }
 
-    /// Deterministic dispatch precedence. The cargo dependency operator runs
-    /// before the mechanical compile operator (a missing dep masquerades as a
-    /// compile error), which runs before any LLM pass; the Node manifest
-    /// operator is the MissingEvidence counterpart on the Node path.
-    pub(super) fn registry_order() -> [RepairOperatorId; 3] {
-        [
-            RepairOperatorId::CargoDependency,
-            RepairOperatorId::MechanicalCompile,
-            RepairOperatorId::NodeManifest,
-        ]
-    }
-
-    /// The binding check this operator satisfies, if it is binding-shaped. The
-    /// mechanical compile operator repairs a compile error rather than a
-    /// binding, so it has no representative check.
-    pub(super) fn binding_check(self) -> Option<BindingCheckKind> {
+    pub(super) fn recovery(self) -> BindingRecovery {
         match self {
-            RepairOperatorId::CargoDependency => Some(BindingCheckKind::CargoDependencyDeclared),
-            RepairOperatorId::NodeManifest => Some(BindingCheckKind::NodeManifestPresent),
-            RepairOperatorId::MechanicalCompile => None,
+            BindingFailureCheck::RunnerManifest => BindingRecovery::MaterializeRunnerManifest,
+            BindingFailureCheck::DocumentSection => BindingRecovery::RecoverDocumentSection,
+            BindingFailureCheck::SchemaOutput => BindingRecovery::RecoverSchemaOutput,
+            BindingFailureCheck::SourceCitation => BindingRecovery::RecoverSourceCitation,
+        }
+    }
+
+    pub(super) fn for_task_kind(task_kind: TaskKind) -> Option<Self> {
+        match task_kind {
+            TaskKind::Coding => Some(BindingFailureCheck::RunnerManifest),
+            TaskKind::Docs => Some(BindingFailureCheck::DocumentSection),
+            TaskKind::Data => Some(BindingFailureCheck::SchemaOutput),
+            TaskKind::Research => Some(BindingFailureCheck::SourceCitation),
+            TaskKind::Ops | TaskKind::Authoring => None,
+        }
+    }
+
+    pub(super) fn for_evidence_runner_kind(kind: EvidenceRunnerKind) -> Option<Self> {
+        match kind {
+            EvidenceRunnerKind::CodingBuildTest => Some(BindingFailureCheck::RunnerManifest),
+            EvidenceRunnerKind::DocsContentCheck => Some(BindingFailureCheck::DocumentSection),
+            EvidenceRunnerKind::DataSchemaCheck => Some(BindingFailureCheck::SchemaOutput),
+            EvidenceRunnerKind::ResearchSourceFetch => Some(BindingFailureCheck::SourceCitation),
+            EvidenceRunnerKind::OpsCommandObservation
+            | EvidenceRunnerKind::AuthoringContentCheck => None,
         }
     }
 }
 
-/// Pure, runtime-agnostic facts about the current workspace/diagnostic, fed to
-/// [`EvidenceBindingPlan::bind`]. No `Agent` / filesystem access; the live
-/// dispatch caller fills these from disk (child issue wiring).
-#[derive(Debug, Clone, Copy)]
-pub(super) struct BindingProbe<'a> {
-    /// The latest verifier diagnostic text.
-    pub(super) verifier_diagnostic: &'a str,
-    /// `Cargo.toml` contents, if present.
-    pub(super) cargo_manifest: Option<&'a str>,
-    /// `package.json` contents, if present.
-    pub(super) node_manifest: Option<&'a str>,
-    /// Workspace-relative test file paths observed this run.
-    pub(super) present_test_files: &'a [&'a str],
-    /// Bin names referenced via `env!("CARGO_BIN_EXE_<name>")` in tests.
-    pub(super) referenced_bin_exe_names: &'a [&'a str],
-    /// The crate name the task expects `[lib] name` to bind, if known.
-    pub(super) expected_crate_name: Option<&'a str>,
-    /// Non-coding artifact excerpt (docs/data/research content binding).
-    pub(super) artifact_excerpt: Option<&'a str>,
-}
-
-impl<'a> BindingProbe<'a> {
-    /// Construct a probe carrying only the diagnostic; all other facts empty.
-    pub(super) fn for_diagnostic(verifier_diagnostic: &'a str) -> Self {
-        Self {
-            verifier_diagnostic,
-            cargo_manifest: None,
-            node_manifest: None,
-            present_test_files: &[],
-            referenced_bin_exe_names: &[],
-            expected_crate_name: None,
-            artifact_excerpt: None,
-        }
-    }
-
-    fn rust_signal(&self) -> bool {
-        if self.cargo_manifest.is_some() {
-            return true;
-        }
-        if self
-            .present_test_files
-            .iter()
-            .any(|p| p.to_ascii_lowercase().ends_with(".rs"))
-        {
-            return true;
-        }
-        let lower = self.verifier_diagnostic.to_ascii_lowercase();
-        lower.contains("cargo") || lower.contains("error[e0") || lower.contains("rustc")
-    }
-
-    fn node_signal(&self) -> bool {
-        if self.node_manifest.is_some() {
-            return true;
-        }
-        if self.present_test_files.iter().any(|p| is_node_test_path(p)) {
-            return true;
-        }
-        let lower = self.verifier_diagnostic.to_ascii_lowercase();
-        lower.contains("npm")
-            || lower.contains("node --test")
-            || lower.contains("jest")
-            || lower.contains("vitest")
-    }
-}
-
-/// One detected binding mismatch.
+/// The recovery that re-binds a deliverable to its evidence runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BindingMismatch {
-    pub(super) check: BindingCheckKind,
-    /// The deterministic operator that can repair it, if applicable here.
-    pub(super) operator: Option<RepairOperatorId>,
-    pub(super) detail: &'static str,
+pub(super) enum BindingRecovery {
+    MaterializeRunnerManifest,
+    RecoverDocumentSection,
+    RecoverSchemaOutput,
+    RecoverSourceCitation,
 }
 
-impl BindingMismatch {
-    fn new(
-        check: BindingCheckKind,
-        operator: Option<RepairOperatorId>,
-        detail: &'static str,
-    ) -> Self {
+impl BindingRecovery {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            BindingRecovery::MaterializeRunnerManifest => "materialize_runner_manifest",
+            BindingRecovery::RecoverDocumentSection => "recover_document_section",
+            BindingRecovery::RecoverSchemaOutput => "recover_schema_output",
+            BindingRecovery::RecoverSourceCitation => "recover_source_citation",
+        }
+    }
+}
+
+/// A generic binding failure: a deliverable exists but its evidence runner
+/// cannot be bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EvidenceBindingFailedJob {
+    pub(super) check: BindingFailureCheck,
+    pub(super) recovery: BindingRecovery,
+}
+
+impl EvidenceBindingFailedJob {
+    fn new(check: BindingFailureCheck) -> Self {
         Self {
             check,
-            operator,
-            detail,
+            recovery: check.recovery(),
         }
+    }
+
+    pub(super) fn generic_terminal_state(self) -> GenericTerminalState {
+        GenericTerminalState::EvidenceBindingFailed
+    }
+
+    pub(super) fn recovery_job_kind(self) -> RecoveryJobKind {
+        RecoveryJobKind::EvidenceBindingFailedJob
     }
 }
 
-/// The outcome of binding the deliverable to its evidence runner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum BindingResolution {
-    /// Every check binds; the evidence runner can execute.
+/// Result of a generic binding-order check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BindingState {
     Bound,
-    /// One or more checks failed to bind (in plan order).
-    Mismatched(Vec<BindingMismatch>),
+    Failed(EvidenceBindingFailedJob),
 }
 
-impl BindingResolution {
-    pub(super) fn is_bound(&self) -> bool {
-        matches!(self, BindingResolution::Bound)
-    }
-
-    pub(super) fn mismatches(&self) -> &[BindingMismatch] {
+impl BindingState {
+    pub(super) fn failed_job(self) -> Option<EvidenceBindingFailedJob> {
         match self {
-            BindingResolution::Bound => &[],
-            BindingResolution::Mismatched(mismatches) => mismatches,
-        }
-    }
-
-    /// The deterministic operator to run first, by [`RepairOperatorId::registry_order`]
-    /// precedence (not plan order), so the resolution matches the live dispatch.
-    pub(super) fn recoverable_operator(&self) -> Option<RepairOperatorId> {
-        RepairOperatorId::registry_order().into_iter().find(|op| {
-            self.mismatches()
-                .iter()
-                .any(|mismatch| mismatch.operator == Some(*op))
-        })
-    }
-
-    /// Terminal projection: an unbound deliverable is `evidence_binding_failed`,
-    /// not `evidence_runner_missing` / generic `repair_exhausted` (#988
-    /// expectation 1: Rust `safe_stop_verifier_missing` moves to
-    /// `evidence_binding_failed`). A bound deliverable has no terminal — the
-    /// runner proceeds.
-    pub(super) fn generic_terminal_state(&self) -> Option<GenericTerminalState> {
-        match self {
-            BindingResolution::Bound => None,
-            BindingResolution::Mismatched(_) => Some(GenericTerminalState::EvidenceBindingFailed),
+            BindingState::Bound => None,
+            BindingState::Failed(job) => Some(job),
         }
     }
 }
 
-/// The front stage of the evidence lifecycle: the ordered set of binding checks
-/// a task kind's evidence runner depends on, plus the classifier that resolves
-/// them against a [`BindingProbe`].
+pub(super) fn evaluate_binding(
+    check: BindingFailureCheck,
+    deliverable_present: bool,
+    runner_bindable: bool,
+) -> BindingState {
+    if deliverable_present && !runner_bindable {
+        BindingState::Failed(EvidenceBindingFailedJob::new(check))
+    } else {
+        BindingState::Bound
+    }
+}
+
+/// One binding check: the reference the evidence runner depends on, the declared
+/// identities it could bind to, and whether it resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BindingCheck {
+    pub(super) kind: BindingCheckKind,
+    pub(super) status: EvidenceBindingStatus,
+    /// The symbol/handle/identity the test referenced (or the descriptor key
+    /// that was expected for `ManifestIdentity`).
+    pub(super) reference: String,
+    /// The declared identities available to bind to (empty when none exist).
+    pub(super) candidates: Vec<String>,
+}
+
+impl BindingCheck {
+    fn bound(kind: BindingCheckKind, reference: String, candidates: Vec<String>) -> Self {
+        Self {
+            kind,
+            status: EvidenceBindingStatus::Bound,
+            reference,
+            candidates,
+        }
+    }
+
+    fn unbound(kind: BindingCheckKind, reference: String, candidates: Vec<String>) -> Self {
+        Self {
+            kind,
+            status: EvidenceBindingStatus::Unbound,
+            reference,
+            candidates,
+        }
+    }
+
+    fn resolved(
+        kind: BindingCheckKind,
+        bound: bool,
+        reference: String,
+        candidates: Vec<String>,
+    ) -> Self {
+        if bound {
+            Self::bound(kind, reference, candidates)
+        } else {
+            Self::unbound(kind, reference, candidates)
+        }
+    }
+}
+
+/// The structured binding plan for a deliverable's evidence runner.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct EvidenceBindingPlan {
-    task_kind: TaskKind,
-    checks: Vec<BindingCheckKind>,
+    pub(super) checks: Vec<BindingCheck>,
 }
 
 impl EvidenceBindingPlan {
-    /// The binding plan for a task kind. Coding carries the union of Rust and
-    /// Node checks; [`BindingProbe`] runtime signals gate which actually fire,
-    /// so a pure-Rust run never reports a Node mismatch and vice versa.
-    pub(super) fn for_task_kind(task_kind: TaskKind) -> Self {
-        let checks = match task_kind {
-            TaskKind::Coding => vec![
-                BindingCheckKind::CargoManifestPresent,
-                BindingCheckKind::CargoDependencyDeclared,
-                BindingCheckKind::CargoLibTargetName,
-                BindingCheckKind::CargoBinTargetName,
-                BindingCheckKind::CargoIntegrationTestPresent,
-                BindingCheckKind::NodeManifestPresent,
-                BindingCheckKind::NodeTestScriptDeclared,
-            ],
-            TaskKind::Docs | TaskKind::Authoring => vec![BindingCheckKind::DocsContentBound],
-            TaskKind::Data => vec![BindingCheckKind::DataSchemaBound],
-            TaskKind::Research => vec![BindingCheckKind::ResearchCitationBound],
-            // Ops evidence is a command observation with no static binding check.
-            TaskKind::Ops => Vec::new(),
-        };
-        Self { task_kind, checks }
-    }
-
-    pub(super) fn task_kind(&self) -> TaskKind {
-        self.task_kind
-    }
-
-    pub(super) fn checks(&self) -> &[BindingCheckKind] {
-        &self.checks
-    }
-
-    /// Resolve every check against the probe, collecting mismatches in plan
-    /// order. Rust and Node share this single path (#988 acceptance: Rust
-    /// binding mismatch and Node manifest/test ordering on one lifecycle).
-    pub(super) fn bind(&self, probe: &BindingProbe<'_>) -> BindingResolution {
-        let mismatches: Vec<BindingMismatch> = self
+    /// Overall status: `Unbound` if any check is `Unbound`; `Indeterminate` if
+    /// there are no decisive checks; otherwise `Bound`.
+    pub(super) fn status(&self) -> EvidenceBindingStatus {
+        if self
             .checks
             .iter()
-            .filter_map(|check| evaluate_check(*check, probe))
+            .any(|check| check.status == EvidenceBindingStatus::Unbound)
+        {
+            return EvidenceBindingStatus::Unbound;
+        }
+        if self
+            .checks
+            .iter()
+            .any(|check| check.status == EvidenceBindingStatus::Bound)
+        {
+            return EvidenceBindingStatus::Bound;
+        }
+        EvidenceBindingStatus::Indeterminate
+    }
+
+    pub(super) fn is_bound(&self) -> bool {
+        self.status() == EvidenceBindingStatus::Bound
+    }
+
+    /// The checks that failed to bind — the structured observation surface a
+    /// caller logs / routes to recovery.
+    pub(super) fn failed_checks(&self) -> impl Iterator<Item = &BindingCheck> {
+        self.checks
+            .iter()
+            .filter(|check| check.status == EvidenceBindingStatus::Unbound)
+    }
+
+    /// Route a binding gap into the existing evidence-runner error vocabulary
+    /// (`BindingFailed`). `Bound` / `Indeterminate` return `None`.
+    pub(super) fn binding_error(&self) -> Option<EvidenceRunnerError> {
+        (self.status() == EvidenceBindingStatus::Unbound)
+            .then_some(EvidenceRunnerError::BindingFailed)
+    }
+
+    /// Project a binding gap onto the generic terminal state
+    /// (`EvidenceBindingFailed`). Keeps the legacy terminal projection intact —
+    /// no new terminal label is introduced.
+    pub(super) fn generic_terminal_state(&self) -> Option<GenericTerminalState> {
+        self.binding_error()
+            .map(EvidenceRunnerError::generic_terminal_state)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rust adapter
+// ---------------------------------------------------------------------------
+
+/// Cargo manifest identities relevant to test binding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CargoBindingIdentities {
+    pub(super) package_name: Option<String>,
+    pub(super) lib_name: Option<String>,
+    pub(super) bin_names: BTreeSet<String>,
+    /// Normalized dependency import names (`[dependencies]` /
+    /// `[dev-dependencies]` / `[build-dependencies]` keys). The key is the
+    /// import name even under a `package = "…"` rename, so this is exactly the
+    /// set to exclude from self-import detection.
+    pub(super) dependencies: BTreeSet<String>,
+}
+
+impl CargoBindingIdentities {
+    /// The crate names importable as `use <name>::…`. With an explicit
+    /// `[lib] name` that is the only importable identity; otherwise the default
+    /// lib name is the (normalized) package name.
+    fn lib_identities(&self) -> BTreeSet<String> {
+        let mut identities = BTreeSet::new();
+        if let Some(lib) = &self.lib_name {
+            identities.insert(normalize_crate_ident(lib));
+        } else if let Some(pkg) = &self.package_name {
+            identities.insert(normalize_crate_ident(pkg));
+        }
+        identities
+    }
+
+    /// The bin target names a `CARGO_BIN_EXE_*` handle can bind to: declared
+    /// `[[bin]] name`s plus the default bin (the package name). Including the
+    /// package name keeps lib-only crates conservative (false-negative, never a
+    /// false-positive binding failure).
+    fn bin_identities(&self) -> BTreeSet<String> {
+        let mut identities: BTreeSet<String> = self
+            .bin_names
+            .iter()
+            .map(|n| normalize_crate_ident(n))
             .collect();
-        if mismatches.is_empty() {
-            BindingResolution::Bound
-        } else {
-            BindingResolution::Mismatched(mismatches)
+        if let Some(pkg) = &self.package_name {
+            identities.insert(normalize_crate_ident(pkg));
         }
+        identities
     }
 }
 
-fn evaluate_check(check: BindingCheckKind, probe: &BindingProbe<'_>) -> Option<BindingMismatch> {
-    match check {
-        BindingCheckKind::CargoManifestPresent => {
-            (probe.rust_signal() && probe.cargo_manifest.is_none()).then(|| {
-                BindingMismatch::new(
-                    check,
-                    None,
-                    "rust verifier signal but no Cargo.toml manifest",
-                )
-            })
+/// References a Rust integration test makes to the crate under test.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct RustTestReferences {
+    /// First path segments of `use …` / `extern crate …` statements.
+    pub(super) crate_imports: BTreeSet<String>,
+    /// `CARGO_BIN_EXE_*` / `cargo_bin("…")` binary handles.
+    pub(super) binary_handles: BTreeSet<String>,
+}
+
+/// Normalize a crate/bin identifier the way cargo does for `use` idents and
+/// `CARGO_BIN_EXE_*` env var names: `-` becomes `_`. Case is preserved.
+fn normalize_crate_ident(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+const BUILTIN_CRATES: &[&str] = &["std", "core", "alloc", "proc_macro", "test"];
+
+/// Imports that never refer to an external crate and so must be excluded from
+/// self-import detection.
+fn is_self_or_builtin_import(name: &str) -> bool {
+    matches!(name, "crate" | "self" | "super" | "Self") || BUILTIN_CRATES.contains(&name)
+}
+
+/// First path segment of a `use`/`extern crate` tail (e.g. `foo` from
+/// `foo::bar::{…}` or `::foo as bar`). Rust crate idents are `[A-Za-z0-9_]`.
+fn first_path_segment(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("::").unwrap_or(rest);
+    let segment: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    (!segment.is_empty()).then_some(segment)
+}
+
+/// Extract the crate imports and binary handles from a single Rust test source.
+pub(super) fn extract_rust_test_references(source: &str) -> RustTestReferences {
+    let mut crate_imports = BTreeSet::new();
+    for raw_line in source.lines() {
+        let line = strip_toml_comment_free(raw_line.trim());
+        let line = line.strip_prefix("pub ").unwrap_or(line);
+        let import_tail = line
+            .strip_prefix("use ")
+            .or_else(|| line.strip_prefix("extern crate "));
+        if let Some(rest) = import_tail
+            && let Some(segment) = first_path_segment(rest)
+        {
+            crate_imports.insert(segment);
         }
-        BindingCheckKind::CargoDependencyDeclared => {
-            let crates = undeclared_known_crates(probe.verifier_diagnostic);
-            if crates.is_empty() {
-                return None;
-            }
-            match probe.cargo_manifest {
-                // The operator can complete the manifest deterministically.
-                Some(raw) if complete_cargo_dependencies(raw, &crates).is_some() => {
-                    Some(BindingMismatch::new(
-                        check,
-                        check.recommended_operator(),
-                        "declared serde-family crate is undeclared in [dependencies]",
-                    ))
-                }
-                // Already declared -> not a mismatch.
-                Some(_) => None,
-                // No manifest to complete: still a binding mismatch, but no
-                // deterministic operator applies here.
-                None => Some(BindingMismatch::new(
-                    check,
-                    None,
-                    "serde-family crate undeclared and no manifest to complete",
-                )),
-            }
-        }
-        BindingCheckKind::CargoLibTargetName => {
-            match (probe.cargo_manifest, probe.expected_crate_name) {
-                (Some(raw), Some(expected)) => match cargo_lib_target_name(raw) {
-                    Some(actual) if actual != expected => Some(BindingMismatch::new(
-                        check,
-                        None,
-                        "[lib] name does not bind the expected crate name",
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            }
-        }
-        BindingCheckKind::CargoBinTargetName => {
-            if probe.referenced_bin_exe_names.is_empty() {
-                return None;
-            }
-            match probe.cargo_manifest {
-                Some(raw) => {
-                    let declared = cargo_bin_target_names(raw);
-                    let missing = probe
-                        .referenced_bin_exe_names
-                        .iter()
-                        .any(|name| !declared.iter().any(|d| d == name));
-                    missing.then(|| {
-                        BindingMismatch::new(
-                            check,
-                            None,
-                            "CARGO_BIN_EXE_* has no matching [[bin]] name",
-                        )
-                    })
-                }
-                None => Some(BindingMismatch::new(
-                    check,
-                    None,
-                    "CARGO_BIN_EXE_* referenced but no manifest declares [[bin]]",
-                )),
-            }
-        }
-        BindingCheckKind::CargoIntegrationTestPresent => {
-            let needs = probe.rust_signal()
-                && diagnostic_mentions_integration_test(probe.verifier_diagnostic);
-            let has = probe
-                .present_test_files
-                .iter()
-                .any(|path| is_rust_integration_test_path(path));
-            (needs && !has).then(|| {
-                BindingMismatch::new(
-                    check,
-                    None,
-                    "integration test target expected but no tests/*.rs present",
-                )
-            })
-        }
-        BindingCheckKind::NodeManifestPresent => {
-            (probe.node_signal() && probe.node_manifest.is_none()).then(|| {
-                BindingMismatch::new(
-                    check,
-                    check.recommended_operator(),
-                    "node test signal but no package.json manifest",
-                )
-            })
-        }
-        BindingCheckKind::NodeTestScriptDeclared => match probe.node_manifest {
-            Some(raw) if probe.node_signal() => {
-                match complete_node_test_runner_manifest(Some(raw)) {
-                    Some(completion) if completion.action == NodeManifestAction::AddTestScript => {
-                        Some(BindingMismatch::new(
-                            check,
-                            check.recommended_operator(),
-                            "package.json lacks a usable scripts.test",
-                        ))
-                    }
-                    // Already bindable, or malformed (operator declines) -> no
-                    // deterministic mismatch here.
-                    _ => None,
-                }
-            }
-            _ => None,
-        },
-        BindingCheckKind::DocsContentBound
-        | BindingCheckKind::DataSchemaBound
-        | BindingCheckKind::ResearchCitationBound => {
-            // Issue #993 owns the detailed content/schema/citation binding. The
-            // boundary already classifies an absent/empty artifact excerpt as a
-            // binding mismatch (deferred to the LLM pass); present content binds.
-            let bound = probe
-                .artifact_excerpt
-                .is_some_and(|excerpt| !excerpt.trim().is_empty());
-            (!bound).then(|| {
-                BindingMismatch::new(check, None, "non-coding artifact evidence is not yet bound")
-            })
-        }
+    }
+    RustTestReferences {
+        crate_imports,
+        binary_handles: referenced_binary_handles(source),
     }
 }
 
-/// Extract `[lib] name = "..."` from a Cargo manifest. Dependency-free
-/// line scanner (no `toml` crate; local-first). Returns `None` when there is no
-/// `[lib]` table or it declares no `name`.
-fn cargo_lib_target_name(manifest: &str) -> Option<String> {
-    section_string_value(manifest, "[lib]", "name")
-        .into_iter()
-        .next()
-}
-
-/// Extract every `[[bin]] name = "..."` from a Cargo manifest, in declaration
-/// order. Used to bind `CARGO_BIN_EXE_*` references.
-fn cargo_bin_target_names(manifest: &str) -> Vec<String> {
-    section_string_value(manifest, "[[bin]]", "name")
-}
-
-/// Collect the string value of `key` inside every table whose header line
-/// (trimmed, comments stripped) equals `header`. One result per matching table.
-fn section_string_value(manifest: &str, header: &str, key: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut in_section = false;
-    for line in manifest.lines() {
-        let trimmed = strip_inline_comment(line).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if is_table_header(trimmed) {
-            in_section = trimmed == header;
-            continue;
-        }
-        if in_section && let Some(value) = parse_string_assignment(trimmed, key) {
-            values.push(value);
-        }
-    }
-    values
-}
-
-fn is_table_header(trimmed: &str) -> bool {
-    trimmed.starts_with('[') && trimmed.ends_with(']')
-}
-
-/// Drop a trailing `# comment`. A `#` inside a quoted string is not a comment;
-/// the manifests this scanner reads do not put `#` inside `name`/`version`
-/// strings, so a simple first-`#` split is sufficient and conservative.
-fn strip_inline_comment(line: &str) -> &str {
-    match line.find('#') {
-        Some(idx) => &line[..idx],
+/// Drop a trailing `// …` line comment so `use foo; // note` parses cleanly.
+/// (A `use`/`extern crate` line never contains a `//` before the statement, so
+/// this only ever trims trailing comments.)
+fn strip_toml_comment_free(line: &str) -> &str {
+    match line.find("//") {
+        Some(idx) => line[..idx].trim_end(),
         None => line,
     }
 }
 
-/// Parse `key = "value"` (TOML basic string). Returns the unquoted value.
-fn parse_string_assignment(trimmed: &str, key: &str) -> Option<String> {
-    let (lhs, rhs) = trimmed.split_once('=')?;
-    if lhs.trim() != key {
+fn referenced_binary_handles(source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for tail in source.split("CARGO_BIN_EXE_").skip(1) {
+        let name: String = tail
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    for marker in ["cargo_bin(\"", "cargo_bin!(\""] {
+        let mut rest = source;
+        while let Some(idx) = rest.find(marker) {
+            let after = &rest[idx + marker.len()..];
+            let Some(end) = after.find('"') else {
+                break;
+            };
+            let name = &after[..end];
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+            {
+                names.insert(name.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    names
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestSection {
+    Package,
+    Lib,
+    Bin,
+    Dependencies,
+    Other,
+}
+
+/// Parse the binding-relevant identities from a `Cargo.toml` source string.
+///
+/// Reuses the shared `strip_toml_comment` / `parse_toml_string_value` helpers
+/// (no `toml` crate dependency, no ad hoc string mutation) and only tracks the
+/// `[package]` / `[lib]` / `[[bin]]` / dependency sections.
+pub(super) fn parse_cargo_binding_identities(manifest_source: &str) -> CargoBindingIdentities {
+    let mut identities = CargoBindingIdentities::default();
+    let mut section = ManifestSection::Other;
+    for raw_line in manifest_source.lines() {
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
+            section = if inner.trim() == "bin" {
+                ManifestSection::Bin
+            } else {
+                ManifestSection::Other
+            };
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = classify_table_header(inner.trim(), &mut identities);
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        match section {
+            ManifestSection::Package if key == "name" => {
+                identities.package_name =
+                    parse_toml_string_value(value.trim()).filter(|s| !s.is_empty());
+            }
+            ManifestSection::Lib if key == "name" => {
+                identities.lib_name =
+                    parse_toml_string_value(value.trim()).filter(|s| !s.is_empty());
+            }
+            ManifestSection::Bin if key == "name" => {
+                if let Some(name) = parse_toml_string_value(value.trim()).filter(|s| !s.is_empty())
+                {
+                    identities.bin_names.insert(name);
+                }
+            }
+            ManifestSection::Dependencies if !key.is_empty() => {
+                identities
+                    .dependencies
+                    .insert(normalize_crate_ident(strip_quotes(key)));
+            }
+            _ => {}
+        }
+    }
+    identities
+}
+
+/// Classify a single-bracket table header and record `[<table>.<dep>]`
+/// sub-table dependency keys as a side effect.
+fn classify_table_header(header: &str, identities: &mut CargoBindingIdentities) -> ManifestSection {
+    match header {
+        "package" => ManifestSection::Package,
+        "lib" => ManifestSection::Lib,
+        "dependencies" | "dev-dependencies" | "build-dependencies" => ManifestSection::Dependencies,
+        other => {
+            if let Some(dep) = dependency_subtable_key(other) {
+                identities
+                    .dependencies
+                    .insert(normalize_crate_ident(strip_quotes(dep)));
+                ManifestSection::Other
+            } else if other.ends_with(".dependencies") {
+                // e.g. `target.'cfg(unix)'.dependencies`
+                ManifestSection::Dependencies
+            } else {
+                ManifestSection::Other
+            }
+        }
+    }
+}
+
+/// For a `[dependencies.foo]` / `[dev-dependencies.foo]` / `[build-dependencies.foo]`
+/// sub-table header, return the dependency key (`foo`).
+fn dependency_subtable_key(header: &str) -> Option<&str> {
+    for prefix in ["dependencies.", "dev-dependencies.", "build-dependencies."] {
+        if let Some(rest) = header.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+fn strip_quotes(value: &str) -> &str {
+    value.trim().trim_matches('"').trim_matches('\'')
+}
+
+/// Build the Rust evidence binding plan from a manifest source and a set of test
+/// sources. Pure (no filesystem) so focused tests can drive it directly.
+///
+/// - No test references at all → an empty (`Indeterminate`) plan, so non-Rust
+///   evidence paths (Python/Node/docs) are never affected.
+/// - Missing manifest with Rust references → a single `ManifestIdentity`
+///   `Unbound` check (the runner cannot bind without a manifest).
+pub(super) fn rust_evidence_binding_plan(
+    manifest_source: Option<&str>,
+    test_sources: &[&str],
+) -> EvidenceBindingPlan {
+    let mut imports = BTreeSet::new();
+    let mut handles = BTreeSet::new();
+    for source in test_sources {
+        let references = extract_rust_test_references(source);
+        imports.extend(references.crate_imports);
+        handles.extend(references.binary_handles);
+    }
+
+    let mut plan = EvidenceBindingPlan::default();
+    if imports.is_empty() && handles.is_empty() {
+        return plan; // Indeterminate: nothing to bind.
+    }
+
+    let identities = match manifest_source {
+        Some(source) => parse_cargo_binding_identities(source),
+        None => {
+            plan.checks.push(BindingCheck::unbound(
+                BindingCheckKind::ManifestIdentity,
+                "Cargo.toml".to_string(),
+                Vec::new(),
+            ));
+            return plan;
+        }
+    };
+
+    // ManifestIdentity: is there a buildable package identity at all?
+    match &identities.package_name {
+        Some(name) => plan.checks.push(BindingCheck::bound(
+            BindingCheckKind::ManifestIdentity,
+            name.clone(),
+            vec![name.clone()],
+        )),
+        None => plan.checks.push(BindingCheck::unbound(
+            BindingCheckKind::ManifestIdentity,
+            "package.name".to_string(),
+            Vec::new(),
+        )),
+    }
+
+    // ImportSymbol: crate-under-test imports must resolve to the lib identity.
+    let lib_identities = identities.lib_identities();
+    let lib_candidates: Vec<String> = lib_identities.iter().cloned().collect();
+    for import in &imports {
+        if is_self_or_builtin_import(import) {
+            continue;
+        }
+        if identities
+            .dependencies
+            .contains(&normalize_crate_ident(import))
+        {
+            continue; // declared dependency, not a crate-under-test reference
+        }
+        let bound = lib_identities.contains(&normalize_crate_ident(import));
+        plan.checks.push(BindingCheck::resolved(
+            BindingCheckKind::ImportSymbol,
+            bound,
+            import.clone(),
+            lib_candidates.clone(),
+        ));
+    }
+
+    // ExecutableHandle: CARGO_BIN_EXE_* handles must resolve to a bin identity.
+    let bin_identities = identities.bin_identities();
+    let bin_candidates: Vec<String> = bin_identities.iter().cloned().collect();
+    for handle in &handles {
+        let bound = bin_identities.contains(&normalize_crate_ident(handle));
+        plan.checks.push(BindingCheck::resolved(
+            BindingCheckKind::ExecutableHandle,
+            bound,
+            handle.clone(),
+            bin_candidates.clone(),
+        ));
+    }
+
+    plan
+}
+
+/// Per-file read cap so a pathological workspace cannot make the binding scan
+/// allocate unbounded memory.
+const MAX_BINDING_SOURCE_BYTES: u64 = 1024 * 1024;
+
+fn read_capped(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_BINDING_SOURCE_BYTES {
         return None;
     }
-    let rhs = rhs.trim();
-    let inner = rhs.strip_prefix('"')?.strip_suffix('"')?;
-    Some(inner.to_string())
+    std::fs::read_to_string(path).ok()
 }
 
-fn diagnostic_mentions_integration_test(diagnostic: &str) -> bool {
-    let lower = diagnostic.to_ascii_lowercase();
-    lower.contains("tests/") || lower.contains("integration test")
-}
+/// Build the Rust evidence binding plan by reading `Cargo.toml` and the direct
+/// `tests/*.rs` children under `work_root`. Read-only; future production wiring
+/// (#988) calls this before invoking the coding evidence runner.
+pub(super) fn rust_evidence_binding_plan_from_work_root(work_root: &Path) -> EvidenceBindingPlan {
+    let manifest = read_capped(&work_root.join("Cargo.toml"));
 
-fn is_rust_integration_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.starts_with("tests/") && lower.ends_with(".rs")
-}
-
-fn is_node_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    const SUFFIXES: &[&str] = &[
-        ".test.js",
-        ".test.mjs",
-        ".test.cjs",
-        ".test.ts",
-        ".spec.js",
-        ".spec.mjs",
-        ".spec.ts",
-    ];
-    if SUFFIXES.iter().any(|suffix| lower.ends_with(suffix)) {
-        return true;
-    }
-    (lower.starts_with("test/") || lower.contains("/test/"))
-        && (lower.ends_with(".js") || lower.ends_with(".mjs"))
-}
-
-/// Decomposition of the coarse `repair_exhausted` terminal into its actual
-/// sub-cause (#988 acceptance 1 / expectation 3). The legacy label is kept as a
-/// compatibility projection; the generic terminal vocabulary carries the richer
-/// classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RepairExhaustionClass {
-    /// The same target kept producing the same diagnostic after repair.
-    SameTargetSameDiagnostic,
-    /// No deterministic operator applied and the LLM pass could not converge.
-    OperatorMissing,
-    /// Evidence binding still failed after the repair edits applied.
-    BindingFailedAfterRepair,
-    /// The impl/test/evidence contract is ambiguous and unresolved (#994).
-    ContractConflictUnresolved,
-}
-
-impl RepairExhaustionClass {
-    /// The decomposed label (#988 expectation 3).
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            RepairExhaustionClass::SameTargetSameDiagnostic => "same_target_exhausted",
-            RepairExhaustionClass::OperatorMissing => "operator_missing",
-            RepairExhaustionClass::BindingFailedAfterRepair => "binding_failed_after_repair",
-            RepairExhaustionClass::ContractConflictUnresolved => "contract_conflict",
-        }
-    }
-
-    /// The compatibility projection: every decomposed class still came from the
-    /// `repair_exhausted` terminal, so the legacy eval label is preserved
-    /// (#988 non-functional: legacy terminal label kept as compat projection).
-    pub(super) fn legacy_label(self) -> &'static str {
-        "repair_exhausted"
-    }
-
-    /// Project onto the generic terminal vocabulary (#947). A binding failure
-    /// surfaces as `evidence_binding_failed`; a contract conflict is a
-    /// controlled safe stop; the others remain repair exhaustion.
-    pub(super) fn generic_terminal_state(self) -> GenericTerminalState {
-        match self {
-            RepairExhaustionClass::SameTargetSameDiagnostic
-            | RepairExhaustionClass::OperatorMissing => {
-                GenericTerminalState::EvidenceRepairExhausted
-            }
-            RepairExhaustionClass::BindingFailedAfterRepair => {
-                GenericTerminalState::EvidenceBindingFailed
-            }
-            RepairExhaustionClass::ContractConflictUnresolved => {
-                GenericTerminalState::EvidenceRepairSafeStop
+    let mut test_sources: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(work_root.join("tests")) {
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+            })
+            .collect();
+        paths.sort();
+        for path in &paths {
+            if let Some(source) = read_capped(path) {
+                test_sources.push(source);
             }
         }
     }
-}
 
-/// Structured inputs for [`classify_repair_exhaustion`]. Each flag is an
-/// observation the repair controller already has (post-rerun delta, operator
-/// applicability, contract ambiguity); the classifier is a pure decision tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct RepairExhaustionSignal {
-    /// The post-edit rerun reproduced the same diagnostic on the same target
-    /// (the #987 `TargetReassessmentRequired` shape).
-    pub(super) same_target_same_diagnostic: bool,
-    /// Evidence binding was still unbound after the repair edits applied.
-    pub(super) binding_failed_after_repair: bool,
-    /// A deterministic operator was available for this failure.
-    pub(super) operator_available: bool,
-    /// The impl/test/evidence contract is ambiguous (no authority to arbitrate).
-    pub(super) contract_conflict: bool,
-}
-
-/// Classify a `repair_exhausted` terminal into its sub-cause. Most-specific
-/// cause wins: contract conflict > binding-failed-after-repair >
-/// same-target-same-diagnostic > operator-missing. When a deterministic
-/// operator was available but the run still exhausted (the operator did not
-/// resolve it), the cause is treated as same-target stagnation.
-pub(super) fn classify_repair_exhaustion(signal: &RepairExhaustionSignal) -> RepairExhaustionClass {
-    if signal.contract_conflict {
-        RepairExhaustionClass::ContractConflictUnresolved
-    } else if signal.binding_failed_after_repair {
-        RepairExhaustionClass::BindingFailedAfterRepair
-    } else if signal.same_target_same_diagnostic {
-        RepairExhaustionClass::SameTargetSameDiagnostic
-    } else if !signal.operator_available {
-        RepairExhaustionClass::OperatorMissing
-    } else {
-        RepairExhaustionClass::SameTargetSameDiagnostic
-    }
-}
-
-/// A repeated no-progress observation: the same target/role failed `repeated_count`
-/// times with no diagnostic movement.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct NoProgressSignal {
-    pub(super) role: ArtifactRole,
-    pub(super) path: String,
-    pub(super) repeated_count: u32,
-}
-
-/// The structured recovery for a no-progress signal: ban the offending
-/// target/role and force a switch to a different role on the next diagnostic
-/// (#988 acceptance 2). Replaces the #987 blind `Replan`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct NoProgressRecovery {
-    /// The role to ban on the next diagnostic pass.
-    pub(super) banned_role: ArtifactRole,
-    /// The (masked) target path to ban. Masked at construction because it is an
-    /// external-origin string that may flow into later payloads (Security
-    /// Invariant: every external string passes `mask_secrets`).
-    pub(super) banned_target_path: String,
-    /// The role the diagnostic is forced onto instead. Always differs from the
-    /// banned role (the whole point of the switch).
-    pub(super) forced_role_switch: ArtifactRole,
-}
-
-/// Policy that converts a same-target/same-role no-progress signal into a ban
-/// payload plus a forced role switch.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct NoProgressRecoveryPolicy;
-
-impl NoProgressRecoveryPolicy {
-    /// Returns a recovery once the no-progress threshold is reached, otherwise
-    /// `None` (let the normal repair flow continue).
-    pub(super) fn recover(signal: &NoProgressSignal) -> Option<NoProgressRecovery> {
-        if signal.repeated_count < NO_PROGRESS_THRESHOLD {
-            return None;
-        }
-        Some(NoProgressRecovery {
-            banned_role: signal.role,
-            banned_target_path: mask_secrets(&signal.path),
-            forced_role_switch: forced_role_switch_for(signal.role),
-        })
-    }
-}
-
-/// Deterministic forced role switch. When the same role keeps stalling, the
-/// spec authority is likely the *other* side of the impl/test pair, so the
-/// diagnostic is forced onto a different role. Always returns a role distinct
-/// from the input.
-fn forced_role_switch_for(role: ArtifactRole) -> ArtifactRole {
-    match role {
-        ArtifactRole::Implementation => ArtifactRole::Test,
-        ArtifactRole::Test => ArtifactRole::Implementation,
-        ArtifactRole::UsageDocs | ArtifactRole::Setup | ArtifactRole::DataOutput => {
-            ArtifactRole::Implementation
-        }
-    }
+    let references: Vec<&str> = test_sources.iter().map(String::as_str).collect();
+    rust_evidence_binding_plan(manifest.as_deref(), &references)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL_TASK_KINDS: [TaskKind; 6] = [
-        TaskKind::Coding,
-        TaskKind::Docs,
-        TaskKind::Data,
-        TaskKind::Research,
-        TaskKind::Ops,
-        TaskKind::Authoring,
-    ];
-
-    const ALL_BINDING_CHECKS: [BindingCheckKind; 10] = [
-        BindingCheckKind::CargoManifestPresent,
-        BindingCheckKind::CargoDependencyDeclared,
-        BindingCheckKind::CargoLibTargetName,
-        BindingCheckKind::CargoBinTargetName,
-        BindingCheckKind::CargoIntegrationTestPresent,
-        BindingCheckKind::NodeManifestPresent,
-        BindingCheckKind::NodeTestScriptDeclared,
-        BindingCheckKind::DocsContentBound,
-        BindingCheckKind::DataSchemaBound,
-        BindingCheckKind::ResearchCitationBound,
-    ];
-
-    // ----- Replay fixture 052: Rust serde dependency undeclared -----
+    fn fixture_root(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("evidence_binding")
+            .join("rust")
+            .join(name)
+    }
 
     #[test]
-    fn replay_052_rust_serde_dependency_binds_to_cargo_operator() {
-        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
-        let diagnostic = "error[E0432]: unresolved import `serde`\n  --> src/lib.rs:1:5\n   use of undeclared crate or module `serde`";
-        let probe = BindingProbe {
-            cargo_manifest: Some(manifest),
-            present_test_files: &["tests/lib.rs"],
-            ..BindingProbe::for_diagnostic(diagnostic)
-        };
-
-        let plan = EvidenceBindingPlan::for_task_kind(TaskKind::Coding);
-        let resolution = plan.bind(&probe);
-
-        assert!(!resolution.is_bound());
-        let dep_mismatch = resolution
-            .mismatches()
-            .iter()
-            .find(|m| m.check == BindingCheckKind::CargoDependencyDeclared)
-            .expect("serde dependency mismatch is detected");
+    fn label_strings_are_stable() {
+        assert_eq!(EvidenceBindingStatus::Bound.as_str(), "bound");
+        assert_eq!(EvidenceBindingStatus::Unbound.as_str(), "unbound");
         assert_eq!(
-            dep_mismatch.operator,
-            Some(RepairOperatorId::CargoDependency)
+            EvidenceBindingStatus::Indeterminate.as_str(),
+            "indeterminate"
         );
         assert_eq!(
-            resolution.recoverable_operator(),
-            Some(RepairOperatorId::CargoDependency)
+            BindingCheckKind::ManifestIdentity.as_str(),
+            "manifest_identity"
         );
-        // Reclassified as a binding failure, not generic repair exhaustion.
+        assert_eq!(BindingCheckKind::ImportSymbol.as_str(), "import_symbol");
         assert_eq!(
-            resolution.generic_terminal_state(),
+            BindingCheckKind::ExecutableHandle.as_str(),
+            "executable_handle"
+        );
+    }
+
+    #[test]
+    fn parses_package_lib_and_bin_names() {
+        let manifest = "\
+[package]
+name = \"ndjson-tool\"
+version = \"0.1.0\"
+
+[lib]
+name = \"nd_json\"
+
+[[bin]]
+name = \"ndjson\"
+
+[dev-dependencies]
+tempfile = \"3\"
+serde = { version = \"1\", features = [\"derive\"] }
+
+[dependencies.regex]
+version = \"1\"
+";
+        let identities = parse_cargo_binding_identities(manifest);
+        assert_eq!(identities.package_name.as_deref(), Some("ndjson-tool"));
+        assert_eq!(identities.lib_name.as_deref(), Some("nd_json"));
+        assert!(identities.bin_names.contains("ndjson"));
+        assert!(identities.dependencies.contains("tempfile"));
+        assert!(identities.dependencies.contains("serde"));
+        assert!(identities.dependencies.contains("regex"));
+        // `[lib] name` overrides the package name as the importable identity.
+        assert_eq!(
+            identities.lib_identities().into_iter().collect::<Vec<_>>(),
+            vec!["nd_json".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_imports_and_binary_handles() {
+        let source = "\
+use std::process::Command;
+use slug::slugify;
+pub use tempfile::TempDir;
+extern crate libc;
+
+#[test]
+fn runs() {
+    let bin = env!(\"CARGO_BIN_EXE_word_counter\");
+    let other = Command::cargo_bin(\"slug-cli\").unwrap();
+}
+";
+        let references = extract_rust_test_references(source);
+        assert!(references.crate_imports.contains("std"));
+        assert!(references.crate_imports.contains("slug"));
+        assert!(references.crate_imports.contains("tempfile"));
+        assert!(references.crate_imports.contains("libc"));
+        assert!(references.binary_handles.contains("word_counter"));
+        assert!(references.binary_handles.contains("slug-cli"));
+    }
+
+    // --- Representative v0.6.4 failures (slug / word / ndjson) -------------
+
+    #[test]
+    fn slug_crate_import_mismatch_is_binding_failure() {
+        // package is `slugify`; the test imports `slug` -> unresolved self-import.
+        let plan = rust_evidence_binding_plan_from_work_root(&fixture_root("slug"));
+        assert_eq!(plan.status(), EvidenceBindingStatus::Unbound);
+        assert_eq!(
+            plan.binding_error(),
+            Some(EvidenceRunnerError::BindingFailed)
+        );
+        assert_eq!(
+            plan.generic_terminal_state(),
             Some(GenericTerminalState::EvidenceBindingFailed)
         );
-        // Pure-Rust probe never reports a Node mismatch.
-        assert!(
-            resolution
-                .mismatches()
-                .iter()
-                .all(|m| m.check.evidence_runner_kind() == EvidenceRunnerKind::CodingBuildTest)
-        );
-        assert!(!resolution.mismatches().iter().any(|m| matches!(
-            m.check,
-            BindingCheckKind::NodeManifestPresent | BindingCheckKind::NodeTestScriptDeclared
-        )));
+        let failure = plan
+            .failed_checks()
+            .find(|check| check.kind == BindingCheckKind::ImportSymbol)
+            .expect("import symbol binding failure");
+        assert_eq!(failure.reference, "slug");
+        assert_eq!(failure.candidates, vec!["slugify".to_string()]);
     }
 
     #[test]
-    fn rust_serde_already_declared_binds_clean() {
-        let manifest = "[package]\nname = \"app\"\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nserde_json = \"1\"\n";
-        let diagnostic =
-            "error[E0432]: unresolved import `serde`\nuse of undeclared crate or module `serde`";
-        let probe = BindingProbe {
-            cargo_manifest: Some(manifest),
-            ..BindingProbe::for_diagnostic(diagnostic)
-        };
-        let plan = EvidenceBindingPlan::for_task_kind(TaskKind::Coding);
-        // The dep is declared, so the dependency check does not mismatch.
-        let resolution = plan.bind(&probe);
-        assert!(
-            !resolution
-                .mismatches()
-                .iter()
-                .any(|m| m.check == BindingCheckKind::CargoDependencyDeclared)
-        );
-    }
-
-    // ----- Rust [lib]/[[bin]] / CARGO_BIN_EXE binding mismatch -----
-
-    #[test]
-    fn rust_lib_name_mismatch_is_classified_binding() {
-        let manifest = "[package]\nname = \"app\"\n\n[lib]\nname = \"wrong_crate\"\n";
-        let probe = BindingProbe {
-            cargo_manifest: Some(manifest),
-            expected_crate_name: Some("app_core"),
-            present_test_files: &["tests/it.rs"],
-            ..BindingProbe::for_diagnostic("cargo test failed")
-        };
-        let resolution = EvidenceBindingPlan::for_task_kind(TaskKind::Coding).bind(&probe);
-        let mismatch = resolution
-            .mismatches()
-            .iter()
-            .find(|m| m.check == BindingCheckKind::CargoLibTargetName)
-            .expect("lib name mismatch detected");
-        // No deterministic operator yet (#991), but it is classified as binding.
-        assert_eq!(mismatch.operator, None);
+    fn word_executable_handle_mismatch_is_binding_failure() {
+        // package/bin is `wordcount`; the test references CARGO_BIN_EXE_word_counter.
+        let plan = rust_evidence_binding_plan_from_work_root(&fixture_root("word"));
+        assert_eq!(plan.status(), EvidenceBindingStatus::Unbound);
         assert_eq!(
-            resolution.generic_terminal_state(),
+            plan.generic_terminal_state(),
             Some(GenericTerminalState::EvidenceBindingFailed)
         );
+        let failure = plan
+            .failed_checks()
+            .find(|check| check.kind == BindingCheckKind::ExecutableHandle)
+            .expect("executable handle binding failure");
+        assert_eq!(failure.reference, "word_counter");
+        assert!(failure.candidates.contains(&"wordcount".to_string()));
     }
 
     #[test]
-    fn cargo_bin_exe_without_matching_bin_target_is_binding_mismatch() {
-        let manifest = "[package]\nname = \"app\"\n\n[[bin]]\nname = \"server\"\n";
-        let probe = BindingProbe {
-            cargo_manifest: Some(manifest),
-            referenced_bin_exe_names: &["cli"],
-            present_test_files: &["tests/cli.rs"],
-            ..BindingProbe::for_diagnostic("cargo test failed")
-        };
-        let resolution = EvidenceBindingPlan::for_task_kind(TaskKind::Coding).bind(&probe);
+    fn ndjson_lib_name_mismatch_is_binding_failure() {
+        // `[lib] name = "nd_json"`; the test imports `ndjson`.
+        let plan = rust_evidence_binding_plan_from_work_root(&fixture_root("ndjson"));
+        assert_eq!(plan.status(), EvidenceBindingStatus::Unbound);
+        assert_eq!(
+            plan.binding_error(),
+            Some(EvidenceRunnerError::BindingFailed)
+        );
+        let failure = plan
+            .failed_checks()
+            .find(|check| check.kind == BindingCheckKind::ImportSymbol)
+            .expect("import symbol binding failure");
+        assert_eq!(failure.reference, "ndjson");
+        assert_eq!(failure.candidates, vec!["nd_json".to_string()]);
+    }
+
+    #[test]
+    fn correctly_bound_rust_project_has_no_false_positive() {
+        // Correct self-import + matching bin handle + a declared dev-dependency
+        // import (which must NOT be flagged).
+        let plan = rust_evidence_binding_plan_from_work_root(&fixture_root("bound"));
+        assert_eq!(plan.status(), EvidenceBindingStatus::Bound);
+        assert!(plan.is_bound());
+        assert_eq!(plan.binding_error(), None);
+        assert_eq!(plan.generic_terminal_state(), None);
+        assert!(plan.failed_checks().next().is_none());
+    }
+
+    // --- Boundary cases (no false positives on non-coding / dep-only) -----
+
+    #[test]
+    fn importing_only_a_declared_dependency_is_not_flagged() {
+        let manifest = "\
+[package]
+name = \"app\"
+
+[dev-dependencies]
+tempfile = \"3\"
+";
+        let test = "use tempfile::TempDir;\n#[test] fn t() { let _ = TempDir::new(); }\n";
+        let plan = rust_evidence_binding_plan(Some(manifest), &[test]);
+        // ManifestIdentity is bound; the dependency import yields no check.
+        assert_eq!(plan.status(), EvidenceBindingStatus::Bound);
         assert!(
-            resolution
-                .mismatches()
+            plan.checks
                 .iter()
-                .any(|m| m.check == BindingCheckKind::CargoBinTargetName)
+                .all(|check| check.kind != BindingCheckKind::ImportSymbol)
         );
+        assert_eq!(plan.binding_error(), None);
     }
 
     #[test]
-    fn cargo_bin_exe_with_matching_bin_target_binds() {
-        let manifest =
-            "[package]\nname = \"app\"\n\n[[bin]]\nname = \"cli\"\n\n[[bin]]\nname = \"server\"\n";
-        let probe = BindingProbe {
-            cargo_manifest: Some(manifest),
-            referenced_bin_exe_names: &["cli"],
-            ..BindingProbe::for_diagnostic("cargo test failed")
-        };
-        let resolution = EvidenceBindingPlan::for_task_kind(TaskKind::Coding).bind(&probe);
-        assert!(
-            !resolution
-                .mismatches()
-                .iter()
-                .any(|m| m.check == BindingCheckKind::CargoBinTargetName)
-        );
+    fn no_rust_references_yields_indeterminate_plan() {
+        // Mimics a Python/Node/docs evidence path: no Rust references at all.
+        let manifest = "[package]\nname = \"app\"\n";
+        let plan = rust_evidence_binding_plan(Some(manifest), &["print('hello')\n"]);
+        assert!(plan.checks.is_empty());
+        assert_eq!(plan.status(), EvidenceBindingStatus::Indeterminate);
+        assert_eq!(plan.binding_error(), None);
+        assert_eq!(plan.generic_terminal_state(), None);
     }
 
     #[test]
-    fn cargo_target_name_parsers_extract_declared_names() {
-        let manifest = "[package]\nname = \"app\" # crate\n\n[lib]\nname = \"app_core\"\n\n[[bin]]\nname = \"cli\"\n\n[[bin]]\nname = \"server\"\n";
-        assert_eq!(cargo_lib_target_name(manifest).as_deref(), Some("app_core"));
-        assert_eq!(cargo_bin_target_names(manifest), vec!["cli", "server"]);
-        assert_eq!(cargo_lib_target_name("[package]\nname = \"x\"\n"), None);
-    }
-
-    // ----- Replay fixtures 043 / 048 / 058: Node manifest/test ordering -----
-
-    #[test]
-    fn replay_048_node_missing_manifest_binds_to_node_operator() {
-        // Tests exist but package.json is missing (fixtures 048 / 058).
-        let probe = BindingProbe {
-            present_test_files: &["app.test.mjs"],
-            ..BindingProbe::for_diagnostic("npm test could not find package.json")
-        };
-        let resolution = EvidenceBindingPlan::for_task_kind(TaskKind::Coding).bind(&probe);
-        let mismatch = resolution
-            .mismatches()
-            .iter()
-            .find(|m| m.check == BindingCheckKind::NodeManifestPresent)
-            .expect("node manifest mismatch detected");
-        assert_eq!(mismatch.operator, Some(RepairOperatorId::NodeManifest));
-        assert_eq!(
-            resolution.recoverable_operator(),
-            Some(RepairOperatorId::NodeManifest)
-        );
-        // Node-only probe never reports a Rust mismatch.
-        assert!(!resolution.mismatches().iter().any(|m| matches!(
-            m.check,
-            BindingCheckKind::CargoManifestPresent | BindingCheckKind::CargoDependencyDeclared
-        )));
+    fn missing_manifest_with_rust_references_is_manifest_binding_failure() {
+        let test = "use slug::slugify;\n#[test] fn t() {}\n";
+        let plan = rust_evidence_binding_plan(None, &[test]);
+        assert_eq!(plan.status(), EvidenceBindingStatus::Unbound);
+        let failure = plan
+            .failed_checks()
+            .next()
+            .expect("manifest binding failure");
+        assert_eq!(failure.kind, BindingCheckKind::ManifestIdentity);
+        assert_eq!(failure.reference, "Cargo.toml");
     }
 
     #[test]
-    fn replay_043_node_manifest_without_test_script_binds_to_node_operator() {
-        // package.json exists but scripts.test is missing (fixture 043).
-        let manifest = r#"{"name":"app","version":"1.0.0","type":"module"}"#;
-        let probe = BindingProbe {
-            node_manifest: Some(manifest),
-            present_test_files: &["app.test.mjs"],
-            ..BindingProbe::for_diagnostic("npm test: missing script: test")
-        };
-        let resolution = EvidenceBindingPlan::for_task_kind(TaskKind::Coding).bind(&probe);
-        let mismatch = resolution
-            .mismatches()
-            .iter()
-            .find(|m| m.check == BindingCheckKind::NodeTestScriptDeclared)
-            .expect("node test-script mismatch detected");
-        assert_eq!(mismatch.operator, Some(RepairOperatorId::NodeManifest));
+    fn hyphen_underscore_normalization_binds() {
+        // package `word-counter`; bin handle CARGO_BIN_EXE_word_counter binds via
+        // `-`/`_` normalization, and `use word_counter::` binds to the lib.
+        let manifest = "[package]\nname = \"word-counter\"\n";
+        let test = "\
+use word_counter::count;
+#[test]
+fn t() {
+    let bin = env!(\"CARGO_BIN_EXE_word_counter\");
+    let _ = bin;
+}
+";
+        let plan = rust_evidence_binding_plan(Some(manifest), &[test]);
+        assert_eq!(plan.status(), EvidenceBindingStatus::Bound);
+        assert_eq!(plan.binding_error(), None);
     }
+}
+
+#[cfg(test)]
+mod generic_binding_failure_tests {
+    use super::*;
+
+    const ALL_FAILURE_CHECKS: [BindingFailureCheck; 4] = [
+        BindingFailureCheck::RunnerManifest,
+        BindingFailureCheck::DocumentSection,
+        BindingFailureCheck::SchemaOutput,
+        BindingFailureCheck::SourceCitation,
+    ];
 
     #[test]
-    fn node_manifest_with_test_script_binds_clean() {
-        let manifest = r#"{"name":"app","scripts":{"test":"node --test"}}"#;
-        let probe = BindingProbe {
-            node_manifest: Some(manifest),
-            present_test_files: &["app.test.mjs"],
-            ..BindingProbe::for_diagnostic("npm test")
-        };
-        let resolution = EvidenceBindingPlan::for_task_kind(TaskKind::Coding).bind(&probe);
-        assert!(resolution.is_bound());
-        assert_eq!(resolution.generic_terminal_state(), None);
-    }
-
-    #[test]
-    fn rust_and_node_share_one_binding_plan_lifecycle() {
-        // Same plan object resolves both runtimes (#988 acceptance 3).
-        let plan = EvidenceBindingPlan::for_task_kind(TaskKind::Coding);
-
-        let rust = plan.bind(&BindingProbe {
-            cargo_manifest: Some("[package]\nname = \"app\"\n"),
-            ..BindingProbe::for_diagnostic(
-                "error[E0433]: failed to resolve: use of undeclared crate or module `serde_json`",
-            )
-        });
-        assert_eq!(
-            rust.recoverable_operator(),
-            Some(RepairOperatorId::CargoDependency)
-        );
-
-        let node = plan.bind(&BindingProbe {
-            present_test_files: &["app.test.mjs"],
-            ..BindingProbe::for_diagnostic("npm test could not find package.json")
-        });
-        assert_eq!(
-            node.recoverable_operator(),
-            Some(RepairOperatorId::NodeManifest)
-        );
-    }
-
-    // ----- Generic enum / registry boundary (AC4) -----
-
-    #[test]
-    fn binding_plan_covers_every_task_kind() {
-        for kind in ALL_TASK_KINDS {
-            let plan = EvidenceBindingPlan::for_task_kind(kind);
-            assert_eq!(plan.task_kind(), kind);
-            // Ops has a command observation, not a static binding check.
-            if kind == TaskKind::Ops {
-                assert!(plan.checks().is_empty());
-            } else {
-                assert!(!plan.checks().is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn binding_checks_project_onto_runner_vocabulary() {
-        for check in ALL_BINDING_CHECKS {
-            // Every check maps to a real runner kind and a stable label.
-            let _ = check.evidence_runner_kind();
-            assert!(!check.as_str().is_empty());
-        }
-        assert_eq!(
-            BindingCheckKind::DocsContentBound.evidence_runner_kind(),
-            EvidenceRunnerKind::DocsContentCheck
-        );
-        assert_eq!(
-            BindingCheckKind::DataSchemaBound.evidence_runner_kind(),
-            EvidenceRunnerKind::DataSchemaCheck
-        );
-        assert_eq!(
-            BindingCheckKind::ResearchCitationBound.evidence_runner_kind(),
-            EvidenceRunnerKind::ResearchSourceFetch
-        );
-    }
-
-    #[test]
-    fn docs_data_research_extension_axis_classifies_unbound_content() {
-        for (kind, check) in [
-            (TaskKind::Docs, BindingCheckKind::DocsContentBound),
-            (TaskKind::Data, BindingCheckKind::DataSchemaBound),
-            (TaskKind::Research, BindingCheckKind::ResearchCitationBound),
-        ] {
-            let plan = EvidenceBindingPlan::for_task_kind(kind);
-            // Empty excerpt -> binding mismatch.
-            let unbound = plan.bind(&BindingProbe::for_diagnostic(""));
-            assert!(
-                unbound.mismatches().iter().any(|m| m.check == check),
-                "{kind:?} reports an unbound content mismatch"
+    fn deliverable_present_but_unbound_is_a_binding_failure() {
+        for check in ALL_FAILURE_CHECKS {
+            let state = evaluate_binding(check, true, false);
+            let job = state
+                .failed_job()
+                .unwrap_or_else(|| panic!("{} should be a binding failure", check.as_str()));
+            assert_eq!(job.check, check);
+            assert_eq!(job.recovery, check.recovery());
+            assert_eq!(
+                job.generic_terminal_state(),
+                GenericTerminalState::EvidenceBindingFailed
             );
-            // Present excerpt -> bound (detailed logic deferred to #993).
-            let bound = plan.bind(&BindingProbe {
-                artifact_excerpt: Some("## Section\nReal content."),
-                ..BindingProbe::for_diagnostic("")
-            });
-            assert!(bound.is_bound(), "{kind:?} binds with present content");
+            assert_eq!(
+                job.recovery_job_kind(),
+                RecoveryJobKind::EvidenceBindingFailedJob
+            );
         }
     }
 
     #[test]
-    fn operator_registry_and_binding_check_mapping_are_consistent() {
-        // registry_order is the dispatch precedence and has no duplicates.
-        let order = RepairOperatorId::registry_order();
-        assert_eq!(order.len(), 3);
-        assert_eq!(order[0], RepairOperatorId::CargoDependency);
-
-        // recommended_operator and binding_check are inverse for binding-shaped
-        // operators (single source of truth for the check<->operator mapping).
-        assert_eq!(
-            BindingCheckKind::CargoDependencyDeclared.recommended_operator(),
-            Some(RepairOperatorId::CargoDependency)
-        );
-        assert_eq!(
-            RepairOperatorId::CargoDependency.binding_check(),
-            Some(BindingCheckKind::CargoDependencyDeclared)
-        );
-        // The compile operator is not binding-shaped.
-        assert_eq!(RepairOperatorId::MechanicalCompile.binding_check(), None);
-        for op in order {
-            assert!(!op.as_str().is_empty());
+    fn bound_or_absent_deliverable_is_not_a_binding_failure() {
+        for check in ALL_FAILURE_CHECKS {
+            assert_eq!(evaluate_binding(check, true, true), BindingState::Bound);
+            assert_eq!(evaluate_binding(check, false, false), BindingState::Bound);
+            assert_eq!(evaluate_binding(check, false, true), BindingState::Bound);
         }
     }
 
-    // ----- repair_exhausted decomposition (AC1 / expectation 3) -----
+    #[test]
+    fn binding_failure_check_for_task_kind_mirrors_evidence_runner_selection() {
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Coding),
+            Some(BindingFailureCheck::RunnerManifest)
+        );
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Docs),
+            Some(BindingFailureCheck::DocumentSection)
+        );
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Data),
+            Some(BindingFailureCheck::SchemaOutput)
+        );
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Research),
+            Some(BindingFailureCheck::SourceCitation)
+        );
+        assert_eq!(BindingFailureCheck::for_task_kind(TaskKind::Ops), None);
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Authoring),
+            None
+        );
+    }
 
     #[test]
-    fn repair_exhaustion_decomposes_by_most_specific_cause() {
+    fn binding_failure_check_for_evidence_runner_kind_matches_task_kind_mapping() {
         let cases = [
             (
-                RepairExhaustionSignal {
-                    contract_conflict: true,
-                    binding_failed_after_repair: true,
-                    same_target_same_diagnostic: true,
-                    operator_available: true,
-                },
-                RepairExhaustionClass::ContractConflictUnresolved,
-                "contract_conflict",
+                EvidenceRunnerKind::CodingBuildTest,
+                Some(BindingFailureCheck::RunnerManifest),
             ),
             (
-                RepairExhaustionSignal {
-                    binding_failed_after_repair: true,
-                    same_target_same_diagnostic: true,
-                    ..Default::default()
-                },
-                RepairExhaustionClass::BindingFailedAfterRepair,
-                "binding_failed_after_repair",
+                EvidenceRunnerKind::DocsContentCheck,
+                Some(BindingFailureCheck::DocumentSection),
             ),
             (
-                RepairExhaustionSignal {
-                    same_target_same_diagnostic: true,
-                    operator_available: true,
-                    ..Default::default()
-                },
-                RepairExhaustionClass::SameTargetSameDiagnostic,
-                "same_target_exhausted",
+                EvidenceRunnerKind::DataSchemaCheck,
+                Some(BindingFailureCheck::SchemaOutput),
             ),
             (
-                RepairExhaustionSignal::default(),
-                RepairExhaustionClass::OperatorMissing,
-                "operator_missing",
+                EvidenceRunnerKind::ResearchSourceFetch,
+                Some(BindingFailureCheck::SourceCitation),
             ),
+            (EvidenceRunnerKind::OpsCommandObservation, None),
+            (EvidenceRunnerKind::AuthoringContentCheck, None),
         ];
-        for (signal, expected, label) in cases {
-            let class = classify_repair_exhaustion(&signal);
-            assert_eq!(class, expected);
-            assert_eq!(class.label(), label);
-            // Legacy eval label is always preserved.
-            assert_eq!(class.legacy_label(), "repair_exhausted");
+        for (runner_kind, expected) in cases {
+            assert_eq!(
+                BindingFailureCheck::for_evidence_runner_kind(runner_kind),
+                expected
+            );
         }
     }
 
     #[test]
-    fn repair_exhaustion_projects_onto_generic_terminal_states() {
+    fn binding_recovery_labels_are_stable() {
         assert_eq!(
-            RepairExhaustionClass::SameTargetSameDiagnostic.generic_terminal_state(),
-            GenericTerminalState::EvidenceRepairExhausted
+            BindingFailureCheck::RunnerManifest.as_str(),
+            "runner_manifest"
         );
         assert_eq!(
-            RepairExhaustionClass::OperatorMissing.generic_terminal_state(),
-            GenericTerminalState::EvidenceRepairExhausted
+            BindingFailureCheck::DocumentSection.as_str(),
+            "document_section"
+        );
+        assert_eq!(BindingFailureCheck::SchemaOutput.as_str(), "schema_output");
+        assert_eq!(
+            BindingFailureCheck::SourceCitation.as_str(),
+            "source_citation"
         );
         assert_eq!(
-            RepairExhaustionClass::BindingFailedAfterRepair.generic_terminal_state(),
-            GenericTerminalState::EvidenceBindingFailed
+            BindingRecovery::MaterializeRunnerManifest.as_str(),
+            "materialize_runner_manifest"
         );
         assert_eq!(
-            RepairExhaustionClass::ContractConflictUnresolved.generic_terminal_state(),
-            GenericTerminalState::EvidenceRepairSafeStop
-        );
-    }
-
-    // ----- NoProgressRecoveryPolicy: ban payload + forced role switch (AC2) ----
-
-    #[test]
-    fn no_progress_below_threshold_does_not_ban() {
-        let signal = NoProgressSignal {
-            role: ArtifactRole::Implementation,
-            path: "src/lib.rs".to_string(),
-            repeated_count: 1,
-        };
-        assert_eq!(NoProgressRecoveryPolicy::recover(&signal), None);
-    }
-
-    #[test]
-    fn no_progress_at_threshold_bans_target_and_forces_role_switch() {
-        let signal = NoProgressSignal {
-            role: ArtifactRole::Implementation,
-            path: "src/lib.rs".to_string(),
-            repeated_count: 2,
-        };
-        let recovery =
-            NoProgressRecoveryPolicy::recover(&signal).expect("threshold reached -> recovery");
-        assert_eq!(recovery.banned_role, ArtifactRole::Implementation);
-        assert_eq!(recovery.banned_target_path, "src/lib.rs");
-        // Forced switch is always a different role.
-        assert_ne!(recovery.forced_role_switch, recovery.banned_role);
-        assert_eq!(recovery.forced_role_switch, ArtifactRole::Test);
-    }
-
-    #[test]
-    fn forced_role_switch_is_total_and_always_changes_role() {
-        for role in ArtifactRole::all() {
-            let switched = forced_role_switch_for(role);
-            assert_ne!(switched, role, "{role:?} switches to a different role");
-        }
-        assert_eq!(
-            forced_role_switch_for(ArtifactRole::Test),
-            ArtifactRole::Implementation
+            BindingRecovery::RecoverDocumentSection.as_str(),
+            "recover_document_section"
         );
         assert_eq!(
-            forced_role_switch_for(ArtifactRole::UsageDocs),
-            ArtifactRole::Implementation
+            BindingRecovery::RecoverSchemaOutput.as_str(),
+            "recover_schema_output"
         );
         assert_eq!(
-            forced_role_switch_for(ArtifactRole::DataOutput),
-            ArtifactRole::Implementation
-        );
-    }
-
-    #[test]
-    fn no_progress_masks_external_target_path() {
-        // A secret-looking path token is masked at construction (Security
-        // Invariant); ordinary paths pass through unchanged.
-        let signal = NoProgressSignal {
-            role: ArtifactRole::Setup,
-            path: "config/api_key=sk-ABCDEFGHIJKLMNOPQRSTUVWX".to_string(),
-            repeated_count: 3,
-        };
-        let recovery = NoProgressRecoveryPolicy::recover(&signal).expect("recovery");
-        assert_eq!(
-            recovery.banned_target_path,
-            mask_secrets("config/api_key=sk-ABCDEFGHIJKLMNOPQRSTUVWX")
+            BindingRecovery::RecoverSourceCitation.as_str(),
+            "recover_source_citation"
         );
     }
 }

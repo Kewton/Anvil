@@ -378,7 +378,7 @@ class TestTaskKindEvalReporting(unittest.TestCase):
             (
                 "safe_stop_verifier_weak",
                 "evidence_binding_failed",
-                "EvidenceFailedJob",
+                "EvidenceBindingFailedJob",
             ),
             (
                 "safe_stop_verifier_missing",
@@ -851,6 +851,98 @@ class TestTaskKindEvalReporting(unittest.TestCase):
                     "evidence_runner_missing",
                 )
 
+    def test_evidence_binding_failure_fixtures_cover_node_docs_data_research(
+        self,
+    ) -> None:
+        """Issue #993 (parent #988, Issue E): a deliverable that exists but
+        cannot bind its evidence runner is an ``evidence_binding_failed``
+        transition, not a generic ``missing_evidence`` (legacy
+        ``missing_verification``) terminal. The runtime-specific binding (Node
+        manifest / docs document / data schema / research citation) all share
+        the same generic lifecycle, recovery job, and runner-binding stage.
+        """
+        # task_kind, evidence deliverable path, binding-failure description.
+        binding_fixtures = [
+            ("coding", "tests/main.test.js"),  # no package.json -> runner unbound
+            ("docs", "README.md"),  # no target document for content check
+            ("data", "output/users.csv"),  # no output for schema check
+            ("research", "research/report.md"),  # no source notes for citation check
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            for idx, (task_kind, modified_path) in enumerate(binding_fixtures, start=1):
+                run_dir = root / f"binding-{idx}"
+                _make_run(
+                    run_dir,
+                    task_kind=task_kind,
+                    pam_variant="pam_off",
+                    modified_path=modified_path,
+                    rc=1,
+                    final_outcome="missing_evidence",
+                    worker_lifecycle={
+                        "worker_kind": "evidence_binding",
+                        "context_pack_kind": "evidence",
+                        # The evidence deliverable was authored ...
+                        "deliverable_created": True,
+                        "evidence_created": True,
+                        # ... but no evidence runner could be bound to it.
+                        "runner_bound": False,
+                        "diagnostic_classified": True,
+                        "repair_applied": False,
+                        "rerun_passed": False,
+                    },
+                )
+                data = self._analyze(run_dir)
+                self.assertEqual(data["task_kind"], task_kind)
+                # Legacy wire label is preserved for compatibility consumers.
+                self.assertEqual(
+                    data["legacy_terminal_state"], "missing_evidence", task_kind
+                )
+                # ... but the generic lifecycle is the binding-failure transition.
+                self.assertEqual(
+                    data["generic_terminal_state"],
+                    "evidence_binding_failed",
+                    task_kind,
+                )
+                self.assertEqual(
+                    data["recovery_job_kind"],
+                    "EvidenceBindingFailedJob",
+                    task_kind,
+                )
+                self.assertEqual(
+                    data["lifecycle_failure_stage"], "runner_binding", task_kind
+                )
+
+    def test_missing_evidence_without_deliverable_is_not_binding_failure(self) -> None:
+        """Contrast to the binding fixtures: when the evidence deliverable was
+        never authored (``evidence_created=False``), the run stays a generic
+        ``missing_evidence`` terminal. Only the binding-order case (deliverable
+        present, runner unbound) migrates off ``missing_verification``."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/lib.rs",
+                rc=1,
+                final_outcome="missing_evidence",
+                worker_lifecycle={
+                    "worker_kind": "test_author",
+                    "context_pack_kind": "evidence",
+                    "deliverable_created": True,
+                    "evidence_created": False,
+                    "runner_bound": False,
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+            )
+            data = self._analyze(run_dir)
+        self.assertEqual(data["generic_terminal_state"], "missing_evidence")
+        self.assertEqual(data["recovery_job_kind"], "MissingEvidenceJob")
+        self.assertEqual(data["lifecycle_failure_stage"], "evidence_authoring")
+
     # ---- Issue #925 (P8): R5 misroute fail-closed gate ---------------------
 
     def _analyze(self, run_dir: pathlib.Path) -> dict:
@@ -1158,6 +1250,24 @@ class TestFailureObservationClassifier(unittest.TestCase):
                 rc=1,
                 final_outcome="evidence_failed",
                 recovery_strategies=["deterministic_compile_repair"],
+            )
+            fo = self._observe(run_dir)
+        self.assertTrue(fo["deterministic_operator_hit"])
+
+    def test_deterministic_operator_hit_from_rust_binding_repair(self) -> None:
+        # Issue #991: the Rust binding-repair controller strategy
+        # (`deterministic_binding_repair`) must surface in the eval/report
+        # deterministic-operator hit rate.
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="Cargo.toml",
+                rc=1,
+                final_outcome="evidence_failed",
+                recovery_strategies=["deterministic_binding_repair"],
             )
             fo = self._observe(run_dir)
         self.assertTrue(fo["deterministic_operator_hit"])

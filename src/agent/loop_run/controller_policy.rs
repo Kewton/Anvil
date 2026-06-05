@@ -13,6 +13,11 @@ pub(super) enum ControllerRecoveryStrategy {
     ToolFirstRetry,
     TargetedArtifactRetry,
     DeterministicFallback,
+    /// Issue #991: a deterministic Rust binding-mismatch operator fired (lib
+    /// name / `CARGO_BIN_EXE`). Distinct from `DeterministicFallback` so the
+    /// eval/report operator hit rate is attributable to binding repair, while
+    /// still matching the `deterministic` hit-rate marker.
+    DeterministicBindingRepair,
     EvidenceAction,
     VerifierRepairEdit,
     MissingVerifierSetup,
@@ -25,6 +30,7 @@ impl ControllerRecoveryStrategy {
             Self::ToolFirstRetry => "tool_first_retry",
             Self::TargetedArtifactRetry => "targeted_artifact_retry",
             Self::DeterministicFallback => "deterministic_fallback",
+            Self::DeterministicBindingRepair => "deterministic_binding_repair",
             Self::EvidenceAction => "evidence_action",
             Self::VerifierRepairEdit => "verifier_repair_edit",
             Self::MissingVerifierSetup => "missing_verifier_setup",
@@ -215,5 +221,15 @@ mod tests {
         assert!(note.contains("controller_recovery_strategy=evidence_action"));
         assert!(note.contains("controller_recovery_strategy_count=2/3"));
         assert!(note.contains("Preserve approval"));
+    }
+
+    #[test]
+    fn deterministic_binding_repair_label_feeds_the_operator_hit_rate() {
+        // Issue #991: the binding-repair strategy must carry the `deterministic`
+        // marker so `analyze_run.py::_deterministic_operator_hit` /
+        // `report.py` count it in the deterministic-operator hit rate.
+        let label = ControllerRecoveryStrategy::DeterministicBindingRepair.label();
+        assert_eq!(label, "deterministic_binding_repair");
+        assert!(label.contains("deterministic"));
     }
 }
