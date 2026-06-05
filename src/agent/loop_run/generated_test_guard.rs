@@ -374,7 +374,10 @@ enum CargoManifestSection {
     Other,
 }
 
-fn strip_toml_comment(line: &str) -> &str {
+// Issue #989: shared with `evidence_binding.rs` (Cargo manifest binding plan).
+// Pure TOML line helpers; `pub(super)` so the binding adapter reuses them
+// instead of re-implementing ad hoc string mutation (DRY). Behavior unchanged.
+pub(super) fn strip_toml_comment(line: &str) -> &str {
     let mut in_string = false;
     let mut escaped = false;
     for (idx, ch) in line.char_indices() {
@@ -392,7 +395,7 @@ fn strip_toml_comment(line: &str) -> &str {
     line
 }
 
-fn parse_toml_string_value(value: &str) -> Option<String> {
+pub(super) fn parse_toml_string_value(value: &str) -> Option<String> {
     let quoted = value.trim().strip_prefix('"')?;
     let end = quoted.find('"')?;
     Some(quoted[..end].to_string())

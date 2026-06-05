@@ -1,0 +1,14 @@
+# Issue #989 fixture: Rust `[lib] name` binding mismatch (ndjson).
+#
+# Read-only fixture data — NOT a workspace member (excluded via
+# `[workspace] exclude = ["tests/fixtures"]`). The library is renamed to
+# `nd_json` via `[lib] name`, but `tests/ndjson.rs` imports `ndjson`, so the
+# crate-under-test import does not bind.
+[package]
+name = "ndjson-tool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "nd_json"
