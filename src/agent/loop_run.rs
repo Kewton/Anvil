@@ -509,6 +509,12 @@ mod repair_brief;
 // adapter over TaskContract + RepairJob state; repair loop ownership stays
 // with the repair modules.
 mod repair_job;
+// Issue #990 (parent #988, Issue B): failure-cluster-scoped no-progress
+// recovery policy. Connects the `TargetReassessmentRequired` event (#987) to
+// deterministic target/role bans + forced role switch + `repair_exhausted`
+// sub-classification. Private module, not re-exported (DR3-001) — `repair_job`
+// / `verifier_orchestration` are the only in-crate consumers.
+mod no_progress_recovery;
 mod repair_packet;
 // Issue #653: `RepairAttemptOutcome` lifecycle ledger. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
