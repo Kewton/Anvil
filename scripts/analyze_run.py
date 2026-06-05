@@ -90,6 +90,17 @@ GENERIC_TERMINAL_BY_FINAL_OUTCOME = {
 KNOWN_GENERIC_TERMINAL_STATES = set(GENERIC_TERMINAL_BY_FINAL_OUTCOME.values()) | {
     "unknown",
 }
+KNOWN_LIFECYCLE_FAILURE_STAGES = {
+    "classification",
+    "deliverable",
+    "evidence_authoring",
+    "runner_binding",
+    "diagnostic_classification",
+    "repair",
+    "rerun",
+    "completed",
+    "unknown",
+}
 RECOVERY_JOB_BY_GENERIC_TERMINAL = {
     "completed": "none",
     "missing_deliverable": "MissingDeliverableJob",
@@ -114,6 +125,24 @@ KNOWN_FAILURE_AUTHORITIES = {
     "repair_routing",
     "success",
     "unknown",
+}
+WORKER_LIFECYCLE_STRING_FIELDS = {
+    "worker_kind",
+    "context_pack_kind",
+    "diagnostic_class",
+    "lifecycle_failure_stage",
+}
+WORKER_LIFECYCLE_BOOL_FIELDS = {
+    "deliverable_created",
+    "evidence_created",
+    "runner_bound",
+    "diagnostic_classified",
+    "repair_applied",
+    "rerun_passed",
+}
+WORKER_LIFECYCLE_INT_FIELDS = {
+    "context_token_estimate",
+    "context_entry_count",
 }
 
 GAME_KEYWORDS_V1 = [
@@ -862,12 +891,78 @@ def _read_eval_objective_projection(run_dir: Path) -> dict[str, Any]:
                 if recovery_strategies:
                     parsed["recovery_strategies"] = recovery_strategies
 
+                worker_lifecycle = rec.get("worker_lifecycle")
+                if isinstance(worker_lifecycle, dict):
+                    for key in WORKER_LIFECYCLE_STRING_FIELDS:
+                        value = _bounded_string(worker_lifecycle.get(key))
+                        if value is not None:
+                            parsed[key] = value
+                    for key in WORKER_LIFECYCLE_BOOL_FIELDS:
+                        value = worker_lifecycle.get(key)
+                        if isinstance(value, bool):
+                            parsed[key] = value
+                    for key in WORKER_LIFECYCLE_INT_FIELDS:
+                        value = worker_lifecycle.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            parsed[key] = max(0, value)
+
                 if parsed:
                     last = parsed
     except OSError as e:
         _warn(f"eval.jsonl read error: {e}")
         return {}
     return last
+
+
+def _has_worker_lifecycle_projection(projection: dict[str, Any]) -> bool:
+    return any(
+        key in projection
+        for key in (
+            *WORKER_LIFECYCLE_STRING_FIELDS,
+            *WORKER_LIFECYCLE_BOOL_FIELDS,
+            *WORKER_LIFECYCLE_INT_FIELDS,
+        )
+    )
+
+
+def _derive_lifecycle_failure_stage(
+    *,
+    task_kind_misroute: bool,
+    projection: dict[str, Any],
+    generic_terminal_state: str,
+    postcheck_success: bool | None,
+) -> str:
+    explicit = projection.get("lifecycle_failure_stage")
+    if isinstance(explicit, str) and explicit in KNOWN_LIFECYCLE_FAILURE_STAGES:
+        return explicit
+    if task_kind_misroute:
+        return "classification"
+    if projection.get("deliverable_created") is False:
+        return "deliverable"
+    if projection.get("evidence_created") is False:
+        return "evidence_authoring"
+    if projection.get("runner_bound") is False:
+        return "runner_binding"
+    if projection.get("diagnostic_classified") is False:
+        return "diagnostic_classification"
+    if generic_terminal_state == "missing_deliverable":
+        return "deliverable"
+    if generic_terminal_state == "missing_evidence":
+        return "evidence_authoring"
+    if generic_terminal_state in {"evidence_runner_missing", "evidence_binding_failed"}:
+        return "runner_binding"
+    if generic_terminal_state in {
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }:
+        return "repair"
+    if projection.get("rerun_passed") is False:
+        return "rerun"
+    if generic_terminal_state == "evidence_failed":
+        return "rerun"
+    if generic_terminal_state == "completed" and postcheck_success is True:
+        return "completed"
+    return "unknown"
 
 
 def _read_classified_task_kind(run_dir: Path) -> str | None:
@@ -1378,6 +1473,27 @@ def main(argv: list[str]) -> int:
     page_tsx_touched = "src/app/page.tsx" in files_modified
     tool_calls = session_metrics["tool_calls"]
     tool_call_total = sum(tool_calls.values())
+    worker_lifecycle_available = _has_worker_lifecycle_projection(
+        eval_objective_projection
+    )
+    worker_lifecycle_fields = {
+        key: eval_objective_projection[key]
+        for key in (
+            *WORKER_LIFECYCLE_STRING_FIELDS,
+            *WORKER_LIFECYCLE_BOOL_FIELDS,
+            *WORKER_LIFECYCLE_INT_FIELDS,
+        )
+        if key in eval_objective_projection
+    }
+    if worker_lifecycle_available or task_kind_misroute:
+        worker_lifecycle_fields["lifecycle_failure_stage"] = (
+            _derive_lifecycle_failure_stage(
+                task_kind_misroute=task_kind_misroute,
+                projection=eval_objective_projection,
+                generic_terminal_state=generic_terminal_state,
+                postcheck_success=postcheck_success,
+            )
+        )
 
     out: dict[str, Any] = {
         "anvil_score": anvil_score,
@@ -1432,6 +1548,7 @@ def main(argv: list[str]) -> int:
         "tool_call_total": tool_call_total,
         "tool_calls": tool_calls,
         "we_total": session_metrics["we_total"],
+        **worker_lifecycle_fields,
         "xml_parser_errors": None,
     }
 

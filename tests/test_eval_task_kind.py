@@ -41,6 +41,7 @@ def _make_run(
     classified_task_kind: object = _MATCH_TASK_KIND,
     recovery_strategy_count: int | None = None,
     recovery_strategies: list[str] | None = None,
+    worker_lifecycle: dict[str, object] | None = None,
 ) -> None:
     session: dict[str, object] = {
         "id": f"{task_kind}-{pam_variant}",
@@ -103,6 +104,8 @@ def _make_run(
         eval_record["recovery_strategy_count"] = recovery_strategy_count
     if recovery_strategies is not None:
         eval_record["recovery_strategies"] = recovery_strategies
+    if worker_lifecycle is not None:
+        eval_record["worker_lifecycle"] = worker_lifecycle
     if eval_record:
         logs_dir = run_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -475,6 +478,262 @@ class TestTaskKindEvalReporting(unittest.TestCase):
         )
         self.assertEqual(completed["terminal_success"]["ok"], 6)
         self.assertEqual(data["by_recovery_job_kind"][0]["recovery_job_kind"], "none")
+
+    def test_analyze_emits_worker_lifecycle_metrics_from_eval_log(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="tests/test_sales_cli.py",
+                final_outcome="missing_evidence",
+                worker_lifecycle={
+                    "worker_kind": "test_author",
+                    "context_pack_kind": "evidence",
+                    "context_token_estimate": 384,
+                    "context_entry_count": 5,
+                    "deliverable_created": True,
+                    "evidence_created": False,
+                    "runner_bound": False,
+                    "diagnostic_class": "missing_test",
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+            )
+            data = self._analyze(run_dir)
+
+        self.assertEqual(data["worker_kind"], "test_author")
+        self.assertEqual(data["context_pack_kind"], "evidence")
+        self.assertEqual(data["context_token_estimate"], 384)
+        self.assertEqual(data["context_entry_count"], 5)
+        self.assertTrue(data["deliverable_created"])
+        self.assertFalse(data["evidence_created"])
+        self.assertFalse(data["runner_bound"])
+        self.assertEqual(data["diagnostic_class"], "missing_test")
+        self.assertTrue(data["diagnostic_classified"])
+        self.assertFalse(data["repair_applied"])
+        self.assertFalse(data["rerun_passed"])
+        self.assertEqual(data["lifecycle_failure_stage"], "evidence_authoring")
+
+    def test_report_worker_lifecycle_summary_and_json_groupings(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            bench_root = pathlib.Path(raw) / "bench-root"
+            _make_run(
+                bench_root / "qwen3" / "coding" / "pam_off" / "run-1",
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="tests/test_sales_cli.py",
+                final_outcome="missing_evidence",
+                worker_lifecycle={
+                    "worker_kind": "test_author",
+                    "context_pack_kind": "evidence",
+                    "deliverable_created": True,
+                    "evidence_created": False,
+                    "runner_bound": False,
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+            )
+            _make_run(
+                bench_root / "qwen3" / "docs" / "pam_on" / "run-1",
+                task_kind="docs",
+                pam_variant="pam_on",
+                modified_path="README.md",
+                final_outcome="done",
+                worker_lifecycle={
+                    "worker_kind": "docs",
+                    "context_pack_kind": "contract",
+                    "deliverable_created": True,
+                    "evidence_created": True,
+                    "runner_bound": True,
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": True,
+                },
+            )
+
+            markdown = subprocess.run(
+                [sys.executable, str(REPORT), str(bench_root)],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                check=True,
+            ).stdout
+            self.assertIn("## Worker Lifecycle Summary", markdown)
+            self.assertIn(
+                "| test_author | evidence | evidence_authoring | MissingEvidenceJob | 1 | 100% (1/1) | 100% (1/1) | 100% (1/1) | 1 | 0 | 0 | 0 |",
+                markdown,
+            )
+            self.assertIn(
+                "| docs | contract | completed | none | 1 | 100% (1/1) | 100% (1/1) | 100% (1/1) | 1 | 0 | 0 | 0 |",
+                markdown,
+            )
+
+            json_result = subprocess.run(
+                [sys.executable, str(REPORT), "--format", "json", str(bench_root)],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                check=True,
+            )
+            data = json.loads(json_result.stdout)
+
+        def by_keys(items: list[dict[str, object]], **criteria: str) -> dict[str, object]:
+            for item in items:
+                if all(item.get(key) == value for key, value in criteria.items()):
+                    return item
+            raise AssertionError(f"missing {criteria}: {items}")
+
+        by_keys(data["by_worker_kind"], worker_kind="test_author")
+        by_keys(data["by_context_pack_kind"], context_pack_kind="evidence")
+        by_keys(
+            data["by_lifecycle_failure_stage"],
+            lifecycle_failure_stage="evidence_authoring",
+        )
+        by_keys(
+            data["by_worker_lifecycle"],
+            worker_kind="docs",
+            context_pack_kind="contract",
+            lifecycle_failure_stage="completed",
+            recovery_job_kind="none",
+        )
+
+    def test_v062_successor_regression_matrix_has_worker_lifecycle_expectations(self) -> None:
+        cases = [
+            (
+                "python_sales_cli_missing_tests",
+                "tests/test_sales_cli.py",
+                "missing_evidence",
+                {
+                    "worker_kind": "test_author",
+                    "context_pack_kind": "evidence",
+                    "deliverable_created": True,
+                    "evidence_created": False,
+                    "runner_bound": False,
+                    "diagnostic_class": "missing_test",
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+                "evidence_authoring",
+            ),
+            (
+                "node_json_formatter_missing_tests",
+                "tests/main.test.js",
+                "missing_evidence",
+                {
+                    "worker_kind": "test_author",
+                    "context_pack_kind": "evidence",
+                    "deliverable_created": True,
+                    "evidence_created": False,
+                    "runner_bound": False,
+                    "diagnostic_class": "missing_test",
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+                "evidence_authoring",
+            ),
+            (
+                "node_csv_to_json_package_only_partial_state",
+                "package.json",
+                "missing_deliverable",
+                {
+                    "worker_kind": "implement",
+                    "context_pack_kind": "target",
+                    "deliverable_created": False,
+                    "evidence_created": False,
+                    "runner_bound": False,
+                    "diagnostic_class": "partial_scaffold",
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+                "deliverable",
+            ),
+            (
+                "rust_slug_compile_failure",
+                "src/lib.rs",
+                "evidence_failed",
+                {
+                    "worker_kind": "diagnostic_repair",
+                    "context_pack_kind": "diagnostic",
+                    "deliverable_created": True,
+                    "evidence_created": True,
+                    "runner_bound": True,
+                    "diagnostic_class": "compile_error",
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+                "rerun",
+            ),
+            (
+                "rust_ndjson_trivial_compile_repair",
+                "tests/ndjson.rs",
+                "done",
+                {
+                    "worker_kind": "diagnostic_repair",
+                    "context_pack_kind": "repair",
+                    "deliverable_created": True,
+                    "evidence_created": True,
+                    "runner_bound": True,
+                    "diagnostic_class": "compile_error",
+                    "diagnostic_classified": True,
+                    "repair_applied": True,
+                    "rerun_passed": True,
+                },
+                "completed",
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            analyzed: list[dict[str, object]] = []
+            for idx, (
+                case_name,
+                modified_path,
+                final_outcome,
+                worker_lifecycle,
+                expected_stage,
+            ) in enumerate(cases, start=1):
+                run_dir = root / f"run-{idx}"
+                _make_run(
+                    run_dir,
+                    task_kind="coding",
+                    pam_variant="pam_off",
+                    modified_path=modified_path,
+                    final_outcome=final_outcome,
+                    worker_lifecycle=worker_lifecycle,
+                )
+                data = self._analyze(run_dir)
+                analyzed.append(data)
+                self.assertEqual(data["case"], "coding-case")
+                self.assertEqual(
+                    data["lifecycle_failure_stage"],
+                    expected_stage,
+                    case_name,
+                )
+
+        legacy_states = [row["legacy_terminal_state"] for row in analyzed]
+        self.assertNotIn("missing_verification", legacy_states)
+        self.assertEqual(
+            sum(row["generic_terminal_state"] == "missing_evidence" for row in analyzed),
+            2,
+        )
+        for row in analyzed:
+            if row.get("runner_bound") is True and row.get("diagnostic_class") == "compile_error":
+                self.assertNotEqual(
+                    row["legacy_terminal_state"],
+                    "safe_stop_verifier_missing",
+                )
+                self.assertNotEqual(
+                    row["generic_terminal_state"],
+                    "evidence_runner_missing",
+                )
 
     # ---- Issue #925 (P8): R5 misroute fail-closed gate ---------------------
 
