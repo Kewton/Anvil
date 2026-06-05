@@ -601,6 +601,68 @@ class TestTaskKindEvalReporting(unittest.TestCase):
             recovery_job_kind="none",
         )
 
+    def test_non_coding_worker_lifecycle_fixtures_cover_general_purpose_kinds(
+        self,
+    ) -> None:
+        fixtures = [
+            ("docs", "README.md", "docs", "contract"),
+            ("data", "output/users.csv", "data", "evidence"),
+            ("research", "research/report.md", "research", "evidence"),
+            ("ops", "scripts/cleanup.sh", "ops", "evidence"),
+            ("authoring", "drafts/lesson.md", "authoring", "contract"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            bench_root = pathlib.Path(raw) / "bench-root"
+            for task_kind, modified_path, worker_kind, context_pack_kind in fixtures:
+                run_dir = bench_root / "qwen3" / task_kind / "pam_off" / "run-1"
+                _make_run(
+                    run_dir,
+                    task_kind=task_kind,
+                    pam_variant="pam_off",
+                    modified_path=modified_path,
+                    final_outcome="done",
+                    worker_lifecycle={
+                        "worker_kind": worker_kind,
+                        "context_pack_kind": context_pack_kind,
+                        "context_token_estimate": 256,
+                        "context_entry_count": 4,
+                        "deliverable_created": True,
+                        "evidence_created": True,
+                        "runner_bound": True,
+                        "diagnostic_class": "none",
+                        "diagnostic_classified": True,
+                        "repair_applied": False,
+                        "rerun_passed": True,
+                    },
+                )
+                analyzed = self._analyze(run_dir)
+                self.assertEqual(analyzed["task_kind"], task_kind)
+                self.assertEqual(analyzed["worker_kind"], worker_kind)
+                self.assertEqual(analyzed["context_pack_kind"], context_pack_kind)
+                self.assertEqual(analyzed["lifecycle_failure_stage"], "completed")
+
+            json_result = subprocess.run(
+                [sys.executable, str(REPORT), "--format", "json", str(bench_root)],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                check=True,
+            )
+            data = json.loads(json_result.stdout)
+
+        lifecycle_rows = data["by_worker_lifecycle"]
+        for task_kind, _modified_path, worker_kind, context_pack_kind in fixtures:
+            self.assertTrue(
+                any(
+                    row.get("worker_kind") == worker_kind
+                    and row.get("context_pack_kind") == context_pack_kind
+                    and row.get("lifecycle_failure_stage") == "completed"
+                    and row.get("recovery_job_kind") == "none"
+                    for row in lifecycle_rows
+                ),
+                task_kind,
+            )
+
     def test_v062_successor_regression_matrix_has_worker_lifecycle_expectations(self) -> None:
         cases = [
             (
