@@ -264,11 +264,14 @@ pub(super) fn verifier_framework_signal_for_context(context: &RepairJob) -> Stri
 }
 
 pub(super) fn verifier_setup_policy_message(active_request: &str) -> String {
-    let hint = missing_verifier_setup_hint_for_request(active_request)
+    let setup_hint = missing_verifier_setup_hint_for_request(active_request)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    let author_hint = missing_evidence_test_author_hint_for_request(active_request)
         .map(|hint| format!(" {hint}"))
         .unwrap_or_default();
     format!(
-        "[Verifier Setup Policy] A runnable verifier is required but missing. Emit exactly one Write or Edit for project-local verifier metadata now.{hint} Do not call Bash, do not switch tasks, and do not answer in prose."
+        "[Verifier Setup Policy] A runnable verifier is required but missing. MissingEvidenceJob selected TestAuthorWorker for coding evidence authoring. Emit exactly one Write or Edit for project-local verifier metadata or the owned test artifact now.{author_hint}{setup_hint} Do not call Bash, do not switch tasks, and do not answer in prose."
     )
 }
 
@@ -1394,11 +1397,14 @@ pub(super) fn task_contract_no_verifier_note(
     attempt_limit: usize,
     active_request: &str,
 ) -> String {
-    let hint = missing_verifier_setup_hint_for_request(active_request)
+    let setup_hint = missing_verifier_setup_hint_for_request(active_request)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    let author_hint = missing_evidence_test_author_hint_for_request(active_request)
         .map(|hint| format!(" {hint}"))
         .unwrap_or_default();
     format!(
-        "[Task Contract Verification] Required artifacts are present, but no runnable verifier was detected for this workspace. Emit exactly one Write or Edit now for project-local verifier metadata, then Anvil will rerun verification.{hint} Do not call Bash, do not switch tasks, and do not answer in prose. task_contract_verify_attempt={attempt}/{attempt_limit}"
+        "[Task Contract Verification] Required artifacts are present, but no runnable verifier evidence was detected for this workspace. MissingEvidenceJob selected TestAuthorWorker for coding evidence authoring. Emit exactly one Write or Edit now for project-local verifier metadata or the owned test artifact, then Anvil will rerun verification.{author_hint}{setup_hint} Do not call Bash, do not switch tasks, and do not answer in prose. task_contract_verify_attempt={attempt}/{attempt_limit}"
     )
 }
 
@@ -2165,6 +2171,15 @@ pub(super) fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&
         return Some("For Node/npm workspaces, create or update package.json with a test script.");
     }
     None
+}
+
+fn missing_evidence_test_author_hint_for_request(request: &str) -> Option<String> {
+    let (target_path, stack_label) = synthesized_missing_test_target_path_for_request(request)?;
+    let evidence_command =
+        super::worker_contract::test_author_evidence_command_for_stack(stack_label, target_path);
+    Some(format!(
+        "TestAuthorWorker target `{target_path}`; required evidence command `{evidence_command}`."
+    ))
 }
 
 pub(super) fn apply_verifier_repair_pass_edit(

@@ -7,6 +7,8 @@
 
 #![allow(dead_code)] // Foundation seam; focused tests pin the shape before broad callers are wired.
 
+use std::path::{Path, PathBuf};
+
 use super::task_contract::{
     ObjectiveDeliverableKind, ObjectiveEvidenceKind, TaskContract, TaskKind,
 };
@@ -211,6 +213,104 @@ impl WorkerContract {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TestAuthorWorkerRequest {
+    pub(super) worker_contract: WorkerContract,
+    target_test_path: PathBuf,
+    allowed_write_scope: Vec<PathBuf>,
+    evidence_command: String,
+    output_contract: &'static str,
+}
+
+impl TestAuthorWorkerRequest {
+    pub(super) fn target_test_path(&self) -> &Path {
+        &self.target_test_path
+    }
+
+    pub(super) fn allowed_write_scope(&self) -> &[PathBuf] {
+        &self.allowed_write_scope
+    }
+
+    pub(super) fn evidence_command(&self) -> &str {
+        &self.evidence_command
+    }
+
+    pub(super) fn output_contract(&self) -> &'static str {
+        self.output_contract
+    }
+
+    pub(super) fn policy_message(&self) -> String {
+        let target = self.target_test_path.to_string_lossy();
+        format!(
+            "[TestAuthorWorker] MissingEvidenceJob owns this turn. Create or update `{target}` only, using exactly one Write or Edit tool call. The required evidence command is `{}`. Output runnable tests; do not answer in prose, do not call Bash, and do not change unrelated files.",
+            self.evidence_command
+        )
+    }
+}
+
+pub(super) fn test_author_worker_request_for_missing_evidence(
+    contract: &TaskContract,
+    target_and_stack: Option<(&str, &str)>,
+    implementation_context: Option<&str>,
+) -> Option<TestAuthorWorkerRequest> {
+    let objective = contract.objective_contract();
+    if objective.task_kind != TaskKind::Coding
+        || objective.deliverable_kind != ObjectiveDeliverableKind::SourceFiles
+        || objective.evidence_kind != ObjectiveEvidenceKind::TestRun
+    {
+        return None;
+    }
+    let (target_test_path, stack_label) = target_and_stack?;
+    let target_test_path = PathBuf::from(target_test_path);
+    let evidence_command =
+        test_author_evidence_command_for_stack(stack_label, &target_test_path.to_string_lossy());
+    let mut context_pack =
+        WorkerContract::from_task_contract(contract, WorkerKind::TestAuthor).context_pack;
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Target,
+        "target_test_path",
+        target_test_path.to_string_lossy(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Target,
+        "allowed_write_scope",
+        target_test_path.to_string_lossy(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Evidence,
+        "evidence_command",
+        evidence_command.as_str(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Target,
+        "implementation_context",
+        implementation_context.unwrap_or(
+            "implementation excerpt unavailable; infer public behavior from the active request and project files",
+        ),
+    ));
+    Some(TestAuthorWorkerRequest {
+        worker_contract: WorkerContract::from_task_contract(contract, WorkerKind::TestAuthor)
+            .with_context_pack(context_pack),
+        target_test_path: target_test_path.clone(),
+        allowed_write_scope: vec![target_test_path],
+        evidence_command,
+        output_contract: "exactly_one_write_or_edit_tool_call_creating_or_updating_the_owned_test_artifact",
+    })
+}
+
+pub(super) fn test_author_evidence_command_for_stack(
+    stack_label: &str,
+    target_test_path: &str,
+) -> String {
+    match stack_label {
+        "rust" => "cargo test".to_string(),
+        "python" => format!("pytest {target_test_path}"),
+        "javascript" => format!("node --test {target_test_path}"),
+        "typescript" => "npm test".to_string(),
+        _ => "npm test".to_string(),
+    }
+}
+
 fn truncate_utf8(value: String, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value, false);
@@ -347,5 +447,96 @@ mod tests {
             MAX_CONTEXT_PACK_ENTRIES / 2
         );
         assert!(pack.approximate_token_count() > 0);
+    }
+
+    #[test]
+    fn test_author_worker_request_uses_coding_objective_and_bounded_context() {
+        let contract = TaskContract::from_request(
+            "Create a Rust library crate and verify it with cargo test.",
+        );
+        let request = test_author_worker_request_for_missing_evidence(
+            &contract,
+            Some(("tests/lib.rs", "rust")),
+            Some("pub fn slugify(input: &str) -> String"),
+        )
+        .expect("coding request should create test author request");
+
+        assert_eq!(request.worker_contract.worker_kind, WorkerKind::TestAuthor);
+        assert_eq!(request.worker_contract.task_kind, TaskKind::Coding);
+        assert_eq!(
+            request.worker_contract.deliverable_kind,
+            ObjectiveDeliverableKind::SourceFiles
+        );
+        assert_eq!(
+            request.worker_contract.evidence_kind,
+            ObjectiveEvidenceKind::TestRun
+        );
+        assert_eq!(request.target_test_path(), Path::new("tests/lib.rs"));
+        assert_eq!(
+            request.allowed_write_scope(),
+            &[PathBuf::from("tests/lib.rs")]
+        );
+        assert_eq!(request.evidence_command(), "cargo test");
+        assert!(request.policy_message().contains("TestAuthorWorker"));
+        assert!(
+            request
+                .worker_contract
+                .context_pack
+                .entries_for_kind(ContextPackKind::Target)
+                .len()
+                >= 3
+        );
+    }
+
+    #[test]
+    fn test_author_worker_request_covers_rust_node_and_python_target_synthesis() {
+        let cases = [
+            (
+                "Create a Rust library and verify behavior with cargo test.",
+                "tests/lib.rs",
+                "cargo test",
+            ),
+            (
+                "Build a Node JSON formatter CLI and add npm test coverage.",
+                "tests/main.test.js",
+                "node --test tests/main.test.js",
+            ),
+            (
+                "Create a Python sales CLI and verify it with pytest.",
+                "tests/test_main.py",
+                "pytest tests/test_main.py",
+            ),
+        ];
+
+        for (active_request, expected_target, expected_command) in cases {
+            let contract = TaskContract::from_request(active_request);
+            let target_and_stack =
+                super::super::verifier_orchestration::synthesized_missing_test_target_path_for_request(
+                    active_request,
+                );
+            let request =
+                test_author_worker_request_for_missing_evidence(&contract, target_and_stack, None)
+                    .expect(active_request);
+
+            assert_eq!(request.target_test_path(), Path::new(expected_target));
+            assert_eq!(request.evidence_command(), expected_command);
+            assert_eq!(
+                request.output_contract(),
+                "exactly_one_write_or_edit_tool_call_creating_or_updating_the_owned_test_artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn test_author_worker_request_keeps_non_coding_tasks_out_of_coding_verifier_vocabulary() {
+        let docs =
+            TaskContract::from_request("Write README.md with install and rollback sections.");
+        let request = test_author_worker_request_for_missing_evidence(
+            &docs,
+            Some(("tests/main.test.js", "javascript")),
+            None,
+        );
+
+        assert!(request.is_none());
     }
 }

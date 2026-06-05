@@ -195,9 +195,10 @@ fn priority_one_arbiter_candidates(agent: &Agent) -> Option<Vec<JobCandidate>> {
                 super::repair_job::VerifierBootstrapNextAction::RequestSetupEdit
             ) && let Some(job) = agent.missing_verifier_job.as_ref()
             {
+                let worker_request = test_author_worker_request_for_missing_evidence(agent);
                 return Some(vec![JobCandidate {
                     kind: ActiveJobKind::VerifierRepair,
-                    desired_action: DesiredAction::MissingVerifierCreate,
+                    desired_action: DesiredAction::MissingVerifierCreate { worker_request },
                     policy: EffectiveToolPolicy::restricted(
                         EffectiveToolPolicyReason::VerifierRepair,
                         job.allowed_tool_names().to_vec(),
@@ -209,6 +210,24 @@ fn priority_one_arbiter_candidates(agent: &Agent) -> Option<Vec<JobCandidate>> {
         }
         LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => None,
     }
+}
+
+fn test_author_worker_request_for_missing_evidence(
+    agent: &Agent,
+) -> Option<super::worker_contract::TestAuthorWorkerRequest> {
+    let contract = super::task_classification::task_contract_authority(agent)?;
+    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
+    let implementation_context = agent
+        .task_contract_excerpts
+        .get(&super::task_contract::ArtifactRole::Implementation)
+        .map(String::as_str);
+    super::worker_contract::test_author_worker_request_for_missing_evidence(
+        contract.as_ref(),
+        super::verifier_orchestration::synthesized_missing_test_target_path_for_request(
+            &active_request,
+        ),
+        implementation_context,
+    )
 }
 
 fn push_focused_edit_candidate(
