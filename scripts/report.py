@@ -839,6 +839,39 @@ def _render_recovery_job_summary(rows: list[dict]) -> list[str]:
     )
 
 
+def _worker_lifecycle_rows(rows: list[dict]) -> list[dict]:
+    lifecycle_keys = {
+        "worker_kind",
+        "context_pack_kind",
+        "lifecycle_failure_stage",
+        "deliverable_created",
+        "evidence_created",
+        "runner_bound",
+        "diagnostic_classified",
+        "repair_applied",
+        "rerun_passed",
+    }
+    return [
+        row
+        for row in rows
+        if not row.get("_failed") and any(key in row for key in lifecycle_keys)
+    ]
+
+
+def _render_worker_lifecycle_summary(rows: list[dict]) -> list[str]:
+    lifecycle_rows = _worker_lifecycle_rows(rows)
+    return _render_quality_group_summary(
+        "Worker Lifecycle Summary",
+        [
+            "worker_kind",
+            "context_pack_kind",
+            "lifecycle_failure_stage",
+            "recovery_job_kind",
+        ],
+        rows=lifecycle_rows,
+    )
+
+
 def _render_report(bench_root: Path, rows: list[dict]) -> str:
     parts: list[str] = []
     parts.append(f"# Benchmark Report: {bench_root.name}")
@@ -879,12 +912,16 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
         parts.append("")
         parts.extend(_render_recovery_job_summary(rows))
         parts.append("")
+        if _worker_lifecycle_rows(rows):
+            parts.extend(_render_worker_lifecycle_summary(rows))
+            parts.append("")
     return "\n".join(parts)
 
 
 def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
     analyzed = [r for r in rows if not r.get("_failed")]
     failed = [r for r in rows if r.get("_failed")]
+    lifecycle_rows = _worker_lifecycle_rows(analyzed)
     out = {
         "schema_version": 1,
         "bench_root": str(bench_root),
@@ -904,6 +941,20 @@ def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
             analyzed, ["generic_terminal_state"]
         ),
         "by_recovery_job_kind": _grouped_quality(analyzed, ["recovery_job_kind"]),
+        "by_worker_kind": _grouped_quality(lifecycle_rows, ["worker_kind"]),
+        "by_context_pack_kind": _grouped_quality(lifecycle_rows, ["context_pack_kind"]),
+        "by_lifecycle_failure_stage": _grouped_quality(
+            lifecycle_rows, ["lifecycle_failure_stage"]
+        ),
+        "by_worker_lifecycle": _grouped_quality(
+            lifecycle_rows,
+            [
+                "worker_kind",
+                "context_pack_kind",
+                "lifecycle_failure_stage",
+                "recovery_job_kind",
+            ],
+        ),
         "by_objective_matrix": _grouped_quality(
             analyzed,
             [
