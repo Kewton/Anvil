@@ -127,6 +127,9 @@ pub(super) struct PostReplyRecoveryArgs<'a, 'b> {
     pub(super) interrupt_flag: &'a InterruptFlag,
     pub(super) repo_change_retries: &'b mut usize,
     pub(super) python_test_retries: &'b mut usize,
+    // Issue #977 (parent #974, Issue C): per-actor-loop counter for the Node
+    // test-runner manifest recovery (mirrors `python_test_retries`).
+    pub(super) node_runner_retries: &'b mut usize,
     pub(super) no_tool_retries: &'b mut usize,
     pub(super) framework_app_fallback_materialized: &'b mut bool,
 }
@@ -664,6 +667,83 @@ pub(super) fn maybe_handle_python_test_artifact_recovery(
     );
     super::message_push::push_system_note(agent,
         "[Python Test Policy] The user explicitly requested tests. Add a concrete Python test artifact now, such as test_*.py, *_test.py, or a clearly runnable self-test command. Keep the edit small and verify it if possible."
+            .to_string(),
+    );
+    Some(PostReplyRecoveryOutcome::Continue)
+}
+
+/// Issue #977 (parent #974, Issue C): MissingEvidence recovery for a Node
+/// task whose test artifacts already exist but cannot be run because no test
+/// runner can be bound (`package.json` missing, or present without a usable
+/// `scripts.test`). After a couple of nudges the manifest is completed
+/// deterministically (not LLM free regeneration) and the loop continues so
+/// the EvidenceRunner reruns against the now-bound `npm test` command.
+///
+/// Disjoint from `maybe_handle_python_test_artifact_recovery`, which fires
+/// only when a test artifact is *missing*; this fires only when one *exists*
+/// but the runner is unbindable.
+pub(super) fn maybe_handle_node_test_runner_recovery(
+    agent: &mut Agent,
+    args: &mut PostReplyRecoveryArgs<'_, '_>,
+) -> Option<PostReplyRecoveryOutcome> {
+    if args.repo_edit_calls_made_this_turn == 0
+        || !super::node_request_helpers::active_node_request_requires_tests(agent)
+        || !super::node_request_helpers::node_test_artifact_exists(agent)
+        || super::node_request_helpers::node_test_runner_bindable(agent)
+    {
+        return None;
+    }
+    *args.node_runner_retries += 1;
+    agent
+        .controller_policy_ledger
+        .record(ControllerRecoveryStrategy::TargetedArtifactRetry);
+    if *args.node_runner_retries >= 2 {
+        return Some(
+            match super::scaffold_pipeline::maybe_materialize_node_test_runner_manifest(agent) {
+                Ok(Some(path)) => {
+                    agent
+                        .controller_policy_ledger
+                        .record(ControllerRecoveryStrategy::DeterministicFallback);
+                    super::message_push::push_system_note(
+                        agent,
+                        format!(
+                            "[Node Evidence Policy] Completed the missing Node test runner manifest deterministically: {path}. The bound `npm test` command will run the existing tests on the next verification pass."
+                        ),
+                    );
+                    // Issue #977: completion always proceeds to an EvidenceRunner
+                    // rerun. `Continue` re-enters the actor loop, where the verifier
+                    // orchestration now binds `npm test` via the completed manifest.
+                    // The `node_test_runner_bindable` predicate short-circuits a
+                    // second materialization, so this cannot loop.
+                    PostReplyRecoveryOutcome::Continue
+                }
+                Ok(None) => PostReplyRecoveryOutcome::Finalize {
+                    final_prose: String::new(),
+                    exit_reason: ExitReason::MissingRepoEdits,
+                    error_text:
+                        "Node test runner manifest could not be completed deterministically"
+                            .to_string(),
+                },
+                Err(err) => PostReplyRecoveryOutcome::Finalize {
+                    final_prose: String::new(),
+                    exit_reason: ExitReason::TransportError,
+                    error_text: err,
+                },
+            },
+        );
+    }
+    super::turn_helpers::write_stdout_rendered(
+        &format_iteration_status(
+            args.last_iter,
+            agent.config.max_iterations,
+            "Evidence gate",
+            "Asked the model to add a Node test runner manifest (package.json test script) so the existing tests can run.",
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    super::message_push::push_system_note(agent,
+        "[Node Evidence Policy] Test files exist but no runnable test command is bound. Create or update package.json with a `scripts.test` entry (for example `node --test`) so `npm test` can run the existing tests."
             .to_string(),
     );
     Some(PostReplyRecoveryOutcome::Continue)
@@ -2903,6 +2983,9 @@ pub(super) fn handle_post_reply_recovery(
     if let Some(outcome) = maybe_handle_python_test_artifact_recovery(agent, &mut args) {
         return Some(outcome);
     }
+    if let Some(outcome) = maybe_handle_node_test_runner_recovery(agent, &mut args) {
+        return Some(outcome);
+    }
     if let Some(outcome) = maybe_handle_answer_only_inadequate_recovery(agent, &mut args) {
         return Some(outcome);
     }
@@ -3078,6 +3161,7 @@ pub(super) fn run_actor_loop(
     let mut task_contract_verifier_passed_in_loop = false;
     let mut task_contract_verify_commands_collected = Vec::<String>::new();
     let mut python_test_retries = 0usize;
+    let mut node_runner_retries = 0usize;
     let mut plan_progress_retries = 0usize;
     let mut plan_exploration_only_turns = 0usize;
     let mut plan_exploration_counts = HashMap::<PlanExplorationKey, usize>::new();
@@ -3879,6 +3963,7 @@ pub(super) fn run_actor_loop(
                 interrupt_flag: &interrupt_flag,
                 repo_change_retries: &mut repo_change_retries,
                 python_test_retries: &mut python_test_retries,
+                node_runner_retries: &mut node_runner_retries,
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             },
