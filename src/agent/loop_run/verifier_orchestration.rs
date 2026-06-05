@@ -3011,6 +3011,14 @@ pub(super) fn maybe_emit_repair_exhausted_from_promotion(
     promotion: Option<super::repair_job::PromotionResult>,
 ) {
     if promotion.map(|p| p.all_clusters_exhausted).unwrap_or(false) {
+        // Issue #994 (parent #988, Issue F): before the loop gives up on a
+        // no-progress repair and the safe-stop projects `repair_exhausted`,
+        // arbitrate the contract conflict. This records a typed
+        // `ContractArbitrationDecision` so the `agent.contract_arbitration.report`
+        // is emitted (with `repair_exhausted` linkage) by the safe-stop's
+        // job-report chokepoint. Deterministic — no LLM call on this terminal
+        // path. The legacy `repair_exhausted` terminal label is unchanged.
+        super::contract_conflict_job::maybe_record_contract_arbitration_on_repair_exhausted(agent);
         emit_safe_stop_report_for_repair_exhausted(agent);
     }
 }

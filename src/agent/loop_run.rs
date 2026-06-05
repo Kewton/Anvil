@@ -449,6 +449,10 @@ pub(crate) mod completion_evidence;
 mod evidence_binding;
 mod evidence_runner;
 mod worker_contract;
+// Issue #994 (parent #988, Issue F): ContractConflictJob — typed arbitration of
+// ambiguous impl/test/setup/docs/data/research contracts at the no-progress /
+// repair_exhausted chokepoint. pub(super) only, no facade re-export (DR3-001).
+mod contract_conflict_job;
 // Issue #950: delegated local-LLM persistence policy. Records static
 // controller recovery strategy labels and gates prose-only recovery exits
 // without widening provider abstractions.
@@ -785,6 +789,12 @@ mod job_report;
 // this module.
 #[cfg(test)]
 mod job_report_e2e_tests;
+// Issue #994 (parent #988, Issue F): in-crate `#[cfg(test)]` E2E suite for the
+// ContractConflictJob production hook + typed `agent.contract_arbitration.report`
+// emission (CB-001 fix pattern, `job_report_e2e_tests.rs` precedent). Production
+// binary does not include this module (DR3-001).
+#[cfg(test)]
+mod contract_conflict_job_e2e_tests;
 // Issue #664: in-crate `#[cfg(test)]` E2E suite for Bash/Setup policy
 // wiring (CB-001 fix pattern, `safe_stop_e2e_tests.rs` /
 // `job_report_e2e_tests.rs` / `behavior_contract_projection_e2e_tests.rs`
@@ -2499,6 +2509,13 @@ pub struct Agent {
     /// Issue #867: per-turn reason PAM advisory was not used. Eval logging
     /// consumes this only when `last_pam_decision_this_turn` is `None`.
     pub(in crate::agent::loop_run) last_pam_unused_reason_this_turn: Option<String>,
+    /// Issue #994 (parent #988, Issue F): per-turn carrier for the
+    /// `ContractConflictJob` arbitrated at the `repair_exhausted` chokepoint.
+    /// `is_some()` drives the `agent.contract_arbitration.report` emit in
+    /// `maybe_emit_job_reports_with_linkage`. Reset to `None` at the head of
+    /// every `handle_user_message` (per-turn rule). NOT serialized.
+    pub(in crate::agent::loop_run) last_contract_conflict_job_this_turn:
+        Option<contract_conflict_job::ContractConflictJob>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2776,6 +2793,7 @@ impl Agent {
             // Issue #667: PAM advisory per-turn carrier.
             last_pam_decision_this_turn: None,
             last_pam_unused_reason_this_turn: None,
+            last_contract_conflict_job_this_turn: None,
         }
     }
 

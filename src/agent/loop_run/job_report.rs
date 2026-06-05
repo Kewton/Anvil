@@ -179,6 +179,52 @@ impl JobReport for MemoryReport {
     }
 }
 
+/// ContractArbitrationReport — per-turn snapshot of a contract-conflict
+/// arbitration decision (Issue #994). Emitted when the repair lifecycle
+/// exhausts every cluster and the failure is classified as an inter-artifact
+/// contract conflict. The typed `decision` projection records
+/// `authoritative_role` / `weaker_role` / `allowed_change_kind` / `target` /
+/// `confidence` / `reason`. Embeds `SafeStopLinkage` because the decision is
+/// produced at the `repair_exhausted` terminal point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ContractArbitrationReport {
+    pub turn_index: u64,
+    /// `true` when the failure was classified as a contract conflict and a
+    /// decision was recorded this turn.
+    pub classified: bool,
+    /// `true` when the decision directs a concrete (non-abstain) repair within
+    /// the bounded arbitration budget. `false` for an `insufficient_evidence`
+    /// abstain or an exhausted job — the loop is not re-directed to edit.
+    #[serde(default)]
+    pub actionable: bool,
+    /// The bounded arbitration round (1-based), when a job exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbitration_round: Option<u32>,
+    /// Typed arbitration decision projection
+    /// (`ContractArbitrationDecision::to_json_value`). Absent when no decision
+    /// was recorded (only the SafeStop linkage forced the report observable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<serde_json::Value>,
+    /// Distinct artifact roles implicated by the conflict (label strings).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub involved_roles: Vec<String>,
+    #[serde(default)]
+    pub safe_stop: SafeStopLinkage,
+    /// Issue #925 (P8): the turn's classified `task_kind`. See
+    /// `ArtifactCompletionReport::task_kind`. Additive, `None` when no
+    /// per-turn classification authority exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_kind: Option<String>,
+}
+
+impl JobReport for ContractArbitrationReport {
+    const EVENT_NAME: &'static str = "agent.contract_arbitration.report";
+    const PAYLOAD_SCHEMA_VERSION: u32 = 1;
+    fn dedup_key(&self) -> String {
+        format!("turn:{}", self.turn_index)
+    }
+}
+
 fn default_projection_status() -> String {
     "not_available".to_string()
 }
@@ -474,10 +520,43 @@ impl super::Agent {
                 context_pack_binding: None,
                 adopted_item_count: self.last_injected_summary_ids.len() as u32,
                 injection_skipped_reason: None,
-                task_kind,
+                task_kind: task_kind.clone(),
             };
             if let Some(env) = self.record_job_report(mr) {
                 self.persist_job_report_to_session(MemoryReport::EVENT_NAME, &env);
+            }
+        }
+
+        // ContractArbitrationReport (Issue #994) — emitted ONLY when a contract
+        // conflict was actually arbitrated this turn. The decision is recorded
+        // by the production hook BEFORE the safe-stop emit, so by the time this
+        // chokepoint runs `last_contract_conflict_job_this_turn` is already
+        // `Some` on the terminal `repair_exhausted` turn. We deliberately do
+        // NOT OR-in `safe_stop.report_emitted` — that would emit a contentless
+        // arbitration report on every safe-stop turn (e.g. verifier_missing),
+        // which is noise. The decision projection is already masked at
+        // construction; the envelope still traverses
+        // `record_job_report → log_llm_event → mask_payload_inplace` as the
+        // final defence line (Security Invariants).
+        if let Some(job) = self.last_contract_conflict_job_this_turn.as_ref() {
+            let involved_roles = job
+                .assessment
+                .involved_roles
+                .iter()
+                .map(|r| r.label().to_string())
+                .collect::<Vec<_>>();
+            let car = ContractArbitrationReport {
+                turn_index,
+                classified: true,
+                actionable: job.is_actionable(),
+                arbitration_round: Some(job.arbitration_round()),
+                decision: Some(job.decision.to_json_value()),
+                involved_roles,
+                safe_stop: safe_stop.clone(),
+                task_kind: task_kind.clone(),
+            };
+            if let Some(env) = self.record_job_report(car) {
+                self.persist_job_report_to_session(ContractArbitrationReport::EVENT_NAME, &env);
             }
         }
     }
