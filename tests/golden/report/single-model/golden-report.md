@@ -63,3 +63,24 @@ Generated: 2026-06-02T03:27:35+00:00
 | recovery_job_kind | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
 |-----|-----|-----|-----|-----|-----|-----|-----|-----|
 | none | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |
+
+## Transition Metrics
+
+| metric | value |
+|-----|-----|
+| runs | 3 |
+| missing_evidence | 0 |
+| missing_deliverable | 0 |
+| evidence_failed | 0 |
+| recovery_exhausted | 0 |
+| wrong_target_repair | 0 |
+| same_diagnostic_repeated | 0 |
+| tool_protocol_failure | 0 |
+| runner_present_but_failed | 0 |
+| repair_should_target_test_or_setup | 0 |
+| evidence_runner_executed | 0/3 (0%) |
+| deterministic_operator_hit | 0/3 (0%) |
+
+| failure_class | count |
+|-----|-----|
+| none | 3 |

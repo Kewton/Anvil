@@ -70,3 +70,25 @@ Generated: 2026-06-02T03:27:36+00:00
 |-----|-----|-----|-----|-----|-----|-----|-----|-----|
 | none | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |
 | unknown | 1 | 0% (0/1) | 100% (1/1) | 0% (0/1) | 0 | 0 | 1 | 0 |
+
+## Transition Metrics
+
+| metric | value |
+|-----|-----|
+| runs | 4 |
+| missing_evidence | 0 |
+| missing_deliverable | 0 |
+| evidence_failed | 0 |
+| recovery_exhausted | 0 |
+| wrong_target_repair | 0 |
+| same_diagnostic_repeated | 0 |
+| tool_protocol_failure | 0 |
+| runner_present_but_failed | 0 |
+| repair_should_target_test_or_setup | 0 |
+| evidence_runner_executed | 0/4 (0%) |
+| deterministic_operator_hit | 0/4 (0%) |
+
+| failure_class | count |
+|-----|-----|
+| none | 3 |
+| unknown | 1 |
