@@ -517,6 +517,36 @@ class TestTaskKindEvalReporting(unittest.TestCase):
         self.assertFalse(data["rerun_passed"])
         self.assertEqual(data["lifecycle_failure_stage"], "evidence_authoring")
 
+    def test_bound_runner_failure_refines_missing_evidence_to_evidence_failed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/lib.rs",
+                final_outcome="missing_evidence",
+                worker_lifecycle={
+                    "worker_kind": "diagnostic_repair",
+                    "context_pack_kind": "diagnostic",
+                    "deliverable_created": True,
+                    "evidence_created": True,
+                    "runner_bound": True,
+                    "diagnostic_class": "compile_error",
+                    "diagnostic_classified": True,
+                    "repair_applied": False,
+                    "rerun_passed": False,
+                },
+            )
+            data = self._analyze(run_dir)
+
+        self.assertEqual(data["legacy_terminal_state"], "missing_evidence")
+        self.assertEqual(data["generic_terminal_state"], "evidence_failed")
+        self.assertEqual(data["recovery_job_kind"], "EvidenceFailedJob")
+        self.assertEqual(data["lifecycle_failure_stage"], "rerun")
+
     def test_report_worker_lifecycle_summary_and_json_groupings(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             bench_root = pathlib.Path(raw) / "bench-root"
