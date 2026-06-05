@@ -80,6 +80,210 @@ impl ContextPackKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CapabilityAllowedTool {
+    Read,
+    Write,
+    Edit,
+    Bash,
+}
+
+impl CapabilityAllowedTool {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            CapabilityAllowedTool::Read => "read",
+            CapabilityAllowedTool::Write => "write",
+            CapabilityAllowedTool::Edit => "edit",
+            CapabilityAllowedTool::Bash => "bash",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CapabilityContextPolicy {
+    ContractOnly,
+    TargetedArtifact,
+    EvidenceBounded,
+    DiagnosticBounded,
+    ProcedureBounded,
+}
+
+impl CapabilityContextPolicy {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            CapabilityContextPolicy::ContractOnly => "contract_only",
+            CapabilityContextPolicy::TargetedArtifact => "targeted_artifact",
+            CapabilityContextPolicy::EvidenceBounded => "evidence_bounded",
+            CapabilityContextPolicy::DiagnosticBounded => "diagnostic_bounded",
+            CapabilityContextPolicy::ProcedureBounded => "procedure_bounded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CapabilityRepairStrategy {
+    CompleteMissingDeliverable,
+    CreateMissingEvidence,
+    RepairFailedEvidence,
+    ResolveToolFailure,
+}
+
+impl CapabilityRepairStrategy {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            CapabilityRepairStrategy::CompleteMissingDeliverable => "complete_missing_deliverable",
+            CapabilityRepairStrategy::CreateMissingEvidence => "create_missing_evidence",
+            CapabilityRepairStrategy::RepairFailedEvidence => "repair_failed_evidence",
+            CapabilityRepairStrategy::ResolveToolFailure => "resolve_tool_failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CapabilityCompletionPredicate {
+    TestRunPassed,
+    RequiredSectionsPresent,
+    SchemaCheckPassed,
+    SourceEvidencePresent,
+    CommandObservationRecorded,
+    ContentAccepted,
+}
+
+impl CapabilityCompletionPredicate {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            CapabilityCompletionPredicate::TestRunPassed => "test_run_passed",
+            CapabilityCompletionPredicate::RequiredSectionsPresent => "required_sections_present",
+            CapabilityCompletionPredicate::SchemaCheckPassed => "schema_check_passed",
+            CapabilityCompletionPredicate::SourceEvidencePresent => "source_evidence_present",
+            CapabilityCompletionPredicate::CommandObservationRecorded => {
+                "command_observation_recorded"
+            }
+            CapabilityCompletionPredicate::ContentAccepted => "content_accepted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CapabilityLifecycleStageKind {
+    Deliverable,
+    Evidence,
+    Repair,
+    ToolFailure,
+}
+
+impl CapabilityLifecycleStageKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            CapabilityLifecycleStageKind::Deliverable => "deliverable",
+            CapabilityLifecycleStageKind::Evidence => "evidence",
+            CapabilityLifecycleStageKind::Repair => "repair",
+            CapabilityLifecycleStageKind::ToolFailure => "tool_failure",
+        }
+    }
+
+    pub(super) fn recovery_job_label(self) -> &'static str {
+        match self {
+            CapabilityLifecycleStageKind::Deliverable => "MissingDeliverableJob",
+            CapabilityLifecycleStageKind::Evidence => "MissingEvidenceJob",
+            CapabilityLifecycleStageKind::Repair => "EvidenceFailedJob",
+            CapabilityLifecycleStageKind::ToolFailure => "ToolFailureJob",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CapabilitySpec {
+    pub(super) task_kind: TaskKind,
+    pub(super) deliverable_kind: ObjectiveDeliverableKind,
+    pub(super) evidence_kind: ObjectiveEvidenceKind,
+    pub(super) required_artifacts: Vec<ArtifactRole>,
+    pub(super) allowed_tools: Vec<CapabilityAllowedTool>,
+    pub(super) context_policy: CapabilityContextPolicy,
+    pub(super) worker_sequence: Vec<WorkerKind>,
+    pub(super) repair_strategies: Vec<CapabilityRepairStrategy>,
+    pub(super) completion_predicate: CapabilityCompletionPredicate,
+    pub(super) eval_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityDefaults {
+    task_kind: TaskKind,
+    deliverable_kind: ObjectiveDeliverableKind,
+    evidence_kind: ObjectiveEvidenceKind,
+    required_artifacts: Vec<ArtifactRole>,
+    allowed_tools: Vec<CapabilityAllowedTool>,
+    context_policy: CapabilityContextPolicy,
+    worker_sequence: Vec<WorkerKind>,
+    repair_strategies: Vec<CapabilityRepairStrategy>,
+    completion_predicate: CapabilityCompletionPredicate,
+}
+
+impl CapabilityDefaults {
+    fn into_spec(self) -> CapabilitySpec {
+        let eval_labels = vec![
+            format!("task_kind={}", self.task_kind.as_str()),
+            format!("deliverable_kind={}", self.deliverable_kind.label()),
+            format!("evidence_kind={}", self.evidence_kind.label()),
+            format!("completion_predicate={}", self.completion_predicate.label()),
+        ];
+        CapabilitySpec {
+            task_kind: self.task_kind,
+            deliverable_kind: self.deliverable_kind,
+            evidence_kind: self.evidence_kind,
+            required_artifacts: self.required_artifacts,
+            allowed_tools: self.allowed_tools,
+            context_policy: self.context_policy,
+            worker_sequence: self.worker_sequence,
+            repair_strategies: self.repair_strategies,
+            completion_predicate: self.completion_predicate,
+            eval_labels,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CapabilityLifecycleStagePlan {
+    pub(super) stage_kind: CapabilityLifecycleStageKind,
+    pub(super) worker_contract: WorkerContract,
+    pub(super) context_policy: CapabilityContextPolicy,
+    pub(super) repair_strategy: CapabilityRepairStrategy,
+    pub(super) output_contract: &'static str,
+    pub(super) eval_label: String,
+    policy_message: String,
+}
+
+impl CapabilityLifecycleStagePlan {
+    pub(super) fn recovery_job_label(&self) -> &'static str {
+        self.stage_kind.recovery_job_label()
+    }
+
+    pub(super) fn policy_message(&self) -> &str {
+        &self.policy_message
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WorkerLifecyclePlan {
+    pub(super) capability: CapabilitySpec,
+    stages: Vec<CapabilityLifecycleStagePlan>,
+}
+
+impl WorkerLifecyclePlan {
+    pub(super) fn stages(&self) -> &[CapabilityLifecycleStagePlan] {
+        &self.stages
+    }
+
+    pub(super) fn stage(
+        &self,
+        stage_kind: CapabilityLifecycleStageKind,
+    ) -> Option<&CapabilityLifecycleStagePlan> {
+        self.stages
+            .iter()
+            .find(|stage| stage.stage_kind == stage_kind)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ContextPackEntry {
     pub(super) kind: ContextPackKind,
@@ -211,6 +415,367 @@ impl WorkerContract {
     pub(super) fn with_context_pack(mut self, context_pack: ContextPack) -> Self {
         self.context_pack = context_pack;
         self
+    }
+}
+
+pub(super) fn capability_spec_for_task_kind(task_kind: TaskKind) -> CapabilitySpec {
+    capability_defaults_for_task_kind(task_kind).into_spec()
+}
+
+pub(super) fn capability_spec_for_task_contract(contract: &TaskContract) -> CapabilitySpec {
+    let objective = contract.objective_contract();
+    let mut defaults = capability_defaults_for_task_kind(objective.task_kind);
+    defaults.deliverable_kind = objective.deliverable_kind;
+    defaults.evidence_kind = objective.evidence_kind;
+    if !contract.required_artifacts.is_empty() {
+        defaults.required_artifacts = contract.required_artifacts.clone();
+    }
+    defaults.into_spec()
+}
+
+pub(super) fn worker_lifecycle_plan_for_task_contract(
+    contract: &TaskContract,
+) -> WorkerLifecyclePlan {
+    let capability = capability_spec_for_task_contract(contract);
+    let stages = [
+        CapabilityLifecycleStageKind::Deliverable,
+        CapabilityLifecycleStageKind::Evidence,
+        CapabilityLifecycleStageKind::Repair,
+        CapabilityLifecycleStageKind::ToolFailure,
+    ]
+    .into_iter()
+    .map(|stage_kind| lifecycle_stage_plan_for_contract(contract, &capability, stage_kind))
+    .collect();
+    WorkerLifecyclePlan { capability, stages }
+}
+
+fn capability_defaults_for_task_kind(task_kind: TaskKind) -> CapabilityDefaults {
+    match task_kind {
+        TaskKind::Coding => CapabilityDefaults {
+            task_kind,
+            deliverable_kind: ObjectiveDeliverableKind::SourceFiles,
+            evidence_kind: ObjectiveEvidenceKind::TestRun,
+            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
+            allowed_tools: vec![
+                CapabilityAllowedTool::Read,
+                CapabilityAllowedTool::Write,
+                CapabilityAllowedTool::Edit,
+                CapabilityAllowedTool::Bash,
+            ],
+            context_policy: CapabilityContextPolicy::TargetedArtifact,
+            worker_sequence: vec![
+                WorkerKind::Implement,
+                WorkerKind::TestAuthor,
+                WorkerKind::Evidence,
+                WorkerKind::DiagnosticRepair,
+            ],
+            repair_strategies: generic_repair_strategies(),
+            completion_predicate: CapabilityCompletionPredicate::TestRunPassed,
+        },
+        TaskKind::Docs => CapabilityDefaults {
+            task_kind,
+            deliverable_kind: ObjectiveDeliverableKind::DocumentSections,
+            evidence_kind: ObjectiveEvidenceKind::ContentCheck,
+            required_artifacts: vec![ArtifactRole::UsageDocs],
+            allowed_tools: vec![
+                CapabilityAllowedTool::Read,
+                CapabilityAllowedTool::Write,
+                CapabilityAllowedTool::Edit,
+            ],
+            context_policy: CapabilityContextPolicy::TargetedArtifact,
+            worker_sequence: vec![
+                WorkerKind::Docs,
+                WorkerKind::Evidence,
+                WorkerKind::DiagnosticRepair,
+            ],
+            repair_strategies: generic_repair_strategies(),
+            completion_predicate: CapabilityCompletionPredicate::RequiredSectionsPresent,
+        },
+        TaskKind::Data => CapabilityDefaults {
+            task_kind,
+            deliverable_kind: ObjectiveDeliverableKind::OutputFile,
+            evidence_kind: ObjectiveEvidenceKind::SchemaCheck,
+            required_artifacts: vec![ArtifactRole::DataOutput],
+            allowed_tools: vec![
+                CapabilityAllowedTool::Read,
+                CapabilityAllowedTool::Write,
+                CapabilityAllowedTool::Edit,
+                CapabilityAllowedTool::Bash,
+            ],
+            context_policy: CapabilityContextPolicy::TargetedArtifact,
+            worker_sequence: vec![
+                WorkerKind::Data,
+                WorkerKind::Evidence,
+                WorkerKind::DiagnosticRepair,
+            ],
+            repair_strategies: generic_repair_strategies(),
+            completion_predicate: CapabilityCompletionPredicate::SchemaCheckPassed,
+        },
+        TaskKind::Research => CapabilityDefaults {
+            task_kind,
+            deliverable_kind: ObjectiveDeliverableKind::ResearchNotes,
+            evidence_kind: ObjectiveEvidenceKind::SourceFetchEvidence,
+            required_artifacts: vec![ArtifactRole::UsageDocs],
+            allowed_tools: vec![
+                CapabilityAllowedTool::Read,
+                CapabilityAllowedTool::Write,
+                CapabilityAllowedTool::Edit,
+                CapabilityAllowedTool::Bash,
+            ],
+            context_policy: CapabilityContextPolicy::EvidenceBounded,
+            worker_sequence: vec![
+                WorkerKind::Research,
+                WorkerKind::Evidence,
+                WorkerKind::DiagnosticRepair,
+            ],
+            repair_strategies: generic_repair_strategies(),
+            completion_predicate: CapabilityCompletionPredicate::SourceEvidencePresent,
+        },
+        TaskKind::Ops => CapabilityDefaults {
+            task_kind,
+            deliverable_kind: ObjectiveDeliverableKind::CommandObservation,
+            evidence_kind: ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+            required_artifacts: vec![ArtifactRole::UsageDocs],
+            allowed_tools: vec![
+                CapabilityAllowedTool::Read,
+                CapabilityAllowedTool::Write,
+                CapabilityAllowedTool::Edit,
+                CapabilityAllowedTool::Bash,
+            ],
+            context_policy: CapabilityContextPolicy::ProcedureBounded,
+            worker_sequence: vec![
+                WorkerKind::Ops,
+                WorkerKind::Evidence,
+                WorkerKind::DiagnosticRepair,
+            ],
+            repair_strategies: generic_repair_strategies(),
+            completion_predicate: CapabilityCompletionPredicate::CommandObservationRecorded,
+        },
+        TaskKind::Authoring => CapabilityDefaults {
+            task_kind,
+            deliverable_kind: ObjectiveDeliverableKind::ProseArtifact,
+            evidence_kind: ObjectiveEvidenceKind::ContentAcceptance,
+            required_artifacts: vec![ArtifactRole::UsageDocs],
+            allowed_tools: vec![
+                CapabilityAllowedTool::Read,
+                CapabilityAllowedTool::Write,
+                CapabilityAllowedTool::Edit,
+            ],
+            context_policy: CapabilityContextPolicy::TargetedArtifact,
+            worker_sequence: vec![
+                WorkerKind::Authoring,
+                WorkerKind::Evidence,
+                WorkerKind::DiagnosticRepair,
+            ],
+            repair_strategies: generic_repair_strategies(),
+            completion_predicate: CapabilityCompletionPredicate::ContentAccepted,
+        },
+    }
+}
+
+fn generic_repair_strategies() -> Vec<CapabilityRepairStrategy> {
+    vec![
+        CapabilityRepairStrategy::CompleteMissingDeliverable,
+        CapabilityRepairStrategy::CreateMissingEvidence,
+        CapabilityRepairStrategy::RepairFailedEvidence,
+        CapabilityRepairStrategy::ResolveToolFailure,
+    ]
+}
+
+fn lifecycle_stage_plan_for_contract(
+    contract: &TaskContract,
+    capability: &CapabilitySpec,
+    stage_kind: CapabilityLifecycleStageKind,
+) -> CapabilityLifecycleStagePlan {
+    let worker_kind = worker_kind_for_lifecycle_stage(capability, stage_kind);
+    let context_policy = context_policy_for_lifecycle_stage(capability, stage_kind);
+    let repair_strategy = repair_strategy_for_lifecycle_stage(stage_kind);
+    let worker_contract = worker_contract_for_capability_stage(
+        contract,
+        capability,
+        worker_kind,
+        stage_kind,
+        context_policy,
+        repair_strategy,
+    );
+    let output_contract = output_contract_for_lifecycle_stage(capability, stage_kind);
+    let eval_label = format!(
+        "stage={};recovery_job={};worker_kind={};task_kind={}",
+        stage_kind.label(),
+        stage_kind.recovery_job_label(),
+        worker_kind.label(),
+        capability.task_kind.as_str()
+    );
+    let policy_message = policy_message_for_lifecycle_stage(capability, stage_kind, worker_kind);
+    CapabilityLifecycleStagePlan {
+        stage_kind,
+        worker_contract,
+        context_policy,
+        repair_strategy,
+        output_contract,
+        eval_label,
+        policy_message,
+    }
+}
+
+fn worker_kind_for_lifecycle_stage(
+    capability: &CapabilitySpec,
+    stage_kind: CapabilityLifecycleStageKind,
+) -> WorkerKind {
+    match stage_kind {
+        CapabilityLifecycleStageKind::Deliverable => capability.worker_sequence[0],
+        CapabilityLifecycleStageKind::Evidence => WorkerKind::Evidence,
+        CapabilityLifecycleStageKind::Repair => WorkerKind::DiagnosticRepair,
+        CapabilityLifecycleStageKind::ToolFailure => match capability.task_kind {
+            TaskKind::Ops => WorkerKind::Ops,
+            _ => WorkerKind::DiagnosticRepair,
+        },
+    }
+}
+
+fn context_policy_for_lifecycle_stage(
+    capability: &CapabilitySpec,
+    stage_kind: CapabilityLifecycleStageKind,
+) -> CapabilityContextPolicy {
+    match stage_kind {
+        CapabilityLifecycleStageKind::Deliverable => capability.context_policy,
+        CapabilityLifecycleStageKind::Evidence => CapabilityContextPolicy::EvidenceBounded,
+        CapabilityLifecycleStageKind::Repair => CapabilityContextPolicy::DiagnosticBounded,
+        CapabilityLifecycleStageKind::ToolFailure => CapabilityContextPolicy::ProcedureBounded,
+    }
+}
+
+fn repair_strategy_for_lifecycle_stage(
+    stage_kind: CapabilityLifecycleStageKind,
+) -> CapabilityRepairStrategy {
+    match stage_kind {
+        CapabilityLifecycleStageKind::Deliverable => {
+            CapabilityRepairStrategy::CompleteMissingDeliverable
+        }
+        CapabilityLifecycleStageKind::Evidence => CapabilityRepairStrategy::CreateMissingEvidence,
+        CapabilityLifecycleStageKind::Repair => CapabilityRepairStrategy::RepairFailedEvidence,
+        CapabilityLifecycleStageKind::ToolFailure => CapabilityRepairStrategy::ResolveToolFailure,
+    }
+}
+
+fn worker_contract_for_capability_stage(
+    contract: &TaskContract,
+    capability: &CapabilitySpec,
+    worker_kind: WorkerKind,
+    stage_kind: CapabilityLifecycleStageKind,
+    context_policy: CapabilityContextPolicy,
+    repair_strategy: CapabilityRepairStrategy,
+) -> WorkerContract {
+    let mut worker_contract = WorkerContract::from_task_contract(contract, worker_kind);
+    let mut context_pack = worker_contract.context_pack;
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Contract,
+        "capability_stage",
+        stage_kind.label(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Contract,
+        "context_policy",
+        context_policy.label(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Contract,
+        "required_artifacts",
+        capability
+            .required_artifacts
+            .iter()
+            .map(|role| role.label())
+            .collect::<Vec<_>>()
+            .join(","),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Contract,
+        "allowed_tools",
+        capability
+            .allowed_tools
+            .iter()
+            .map(|tool| tool.label())
+            .collect::<Vec<_>>()
+            .join(","),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Repair,
+        "repair_strategy",
+        repair_strategy.label(),
+    ));
+    worker_contract.context_pack = context_pack;
+    worker_contract
+}
+
+fn output_contract_for_lifecycle_stage(
+    capability: &CapabilitySpec,
+    stage_kind: CapabilityLifecycleStageKind,
+) -> &'static str {
+    match stage_kind {
+        CapabilityLifecycleStageKind::Deliverable => match capability.task_kind {
+            TaskKind::Coding => "source_files_created_or_updated_with_no_unrelated_changes",
+            TaskKind::Docs => "required_document_sections_created_or_updated",
+            TaskKind::Data => "structured_output_file_created_or_updated",
+            TaskKind::Research => "research_report_or_notes_created_with_source_slots",
+            TaskKind::Ops => "command_observation_or_runbook_created_with_safety_notes",
+            TaskKind::Authoring => "prose_artifact_created_or_updated_for_requested_audience",
+        },
+        CapabilityLifecycleStageKind::Evidence => match capability.task_kind {
+            TaskKind::Coding => "test_run_evidence_bound_to_owned_artifacts",
+            TaskKind::Docs => "content_check_evidence_for_required_sections",
+            TaskKind::Data => "schema_or_record_count_evidence_for_output_file",
+            TaskKind::Research => "source_fetch_or_citation_evidence_for_research_artifact",
+            TaskKind::Ops => "command_observation_and_safety_boundary_evidence",
+            TaskKind::Authoring => "content_acceptance_evidence_for_prose_artifact",
+        },
+        CapabilityLifecycleStageKind::Repair => "single_bounded_repair_for_declared_stage_failure",
+        CapabilityLifecycleStageKind::ToolFailure => {
+            "tool_or_environment_failure_observed_and_recovered_before_completion"
+        }
+    }
+}
+
+fn policy_message_for_lifecycle_stage(
+    capability: &CapabilitySpec,
+    stage_kind: CapabilityLifecycleStageKind,
+    worker_kind: WorkerKind,
+) -> String {
+    format!(
+        "[{worker}] {recovery_job} owns this turn for task_kind={task_kind}. Produce {deliverable_kind}, gather {evidence_kind}, use context_policy={context_policy}, and satisfy completion_predicate={predicate}. Next action: {next_action}.",
+        worker = worker_kind.label(),
+        recovery_job = stage_kind.recovery_job_label(),
+        task_kind = capability.task_kind.as_str(),
+        deliverable_kind = capability.deliverable_kind.label(),
+        evidence_kind = capability.evidence_kind.label(),
+        context_policy = context_policy_for_lifecycle_stage(capability, stage_kind).label(),
+        predicate = capability.completion_predicate.label(),
+        next_action = next_action_for_lifecycle_stage(capability.task_kind, stage_kind),
+    )
+}
+
+fn next_action_for_lifecycle_stage(
+    task_kind: TaskKind,
+    stage_kind: CapabilityLifecycleStageKind,
+) -> &'static str {
+    match (task_kind, stage_kind) {
+        (TaskKind::Coding, CapabilityLifecycleStageKind::Evidence) => {
+            "run the local test command tied to owned test artifacts"
+        }
+        (TaskKind::Coding, CapabilityLifecycleStageKind::Repair) => {
+            "apply one bounded code or test repair, then rerun local tests"
+        }
+        (_, CapabilityLifecycleStageKind::Deliverable) => {
+            "create or update only the declared deliverable artifacts"
+        }
+        (_, CapabilityLifecycleStageKind::Evidence) => {
+            "record deterministic local evidence for the declared artifact"
+        }
+        (_, CapabilityLifecycleStageKind::Repair) => {
+            "apply one bounded artifact repair, then rerun the evidence check"
+        }
+        (_, CapabilityLifecycleStageKind::ToolFailure) => {
+            "resolve the tool, permission, or environment problem before claiming completion"
+        }
     }
 }
 
@@ -1048,5 +1613,276 @@ mod tests {
         );
         assert_eq!(data_request.target_role(), DiagnosticRepairTargetRole::Data);
         assert_eq!(data_request.allowed_change_kind(), "data_schema");
+    }
+
+    #[test]
+    fn capability_spec_defaults_cover_general_purpose_task_kinds() {
+        let cases = [
+            (
+                TaskKind::Docs,
+                ObjectiveDeliverableKind::DocumentSections,
+                ObjectiveEvidenceKind::ContentCheck,
+                CapabilityCompletionPredicate::RequiredSectionsPresent,
+                ArtifactRole::UsageDocs,
+            ),
+            (
+                TaskKind::Data,
+                ObjectiveDeliverableKind::OutputFile,
+                ObjectiveEvidenceKind::SchemaCheck,
+                CapabilityCompletionPredicate::SchemaCheckPassed,
+                ArtifactRole::DataOutput,
+            ),
+            (
+                TaskKind::Research,
+                ObjectiveDeliverableKind::ResearchNotes,
+                ObjectiveEvidenceKind::SourceFetchEvidence,
+                CapabilityCompletionPredicate::SourceEvidencePresent,
+                ArtifactRole::UsageDocs,
+            ),
+            (
+                TaskKind::Ops,
+                ObjectiveDeliverableKind::CommandObservation,
+                ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+                CapabilityCompletionPredicate::CommandObservationRecorded,
+                ArtifactRole::UsageDocs,
+            ),
+            (
+                TaskKind::Authoring,
+                ObjectiveDeliverableKind::ProseArtifact,
+                ObjectiveEvidenceKind::ContentAcceptance,
+                CapabilityCompletionPredicate::ContentAccepted,
+                ArtifactRole::UsageDocs,
+            ),
+        ];
+
+        for (
+            task_kind,
+            expected_deliverable,
+            expected_evidence,
+            expected_predicate,
+            expected_role,
+        ) in cases
+        {
+            let spec = capability_spec_for_task_kind(task_kind);
+
+            assert_eq!(spec.task_kind, task_kind);
+            assert_eq!(spec.deliverable_kind, expected_deliverable);
+            assert_eq!(spec.evidence_kind, expected_evidence);
+            assert_eq!(spec.completion_predicate, expected_predicate);
+            assert!(spec.required_artifacts.contains(&expected_role));
+            assert!(spec.worker_sequence.contains(&WorkerKind::Evidence));
+            assert!(spec.worker_sequence.contains(&WorkerKind::DiagnosticRepair));
+            assert!(
+                spec.repair_strategies
+                    .contains(&CapabilityRepairStrategy::RepairFailedEvidence)
+            );
+            assert!(
+                spec.eval_labels
+                    .iter()
+                    .any(|label| label == &format!("task_kind={}", task_kind.as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn non_coding_worker_lifecycle_plans_have_deliverable_evidence_and_repair_stages() {
+        let cases = [
+            (
+                "Write README.md with install, validation, and rollback sections.",
+                TaskKind::Docs,
+                WorkerKind::Docs,
+            ),
+            (
+                "Transform orders.csv into output.csv with id,total columns.",
+                TaskKind::Data,
+                WorkerKind::Data,
+            ),
+            (
+                "Investigate local LLM repair loops and produce a report in report.md with sources.",
+                TaskKind::Research,
+                WorkerKind::Research,
+            ),
+            (
+                "Prepare a deployment runbook with rollback and validation commands.",
+                TaskKind::Ops,
+                WorkerKind::Ops,
+            ),
+            (
+                "Translate README.ja.md into English and write README.md.",
+                TaskKind::Authoring,
+                WorkerKind::Authoring,
+            ),
+        ];
+
+        for (request, expected_kind, expected_primary_worker) in cases {
+            let contract = TaskContract::from_request(request);
+            assert_eq!(contract.task_kind, expected_kind, "{request}");
+
+            let plan = worker_lifecycle_plan_for_task_contract(&contract);
+
+            assert_eq!(plan.capability.task_kind, expected_kind);
+            assert_eq!(plan.stages().len(), 4);
+            let deliverable = plan
+                .stage(CapabilityLifecycleStageKind::Deliverable)
+                .expect("deliverable stage");
+            let evidence = plan
+                .stage(CapabilityLifecycleStageKind::Evidence)
+                .expect("evidence stage");
+            let repair = plan
+                .stage(CapabilityLifecycleStageKind::Repair)
+                .expect("repair stage");
+
+            assert_eq!(
+                deliverable.worker_contract.worker_kind,
+                expected_primary_worker
+            );
+            assert_eq!(evidence.worker_contract.worker_kind, WorkerKind::Evidence);
+            assert_eq!(
+                repair.worker_contract.worker_kind,
+                WorkerKind::DiagnosticRepair
+            );
+            assert_eq!(deliverable.recovery_job_label(), "MissingDeliverableJob");
+            assert_eq!(evidence.recovery_job_label(), "MissingEvidenceJob");
+            assert_eq!(repair.recovery_job_label(), "EvidenceFailedJob");
+            assert_eq!(
+                deliverable.worker_contract.deliverable_kind,
+                plan.capability.deliverable_kind
+            );
+            assert_eq!(
+                evidence.worker_contract.evidence_kind,
+                plan.capability.evidence_kind
+            );
+            assert!(
+                deliverable
+                    .worker_contract
+                    .context_pack
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.label() == "allowed_tools")
+            );
+            assert!(
+                repair
+                    .worker_contract
+                    .context_pack
+                    .entries_for_kind(ContextPackKind::Repair)
+                    .iter()
+                    .any(|entry| entry.content().contains("repair_failed_evidence"))
+            );
+        }
+    }
+
+    #[test]
+    fn non_coding_lifecycle_represents_expected_evidence_predicates() {
+        let docs = worker_lifecycle_plan_for_task_contract(&TaskContract::from_request(
+            "Write README.md with setup, usage, and rollback sections.",
+        ));
+        assert_eq!(
+            docs.capability.completion_predicate,
+            CapabilityCompletionPredicate::RequiredSectionsPresent
+        );
+        assert!(
+            docs.stage(CapabilityLifecycleStageKind::Evidence)
+                .unwrap()
+                .output_contract
+                .contains("content_check")
+        );
+
+        let data = worker_lifecycle_plan_for_task_contract(&TaskContract::from_request(
+            "Convert customers.csv to customers.json with id,name fields.",
+        ));
+        assert_eq!(
+            data.capability.completion_predicate,
+            CapabilityCompletionPredicate::SchemaCheckPassed
+        );
+        assert!(
+            data.stage(CapabilityLifecycleStageKind::Evidence)
+                .unwrap()
+                .output_contract
+                .contains("schema")
+        );
+
+        let research = worker_lifecycle_plan_for_task_contract(&TaskContract::from_request(
+            "Investigate local LLM agents and produce a report in report.md with cited sources.",
+        ));
+        assert_eq!(
+            research.capability.completion_predicate,
+            CapabilityCompletionPredicate::SourceEvidencePresent
+        );
+        assert!(
+            research
+                .stage(CapabilityLifecycleStageKind::Evidence)
+                .unwrap()
+                .output_contract
+                .contains("source_fetch")
+        );
+
+        let ops = worker_lifecycle_plan_for_task_contract(&TaskContract::from_request(
+            "Prepare a deployment runbook with rollback commands and validation checks.",
+        ));
+        assert_eq!(
+            ops.capability.completion_predicate,
+            CapabilityCompletionPredicate::CommandObservationRecorded
+        );
+        assert!(
+            ops.stage(CapabilityLifecycleStageKind::Deliverable)
+                .unwrap()
+                .output_contract
+                .contains("runbook")
+        );
+
+        let authoring = worker_lifecycle_plan_for_task_contract(&TaskContract::from_request(
+            "Translate README.ja.md into English and write README.md.",
+        ));
+        assert_eq!(
+            authoring.capability.completion_predicate,
+            CapabilityCompletionPredicate::ContentAccepted
+        );
+        assert!(
+            authoring
+                .stage(CapabilityLifecycleStageKind::Evidence)
+                .unwrap()
+                .output_contract
+                .contains("content_acceptance")
+        );
+    }
+
+    #[test]
+    fn non_coding_policy_messages_avoid_coding_specific_verifier_vocabulary() {
+        let requests = [
+            "Write README.md with install and rollback sections.",
+            "Convert orders.csv into output.csv with id,total columns.",
+            "Investigate local-first agent repair loops and produce a report in report.md with sources.",
+            "Prepare a deployment runbook with rollback and validation commands.",
+            "Translate README.ja.md into English and write README.md.",
+        ];
+
+        for request in requests {
+            let contract = TaskContract::from_request(request);
+            assert_ne!(contract.task_kind, TaskKind::Coding, "{request}");
+            let plan = worker_lifecycle_plan_for_task_contract(&contract);
+            for stage in plan.stages() {
+                let message = stage.policy_message().to_ascii_lowercase();
+                assert!(!message.contains("verifier"), "{request}: {message}");
+                assert!(!message.contains("cargo"), "{request}: {message}");
+                assert!(!message.contains("pytest"), "{request}: {message}");
+                assert!(!message.contains("npm test"), "{request}: {message}");
+                assert!(!message.contains("node --test"), "{request}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_stage_context_pack_stays_bounded_and_eval_labeled() {
+        let contract = TaskContract::from_request(
+            "Transform orders.csv into output.csv with id,total columns.",
+        );
+        let plan = worker_lifecycle_plan_for_task_contract(&contract);
+
+        for stage in plan.stages() {
+            assert!(stage.worker_contract.context_pack.entries().len() <= MAX_CONTEXT_PACK_ENTRIES);
+            assert!(stage.eval_label.contains(stage.stage_kind.label()));
+            assert!(stage.eval_label.contains(stage.recovery_job_label()));
+            assert!(stage.output_contract.len() > 12);
+        }
     }
 }
