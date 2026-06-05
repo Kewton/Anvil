@@ -318,6 +318,15 @@ mod tool_policy_decisions;
 // `tests.py` scan). Free fns over `&Agent`. `pub(super)` limited / no
 // facade re-export (DR3-001).
 mod python_request_helpers;
+// Issue #977 (parent #974, Issue C): Node request / workspace-state
+// inspection helpers (`active_node_request_requires_tests`,
+// `node_test_artifact_exists`, `node_test_runner_completion`,
+// `node_test_runner_bindable`) that gate the deterministic Node
+// test-runner manifest completion, plus the pure operator that produces
+// the completed `package.json` contents. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod node_request_helpers;
+mod node_runner_manifest;
 // Per-Agent `#[cfg(test)]` test seams extracted from `turn.rs` (parent
 // #680). Hosts the test-only `pub(super)` seams that drive the
 // production wiring without widening visibility (Issue #664 / CB2-003):

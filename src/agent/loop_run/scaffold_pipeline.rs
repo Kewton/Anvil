@@ -585,6 +585,11 @@ pub(super) const EVENT_DETERMINISTIC_FORMAT_ERROR_SMALL_EDIT: &str =
     "agent.deterministic_format_error_small_edit";
 pub(super) const EVENT_DETERMINISTIC_PYTHON_TEST_FALLBACK: &str =
     "agent.empty_workspace.deterministic_python_test_fallback";
+// Issue #977 (parent #974, Issue C): MissingEvidence runner-manifest
+// completion. Distinct from the empty-workspace scaffold events — this fires
+// when test artifacts already exist but no runnable test command is bound.
+pub(super) const EVENT_DETERMINISTIC_NODE_TEST_RUNNER_MANIFEST: &str =
+    "agent.deterministic_node_test_runner_manifest";
 pub(super) const CREATE_NEXT_APP_PACKAGE_VERSION: &str = "16.2.4";
 
 pub(super) fn task_requires_nextjs_scaffold(task: &str) -> bool {
@@ -1868,6 +1873,56 @@ if __name__ == "__main__":
         }),
     );
     Ok(Some(test_name))
+}
+
+/// Issue #977 (parent #974, Issue C): deterministically complete the Node
+/// test-runner manifest (`package.json`) when the workspace has Node test
+/// artifacts but no runnable test command can be bound. This is the
+/// MissingEvidence "runner manifest/script missing" recovery — it materializes
+/// the manifest from the deterministic `node_runner_manifest` operator (no LLM
+/// free regeneration) so the existing `auto_test::detect_node_scripts` binding
+/// can run `npm test` on the next EvidenceRunner pass.
+///
+/// Returns `Ok(Some(relative_path))` when the manifest was written,
+/// `Ok(None)` when no completion applies (non-coding task, support recovery
+/// disabled, runner already bindable, or a malformed manifest that must not be
+/// clobbered), and `Err` on a filesystem write failure.
+pub(super) fn maybe_materialize_node_test_runner_manifest(
+    agent: &mut Agent,
+) -> Result<Option<String>, String> {
+    if !scaffold_allowed_for_active_task(agent) {
+        return Ok(None);
+    }
+    if !agent
+        .config
+        .deterministic_fallback
+        .allows_support_recovery()
+    {
+        return Ok(None);
+    }
+    let Some(completion) = super::node_request_helpers::node_test_runner_completion(agent) else {
+        return Ok(None);
+    };
+    let relative = "package.json";
+    let target = agent.work_root.join(relative);
+    std::fs::write(&target, &completion.contents)
+        .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+    agent
+        .session
+        .working_memory
+        .note_touched_file(normalize_memory_path(relative, &agent.work_root));
+    log_llm_event(
+        EVENT_DETERMINISTIC_NODE_TEST_RUNNER_MANIFEST,
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "work_root": agent.work_root.display().to_string(),
+            "work_mode": agent.session.mode_state.work_mode.as_str(),
+            "fallback_level": agent.config.deterministic_fallback.fallback_level(),
+            "fallback_action": completion.action.as_str(),
+            "target": relative,
+        }),
+    );
+    Ok(Some(relative.to_string()))
 }
 
 pub(super) fn maybe_apply_deterministic_polish_fallback(

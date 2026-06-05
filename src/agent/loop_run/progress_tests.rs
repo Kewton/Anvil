@@ -7729,6 +7729,7 @@ export default function App() {
         let interrupt = super::InterruptFlag::new_preset(false);
         let mut repo_change_retries = 0;
         let mut python_test_retries = 0;
+        let mut node_runner_retries = 0;
         let mut no_tool_retries = 0;
         let mut framework_app_fallback_materialized = false;
 
@@ -7746,6 +7747,7 @@ export default function App() {
                 interrupt_flag: &interrupt,
                 repo_change_retries: &mut repo_change_retries,
                 python_test_retries: &mut python_test_retries,
+                node_runner_retries: &mut node_runner_retries,
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             };
@@ -7766,10 +7768,183 @@ export default function App() {
                 interrupt_flag: &interrupt,
                 repo_change_retries: &mut repo_change_retries,
                 python_test_retries: &mut python_test_retries,
+                node_runner_retries: &mut node_runner_retries,
                 no_tool_retries: &mut no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             };
             assert!(!super::missing_repo_edit_recovery_allowed(&blocked_args));
+        }
+    }
+
+    /// Issue #977: the deterministic Node manifest applier creates a
+    /// `package.json` with a `node --test` script when none exists (replay
+    /// fixtures 048 / 058: tests exist but the manifest is missing), and is a
+    /// no-op once the runner is bindable.
+    #[test]
+    fn node_runner_manifest_applier_creates_missing_package_json() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        let result = super::super::scaffold_pipeline::maybe_materialize_node_test_runner_manifest(
+            &mut agent,
+        )
+        .expect("applier does not error");
+        assert_eq!(result.as_deref(), Some("package.json"));
+
+        let written = std::fs::read_to_string(temp.path().join("package.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json["scripts"]["test"].as_str(), Some("node --test"));
+        assert!(
+            agent
+                .session
+                .working_memory
+                .touched_files
+                .iter()
+                .any(|path| path.ends_with("package.json")),
+            "materialized manifest must be recorded as a touched file"
+        );
+
+        // Runner is now bindable -> second call is a no-op.
+        let second = super::super::scaffold_pipeline::maybe_materialize_node_test_runner_manifest(
+            &mut agent,
+        )
+        .expect("applier does not error");
+        assert_eq!(second, None);
+    }
+
+    /// Issue #977: the deterministic Node manifest applier adds a missing
+    /// `scripts.test` while preserving existing fields (replay fixture 043:
+    /// `package.json` exists but the test script is missing).
+    #[test]
+    fn node_runner_manifest_applier_adds_missing_test_script() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"name":"app","version":"2.0.0","type":"module"}"#,
+        )
+        .unwrap();
+
+        let result = super::super::scaffold_pipeline::maybe_materialize_node_test_runner_manifest(
+            &mut agent,
+        )
+        .expect("applier does not error");
+        assert_eq!(result.as_deref(), Some("package.json"));
+
+        let written = std::fs::read_to_string(temp.path().join("package.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json["scripts"]["test"].as_str(), Some("node --test"));
+        assert_eq!(json["name"].as_str(), Some("app"));
+        assert_eq!(json["version"].as_str(), Some("2.0.0"));
+    }
+
+    /// Issue #977: end-to-end MissingEvidence recovery. A Node task with an
+    /// existing test artifact but no bindable runner is nudged once, then the
+    /// manifest is deterministically completed and the loop continues so the
+    /// EvidenceRunner reruns against the bound `npm test`.
+    #[test]
+    fn node_runner_recovery_completes_manifest_then_continues() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        agent.session.working_memory.active_task = Some(
+            "Create a JavaScript CLI word counter in src/index.js with node --test tests."
+                .to_string(),
+        );
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(
+            temp.path().join("tests").join("index.test.js"),
+            "import test from 'node:test';\ntest('noop', () => {});\n",
+        )
+        .unwrap();
+
+        // Precondition: the recovery gate signals fire for this Node request.
+        assert!(
+            super::super::node_request_helpers::active_node_request_requires_tests(&agent),
+            "node request requiring tests must be recognized"
+        );
+        assert!(super::super::node_request_helpers::node_test_artifact_exists(&agent));
+        assert!(
+            !super::super::node_request_helpers::node_test_runner_bindable(&agent),
+            "no package.json yet -> runner not bindable"
+        );
+
+        let interrupt = super::InterruptFlag::new_preset(false);
+        let mut repo_change_retries = 0;
+        let mut python_test_retries = 0;
+        let mut node_runner_retries = 0;
+        let mut no_tool_retries = 0;
+        let mut framework_app_fallback_materialized = false;
+
+        // Construct fresh `PostReplyRecoveryArgs` for each pass; borrows are
+        // confined to the macro expansion so the counters can be reborrowed.
+        macro_rules! node_recovery_args {
+            () => {
+                super::PostReplyRecoveryArgs {
+                    last_iter: 0,
+                    action_expectation: super::recovery::ActionExpectation::RepoChange,
+                    requires_action: true,
+                    recovery_dispatch_gate: super::RecoveryDispatchGate::from_owner(
+                        super::RecoveryOwner::None,
+                    ),
+                    repo_edit_calls_made_this_turn: 1,
+                    final_reply: "",
+                    task_contract_action: None,
+                    interrupt_flag: &interrupt,
+                    repo_change_retries: &mut repo_change_retries,
+                    python_test_retries: &mut python_test_retries,
+                    node_runner_retries: &mut node_runner_retries,
+                    no_tool_retries: &mut no_tool_retries,
+                    framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
+                }
+            };
+        }
+
+        // First pass: nudge only, no manifest yet.
+        {
+            let mut args = node_recovery_args!();
+            let outcome = super::super::actor_loop_flow::maybe_handle_node_test_runner_recovery(
+                &mut agent, &mut args,
+            );
+            assert!(matches!(
+                outcome,
+                Some(super::PostReplyRecoveryOutcome::Continue)
+            ));
+        }
+        assert!(
+            !temp.path().join("package.json").exists(),
+            "first pass must not materialize the manifest yet"
+        );
+
+        // Second pass: deterministic completion + Continue (forces rerun).
+        {
+            let mut args = node_recovery_args!();
+            let outcome = super::super::actor_loop_flow::maybe_handle_node_test_runner_recovery(
+                &mut agent, &mut args,
+            );
+            assert!(matches!(
+                outcome,
+                Some(super::PostReplyRecoveryOutcome::Continue)
+            ));
+        }
+        let written = std::fs::read_to_string(temp.path().join("package.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json["scripts"]["test"].as_str(), Some("node --test"));
+
+        // Now bindable -> the handler steps aside on subsequent passes.
+        {
+            let mut args = node_recovery_args!();
+            let outcome = super::super::actor_loop_flow::maybe_handle_node_test_runner_recovery(
+                &mut agent, &mut args,
+            );
+            assert!(
+                outcome.is_none(),
+                "bound runner must not re-trigger recovery"
+            );
         }
     }
 
