@@ -441,11 +441,11 @@ pub mod commands;
 // reaching into private module state — see `is_completion_verifier_command`
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
-// Issue #989 (parent #988, Issue A): structured cargo/test evidence binding
-// plan. Runtime-neutral binding types + a Rust adapter that routes binding
-// gaps to `EvidenceBindingFailed` instead of `safe_stop_verifier_missing`.
-// Extension seam (not yet wired); `pub(super)` only, no facade re-export
-// (DR3-001).
+// Issues #989/#993 (parent #988): structured evidence binding plan plus the
+// generic `EvidenceBindingFailedJob` routing seam. Runtime-neutral binding
+// types route binding gaps to `EvidenceBindingFailed` instead of
+// `safe_stop_verifier_missing`; runtime-specific differences stay in data
+// enums/adapters. `pub(super)` only, no facade re-export (DR3-001).
 mod evidence_binding;
 mod evidence_runner;
 mod worker_contract;

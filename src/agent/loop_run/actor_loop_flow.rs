@@ -694,6 +694,29 @@ pub(super) fn maybe_handle_node_test_runner_recovery(
         return None;
     }
     *args.node_runner_retries += 1;
+    // Issue #993 (parent #988, Issue E): record the binding-order failure as a
+    // generic transition the first time it is observed. The Node test
+    // deliverable exists but its runner cannot bind — this is an
+    // `evidence_binding_failed` transition, not a missing-evidence terminal.
+    // Additive observation only (enum labels, no raw paths); control flow is
+    // unchanged.
+    if *args.node_runner_retries == 1
+        && let Some(job) =
+            super::node_request_helpers::node_evidence_binding_state(agent).failed_job()
+    {
+        log_llm_event(
+            "agent.evidence_binding.failed",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "turn_index": agent.current_turn_index,
+                "task_kind": "coding",
+                "binding_check": job.check.as_str(),
+                "binding_recovery": job.recovery.as_str(),
+                "generic_terminal_state": job.generic_terminal_state().label(),
+                "recovery_job_kind": job.recovery_job_kind().as_str(),
+            }),
+        );
+    }
     agent
         .controller_policy_ledger
         .record(ControllerRecoveryStrategy::TargetedArtifactRetry);

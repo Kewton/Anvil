@@ -23,9 +23,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::evidence_runner::EvidenceRunnerError;
+use super::active_job_arbiter::RecoveryJobKind;
+use super::evidence_runner::{EvidenceRunnerError, EvidenceRunnerKind};
 use super::generated_test_guard::{parse_toml_string_value, strip_toml_comment};
 use super::summary::GenericTerminalState;
+use super::task_contract::TaskKind;
 
 /// Whether a single binding check (or the whole plan) resolved.
 ///
@@ -74,6 +76,142 @@ impl BindingCheckKind {
             BindingCheckKind::ImportSymbol => "import_symbol",
             BindingCheckKind::ExecutableHandle => "executable_handle",
         }
+    }
+}
+
+/// Which deliverable -> evidence-runner family cannot bind.
+///
+/// This is separate from [`BindingCheck`], which is the structured per-reference
+/// observation used by [`EvidenceBindingPlan`]. `BindingFailureCheck` is the
+/// generic recovery routing axis for Node/docs/data/research binding-order
+/// failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BindingFailureCheck {
+    /// Coding / Node: a test deliverable exists but no test runner manifest
+    /// binds it.
+    RunnerManifest,
+    /// Docs: a document exists but the content check cannot bind to a target
+    /// document / section.
+    DocumentSection,
+    /// Data: an output exists but the schema check cannot bind to an output
+    /// file.
+    SchemaOutput,
+    /// Research: notes exist but the citation check cannot bind to source
+    /// notes.
+    SourceCitation,
+}
+
+impl BindingFailureCheck {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            BindingFailureCheck::RunnerManifest => "runner_manifest",
+            BindingFailureCheck::DocumentSection => "document_section",
+            BindingFailureCheck::SchemaOutput => "schema_output",
+            BindingFailureCheck::SourceCitation => "source_citation",
+        }
+    }
+
+    pub(super) fn recovery(self) -> BindingRecovery {
+        match self {
+            BindingFailureCheck::RunnerManifest => BindingRecovery::MaterializeRunnerManifest,
+            BindingFailureCheck::DocumentSection => BindingRecovery::RecoverDocumentSection,
+            BindingFailureCheck::SchemaOutput => BindingRecovery::RecoverSchemaOutput,
+            BindingFailureCheck::SourceCitation => BindingRecovery::RecoverSourceCitation,
+        }
+    }
+
+    pub(super) fn for_task_kind(task_kind: TaskKind) -> Option<Self> {
+        match task_kind {
+            TaskKind::Coding => Some(BindingFailureCheck::RunnerManifest),
+            TaskKind::Docs => Some(BindingFailureCheck::DocumentSection),
+            TaskKind::Data => Some(BindingFailureCheck::SchemaOutput),
+            TaskKind::Research => Some(BindingFailureCheck::SourceCitation),
+            TaskKind::Ops | TaskKind::Authoring => None,
+        }
+    }
+
+    pub(super) fn for_evidence_runner_kind(kind: EvidenceRunnerKind) -> Option<Self> {
+        match kind {
+            EvidenceRunnerKind::CodingBuildTest => Some(BindingFailureCheck::RunnerManifest),
+            EvidenceRunnerKind::DocsContentCheck => Some(BindingFailureCheck::DocumentSection),
+            EvidenceRunnerKind::DataSchemaCheck => Some(BindingFailureCheck::SchemaOutput),
+            EvidenceRunnerKind::ResearchSourceFetch => Some(BindingFailureCheck::SourceCitation),
+            EvidenceRunnerKind::OpsCommandObservation
+            | EvidenceRunnerKind::AuthoringContentCheck => None,
+        }
+    }
+}
+
+/// The recovery that re-binds a deliverable to its evidence runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BindingRecovery {
+    MaterializeRunnerManifest,
+    RecoverDocumentSection,
+    RecoverSchemaOutput,
+    RecoverSourceCitation,
+}
+
+impl BindingRecovery {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            BindingRecovery::MaterializeRunnerManifest => "materialize_runner_manifest",
+            BindingRecovery::RecoverDocumentSection => "recover_document_section",
+            BindingRecovery::RecoverSchemaOutput => "recover_schema_output",
+            BindingRecovery::RecoverSourceCitation => "recover_source_citation",
+        }
+    }
+}
+
+/// A generic binding failure: a deliverable exists but its evidence runner
+/// cannot be bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EvidenceBindingFailedJob {
+    pub(super) check: BindingFailureCheck,
+    pub(super) recovery: BindingRecovery,
+}
+
+impl EvidenceBindingFailedJob {
+    fn new(check: BindingFailureCheck) -> Self {
+        Self {
+            check,
+            recovery: check.recovery(),
+        }
+    }
+
+    pub(super) fn generic_terminal_state(self) -> GenericTerminalState {
+        GenericTerminalState::EvidenceBindingFailed
+    }
+
+    pub(super) fn recovery_job_kind(self) -> RecoveryJobKind {
+        RecoveryJobKind::EvidenceBindingFailedJob
+    }
+}
+
+/// Result of a generic binding-order check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BindingState {
+    Bound,
+    Failed(EvidenceBindingFailedJob),
+}
+
+impl BindingState {
+    pub(super) fn failed_job(self) -> Option<EvidenceBindingFailedJob> {
+        match self {
+            BindingState::Bound => None,
+            BindingState::Failed(job) => Some(job),
+        }
+    }
+}
+
+pub(super) fn evaluate_binding(
+    check: BindingFailureCheck,
+    deliverable_present: bool,
+    runner_bindable: bool,
+) -> BindingState {
+    if deliverable_present && !runner_bindable {
+        BindingState::Failed(EvidenceBindingFailedJob::new(check))
+    } else {
+        BindingState::Bound
     }
 }
 
@@ -774,5 +912,134 @@ fn t() {
         let plan = rust_evidence_binding_plan(Some(manifest), &[test]);
         assert_eq!(plan.status(), EvidenceBindingStatus::Bound);
         assert_eq!(plan.binding_error(), None);
+    }
+}
+
+#[cfg(test)]
+mod generic_binding_failure_tests {
+    use super::*;
+
+    const ALL_FAILURE_CHECKS: [BindingFailureCheck; 4] = [
+        BindingFailureCheck::RunnerManifest,
+        BindingFailureCheck::DocumentSection,
+        BindingFailureCheck::SchemaOutput,
+        BindingFailureCheck::SourceCitation,
+    ];
+
+    #[test]
+    fn deliverable_present_but_unbound_is_a_binding_failure() {
+        for check in ALL_FAILURE_CHECKS {
+            let state = evaluate_binding(check, true, false);
+            let job = state
+                .failed_job()
+                .unwrap_or_else(|| panic!("{} should be a binding failure", check.as_str()));
+            assert_eq!(job.check, check);
+            assert_eq!(job.recovery, check.recovery());
+            assert_eq!(
+                job.generic_terminal_state(),
+                GenericTerminalState::EvidenceBindingFailed
+            );
+            assert_eq!(
+                job.recovery_job_kind(),
+                RecoveryJobKind::EvidenceBindingFailedJob
+            );
+        }
+    }
+
+    #[test]
+    fn bound_or_absent_deliverable_is_not_a_binding_failure() {
+        for check in ALL_FAILURE_CHECKS {
+            assert_eq!(evaluate_binding(check, true, true), BindingState::Bound);
+            assert_eq!(evaluate_binding(check, false, false), BindingState::Bound);
+            assert_eq!(evaluate_binding(check, false, true), BindingState::Bound);
+        }
+    }
+
+    #[test]
+    fn binding_failure_check_for_task_kind_mirrors_evidence_runner_selection() {
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Coding),
+            Some(BindingFailureCheck::RunnerManifest)
+        );
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Docs),
+            Some(BindingFailureCheck::DocumentSection)
+        );
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Data),
+            Some(BindingFailureCheck::SchemaOutput)
+        );
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Research),
+            Some(BindingFailureCheck::SourceCitation)
+        );
+        assert_eq!(BindingFailureCheck::for_task_kind(TaskKind::Ops), None);
+        assert_eq!(
+            BindingFailureCheck::for_task_kind(TaskKind::Authoring),
+            None
+        );
+    }
+
+    #[test]
+    fn binding_failure_check_for_evidence_runner_kind_matches_task_kind_mapping() {
+        let cases = [
+            (
+                EvidenceRunnerKind::CodingBuildTest,
+                Some(BindingFailureCheck::RunnerManifest),
+            ),
+            (
+                EvidenceRunnerKind::DocsContentCheck,
+                Some(BindingFailureCheck::DocumentSection),
+            ),
+            (
+                EvidenceRunnerKind::DataSchemaCheck,
+                Some(BindingFailureCheck::SchemaOutput),
+            ),
+            (
+                EvidenceRunnerKind::ResearchSourceFetch,
+                Some(BindingFailureCheck::SourceCitation),
+            ),
+            (EvidenceRunnerKind::OpsCommandObservation, None),
+            (EvidenceRunnerKind::AuthoringContentCheck, None),
+        ];
+        for (runner_kind, expected) in cases {
+            assert_eq!(
+                BindingFailureCheck::for_evidence_runner_kind(runner_kind),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn binding_recovery_labels_are_stable() {
+        assert_eq!(
+            BindingFailureCheck::RunnerManifest.as_str(),
+            "runner_manifest"
+        );
+        assert_eq!(
+            BindingFailureCheck::DocumentSection.as_str(),
+            "document_section"
+        );
+        assert_eq!(BindingFailureCheck::SchemaOutput.as_str(), "schema_output");
+        assert_eq!(
+            BindingFailureCheck::SourceCitation.as_str(),
+            "source_citation"
+        );
+        assert_eq!(
+            BindingRecovery::MaterializeRunnerManifest.as_str(),
+            "materialize_runner_manifest"
+        );
+        assert_eq!(
+            BindingRecovery::RecoverDocumentSection.as_str(),
+            "recover_document_section"
+        );
+        assert_eq!(
+            BindingRecovery::RecoverSchemaOutput.as_str(),
+            "recover_schema_output"
+        );
+        assert_eq!(
+            BindingRecovery::RecoverSourceCitation.as_str(),
+            "recover_source_citation"
+        );
     }
 }
