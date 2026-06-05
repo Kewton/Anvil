@@ -29,6 +29,7 @@ use super::Agent;
 use super::actor_loop_flow::{
     TaskContractVerifierFlowOutcome, format_iteration_status, repair_job_done_outcome,
 };
+use super::controller_policy::ControllerRecoveryStrategy;
 use super::repair_driver::VerifierRepairPassOutcome;
 use super::repair_job;
 use super::repair_job::verifier_repair_context_from_failure;
@@ -327,6 +328,32 @@ fn handle_repair_job_patch_provider_step(
             "Verifier repair",
             &format!(
                 "Added missing Cargo dependencies to {relative_path} deterministically; verifier will rerun."
+            ),
+        );
+        return TaskContractVerifierFlowOutcome::Continue;
+    }
+    // Issue #991 (parent #988, Issue C): deterministic Rust binding-mismatch
+    // operators (lib name / CARGO_BIN_EXE) run before the LLM repair pass. Keyed
+    // on the failure diagnostic + workspace inspection (not `target_hint`).
+    // Recording the recovery strategy surfaces the operator in the eval/report
+    // deterministic-operator hit rate.
+    if let super::rust_binding_repair::RustBindingRepairOutcome::Applied {
+        operator,
+        relative_path,
+    } = super::rust_binding_repair::try_apply_rust_binding_repair(agent)
+    {
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::DeterministicBindingRepair);
+        *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        write_repair_job_step_status(
+            agent,
+            args.last_iter,
+            "Verifier repair",
+            &format!(
+                "Applied deterministic binding repair ({operator}) to {relative_path}; verifier will rerun."
             ),
         );
         return TaskContractVerifierFlowOutcome::Continue;

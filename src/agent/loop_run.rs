@@ -519,7 +519,12 @@ mod mechanical_compile_repair;
 // missing serde-family Cargo dependencies. Runs in the deterministic repair
 // slot before the LLM verifier-repair pass. Not re-exported (DR3-001).
 mod cargo_dependency_repair;
+// Issue #991 (parent #988, Issue C): deterministic Rust binding-mismatch repair
+// operators (lib name / CARGO_BIN_EXE). Runs in the deterministic repair slot
+// before the LLM verifier-repair pass, after `cargo_dependency_repair`. Not
+// re-exported (DR3-001).
 mod repair_assertion_analysis;
+mod rust_binding_repair;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
