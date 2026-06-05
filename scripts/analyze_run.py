@@ -116,6 +116,99 @@ RECOVERY_JOB_BY_GENERIC_TERMINAL = {
     "interrupted": "none",
     "unknown": "unknown",
 }
+# Issue #976 (parent #974, Issue B): FailureObservation replay classifier.
+#
+# `failure_class` collapses the generic terminal lifecycle state into the small
+# transition vocabulary the v0.6.3 countermeasure analysis tracks. It lets the
+# offline report count *transitions* (e.g. missing_evidence shrinking while
+# recovery_exhausted grows) rather than only a single pass rate. The map is a
+# refinement layer on top of `generic_terminal_state`; detectors below can
+# override individual classes (e.g. a bound runner that failed under a
+# `verifier_missing` terminal is reclassified to `evidence_failed`).
+FAILURE_CLASS_BY_GENERIC_TERMINAL = {
+    "completed": "none",
+    "missing_deliverable": "missing_deliverable",
+    "missing_evidence": "missing_evidence",
+    "evidence_failed": "evidence_failed",
+    "evidence_binding_failed": "evidence_failed",
+    "evidence_runner_missing": "evidence_runner_missing",
+    "evidence_repair_exhausted": "recovery_exhausted",
+    "evidence_repair_safe_stop": "recovery_exhausted",
+    "control_loop_exhausted": "control_loop_exhausted",
+    "model_output_failure": "tool_protocol_failure",
+    "transport_failure": "transport_failure",
+    "interrupted": "interrupted",
+    "unknown": "unknown",
+}
+KNOWN_FAILURE_CLASSES = set(FAILURE_CLASS_BY_GENERIC_TERMINAL.values())
+# Terminal families that imply an evidence runner was actually bound + executed.
+EVIDENCE_RAN_TERMINAL_STATES = {
+    "evidence_failed",
+    "evidence_binding_failed",
+    "evidence_repair_exhausted",
+    "evidence_repair_safe_stop",
+}
+# Terminal families where a repair loop ran against a failing diagnostic.
+REPAIR_TERMINAL_STATES = {
+    "evidence_repair_exhausted",
+    "evidence_repair_safe_stop",
+}
+# Verifier-status labels that mean a runner ran (vs. was never available).
+VERIFIER_STATUS_EXECUTED = {
+    "failed",
+    "ran",
+    "executed",
+    "nonzero_exit",
+    "passed",
+    "weak",
+}
+# Verifier-status labels that mean a runner ran and did NOT pass.
+VERIFIER_STATUS_FAILED = {
+    "failed",
+    "nonzero_exit",
+    "weak",
+}
+# Substrings (lowercased) in a failure signature/classification that point at a
+# test- or setup-side cause rather than the implementation under repair.
+TEST_OR_SETUP_FAILURE_MARKERS = (
+    "import",
+    "module",
+    "modulenotfound",
+    "no module named",
+    "unresolved",
+    "cannot find module",
+    "no such module",
+    "missing test",
+    "no test",
+    "no tests",
+    "scripts.test",
+    "test script",
+    "package.json",
+    "cargo.toml",
+    "requirements",
+    "dependency",
+    "unresolved import",
+)
+# recovery_strategies labels (lowercased substrings) that mark a deterministic
+# operator firing ahead of an LLM edit pass. Best-effort until an explicit
+# `deterministic_operator_hit` signal is emitted by the eval log.
+DETERMINISTIC_OPERATOR_MARKERS = (
+    "deterministic",
+    "operator",
+    "scaffold",
+)
+KNOWN_TARGET_ROLES = {
+    "implementation",
+    "test",
+    "setup",
+    "test_or_setup",
+    "deliverable",
+    "evidence",
+    "tool_protocol",
+    "none",
+    "unknown",
+}
+
 KNOWN_FAILURE_AUTHORITIES = {
     "contract_extraction",
     "artifact_classification",
@@ -369,6 +462,9 @@ def _analyze_session(
     tool_calls: dict[str, int] = {}
     files_modified: list[str] = []
     seen: set[str] = set()
+    # Issue #976: count every normalized Write/Edit target (pre-dedup) so the
+    # FailureObservation can surface repeated repair targets.
+    write_target_counts: dict[str, int] = {}
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -413,6 +509,7 @@ def _analyze_session(
             )
             if normalized is None:
                 continue
+            write_target_counts[normalized] = write_target_counts.get(normalized, 0) + 1
             if normalized in seen:
                 continue
             seen.add(normalized)
@@ -433,6 +530,7 @@ def _analyze_session(
         "we_total": we_total,
         "compact_events": compact_events,
         "files_modified": files_modified,
+        "write_target_counts": write_target_counts,
     }
 
 
@@ -933,6 +1031,114 @@ def _read_eval_objective_projection(run_dir: Path) -> dict[str, Any]:
     return last
 
 
+def _read_failure_inputs(run_dir: Path) -> dict[str, Any]:
+    """Return failure-observation signals from the last eval.jsonl record.
+
+    Report-only and best-effort (mirrors :func:`_read_eval_objective_projection`,
+    NOT the fail-closed :func:`_read_classified_task_kind`). Pulls from the
+    production ``terminal_diagnostics`` block (``verifier_status``,
+    ``last_failure_signature``, ``classification``, ``missing_obligations`` and
+    per-obligation ``failure_domain``) plus the top-level ``verify_commands``
+    list. An optional ``failure_observation`` block carries fields the eval log
+    does not derive itself yet (``evidence_exit_code``, stdout/stderr excerpts,
+    ``invalid_proposal_count``, ``repair_count``, ``deterministic_operator_hit``);
+    these are read defensively and override the derived defaults when present.
+    Absent/unreadable inputs yield ``{}`` so the classifier degrades cleanly.
+    """
+    logs_dir = run_dir / "logs"
+    candidate = logs_dir / "eval.jsonl"
+    try:
+        if logs_dir.is_symlink():
+            return {}
+    except OSError:
+        return {}
+    if not logs_dir.exists():
+        return {}
+    safe = _safe_regular_file_in(candidate, run_dir, MAX_EVAL_JSONL)
+    if safe is None:
+        return {}
+
+    last: dict[str, Any] = {}
+    try:
+        with safe.open("rb") as fh:
+            while True:
+                raw_line = fh.readline(MAX_EVAL_JSONL_LINE + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > MAX_EVAL_JSONL_LINE:
+                    _warn("eval.jsonl: oversized line, skipping failure inputs remainder")
+                    return last
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+
+                parsed: dict[str, Any] = {}
+                diagnostics = rec.get("terminal_diagnostics")
+                if isinstance(diagnostics, dict):
+                    for src, dst in (
+                        ("verifier_status", "verifier_status"),
+                        ("last_failure_signature", "last_failure_signature"),
+                        ("classification", "terminal_classification"),
+                    ):
+                        value = _bounded_string(diagnostics.get(src))
+                        if value is not None:
+                            parsed[dst] = value
+                    missing = _bounded_string_list(diagnostics.get("missing_obligations"))
+                    if missing:
+                        parsed["missing_obligations"] = missing
+                    obligations = diagnostics.get("obligations")
+                    if isinstance(obligations, list):
+                        domains: list[str] = []
+                        for ob in obligations:
+                            if not isinstance(ob, dict):
+                                continue
+                            domain = _bounded_string(ob.get("failure_domain"))
+                            if domain is not None and domain not in domains:
+                                domains.append(domain)
+                            if len(domains) >= 8:
+                                break
+                        if domains:
+                            parsed["obligation_failure_domains"] = domains
+
+                verify_commands = _bounded_string_list(rec.get("verify_commands"))
+                if verify_commands:
+                    parsed["verify_commands"] = verify_commands
+
+                override = rec.get("failure_observation")
+                if isinstance(override, dict):
+                    for key in ("evidence_command", "stdout_excerpt", "stderr_excerpt"):
+                        value = _bounded_string(override.get(key), limit=256)
+                        if value is not None:
+                            parsed[key] = value
+                    for key in (
+                        "evidence_exit_code",
+                        "invalid_proposal_count",
+                        "repair_count",
+                    ):
+                        value = override.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            parsed[key] = value
+                    hit = override.get("deterministic_operator_hit")
+                    if isinstance(hit, bool):
+                        parsed["deterministic_operator_hit"] = hit
+
+                if parsed:
+                    last = parsed
+    except OSError as e:
+        _warn(f"eval.jsonl failure inputs read error: {e}")
+        return {}
+    return last
+
+
 def _has_worker_lifecycle_projection(projection: dict[str, Any]) -> bool:
     return any(
         key in projection
@@ -1113,6 +1319,43 @@ def _looks_like_test_path(path: str) -> bool:
     )
 
 
+_SETUP_BASENAMES = {
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "cargo.toml",
+    "cargo.lock",
+    "requirements.txt",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "go.mod",
+    "go.sum",
+    "tsconfig.json",
+    "pom.xml",
+    "build.gradle",
+    "makefile",
+    "dockerfile",
+}
+
+
+def _looks_like_setup_path(path: str) -> bool:
+    """True for dependency/build/config manifests (setup-side artifacts)."""
+    lower = path.lower().replace("\\", "/")
+    name = Path(lower).name
+    if name in _SETUP_BASENAMES:
+        return True
+    return Path(lower).suffix in CONFIG_EXTS
+
+
+def _looks_like_impl_path(path: str) -> bool:
+    """True for a source file that is neither a test nor a setup manifest."""
+    if _looks_like_test_path(path) or _looks_like_setup_path(path):
+        return False
+    return Path(path.lower()).suffix in CODE_EXTS
+
+
 def _generated_test_bug_evidence(
     failure_kind: str | None,
     anvil_score: dict | None,
@@ -1178,6 +1421,364 @@ def _classify_failure_authority(
     if agreement in {"false_positive", "false_negative", "true_negative"}:
         return "implementation_bug"
     return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# FailureObservation replay classifier (Issue #976 / parent #974, Issue B)
+# ---------------------------------------------------------------------------
+
+
+def _signature_points_at_test_or_setup(
+    signature: str | None, classification: str | None
+) -> bool:
+    """True when a failure signature/classification names a test- or setup-side
+    cause (import error, missing manifest, missing test, ...)."""
+    for text in (signature, classification):
+        if not isinstance(text, str) or not text:
+            continue
+        low = text.lower()
+        if any(marker in low for marker in TEST_OR_SETUP_FAILURE_MARKERS):
+            return True
+    return False
+
+
+def _test_or_setup_cause(
+    *,
+    signature: str | None,
+    classification: str | None,
+    failure_kind: str | None,
+    anvil_score: dict | None,
+) -> bool:
+    """Whether the failing diagnostic points at test/setup rather than impl."""
+    if _signature_points_at_test_or_setup(signature, classification):
+        return True
+    test_failures = _score_int(anvil_score, "test_failure_count")
+    test_changed = _score_int(anvil_score, "test_files_changed")
+    if (test_failures or 0) > 0 and (test_changed or 0) == 0:
+        return True
+    if failure_kind == "test_failure" and (test_changed or 0) == 0:
+        return True
+    return False
+
+
+def _impl_only_repaired(
+    anvil_score: dict | None, repeated_targets: list[str]
+) -> bool:
+    """Whether repair effort only touched implementation files."""
+    impl_changed = _score_int(anvil_score, "implementation_files_changed")
+    test_changed = _score_int(anvil_score, "test_files_changed")
+    setup_changed = _score_int(anvil_score, "setup_files_changed")
+    score_impl_only = (
+        (impl_changed or 0) > 0
+        and (test_changed or 0) == 0
+        and (setup_changed or 0) == 0
+    )
+    repeated_impl = any(_looks_like_impl_path(p) for p in repeated_targets)
+    repeated_other = any(
+        _looks_like_test_path(p) or _looks_like_setup_path(p) for p in repeated_targets
+    )
+    path_impl_only = repeated_impl and not repeated_other
+    return score_impl_only or path_impl_only
+
+
+def _evidence_runner_executed(
+    *,
+    generic_terminal_state: str,
+    projection: dict[str, Any],
+    failure_inputs: dict[str, Any],
+    anvil_score: dict | None,
+) -> bool:
+    """Whether an evidence runner (test/build/command) actually executed."""
+    if generic_terminal_state in EVIDENCE_RAN_TERMINAL_STATES:
+        return True
+    if projection.get("runner_bound") is True:
+        return True
+    if failure_inputs.get("verify_commands"):
+        return True
+    status = failure_inputs.get("verifier_status")
+    if isinstance(status, str) and status.strip().lower() in VERIFIER_STATUS_EXECUTED:
+        return True
+    if isinstance(anvil_score, dict):
+        if isinstance(anvil_score.get("build_passed"), bool):
+            return True
+        if isinstance(anvil_score.get("tests_passed"), bool):
+            return True
+    return False
+
+
+def _runner_present_but_failed(
+    *,
+    generic_terminal_state: str,
+    projection: dict[str, Any],
+    failure_inputs: dict[str, Any],
+    anvil_score: dict | None,
+) -> bool:
+    """Detector (Issue #976 acceptance): a ``verifier_missing`` terminal that
+    actually had a runner bound which ran and failed. These runs must route to
+    evidence-failed recovery, not a missing-evidence/runner job."""
+    if generic_terminal_state != "evidence_runner_missing":
+        return False
+    status = failure_inputs.get("verifier_status")
+    if isinstance(status, str) and status.strip().lower() in VERIFIER_STATUS_FAILED:
+        return True
+    if failure_inputs.get("verify_commands"):
+        return True
+    if (
+        projection.get("runner_bound") is True
+        and projection.get("rerun_passed") is False
+    ):
+        return True
+    if isinstance(anvil_score, dict):
+        if anvil_score.get("build_passed") is False or anvil_score.get("tests_passed") is False:
+            return True
+        if (_score_int(anvil_score, "compile_error_count") or 0) > 0:
+            return True
+        if (_score_int(anvil_score, "test_failure_count") or 0) > 0:
+            return True
+    return False
+
+
+def _tool_protocol_error(
+    *, generic_terminal_state: str, legacy_terminal_state: str, failure_kind: str | None
+) -> bool:
+    """Whether the run failed on tool-call protocol (format/no-tool) rather than
+    on evidence."""
+    if generic_terminal_state == "model_output_failure":
+        return True
+    if failure_kind in {"tool_protocol_failure", "tool_call_format_error", "no_tool_call"}:
+        return True
+    if legacy_terminal_state in {
+        "tool_call_format_error",
+        "no_tool_calls",
+        "empty_responses",
+    }:
+        return True
+    return False
+
+
+def _deterministic_operator_hit(
+    failure_inputs: dict[str, Any], recovery_strategies: list[str]
+) -> bool:
+    explicit = failure_inputs.get("deterministic_operator_hit")
+    if isinstance(explicit, bool):
+        return explicit
+    for strategy in recovery_strategies:
+        if not isinstance(strategy, str):
+            continue
+        low = strategy.lower()
+        if any(marker in low for marker in DETERMINISTIC_OPERATOR_MARKERS):
+            return True
+    return False
+
+
+def _failure_class_for(
+    generic_terminal_state: str, runner_present_but_failed: bool
+) -> str:
+    base = FAILURE_CLASS_BY_GENERIC_TERMINAL.get(generic_terminal_state, "unknown")
+    if base == "evidence_runner_missing" and runner_present_but_failed:
+        return "evidence_failed"
+    return base
+
+
+def _target_role_for(
+    *,
+    failure_class: str,
+    repair_should_target_test_or_setup: bool,
+    wrong_target_repair: bool,
+    test_or_setup_cause: bool,
+    obligation_failure_domains: list[str],
+) -> str:
+    if failure_class == "none":
+        return "none"
+    if failure_class == "missing_deliverable":
+        return "deliverable"
+    if failure_class == "missing_evidence":
+        return "evidence"
+    if failure_class == "tool_protocol_failure":
+        return "tool_protocol"
+    if repair_should_target_test_or_setup or wrong_target_repair:
+        return "test_or_setup"
+    if failure_class in {"evidence_failed", "recovery_exhausted"}:
+        # The failure markers (import/module/dependency/missing-test) do not
+        # disambiguate a test-side from a setup-side cause, so stay honest with
+        # the combined role rather than over-claiming "test".
+        return "test_or_setup" if test_or_setup_cause else "implementation"
+    for domain in obligation_failure_domains:
+        low = domain.lower()
+        if "test" in low:
+            return "test"
+        if "setup" in low or "manifest" in low or "dependency" in low:
+            return "setup"
+        if "deliverable" in low or "artifact" in low:
+            return "deliverable"
+    return "unknown"
+
+
+def _build_failure_observation(
+    *,
+    generic_terminal_state: str,
+    legacy_terminal_state: str,
+    postcheck_success: bool | None,
+    artifact_files: list[str],
+    write_target_counts: dict[str, int],
+    evidence_kind: str,
+    failure_kind: str | None,
+    anvil_score: dict | None,
+    recovery_strategy_count: int,
+    recovery_strategies: list[str],
+    projection: dict[str, Any],
+    failure_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    """Structure a single run's failure for replay classification.
+
+    Pure projection over already-parsed inputs (no I/O). Successful runs get
+    ``failure_class == "none"`` with the transition flags all False, so the
+    aggregate report can use every analyzed run as a rate denominator.
+    """
+    repeated_targets = sorted(
+        path for path, count in write_target_counts.items() if count >= 2
+    )[:8]
+
+    signature = failure_inputs.get("last_failure_signature")
+    if not isinstance(signature, str) or not signature:
+        diag_class = projection.get("diagnostic_class")
+        signature = diag_class if isinstance(diag_class, str) and diag_class else None
+    classification = failure_inputs.get("terminal_classification")
+    first_failing_diagnostic = signature or (
+        classification if isinstance(classification, str) else None
+    )
+
+    verify_commands = failure_inputs.get("verify_commands")
+    evidence_command = failure_inputs.get("evidence_command")
+    if not isinstance(evidence_command, str) and isinstance(verify_commands, list) and verify_commands:
+        evidence_command = verify_commands[0]
+    if not isinstance(evidence_command, str):
+        evidence_command = None
+
+    evidence_exit_code = failure_inputs.get("evidence_exit_code")
+    if not isinstance(evidence_exit_code, int) or isinstance(evidence_exit_code, bool):
+        evidence_exit_code = None
+    stdout_excerpt = failure_inputs.get("stdout_excerpt")
+    stdout_excerpt = stdout_excerpt if isinstance(stdout_excerpt, str) else None
+    stderr_excerpt = failure_inputs.get("stderr_excerpt")
+    stderr_excerpt = stderr_excerpt if isinstance(stderr_excerpt, str) else None
+
+    repair_count_override = failure_inputs.get("repair_count")
+    repair_count = (
+        repair_count_override
+        if isinstance(repair_count_override, int)
+        and not isinstance(repair_count_override, bool)
+        and repair_count_override >= 0
+        else recovery_strategy_count
+    )
+    invalid_proposal_count = failure_inputs.get("invalid_proposal_count")
+    if (
+        not isinstance(invalid_proposal_count, int)
+        or isinstance(invalid_proposal_count, bool)
+        or invalid_proposal_count < 0
+    ):
+        invalid_proposal_count = 0
+
+    missing_obligations = failure_inputs.get("missing_obligations")
+    missing_obligations = (
+        missing_obligations if isinstance(missing_obligations, list) else []
+    )
+    obligation_failure_domains = failure_inputs.get("obligation_failure_domains")
+    obligation_failure_domains = (
+        obligation_failure_domains
+        if isinstance(obligation_failure_domains, list)
+        else []
+    )
+
+    tool_protocol_error = _tool_protocol_error(
+        generic_terminal_state=generic_terminal_state,
+        legacy_terminal_state=legacy_terminal_state,
+        failure_kind=failure_kind,
+    )
+    runner_present_but_failed = _runner_present_but_failed(
+        generic_terminal_state=generic_terminal_state,
+        projection=projection,
+        failure_inputs=failure_inputs,
+        anvil_score=anvil_score,
+    )
+    failure_class = _failure_class_for(generic_terminal_state, runner_present_but_failed)
+    if failure_class not in KNOWN_FAILURE_CLASSES:
+        failure_class = "unknown"
+
+    test_or_setup_cause = _test_or_setup_cause(
+        signature=signature,
+        classification=classification,
+        failure_kind=failure_kind,
+        anvil_score=anvil_score,
+    )
+    impl_only_repaired = _impl_only_repaired(anvil_score, repeated_targets)
+    repaired_wrong_role = impl_only_repaired and test_or_setup_cause
+    repair_should_target_test_or_setup = (
+        repaired_wrong_role and generic_terminal_state in REPAIR_TERMINAL_STATES
+    )
+    wrong_target_repair = (
+        repaired_wrong_role and generic_terminal_state in EVIDENCE_RAN_TERMINAL_STATES
+    )
+
+    evidence_runner_executed = _evidence_runner_executed(
+        generic_terminal_state=generic_terminal_state,
+        projection=projection,
+        failure_inputs=failure_inputs,
+        anvil_score=anvil_score,
+    )
+    deterministic_operator_hit = _deterministic_operator_hit(
+        failure_inputs, recovery_strategies
+    )
+
+    consecutive_no_progress = _score_int(anvil_score, "consecutive_no_progress_turns")
+    same_diagnostic_repeated = (
+        first_failing_diagnostic is not None
+        and generic_terminal_state
+        in (EVIDENCE_RAN_TERMINAL_STATES | {"evidence_runner_missing"})
+        and (
+            (consecutive_no_progress or 0) >= 2
+            or repair_count >= 2
+            or bool(repeated_targets)
+        )
+    )
+
+    target_role = _target_role_for(
+        failure_class=failure_class,
+        repair_should_target_test_or_setup=repair_should_target_test_or_setup,
+        wrong_target_repair=wrong_target_repair,
+        test_or_setup_cause=test_or_setup_cause,
+        obligation_failure_domains=obligation_failure_domains,
+    )
+    if target_role not in KNOWN_TARGET_ROLES:
+        target_role = "unknown"
+
+    return {
+        "failure_class": failure_class,
+        "target_role": target_role,
+        "terminal_state": generic_terminal_state,
+        "legacy_terminal_state": legacy_terminal_state,
+        "postcheck_success": postcheck_success,
+        "generated_file_count": len(artifact_files),
+        "repair_count": repair_count,
+        "invalid_proposal_count": invalid_proposal_count,
+        "first_failing_diagnostic": first_failing_diagnostic,
+        "evidence_kind": evidence_kind,
+        "evidence_command": evidence_command,
+        "evidence_exit_code": evidence_exit_code,
+        "stdout_excerpt": stdout_excerpt,
+        "stderr_excerpt": stderr_excerpt,
+        "missing_deliverable": failure_class == "missing_deliverable",
+        "missing_evidence": failure_class == "missing_evidence",
+        "missing_obligations": missing_obligations,
+        "repeated_targets": repeated_targets,
+        "tool_protocol_error": tool_protocol_error,
+        "runner_present_but_failed": runner_present_but_failed,
+        "repair_should_target_test_or_setup": repair_should_target_test_or_setup,
+        "wrong_target_repair": wrong_target_repair,
+        "same_diagnostic_repeated": same_diagnostic_repeated,
+        "evidence_runner_executed": evidence_runner_executed,
+        "deterministic_operator_hit": deterministic_operator_hit,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +2003,7 @@ def main(argv: list[str]) -> int:
     failure_kind = _read_failure_kind(session)
     eval_log_taxonomy = _read_eval_taxonomy(run_dir)
     eval_objective_projection = _read_eval_objective_projection(run_dir)
+    failure_inputs = _read_failure_inputs(run_dir)
     token_prompt, token_completion = _read_token_usage(run_dir)
 
     files_modified = session_metrics["files_modified"]
@@ -1520,6 +2122,25 @@ def main(argv: list[str]) -> int:
             )
         )
 
+    # Issue #976 (parent #974, Issue B): structure the failure for replay
+    # classification + transition metrics. Emitted for every run (success ->
+    # failure_class "none") so report.py can use all analyzed runs as a rate
+    # denominator.
+    failure_observation = _build_failure_observation(
+        generic_terminal_state=generic_terminal_state,
+        legacy_terminal_state=legacy_terminal_state,
+        postcheck_success=postcheck_success,
+        artifact_files=artifact_files,
+        write_target_counts=session_metrics["write_target_counts"],
+        evidence_kind=evidence_kind,
+        failure_kind=failure_kind,
+        anvil_score=anvil_score,
+        recovery_strategy_count=recovery_strategy_count,
+        recovery_strategies=recovery_strategies,
+        projection=eval_objective_projection,
+        failure_inputs=failure_inputs,
+    )
+
     out: dict[str, Any] = {
         "anvil_score": anvil_score,
         "anvil_terminal_class": anvil_terminal_class,
@@ -1550,6 +2171,7 @@ def main(argv: list[str]) -> int:
         },
         "failure_authority": failure_authority,
         "failure_kind": failure_kind,
+        "failure_observation": failure_observation,
         "files_modified": files_modified,
         "generic_terminal_state": generic_terminal_state,
         "iter_count": session_metrics["iter_count"],

@@ -42,21 +42,37 @@ def _make_run(
     recovery_strategy_count: int | None = None,
     recovery_strategies: list[str] | None = None,
     worker_lifecycle: dict[str, object] | None = None,
+    extra_edits: list[str] | None = None,
+    terminal_diagnostics: dict[str, object] | None = None,
+    verify_commands: list[str] | None = None,
+    failure_observation: dict[str, object] | None = None,
 ) -> None:
-    session: dict[str, object] = {
-        "id": f"{task_kind}-{pam_variant}",
-        "messages": [
+    messages: list[dict[str, object]] = [
+        {
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [
+                {
+                    "name": "Write",
+                    "arguments": {"path": modified_path},
+                }
+            ],
+        }
+    ]
+    # Issue #976: extra Edit turns let a test exercise repeated repair targets.
+    for edit_path in extra_edits or []:
+        messages.append(
             {
                 "role": "assistant",
-                "content": "done",
+                "content": "edit",
                 "tool_calls": [
-                    {
-                        "name": "Write",
-                        "arguments": {"path": modified_path},
-                    }
+                    {"name": "Edit", "arguments": {"path": edit_path}},
                 ],
             }
-        ],
+        )
+    session: dict[str, object] = {
+        "id": f"{task_kind}-{pam_variant}",
+        "messages": messages,
     }
     if last_feedback_kind is not None:
         session["last_feedback"] = {"kind": last_feedback_kind}
@@ -100,6 +116,14 @@ def _make_run(
     if final_outcome is not None:
         eval_record["final_outcome"] = final_outcome
         eval_record["terminal_diagnostics"] = {"outcome": final_outcome}
+    if terminal_diagnostics is not None:
+        merged = dict(eval_record.get("terminal_diagnostics") or {})
+        merged.update(terminal_diagnostics)
+        eval_record["terminal_diagnostics"] = merged
+    if verify_commands is not None:
+        eval_record["verify_commands"] = verify_commands
+    if failure_observation is not None:
+        eval_record["failure_observation"] = failure_observation
     if recovery_strategy_count is not None:
         eval_record["recovery_strategy_count"] = recovery_strategy_count
     if recovery_strategies is not None:
@@ -932,6 +956,295 @@ class TestTaskKindEvalReporting(unittest.TestCase):
         self.assertTrue(data["task_kind_misroute"])
         self.assertFalse(data["postcheck_success"])
         self.assertEqual(data["postcheck_reason"], "missing_classification")
+
+
+class TestFailureObservationClassifier(unittest.TestCase):
+    """Issue #976 (parent #974, Issue B): FailureObservation replay classifier
+    and transition metrics."""
+
+    def _analyze(self, run_dir: pathlib.Path) -> dict:
+        result = subprocess.run(
+            [sys.executable, str(ANALYZE), str(run_dir)],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            check=True,
+        )
+        return json.loads(result.stdout)
+
+    def _observe(self, run_dir: pathlib.Path) -> dict:
+        return self._analyze(run_dir)["failure_observation"]
+
+    def _report_json(self, bench_root: pathlib.Path) -> dict:
+        result = subprocess.run(
+            [sys.executable, str(REPORT), "--format", "json", str(bench_root)],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+            check=True,
+        )
+        return json.loads(result.stdout)
+
+    def test_success_emits_neutral_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                final_outcome="done",
+            )
+            fo = self._observe(run_dir)
+        self.assertEqual(fo["failure_class"], "none")
+        self.assertEqual(fo["target_role"], "none")
+        self.assertEqual(fo["terminal_state"], "completed")
+        self.assertFalse(fo["runner_present_but_failed"])
+        self.assertFalse(fo["wrong_target_repair"])
+        self.assertFalse(fo["tool_protocol_error"])
+
+    def test_runner_present_but_failed_under_verifier_missing(self) -> None:
+        """Acceptance: a `safe_stop_verifier_missing` run whose runner actually
+        ran and failed is detected and reclassified to evidence_failed."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/lib.rs",
+                rc=1,
+                final_outcome="safe_stop_verifier_missing",
+                terminal_diagnostics={
+                    "verifier_status": "failed",
+                    "last_failure_signature": "error[E0432]: unresolved import",
+                },
+                anvil_score={"build_passed": False, "compile_error_count": 3},
+            )
+            data = self._analyze(run_dir)
+        fo = data["failure_observation"]
+        # legacy + generic terminal states are both observable (acceptance).
+        self.assertEqual(data["legacy_terminal_state"], "safe_stop_verifier_missing")
+        self.assertEqual(data["generic_terminal_state"], "evidence_runner_missing")
+        self.assertEqual(fo["terminal_state"], "evidence_runner_missing")
+        self.assertTrue(fo["runner_present_but_failed"])
+        self.assertEqual(fo["failure_class"], "evidence_failed")
+        self.assertTrue(fo["evidence_runner_executed"])
+
+    def test_repair_exhausted_should_target_test_or_setup(self) -> None:
+        """Acceptance: a `repair_exhausted` run that repeatedly edited the
+        implementation while the failure is a test import is detected."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.py",
+                rc=1,
+                final_outcome="repair_exhausted",
+                extra_edits=["src/main.py"],  # repeated impl target
+                terminal_diagnostics={
+                    "last_failure_signature": (
+                        "ModuleNotFoundError: No module named 'tests.helpers'"
+                    ),
+                },
+                anvil_score={
+                    "implementation_files_changed": 2,
+                    "test_files_changed": 0,
+                    "setup_files_changed": 0,
+                    "test_failure_count": 1,
+                    "consecutive_no_progress_turns": 3,
+                },
+            )
+            fo = self._observe(run_dir)
+        self.assertEqual(fo["terminal_state"], "evidence_repair_exhausted")
+        self.assertEqual(fo["failure_class"], "recovery_exhausted")
+        self.assertTrue(fo["repair_should_target_test_or_setup"])
+        self.assertTrue(fo["wrong_target_repair"])
+        self.assertEqual(fo["target_role"], "test_or_setup")
+        self.assertEqual(fo["repeated_targets"], ["src/main.py"])
+        self.assertTrue(fo["same_diagnostic_repeated"])
+
+    def test_tool_protocol_failure_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                rc=1,
+                final_outcome="tool_call_format_error",
+            )
+            fo = self._observe(run_dir)
+        self.assertEqual(fo["terminal_state"], "model_output_failure")
+        self.assertEqual(fo["failure_class"], "tool_protocol_failure")
+        self.assertTrue(fo["tool_protocol_error"])
+        self.assertEqual(fo["target_role"], "tool_protocol")
+        self.assertFalse(fo["evidence_runner_executed"])
+
+    def test_missing_evidence_and_deliverable_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            ev_dir = pathlib.Path(raw) / "ev"
+            _make_run(
+                ev_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                rc=1,
+                final_outcome="missing_evidence",
+            )
+            ev = self._observe(ev_dir)
+            del_dir = pathlib.Path(raw) / "del"
+            _make_run(
+                del_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                rc=1,
+                final_outcome="missing_deliverable",
+            )
+            de = self._observe(del_dir)
+        self.assertEqual(ev["failure_class"], "missing_evidence")
+        self.assertTrue(ev["missing_evidence"])
+        self.assertEqual(ev["target_role"], "evidence")
+        self.assertEqual(de["failure_class"], "missing_deliverable")
+        self.assertTrue(de["missing_deliverable"])
+        self.assertEqual(de["target_role"], "deliverable")
+
+    def test_failure_observation_override_block_surfaced(self) -> None:
+        """Fields the eval log does not derive itself (exit code, excerpts,
+        invalid-proposal/repair counts, operator hit) ride an optional
+        `failure_observation` block and override the defaults."""
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                rc=1,
+                final_outcome="evidence_failed",
+                verify_commands=["pytest -q"],
+                failure_observation={
+                    "evidence_command": "pytest -q tests/",
+                    "evidence_exit_code": 1,
+                    "stdout_excerpt": "1 failed",
+                    "stderr_excerpt": "AssertionError",
+                    "invalid_proposal_count": 2,
+                    "repair_count": 4,
+                    "deterministic_operator_hit": True,
+                },
+            )
+            fo = self._observe(run_dir)
+        self.assertEqual(fo["evidence_command"], "pytest -q tests/")
+        self.assertEqual(fo["evidence_exit_code"], 1)
+        self.assertEqual(fo["stdout_excerpt"], "1 failed")
+        self.assertEqual(fo["stderr_excerpt"], "AssertionError")
+        self.assertEqual(fo["invalid_proposal_count"], 2)
+        self.assertEqual(fo["repair_count"], 4)
+        self.assertTrue(fo["deterministic_operator_hit"])
+        self.assertTrue(fo["evidence_runner_executed"])
+
+    def test_deterministic_operator_hit_from_recovery_strategies(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                rc=1,
+                final_outcome="evidence_failed",
+                recovery_strategies=["deterministic_compile_repair"],
+            )
+            fo = self._observe(run_dir)
+        self.assertTrue(fo["deterministic_operator_hit"])
+
+    def test_report_transition_metrics_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            bench_root = pathlib.Path(raw) / "bench-root"
+            base = bench_root / "qwen3" / "coding" / "pam_off"
+            _make_run(
+                base / "run-1",
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                final_outcome="done",
+                anvil_score={"tests_passed": True},
+            )
+            _make_run(
+                base / "run-2",
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/lib.rs",
+                rc=1,
+                final_outcome="safe_stop_verifier_missing",
+                terminal_diagnostics={
+                    "verifier_status": "failed",
+                    "last_failure_signature": "error[E0432]: unresolved import",
+                },
+                anvil_score={"build_passed": False, "compile_error_count": 1},
+            )
+            _make_run(
+                base / "run-3",
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.py",
+                rc=1,
+                final_outcome="repair_exhausted",
+                extra_edits=["src/main.py"],
+                terminal_diagnostics={
+                    "last_failure_signature": (
+                        "ModuleNotFoundError: No module named 'tests.helpers'"
+                    ),
+                },
+                anvil_score={
+                    "implementation_files_changed": 2,
+                    "test_files_changed": 0,
+                    "setup_files_changed": 0,
+                    "test_failure_count": 1,
+                    "consecutive_no_progress_turns": 3,
+                },
+            )
+            _make_run(
+                base / "run-4",
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="src/main.rs",
+                rc=1,
+                final_outcome="tool_call_format_error",
+            )
+            metrics = self._report_json(bench_root)["transition_metrics"]
+            markdown = subprocess.run(
+                [sys.executable, str(REPORT), str(bench_root)],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+                check=True,
+            ).stdout
+
+        self.assertEqual(metrics["runs"], 4)
+        self.assertEqual(metrics["failure_class"]["none"], 1)
+        self.assertEqual(metrics["failure_class"]["evidence_failed"], 1)
+        self.assertEqual(metrics["failure_class"]["recovery_exhausted"], 1)
+        self.assertEqual(metrics["failure_class"]["tool_protocol_failure"], 1)
+        self.assertEqual(metrics["evidence_failed"], 1)
+        self.assertEqual(metrics["recovery_exhausted"], 1)
+        self.assertEqual(metrics["tool_protocol_failure"], 1)
+        self.assertEqual(metrics["wrong_target_repair"], 1)
+        self.assertEqual(metrics["same_diagnostic_repeated"], 1)
+        self.assertEqual(metrics["runner_present_but_failed"], 1)
+        self.assertEqual(metrics["repair_should_target_test_or_setup"], 1)
+        self.assertEqual(metrics["evidence_runner_executed"]["ok"], 3)
+        self.assertEqual(metrics["evidence_runner_executed"]["total"], 4)
+        self.assertAlmostEqual(metrics["evidence_runner_executed"]["rate"], 0.75)
+        self.assertEqual(metrics["deterministic_operator_hit"]["ok"], 0)
+
+        self.assertIn("## Transition Metrics", markdown)
+        self.assertIn("| evidence_failed | 1 |", markdown)
+        self.assertIn("| evidence_runner_executed | 3/4 (75%) |", markdown)
 
 
 if __name__ == "__main__":

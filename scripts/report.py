@@ -485,6 +485,67 @@ def _quality_summary(rows: list[dict]) -> dict:
     }
 
 
+# Issue #976 (parent #974, Issue B): transition metrics aggregated from the
+# per-run `failure_observation` projection emitted by analyze_run.py.
+TRANSITION_FLAG_METRICS = (
+    "wrong_target_repair",
+    "same_diagnostic_repeated",
+    "runner_present_but_failed",
+    "repair_should_target_test_or_setup",
+    "missing_evidence",
+    "missing_deliverable",
+)
+TRANSITION_RATE_METRICS = (
+    "evidence_runner_executed",
+    "deterministic_operator_hit",
+)
+
+
+def _transition_metrics(rows: list[dict]) -> dict:
+    """Aggregate per-run failure_observation flags into transition metrics.
+
+    Surfaces the lifecycle transition signals the v0.6.3 countermeasure analysis
+    tracks (Issue #976): failure-class distribution, wrong-target / repeated-
+    diagnostic / tool-protocol counts, plus evidence-runner-executed and
+    deterministic-operator-hit rates. The denominator for rates is every
+    analyzed run that carries a failure_observation, so a shrinking
+    missing_evidence count against a stable runner-executed rate is visible.
+    """
+    observations = [
+        row["failure_observation"]
+        for row in rows
+        if not row.get("_failed") and isinstance(row.get("failure_observation"), dict)
+    ]
+    total = len(observations)
+
+    def _count_true(key: str) -> int:
+        return sum(1 for o in observations if o.get(key) is True)
+
+    def _count_strings(key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for o in observations:
+            raw = o.get(key)
+            value = raw if isinstance(raw, str) and raw else "unknown"
+            counts[value] = counts.get(value, 0) + 1
+        return dict(sorted(counts.items()))
+
+    failure_class = _count_strings("failure_class")
+    out: dict = {
+        "runs": total,
+        "failure_class": failure_class,
+        "target_role": _count_strings("target_role"),
+        "tool_protocol_failure": _count_true("tool_protocol_error"),
+        "evidence_failed": failure_class.get("evidence_failed", 0),
+        "recovery_exhausted": failure_class.get("recovery_exhausted", 0),
+    }
+    for metric in TRANSITION_FLAG_METRICS:
+        out[metric] = _count_true(metric)
+    for metric in TRANSITION_RATE_METRICS:
+        ok = _count_true(metric)
+        out[metric] = {"ok": ok, "total": total, "rate": _ratio(ok, total)}
+    return out
+
+
 def _grouped_quality(rows: list[dict], group_keys: list[str]) -> list[dict]:
     groups: dict[tuple[str, ...], list[dict]] = {}
     for r in rows:
@@ -839,6 +900,45 @@ def _render_recovery_job_summary(rows: list[dict]) -> list[str]:
     )
 
 
+def _fmt_rate_cell(stat: dict) -> str:
+    ok = stat.get("ok", 0)
+    total = stat.get("total", 0)
+    rate = stat.get("rate")
+    pct = "N/A" if not isinstance(rate, (int, float)) else f"{rate * 100:.0f}%"
+    return f"{ok}/{total} ({pct})"
+
+
+def _render_transition_metrics_summary(rows: list[dict]) -> list[str]:
+    metrics = _transition_metrics(rows)
+    lines = ["## Transition Metrics", ""]
+    if metrics["runs"] == 0:
+        lines.append("(no completed analyses)")
+        return lines
+    lines.append("| metric | value |")
+    lines.append("|-----|-----|")
+    lines.append(f"| runs | {metrics['runs']} |")
+    for metric in (
+        "missing_evidence",
+        "missing_deliverable",
+        "evidence_failed",
+        "recovery_exhausted",
+        "wrong_target_repair",
+        "same_diagnostic_repeated",
+        "tool_protocol_failure",
+        "runner_present_but_failed",
+        "repair_should_target_test_or_setup",
+    ):
+        lines.append(f"| {metric} | {metrics[metric]} |")
+    for metric in TRANSITION_RATE_METRICS:
+        lines.append(f"| {metric} | {_fmt_rate_cell(metrics[metric])} |")
+    lines.append("")
+    lines.append("| failure_class | count |")
+    lines.append("|-----|-----|")
+    for name, count in metrics["failure_class"].items():
+        lines.append(f"| {name} | {count} |")
+    return lines
+
+
 def _worker_lifecycle_rows(rows: list[dict]) -> list[dict]:
     lifecycle_keys = {
         "worker_kind",
@@ -912,6 +1012,8 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
         parts.append("")
         parts.extend(_render_recovery_job_summary(rows))
         parts.append("")
+        parts.extend(_render_transition_metrics_summary(rows))
+        parts.append("")
         if _worker_lifecycle_rows(rows):
             parts.extend(_render_worker_lifecycle_summary(rows))
             parts.append("")
@@ -969,6 +1071,7 @@ def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
             analyzed, ["task_kind", "pam_variant"]
         ),
         "by_failure_authority": _grouped_quality(analyzed, ["failure_authority"]),
+        "transition_metrics": _transition_metrics(analyzed),
     }
     return json.dumps(out, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
 
