@@ -4658,6 +4658,73 @@ E   assert [{'id': 1}] == []\n";
     }
 
     #[test]
+    fn verifier_diagnostic_rejects_no_progress_banned_target_reselection() {
+        // Issue #990 (AC3): once a target is banned for no progress, the
+        // diagnostic LLM re-selecting it is rejected and a fresh alternate is
+        // chosen instead.
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let app = work_root.join("app").join("main.py");
+        let alt = work_root.join("app").join("service.py");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, "todos = []\n").unwrap();
+        std::fs::write(&alt, "def handle():\n    return 1\n").unwrap();
+        let mut context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            "FAILED tests/test_health.py::test_list_empty - AssertionError\n",
+            &["app/main.py".to_string()],
+            2,
+            None,
+        );
+        context.failure_type = super::super::VerifierFailureType::AssertionFailure;
+        // Ban the implementation target the previous repair made no progress on.
+        let scope = context
+            .no_progress_cluster_scope()
+            .expect("scope available from failure signature");
+        context.no_progress_policy.record_no_progress(
+            &scope,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "app/main.py",
+        );
+
+        let parsed = super::parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"assertion_mismatch",
+                "probable_cause_role":"implementation",
+                "repair_plan":[
+                    {"target":"app/main.py","intent":"retry the banned target","confidence":0.95},
+                    {"target":"app/service.py","intent":"fresh alternate","confidence":0.9}
+                ]
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let ws = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &ws);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+
+        assert!(
+            assessment
+                .repair_plan
+                .iter()
+                .all(|hint| hint.path != "app/main.py"),
+            "banned target must be rejected from repair_plan: {:?}",
+            assessment.repair_plan
+        );
+        assert_eq!(
+            assessment
+                .repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("app/service.py"),
+            "fresh alternate should be selected after the banned target is rejected"
+        );
+    }
+
+    #[test]
     fn verifier_diagnostic_stale_assertion_keeps_role_kind_compatible_target_after_improved_non_test_repair()
      {
         let temp = tempdir().unwrap();

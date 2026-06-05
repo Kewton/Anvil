@@ -89,6 +89,7 @@ fn enforce_safe_stop_payload_hard_cap(report: &SafeStopReport) -> serde_json::Va
         "expected_target": serde_json::Value::Null,
         "actual_actions": serde_json::json!([]),
         "diagnostic_target_missing_reason": serde_json::Value::Null,
+        "no_progress_reason": report.no_progress_reason,
         "blocker_class": safe_stop_blocker_class(report),
         "authority_status": safe_stop_authority_status(report),
         "next_user_action": safe_stop_next_user_action(report),
@@ -178,6 +179,8 @@ fn render_safe_stop_payload(report: &SafeStopReport, truncated: bool) -> serde_j
         "diagnostic_target_missing_reason": report
             .diagnostic_target_missing_reason
             .map(|r| r.as_str()),
+        // Issue #990: no-progress `repair_exhausted` sub-classification.
+        "no_progress_reason": report.no_progress_reason,
         "blocker_class": safe_stop_blocker_class(report),
         "authority_status": safe_stop_authority_status(report),
         "next_user_action": safe_stop_next_user_action(report),
