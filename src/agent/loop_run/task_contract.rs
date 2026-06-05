@@ -169,6 +169,83 @@ impl TaskClassification {
     }
 }
 
+/// Issue #975: objective-layer classification name for the generic
+/// Objective/Evidence lifecycle. Coding is mainstreamed as *one* objective kind
+/// (`ObjectiveKind::Coding`) rather than the privileged default, so docs / data
+/// / research / ops / authoring objectives share the same lifecycle vocabulary.
+///
+/// This projects 1:1 from the classification-layer [`TaskKind`]: `TaskKind` is
+/// *how the request was classified* (keyword inference + confirm), while
+/// `ObjectiveKind` is *what the lifecycle is driving toward*. Keeping them as
+/// distinct names — rather than reusing `TaskKind` directly at the lifecycle
+/// layer — leaves a stable seam for future objectives that are not 1:1 with a
+/// keyword-classified `TaskKind`. [`Self::from_task_kind`] is the SSOT mapping.
+#[allow(dead_code)] // Issue #975: objective-layer vocabulary; producers wire incrementally (#947 pattern).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectiveKind {
+    Coding,
+    Docs,
+    Data,
+    Research,
+    Ops,
+    Authoring,
+}
+
+impl ObjectiveKind {
+    /// SSOT projection from the classification-layer [`TaskKind`].
+    pub(super) fn from_task_kind(task_kind: TaskKind) -> Self {
+        match task_kind {
+            TaskKind::Coding => ObjectiveKind::Coding,
+            TaskKind::Docs => ObjectiveKind::Docs,
+            TaskKind::Data => ObjectiveKind::Data,
+            TaskKind::Research => ObjectiveKind::Research,
+            TaskKind::Ops => ObjectiveKind::Ops,
+            TaskKind::Authoring => ObjectiveKind::Authoring,
+        }
+    }
+
+    #[allow(dead_code)] // Issue #975: round-trip accessor for callers that bridge back to TaskKind.
+    pub(super) fn to_task_kind(self) -> TaskKind {
+        match self {
+            ObjectiveKind::Coding => TaskKind::Coding,
+            ObjectiveKind::Docs => TaskKind::Docs,
+            ObjectiveKind::Data => TaskKind::Data,
+            ObjectiveKind::Research => TaskKind::Research,
+            ObjectiveKind::Ops => TaskKind::Ops,
+            ObjectiveKind::Authoring => TaskKind::Authoring,
+        }
+    }
+
+    #[allow(dead_code)] // Issue #975: byte-stable label reuses TaskKind::as_str so goldens stay green.
+    pub(super) fn label(self) -> &'static str {
+        self.to_task_kind().as_str()
+    }
+
+    #[allow(dead_code)] // Issue #975: coding is one objective kind, not the privileged default.
+    pub(super) fn is_coding(self) -> bool {
+        matches!(self, ObjectiveKind::Coding)
+    }
+}
+
+/// Issue #947: projection vocabulary before all telemetry consumers are wired.
+///
+/// Issue #975: this is the canonical **DeliverableSpec** vocabulary the generic
+/// Objective/Evidence lifecycle speaks (see the [`DeliverableSpec`] alias). It
+/// can express every deliverable shape the lifecycle produces:
+///
+/// | request shape          | variant                                             |
+/// |------------------------|-----------------------------------------------------|
+/// | source / test / config | `SourceFiles` (role split lives in `ArtifactRole` / `DeliverableKind`) |
+/// | document               | `DocumentSections`                                  |
+/// | dataset                | `OutputFile`                                        |
+/// | command result         | `CommandObservation`                                |
+/// | research notes         | `ResearchNotes`                                     |
+/// | visual observation     | `VisualObservation`                                 |
+/// | explanation text       | `ProseArtifact` / `Answer`                          |
+///
+/// The objective layer intentionally groups source/test/config under a coding
+/// objective's `SourceFiles`; the per-artifact role granularity (test vs config
+/// vs source) is the obligation layer's job (`ArtifactRole` / `DeliverableKind`).
 #[allow(dead_code)] // Issue #947: projection vocabulary before all telemetry consumers are wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObjectiveDeliverableKind {
@@ -177,6 +254,10 @@ pub(super) enum ObjectiveDeliverableKind {
     OutputFile,
     ResearchNotes,
     CommandObservation,
+    /// Issue #975: media-reading / screenshot-description style deliverables
+    /// whose product is an observation of visual content rather than a file
+    /// edit or a command result.
+    VisualObservation,
     ProseArtifact,
     Answer,
 }
@@ -190,12 +271,34 @@ impl ObjectiveDeliverableKind {
             ObjectiveDeliverableKind::OutputFile => "output_file",
             ObjectiveDeliverableKind::ResearchNotes => "research_notes",
             ObjectiveDeliverableKind::CommandObservation => "command_observation",
+            ObjectiveDeliverableKind::VisualObservation => "visual_observation",
             ObjectiveDeliverableKind::ProseArtifact => "prose_artifact",
             ObjectiveDeliverableKind::Answer => "answer",
         }
     }
 }
 
+/// Issue #975: lifecycle-layer name for the canonical deliverable taxonomy.
+/// Aliasing (rather than introducing a third parallel enum) keeps the generic
+/// vocabulary single-sourced per the "abstraction を増やさない" project rule.
+#[allow(dead_code)] // Issue #975: named scope for the generic lifecycle; consumers wire incrementally.
+pub(super) type DeliverableSpec = ObjectiveDeliverableKind;
+
+/// Issue #947: projection vocabulary before all telemetry consumers are wired.
+///
+/// Issue #975: this is the canonical **EvidenceSpec** vocabulary (see the
+/// [`EvidenceSpec`] alias). It can express every evidence shape the lifecycle
+/// accepts:
+///
+/// | evidence shape       | variant                  |
+/// |----------------------|--------------------------|
+/// | test run             | `TestRun`                |
+/// | content check        | `ContentCheck`           |
+/// | schema check         | `SchemaCheck`            |
+/// | command observation  | `SafetyBoundaryEvidence` |
+/// | source citation      | `SourceFetchEvidence`    |
+/// | file layout          | `FileLayoutCheck`        |
+/// | explanation coverage | `ContentAcceptance`      |
 #[allow(dead_code)] // Issue #947: projection vocabulary before all telemetry consumers are wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObjectiveEvidenceKind {
@@ -204,6 +307,10 @@ pub(super) enum ObjectiveEvidenceKind {
     SchemaCheck,
     SourceFetchEvidence,
     SafetyBoundaryEvidence,
+    /// Issue #975: file-organization / layout evidence — the deliverable is a
+    /// directory shape or file placement, verified by observing the resulting
+    /// layout rather than running a test or parsing a schema.
+    FileLayoutCheck,
     ContentAcceptance,
 }
 
@@ -216,17 +323,28 @@ impl ObjectiveEvidenceKind {
             ObjectiveEvidenceKind::SchemaCheck => "schema_check",
             ObjectiveEvidenceKind::SourceFetchEvidence => "source_fetch_evidence",
             ObjectiveEvidenceKind::SafetyBoundaryEvidence => "safety_boundary_evidence",
+            ObjectiveEvidenceKind::FileLayoutCheck => "file_layout_check",
             ObjectiveEvidenceKind::ContentAcceptance => "content_acceptance",
         }
     }
 }
 
+/// Issue #975: lifecycle-layer name for the canonical evidence taxonomy. See
+/// [`DeliverableSpec`] for the rationale behind aliasing instead of adding a
+/// parallel enum.
+#[allow(dead_code)] // Issue #975: named scope for the generic lifecycle; consumers wire incrementally.
+pub(super) type EvidenceSpec = ObjectiveEvidenceKind;
+
 #[allow(dead_code)] // Issue #947: read-only ObjectiveContract projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ObjectiveContract {
+    /// Classification-layer kind (kept for back-compat with existing readers).
     pub(super) task_kind: TaskKind,
-    pub(super) deliverable_kind: ObjectiveDeliverableKind,
-    pub(super) evidence_kind: ObjectiveEvidenceKind,
+    /// Issue #975: objective-layer kind — coding is `ObjectiveKind::Coding`,
+    /// one kind among the non-coding objectives rather than the default.
+    pub(super) objective_kind: ObjectiveKind,
+    pub(super) deliverable_kind: DeliverableSpec,
+    pub(super) evidence_kind: EvidenceSpec,
 }
 
 impl ObjectiveContract {
@@ -234,6 +352,7 @@ impl ObjectiveContract {
         if contract.completion_policy.project_intent == CompletionProjectIntent::AnswerOnly {
             return Self {
                 task_kind: contract.task_kind,
+                objective_kind: ObjectiveKind::from_task_kind(contract.task_kind),
                 deliverable_kind: ObjectiveDeliverableKind::Answer,
                 evidence_kind: ObjectiveEvidenceKind::ContentAcceptance,
             };
@@ -268,6 +387,7 @@ impl ObjectiveContract {
 
         Self {
             task_kind: contract.task_kind,
+            objective_kind: ObjectiveKind::from_task_kind(contract.task_kind),
             deliverable_kind,
             evidence_kind,
         }
@@ -6746,6 +6866,152 @@ mod tests {
             answer_projection.evidence_kind,
             ObjectiveEvidenceKind::ContentAcceptance
         );
+    }
+
+    #[test]
+    fn objective_kind_round_trips_task_kind() {
+        // Issue #975: coding is mainstreamed as one objective kind
+        // (`ObjectiveKind::Coding`), and every TaskKind projects 1:1.
+        let cases = [
+            (TaskKind::Coding, ObjectiveKind::Coding, "coding"),
+            (TaskKind::Docs, ObjectiveKind::Docs, "docs"),
+            (TaskKind::Data, ObjectiveKind::Data, "data"),
+            (TaskKind::Research, ObjectiveKind::Research, "research"),
+            (TaskKind::Ops, ObjectiveKind::Ops, "ops"),
+            (TaskKind::Authoring, ObjectiveKind::Authoring, "authoring"),
+        ];
+        for (task_kind, objective_kind, label) in cases {
+            assert_eq!(ObjectiveKind::from_task_kind(task_kind), objective_kind);
+            assert_eq!(objective_kind.to_task_kind(), task_kind);
+            assert_eq!(objective_kind.label(), label);
+            assert_eq!(objective_kind.label(), task_kind.as_str());
+            assert_eq!(
+                objective_kind.is_coding(),
+                task_kind == TaskKind::Coding,
+                "objective_kind={objective_kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn objective_contract_carries_objective_kind() {
+        // Issue #975: the projection exposes the objective-layer kind alongside
+        // the classification-layer task_kind for all six kinds.
+        let cases = [
+            (
+                "Implement a Rust library feature X and add tests",
+                TaskKind::Coding,
+            ),
+            (
+                "Update README.md with installation, usage, and testing sections",
+                TaskKind::Docs,
+            ),
+            (
+                "Clean data.csv and write summary.csv with grouped totals",
+                TaskKind::Data,
+            ),
+            (
+                "Research and compare local LLM options, include sources and a recommendation",
+                TaskKind::Research,
+            ),
+            (
+                "Prepare a deployment runbook checklist with rollback steps",
+                TaskKind::Ops,
+            ),
+            (
+                "Translate README.ja.md into English and write README.md",
+                TaskKind::Authoring,
+            ),
+        ];
+        for (request, task_kind) in cases {
+            let projection = TaskContract::from_request(request).objective_contract();
+            assert_eq!(projection.task_kind, task_kind, "request={request}");
+            assert_eq!(
+                projection.objective_kind,
+                ObjectiveKind::from_task_kind(task_kind),
+                "request={request}"
+            );
+        }
+    }
+
+    #[test]
+    fn deliverable_spec_expresses_full_taxonomy() {
+        // Issue #975: DeliverableSpec must be able to express source/test/config/
+        // document/dataset/command result/research notes/visual observation/
+        // explanation text. source/test/config share the objective-layer
+        // `SourceFiles` variant (role split is the obligation layer's job).
+        let taxonomy: &[(&str, DeliverableSpec, &str)] = &[
+            ("source", DeliverableSpec::SourceFiles, "source_files"),
+            ("test", DeliverableSpec::SourceFiles, "source_files"),
+            ("config", DeliverableSpec::SourceFiles, "source_files"),
+            (
+                "document",
+                DeliverableSpec::DocumentSections,
+                "document_sections",
+            ),
+            ("dataset", DeliverableSpec::OutputFile, "output_file"),
+            (
+                "command result",
+                DeliverableSpec::CommandObservation,
+                "command_observation",
+            ),
+            (
+                "research notes",
+                DeliverableSpec::ResearchNotes,
+                "research_notes",
+            ),
+            (
+                "visual observation",
+                DeliverableSpec::VisualObservation,
+                "visual_observation",
+            ),
+            (
+                "explanation text",
+                DeliverableSpec::ProseArtifact,
+                "prose_artifact",
+            ),
+        ];
+        for (taxonomy_term, spec, label) in taxonomy {
+            assert_eq!(spec.label(), *label, "taxonomy_term={taxonomy_term}");
+        }
+        // The Issue #975 additions are reachable as the named DeliverableSpec type.
+        let _: DeliverableSpec = ObjectiveDeliverableKind::VisualObservation;
+    }
+
+    #[test]
+    fn evidence_spec_expresses_full_taxonomy() {
+        // Issue #975: EvidenceSpec must be able to express test run/content check/
+        // schema check/command observation/source citation/file layout/
+        // explanation coverage.
+        let taxonomy: &[(&str, EvidenceSpec, &str)] = &[
+            ("test run", EvidenceSpec::TestRun, "test_run"),
+            ("content check", EvidenceSpec::ContentCheck, "content_check"),
+            ("schema check", EvidenceSpec::SchemaCheck, "schema_check"),
+            (
+                "command observation",
+                EvidenceSpec::SafetyBoundaryEvidence,
+                "safety_boundary_evidence",
+            ),
+            (
+                "source citation",
+                EvidenceSpec::SourceFetchEvidence,
+                "source_fetch_evidence",
+            ),
+            (
+                "file layout",
+                EvidenceSpec::FileLayoutCheck,
+                "file_layout_check",
+            ),
+            (
+                "explanation coverage",
+                EvidenceSpec::ContentAcceptance,
+                "content_acceptance",
+            ),
+        ];
+        for (taxonomy_term, spec, label) in taxonomy {
+            assert_eq!(spec.label(), *label, "taxonomy_term={taxonomy_term}");
+        }
+        let _: EvidenceSpec = ObjectiveEvidenceKind::FileLayoutCheck;
     }
 
     #[test]

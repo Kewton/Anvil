@@ -775,6 +775,45 @@ mod tests {
     }
 
     #[test]
+    fn legacy_terminal_labels_remain_projected_for_issue_975() {
+        // Issue #975 requirement 5 / AC1: the coding-era terminal labels named in
+        // the issue must survive as legacy projections even though the internal
+        // terminal vocabulary is now generic. Each legacy label must reproduce
+        // from its ExitReason AND carry a generic projection + recovery routing.
+        let cases = [
+            (ExitReason::MissingRepoEdits, "missing_repo_edits"),
+            (ExitReason::MissingVerification, "missing_verification"),
+            (
+                ExitReason::SafeStopVerifierMissing,
+                "safe_stop_verifier_missing",
+            ),
+            (ExitReason::RepairExhausted, "repair_exhausted"),
+            (ExitReason::ToolCallFormatError, "tool_call_format_error"),
+        ];
+        for (reason, legacy_label) in cases {
+            let outcome = RunTerminalOutcome::from_exit_reason(reason);
+            assert_eq!(reason.label(), legacy_label, "reason={reason:?}");
+            assert_eq!(
+                outcome.legacy_label_for_eval(),
+                legacy_label,
+                "reason={reason:?}"
+            );
+            // The generic projection is distinct from the legacy label (the
+            // internal vocabulary is generic, the wire label stays legacy).
+            assert_ne!(
+                outcome.generic_label(),
+                legacy_label,
+                "generic label should not equal legacy for reason={reason:?}"
+            );
+            // Every named legacy failure routes to a generic recovery job.
+            assert!(
+                reason.recovery_job_kind().is_some(),
+                "reason={reason:?} must project to a recovery job"
+            );
+        }
+    }
+
+    #[test]
     fn success_only_for_done() {
         assert!(ExitReason::Done.is_success());
         assert!(!ExitReason::MaxIterations.is_success());
