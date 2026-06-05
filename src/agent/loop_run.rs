@@ -442,6 +442,13 @@ pub mod commands;
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
 mod evidence_runner;
+// Issue #988 (parent #974): EvidenceBinding / NoProgressRecovery lifecycle
+// boundary. `EvidenceBindingPlan` + `RepairOperatorId` registry +
+// `RepairExhaustionClass` decomposition + `NoProgressRecoveryPolicy` unify the
+// Rust/Node binding mismatch and no-progress recovery shapes behind one generic
+// lifecycle (extensible to docs/data/research). Extension seam; focused tests
+// pin the shape before the child issues (#989-#994) wire broad callers.
+mod evidence_binding;
 mod worker_contract;
 // Issue #950: delegated local-LLM persistence policy. Records static
 // controller recovery strategy labels and gates prose-only recovery exits
