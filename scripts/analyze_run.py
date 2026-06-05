@@ -814,6 +814,25 @@ def _generic_terminal_state(final_outcome: str | None, rc: Any) -> str:
     return "unknown"
 
 
+def _normalize_generic_terminal_state_from_worker_lifecycle(
+    generic_terminal_state: str, projection: dict[str, Any]
+) -> str:
+    """Use deterministic worker observations to refine legacy terminal labels.
+
+    Older replay logs can end with ``missing_evidence`` even after a runner was
+    bound and a rerun failed. Keep the legacy label readable, but route the
+    generic lifecycle through evidence failure so recovery analysis does not
+    schedule a missing-evidence job for a failed runner.
+    """
+    if generic_terminal_state != "missing_evidence":
+        return generic_terminal_state
+    if projection.get("runner_bound") is not True:
+        return generic_terminal_state
+    if projection.get("evidence_created") is True or projection.get("rerun_passed") is False:
+        return "evidence_failed"
+    return generic_terminal_state
+
+
 def _recovery_job_kind_for_terminal(generic_terminal_state: str) -> str:
     return RECOVERY_JOB_BY_GENERIC_TERMINAL.get(generic_terminal_state, "unknown")
 
@@ -1408,16 +1427,22 @@ def main(argv: list[str]) -> int:
         if isinstance(final_outcome, str) and final_outcome
         else ("done" if _anvil_terminal_success(meta["rc"]) is True else "unknown")
     )
-    generic_terminal_state = eval_objective_projection.get(
+    raw_generic_terminal_state = eval_objective_projection.get(
         "generic_terminal_state",
         _generic_terminal_state(final_outcome, meta["rc"]),
     )
+    generic_terminal_state = _normalize_generic_terminal_state_from_worker_lifecycle(
+        raw_generic_terminal_state, eval_objective_projection
+    )
     if generic_terminal_state not in KNOWN_GENERIC_TERMINAL_STATES:
         generic_terminal_state = "unknown"
-    recovery_job_kind = eval_objective_projection.get(
-        "recovery_job_kind",
-        _recovery_job_kind_for_terminal(generic_terminal_state),
-    )
+    if generic_terminal_state != raw_generic_terminal_state:
+        recovery_job_kind = _recovery_job_kind_for_terminal(generic_terminal_state)
+    else:
+        recovery_job_kind = eval_objective_projection.get(
+            "recovery_job_kind",
+            _recovery_job_kind_for_terminal(generic_terminal_state),
+        )
     recovery_strategy_count = eval_objective_projection.get("recovery_strategy_count", 0)
     if not isinstance(recovery_strategy_count, int) or isinstance(
         recovery_strategy_count, bool
