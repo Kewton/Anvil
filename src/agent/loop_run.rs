@@ -497,6 +497,7 @@ mod repair_attempt_outcome;
 mod repair_driver;
 // v0.4.25: pure assertion/output analysis helpers shared by verifier repair
 // diagnostics and generated-test semantic weakening filters.
+mod mechanical_compile_repair;
 mod repair_assertion_analysis;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only

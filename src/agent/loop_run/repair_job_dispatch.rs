@@ -311,6 +311,24 @@ fn handle_repair_job_patch_provider_step(
         "Verifier repair",
         "Running controller-applied repair pass for the selected target.",
     );
+    if let super::mechanical_compile_repair::MechanicalCompileRepairOutcome::Applied {
+        relative_path,
+    } =
+        super::mechanical_compile_repair::try_apply_mechanical_compile_repair(agent, &target_hint)
+    {
+        *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        write_repair_job_step_status(
+            agent,
+            args.last_iter,
+            "Verifier repair",
+            &format!(
+                "Applied deterministic compile repair to {relative_path}; verifier will rerun."
+            ),
+        );
+        return TaskContractVerifierFlowOutcome::Continue;
+    }
     match super::verifier_orchestration::run_verifier_repair_pass_and_apply(agent, &target_hint) {
         VerifierRepairPassOutcome::Applied { relative_path } => {
             *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
