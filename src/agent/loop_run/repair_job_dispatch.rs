@@ -311,6 +311,26 @@ fn handle_repair_job_patch_provider_step(
         "Verifier repair",
         "Running controller-applied repair pass for the selected target.",
     );
+    // Issue #978 (parent #974, Issue D): deterministic EvidenceFailed operator
+    // for missing serde-family Cargo dependencies runs before the LLM repair
+    // pass. Keyed on the failure diagnostic (not `target_hint`) so it stays
+    // correct even when target selection misroutes; edits `Cargo.toml`.
+    if let super::cargo_dependency_repair::CargoDependencyRepairOutcome::Applied { relative_path } =
+        super::cargo_dependency_repair::try_apply_cargo_dependency_repair(agent)
+    {
+        *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
+        *args.repo_change_retries = 0;
+        *args.verifier_repair_retries = 0;
+        write_repair_job_step_status(
+            agent,
+            args.last_iter,
+            "Verifier repair",
+            &format!(
+                "Added missing Cargo dependencies to {relative_path} deterministically; verifier will rerun."
+            ),
+        );
+        return TaskContractVerifierFlowOutcome::Continue;
+    }
     if let super::mechanical_compile_repair::MechanicalCompileRepairOutcome::Applied {
         relative_path,
     } =
