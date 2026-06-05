@@ -425,6 +425,7 @@ pub mod commands;
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
 mod evidence_runner;
+mod worker_contract;
 // Issue #950: delegated local-LLM persistence policy. Records static
 // controller recovery strategy labels and gates prose-only recovery exits
 // without widening provider abstractions.
