@@ -780,6 +780,65 @@ def _render_failure_authority_summary(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _render_quality_group_summary(
+    title: str,
+    group_keys: list[str],
+    *,
+    rows: list[dict],
+) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, group_keys)
+    lines = [f"## {title}", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        *group_keys,
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_objective_matrix_summary(rows: list[dict]) -> list[str]:
+    return _render_quality_group_summary(
+        "Objective Matrix",
+        [
+            "task_kind",
+            "deliverable_kind",
+            "evidence_kind",
+            "generic_terminal_state",
+            "recovery_job_kind",
+        ],
+        rows=rows,
+    )
+
+
+def _render_terminal_state_summary(rows: list[dict]) -> list[str]:
+    return _render_quality_group_summary(
+        "Terminal State Summary",
+        ["generic_terminal_state"],
+        rows=rows,
+    )
+
+
+def _render_recovery_job_summary(rows: list[dict]) -> list[str]:
+    return _render_quality_group_summary(
+        "Recovery Job Summary",
+        ["recovery_job_kind"],
+        rows=rows,
+    )
+
+
 def _render_report(bench_root: Path, rows: list[dict]) -> str:
     parts: list[str] = []
     parts.append(f"# Benchmark Report: {bench_root.name}")
@@ -814,6 +873,12 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
         parts.append("")
         parts.extend(_render_failure_authority_summary(rows))
         parts.append("")
+        parts.extend(_render_objective_matrix_summary(rows))
+        parts.append("")
+        parts.extend(_render_terminal_state_summary(rows))
+        parts.append("")
+        parts.extend(_render_recovery_job_summary(rows))
+        parts.append("")
     return "\n".join(parts)
 
 
@@ -833,6 +898,22 @@ def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
         "overall": _quality_summary(analyzed),
         "by_pam_variant": _grouped_quality(analyzed, ["pam_variant"]),
         "by_task_kind": _grouped_quality(analyzed, ["task_kind"]),
+        "by_deliverable_kind": _grouped_quality(analyzed, ["deliverable_kind"]),
+        "by_evidence_kind": _grouped_quality(analyzed, ["evidence_kind"]),
+        "by_generic_terminal_state": _grouped_quality(
+            analyzed, ["generic_terminal_state"]
+        ),
+        "by_recovery_job_kind": _grouped_quality(analyzed, ["recovery_job_kind"]),
+        "by_objective_matrix": _grouped_quality(
+            analyzed,
+            [
+                "task_kind",
+                "deliverable_kind",
+                "evidence_kind",
+                "generic_terminal_state",
+                "recovery_job_kind",
+            ],
+        ),
         "by_task_kind_pam_variant": _grouped_quality(
             analyzed, ["task_kind", "pam_variant"]
         ),
