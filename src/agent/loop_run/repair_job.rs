@@ -825,6 +825,9 @@ pub(super) enum RepairJobEvent {
     VerifierObserved {
         delta: VerifierDelta,
     },
+    TargetReassessmentRequired {
+        key: RepairAttemptKey,
+    },
 }
 
 /// v0.4.16: first-class next action. This is the small state-machine surface
@@ -1038,7 +1041,9 @@ impl RepairJob {
                     reason: *reason,
                 });
             }
-            RepairJobEvent::PatchApplied { .. } | RepairJobEvent::VerifierObserved { .. } => {}
+            RepairJobEvent::PatchApplied { .. }
+            | RepairJobEvent::VerifierObserved { .. }
+            | RepairJobEvent::TargetReassessmentRequired { .. } => {}
         }
         self.push_lifecycle_event(event);
     }
@@ -1226,6 +1231,9 @@ impl RepairJob {
             RepairJobEvent::PatchApplied { .. } => Some(RepairNextAction::RerunVerifier),
             RepairJobEvent::VerifierObserved { delta } => {
                 self.next_action_for_verifier_delta(*delta)
+            }
+            RepairJobEvent::TargetReassessmentRequired { .. } => {
+                Some(self.replan_or_safe_stop(RepairTerminalReason::RepairBudgetExhausted))
             }
             RepairJobEvent::DiagnosticUnavailable
             | RepairJobEvent::AmbiguousAuthority
@@ -2447,17 +2455,49 @@ pub(super) fn apply_verifier_rerun_observation(
     let previous_repair_target_hint = previous_context
         .and_then(verifier_repair_effective_target_hint)
         .cloned();
+    let target_reassessment_key = target_reassessment_key_after_rerun(
+        previous_context,
+        previous_repair_target_hint.as_ref(),
+        repair_context,
+    );
     let applied_outcome_promotion = record_applied_repair_outcome_for_rerun(
         repair_context,
         previous_repair_target_hint.as_ref(),
     );
     apply_semantic_repair_dispatch_after_rerun(repair_context, previous_cluster_id.as_ref());
-    if let Some(outcome) = repair_context.rerun_outcome {
+    if let Some(key) = target_reassessment_key {
+        repair_context.apply_event(RepairJobEvent::TargetReassessmentRequired { key });
+    } else if let Some(outcome) = repair_context.rerun_outcome {
         repair_context.apply_event(RepairJobEvent::VerifierObserved {
             delta: outcome.into(),
         });
     }
     applied_outcome_promotion
+}
+
+fn target_reassessment_key_after_rerun(
+    previous_context: Option<&RepairJob>,
+    previous_repair_target_hint: Option<&RecoveryTargetHint>,
+    repair_context: &RepairJob,
+) -> Option<RepairAttemptKey> {
+    let previous = previous_context?;
+    let target_hint = previous_repair_target_hint?;
+    if previous.applied_repair_intents.is_empty() {
+        return None;
+    }
+    if repair_context.repair_attempt < 2 {
+        return None;
+    }
+    if previous.failure_signature != repair_context.failure_signature {
+        return None;
+    }
+    if !matches!(
+        repair_context.rerun_outcome,
+        Some(VerifierRepairRerunOutcome::SameFailureRemaining)
+    ) {
+        return None;
+    }
+    Some(RepairAttemptKey::from_target(target_hint, None))
 }
 
 fn record_applied_repair_outcome_for_rerun(
@@ -4418,6 +4458,134 @@ mod tests {
                 delta: VerifierDelta::Improved,
             })
         );
+    }
+
+    #[test]
+    fn same_target_same_diagnostic_after_repair_forces_target_reassessment() {
+        let (mut previous, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        previous.failure_signature = "assertion-shape-A".to_string();
+        previous.repair_attempt = 1;
+        previous.applied_repair_intents = vec!["intent-fingerprint".to_string()];
+        previous.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+
+        let mut current = RepairJob {
+            failure_signature: previous.failure_signature.clone(),
+            previous_failure_signature: Some(previous.failure_signature.clone()),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            repair_attempt: 2,
+            lifecycle_events: Vec::new(),
+            ..previous.clone()
+        };
+
+        let promotion = apply_verifier_rerun_observation(&mut current, Some(&previous));
+
+        assert!(promotion.is_some());
+        assert_eq!(
+            current.lifecycle_events.last(),
+            Some(&RepairJobEvent::TargetReassessmentRequired {
+                key: RepairAttemptKey::from_target(&targets[0], None),
+            })
+        );
+        assert_eq!(current.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn target_reassessment_is_generic_for_docs_evidence_conflicts() {
+        let (mut previous, targets) =
+            semantic_repair_job_with_targets_for_test("A", ArtifactRole::UsageDocs, &["README.md"]);
+        previous.failure_signature = "docs-contract-still-failing".to_string();
+        previous.repair_attempt = 1;
+        previous.applied_repair_intents = vec!["docs-intent".to_string()];
+        previous.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::UsageDocs),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+
+        let mut current = RepairJob {
+            failure_signature: previous.failure_signature.clone(),
+            previous_failure_signature: Some(previous.failure_signature.clone()),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            repair_attempt: 2,
+            lifecycle_events: Vec::new(),
+            ..previous.clone()
+        };
+
+        let _ = apply_verifier_rerun_observation(&mut current, Some(&previous));
+
+        assert_eq!(
+            current.lifecycle_events.last(),
+            Some(&RepairJobEvent::TargetReassessmentRequired {
+                key: RepairAttemptKey {
+                    role: ArtifactRole::UsageDocs,
+                    path: "README.md".to_string(),
+                    allowed_change_kind: None,
+                    obligation_id: Some("usage_docs:README.md".to_string()),
+                    failure_domain: None,
+                    correction_kind: Some(CorrectionKind::Patch),
+                },
+            })
+        );
+        assert_eq!(current.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn changed_diagnostic_keeps_normal_verifier_observation_event() {
+        let (mut previous, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        previous.failure_signature = "old-signature".to_string();
+        previous.repair_attempt = 1;
+        previous.applied_repair_intents = vec!["intent-fingerprint".to_string()];
+        previous.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+
+        let mut current = RepairJob {
+            failure_signature: "new-signature".to_string(),
+            previous_failure_signature: Some(previous.failure_signature.clone()),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::NewFailure),
+            repair_attempt: 1,
+            lifecycle_events: Vec::new(),
+            ..previous.clone()
+        };
+
+        let _ = apply_verifier_rerun_observation(&mut current, Some(&previous));
+
+        assert_eq!(
+            current.lifecycle_events.last(),
+            Some(&RepairJobEvent::VerifierObserved {
+                delta: VerifierDelta::DifferentFailure,
+            })
+        );
+        assert_eq!(current.next_action(), RepairNextAction::Replan);
     }
 
     #[test]
