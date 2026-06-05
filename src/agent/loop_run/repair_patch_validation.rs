@@ -1807,6 +1807,34 @@ mod tests {
         );
     }
 
+    // Issue #992: the new `RustSyntax` cheap-check shares the same capability
+    // spawn gate as `PythonSyntax`. A non-coding kind with a `.rs` target must
+    // fail closed with Unavailable BEFORE any `rustc` process is spawned (the
+    // gate precedes `ProjectVerifier::check`). This is env-independent — it
+    // never reaches rustc, so it asserts the fail-closed direction only.
+    #[test]
+    fn candidate_content_validation_non_coding_rust_target_fails_closed_no_spawn() {
+        for kind in [
+            super::super::task_contract::TaskKind::Docs,
+            super::super::task_contract::TaskKind::Data,
+            super::super::task_contract::TaskKind::Research,
+            super::super::task_contract::TaskKind::Ops,
+            super::super::task_contract::TaskKind::Authoring,
+        ] {
+            let result = validate_repair_candidate_contents(
+                "src/lib.rs",
+                "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+                false,
+                kind,
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                RepairCandidateContentError::Unavailable,
+                "{kind:?}: rustc cheap-check must be gated (fail closed, no spawn)"
+            );
+        }
+    }
+
     #[test]
     fn apply_repair_intent_edits_applies_exact_and_replace_all() {
         let edits = vec![
