@@ -515,6 +515,10 @@ mod repair_driver;
 // v0.4.25: pure assertion/output analysis helpers shared by verifier repair
 // diagnostics and generated-test semantic weakening filters.
 mod mechanical_compile_repair;
+// Issue #978 (parent #974, Issue D): deterministic EvidenceFailed operator for
+// missing serde-family Cargo dependencies. Runs in the deterministic repair
+// slot before the LLM verifier-repair pass. Not re-exported (DR3-001).
+mod cargo_dependency_repair;
 mod repair_assertion_analysis;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
