@@ -1254,6 +1254,24 @@ class TestFailureObservationClassifier(unittest.TestCase):
             fo = self._observe(run_dir)
         self.assertTrue(fo["deterministic_operator_hit"])
 
+    def test_deterministic_operator_hit_from_rust_binding_repair(self) -> None:
+        # Issue #991: the Rust binding-repair controller strategy
+        # (`deterministic_binding_repair`) must surface in the eval/report
+        # deterministic-operator hit rate.
+        with tempfile.TemporaryDirectory() as raw:
+            run_dir = pathlib.Path(raw) / "run-1"
+            _make_run(
+                run_dir,
+                task_kind="coding",
+                pam_variant="pam_off",
+                modified_path="Cargo.toml",
+                rc=1,
+                final_outcome="evidence_failed",
+                recovery_strategies=["deterministic_binding_repair"],
+            )
+            fo = self._observe(run_dir)
+        self.assertTrue(fo["deterministic_operator_hit"])
+
     def test_report_transition_metrics_aggregate(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             bench_root = pathlib.Path(raw) / "bench-root"

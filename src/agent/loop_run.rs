@@ -441,11 +441,11 @@ pub mod commands;
 // reaching into private module state — see `is_completion_verifier_command`
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
-// Issue #993 (parent #988, Issue E): generic `EvidenceBindingFailedJob` —
-// models "deliverable exists but its evidence runner cannot bind" once,
-// keying the runtime difference (Node manifest / docs section / data schema /
-// research citation) into a small `BindingCheck` enum + `BindingRecovery`
-// data, not a per-task-kind control-flow branch.
+// Issues #989/#993 (parent #988): structured evidence binding plan plus the
+// generic `EvidenceBindingFailedJob` routing seam. Runtime-neutral binding
+// types route binding gaps to `EvidenceBindingFailed` instead of
+// `safe_stop_verifier_missing`; runtime-specific differences stay in data
+// enums/adapters. `pub(super)` only, no facade re-export (DR3-001).
 mod evidence_binding;
 mod evidence_runner;
 mod worker_contract;
@@ -509,6 +509,12 @@ mod repair_brief;
 // adapter over TaskContract + RepairJob state; repair loop ownership stays
 // with the repair modules.
 mod repair_job;
+// Issue #990 (parent #988, Issue B): failure-cluster-scoped no-progress
+// recovery policy. Connects the `TargetReassessmentRequired` event (#987) to
+// deterministic target/role bans + forced role switch + `repair_exhausted`
+// sub-classification. Private module, not re-exported (DR3-001) — `repair_job`
+// / `verifier_orchestration` are the only in-crate consumers.
+mod no_progress_recovery;
 mod repair_packet;
 // Issue #653: `RepairAttemptOutcome` lifecycle ledger. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
@@ -525,7 +531,12 @@ mod mechanical_compile_repair;
 // missing serde-family Cargo dependencies. Runs in the deterministic repair
 // slot before the LLM verifier-repair pass. Not re-exported (DR3-001).
 mod cargo_dependency_repair;
+// Issue #991 (parent #988, Issue C): deterministic Rust binding-mismatch repair
+// operators (lib name / CARGO_BIN_EXE). Runs in the deterministic repair slot
+// before the LLM verifier-repair pass, after `cargo_dependency_repair`. Not
+// re-exported (DR3-001).
 mod repair_assertion_analysis;
+mod rust_binding_repair;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.

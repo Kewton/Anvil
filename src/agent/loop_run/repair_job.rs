@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::no_progress_recovery::{NoProgressExhaustionReason, NoProgressRecoveryPolicy};
 use super::repair_attempt_outcome::{
     MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, RepairAttemptOutcomeKind,
     RepairRejectionKind, should_promote_to_exhausted_after_push,
@@ -288,6 +289,12 @@ pub(super) struct RepairJob {
     /// v0.4.16: normalized reject ledger used by `next_action()` to avoid
     /// repeating the same invalid patch family.
     pub(super) rejected_attempts: Vec<RejectedAttempt>,
+    /// Issue #990: failure-cluster-scoped no-progress recovery policy.
+    /// `apply_event(TargetReassessmentRequired)` records target/role bans here;
+    /// the diagnostic payload and controller admission consume it so the same
+    /// target / role is not retried after no progress. Turn-local; carried over
+    /// across reruns alongside `exhausted_attempts` (not serialized).
+    pub(super) no_progress_policy: NoProgressRecoveryPolicy,
 }
 
 /// Legacy verifier-repair projection retained for tests that pin the old
@@ -1000,6 +1007,7 @@ impl RepairJob {
             exhausted_repair_targets: Vec::new(),
             lifecycle_events: Vec::new(),
             rejected_attempts: Vec::new(),
+            no_progress_policy: NoProgressRecoveryPolicy::new(),
         }
     }
 
@@ -1041,11 +1049,95 @@ impl RepairJob {
                     reason: *reason,
                 });
             }
-            RepairJobEvent::PatchApplied { .. }
-            | RepairJobEvent::VerifierObserved { .. }
-            | RepairJobEvent::TargetReassessmentRequired { .. } => {}
+            RepairJobEvent::TargetReassessmentRequired { key } => {
+                // Issue #990: a target reassessment (#987) means the same target
+                // produced the same diagnostic with no progress. Record a
+                // cluster-scoped target/role ban so the next diagnostic stops
+                // reselecting it. The `next_action()` Replan projection is
+                // unchanged — this only populates the recovery policy.
+                if let Some(scope) = self.no_progress_cluster_scope() {
+                    let role = key.role;
+                    let path = key.path.clone();
+                    self.no_progress_policy
+                        .record_no_progress(&scope, role, &path);
+                }
+            }
+            RepairJobEvent::PatchApplied { .. } | RepairJobEvent::VerifierObserved { .. } => {}
         }
         self.push_lifecycle_event(event);
+    }
+
+    /// Issue #990: the failure-cluster identifier used to scope no-progress
+    /// bans. Prefers the active semantic cluster key; falls back to the
+    /// (sanitized) failure signature so a no-progress observation can still be
+    /// scoped before a semantic plan exists. `TargetReassessmentRequired`
+    /// (#987) only fires when the same failure signature persists, so both
+    /// identifiers are stable per failure cluster.
+    pub(super) fn no_progress_cluster_scope(&self) -> Option<String> {
+        if let Some(plan) = self.semantic_plan.as_ref() {
+            return Some(plan.failure_cluster_id.as_str().to_string());
+        }
+        if self.failure_signature.is_empty() {
+            return None;
+        }
+        Some(self.failure_signature.clone())
+    }
+
+    /// Issue #990: candidate repair roles for the active cluster, used to derive
+    /// `required_next_roles` and to classify role exhaustion. Drawn from the
+    /// cluster's involved artifacts (preferred role first), falling back to the
+    /// plan's preferred role.
+    fn no_progress_candidate_roles(&self) -> Vec<ArtifactRole> {
+        let Some(plan) = self.semantic_plan.as_ref() else {
+            return Vec::new();
+        };
+        let mut roles: Vec<ArtifactRole> = vec![plan.preferred_repair_role];
+        if let Some(cluster) = plan.current_cluster() {
+            for &role in cluster.involved_artifacts.iter() {
+                if !roles.contains(&role) {
+                    roles.push(role);
+                }
+            }
+        }
+        roles
+    }
+
+    /// Issue #990: structured, already-masked no-progress projection for the
+    /// diagnostic payload (`banned_targets` / `banned_roles` /
+    /// `required_next_roles`). Returns empty arrays when no cluster scope or no
+    /// bans exist.
+    pub(super) fn no_progress_diagnostic_payload(&self) -> serde_json::Value {
+        let scope = self.no_progress_cluster_scope().unwrap_or_default();
+        let candidate_roles = self.no_progress_candidate_roles();
+        self.no_progress_policy
+            .diagnostic_payload(&scope, &candidate_roles)
+    }
+
+    /// Issue #990: whether the diagnostic LLM's selected `(role, path)` is
+    /// banned for the active cluster (role ban or exact-target ban). Used by the
+    /// diagnostic admission to reject a re-selected banned target.
+    pub(super) fn no_progress_selection_banned(&self, role: ArtifactRole, path: &str) -> bool {
+        if self.no_progress_policy.is_empty() {
+            return false;
+        }
+        let Some(scope) = self.no_progress_cluster_scope() else {
+            return false;
+        };
+        self.no_progress_policy
+            .is_selection_banned(&scope, role, path)
+    }
+
+    /// Issue #990: classify the `repair_exhausted` terminal state from the
+    /// no-progress signals for the active cluster. `None` when the no-progress
+    /// policy did not contribute (legacy classification stands).
+    pub(super) fn no_progress_exhaustion_reason(&self) -> Option<NoProgressExhaustionReason> {
+        if self.no_progress_policy.is_empty() {
+            return None;
+        }
+        let scope = self.no_progress_cluster_scope()?;
+        let candidate_roles = self.no_progress_candidate_roles();
+        self.no_progress_policy
+            .classify_exhaustion(&scope, &candidate_roles)
     }
 
     /// Controller-facing state-machine projection used by production
@@ -2747,6 +2839,12 @@ pub(super) fn verifier_repair_context_from_failure(
         rejected_attempts: previous_context
             .map(|context| context.rejected_attempts.clone())
             .unwrap_or_default(),
+        // Issue #990: carry the no-progress policy over so cluster-scoped
+        // target/role bans survive slot reuse across reruns within a turn
+        // (same regime as `exhausted_attempts`). A fresh failure starts clean.
+        no_progress_policy: previous_context
+            .map(|context| context.no_progress_policy.clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -3267,6 +3365,12 @@ pub(super) struct SafeStopReport {
     pub(super) actual_actions: Vec<String>,
     pub(super) exhausted_attempts_summary: Option<ExhaustedAttemptsSummary>,
     pub(super) diagnostic_target_missing_reason: Option<DiagnosticTargetMissingReason>,
+    /// Issue #990: internal `repair_exhausted` sub-classification from the
+    /// no-progress recovery policy (`same_target_same_diagnostic` /
+    /// `same_role_no_progress` / `operator_missing`). `None` for non-repair
+    /// stop reasons or when no no-progress signal contributed. Additive — the
+    /// legacy `stop_reason` / `failure_type` projection is unchanged.
+    pub(super) no_progress_reason: Option<&'static str>,
     pub(super) owned_test_artifacts: Vec<String>,
     pub(super) session_id: String,
     pub(super) turn_index: u64,
@@ -3333,6 +3437,15 @@ impl SafeStopReport {
                     last_hyp,
                     &ctx.unfulfilled_obligations,
                 ));
+                // Issue #990: surface the no-progress sub-reason on the
+                // `repair_exhausted` terminal report. Only meaningful for the
+                // repair-exhausted stop; the legacy label projection is intact.
+                let no_progress_reason = if stop_reason == StopReason::RepairExhausted {
+                    job.no_progress_exhaustion_reason()
+                        .map(|reason| reason.as_str())
+                } else {
+                    None
+                };
                 Self {
                     failure_signature: snapshot.failure_signature,
                     command: snapshot.command,
@@ -3344,6 +3457,7 @@ impl SafeStopReport {
                     actual_actions,
                     exhausted_attempts_summary: summary,
                     diagnostic_target_missing_reason: diagnostic_reason,
+                    no_progress_reason,
                     owned_test_artifacts: sanitize_and_filter_owned_paths(&owned_test_artifacts),
                     session_id: ctx.session_id.to_string(),
                     turn_index: ctx.turn_index,
@@ -3366,6 +3480,7 @@ impl SafeStopReport {
                 actual_actions,
                 exhausted_attempts_summary: None,
                 diagnostic_target_missing_reason: None,
+                no_progress_reason: None,
                 owned_test_artifacts: sanitize_and_filter_owned_paths(&owned_test_artifacts),
                 session_id: ctx.session_id.to_string(),
                 turn_index: ctx.turn_index,
@@ -4586,6 +4701,98 @@ mod tests {
             })
         );
         assert_eq!(current.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn target_reassessment_event_populates_no_progress_ban() {
+        // Issue #990 (AC1): a `TargetReassessmentRequired` event records a
+        // cluster-scoped target ban in the no-progress policy and surfaces it in
+        // the diagnostic payload.
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        assert!(job.no_progress_policy.is_empty());
+
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+
+        assert!(job.no_progress_selection_banned(ArtifactRole::Implementation, "src/lib.rs"));
+        let payload = job.no_progress_diagnostic_payload();
+        let banned = payload["banned_targets"].as_array().unwrap();
+        assert_eq!(banned.len(), 1);
+        assert_eq!(banned[0]["path"], "src/lib.rs");
+        assert_eq!(banned[0]["role"], "implementation");
+        // The Replan projection is unchanged by the policy bookkeeping.
+        assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn target_reassessment_classifies_no_progress_exhaustion() {
+        // Issue #990 (AC2 / AC4): repeated no-progress under a role forces a
+        // role switch, and the no-progress signals classify `repair_exhausted`.
+        // This fixture cluster involves an alternate role ("test").
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs", "src/other.rs"],
+        );
+        // First reassessment bans a target only — an alternate target remains.
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+        assert_eq!(
+            job.no_progress_exhaustion_reason(),
+            Some(NoProgressExhaustionReason::SameTargetSameDiagnostic)
+        );
+        // Second reassessment under the same role bans the role and forces a
+        // switch to the cluster's alternate role.
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[1], None),
+        });
+        assert_eq!(
+            job.no_progress_exhaustion_reason(),
+            Some(NoProgressExhaustionReason::SameRoleNoProgress)
+        );
+        let payload = job.no_progress_diagnostic_payload();
+        assert_eq!(
+            payload["banned_roles"].as_array().unwrap(),
+            &vec![serde_json::json!("implementation")]
+        );
+        assert_eq!(
+            payload["required_next_roles"].as_array().unwrap(),
+            &vec![serde_json::json!("test")],
+            "forced role switch to the cluster's alternate role"
+        );
+    }
+
+    #[test]
+    fn no_progress_policy_survives_context_rebuild() {
+        // Issue #990: bans carry over when a fresh `RepairJob` is built from the
+        // previous context on a rerun (same regime as `exhausted_attempts`).
+        let (mut previous, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        previous.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+        assert!(!previous.no_progress_policy.is_empty());
+
+        let work_root = std::env::temp_dir();
+        let rebuilt = verifier_repair_context_from_failure(
+            &work_root,
+            "cargo test",
+            "assertion still failing",
+            &[],
+            1,
+            Some(&previous),
+        );
+        assert_eq!(rebuilt.no_progress_policy, previous.no_progress_policy);
+        assert!(rebuilt.no_progress_selection_banned(ArtifactRole::Implementation, "src/lib.rs"));
     }
 
     #[test]

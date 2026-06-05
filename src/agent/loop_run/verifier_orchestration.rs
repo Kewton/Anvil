@@ -883,6 +883,12 @@ pub(super) fn verifier_diagnostic_messages(
         "failure_location": failure_location,
         "changed_candidates": changed_candidates,
         "exhausted_repair_targets": exhausted_repair_targets,
+        // Issue #990: cluster-scoped no-progress recovery state. Structured
+        // controller data (closed enum labels + already-masked paths), never
+        // LLM prose. The diagnostic must avoid `banned_targets` / `banned_roles`
+        // and pick from `required_next_roles`; re-selecting a banned target is
+        // additionally rejected by admission.
+        "no_progress_recovery": context.no_progress_diagnostic_payload(),
         "safe_file_excerpts": excerpts,
         "framework_findings": framework_findings_payload,
         "behavior_contract": behavior_contract,
@@ -1233,6 +1239,9 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
                 failure_kind,
                 admission,
             )
+            // Issue #990: reject a diagnostic LLM re-selection of a
+            // no-progress-banned target / role for the active cluster.
+            .filter(|hint| !context.no_progress_selection_banned(hint.role, &hint.path))
             .filter(|hint| {
                 diagnostic_target_allowed_by_confidence(
                     hint,
@@ -1256,6 +1265,8 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
                 failure_kind,
                 admission,
             )
+            // Issue #990: same no-progress ban guard for the repair plan.
+            .filter(|hint| !context.no_progress_selection_banned(hint.role, &hint.path))
             .filter(|hint| {
                 diagnostic_target_allowed_by_confidence(
                     hint,
@@ -1286,12 +1297,16 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
                 failure_kind,
                 admission,
             )
+            // Issue #990: keep no-progress-banned targets out of the candidate
+            // pool the reorder helpers below draw from.
+            .filter(|hint| !context.no_progress_selection_banned(hint.role, &hint.path))
         })
         .collect::<Vec<_>>();
     let changed_repair_candidates = context
         .changed_file_hints
         .iter()
         .filter_map(|hint| admit_repair_target_hint(hint.clone(), admission))
+        .filter(|hint| !context.no_progress_selection_banned(hint.role, &hint.path))
         .collect::<Vec<_>>();
     // Issue #638 (設計判断 #3): pass assessment-derived failure_type to helpers so
     // they gate on the diagnostic classification, not on context.failure_type
@@ -1330,6 +1345,11 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
         repair_plan.insert(0, preferred);
         repair_plan.truncate(3);
     }
+    // Issue #990: the local-module / import-source / stale-assertion reorder
+    // helpers above draw `preferred` straight off `context`, so a
+    // no-progress-banned target could re-enter the plan. Drop any such target
+    // here so the controller never re-selects it after no progress.
+    repair_plan.retain(|hint| !context.no_progress_selection_banned(hint.role, &hint.path));
     let needed_reads = repair_candidates
         .iter()
         .map(|(hint, _)| hint.clone())
@@ -1362,6 +1382,8 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
                         hint.role == role
                             && (hint.role != ArtifactRole::Setup
                                 || failure_kind.allows_setup_target())
+                            // Issue #990: do not fall back onto a banned target.
+                            && !context.no_progress_selection_banned(hint.role, &hint.path)
                     })
                     .cloned()
                     .and_then(|hint| admit_repair_target_hint(hint, admission))

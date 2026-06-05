@@ -1,0 +1,17 @@
+# Issue #989 fixture: a correctly bound Rust project (no binding failure).
+#
+# Read-only fixture data — NOT a workspace member (excluded via
+# `[workspace] exclude = ["tests/fixtures"]`). The test imports the crate
+# under test by its declared name, references the declared bin, and imports a
+# declared dev-dependency (which must NOT be flagged as a binding mismatch).
+[package]
+name = "slugify"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "slugify"
+
+[dev-dependencies]
+tempfile = "3"

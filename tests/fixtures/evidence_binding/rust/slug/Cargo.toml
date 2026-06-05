@@ -1,0 +1,12 @@
+# Issue #989 fixture: Rust crate-import binding mismatch (slug).
+#
+# Read-only fixture data — NOT a workspace member. The root `Cargo.toml`
+# `[workspace] exclude = ["tests/fixtures"]` keeps this tree out of the build.
+# The package is named `slugify`, but `tests/slug.rs` imports `slug`, so the
+# crate-under-test import does not bind. This is the representative case that
+# previously fell into `safe_stop_verifier_missing`.
+[package]
+name = "slugify"
+version = "0.1.0"
+edition = "2021"
+publish = false

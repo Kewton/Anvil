@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use super::Agent;
-use super::evidence_binding::{BindingCheck, BindingState, evaluate_binding};
+use super::evidence_binding::{BindingFailureCheck, BindingState, evaluate_binding};
 use super::node_runner_manifest::{NodeManifestCompletion, complete_node_test_runner_manifest};
 
 /// True when the active request targets a Node/JS/TS coding stack and the
@@ -61,13 +61,13 @@ pub(super) fn node_test_runner_bindable(agent: &Agent) -> bool {
 /// Issue #993 (parent #988, Issue E): the generic evidence-binding state for the
 /// current Node workspace. A Node test deliverable that exists but cannot bind a
 /// test runner (`package.json`/`scripts.test`) is a binding-order failure
-/// ([`BindingState::Failed`] with [`BindingCheck::RunnerManifest`]), not a
+/// ([`BindingState::Failed`] with [`BindingFailureCheck::RunnerManifest`]), not a
 /// missing-evidence terminal — the deliverable is present, only the runner
 /// binding is missing, so recovery materializes the manifest and reruns the
 /// EvidenceRunner rather than asking for more evidence.
 pub(super) fn node_evidence_binding_state(agent: &Agent) -> BindingState {
     evaluate_binding(
-        BindingCheck::RunnerManifest,
+        BindingFailureCheck::RunnerManifest,
         node_test_artifact_exists(agent),
         node_test_runner_bindable(agent),
     )
@@ -123,7 +123,7 @@ fn dir_has_node_test_file(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::evidence_binding::{BindingCheck, BindingRecovery, BindingState};
+    use super::super::evidence_binding::{BindingFailureCheck, BindingRecovery, BindingState};
     use super::super::node_runner_manifest::NodeManifestAction;
     use super::*;
 
@@ -192,14 +192,14 @@ mod tests {
         // The generic binding evaluation classifies this as a binding failure
         // routed to runner-manifest materialization.
         let state = evaluate_binding(
-            BindingCheck::RunnerManifest,
+            BindingFailureCheck::RunnerManifest,
             test_artifact_exists,
             runner_bindable,
         );
         let job = state
             .failed_job()
             .expect("deliverable present + unbound runner is a binding failure");
-        assert_eq!(job.check, BindingCheck::RunnerManifest);
+        assert_eq!(job.check, BindingFailureCheck::RunnerManifest);
         assert_eq!(job.recovery, BindingRecovery::MaterializeRunnerManifest);
     }
 
@@ -222,7 +222,7 @@ mod tests {
         assert!(runner_bindable);
 
         let state = evaluate_binding(
-            BindingCheck::RunnerManifest,
+            BindingFailureCheck::RunnerManifest,
             workspace_has_node_test_file(root),
             runner_bindable,
         );

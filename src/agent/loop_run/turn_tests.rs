@@ -2329,6 +2329,7 @@ mod tests {
             actual_actions: vec!["Read src/foo.rs".to_string()],
             exhausted_attempts_summary: None,
             diagnostic_target_missing_reason: None,
+            no_progress_reason: None,
             owned_test_artifacts: vec![],
             session_id: "s".to_string(),
             turn_index: 1,
@@ -2430,6 +2431,31 @@ mod tests {
                 .get("next_user_action")
                 .and_then(|v| v.as_str())
                 .is_some_and(|s| s.contains("authoritative"))
+        );
+    }
+
+    #[test]
+    fn build_safe_stop_payload_surfaces_no_progress_reason() {
+        // Issue #990 (AC4): the no-progress sub-classification is observable on
+        // the `repair_exhausted` report payload.
+        let mut report = minimal_report(
+            StopReason::RepairExhausted,
+            VerifierFailureType::RepairExhausted,
+        );
+        report.no_progress_reason = Some("same_role_no_progress");
+        let payload = build_safe_stop_payload(&report);
+        assert_eq!(
+            payload.get("no_progress_reason").and_then(|v| v.as_str()),
+            Some("same_role_no_progress")
+        );
+
+        // Absent when no no-progress signal contributed (null, not missing).
+        let plain = minimal_report(StopReason::VerifierWeak, VerifierFailureType::Unknown);
+        let plain_payload = build_safe_stop_payload(&plain);
+        assert!(
+            plain_payload
+                .get("no_progress_reason")
+                .is_some_and(|v| v.is_null())
         );
     }
 
@@ -2585,6 +2611,7 @@ mod tests {
             actual_actions: vec![],
             exhausted_attempts_summary: None,
             diagnostic_target_missing_reason: None,
+            no_progress_reason: None,
             owned_test_artifacts: vec![],
             session_id: "s".to_string(),
             turn_index: 0,
@@ -2635,6 +2662,7 @@ mod tests {
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
             ),
+            no_progress_reason: None,
             owned_test_artifacts: (0..8).map(|_| big.clone()).collect(),
             session_id: "s".to_string(),
             turn_index: 0,
@@ -3150,6 +3178,7 @@ mod tests {
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
             ),
+            no_progress_reason: None,
             owned_test_artifacts: (0..8).map(|_| big.clone()).collect(),
             session_id: huge_session.clone(),
             turn_index: u64::MAX,
@@ -3192,6 +3221,7 @@ mod tests {
             actual_actions: vec![],
             exhausted_attempts_summary: None,
             diagnostic_target_missing_reason: None,
+            no_progress_reason: None,
             owned_test_artifacts: vec![],
             session_id: huge_session,
             turn_index: 0,
@@ -3238,6 +3268,7 @@ mod tests {
                 exhausted_corrections: Vec::new(),
             }),
             diagnostic_target_missing_reason: None,
+            no_progress_reason: None,
             owned_test_artifacts: vec![],
             session_id: "s".to_string(),
             turn_index: 0,
