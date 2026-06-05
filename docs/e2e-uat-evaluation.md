@@ -108,6 +108,41 @@ Record these for every scenario/model/repetition.
 | `resume_pass` | Interrupted/resumed task honored the latest request and preserved progress | higher |
 | `dirty_worktree_preserved` | Pre-existing unrelated changes survived untouched | higher |
 
+## Objective Matrix Reporting
+
+`scripts/analyze_run.py` projects each run into the same objective vocabulary
+used by the controller:
+
+- `task_kind`: expected or inferred task kind for the scenario.
+- `deliverable_kind`: objective deliverable such as `source_files`,
+  `document_sections`, `output_file`, `research_notes`,
+  `command_observation`, `prose_artifact`, or `answer`.
+- `evidence_kind`: objective evidence such as `test_run`, `content_check`,
+  `schema_check`, `source_fetch_evidence`, `safety_boundary_evidence`, or
+  `content_acceptance`.
+- `legacy_terminal_state`: the existing exit label, when `logs/eval.jsonl`
+  records one.
+- `generic_terminal_state`: the #947-compatible terminal vocabulary, including
+  `missing_deliverable`, `missing_evidence`, `evidence_failed`,
+  `evidence_binding_failed`, `evidence_runner_missing`,
+  `evidence_repair_exhausted`, and `completed`.
+- `recovery_job_kind`: the #948-compatible recovery job projection:
+  `MissingDeliverableJob`, `MissingEvidenceJob`, `EvidenceFailedJob`,
+  `ToolFailureJob`, or `none`.
+
+`scripts/report.py` renders overall success, per-`TaskKind` success, terminal
+state summaries, recovery job summaries, and an Objective Matrix grouped by
+`task_kind` / `deliverable_kind` / `evidence_kind` /
+`generic_terminal_state` / `recovery_job_kind`. The JSON report exposes the
+same groups as `by_task_kind`, `by_deliverable_kind`, `by_evidence_kind`,
+`by_generic_terminal_state`, `by_recovery_job_kind`, and
+`by_objective_matrix`.
+
+No external or manual eval step is required for the matrix itself. Manual
+postchecks can still be supplied through `meta.json` fields such as
+`postcheck_success` and `postcheck_reason`; the matrix will preserve them in
+the terminal/postcheck agreement columns.
+
 ## Scenario Matrix
 
 Scenario IDs are stable. Add new IDs only when existing scenarios cannot measure

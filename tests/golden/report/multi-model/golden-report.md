@@ -49,3 +49,24 @@ Generated: 2026-06-02T03:27:36+00:00
 |-----|-----|-----|-----|-----|-----|-----|-----|-----|
 | implementation_bug | 1 | 0% (0/1) | 100% (1/1) | 0% (0/1) | 0 | 0 | 1 | 0 |
 | success | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |
+
+## Objective Matrix
+
+| task_kind | deliverable_kind | evidence_kind | generic_terminal_state | recovery_job_kind | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| coding | source_files | test_run | completed | none | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |
+| coding | source_files | test_run | unknown | unknown | 1 | 0% (0/1) | 100% (1/1) | 0% (0/1) | 0 | 0 | 1 | 0 |
+
+## Terminal State Summary
+
+| generic_terminal_state | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| completed | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |
+| unknown | 1 | 0% (0/1) | 100% (1/1) | 0% (0/1) | 0 | 0 | 1 | 0 |
+
+## Recovery Job Summary
+
+| recovery_job_kind | runs | terminal_success | postcheck_success | both_success | true_positive | false_positive | false_negative | true_negative |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| none | 3 | 100% (3/3) | 100% (3/3) | 100% (3/3) | 3 | 0 | 0 | 0 |
+| unknown | 1 | 0% (0/1) | 100% (1/1) | 0% (0/1) | 0 | 0 | 1 | 0 |

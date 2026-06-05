@@ -50,6 +50,61 @@ KNOWN_TASK_KINDS = {
     "authoring",
     "answer_only",
 }
+OBJECTIVE_KINDS_BY_TASK_KIND = {
+    "coding": ("source_files", "test_run"),
+    "docs": ("document_sections", "content_check"),
+    "data": ("output_file", "schema_check"),
+    "research": ("research_notes", "source_fetch_evidence"),
+    "ops": ("command_observation", "safety_boundary_evidence"),
+    "authoring": ("prose_artifact", "content_acceptance"),
+    "answer_only": ("answer", "content_acceptance"),
+}
+GENERIC_TERMINAL_BY_FINAL_OUTCOME = {
+    "completed": "completed",
+    "done": "completed",
+    "missing_deliverable": "missing_deliverable",
+    "missing_repo_edits": "missing_deliverable",
+    "missing_evidence": "missing_evidence",
+    "missing_verification": "missing_evidence",
+    "evidence_failed": "evidence_failed",
+    "verifier_failed": "evidence_failed",
+    "evidence_binding_failed": "evidence_binding_failed",
+    "safe_stop_verifier_weak": "evidence_binding_failed",
+    "evidence_runner_missing": "evidence_runner_missing",
+    "safe_stop_verifier_missing": "evidence_runner_missing",
+    "evidence_repair_exhausted": "evidence_repair_exhausted",
+    "repair_exhausted": "evidence_repair_exhausted",
+    "evidence_repair_safe_stop": "evidence_repair_safe_stop",
+    "repair_safe_stop": "evidence_repair_safe_stop",
+    "control_loop_exhausted": "control_loop_exhausted",
+    "max_iterations": "control_loop_exhausted",
+    "plan_incomplete": "control_loop_exhausted",
+    "model_output_failure": "model_output_failure",
+    "empty_responses": "model_output_failure",
+    "no_tool_calls": "model_output_failure",
+    "tool_call_format_error": "model_output_failure",
+    "transport_failure": "transport_failure",
+    "transport_error": "transport_failure",
+    "interrupted": "interrupted",
+}
+KNOWN_GENERIC_TERMINAL_STATES = set(GENERIC_TERMINAL_BY_FINAL_OUTCOME.values()) | {
+    "unknown",
+}
+RECOVERY_JOB_BY_GENERIC_TERMINAL = {
+    "completed": "none",
+    "missing_deliverable": "MissingDeliverableJob",
+    "missing_evidence": "MissingEvidenceJob",
+    "evidence_failed": "EvidenceFailedJob",
+    "evidence_binding_failed": "EvidenceFailedJob",
+    "evidence_runner_missing": "ToolFailureJob",
+    "evidence_repair_exhausted": "EvidenceFailedJob",
+    "evidence_repair_safe_stop": "EvidenceFailedJob",
+    "control_loop_exhausted": "none",
+    "model_output_failure": "ToolFailureJob",
+    "transport_failure": "ToolFailureJob",
+    "interrupted": "none",
+    "unknown": "unknown",
+}
 KNOWN_FAILURE_AUTHORITIES = {
     "contract_extraction",
     "artifact_classification",
@@ -696,6 +751,125 @@ def _read_eval_taxonomy(run_dir: Path) -> dict[str, str] | None:
     return last
 
 
+def _bounded_string(value: Any, *, limit: int = 128) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value[:limit] if value else None
+
+
+def _bounded_string_list(value: Any, *, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        parsed = _bounded_string(item)
+        if parsed is None:
+            continue
+        out.append(parsed)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _objective_kinds_for_task_kind(task_kind: str) -> tuple[str, str]:
+    return OBJECTIVE_KINDS_BY_TASK_KIND.get(task_kind, ("unknown", "unknown"))
+
+
+def _generic_terminal_state(final_outcome: str | None, rc: Any) -> str:
+    if final_outcome in GENERIC_TERMINAL_BY_FINAL_OUTCOME:
+        return GENERIC_TERMINAL_BY_FINAL_OUTCOME[final_outcome]
+    terminal_success = _anvil_terminal_success(rc)
+    if terminal_success is True:
+        return "completed"
+    return "unknown"
+
+
+def _recovery_job_kind_for_terminal(generic_terminal_state: str) -> str:
+    return RECOVERY_JOB_BY_GENERIC_TERMINAL.get(generic_terminal_state, "unknown")
+
+
+def _read_eval_objective_projection(run_dir: Path) -> dict[str, Any]:
+    """Return the last eval.jsonl objective/terminal projection, if present.
+
+    This reader is report-only and best-effort. It intentionally differs from
+    `_read_classified_task_kind`, which fails closed for the R5 routing gate.
+    """
+    logs_dir = run_dir / "logs"
+    candidate = logs_dir / "eval.jsonl"
+    try:
+        if logs_dir.is_symlink():
+            return {}
+    except OSError:
+        return {}
+    if not logs_dir.exists():
+        return {}
+    safe = _safe_regular_file_in(candidate, run_dir, MAX_EVAL_JSONL)
+    if safe is None:
+        if candidate.exists() and not candidate.is_symlink():
+            _warn(f"eval.jsonl unusable: {candidate}")
+        return {}
+
+    last: dict[str, Any] = {}
+    try:
+        with safe.open("rb") as fh:
+            while True:
+                raw_line = fh.readline(MAX_EVAL_JSONL_LINE + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > MAX_EVAL_JSONL_LINE:
+                    _warn("eval.jsonl: oversized line, skipping objective projection remainder")
+                    return last
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+
+                parsed: dict[str, Any] = {}
+                final_outcome = _bounded_string(rec.get("final_outcome"))
+                diagnostics = rec.get("terminal_diagnostics")
+                if final_outcome is None and isinstance(diagnostics, dict):
+                    final_outcome = _bounded_string(diagnostics.get("outcome"))
+                if final_outcome is not None:
+                    parsed["final_outcome"] = final_outcome
+
+                objective = rec.get("objective_evaluation")
+                if isinstance(objective, dict):
+                    for key in (
+                        "deliverable_kind",
+                        "evidence_kind",
+                        "generic_terminal_state",
+                        "recovery_job_kind",
+                    ):
+                        value = _bounded_string(objective.get(key))
+                        if value is not None:
+                            parsed[key] = value
+
+                recovery_strategy_count = rec.get("recovery_strategy_count")
+                if isinstance(recovery_strategy_count, int) and not isinstance(
+                    recovery_strategy_count, bool
+                ):
+                    parsed["recovery_strategy_count"] = max(0, recovery_strategy_count)
+                recovery_strategies = _bounded_string_list(rec.get("recovery_strategies"))
+                if recovery_strategies:
+                    parsed["recovery_strategies"] = recovery_strategies
+
+                if parsed:
+                    last = parsed
+    except OSError as e:
+        _warn(f"eval.jsonl read error: {e}")
+        return {}
+    return last
+
+
 def _read_classified_task_kind(run_dir: Path) -> str | None:
     """Return the last eval.jsonl top-level ``classified_task_kind`` (Issue #925).
 
@@ -1113,6 +1287,7 @@ def main(argv: list[str]) -> int:
     anvil_score = _read_anvil_score(session)
     failure_kind = _read_failure_kind(session)
     eval_log_taxonomy = _read_eval_taxonomy(run_dir)
+    eval_objective_projection = _read_eval_objective_projection(run_dir)
     token_prompt, token_completion = _read_token_usage(run_dir)
 
     files_modified = session_metrics["files_modified"]
@@ -1127,6 +1302,35 @@ def main(argv: list[str]) -> int:
         taxonomy_pam_variant = eval_log_taxonomy.get("pam_variant")
         if taxonomy_pam_variant in {"pam_on", "pam_off"}:
             pam_variant = taxonomy_pam_variant
+    deliverable_kind, evidence_kind = _objective_kinds_for_task_kind(task_kind)
+    deliverable_kind = eval_objective_projection.get(
+        "deliverable_kind", deliverable_kind
+    )
+    evidence_kind = eval_objective_projection.get("evidence_kind", evidence_kind)
+    final_outcome = eval_objective_projection.get("final_outcome")
+    legacy_terminal_state = (
+        final_outcome
+        if isinstance(final_outcome, str) and final_outcome
+        else ("done" if _anvil_terminal_success(meta["rc"]) is True else "unknown")
+    )
+    generic_terminal_state = eval_objective_projection.get(
+        "generic_terminal_state",
+        _generic_terminal_state(final_outcome, meta["rc"]),
+    )
+    if generic_terminal_state not in KNOWN_GENERIC_TERMINAL_STATES:
+        generic_terminal_state = "unknown"
+    recovery_job_kind = eval_objective_projection.get(
+        "recovery_job_kind",
+        _recovery_job_kind_for_terminal(generic_terminal_state),
+    )
+    recovery_strategy_count = eval_objective_projection.get("recovery_strategy_count", 0)
+    if not isinstance(recovery_strategy_count, int) or isinstance(
+        recovery_strategy_count, bool
+    ):
+        recovery_strategy_count = 0
+    recovery_strategies = eval_objective_projection.get("recovery_strategies", [])
+    if not isinstance(recovery_strategies, list):
+        recovery_strategies = []
 
     if isinstance(meta.get("postcheck_success"), bool):
         postcheck_success = meta["postcheck_success"]
@@ -1192,7 +1396,9 @@ def main(argv: list[str]) -> int:
             else {}
         ),
         **({"task_kind_misroute": True} if task_kind_misroute else {}),
+        "deliverable_kind": deliverable_kind,
         "elapsed_s": meta["elapsed_s"],
+        "evidence_kind": evidence_kind,
         "error_500_count": error_500_count,
         "evaluation_taxonomy": {
             "anvil_terminal_class": anvil_terminal_class,
@@ -1204,8 +1410,10 @@ def main(argv: list[str]) -> int:
         "failure_authority": failure_authority,
         "failure_kind": failure_kind,
         "files_modified": files_modified,
+        "generic_terminal_state": generic_terminal_state,
         "iter_count": session_metrics["iter_count"],
         "keywords_version": KEYWORDS_VERSION,
+        "legacy_terminal_state": legacy_terminal_state,
         "outcome_agreement": outcome_agreement,
         "page_tsx_has_game_keywords": page_tsx_has_keywords,
         "page_tsx_touched": page_tsx_touched,
@@ -1213,6 +1421,9 @@ def main(argv: list[str]) -> int:
         "postcheck_reason": postcheck_reason,
         "postcheck_success": postcheck_success,
         "rc": meta["rc"],
+        "recovery_job_kind": recovery_job_kind,
+        "recovery_strategies": recovery_strategies,
+        "recovery_strategy_count": recovery_strategy_count,
         "run_id": session_metrics["run_id"],
         "schema_version": SCHEMA_VERSION,
         "task_kind": task_kind,
