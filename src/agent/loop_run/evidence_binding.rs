@@ -1,4 +1,4 @@
-//! Issue #989 (parent #988, Issue A): evidence binding plan.
+//! Issue #988 umbrella plus child issues #989/#993: evidence binding lifecycle.
 //!
 //! Structures the binding between a deliverable's evidence runner and the
 //! artifacts it depends on *before* the runner executes, so a binding gap is
@@ -10,8 +10,8 @@
 //! `EvidenceBindingStatus` / `BindingCheckKind`) are runtime-neutral so the same
 //! shape extends to Node manifest/test ordering, docs content, data schema, and
 //! research citation binding. Runtime differences live in adapters (`rust_*`
-//! free functions) — this Issue ships the Rust cargo/test adapter; later issues
-//! in #988 wire the plan into the loop and add other adapters/operators.
+//! free functions) and the generic [`BindingFailureCheck`] recovery routing
+//! axis, not in provider-specific control flow.
 //!
 //! Like `evidence_runner.rs`, this module is an extension seam: the focused
 //! in-crate tests pin the shape before broad callers are wired, so the
