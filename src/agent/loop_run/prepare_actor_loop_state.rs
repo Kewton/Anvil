@@ -64,6 +64,10 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     // so the next user turn can emit `agent.verifier.weak` /
     // `agent.verifier.missing` again if the failure mode repeats.
     agent.session.verifier_safe_stop_emitted_this_turn = false;
+    // Issue #979 (parent #974, Issue E): reset the per-turn zero-file
+    // tool-protocol-failure escalation budget so the next user turn can again
+    // escalate one protocol failure into the tool/action path.
+    agent.tool_protocol_recovery_escalated_this_turn = false;
     // Issue #664 iteration-2 (CB-001) / iteration-3 (CB2-001) /
     // iteration-4 (CB3-001): consume the cross-turn carryover bound to
     // the current request key, then clear the per-turn flag.

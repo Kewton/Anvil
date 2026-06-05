@@ -888,22 +888,63 @@ pub(super) fn actor_loop_pre_reply_repo_change_fallback_allowed(
 pub(super) fn actor_loop_pre_reply_request_error(
     agent: &mut Agent,
     err: String,
+    action_expectation: recovery::ActionExpectation,
 ) -> ActorLoopPreReplyOutcome {
-    let reason = if err == super::turn_constants::USER_INTERRUPT_ERROR {
-        ExitReason::Interrupted
-    } else if super::lifecycle::is_tool_call_format_error(&err) {
-        ExitReason::ToolCallFormatError
-    } else {
-        ExitReason::TransportError
-    };
-    if err != super::turn_constants::USER_INTERRUPT_ERROR
-        && (super::lifecycle::is_native_tool_parser_failure(&err)
-            || super::lifecycle::is_tool_call_format_error(&err)
-            || super::lifecycle::is_native_tool_transport_failure(&err))
+    if err == super::turn_constants::USER_INTERRUPT_ERROR {
+        return ActorLoopPreReplyOutcome::Exit {
+            reason: ExitReason::Interrupted,
+            error_text: err,
+        };
+    }
+    // Preserve the tool-protocol-failure diagnosis up front so the failure is
+    // never silently re-classified as a deliverable/evidence failure, whether or
+    // not we escalate below (Issue #979).
+    if super::lifecycle::is_native_tool_parser_failure(&err)
+        || super::lifecycle::is_tool_call_format_error(&err)
+        || super::lifecycle::is_native_tool_transport_failure(&err)
     {
         let frame = build_feedback_for_tool_protocol_failure(&err, &agent.work_root);
         agent.session.record_feedback(frame);
     }
+    // Issue #979 (parent #974, Issue E): a zero-file tool *protocol* failure
+    // (malformed/truncated/unparseable tool call) on a task that still owes a
+    // deliverable must not terminal on assistant prose. Escalate one bounded
+    // round back into the normal tool/action path so the controller's
+    // deterministic deliverable recovery / MissingDeliverable path (step 2) gets
+    // a chance. Bounded by `tool_protocol_recovery_escalated_this_turn` so a
+    // persistent protocol failure still reaches the protocol-failure terminal
+    // and the loop cannot churn.
+    let repo_edits_this_session = super::tool_history::successful_non_plan_repo_edit_count(
+        &agent.session.messages,
+        &agent.work_root,
+        agent.session.mode_state.active_plan_path.as_deref(),
+    );
+    let decision = super::tool_failure_recovery::decide_tool_protocol_recovery(
+        super::tool_failure_recovery::ToolProtocolRecoveryInputs {
+            is_tool_protocol_failure: super::tool_failure_recovery::is_tool_protocol_failure(&err),
+            action_expectation,
+            repo_edits_this_session,
+            already_escalated_this_turn: agent.tool_protocol_recovery_escalated_this_turn,
+        },
+    );
+    if decision
+        == super::tool_failure_recovery::ToolProtocolRecoveryDecision::EscalateToDeliverableRecovery
+    {
+        agent.tool_protocol_recovery_escalated_this_turn = true;
+        agent
+            .controller_policy_ledger
+            .record(ControllerRecoveryStrategy::ToolFirstRetry);
+        super::message_push::push_system_note(
+            agent,
+            recovery::tool_protocol_deliverable_recovery_note(),
+        );
+        return ActorLoopPreReplyOutcome::Continue;
+    }
+    let reason = if super::lifecycle::is_tool_call_format_error(&err) {
+        ExitReason::ToolCallFormatError
+    } else {
+        ExitReason::TransportError
+    };
     ActorLoopPreReplyOutcome::Exit {
         reason,
         error_text: err,
@@ -2279,7 +2320,7 @@ pub(super) fn request_actor_loop_pre_reply_model_turn(
             missing_verifier_setup_turn: control_state.missing_verifier_setup_turn,
             recovery_owner: control_state.recovery_owner,
         },
-        Err(err) => actor_loop_pre_reply_request_error(agent, err),
+        Err(err) => actor_loop_pre_reply_request_error(agent, err, args.action_expectation),
     }
 }
 
