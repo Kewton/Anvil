@@ -58,7 +58,7 @@ fn classified_kind(agent: &super::Agent) -> TaskKind {
 }
 
 // ---------------------------------------------------------------------------
-// Case 7 — `TaskCapability::is_coding()` truth table (Coding=true, other 5=false).
+// Case 7 — `AcceptancePolicy::is_coding()` truth table (Coding=true, other 5=false).
 // (Driven first: it is the predicate the whole gate is built on.)
 // ---------------------------------------------------------------------------
 

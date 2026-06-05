@@ -10,13 +10,9 @@
 //! coverage (the invariants are already individually asserted elsewhere; the
 //! intentional overlap is documentation-as-test and CI catches any drift).
 //!
-//! Task 9 (the SRP trait split of `Verifier` into AcceptancePolicy / Verifier /
-//! Remediator) was evaluated and recorded as **not-warranted** in
-//! `dev-reports/design/issue-929-trait-srp-split-design-policy.md` (DD1): the
-//! `Verifier` trait is `#[allow(dead_code)]`, `failure_packet` is byte-identical
-//! across all kinds with zero production callers, and #918's value-type
-//! `TaskCapability` already obviated the original SRP concern. No trait split is
-//! landed by this Issue; this matrix is the sole deliverable.
+//! Issue #944 extends the matrix to the split trait shape: every kind has an
+//! `AcceptancePolicy`, validating kinds stay behind `Verifier`, and only
+//! `CodingCapability` is reachable as a `Remediator`.
 //!
 //! Pattern lifted from `scaffold_coding_guard_e2e_tests.rs` / `data_capability_e2e_tests.rs`
 //! (CB-001 / DR3-001 precedent): an in-crate `#[cfg(test)] mod` that drives the
@@ -30,7 +26,7 @@ use super::task_contract::TaskKind;
 // dispatched via the trait object's vtable, so the `Verifier` trait does NOT
 // need to be imported here (trait-in-scope is only required to call trait
 // methods on a *concrete* type, not on a `dyn Trait`).
-use super::verifier::{capability_for, verifier_for_task_kind};
+use super::verifier::{capability_for, remediator_for_task_kind, verifier_for_task_kind};
 
 // ---------------------------------------------------------------------------
 // Canonical expectation SSOT.
@@ -48,13 +44,15 @@ use super::verifier::{capability_for, verifier_for_task_kind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Expected {
-    /// `TaskCapability::allows_process_exec()` — verifier child-process spawn.
+    /// `AcceptancePolicy::allows_process_exec()` — verifier child-process spawn.
     allows_process_exec: bool,
-    /// `TaskCapability::is_coding()` — scaffold / deterministic-fallback gate.
+    /// `AcceptancePolicy::is_coding()` — scaffold / deterministic-fallback gate.
     is_coding: bool,
-    /// `TaskCapability::requires_executable_verifier(false)` — the historical
+    /// `AcceptancePolicy::requires_executable_verifier(false)` — the historical
     /// `coding_verifier_required` gate when the task is *not* verifier-free.
     requires_exec_verifier_when_not_free: bool,
+    /// `remediator_for_task_kind(kind).is_some()` — coding-only semantic repair.
+    has_remediator: bool,
 }
 
 fn expected(kind: TaskKind) -> Expected {
@@ -63,6 +61,7 @@ fn expected(kind: TaskKind) -> Expected {
             allows_process_exec: true,
             is_coding: true,
             requires_exec_verifier_when_not_free: true,
+            has_remediator: true,
         },
         TaskKind::Docs
         | TaskKind::Data
@@ -72,6 +71,7 @@ fn expected(kind: TaskKind) -> Expected {
             allows_process_exec: false,
             is_coding: false,
             requires_exec_verifier_when_not_free: false,
+            has_remediator: false,
         },
         // NO `_` arm — a 7th `TaskKind` must be added explicitly above.
     }
@@ -96,6 +96,11 @@ const ALL_KINDS: [TaskKind; 6] = [
 #[test]
 fn allows_process_exec_matches_matrix() {
     for kind in ALL_KINDS {
+        assert_eq!(
+            capability_for(kind).kind(),
+            kind,
+            "capability_for round-trip mismatch for {kind:?}"
+        );
         assert_eq!(
             capability_for(kind).allows_process_exec(),
             expected(kind).allows_process_exec,
@@ -152,6 +157,29 @@ fn verifier_for_task_kind_round_trip() {
             kind,
             "verifier_for_task_kind round-trip mismatch for {kind:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Invariant 5 — Remediator is Coding-only. Non-coding capability paths must not
+// grow a trivial or accidental remediation adapter.
+// ---------------------------------------------------------------------------
+#[test]
+fn remediator_registry_is_coding_only() {
+    for kind in ALL_KINDS {
+        let remediator = remediator_for_task_kind(kind);
+        assert_eq!(
+            remediator.is_some(),
+            expected(kind).has_remediator,
+            "remediator availability mismatch for {kind:?}"
+        );
+        if let Some(remediator) = remediator {
+            assert_eq!(
+                remediator.task_kind(),
+                kind,
+                "remediator round-trip mismatch for {kind:?}"
+            );
+        }
     }
 }
 

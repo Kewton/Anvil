@@ -1,5 +1,8 @@
 use super::completion_evidence::CompletionEvidence;
 use super::failure_packet::{CandidateArtifact, FailurePacket};
+use super::repair_job::SemanticRepairPlan;
+use super::semantic_failure::SemanticFailureReport;
+use super::spec_authority::SpecAuthorityInput;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
     TaskKind,
@@ -183,49 +186,17 @@ pub(super) fn verifier_for_task_kind(task_kind: TaskKind) -> &'static dyn Verifi
     }
 }
 
-/// Issue #918 (P1): the single `capability_for(TaskKind)` dispatch spine.
-///
-/// A small `Copy` descriptor (no allocation, no boxing) that answers two
-/// per-kind capability questions used by the verification-requirement gates
-/// and the structured-verifier process-spawn guard. This is intentionally a
-/// separate concern from [`verifier_for_task_kind`] (which selects the
-/// `&'static dyn Verifier` *strategy*): the capability describes *whether* a
-/// kind requires executable verification / may spawn a process, the strategy
-/// describes *how* it verifies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TaskCapability {
-    kind: TaskKind,
-    /// Only `TaskKind::Coding` may spawn a structured-verifier process.
-    allows_process_exec: bool,
-}
+/// Issue #944 (P1b-2): acceptance policy is the "every task kind" capability
+/// surface. Verification and remediation stay separate traits so non-coding
+/// kinds do not inherit coding-only repair behavior.
+#[allow(dead_code)]
+pub(super) trait AcceptancePolicy {
+    fn kind(&self) -> TaskKind;
 
-/// SSOT static `match` mapping each [`TaskKind`] to its [`TaskCapability`].
-///
-/// The non-coding arm is written as an explicit enumeration (never a `_`
-/// wildcard) so that adding a sixth `TaskKind` is a compile error here,
-/// forcing the capability of any new kind to be reviewed (OCP / fail-safe).
-pub(super) const fn capability_for(kind: TaskKind) -> TaskCapability {
-    match kind {
-        TaskKind::Coding => TaskCapability {
-            kind,
-            allows_process_exec: true,
-        },
-        TaskKind::Docs
-        | TaskKind::Data
-        | TaskKind::Research
-        | TaskKind::Ops
-        | TaskKind::Authoring => TaskCapability {
-            kind,
-            allows_process_exec: false,
-        },
-    }
-}
-
-impl TaskCapability {
     /// Whether the structured verifier for this kind may spawn a child process.
-    /// Only `CodingCapability` (`TaskKind::Coding`) returns `true`.
-    pub(super) const fn allows_process_exec(self) -> bool {
-        self.allows_process_exec
+    /// The default is fail-closed; only `CodingCapability` overrides this.
+    fn allows_process_exec(&self) -> bool {
+        false
     }
 
     /// 1:1 replacement for the historical `coding_verifier_required` gate
@@ -236,42 +207,145 @@ impl TaskCapability {
     /// `verification_required` or `test_execution_required`. Callers AND this
     /// result into each of those two fields *separately* — exactly as the
     /// pre-#918 code did — so no new inter-field dependency is introduced.
-    ///
-    /// Non-coding kinds are enumerated explicitly and always return `false`,
-    /// preserving today's effective behavior (a sixth kind would be a compile
-    /// error). See design policy §5.1 (the non-coding behavior-preservation
-    /// invariant): `test_execution_required` is derived from request text and is
-    /// kind-independent, so this clamp is the primary guard against a non-coding
-    /// task ever requiring executable verification.
-    pub(super) const fn requires_executable_verifier(
-        self,
-        verifier_free_document_task: bool,
-    ) -> bool {
-        match self.kind {
-            TaskKind::Coding => !verifier_free_document_task,
-            TaskKind::Docs
-            | TaskKind::Data
-            | TaskKind::Research
-            | TaskKind::Ops
-            | TaskKind::Authoring => false,
-        }
+    fn requires_executable_verifier(&self, _verifier_free_document_task: bool) -> bool {
+        false
     }
 
     /// Whether the active task is a coding task — the gate for scaffold /
     /// deterministic-fallback materialization and the shared manifest-readiness
     /// diagnostic (Issue #924). Distinct from `allows_process_exec` (verifier
     /// child-process spawn): scaffold is file materialization, not a spawn.
-    /// Non-coding kinds are enumerated explicitly so a 6th `TaskKind` is a
-    /// compile error here (OCP / fail-safe, mirrors `capability_for`).
-    pub(super) const fn is_coding(self) -> bool {
-        match self.kind {
-            TaskKind::Coding => true,
-            TaskKind::Docs
-            | TaskKind::Data
-            | TaskKind::Research
-            | TaskKind::Ops
-            | TaskKind::Authoring => false,
-        }
+    fn is_coding(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct CodingCapability;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DocsCapability;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DataCapability;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ResearchCapability;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct OpsCapability;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct AuthoringCapability;
+
+static CODING_CAPABILITY: CodingCapability = CodingCapability;
+static DOCS_CAPABILITY: DocsCapability = DocsCapability;
+static DATA_CAPABILITY: DataCapability = DataCapability;
+static RESEARCH_CAPABILITY: ResearchCapability = ResearchCapability;
+static OPS_CAPABILITY: OpsCapability = OpsCapability;
+static AUTHORING_CAPABILITY: AuthoringCapability = AuthoringCapability;
+
+impl AcceptancePolicy for CodingCapability {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Coding
+    }
+
+    fn allows_process_exec(&self) -> bool {
+        true
+    }
+
+    fn requires_executable_verifier(&self, verifier_free_document_task: bool) -> bool {
+        !verifier_free_document_task
+    }
+
+    fn is_coding(&self) -> bool {
+        true
+    }
+}
+
+impl AcceptancePolicy for DocsCapability {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Docs
+    }
+}
+
+impl AcceptancePolicy for DataCapability {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Data
+    }
+}
+
+impl AcceptancePolicy for ResearchCapability {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Research
+    }
+}
+
+impl AcceptancePolicy for OpsCapability {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Ops
+    }
+}
+
+impl AcceptancePolicy for AuthoringCapability {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Authoring
+    }
+}
+
+/// Implemented only by `CodingCapability`. Non-coding kinds must reach repair
+/// through deliverable/evidence recovery, not semantic code remediation.
+#[allow(dead_code)]
+pub(super) trait Remediator {
+    fn task_kind(&self) -> TaskKind;
+    fn remediation_plan(&self, report: &SemanticFailureReport) -> Option<SemanticRepairPlan>;
+}
+
+impl Remediator for CodingCapability {
+    fn task_kind(&self) -> TaskKind {
+        TaskKind::Coding
+    }
+
+    fn remediation_plan(&self, report: &SemanticFailureReport) -> Option<SemanticRepairPlan> {
+        super::semantic_repair_planning::build_semantic_repair_plan_from_report_with_authority_input(
+            report.clone(),
+            SpecAuthorityInput {
+                has_user_request_match: false,
+                has_behavior_contract: false,
+                has_verified_public_interface: false,
+                is_newly_generated_task: true,
+                consensus: None,
+            },
+            0,
+        )
+    }
+}
+
+/// SSOT static `match` mapping each [`TaskKind`] to its [`AcceptancePolicy`].
+///
+/// The non-coding arm is written as an explicit enumeration (never a `_`
+/// wildcard) so that adding a seventh `TaskKind` is a compile error here,
+/// forcing the capability of any new kind to be reviewed (OCP / fail-safe).
+pub(super) fn capability_for(kind: TaskKind) -> &'static dyn AcceptancePolicy {
+    match kind {
+        TaskKind::Coding => &CODING_CAPABILITY,
+        TaskKind::Docs => &DOCS_CAPABILITY,
+        TaskKind::Data => &DATA_CAPABILITY,
+        TaskKind::Research => &RESEARCH_CAPABILITY,
+        TaskKind::Ops => &OPS_CAPABILITY,
+        TaskKind::Authoring => &AUTHORING_CAPABILITY,
+    }
+}
+
+#[allow(dead_code)] // Issue #944 extension seam; exercised by capability matrix tests.
+pub(super) fn remediator_for_task_kind(task_kind: TaskKind) -> Option<&'static dyn Remediator> {
+    match task_kind {
+        TaskKind::Coding => Some(&CODING_CAPABILITY),
+        TaskKind::Docs
+        | TaskKind::Data
+        | TaskKind::Research
+        | TaskKind::Ops
+        | TaskKind::Authoring => None,
     }
 }
 
@@ -1704,7 +1778,7 @@ mod tests {
     use super::*;
 
     // Issue #918 (P1): exhaustive capability spine coverage. Every method is
-    // exercised here for all 5 kinds in the SAME commit that introduces them, so
+    // exercised here for all 6 kinds in the SAME commit that introduces them, so
     // `-D warnings` dead_code never fires and the non-coding invariant is pinned.
     #[test]
     fn capability_for_allows_process_exec_only_for_coding() {
@@ -1745,12 +1819,19 @@ mod tests {
         }
     }
 
-    // `capability_for` / `allows_process_exec` are `const fn`: assert const-eval works.
-    const _CODING_CAP: TaskCapability = capability_for(TaskKind::Coding);
-    const _CODING_EXEC: bool = _CODING_CAP.allows_process_exec();
-    // Issue #919: const-eval pin for the new Authoring kind.
-    const _AUTHORING_CAP: TaskCapability = capability_for(TaskKind::Authoring);
-    const _AUTHORING_EXEC: bool = _AUTHORING_CAP.allows_process_exec();
+    #[test]
+    fn capability_registry_round_trips_kind() {
+        for kind in [
+            TaskKind::Coding,
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
+            TaskKind::Authoring,
+        ] {
+            assert_eq!(capability_for(kind).kind(), kind);
+        }
+    }
 
     #[test]
     fn docs_required_sections_pass_becomes_completion_evidence() {
