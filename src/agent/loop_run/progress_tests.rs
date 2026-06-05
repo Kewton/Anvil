@@ -6495,6 +6495,9 @@ E   assert [{'id': 1}] == []\n";
             "def main():\n    return 1\n",
         )
         .unwrap();
+        agent.session.messages.push(ConversationMessage::user(
+            "Create a Python CLI and verify it with pytest.".to_string(),
+        ));
         agent.task_contract_verifier_repair_pending = true;
         agent.repair_job = Some(verifier_context_for("app/main.py"));
 
@@ -6506,17 +6509,34 @@ E   assert [{'id': 1}] == []\n";
             super::super::active_job_arbiter::ActiveJobKind::VerifierRepair
         );
         assert_eq!(
+            selected.recovery_job_kind(),
+            super::super::active_job_arbiter::RecoveryJobKind::EvidenceFailedJob
+        );
+        assert_eq!(
             selected.policy.allowed_tool_names_for_prompt().unwrap(),
             ["Read"]
         );
         match selected.desired_action {
             super::super::active_job_arbiter::DesiredAction::VerifierRepair {
-                target_hint, ..
+                target_hint,
+                worker_request,
+                ..
             } => {
                 assert_eq!(
                     target_hint.map(|hint| hint.path),
                     Some("app/main.py".to_string())
                 );
+                let worker_request = worker_request
+                    .expect("evidence failure should route to DiagnosticRepairWorker");
+                assert_eq!(
+                    worker_request.failure_kind(),
+                    super::super::worker_contract::EvidenceFailureKind::SignatureMismatch
+                );
+                assert_eq!(
+                    worker_request.target_role(),
+                    super::super::worker_contract::DiagnosticRepairTargetRole::Implementation
+                );
+                assert_eq!(worker_request.evidence_command(), "python3 -m pytest");
             }
             other => panic!("unexpected desired action: {other:?}"),
         }

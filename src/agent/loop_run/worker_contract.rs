@@ -10,7 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use super::task_contract::{
-    ObjectiveDeliverableKind, ObjectiveEvidenceKind, TaskContract, TaskKind,
+    ArtifactRole, ObjectiveDeliverableKind, ObjectiveEvidenceKind, RecoveryTargetHint,
+    TaskContract, TaskKind,
 };
 
 pub(super) const MAX_CONTEXT_PACK_ENTRIES: usize = 8;
@@ -222,6 +223,132 @@ pub(super) struct TestAuthorWorkerRequest {
     output_contract: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EvidenceFailureKind {
+    CompileError,
+    ImportNameMismatch,
+    SignatureMismatch,
+    AssertionMismatch,
+    SetupManifestMissing,
+    SchemaMismatch,
+    ContentSectionMissing,
+    SourceEvidenceMissing,
+    Unknown,
+}
+
+impl EvidenceFailureKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            EvidenceFailureKind::CompileError => "compile_error",
+            EvidenceFailureKind::ImportNameMismatch => "import_name_mismatch",
+            EvidenceFailureKind::SignatureMismatch => "signature_mismatch",
+            EvidenceFailureKind::AssertionMismatch => "assertion_mismatch",
+            EvidenceFailureKind::SetupManifestMissing => "setup_manifest_missing",
+            EvidenceFailureKind::SchemaMismatch => "schema_mismatch",
+            EvidenceFailureKind::ContentSectionMissing => "content_section_missing",
+            EvidenceFailureKind::SourceEvidenceMissing => "source_evidence_missing",
+            EvidenceFailureKind::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiagnosticRepairTargetRole {
+    Implementation,
+    TestArtifact,
+    Manifest,
+    Docs,
+    Data,
+    ResearchEvidence,
+    OpsProcedure,
+    Unknown,
+}
+
+impl DiagnosticRepairTargetRole {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            DiagnosticRepairTargetRole::Implementation => "implementation",
+            DiagnosticRepairTargetRole::TestArtifact => "test_artifact",
+            DiagnosticRepairTargetRole::Manifest => "manifest",
+            DiagnosticRepairTargetRole::Docs => "docs",
+            DiagnosticRepairTargetRole::Data => "data",
+            DiagnosticRepairTargetRole::ResearchEvidence => "research_evidence",
+            DiagnosticRepairTargetRole::OpsProcedure => "ops_procedure",
+            DiagnosticRepairTargetRole::Unknown => "unknown",
+        }
+    }
+
+    fn from_artifact_role(role: ArtifactRole, task_kind: TaskKind) -> Self {
+        match role {
+            ArtifactRole::Implementation => DiagnosticRepairTargetRole::Implementation,
+            ArtifactRole::Test => DiagnosticRepairTargetRole::TestArtifact,
+            ArtifactRole::Setup => DiagnosticRepairTargetRole::Manifest,
+            ArtifactRole::UsageDocs => match task_kind {
+                TaskKind::Research => DiagnosticRepairTargetRole::ResearchEvidence,
+                TaskKind::Ops => DiagnosticRepairTargetRole::OpsProcedure,
+                _ => DiagnosticRepairTargetRole::Docs,
+            },
+            ArtifactRole::DataOutput => DiagnosticRepairTargetRole::Data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiagnosticRepairWorkerRequest {
+    pub(super) worker_contract: WorkerContract,
+    failure_kind: EvidenceFailureKind,
+    target_role: DiagnosticRepairTargetRole,
+    target_path: PathBuf,
+    allowed_change_kind: String,
+    evidence_command: String,
+    diagnostic: String,
+    output_contract: &'static str,
+}
+
+impl DiagnosticRepairWorkerRequest {
+    pub(super) fn failure_kind(&self) -> EvidenceFailureKind {
+        self.failure_kind
+    }
+
+    pub(super) fn target_role(&self) -> DiagnosticRepairTargetRole {
+        self.target_role
+    }
+
+    pub(super) fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
+    pub(super) fn allowed_change_kind(&self) -> &str {
+        &self.allowed_change_kind
+    }
+
+    pub(super) fn evidence_command(&self) -> &str {
+        &self.evidence_command
+    }
+
+    pub(super) fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+
+    pub(super) fn output_contract(&self) -> &'static str {
+        self.output_contract
+    }
+
+    pub(super) fn policy_message(&self, next_required_action: &str) -> String {
+        let target =
+            super::task_contract::mask_and_cap_recovery_field(&self.target_path.to_string_lossy());
+        let diagnostic = super::task_contract::mask_and_cap_recovery_field(&self.diagnostic);
+        let evidence_command =
+            super::task_contract::mask_and_cap_recovery_field(&self.evidence_command);
+        format!(
+            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
+            failure_kind = self.failure_kind.label(),
+            target_role = self.target_role.label(),
+            allowed_change_kind = self.allowed_change_kind,
+        )
+    }
+}
+
 impl TestAuthorWorkerRequest {
     pub(super) fn target_test_path(&self) -> &Path {
         &self.target_test_path
@@ -309,6 +436,209 @@ pub(super) fn test_author_evidence_command_for_stack(
         "typescript" => "npm test".to_string(),
         _ => "npm test".to_string(),
     }
+}
+
+pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
+    contract: &TaskContract,
+    diagnostic: &str,
+    target_hint: &RecoveryTargetHint,
+    allowed_change_kind: &str,
+    evidence_command: Option<&str>,
+) -> DiagnosticRepairWorkerRequest {
+    let objective = contract.objective_contract();
+    let failure_kind = classify_evidence_failure_kind(diagnostic);
+    let target_role =
+        DiagnosticRepairTargetRole::from_artifact_role(target_hint.role, objective.task_kind);
+    let target_path = PathBuf::from(target_hint.path.as_str());
+    let evidence_command = evidence_command
+        .filter(|command| !command.trim().is_empty())
+        .unwrap_or("rerun configured evidence command")
+        .to_string();
+    let allowed_change_kind = if allowed_change_kind.trim().is_empty() {
+        default_allowed_change_kind_for_target_role(target_role)
+    } else {
+        allowed_change_kind.trim().to_string()
+    };
+    let mut context_pack =
+        WorkerContract::from_task_contract(contract, WorkerKind::DiagnosticRepair).context_pack;
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Target,
+        "target_role",
+        target_role.label(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Target,
+        "target_path",
+        target_path.to_string_lossy(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Repair,
+        "allowed_change_kind",
+        allowed_change_kind.as_str(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Evidence,
+        "evidence_command",
+        evidence_command.as_str(),
+    ));
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Diagnostic,
+        "diagnostic",
+        format!("failure_kind={}; {diagnostic}", failure_kind.label()),
+    ));
+    DiagnosticRepairWorkerRequest {
+        worker_contract: WorkerContract::from_task_contract(contract, WorkerKind::DiagnosticRepair)
+            .with_context_pack(context_pack),
+        failure_kind,
+        target_role,
+        target_path,
+        allowed_change_kind,
+        evidence_command,
+        diagnostic: diagnostic.to_string(),
+        output_contract: "single_bounded_repair_tool_action_for_the_declared_target_and_failure",
+    }
+}
+
+pub(super) fn classify_evidence_failure_kind(diagnostic: &str) -> EvidenceFailureKind {
+    let normalized = diagnostic.to_ascii_lowercase();
+    if contains_any(
+        &normalized,
+        &[
+            "cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+            "module not found",
+            "no such file or directory",
+            "could not find manifest",
+            "could not find `cargo.toml`",
+            "missing manifest",
+        ],
+    ) {
+        return EvidenceFailureKind::SetupManifestMissing;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "importerror",
+            "modulenotfounderror",
+            "cannot find module",
+            "does not provide an export",
+            "has no exported member",
+            "unresolved import",
+            "unresolved imports",
+            "cannot import name",
+            "no named exports",
+            "not exported",
+        ],
+    ) {
+        return EvidenceFailureKind::ImportNameMismatch;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "wrong number of arguments",
+            "takes 0 positional arguments",
+            "takes 1 argument",
+            "expected function",
+            "mismatched types",
+            "expected signature",
+            "signature mismatch",
+            "typeerror:",
+            "typeerror",
+        ],
+    ) {
+        return EvidenceFailureKind::SignatureMismatch;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "assertionerror",
+            "assertion failed",
+            "assert_eq!",
+            "assert_ne!",
+            "expected:",
+            "actual:",
+            "left:",
+            "right:",
+            "snapshot mismatch",
+            "test failed",
+        ],
+    ) {
+        return EvidenceFailureKind::AssertionMismatch;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "schema",
+            "jsonschema",
+            "csv",
+            "missing column",
+            "unexpected column",
+            "invalid field",
+            "invalid record",
+        ],
+    ) {
+        return EvidenceFailureKind::SchemaMismatch;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "missing heading",
+            "required heading",
+            "missing section",
+            "required section",
+            "content check failed",
+        ],
+    ) {
+        return EvidenceFailureKind::ContentSectionMissing;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "source fetch",
+            "citation",
+            "reference not found",
+            "missing source",
+            "source evidence",
+        ],
+    ) {
+        return EvidenceFailureKind::SourceEvidenceMissing;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "error[e",
+            "failed to compile",
+            "compilation failed",
+            "syntaxerror",
+            "tsc",
+            "cannot find symbol",
+            "expected one of",
+            "unterminated",
+            "parse error",
+        ],
+    ) {
+        return EvidenceFailureKind::CompileError;
+    }
+    EvidenceFailureKind::Unknown
+}
+
+fn default_allowed_change_kind_for_target_role(role: DiagnosticRepairTargetRole) -> String {
+    match role {
+        DiagnosticRepairTargetRole::Implementation => "implementation".to_string(),
+        DiagnosticRepairTargetRole::TestArtifact => "test".to_string(),
+        DiagnosticRepairTargetRole::Manifest => "manifest".to_string(),
+        DiagnosticRepairTargetRole::Docs => "docs".to_string(),
+        DiagnosticRepairTargetRole::Data => "data_schema".to_string(),
+        DiagnosticRepairTargetRole::ResearchEvidence => "research_evidence".to_string(),
+        DiagnosticRepairTargetRole::OpsProcedure => "ops_procedure".to_string(),
+        DiagnosticRepairTargetRole::Unknown => "bounded_target_repair".to_string(),
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn truncate_utf8(value: String, max_bytes: usize) -> (String, bool) {
@@ -538,5 +868,185 @@ mod tests {
         );
 
         assert!(request.is_none());
+    }
+
+    #[test]
+    fn evidence_failure_classifier_covers_coding_and_non_coding_runner_failures() {
+        let cases = [
+            (
+                "error[E0425]: cannot find function `slugify` in this scope",
+                EvidenceFailureKind::CompileError,
+            ),
+            (
+                "ImportError: cannot import name 'slugify' from 'app'",
+                EvidenceFailureKind::ImportNameMismatch,
+            ),
+            (
+                "SyntaxError: The requested module './main.js' does not provide an export named 'formatJson'",
+                EvidenceFailureKind::ImportNameMismatch,
+            ),
+            (
+                "TypeError: slugify() takes 1 argument but 2 were given",
+                EvidenceFailureKind::SignatureMismatch,
+            ),
+            (
+                "AssertionError: expected: clean-slug actual: clean_slug",
+                EvidenceFailureKind::AssertionMismatch,
+            ),
+            (
+                "CSV schema check failed: missing column total",
+                EvidenceFailureKind::SchemaMismatch,
+            ),
+            (
+                "Content check failed: missing section Rollback",
+                EvidenceFailureKind::ContentSectionMissing,
+            ),
+            (
+                "Source evidence missing: citation reference not found",
+                EvidenceFailureKind::SourceEvidenceMissing,
+            ),
+            (
+                "could not find `Cargo.toml` in `/tmp/project`",
+                EvidenceFailureKind::SetupManifestMissing,
+            ),
+        ];
+
+        for (diagnostic, expected) in cases {
+            assert_eq!(
+                classify_evidence_failure_kind(diagnostic),
+                expected,
+                "{diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_repair_worker_request_focuses_rust_compile_failure_on_impl_target() {
+        let contract = TaskContract::from_request(
+            "Create a Rust slugify library and verify it with cargo test.",
+        );
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "src/lib.rs".to_string(),
+            reason: "compiler points at missing public function".to_string(),
+        };
+        let request = diagnostic_repair_worker_request_for_evidence_failed(
+            &contract,
+            "error[E0425]: cannot find function `slugify` in this scope",
+            &target_hint,
+            "implementation",
+            Some("cargo test"),
+        );
+
+        assert_eq!(
+            request.worker_contract.worker_kind,
+            WorkerKind::DiagnosticRepair
+        );
+        assert_eq!(request.failure_kind(), EvidenceFailureKind::CompileError);
+        assert_eq!(
+            request.target_role(),
+            DiagnosticRepairTargetRole::Implementation
+        );
+        assert_eq!(request.target_path(), Path::new("src/lib.rs"));
+        assert_eq!(request.allowed_change_kind(), "implementation");
+        assert_eq!(request.evidence_command(), "cargo test");
+        assert_eq!(
+            request.output_contract(),
+            "single_bounded_repair_tool_action_for_the_declared_target_and_failure"
+        );
+        assert!(
+            request
+                .policy_message("exactly one compact Edit on the declared target")
+                .contains("DiagnosticRepairWorker")
+        );
+        let diagnostic_entries = request
+            .worker_contract
+            .context_pack
+            .entries_for_kind(ContextPackKind::Diagnostic);
+        assert_eq!(diagnostic_entries.len(), 1);
+        assert!(
+            diagnostic_entries[0]
+                .content()
+                .contains("failure_kind=compile_error")
+        );
+    }
+
+    #[test]
+    fn diagnostic_repair_worker_request_distinguishes_test_artifact_self_failure() {
+        let contract = TaskContract::from_request(
+            "Create a Node JSON formatter CLI and verify it with node --test.",
+        );
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/main.test.js".to_string(),
+            reason: "test imports the wrong export name".to_string(),
+        };
+        let request = diagnostic_repair_worker_request_for_evidence_failed(
+            &contract,
+            "SyntaxError: The requested module '../src/main.js' does not provide an export named 'formatJson'",
+            &target_hint,
+            "test",
+            Some("node --test tests/main.test.js"),
+        );
+
+        assert_eq!(
+            request.failure_kind(),
+            EvidenceFailureKind::ImportNameMismatch
+        );
+        assert_eq!(
+            request.target_role(),
+            DiagnosticRepairTargetRole::TestArtifact
+        );
+        assert_eq!(request.allowed_change_kind(), "test");
+        assert_eq!(request.evidence_command(), "node --test tests/main.test.js");
+    }
+
+    #[test]
+    fn diagnostic_repair_worker_request_projects_non_coding_target_roles() {
+        let docs = TaskContract::from_request(
+            "Write README.md with prerequisites, rollback, and validation sections.",
+        );
+        let docs_hint = RecoveryTargetHint {
+            role: ArtifactRole::UsageDocs,
+            path: "README.md".to_string(),
+            reason: "content check found a missing section".to_string(),
+        };
+        let docs_request = diagnostic_repair_worker_request_for_evidence_failed(
+            &docs,
+            "Content check failed: missing heading Rollback",
+            &docs_hint,
+            "",
+            Some("content-check README.md"),
+        );
+
+        assert_eq!(
+            docs_request.failure_kind(),
+            EvidenceFailureKind::ContentSectionMissing
+        );
+        assert_eq!(docs_request.target_role(), DiagnosticRepairTargetRole::Docs);
+        assert_eq!(docs_request.allowed_change_kind(), "docs");
+
+        let data = TaskContract::from_request(
+            "Transform orders.csv into output.csv with id,total columns.",
+        );
+        let data_hint = RecoveryTargetHint {
+            role: ArtifactRole::DataOutput,
+            path: "output.csv".to_string(),
+            reason: "schema check found missing total column".to_string(),
+        };
+        let data_request = diagnostic_repair_worker_request_for_evidence_failed(
+            &data,
+            "CSV schema check failed: missing column total",
+            &data_hint,
+            "",
+            Some("schema-check output.csv"),
+        );
+
+        assert_eq!(
+            data_request.failure_kind(),
+            EvidenceFailureKind::SchemaMismatch
+        );
+        assert_eq!(data_request.target_role(), DiagnosticRepairTargetRole::Data);
+        assert_eq!(data_request.allowed_change_kind(), "data_schema");
     }
 }

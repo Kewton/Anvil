@@ -258,12 +258,72 @@ fn verifier_repair_request_patch_message(
     let target_display = verifier_repair_target_display(&target, &agent.work_root);
     let already_read =
         focused_edit_target_already_read(&agent.session.messages, &target, &agent.work_root);
+    if let Some(message) =
+        diagnostic_repair_worker_policy_message(agent, target_hint, target.is_file(), already_read)
+    {
+        return message;
+    }
     verifier_repair_request_patch_message_body(
         &target_display,
         diagnostics,
         target.is_file(),
         already_read,
     )
+}
+
+fn diagnostic_repair_worker_policy_message(
+    agent: &Agent,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+    target_is_file: bool,
+    target_already_read: bool,
+) -> Option<String> {
+    let contract = super::task_classification::task_contract_authority(agent)?;
+    let job = agent.repair_job.as_ref()?;
+    let allowed_change_kind = job
+        .correction_job
+        .as_ref()
+        .map(|correction| correction.kind.as_str())
+        .unwrap_or("bounded_target_repair");
+    let diagnostic = diagnostic_repair_diagnostic_for_job(job);
+    let request = super::worker_contract::diagnostic_repair_worker_request_for_evidence_failed(
+        contract.as_ref(),
+        &diagnostic,
+        target_hint,
+        allowed_change_kind,
+        Some(job.command.as_str()),
+    );
+    Some(
+        request.policy_message(diagnostic_repair_next_required_action(
+            target_is_file,
+            target_already_read,
+        )),
+    )
+}
+
+fn diagnostic_repair_diagnostic_for_job(job: &super::repair_job::RepairJob) -> String {
+    let error_kind = job
+        .error_kind
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(job.failure_signature.as_str());
+    if job.output_excerpt.trim().is_empty() {
+        error_kind.to_string()
+    } else {
+        format!("{error_kind}\n{}", job.output_excerpt)
+    }
+}
+
+fn diagnostic_repair_next_required_action(
+    target_is_file: bool,
+    target_already_read: bool,
+) -> &'static str {
+    if !target_is_file {
+        "exactly one Write on the declared target"
+    } else if target_already_read {
+        "exactly one compact Edit on the declared target"
+    } else {
+        "exactly one Read on the declared target; the next turn will request the bounded Edit"
+    }
 }
 
 /// Issue #931 (Choke B): pure render-point helper for the verifier-repair

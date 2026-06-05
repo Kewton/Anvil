@@ -2875,6 +2875,7 @@ mod tests {
             desired_action: DesiredAction::VerifierRepair {
                 command: "cargo test -- --token=AKIAIOSFODNN7EXAMPLE".to_string(),
                 target_hint: None,
+                worker_request: None,
             },
             policy,
             budget: Budget::Unbounded,

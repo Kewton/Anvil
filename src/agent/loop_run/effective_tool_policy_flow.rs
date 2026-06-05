@@ -183,7 +183,11 @@ fn priority_one_arbiter_candidates(agent: &Agent) -> Option<Vec<JobCandidate>> {
                 kind: ActiveJobKind::VerifierRepair,
                 desired_action: DesiredAction::VerifierRepair {
                     command: String::new(),
-                    target_hint,
+                    target_hint: target_hint.clone(),
+                    worker_request: diagnostic_repair_worker_request_for_evidence_failed(
+                        agent,
+                        target_hint.as_ref(),
+                    ),
                 },
                 policy: verifier_repair_policy_for_next_action(agent, &next_action),
                 budget: Budget::Unbounded,
@@ -228,6 +232,45 @@ fn test_author_worker_request_for_missing_evidence(
         ),
         implementation_context,
     )
+}
+
+fn diagnostic_repair_worker_request_for_evidence_failed(
+    agent: &Agent,
+    next_action_target_hint: Option<&super::task_contract::RecoveryTargetHint>,
+) -> Option<super::worker_contract::DiagnosticRepairWorkerRequest> {
+    let contract = super::task_classification::task_contract_authority(agent)?;
+    let job = agent.repair_job.as_ref()?;
+    let target_hint = next_action_target_hint
+        .or(job.repair_target_hint.as_ref())
+        .or(job.target_hint.as_ref())?;
+    let allowed_change_kind = job
+        .correction_job
+        .as_ref()
+        .map(|correction| correction.kind.as_str())
+        .unwrap_or("bounded_target_repair");
+    let diagnostic = diagnostic_repair_diagnostic_for_job(job);
+    Some(
+        super::worker_contract::diagnostic_repair_worker_request_for_evidence_failed(
+            contract.as_ref(),
+            &diagnostic,
+            target_hint,
+            allowed_change_kind,
+            Some(job.command.as_str()),
+        ),
+    )
+}
+
+fn diagnostic_repair_diagnostic_for_job(job: &super::repair_job::RepairJob) -> String {
+    let error_kind = job
+        .error_kind
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(job.failure_signature.as_str());
+    if job.output_excerpt.trim().is_empty() {
+        error_kind.to_string()
+    } else {
+        format!("{error_kind}\n{}", job.output_excerpt)
+    }
 }
 
 fn push_focused_edit_candidate(

@@ -39,7 +39,7 @@ use super::task_contract::{
     VerifierPrerequisiteSignal, has_required_setup_artifact,
 };
 use super::tool_policy::EffectiveToolPolicy;
-use super::worker_contract::TestAuthorWorkerRequest;
+use super::worker_contract::{DiagnosticRepairWorkerRequest, TestAuthorWorkerRequest};
 use crate::logging::stable_path_hash;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::feedback::mask_secrets;
@@ -324,6 +324,8 @@ pub(super) enum DesiredAction {
         command: String,
         #[allow(dead_code)]
         target_hint: Option<RecoveryTargetHint>,
+        #[allow(dead_code)]
+        worker_request: Option<DiagnosticRepairWorkerRequest>,
     },
     /// Create missing evidence for the current task. For coding tasks this may
     /// carry a bounded TestAuthorWorker request; legacy missing-verifier setup
@@ -836,6 +838,7 @@ mod tests {
                 DesiredAction::VerifierRepair {
                     command: "cargo test".to_string(),
                     target_hint: None,
+                    worker_request: None,
                 },
             ),
             ActiveJobKind::ForcedSmallEditRecovery => (
@@ -1229,6 +1232,7 @@ mod tests {
         let a = DesiredAction::VerifierRepair {
             command: "cargo test".to_string(),
             target_hint: None,
+            worker_request: None,
         };
         assert_eq!(a.label(), "verifier_repair");
         let b = DesiredAction::MissingVerifierCreate {
