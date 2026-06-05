@@ -227,6 +227,18 @@ pub fn tool_call_format_recovery_note(error: &str, attempt: usize) -> String {
     )
 }
 
+/// Issue #979 (parent #974, Issue E): step-2 escalation note for a zero-file
+/// tool *protocol* failure. The reply-retry budget (step 1: stricter minimal
+/// tool-call retry / native→tagged downgrade) is exhausted, no deliverable has
+/// landed, and the task still owes one. Instead of a terminal on assistant
+/// prose, force the next turn back onto the tool/action path so the controller's
+/// deterministic deliverable recovery can run. Carries no caller-supplied path
+/// or reason, so it needs no masking (it never reaches a path-interpolation
+/// site of the recovery-prompt masking convention).
+pub fn tool_protocol_deliverable_recovery_note() -> String {
+    "Repeated tool-call protocol failures stopped earlier turns before any file was produced, but the task still needs a deliverable. Do not answer in prose and do not describe what you will do. Emit exactly one valid <anvil_tool_call>{\"name\":\"Tool\",\"arguments\":{...}}</anvil_tool_call> block now that creates the first required file with a small, complete Write. Keep the JSON complete and the body short.".to_string()
+}
+
 pub fn forced_small_edit_recovery_note(path: &str, attempt: usize) -> String {
     let path = mask_recovery_path(path);
     format!(

@@ -727,6 +727,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_protocol_failure_is_not_confused_with_deliverable_or_evidence_failure() {
+        // Issue #979 acceptance: a tool *protocol* failure must classify as a
+        // ToolFailure / model_output_failure, never as a missing-deliverable or
+        // evidence failure. The legacy `tool_call_format_error` eval label is
+        // also preserved as the compatibility projection.
+        let outcome = RunTerminalOutcome::from_exit_reason(ExitReason::ToolCallFormatError);
+        assert_eq!(
+            outcome.generic_state,
+            GenericTerminalState::ModelOutputFailure
+        );
+        assert_eq!(
+            outcome.recovery_job_kind(),
+            Some(RecoveryJobKind::ToolFailureJob)
+        );
+        assert_ne!(
+            outcome.recovery_job_kind(),
+            Some(RecoveryJobKind::MissingDeliverableJob)
+        );
+        assert_ne!(
+            outcome.recovery_job_kind(),
+            Some(RecoveryJobKind::EvidenceFailedJob)
+        );
+        assert_eq!(outcome.legacy_label_for_eval(), "tool_call_format_error");
+    }
+
+    #[test]
     fn run_state_projects_existing_controller_actions() {
         let continue_action = ArtifactRecoveryAction::Continue {
             missing: vec![ArtifactRole::UsageDocs],

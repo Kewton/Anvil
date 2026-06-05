@@ -292,6 +292,14 @@ mod repo_edit_observation;
 // RequestPatch branches). Free fns over `&mut Agent` / `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod recovery_targets;
+// Issue #979 (parent #974, Issue E): controller-side ToolFailure recovery.
+// Pure decision logic — `is_tool_protocol_failure` classifier +
+// `decide_tool_protocol_recovery` zero-file escalation guard — that keeps a
+// tool *protocol* failure (malformed/truncated/unparseable tool call) with no
+// deliverable from terminating on assistant prose, escalating one bounded round
+// into the normal tool/action path instead. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod tool_failure_recovery;
 // Playable-UI quality gate decision helpers extracted from `turn.rs`
 // (parent #680). Hosts `current_request_needs_playable_ui_quality_gate`
 // (Act + policy + request gate), `accepted_repo_change_quality_issue`
@@ -2400,6 +2408,14 @@ pub struct Agent {
     #[allow(dead_code)]
     // Iteration-3 wires the production producer (external_import detection in run_structured); until then only the per-turn reset semantics are exercised.
     pub(in crate::agent::loop_run) external_import_rejected_emitted_this_turn: bool,
+    /// Issue #979 (parent #974, Issue E): per-turn budget for the zero-file
+    /// tool-protocol-failure escalation. Set the first time
+    /// `actor_loop_pre_reply_request_error` escalates a protocol failure back
+    /// into the tool/action path (instead of a 0-file terminal); a second
+    /// protocol failure in the same turn then takes the terminal path so the
+    /// protocol classification is preserved and the loop cannot churn. Reset at
+    /// the actor-loop head in `prepare_actor_loop_state`.
+    pub(in crate::agent::loop_run) tool_protocol_recovery_escalated_this_turn: bool,
     /// Issue #664 iteration-2 (CB-001): per-turn observation flag set when
     /// `run_task_contract_verifier_once` observes
     /// `OwnedTestVerifierPlan::Missing`. Read by
@@ -2729,6 +2745,9 @@ impl Agent {
             // Reset at handle_user_message head; producers land in iteration-3.
             last_verifier_invoked_payload_digest: None,
             external_import_rejected_emitted_this_turn: false,
+            // Issue #979 (parent #974, Issue E): per-turn zero-file
+            // tool-protocol-failure escalation budget. Reset at actor-loop head.
+            tool_protocol_recovery_escalated_this_turn: false,
             // Issue #664 iteration-2 (CB-001): per-turn Stage A observation.
             owned_test_verifier_missing_observed_this_turn: false,
             // Issue #664 iteration-4 (CB3-001): request-bound carryover.
