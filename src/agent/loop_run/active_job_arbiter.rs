@@ -27,7 +27,7 @@
 //!   `redact_verifier_command_for_storage` before logging (never `Debug`).
 
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
 use super::repair_job::{RepairNextAction, StopReason, VerifierBootstrapNextAction};
@@ -39,6 +39,7 @@ use super::task_contract::{
     VerifierPrerequisiteSignal, has_required_setup_artifact,
 };
 use super::tool_policy::EffectiveToolPolicy;
+use super::worker_contract::TestAuthorWorkerRequest;
 use crate::logging::stable_path_hash;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::feedback::mask_secrets;
@@ -324,8 +325,12 @@ pub(super) enum DesiredAction {
         #[allow(dead_code)]
         target_hint: Option<RecoveryTargetHint>,
     },
-    /// Create the missing verifier file (no diagnostic command yet).
-    MissingVerifierCreate,
+    /// Create missing evidence for the current task. For coding tasks this may
+    /// carry a bounded TestAuthorWorker request; legacy missing-verifier setup
+    /// keeps `None` for back-compat projections.
+    MissingVerifierCreate {
+        worker_request: Option<TestAuthorWorkerRequest>,
+    },
     /// Focused-edit recovery: model should Read (if not yet) and Edit/Write
     /// the named target.
     FocusedEdit {
@@ -361,7 +366,7 @@ impl DesiredAction {
     pub(super) fn label(&self) -> &'static str {
         match self {
             DesiredAction::VerifierRepair { .. } => "verifier_repair",
-            DesiredAction::MissingVerifierCreate => "missing_verifier_create",
+            DesiredAction::MissingVerifierCreate { .. } => "missing_verifier_create",
             DesiredAction::FocusedEdit { .. } => "focused_edit",
             DesiredAction::ArtifactDirected { .. } => "artifact_directed",
             DesiredAction::SetupBash => "setup_bash",
@@ -369,18 +374,19 @@ impl DesiredAction {
     }
 
     /// Optional workspace-relative target path. `None` for action variants
-    /// with no path semantic (`VerifierRepair` / `MissingVerifierCreate` /
-    /// `SetupBash`). Consumed by the Phase C `agent.active_job.selected`
+    /// with no path semantic (`VerifierRepair` / `SetupBash`). Consumed by the
+    /// Phase C `agent.active_job.selected`
     /// payload builder to derive `target_path_hash` via
     /// `stable_path_hash(mask_secrets(...))`. The raw path MUST NOT be
     /// logged — callers route through the redaction pipeline.
-    pub(super) fn target_path(&self) -> Option<&PathBuf> {
+    pub(super) fn target_path(&self) -> Option<&Path> {
         match self {
-            DesiredAction::VerifierRepair { .. }
-            | DesiredAction::MissingVerifierCreate
-            | DesiredAction::SetupBash => None,
-            DesiredAction::FocusedEdit { target, .. } => Some(target),
-            DesiredAction::ArtifactDirected { target, .. } => Some(target),
+            DesiredAction::VerifierRepair { .. } | DesiredAction::SetupBash => None,
+            DesiredAction::MissingVerifierCreate { worker_request } => worker_request
+                .as_ref()
+                .map(|request| request.target_test_path()),
+            DesiredAction::FocusedEdit { target, .. } => Some(target.as_path()),
+            DesiredAction::ArtifactDirected { target, .. } => Some(target.as_path()),
         }
     }
 }
@@ -468,7 +474,7 @@ pub(super) struct JobCandidate {
 impl JobCandidate {
     pub(super) fn recovery_job_kind(&self) -> RecoveryJobKind {
         match &self.desired_action {
-            DesiredAction::MissingVerifierCreate => RecoveryJobKind::MissingEvidenceJob,
+            DesiredAction::MissingVerifierCreate { .. } => RecoveryJobKind::MissingEvidenceJob,
             DesiredAction::SetupBash => RecoveryJobKind::ToolFailureJob,
             _ => self.kind.default_recovery_job_kind(),
         }
@@ -1194,7 +1200,9 @@ mod tests {
 
         let missing_verifier = JobCandidate {
             kind: ActiveJobKind::VerifierRepair,
-            desired_action: DesiredAction::MissingVerifierCreate,
+            desired_action: DesiredAction::MissingVerifierCreate {
+                worker_request: None,
+            },
             policy: EffectiveToolPolicy::restricted(
                 EffectiveToolPolicyReason::VerifierRepair,
                 vec!["Read", "Edit"],
@@ -1223,7 +1231,9 @@ mod tests {
             target_hint: None,
         };
         assert_eq!(a.label(), "verifier_repair");
-        let b = DesiredAction::MissingVerifierCreate;
+        let b = DesiredAction::MissingVerifierCreate {
+            worker_request: None,
+        };
         assert_eq!(b.label(), "missing_verifier_create");
         let c = DesiredAction::FocusedEdit {
             target: PathBuf::from("x"),
@@ -1258,7 +1268,9 @@ mod tests {
     fn missing_verifier_create_variant_constructs_and_labels() {
         let c = JobCandidate {
             kind: ActiveJobKind::VerifierRepair,
-            desired_action: DesiredAction::MissingVerifierCreate,
+            desired_action: DesiredAction::MissingVerifierCreate {
+                worker_request: None,
+            },
             policy: EffectiveToolPolicy::restricted(
                 EffectiveToolPolicyReason::VerifierRepair,
                 vec!["Write"],

@@ -202,12 +202,31 @@ pub(super) fn verifier_repair_policy_message(
                 super::repair_job::RepairNextAction::RerunVerifier
                 | super::repair_job::RepairNextAction::VerifiedDone,
             ) => verifier_repair_transition_message(),
-            None if agent.missing_verifier_job.is_some() => verifier_setup_policy_message(
-                &super::workspace_access::active_request_text(agent).unwrap_or_default(),
-            ),
+            None if agent.missing_verifier_job.is_some() => {
+                let active_request =
+                    super::workspace_access::active_request_text(agent).unwrap_or_default();
+                test_author_worker_policy_message(agent, &active_request)
+                    .unwrap_or_else(|| verifier_setup_policy_message(&active_request))
+            }
             None => verifier_repair_transition_message(),
         }
     })
+}
+
+fn test_author_worker_policy_message(agent: &Agent, active_request: &str) -> Option<String> {
+    let contract = super::task_classification::task_contract_authority(agent)?;
+    let implementation_context = agent
+        .task_contract_excerpts
+        .get(&super::task_contract::ArtifactRole::Implementation)
+        .map(String::as_str);
+    super::worker_contract::test_author_worker_request_for_missing_evidence(
+        contract.as_ref(),
+        super::verifier_orchestration::synthesized_missing_test_target_path_for_request(
+            active_request,
+        ),
+        implementation_context,
+    )
+    .map(|request| request.policy_message())
 }
 
 fn verifier_repair_diagnostic_policy_message(agent: &Agent) -> String {
