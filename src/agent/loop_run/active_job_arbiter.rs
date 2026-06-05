@@ -126,6 +126,12 @@ pub(super) enum RecoveryJobKind {
     MissingDeliverableJob,
     MissingEvidenceJob,
     EvidenceFailedJob,
+    // Issue #993 (parent #988, Issue E): a deliverable exists but its evidence
+    // runner cannot be bound (Node `package.json`/`scripts.test`, docs target
+    // document, data output schema, research source citation). Distinct from
+    // MissingEvidenceJob (the deliverable is present) and EvidenceFailedJob
+    // (the runner never bound, so it never ran).
+    EvidenceBindingFailedJob,
     ToolFailureJob,
 }
 
@@ -135,6 +141,7 @@ impl RecoveryJobKind {
             RecoveryJobKind::MissingDeliverableJob => "MissingDeliverableJob",
             RecoveryJobKind::MissingEvidenceJob => "MissingEvidenceJob",
             RecoveryJobKind::EvidenceFailedJob => "EvidenceFailedJob",
+            RecoveryJobKind::EvidenceBindingFailedJob => "EvidenceBindingFailedJob",
             RecoveryJobKind::ToolFailureJob => "ToolFailureJob",
         }
     }

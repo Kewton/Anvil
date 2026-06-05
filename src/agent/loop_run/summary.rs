@@ -269,8 +269,13 @@ impl RunTerminalOutcome {
                 Some(RecoveryJobKind::MissingDeliverableJob)
             }
             GenericTerminalState::MissingEvidence => Some(RecoveryJobKind::MissingEvidenceJob),
+            // Issue #993 (parent #988, Issue E): a deliverable exists but its
+            // evidence runner cannot be bound. Distinct recovery job from a
+            // runner that bound and failed (`EvidenceFailed*`).
+            GenericTerminalState::EvidenceBindingFailed => {
+                Some(RecoveryJobKind::EvidenceBindingFailedJob)
+            }
             GenericTerminalState::EvidenceFailed
-            | GenericTerminalState::EvidenceBindingFailed
             | GenericTerminalState::EvidenceRepairExhausted
             | GenericTerminalState::EvidenceRepairSafeStop => {
                 Some(RecoveryJobKind::EvidenceFailedJob)
@@ -724,6 +729,33 @@ mod tests {
             assert_eq!(outcome.legacy_label_for_eval(), legacy_label);
             assert_eq!(reason.label(), legacy_label);
         }
+    }
+
+    #[test]
+    fn binding_failure_routes_to_its_own_recovery_job() {
+        // Issue #993 (parent #988, Issue E): the `EvidenceBindingFailed`
+        // terminal (a deliverable exists but its runner cannot bind) projects
+        // to the dedicated `EvidenceBindingFailedJob`, NOT the generic
+        // `EvidenceFailedJob` used when a bound runner actually failed.
+        let outcome = RunTerminalOutcome::from_exit_reason(ExitReason::SafeStopVerifierWeak);
+        assert_eq!(
+            outcome.generic_state,
+            GenericTerminalState::EvidenceBindingFailed
+        );
+        assert_eq!(
+            outcome.recovery_job_kind(),
+            Some(RecoveryJobKind::EvidenceBindingFailedJob)
+        );
+        assert_ne!(
+            outcome.recovery_job_kind(),
+            Some(RecoveryJobKind::EvidenceFailedJob)
+        );
+        // A bound runner that failed still routes to `EvidenceFailedJob`.
+        let failed = RunTerminalOutcome::from_exit_reason(ExitReason::VerifierFailed);
+        assert_eq!(
+            failed.recovery_job_kind(),
+            Some(RecoveryJobKind::EvidenceFailedJob)
+        );
     }
 
     #[test]

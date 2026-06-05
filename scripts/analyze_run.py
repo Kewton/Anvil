@@ -106,7 +106,10 @@ RECOVERY_JOB_BY_GENERIC_TERMINAL = {
     "missing_deliverable": "MissingDeliverableJob",
     "missing_evidence": "MissingEvidenceJob",
     "evidence_failed": "EvidenceFailedJob",
-    "evidence_binding_failed": "EvidenceFailedJob",
+    # Issue #993 (parent #988, Issue E): a deliverable exists but its evidence
+    # runner cannot bind. Kept aligned with the Rust
+    # `RecoveryJobKind::EvidenceBindingFailedJob` projection.
+    "evidence_binding_failed": "EvidenceBindingFailedJob",
     "evidence_runner_missing": "ToolFailureJob",
     "evidence_repair_exhausted": "EvidenceFailedJob",
     "evidence_repair_safe_stop": "EvidenceFailedJob",
@@ -921,13 +924,28 @@ def _normalize_generic_terminal_state_from_worker_lifecycle(
     bound and a rerun failed. Keep the legacy label readable, but route the
     generic lifecycle through evidence failure so recovery analysis does not
     schedule a missing-evidence job for a failed runner.
+
+    Issue #993 (parent #988, Issue E): the inverse case is a *binding-order*
+    failure — the evidence deliverable was created (a Node test file, a docs
+    document, a data output, research notes) but no evidence runner could be
+    bound to it (`package.json`/`scripts.test` missing, no target document, no
+    output file, no source notes). That is ``evidence_binding_failed``, not a
+    generic ``missing_evidence`` (legacy ``missing_verification``) terminal, so
+    recovery materializes the binding and reruns instead of asking for more
+    evidence. The ``evidence_created is False`` case (the test author has not
+    produced the deliverable yet) is left untouched as ``missing_evidence``.
     """
     if generic_terminal_state != "missing_evidence":
         return generic_terminal_state
-    if projection.get("runner_bound") is not True:
+    if projection.get("runner_bound") is True:
+        if projection.get("evidence_created") is True or projection.get("rerun_passed") is False:
+            return "evidence_failed"
         return generic_terminal_state
-    if projection.get("evidence_created") is True or projection.get("rerun_passed") is False:
-        return "evidence_failed"
+    if (
+        projection.get("runner_bound") is False
+        and projection.get("evidence_created") is True
+    ):
+        return "evidence_binding_failed"
     return generic_terminal_state
 
 

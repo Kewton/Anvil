@@ -441,6 +441,12 @@ pub mod commands;
 // reaching into private module state — see `is_completion_verifier_command`
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
+// Issue #993 (parent #988, Issue E): generic `EvidenceBindingFailedJob` —
+// models "deliverable exists but its evidence runner cannot bind" once,
+// keying the runtime difference (Node manifest / docs section / data schema /
+// research citation) into a small `BindingCheck` enum + `BindingRecovery`
+// data, not a per-task-kind control-flow branch.
+mod evidence_binding;
 mod evidence_runner;
 mod worker_contract;
 // Issue #950: delegated local-LLM persistence policy. Records static
