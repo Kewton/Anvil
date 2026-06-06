@@ -541,6 +541,12 @@ mod cargo_dependency_repair;
 // re-exported (DR3-001).
 mod repair_assertion_analysis;
 mod rust_binding_repair;
+// Issue #1005: RepairOperatorRegistry — organizes the deterministic repair
+// operators by failure class / binding check / target role so docs/data/research
+// operators are table rows, not new task-kind jobs. Pure metadata + selection +
+// session-observation over the existing operators (no re-implementation). Not
+// re-exported (DR3-001).
+mod repair_operator;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
@@ -795,6 +801,12 @@ mod job_report_e2e_tests;
 // binary does not include this module (DR3-001).
 #[cfg(test)]
 mod contract_conflict_job_e2e_tests;
+// Issue #1005: in-crate `#[cfg(test)]` E2E suite for the RepairOperatorRegistry
+// production projection (`FailureContext::from_repair_job`) + failure-class
+// routing (CB-001 fix pattern, `job_report_e2e_tests.rs` precedent). Production
+// binary does not include this module (DR3-001).
+#[cfg(test)]
+mod repair_operator_e2e_tests;
 // Issue #664: in-crate `#[cfg(test)]` E2E suite for Bash/Setup policy
 // wiring (CB-001 fix pattern, `safe_stop_e2e_tests.rs` /
 // `job_report_e2e_tests.rs` / `behavior_contract_projection_e2e_tests.rs`
