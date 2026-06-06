@@ -1814,6 +1814,23 @@ fn recovery_target_hint_for_missing_with_contract(
     missing: &[ArtifactRole],
 ) -> Option<RecoveryTargetHint> {
     let role = missing.first().copied()?;
+    if let Some(target_hint) = recovery_target_hint_for_blocking_obligation_diagnostic(
+        contract,
+        artifacts,
+        artifact_excerpts,
+        role,
+    ) {
+        return Some(target_hint);
+    }
+    recovery_target_hint_for_missing(artifacts, missing)
+}
+
+pub(super) fn recovery_target_hint_for_blocking_obligation_diagnostic(
+    contract: &TaskContract,
+    artifacts: &[ArtifactState],
+    artifact_excerpts: &ArtifactExcerpts,
+    role: ArtifactRole,
+) -> Option<RecoveryTargetHint> {
     if let Some((identity, diagnostic)) = contract
         .required_identities_for_role(role)
         .into_iter()
@@ -1850,7 +1867,7 @@ fn recovery_target_hint_for_missing_with_contract(
             reason,
         });
     }
-    recovery_target_hint_for_missing(artifacts, missing)
+    None
 }
 
 /// Issue #918 (P1): display cap (chars) for a single section/schema label.

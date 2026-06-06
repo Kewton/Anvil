@@ -51,17 +51,10 @@ pub(super) fn task_contract_recovery_action(
     repo_edit_calls_made_this_turn: usize,
 ) -> super::task_contract::ArtifactRecoveryAction {
     super::agent_misc::refresh_artifact_completion_satisfied(agent);
-    if agent.artifact_completion_job.as_ref().is_some_and(|job| {
-        matches!(
-            job.status(),
-            super::artifact_completion_job::ArtifactCompletionStatus::Satisfied
-        )
-    }) {
-        return if contract.verification_required {
-            super::task_contract::ArtifactRecoveryAction::RunVerifier
-        } else {
-            super::task_contract::ArtifactRecoveryAction::Done
-        };
+    let artifacts =
+        super::artifact_state_projection::task_contract_artifact_states(agent, contract);
+    if let Some(action) = satisfied_artifact_job_action(agent, contract, &artifacts) {
+        return action;
     }
 
     let verifier_repair_ready_to_verify = agent.task_contract_verifier_repair_pending
@@ -77,8 +70,6 @@ pub(super) fn task_contract_recovery_action(
     if verifier_repair_ready_to_verify {
         return super::task_contract::ArtifactRecoveryAction::RunVerifier;
     }
-    let artifacts =
-        super::artifact_state_projection::task_contract_artifact_states(agent, contract);
     let repair_state =
         task_contract_repair_state(agent, repair_edit_count, repo_edit_calls_made_this_turn);
     let missing_verifier_suppress_retry = agent
@@ -146,6 +137,40 @@ pub(super) fn task_contract_recovery_action(
         }
     }
     action
+}
+
+fn satisfied_artifact_job_action(
+    agent: &Agent,
+    contract: &super::task_contract::TaskContract,
+    artifacts: &[super::task_contract::ArtifactState],
+) -> Option<super::task_contract::ArtifactRecoveryAction> {
+    let job = agent.artifact_completion_job.as_ref()?;
+    if !matches!(
+        job.status(),
+        super::artifact_completion_job::ArtifactCompletionStatus::Satisfied
+    ) {
+        return None;
+    }
+    let missing = vec![job.role()];
+    if let Some(target_hint) =
+        super::task_contract::recovery_target_hint_for_blocking_obligation_diagnostic(
+            contract,
+            artifacts,
+            &agent.task_contract_excerpts,
+            job.role(),
+        )
+        .filter(|hint| hint.path == job.target_path())
+    {
+        return Some(super::task_contract::ArtifactRecoveryAction::Continue {
+            missing,
+            target_hint: Some(target_hint),
+        });
+    }
+    Some(if contract.verification_required {
+        super::task_contract::ArtifactRecoveryAction::RunVerifier
+    } else {
+        super::task_contract::ArtifactRecoveryAction::Done
+    })
 }
 
 pub(super) fn task_contract_recovery_target(
@@ -239,6 +264,7 @@ mod tests {
     };
     use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
     use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::completion_evidence::{CompletionEvidence, RepoEditCategory};
     use crate::agent::loop_run::task_contract::{
         ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract, TaskKind,
     };
@@ -294,6 +320,19 @@ mod tests {
             "# Local Notes CLI\n\n## Setup\n\nInstall the binary.\n\n## Usage\n\nRun notes from the shell.\n",
         )
         .unwrap();
+        agent
+            .turn_edited_relative_paths
+            .insert("README.md".to_string());
+        agent
+            .task_contract_excerpts
+            .insert(ArtifactRole::UsageDocs, "# Local Notes CLI\n\n## Setup\n\nInstall the binary.\n\n## Usage\n\nRun notes from the shell.\n".to_string());
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::RepoEdit {
+                category: RepoEditCategory::Docs,
+                count: 1,
+                path: Some("README.md".to_string()),
+            });
         let recorded = agent.artifact_ledger.record_repo_edit_event(
             &LedgerAdmissionContext::new(&agent.work_root, &scope),
             "README.md".to_string(),
@@ -304,6 +343,21 @@ mod tests {
             recorded.is_some(),
             "README.md repo edit must be admitted as UsageDocs evidence"
         );
+        let completed = agent
+            .artifact_ledger
+            .required_artifacts_completed(&contract);
+        assert_eq!(completed.get(&ArtifactRole::UsageDocs), Some(&true));
+        let states =
+            super::super::artifact_state_projection::task_contract_artifact_states_for_test(
+                &mut agent, &contract,
+            );
+        assert!(
+            states
+                .iter()
+                .any(|state| state.role == ArtifactRole::UsageDocs
+                    && state.path.as_deref() == Some("README.md")),
+            "states={states:?}"
+        );
 
         let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
         assert_eq!(action, ArtifactRecoveryAction::Done);
@@ -313,5 +367,79 @@ mod tests {
                 .as_ref()
                 .is_some_and(|job| { matches!(job.status(), ArtifactCompletionStatus::Satisfied) })
         );
+    }
+
+    #[test]
+    fn satisfied_data_artifact_job_still_blocks_on_schema_diagnostic() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Generate output.csv with columns Category and Total from the input CSV.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::DataOutput,
+                    path: "output.csv".to_string(),
+                    reason: "missing data artifact".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("data artifact completion job"),
+        );
+        std::fs::write(agent.work_root.join("output.csv"), "x,y\n1").unwrap();
+        agent
+            .turn_edited_relative_paths
+            .insert("output.csv".to_string());
+        agent
+            .task_contract_excerpts
+            .insert(ArtifactRole::DataOutput, "x,y\n1".to_string());
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::RepoEdit {
+                category: RepoEditCategory::Data,
+                count: 1,
+                path: Some("output.csv".to_string()),
+            });
+        let recorded = agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "output.csv".to_string(),
+            ArtifactRole::DataOutput,
+            true,
+        );
+        assert!(
+            recorded.is_some(),
+            "output.csv repo edit must be admitted as DataOutput evidence"
+        );
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
+        match action {
+            ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: Some(target_hint),
+            } => {
+                assert_eq!(missing, vec![ArtifactRole::DataOutput]);
+                assert_eq!(target_hint.path, "output.csv");
+                assert!(
+                    target_hint.reason.contains("schema_mismatch"),
+                    "reason={}",
+                    target_hint.reason
+                );
+            }
+            other => panic!("expected schema repair Continue, got {other:?}"),
+        }
     }
 }
