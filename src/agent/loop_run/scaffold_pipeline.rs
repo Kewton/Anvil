@@ -1919,6 +1919,18 @@ pub(super) fn maybe_materialize_node_test_runner_manifest(
             "target": relative,
         }),
     );
+    // Issue #1005: surface the Node test-runner manifest completion through the
+    // RepairOperatorRegistry so the operator that handled this failure class is
+    // observable from the same SSOT as the verifier-repair-slot operators (AC2).
+    let selection = super::repair_operator::select(
+        Some(super::repair_operator::FailureClass::NodeTestRunnerUnbound),
+        Some(super::task_contract::ArtifactRole::Setup),
+    );
+    super::repair_operator::record_operator_selection(
+        agent.session_store.session_id(),
+        &selection,
+        Some(super::repair_operator::OperatorId::NodeTestRunnerManifest),
+    );
     Ok(Some(relative.to_string()))
 }
 

@@ -312,6 +312,14 @@ fn handle_repair_job_patch_provider_step(
         "Verifier repair",
         "Running controller-applied repair pass for the selected target.",
     );
+    // Issue #1005: capture the failure projection before the deterministic
+    // operator chain runs so the RepairOperatorRegistry observation reflects the
+    // failure being repaired. Recording is purely additive — the existing
+    // operators continue to self-gate precisely; the registry does not gate
+    // their execution (a coarse classification must never suppress an operator).
+    let operator_session_id = agent.session_store.session_id().to_string();
+    let operator_failure =
+        super::repair_operator::FailureContext::from_repair_job(agent.repair_job.as_ref());
     // Issue #978 (parent #974, Issue D): deterministic EvidenceFailed operator
     // for missing serde-family Cargo dependencies runs before the LLM repair
     // pass. Keyed on the failure diagnostic (not `target_hint`) so it stays
@@ -322,6 +330,11 @@ fn handle_repair_job_patch_provider_step(
         *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
         *args.repo_change_retries = 0;
         *args.verifier_repair_retries = 0;
+        super::repair_operator::observe_operator_selection(
+            &operator_session_id,
+            &operator_failure,
+            Some(super::repair_operator::OperatorId::CargoSerdeDependency),
+        );
         write_repair_job_step_status(
             agent,
             args.last_iter,
@@ -348,6 +361,11 @@ fn handle_repair_job_patch_provider_step(
         *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
         *args.repo_change_retries = 0;
         *args.verifier_repair_retries = 0;
+        super::repair_operator::observe_operator_selection(
+            &operator_session_id,
+            &operator_failure,
+            super::repair_operator::rust_binding_operator_id(operator),
+        );
         write_repair_job_step_status(
             agent,
             args.last_iter,
@@ -376,6 +394,15 @@ fn handle_repair_job_patch_provider_step(
         );
         return TaskContractVerifierFlowOutcome::Continue;
     }
+    // Issue #1005: no deterministic operator applied. Record the registry
+    // selection (`applied = None`): a routed failure class hands off to the
+    // bounded LLM repair pass below (1 failure / 1 target / 1 patch); an
+    // unroutable failure is observed as `operator_missing` (AC4).
+    super::repair_operator::observe_operator_selection(
+        &operator_session_id,
+        &operator_failure,
+        None,
+    );
     match super::verifier_orchestration::run_verifier_repair_pass_and_apply(agent, &target_hint) {
         VerifierRepairPassOutcome::Applied { relative_path } => {
             *repo_edit_calls_made_this_turn = repo_edit_calls_made_this_turn.saturating_add(1);
