@@ -838,14 +838,18 @@ fn verifier_diagnostic_for_obligation_parts(
         && let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
         && !sections.is_empty()
         && let Some(excerpt) = excerpt
-        && (!required_sections_present(excerpt, sections) || !docs_required_sections_pass(excerpt))
+        && !required_section_headings_present(excerpt, sections)
     {
+        let missing = missing_required_section_headings(excerpt, sections);
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::EvidenceMissing,
             obligation.role,
             Some(&obligation.path),
-            "documentation required sections are absent from the observed content",
+            format!(
+                "documentation required section headings are missing: {}; add markdown headings for all required sections",
+                display_schema_columns(&missing)
+            ),
         ));
     }
     if task_kind == TaskKind::Coding
@@ -1061,6 +1065,54 @@ fn required_sections_present(excerpt: &str, sections: &[String]) -> bool {
         .filter(|section| section_present(&lower, section))
         .count();
     hits * 2 >= sections.len()
+}
+
+pub(super) fn required_section_headings_present(excerpt: &str, sections: &[String]) -> bool {
+    missing_required_section_headings(excerpt, sections).is_empty()
+}
+
+fn missing_required_section_headings(excerpt: &str, sections: &[String]) -> Vec<String> {
+    sections
+        .iter()
+        .filter(|section| !markdown_heading_present(excerpt, section))
+        .cloned()
+        .collect()
+}
+
+fn markdown_heading_present(excerpt: &str, section: &str) -> bool {
+    let normalized_section = normalize_section_heading_label(section);
+    if normalized_section.is_empty() {
+        return false;
+    }
+    excerpt
+        .lines()
+        .filter_map(markdown_heading_label)
+        .map(|label| normalize_section_heading_label(&label))
+        .any(|label| {
+            label == normalized_section || label.starts_with(&format!("{normalized_section} "))
+        })
+}
+
+fn markdown_heading_label(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if hashes == 0 {
+        return None;
+    }
+    let rest = trimmed.get(hashes..)?;
+    let label = rest.trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some(label.trim_end_matches('#').trim().to_string())
+}
+
+fn normalize_section_heading_label(label: &str) -> String {
+    label
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// Per-section presence check (the historical `## {n}` / `# {n}` / substring
@@ -2683,5 +2735,23 @@ mod tests {
         let one = vec!["usage".to_string()];
         assert!(required_sections_present("## Usage\nrun it\n", &one));
         assert!(!required_sections_present("no section", &one));
+    }
+
+    #[test]
+    fn required_section_headings_present_requires_markdown_headings() {
+        let sections = vec!["Setup".to_string(), "Usage".to_string()];
+
+        assert!(!required_section_headings_present(
+            "This document mentions Setup and Usage in prose only.",
+            &sections
+        ));
+        assert!(required_section_headings_present(
+            "# Setup\nInstall it.\n\n## Usage\nRun it.\n",
+            &sections
+        ));
+        assert!(required_section_headings_present(
+            "## Setup:\nInstall it.\n\n## Usage notes\nRun it.\n",
+            &sections
+        ));
     }
 }

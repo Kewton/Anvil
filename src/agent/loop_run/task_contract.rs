@@ -1550,18 +1550,12 @@ fn usage_docs_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &s
     let section_obligations = contract
         .required_identities_for_role(ArtifactRole::UsageDocs)
         .into_iter()
-        .flat_map(|identity| identity.required_sections.iter())
+        .flat_map(|identity| identity.required_sections.iter().cloned())
         .collect::<Vec<_>>();
     if section_obligations.is_empty() {
         return usage_docs_surface_satisfied(excerpt);
     }
-    section_obligations.iter().all(|section| {
-        let lower = excerpt.to_ascii_lowercase();
-        let normalized = section.to_ascii_lowercase();
-        lower.contains(&format!("## {normalized}"))
-            || lower.contains(&format!("# {normalized}"))
-            || lower.contains(&normalized)
-    }) && usage_docs_surface_satisfied(excerpt)
+    super::verifier::required_section_headings_present(excerpt, &section_obligations)
 }
 
 fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
@@ -3221,11 +3215,18 @@ fn default_docs_path_from_request(request: &str) -> String {
 fn required_doc_sections_from_request(request: &str) -> Vec<String> {
     let lower = request.to_ascii_lowercase();
     let mut sections = Vec::new();
+    let mentions_setup = contains_any(&lower, &["setup", "getting started"])
+        || contains_any(request, &["セットアップ", "導入"]);
+    let mentions_installation = contains_any(&lower, &["install", "installation"])
+        || contains_any(request, &["インストール"]);
     push_section_if(
         &mut sections,
-        contains_any(&lower, &["install", "setup", "getting started"])
-            || contains_any(request, &["インストール", "セットアップ", "導入"]),
-        "installation",
+        mentions_setup || mentions_installation,
+        if mentions_setup {
+            "setup"
+        } else {
+            "installation"
+        },
     );
     push_section_if(
         &mut sections,
@@ -6748,6 +6749,20 @@ mod tests {
     }
 
     #[test]
+    fn docs_section_inference_preserves_setup_label_when_requested() {
+        let contract = TaskContract::from_request(
+            "Create README.md documentation with Setup and Usage sections.",
+        );
+
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+
+        assert_eq!(
+            readme.required_sections,
+            vec!["setup".to_string(), "usage".to_string()]
+        );
+    }
+
+    #[test]
     fn python_cli_main_py_alone_leaves_tests_and_readme_missing() {
         let contract = TaskContract::from_request(
             "Create a Python CLI in main.py with tests and README.md usage docs.",
@@ -8146,6 +8161,42 @@ mod tests {
     }
 
     #[test]
+    fn controller_state_packet_docs_mentions_without_headings_does_not_complete() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create README.md documentation.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs","schema":{"required_sections":["Setup","Usage"]}}]}"#,
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "# Overview\n\nThis document mentions Setup and Usage in prose only.",
+        )]);
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(ArtifactRole::UsageDocs, "README.md")],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: Some(RecoveryTargetHint { reason, .. }),
+            } if missing == vec![ArtifactRole::UsageDocs]
+                && reason.contains("required section headings are missing")
+                && reason.contains("Setup")
+                && reason.contains("Usage")
+        ));
+    }
+
+    #[test]
     fn controller_state_packet_json_extra_field_does_not_complete() {
         let contract = TaskContract::from_request(
             r#"STATE_CONTROL_PACKET
@@ -8515,7 +8566,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::UsageDocs,
                     path: "README.md".to_string(),
-                    reason: "structured verifier diagnostic: kind=evidence_missing, task_kind=docs, summary=documentation required sections are absent from the observed content".to_string(),
+                    reason: "structured verifier diagnostic: kind=evidence_missing, task_kind=docs, summary=documentation required section headings are missing: usage, testing; add markdown headings for all required sections".to_string(),
                 }),
             }
         );
@@ -8852,7 +8903,7 @@ mod tests {
 
         let complete = build_excerpts(&[(
             ArtifactRole::UsageDocs,
-            "# Project\n\n## Installation\ninstall\n\n## Usage\nrun it\n\n## Testing\npytest\n",
+            "# Project\n\n## Setup\ninstall\n\n## Usage\nrun it\n",
         )]);
         assert_eq!(
             plan_artifact_recovery(ArtifactRecoveryInputs {

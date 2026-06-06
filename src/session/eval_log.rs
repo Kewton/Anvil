@@ -407,6 +407,29 @@ impl EvalRecord {
             None,
             "repository artifact edit was recorded through a non-coding tool call",
         );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_environment",
+            "not_applicable",
+            None,
+            "command verifier was not required because controller artifact evidence completed the turn",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_evidence",
+            "not_applicable",
+            None,
+            "command verifier evidence was not required because artifact evidence completed the turn",
+        );
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "artifact_evidence",
+                "satisfied",
+                None,
+                "non-coding artifact evidence was satisfied by the controller completion gate",
+            ),
+        );
         refresh_terminal_obligation_indexes(diagnostics);
     }
 
@@ -1625,7 +1648,23 @@ mod tests {
             diag.satisfied_obligations
                 .contains(&"repo_edit".to_string())
         );
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"artifact_evidence".to_string())
+        );
         assert!(!diag.missing_obligations.contains(&"repo_edit".to_string()));
+        let artifact_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "artifact_evidence")
+            .expect("artifact evidence obligation");
+        assert_eq!(artifact_evidence.status, "satisfied");
+        let verifier_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "verification_evidence")
+            .expect("verification evidence obligation");
+        assert_eq!(verifier_evidence.status, "not_applicable");
     }
 
     #[test]
