@@ -34,8 +34,9 @@
 //!      `test_*.py` / `*_test.py`)
 //!   2. `is_setup_file` (covers `package.json` / `tsconfig.json` / lock files)
 //!   3. Docs extension (`.md` / `.mdx` / `.txt` / `.rst`)
-//!   4. `is_implementation_file` (covers `.rs` / `.py` / `.ts` / `.tsx` / ...)
-//!   5. fallback `Other`
+//!   4. `is_structured_data_file` (covers `.csv` / `.json` / `.jsonl` / ...)
+//!   5. `is_implementation_file` (covers `.rs` / `.py` / `.ts` / `.tsx` / ...)
+//!   6. fallback `Other`
 //!
 //! Docs comes **before** `is_implementation_file` because `.mdx` is in the
 //! impl SSOT (`util::file_classify::is_implementation_file`) — DR1-001 pins
@@ -51,7 +52,9 @@
 use std::path::Path;
 
 use crate::tools::bash::BashCommandClass;
-use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use crate::util::file_classify::{
+    is_implementation_file, is_setup_file, is_structured_data_file, is_test_file,
+};
 
 /// Repository edit category emitted by `Edit` / `Write` tool calls. Mirrors
 /// the SSOT classifiers in `util::file_classify` but distinguishes Docs from
@@ -195,7 +198,7 @@ pub(crate) fn classify_repo_edit_path<P: AsRef<Path>>(path: P) -> RepoEditCatego
     if has_docs_extension(path) {
         return RepoEditCategory::Docs;
     }
-    if has_structured_data_extension(path) {
+    if is_structured_data_file(path) {
         return RepoEditCategory::Data;
     }
     if is_implementation_file(path) {
@@ -215,13 +218,6 @@ fn has_docs_extension(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some("md" | "mdx" | "txt" | "rst")
-    )
-}
-
-fn has_structured_data_extension(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("csv" | "tsv" | "json" | "jsonl" | "ndjson" | "parquet")
     )
 }
 
@@ -421,8 +417,16 @@ mod tests {
             RepoEditCategory::Data
         );
         assert_eq!(
+            classify_repo_edit_path(PathBuf::from("summary.json")),
+            RepoEditCategory::Data
+        );
+        assert_eq!(
             classify_repo_edit_path(PathBuf::from("reports/summary.jsonl")),
             RepoEditCategory::Data
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("package.json")),
+            RepoEditCategory::Setup
         );
     }
 

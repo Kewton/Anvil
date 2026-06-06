@@ -8,7 +8,9 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
-use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use crate::util::file_classify::{
+    is_implementation_file, is_setup_file, is_structured_data_file, is_test_file,
+};
 use crate::util::workspace_paths::is_workspace_artifact_admitted_relative_path;
 
 use super::task_contract::{ArtifactRole, TaskContract};
@@ -320,10 +322,7 @@ fn file_matches_role(work_root: &Path, relative_path: &str, role: ArtifactRole) 
                         Some("go.mod" | "pom.xml" | "Gemfile" | "composer.json")
                     ))
         }
-        ArtifactRole::DataOutput => matches!(
-            p.extension().and_then(|ext| ext.to_str()),
-            Some("csv" | "tsv" | "jsonl" | "ndjson" | "parquet")
-        ),
+        ArtifactRole::DataOutput => is_structured_data_file(p),
     }
 }
 

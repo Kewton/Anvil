@@ -5,7 +5,7 @@
 //! per-turn caps / counters / dedup carriers that the actor loop must
 //! observe in a clean state, then computes the initial `TaskContract`
 //! and seeds the artifact-recovery target when the contract's pre-loop
-//! evaluation already returns `Continue`. Called once from
+//! recovery plan already has a concrete deliverable gap. Called once from
 //! `actor_loop_flow::run_actor_loop`.
 //!
 //! Originally an `impl Agent` method; converted to a free function
@@ -14,8 +14,7 @@
 //! re-export (DR3-001).
 
 use super::Agent;
-use super::completion_evidence::EvidenceSet;
-use super::task_contract::{CompletionDecision, RequestCarryoverKey, TaskContract};
+use super::task_contract::{RequestCarryoverKey, TaskContract};
 use crate::modes::plan_act::ExecutionMode;
 
 pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskContract> {
@@ -135,14 +134,72 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
     if agent.session.mode_state.mode != ExecutionMode::Plan
         && let Some(contract) = task_contract.as_ref()
     {
-        let initial_decision = contract.evaluate(&EvidenceSet::new());
-        if matches!(initial_decision, CompletionDecision::Continue { .. }) {
-            super::set_artifact_recovery_target::set_artifact_recovery_target_for_decision(
+        let initial_action =
+            super::task_contract_recovery::task_contract_recovery_action(agent, contract, None, 0);
+        if matches!(
+            initial_action,
+            super::task_contract::ArtifactRecoveryAction::Continue { .. }
+                | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. }
+        ) {
+            super::set_artifact_recovery_target::set_artifact_recovery_target_for_action(
                 agent,
-                &initial_decision,
+                &initial_action,
                 0,
             );
         }
     }
     task_contract
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::loop_run::artifact_completion_job::ArtifactCompletionStatus;
+    use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::task_contract::{ArtifactRole, TaskKind};
+    use crate::config::Config;
+    use crate::session::store::ConversationMessage;
+
+    #[test]
+    fn controller_state_data_output_seeds_artifact_recovery_job() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = concat!(
+            "STATE_CONTROL_PACKET\n",
+            r#"{"objective":"Create a CSV inventory file for three local tools.","next_required_action":"artifact","required_artifacts":[{"path":"inventory.csv","role":"data"}]}"#
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+
+        let contract = prepare_actor_loop_turn_state(&mut agent).expect("task contract");
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::DataOutput)
+        );
+
+        let target = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("data output recovery target");
+        assert_eq!(target.role, ArtifactRole::DataOutput);
+        assert_eq!(target.path, "inventory.csv");
+
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("data output artifact completion job");
+        assert_eq!(job.role(), ArtifactRole::DataOutput);
+        assert_eq!(job.target_path(), "inventory.csv");
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
+    }
 }

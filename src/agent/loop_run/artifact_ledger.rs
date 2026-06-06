@@ -66,7 +66,7 @@ use super::task_contract::{ArtifactRole, TaskContract};
 use super::task_workspace_scope::TaskWorkspaceScope;
 use crate::logging::{log_llm_event, stable_path_hash};
 use crate::session::feedback::mask_secrets;
-use crate::util::file_classify::{is_setup_file, is_test_file};
+use crate::util::file_classify::{is_setup_file, is_structured_data_file, is_test_file};
 
 /// Per-turn cap on accepted events. New events past this cap are dropped
 /// (not FIFO-evicted) so legacy / projection consumers see a stable prefix.
@@ -806,10 +806,7 @@ fn role_matches_path(role: ArtifactRole, path: &str) -> bool {
         // injection vector we guard against here.
         ArtifactRole::Implementation => !is_test_file(p) && !is_setup_file(p),
         ArtifactRole::UsageDocs => !is_test_file(p) && !is_setup_file(p),
-        ArtifactRole::DataOutput => matches!(
-            p.extension().and_then(|ext| ext.to_str()),
-            Some("csv" | "tsv" | "jsonl" | "ndjson" | "parquet")
-        ),
+        ArtifactRole::DataOutput => is_structured_data_file(p),
     }
 }
 
@@ -994,8 +991,14 @@ mod tests {
             "tests/test_x.py"
         ));
         assert!(!role_matches_path(ArtifactRole::DataOutput, "README.md"));
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "package.json"));
+        assert!(!role_matches_path(
+            ArtifactRole::DataOutput,
+            "tsconfig.json"
+        ));
         // Genuine data files are admitted.
         assert!(role_matches_path(ArtifactRole::DataOutput, "out.csv"));
+        assert!(role_matches_path(ArtifactRole::DataOutput, "summary.json"));
         assert!(role_matches_path(
             ArtifactRole::DataOutput,
             "data/records.jsonl"
