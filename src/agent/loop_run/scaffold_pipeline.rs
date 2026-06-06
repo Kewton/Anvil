@@ -248,38 +248,32 @@ fn plan_project_skeleton_with_obligations(
     intent: &ProjectIntent,
     obligations: &[ArtifactObligation],
 ) -> Option<ScaffoldPlan> {
-    match (intent.runtime?, intent.shape?) {
-        (ProjectRuntime::Rust, ProjectShape::Cli) => Some(ScaffoldPlan {
-            label: "Rust CLI scaffold",
-            event: "agent.empty_workspace.deterministic_rust_cli",
-            scaffold_kind: "Rust CLI",
-            files: rust_cli_skeleton_files(rust_requested_impl_path(obligations, "src/main.rs")),
-        }),
-        (ProjectRuntime::Rust, ProjectShape::Library) => Some(ScaffoldPlan {
-            label: "Rust library scaffold",
-            event: "agent.empty_workspace.deterministic_rust_library",
-            scaffold_kind: "Rust library",
-            files: rust_library_skeleton_files(rust_requested_impl_path(obligations, "src/lib.rs")),
-        }),
-        (ProjectRuntime::Node, ProjectShape::Cli) => Some(ScaffoldPlan {
-            label: "Node CLI scaffold",
-            event: "agent.empty_workspace.deterministic_node_cli",
-            scaffold_kind: "Node CLI",
-            files: node_skeleton_files(
-                ProjectShape::Cli,
-                node_requested_impl_path(obligations, "src/index.js"),
-            ),
-        }),
-        (ProjectRuntime::Node, ProjectShape::Library) => Some(ScaffoldPlan {
-            label: "Node library scaffold",
-            event: "agent.empty_workspace.deterministic_node_library",
-            scaffold_kind: "Node library",
-            files: node_skeleton_files(
-                ProjectShape::Library,
-                node_requested_impl_path(obligations, "src/index.js"),
-            ),
-        }),
-    }
+    // Issue #1003: route the empty-workspace coding skeletons through the
+    // `ScaffoldProfile` registry. The profile is the SSOT for the label / event /
+    // scaffold_kind metadata; materialization still delegates to the existing
+    // skeleton generators (byte-identical) but the registry now owns the routing
+    // and enforces the per-profile binding contract.
+    let runtime = intent.runtime?;
+    let shape = intent.shape?;
+    let profile = super::scaffold_profile::ScaffoldProfile::for_runtime_shape(runtime, shape);
+    let entrypoint = match runtime {
+        ProjectRuntime::Rust => rust_requested_impl_path(obligations, profile.default_entrypoint()),
+        ProjectRuntime::Node => node_requested_impl_path(obligations, profile.default_entrypoint()),
+    };
+    let files = profile.materialize(Some(&entrypoint));
+    debug_assert!(
+        profile.verify_bindings(&files).is_ok(),
+        "deterministic scaffold profile {} ({:?}) violated its binding contract; command={}",
+        profile.as_str(),
+        profile.runtime,
+        profile.command.display(),
+    );
+    Some(ScaffoldPlan {
+        label: profile.label,
+        event: profile.event,
+        scaffold_kind: profile.scaffold_kind,
+        files,
+    })
 }
 
 pub(super) fn materialize_scaffold(
@@ -343,7 +337,7 @@ fn node_requested_impl_path(obligations: &[ArtifactObligation], default: &str) -
         .unwrap_or_else(|| PathBuf::from(default))
 }
 
-fn rust_cli_skeleton_files(impl_path: PathBuf) -> Vec<(PathBuf, String)> {
+pub(super) fn rust_cli_skeleton_files(impl_path: PathBuf) -> Vec<(PathBuf, String)> {
     let impl_path_display = impl_path.to_string_lossy().to_string();
     vec![
         (
@@ -423,7 +417,7 @@ fn cli_accepts_stdin() {
     ]
 }
 
-fn rust_library_skeleton_files(impl_path: PathBuf) -> Vec<(PathBuf, String)> {
+pub(super) fn rust_library_skeleton_files(impl_path: PathBuf) -> Vec<(PathBuf, String)> {
     let impl_path_display = impl_path.to_string_lossy().to_string();
     vec![
         (
@@ -494,7 +488,10 @@ fn node_test_import_path(impl_path: &Path) -> String {
     format!("../{}", impl_path.to_string_lossy().replace('\\', "/"))
 }
 
-fn node_skeleton_files(shape: ProjectShape, impl_path: PathBuf) -> Vec<(PathBuf, String)> {
+pub(super) fn node_skeleton_files(
+    shape: ProjectShape,
+    impl_path: PathBuf,
+) -> Vec<(PathBuf, String)> {
     let impl_path_display = impl_path.to_string_lossy().replace('\\', "/");
     let bin_block = if shape == ProjectShape::Cli {
         format!(

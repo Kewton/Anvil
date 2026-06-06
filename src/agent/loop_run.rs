@@ -611,6 +611,20 @@ mod verifier_orchestration;
 // on `impl Agent` stay in turn.rs for now and will be migrated in
 // follow-up PRs.
 mod scaffold_pipeline;
+// Issue #1003: `ScaffoldProfile` registry — deterministic, table-driven SSOT for
+// the minimal per-runtime/use scaffolds (coding / docs / data / research). Coding
+// profiles delegate materialization to `scaffold_pipeline`'s skeleton generators;
+// the rest expand small `&'static` template tables. `plan_project_skeleton_with_obligations`
+// routes the empty-workspace coding skeletons through it and asserts the binding
+// contract. `pub(super)` limited / no facade re-export (DR3-001). No provider abstraction.
+mod scaffold_profile;
+// Issue #1003: in-crate `#[cfg(test)] mod` E2E suite for the ScaffoldProfile
+// registry — table-driven over every profile id (materialize + verify_bindings),
+// pinning the Node test-script/package.json binding and the Rust Cargo entrypoint
+// binding. `#[cfg(test)]` keeps it out of the production binary; the explicit
+// `mod` is required (no auto-discovery). No facade re-export (DR3-001 / CB-001).
+#[cfg(test)]
+mod scaffold_profile_e2e_tests;
 // Issue #684 (parent #680, Phase 4): reminder dispatch orchestration extracted
 // from `turn.rs`. Hosts `ReminderCallContext` + the impl that materialises a
 // `ReminderInputs<'_>` view and emits the `agent.reminder.*` log event. The
