@@ -292,6 +292,7 @@ fn append_common_request_messages(
     messages.extend(prompting::runtime_context_messages(
         &agent.config.cwd,
         &agent.work_root,
+        agent.session.mode_state.task_profile,
         protocol,
         &agent.session.working_memory.touched_files,
         last_suspected,

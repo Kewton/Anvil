@@ -31,9 +31,14 @@ pub(crate) fn build_system_prompt(
     } else {
         "7. Do not install dependencies in this restricted turn. Continue only with the listed tool(s)."
     };
+    let persona = persona_for_profile(task_profile);
+    let script_rule = script_rule_for_profile(task_profile);
+    let visual_rule = visual_rule_for_profile(task_profile);
+    let multistep_rule = multistep_rule_for_profile(task_profile);
+    let path_rule = path_rule_for_profile(task_profile);
     let tool_catalog = render_tool_catalog(allowed_tools);
     let mut prompt = format!(
-        "You are Anvil, a local-first coding agent. You EXECUTE tasks using tools and explain results clearly.\n\
+        "{persona}\n\
 {tool_call_instruction}\n\
 \n\
 CORE RULES:\n\
@@ -44,15 +49,15 @@ CORE RULES:\n\
 {shell_rule}\n\
 6. If a tool fails, diagnose the error and immediately try a different approach. NEVER give up, NEVER ask the user. Only report a failure after 3 different attempts.\n\
 {dependency_rule}\n\
-8. Scripts using input()/stdin CANNOT run in Bash (gets EOFError). Write non-interactive versions (HTML/JS, CLI flags) instead.\n\
-9. For GUI or visual apps, prefer HTML/CSS/JS in a browser over desktop toolkits. For Next.js apps, the user-facing UI usually lives in app/page.tsx or src/app/page.tsx; follow the actual repo layout and implement the requested feature there.\n\
+{script_rule}\n\
+{visual_rule}\n\
 10. NEVER use sudo unless the user explicitly asks.\n\
 11. Reply in the SAME language as the user's message. Never mix languages.\n\
 12. In Bash, ALWAYS quote URLs with single quotes: curl 'https://example.com/path?key=val'\n\
 13. NEVER fabricate URLs, search results, or sources. If a search returns no results, say so honestly.\n\
-14. For multi-step build tasks (scaffold → install → implement → verify), complete ALL steps in sequence without pausing after scaffolding.\n\
+{multistep_rule}\n\
 15. Do not say \"I will do the next step later\". If implementation is still pending, call the next tool now.\n\
-16. Use repository-relative paths (e.g. 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout) for Read, Write, and Edit. Never invent absolute paths from memory such as '/Users/...' or '/home/...'.\n\
+{path_rule}\n\
 17. When the project root is given, do not repeat the project directory name in tool paths.\n\
 18. When a task is large, do not attempt a large output in one response. Start with one small, self-contained change that moves the task forward.\n\
 19. Prefer short Write/Edit actions over large full-file outputs. If more work is needed, continue in later turns with additional small changes.\n\
@@ -186,6 +191,61 @@ For research work, gather only the evidence needed, verify key claims, and evalu
     prompt
 }
 
+fn persona_for_profile(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding | TaskProfile::Ui => {
+            "You are Anvil, a local-first coding agent. You EXECUTE tasks using tools and explain results clearly."
+        }
+        TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
+            "You are Anvil, a local-first agent. You complete the requested objective using tools and explain results clearly."
+        }
+    }
+}
+
+fn script_rule_for_profile(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding | TaskProfile::Ui => {
+            "8. Scripts using input()/stdin CANNOT run in Bash (gets EOFError). Write non-interactive versions (HTML/JS, CLI flags) instead."
+        }
+        TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
+            "8. Scripts using input()/stdin CANNOT run in Bash (gets EOFError). Use non-interactive commands, CLI flags, or file-based inputs instead."
+        }
+    }
+}
+
+fn visual_rule_for_profile(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding | TaskProfile::Ui => {
+            "9. For GUI or visual apps, prefer HTML/CSS/JS in a browser over desktop toolkits. For Next.js apps, the user-facing UI usually lives in app/page.tsx or src/app/page.tsx; follow the actual repo layout and implement the requested feature there."
+        }
+        TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
+            "9. Only create GUI, browser app, or framework scaffolding when the user explicitly requests that kind of artifact; otherwise produce the requested document, data, research, or shell artifact directly."
+        }
+    }
+}
+
+fn multistep_rule_for_profile(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding | TaskProfile::Ui => {
+            "14. For multi-step build tasks (scaffold → install → implement → verify), complete ALL steps in sequence without pausing after scaffolding."
+        }
+        TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
+            "14. For multi-step artifact tasks, complete the required deliverable and evidence sequence without pausing after the first file."
+        }
+    }
+}
+
+fn path_rule_for_profile(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding | TaskProfile::Ui => {
+            "16. Use repository-relative paths (e.g. 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout) for Read, Write, and Edit. Never invent absolute paths from memory such as '/Users/...' or '/home/...'."
+        }
+        TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
+            "16. Use repository-relative paths (e.g. 'summary.json', 'output.csv', or 'docs/runbook.md') for Read, Write, and Edit. Never invent absolute paths from memory such as '/Users/...' or '/home/...'."
+        }
+    }
+}
+
 fn render_tool_catalog(allowed_tools: Option<&[&str]>) -> String {
     let mut out = String::new();
     match allowed_tools {
@@ -305,5 +365,48 @@ mod tests {
         assert!(prompt.contains("plans/plan.md"));
         assert!(prompt.contains("- Bash(command)"));
         assert!(prompt.contains("Bash is disabled"));
+    }
+
+    #[test]
+    fn generic_prompt_uses_general_persona_and_artifact_path_examples() {
+        let prompt = build_system_prompt(
+            ExecutionMode::Act,
+            None,
+            TaskProfile::Generic,
+            ToolProtocol::Native,
+            None,
+            &[],
+            Some(&["Read", "Write"]),
+        );
+
+        assert!(prompt.contains("You are Anvil, a local-first agent."));
+        assert!(prompt.contains("Only create GUI, browser app, or framework scaffolding"));
+        assert!(prompt.contains("'summary.json'"));
+        assert!(prompt.contains("'output.csv'"));
+        assert!(prompt.contains("'docs/runbook.md'"));
+        assert!(prompt.contains("For multi-step artifact tasks"));
+        assert!(!prompt.contains("local-first coding agent"));
+        assert!(!prompt.contains("Next.js apps"));
+        assert!(!prompt.contains("app/page.tsx"));
+        assert!(!prompt.contains("scaffold → install → implement → verify"));
+    }
+
+    #[test]
+    fn coding_prompt_keeps_coding_ui_guidance() {
+        let prompt = build_system_prompt(
+            ExecutionMode::Act,
+            None,
+            TaskProfile::Coding,
+            ToolProtocol::Native,
+            None,
+            &[],
+            Some(&["Read", "Write"]),
+        );
+
+        assert!(prompt.contains("You are Anvil, a local-first coding agent."));
+        assert!(prompt.contains("Next.js apps"));
+        assert!(prompt.contains("app/page.tsx"));
+        assert!(prompt.contains("scaffold → install → implement → verify"));
+        assert!(prompt.contains("HTML/JS"));
     }
 }

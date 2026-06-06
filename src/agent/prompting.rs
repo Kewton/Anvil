@@ -11,6 +11,7 @@ use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::logging::log_llm_event;
+use crate::modes::plan_act::TaskProfile;
 use crate::repo_graph::RepoGraph;
 use crate::session::store::ConversationMessage;
 
@@ -106,6 +107,7 @@ pub fn detect_language_hint(text: &str) -> &'static str {
 pub(crate) fn runtime_context_messages(
     cwd: &Path,
     work_root: &Path,
+    task_profile: TaskProfile,
     protocol: ToolProtocol,
     touched_files: &[String],
     suspected_files: Option<&[PathBuf]>,
@@ -114,6 +116,7 @@ pub(crate) fn runtime_context_messages(
     runtime_context_messages_with_env(
         cwd,
         work_root,
+        task_profile,
         protocol,
         touched_files,
         suspected_files,
@@ -125,6 +128,7 @@ pub(crate) fn runtime_context_messages(
 fn runtime_context_messages_with_env<F>(
     cwd: &Path,
     work_root: &Path,
+    task_profile: TaskProfile,
     protocol: ToolProtocol,
     touched_files: &[String],
     suspected_files: Option<&[PathBuf]>,
@@ -139,9 +143,10 @@ where
         messages.push(ConversationMessage::system(instruction));
     }
     let _ = cwd;
+    let path_examples = runtime_path_examples_for_profile(task_profile);
     messages.push(ConversationMessage::system(format!(
-        "Current project root is {}. All repository files live under this path. Use repository-relative paths (for example 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout) for Read, Write, and Edit. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
-        work_root.display()
+        "Current project root is {}. All repository files live under this path. Use repository-relative paths ({path_examples}) for Read, Write, and Edit. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
+        work_root.display(),
     )));
     if let Some(instructions) = load_project_instructions(cwd, work_root) {
         let path_scoped_disabled = getenv(ENV_NO_PATH_SCOPED_INSTRUCTIONS)
@@ -169,6 +174,17 @@ where
         ));
     }
     messages
+}
+
+fn runtime_path_examples_for_profile(task_profile: TaskProfile) -> &'static str {
+    match task_profile {
+        TaskProfile::Coding | TaskProfile::Ui => {
+            "for example 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout"
+        }
+        TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
+            "for example 'summary.json', 'output.csv', or 'docs/runbook.md', depending on the requested artifact"
+        }
+    }
 }
 
 fn build_full_content(instructions: &ProjectInstructions) -> String {
@@ -1295,6 +1311,7 @@ mod tests {
         resolve_import_target_to_file, runtime_context_messages, runtime_context_messages_with_env,
         sanitize_import_target, validate_path_pattern,
     };
+    use crate::modes::plan_act::TaskProfile;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1595,6 +1612,7 @@ mod tests {
         let messages = runtime_context_messages(
             temp.path(),
             temp.path(),
+            TaskProfile::Generic,
             ToolProtocol::TaggedXml,
             &[],
             None,
@@ -1604,6 +1622,53 @@ mod tests {
             message.content.contains("[Project Instructions: ANVIL.md]")
                 && message.content.contains("Use `cargo test`.")
         }));
+    }
+
+    #[test]
+    fn runtime_context_generic_root_reminder_uses_artifact_path_examples() {
+        let temp = tempdir().unwrap();
+        let messages = runtime_context_messages(
+            temp.path(),
+            temp.path(),
+            TaskProfile::Generic,
+            ToolProtocol::TaggedXml,
+            &[],
+            None,
+            &[],
+        );
+        let combined = messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(combined.contains("'summary.json'"));
+        assert!(combined.contains("'output.csv'"));
+        assert!(combined.contains("'docs/runbook.md'"));
+        assert!(!combined.contains("app/page.tsx"));
+        assert!(!combined.contains("src/app/page.tsx"));
+    }
+
+    #[test]
+    fn runtime_context_coding_root_reminder_keeps_ui_path_examples() {
+        let temp = tempdir().unwrap();
+        let messages = runtime_context_messages(
+            temp.path(),
+            temp.path(),
+            TaskProfile::Coding,
+            ToolProtocol::TaggedXml,
+            &[],
+            None,
+            &[],
+        );
+        let combined = messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(combined.contains("'app/page.tsx'"));
+        assert!(combined.contains("'src/app/page.tsx'"));
     }
 
     #[test]
@@ -1747,6 +1812,7 @@ mod tests {
         let messages = runtime_context_messages(
             temp.path(),
             temp.path(),
+            TaskProfile::Generic,
             ToolProtocol::TaggedXml,
             &["src/main.rs".to_string()],
             None,
@@ -1770,6 +1836,7 @@ mod tests {
         let messages = runtime_context_messages(
             temp.path(),
             temp.path(),
+            TaskProfile::Generic,
             ToolProtocol::TaggedXml,
             &["tests/foo.rs".to_string()],
             None,
@@ -1792,6 +1859,7 @@ mod tests {
         let messages = runtime_context_messages(
             temp.path(),
             temp.path(),
+            TaskProfile::Generic,
             ToolProtocol::TaggedXml,
             &[],
             None,
@@ -1814,6 +1882,7 @@ mod tests {
         let messages = runtime_context_messages_with_env(
             temp.path(),
             temp.path(),
+            TaskProfile::Generic,
             ToolProtocol::TaggedXml,
             &[],
             None,
