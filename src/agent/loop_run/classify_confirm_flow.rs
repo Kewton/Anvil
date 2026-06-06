@@ -42,7 +42,7 @@ use super::task_kind_confirm::{
 use super::turn_helpers::quality_confirm_cache_key;
 use super::work_mode_confirm::{
     self, WORK_MODE_CONFIRM_TIMEOUT_SECS, WorkModeConfirmInputs, WorkModeConfirmOutcome,
-    run_work_mode_confirm_with_strategy,
+    WorkModeConfirmation, WorkModeConfirmationSource, run_work_mode_confirm_with_strategy,
 };
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{ModeClassification, WorkMode, classify_work_mode_json};
@@ -74,6 +74,7 @@ pub(super) fn classify_with_confirmation(
     stage_label: &'static str,
 ) -> ModeClassification {
     let mut classification = classify_work_mode_json(input);
+    let objective_requires_artifact = objective_requires_artifact(agent);
     // Issue #922 (PR-002 / DR3-004): a report-intended research request must not
     // stay `AnswerOnly` — that mode blocks Write/Edit and `ProtocolKind::AnswerOnly`
     // rejects the report's RepoEdit / ReportCompletenessPass evidence, so the
@@ -88,6 +89,7 @@ pub(super) fn classify_with_confirmation(
         classification.allows_file_edits = true;
         classification.requires_tests = false;
     }
+    guard_first_pass_for_objective_artifact(&mut classification, objective_requires_artifact);
     // CB-001: only write back the first-pass result when the per-turn cap
     // has NOT yet been consumed. Otherwise the previous call already
     // resolved the final mode and we must keep it.
@@ -160,6 +162,11 @@ pub(super) fn maybe_invoke_work_mode_confirm(
     let attempt_started = Instant::now();
     let outcome = run_work_mode_confirm_attempt(agent, inputs, &sidecar_model);
     let latency_ms = attempt_started.elapsed().as_millis() as u64;
+    let outcome = guard_confirmed_work_mode_for_objective_artifact(
+        outcome,
+        first_pass,
+        objective_requires_artifact(agent),
+    );
 
     if let WorkModeConfirmOutcome::Confirmed(c) = &outcome {
         agent.session.mode_state.work_mode = c.mode;
@@ -204,6 +211,56 @@ fn run_work_mode_confirm_attempt(
         // because the user might transition into a state where the sidecar
         // becomes available later in this same turn (defensive design).
         run_work_mode_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
+    }
+}
+
+fn objective_requires_artifact(agent: &Agent) -> bool {
+    super::task_classification::task_contract_authority(agent)
+        .is_some_and(|contract| !contract.required_artifacts.is_empty())
+}
+
+fn guard_first_pass_for_objective_artifact(
+    classification: &mut ModeClassification,
+    objective_requires_artifact: bool,
+) {
+    if objective_requires_artifact && classification.work_mode == WorkMode::AnswerOnly {
+        classification.work_mode = WorkMode::GenericCode;
+        classification.intent = "generic-edit";
+        classification.allows_file_edits = true;
+        classification.requires_tests = false;
+        classification.reason = "objective contract requires an artifact";
+        classification.evidence.push("objective-artifact");
+    }
+}
+
+fn guard_confirmed_work_mode_for_objective_artifact(
+    outcome: WorkModeConfirmOutcome,
+    first_pass: &ModeClassification,
+    objective_requires_artifact: bool,
+) -> WorkModeConfirmOutcome {
+    if !objective_requires_artifact {
+        return outcome;
+    }
+    let WorkModeConfirmOutcome::Confirmed(confirmation) = outcome else {
+        return outcome;
+    };
+    if confirmation.mode != WorkMode::AnswerOnly {
+        return WorkModeConfirmOutcome::Confirmed(confirmation);
+    }
+    WorkModeConfirmOutcome::Confirmed(WorkModeConfirmation {
+        mode: edit_capable_artifact_mode(first_pass.work_mode),
+        confidence: first_pass.confidence,
+        source: WorkModeConfirmationSource::FirstPass,
+        reason: Some(
+            "objective contract requires an artifact; answer-only confirmation ignored".to_string(),
+        ),
+    })
+}
+
+fn edit_capable_artifact_mode(first_pass_mode: WorkMode) -> WorkMode {
+    match first_pass_mode {
+        WorkMode::AnswerOnly | WorkMode::Unknown => WorkMode::GenericCode,
+        mode => mode,
     }
 }
 
@@ -565,6 +622,85 @@ fn run_task_kind_confirm_attempt(
         // sidecar_model is None — orchestrator returns Fallback(SidecarUnavailable)
         // without invoking the closure and without consuming the cap.
         run_task_kind_confirm_with_strategy(inputs, |_| Err("sidecar unavailable".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod objective_artifact_work_mode_tests {
+    use super::*;
+
+    fn make_classification(mode: WorkMode) -> ModeClassification {
+        ModeClassification {
+            work_mode: mode,
+            intent: "test",
+            allows_file_edits: mode != WorkMode::AnswerOnly,
+            requires_tests: false,
+            confidence: 0.7,
+            ambiguity: false,
+            alternative_gap: 0.2,
+            reason: "test",
+            evidence: vec![],
+            alternatives: vec![],
+        }
+    }
+
+    #[test]
+    fn first_pass_answer_only_is_guarded_when_objective_requires_artifact() {
+        let mut classification = make_classification(WorkMode::AnswerOnly);
+
+        guard_first_pass_for_objective_artifact(&mut classification, true);
+
+        assert_eq!(classification.work_mode, WorkMode::GenericCode);
+        assert_eq!(classification.intent, "generic-edit");
+        assert!(classification.allows_file_edits);
+        assert!(classification.evidence.contains(&"objective-artifact"));
+    }
+
+    #[test]
+    fn confirmed_answer_only_is_guarded_when_objective_requires_artifact() {
+        let first_pass = make_classification(WorkMode::GenericCode);
+        let outcome = WorkModeConfirmOutcome::Confirmed(WorkModeConfirmation {
+            mode: WorkMode::AnswerOnly,
+            confidence: 0.95,
+            source: WorkModeConfirmationSource::SecondPassOverridden,
+            reason: Some("sidecar said answer-only".to_string()),
+        });
+
+        let guarded = guard_confirmed_work_mode_for_objective_artifact(outcome, &first_pass, true);
+
+        match guarded {
+            WorkModeConfirmOutcome::Confirmed(c) => {
+                assert_eq!(c.mode, WorkMode::GenericCode);
+                assert_eq!(c.source, WorkModeConfirmationSource::FirstPass);
+                assert!(
+                    c.reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("answer-only confirmation ignored"))
+                );
+            }
+            other => panic!("expected guarded confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirmed_answer_only_is_preserved_without_artifact_objective() {
+        let first_pass = make_classification(WorkMode::GenericCode);
+        let outcome = WorkModeConfirmOutcome::Confirmed(WorkModeConfirmation {
+            mode: WorkMode::AnswerOnly,
+            confidence: 0.95,
+            source: WorkModeConfirmationSource::SecondPassOverridden,
+            reason: Some("read-only".to_string()),
+        });
+
+        let guarded = guard_confirmed_work_mode_for_objective_artifact(outcome, &first_pass, false);
+
+        match guarded {
+            WorkModeConfirmOutcome::Confirmed(c) => {
+                assert_eq!(c.mode, WorkMode::AnswerOnly);
+                assert_eq!(c.source, WorkModeConfirmationSource::SecondPassOverridden);
+            }
+            other => panic!("expected unguarded confirmation, got {other:?}"),
+        }
     }
 }
 

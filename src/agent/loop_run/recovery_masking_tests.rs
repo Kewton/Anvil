@@ -134,6 +134,7 @@ fn artifact_directed_recovery_message_body_masks_and_is_byte_stable() {
         let masked = artifact_directed_recovery_message_body(
             &secret_path(),
             "implementation",
+            &format!("schema_mismatch at {}", secret_path()),
             "Read, Write, Edit",
             already_read,
         );
@@ -141,16 +142,29 @@ fn artifact_directed_recovery_message_body_masks_and_is_byte_stable() {
     }
     // Byte-equality golden: ordinary path, both arms.
     let p = "app/page.tsx";
+    let reason = "required deliverable obligation is still missing";
     assert_eq!(
-        artifact_directed_recovery_message_body(p, "implementation", "Read, Write, Edit", false),
+        artifact_directed_recovery_message_body(
+            p,
+            "implementation",
+            reason,
+            "Read, Write, Edit",
+            false
+        ),
         format!(
-            "[Artifact Directed Recovery] Missing role: implementation. Target file: {p}. Allowed tools for this turn are Read, Write, Edit on that exact target path only. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
+            "[Artifact Directed Recovery] Missing role: implementation. Target file: {p}. Reason: {reason}. Allowed tools for this turn are Read, Write, Edit on that exact target path only. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
         )
     );
     assert_eq!(
-        artifact_directed_recovery_message_body(p, "implementation", "Read, Write, Edit", true),
+        artifact_directed_recovery_message_body(
+            p,
+            "implementation",
+            reason,
+            "Read, Write, Edit",
+            true
+        ),
         format!(
-            "[Artifact Directed Recovery] Missing role: implementation. Target file: {p}. Allowed tools for this turn are Read, Write, Edit on that exact target path only. The target has already been read in this session, so do not call Read again. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
+            "[Artifact Directed Recovery] Missing role: implementation. Target file: {p}. Reason: {reason}. Allowed tools for this turn are Read, Write, Edit on that exact target path only. The target has already been read in this session, so do not call Read again. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
         )
     );
 }

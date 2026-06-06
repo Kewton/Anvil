@@ -8092,7 +8092,10 @@ mod tests {
             ArtifactRecoveryAction::Continue {
                 missing,
                 target_hint: Some(RecoveryTargetHint { reason, .. }),
-            } if missing == vec![ArtifactRole::DataOutput] && reason.contains("schema_mismatch")
+            } if missing == vec![ArtifactRole::DataOutput]
+                && reason.contains("schema_mismatch")
+                && reason.contains("exactly: status, duration_seconds, warnings")
+                && reason.contains("x")
         ));
     }
 
@@ -8140,6 +8143,42 @@ mod tests {
         assert!(message.contains("path=README.md"));
         assert!(message.contains("include required sections: Setup|Usage"));
         assert!(!message.contains("STATE_CONTROL_PACKET"));
+    }
+
+    #[test]
+    fn controller_state_packet_json_extra_field_does_not_complete() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create summary.json with required fields.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data","schema":{"json_fields":["topic","status"]}}]}"#,
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "summary.json"));
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::DataOutput,
+            r#"{"topic":"validation","status":"completed","description":"extra"}"#,
+        )]);
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::DataOutput,
+                "summary.json",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: Some(RecoveryTargetHint { reason, .. }),
+            } if missing == vec![ArtifactRole::DataOutput] && reason.contains("schema_mismatch")
+        ));
     }
 
     #[test]

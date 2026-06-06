@@ -739,7 +739,9 @@ impl ArtifactCompletionJob {
         // 1-line `if !matches!(...) { return; }` filter (DR1-001 SSOT集約).
         if !matches!(
             self.status,
-            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved
+            ArtifactCompletionStatus::AwaitingEdit
+                | ArtifactCompletionStatus::EvidenceObserved
+                | ArtifactCompletionStatus::Exhausted { .. }
         ) {
             return;
         }
@@ -1356,6 +1358,34 @@ mod tests {
             job.status(),
             ArtifactCompletionStatus::AwaitingEdit
         ));
+    }
+
+    #[test]
+    fn test_record_satisfied_from_ledger_can_recover_exhausted_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        drive_to_exhaustion(
+            &mut job,
+            ArtifactAttemptOutcomeKind::EvidenceFailed,
+            vec!["schema mismatch".to_string()],
+        );
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::Exhausted { .. }
+        ));
+
+        let p = projection_for(ArtifactRole::Test, true);
+        job.record_satisfied_from_ledger(&p);
+
+        assert!(matches!(job.status(), ArtifactCompletionStatus::Satisfied));
     }
 
     /// Issue #663 (Phase A / Task A.4 / R5): `record_repo_edit_observed`

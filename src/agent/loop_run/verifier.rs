@@ -934,6 +934,15 @@ fn data_artifact_diagnostic(
     excerpt: &str,
     required_columns: &[String],
 ) -> Option<VerifierDiagnostic> {
+    if let Some(message) = json_object_exact_columns_diagnostic(path, excerpt, required_columns) {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            message,
+        ));
+    }
     // Issue #921 (P4 / DD2 / DR1-004): route through the OR-tolerant SSOT and
     // return a BLOCKING diagnostic ONLY when the tier is `Insufficient`. For
     // `SchemaSatisfied` / `AcceptTier` we MUST return strictly `None` — not
@@ -958,6 +967,40 @@ fn data_artifact_diagnostic(
         ));
     }
     None
+}
+
+fn json_object_exact_columns_diagnostic(
+    path: &str,
+    excerpt: &str,
+    required_columns: &[String],
+) -> Option<String> {
+    if required_columns.is_empty() || !path_has_extension(Some(path), "json") {
+        return None;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(excerpt)
+    else {
+        return None;
+    };
+    let observed = sorted_unique(map.keys().cloned().collect());
+    let required = sorted_unique(required_columns.to_vec());
+    (observed != required).then(|| {
+        format!(
+            "JSON object top-level fields must be exactly: {}; observed fields: {}; remove extra fields and add missing required fields",
+            display_schema_columns(required_columns),
+            display_schema_columns(&observed)
+        )
+    })
+}
+
+fn display_schema_columns(columns: &[String]) -> String {
+    if columns.is_empty() {
+        return "(none)".to_string();
+    }
+    columns
+        .iter()
+        .map(|column| crate::session::feedback::mask_secrets(column))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn manifest_readiness_diagnostic(
@@ -1374,6 +1417,9 @@ pub(super) fn assess_structured_data(
     if required_columns.is_empty() {
         return StructuredDataTier::SchemaSatisfied;
     }
+    if let Some(tier) = json_object_exact_columns_tier(path, excerpt, required_columns) {
+        return tier;
+    }
     let observed = observed_data_columns(path, excerpt, required_columns);
     let all_observed = required_columns
         .iter()
@@ -1400,6 +1446,27 @@ pub(super) fn assess_structured_data(
     }
 }
 
+fn json_object_exact_columns_tier(
+    path: Option<&str>,
+    excerpt: &str,
+    required_columns: &[String],
+) -> Option<StructuredDataTier> {
+    if !path_has_extension(path, "json") {
+        return None;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(excerpt)
+    else {
+        return None;
+    };
+    let observed = sorted_unique(map.keys().cloned().collect());
+    let required = sorted_unique(required_columns.to_vec());
+    Some(if observed == required {
+        StructuredDataTier::SchemaSatisfied
+    } else {
+        StructuredDataTier::Insufficient
+    })
+}
+
 /// Issue #921 (P4 / CB-001): whether the AcceptTier fallback may apply to this
 /// path's format. `None` (the path-less completion case) and the parse-checkable
 /// text formats are allowed; any other recognized extension (e.g. binary
@@ -1410,16 +1477,23 @@ fn accept_tier_format_is_parse_checkable(path: Option<&str>) -> bool {
     let Some(path) = path else {
         return true;
     };
-    match std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+    match path_extension_lower(path).as_deref() {
         None => true,
         Some("csv" | "tsv" | "json" | "jsonl" | "ndjson") => true,
         Some(_) => false,
     }
+}
+
+fn path_has_extension(path: Option<&str>, expected: &str) -> bool {
+    path.and_then(path_extension_lower)
+        .is_some_and(|ext| ext == expected)
+}
+
+fn path_extension_lower(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
 }
 
 fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[String]) -> bool {
@@ -2032,6 +2106,36 @@ mod tests {
     }
 
     #[test]
+    fn assess_structured_data_json_object_requires_exact_declared_keys() {
+        let cols = vec!["topic".to_string(), "status".to_string()];
+
+        assert_eq!(
+            assess_structured_data(
+                Some("summary.json"),
+                r#"{"topic":"validation","status":"completed"}"#,
+                &cols
+            ),
+            StructuredDataTier::SchemaSatisfied
+        );
+        assert_eq!(
+            assess_structured_data(
+                Some("summary.json"),
+                r#"{"topic":"validation","status":"completed","description":"extra"}"#,
+                &cols
+            ),
+            StructuredDataTier::Insufficient
+        );
+        assert_eq!(
+            assess_structured_data(
+                Some("summary.json"),
+                r#"{"status":"completed","description":"missing topic"}"#,
+                &cols
+            ),
+            StructuredDataTier::Insufficient
+        );
+    }
+
+    #[test]
     fn assess_structured_data_missing_column_floor_boundary() {
         let cols = vec!["zzz".to_string()];
         // 15 chars, missing column → below floor → Insufficient.
@@ -2137,6 +2241,30 @@ mod tests {
 
         assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
         assert_eq!(diagnostic.role, ArtifactRole::DataOutput);
+        assert!(diagnostic.message.contains("not parse-ready"));
+    }
+
+    #[test]
+    fn data_verifier_diagnoses_json_object_extra_fields() {
+        let verifier = DataVerifier;
+        let required = vec!["topic".to_string(), "status".to_string()];
+        let diagnostic = verifier
+            .diagnostic(VerifierArtifact {
+                path: Some("summary.json"),
+                excerpt: r#"{"topic":"validation","status":"completed","description":"extra"}"#,
+                required_columns: &required,
+                required_sections: &[],
+            })
+            .expect("extra field diagnostic");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.role, ArtifactRole::DataOutput);
+        assert!(
+            diagnostic
+                .message
+                .contains("JSON object top-level fields must be exactly: topic, status")
+        );
+        assert!(diagnostic.message.contains("description"));
     }
 
     #[test]
