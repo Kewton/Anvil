@@ -1558,6 +1558,25 @@ fn usage_docs_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &s
     super::verifier::required_section_headings_present(excerpt, &section_obligations)
 }
 
+fn usage_docs_obligation_has_content_gate(identity: &ArtifactObligation) -> bool {
+    !identity.required_sections.is_empty()
+        || matches!(
+            identity.schema.as_ref(),
+            Some(DeliverableSchema::RequiredSections(_))
+        )
+        || matches!(
+            identity.kind,
+            DeliverableKind::ResearchNotes | DeliverableKind::OpsRunbook
+        )
+}
+
+fn usage_docs_role_has_content_gate(contract: &TaskContract) -> bool {
+    contract
+        .required_identities_for_role(ArtifactRole::UsageDocs)
+        .into_iter()
+        .any(usage_docs_obligation_has_content_gate)
+}
+
 fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, excerpt: &str) -> bool {
     // Issue #921 (P4 / DD1 / DR2-004): route the completion side through the same
     // OR-tolerant SSOT the diagnostic side uses. Each schema-bearing DataOutput
@@ -1818,14 +1837,19 @@ fn required_role_satisfied(
     if identities.is_empty() {
         return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
     }
+    let usage_docs_content_gate =
+        role == ArtifactRole::UsageDocs && usage_docs_role_has_content_gate(contract);
     // The `UsageDocs` fast-path must NOT bypass per-identity verification for
     // kinds whose UsageDocs obligation carries a content gate:
     //  - Research (#922 DR3-001): a `ReportCompletenessPass{path:None}` must not
     //    falsely satisfy the section / open-ended-floor check (`assess_research_report`).
     //  - Ops (#923): the OpsRunbook obligation is completion authority and must
     //    satisfy the ops tier predicate.
-    // Docs/Authoring keep the existing fast-path here (no regression).
+    //  - Docs/Authoring: explicit required sections are content gates too.
+    // Docs/Authoring without an explicit content gate keep the existing fast-path
+    // here (no regression).
     if role == ArtifactRole::UsageDocs
+        && !usage_docs_content_gate
         && contract.task_kind != TaskKind::Research
         && contract.task_kind != TaskKind::Ops
         && observed.contains(&role)
@@ -1916,7 +1940,10 @@ fn required_role_satisfied_by_evidence(
     //  - Authoring (#919 DR3-002): raw `RepoEdit(Docs)` is not completion authority;
     //    needs the accept-tier pass.
     //  - Ops (#923): the OpsRunbook obligation is the authority; needs the tier predicate.
+    let usage_docs_content_gate =
+        role == ArtifactRole::UsageDocs && usage_docs_role_has_content_gate(contract);
     if role == ArtifactRole::UsageDocs
+        && !usage_docs_content_gate
         && contract.task_kind != TaskKind::Research
         && !authoring
         && contract.task_kind != TaskKind::Ops
@@ -2317,29 +2344,36 @@ impl TaskContract {
     /// runs the full-struct equality against the deterministic recompute.
     pub(super) fn from_request_with_kind(request: &str, forced_kind: Option<TaskKind>) -> Self {
         let controller_state = ControllerStatePacket::parse(request);
+        let natural_request = if controller_state.is_some() {
+            model_visible_request_text(request)
+        } else {
+            request.to_string()
+        };
+        let request_for_inference = natural_request.as_str();
         let controller_task_kind = controller_state
             .as_ref()
             .and_then(ControllerStatePacket::inferred_task_kind);
         let evidence_command_hint = controller_state
             .as_ref()
             .and_then(|state| state.evidence_command.clone());
-        let lower = request.to_ascii_lowercase();
+        let lower = request_for_inference.to_ascii_lowercase();
         // Issue #937 (DS3-001): the output-context mask is allocated exactly ONCE
         // per request and threaded by reference into every output-context surface
         // (research / data / docs / default-DataOutput inference). Transient,
         // judgement-only, never stored.
-        let scan = OutputContextScan::new(request);
-        let project_intent = ProjectIntent::from_request(request);
+        let scan = OutputContextScan::new(request_for_inference);
+        let project_intent = ProjectIntent::from_request(request_for_inference);
         let mut intent = project_intent.intent;
-        let asks_for_tests = request_asks_for_test_artifact(request, &lower);
-        let asks_for_usage_docs = request_asks_for_usage_docs(request, &lower);
-        let asks_for_setup = request_asks_for_setup(request, &lower);
-        let asks_for_data_output = request_asks_for_data_output_artifact_with_scan(&scan, request);
+        let asks_for_tests = request_asks_for_test_artifact(request_for_inference, &lower);
+        let asks_for_usage_docs = request_asks_for_usage_docs(request_for_inference, &lower);
+        let asks_for_setup = request_asks_for_setup(request_for_inference, &lower);
+        let asks_for_data_output =
+            request_asks_for_data_output_artifact_with_scan(&scan, request_for_inference);
         let TaskKindInference {
             kind: inferred_kind,
             matched: inferred_matched,
         } = infer_task_kind(
-            request,
+            request_for_inference,
             &lower,
             intent,
             asks_for_tests,
@@ -2372,7 +2406,7 @@ impl TaskContract {
 
         if task_kind == TaskKind::Coding
             && request_asks_for_implementation_artifact(
-                request,
+                request_for_inference,
                 &lower,
                 asks_for_tests,
                 asks_for_usage_docs,
@@ -2412,7 +2446,7 @@ impl TaskContract {
         // answer-only or trivially). Added to `required` BEFORE the `retain`
         // below so any explicit report path obligation survives (DR3-002).
         let research_report_intended = task_kind == TaskKind::Research
-            && research_report_artifact_intended_with_scan(&scan, request);
+            && research_report_artifact_intended_with_scan(&scan, request_for_inference);
         if research_report_intended {
             required.push(ArtifactRole::UsageDocs);
         }
@@ -2420,7 +2454,7 @@ impl TaskContract {
         optional.sort();
         optional.dedup();
         let mut required_artifact_identities =
-            explicit_artifact_obligations_from_request_with_scan(&scan, request);
+            explicit_artifact_obligations_from_request_with_scan(&scan, request_for_inference);
         if let Some(controller_state) = &controller_state {
             controller_state
                 .extend_contract_parts(&mut required, &mut required_artifact_identities);
@@ -2447,7 +2481,9 @@ impl TaskContract {
             }
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
-        for identity in inferred_docs_obligations_from_request(request, &lower, &required) {
+        for identity in
+            inferred_docs_obligations_from_request(request_for_inference, &lower, &required)
+        {
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
         // Issue #922 (P5 / DD3): bridge the research report obligation. Merges
@@ -2455,20 +2491,24 @@ impl TaskContract {
         // `RequiredSections` schema) or is added fresh. UsageDocs role reuse
         // (S7-002) + `ResearchNotes` kind + research sections; path is admitted.
         if research_report_intended {
-            let sections = required_research_sections_from_request(request);
-            let path = research_report_path_from_request_with_scan(&scan, request);
+            let sections = required_research_sections_from_request(request_for_inference);
+            let path = research_report_path_from_request_with_scan(&scan, request_for_inference);
             push_or_merge_artifact_obligation(
                 &mut required_artifact_identities,
                 ArtifactObligation::research_report(path, sections),
             );
         }
-        for identity in inferred_data_obligations_from_request_with_scan(&scan, request) {
+        for identity in
+            inferred_data_obligations_from_request_with_scan(&scan, request_for_inference)
+        {
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
             push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
-        for identity in inferred_ops_obligations_from_request(request, &lower, task_kind) {
+        for identity in
+            inferred_ops_obligations_from_request(request_for_inference, &lower, task_kind)
+        {
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
@@ -2479,7 +2519,7 @@ impl TaskContract {
         required_artifact_identities
             .sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
         let deliverables = deliverables_from_contract_parts(
-            request,
+            request_for_inference,
             task_kind,
             &required,
             &required_artifact_identities,
@@ -2490,14 +2530,14 @@ impl TaskContract {
         // existing `required_artifacts` gate above is the source of truth
         // for the artifact list; behavior schema is stored alongside it
         // as a future read-only input for #636.
-        let mut required_behavior = required_behavior::extract(request);
+        let mut required_behavior = required_behavior::extract(request_for_inference);
         required_behavior.required_artifacts = None;
         required_behavior.verification = None;
         let completion_policy = CompletionPolicy::from_contract_parts(
             task_kind,
             intent,
             &required,
-            project_intent.verification_required(),
+            project_intent.verification_required() || evidence_command_hint.is_some(),
             &required_behavior,
         );
         Self {
@@ -2742,6 +2782,14 @@ pub(super) fn has_required_setup_artifact(contract: &TaskContract) -> bool {
         .required_artifacts
         .iter()
         .any(|role| matches!(role, ArtifactRole::Setup))
+}
+
+/// SetupBootstrap is only for install/env setup work. Manifest/config
+/// deliverables such as `Cargo.toml` and `package.json` also use
+/// `ArtifactRole::Setup`, but those must remain normal MissingDeliverableJob
+/// targets with Write/Edit policy.
+pub(super) fn has_required_setup_install_intent(contract: &TaskContract) -> bool {
+    matches!(contract.intent, TaskIntent::Install) && has_required_setup_artifact(contract)
 }
 
 /// AD18 accessor: returns `true` iff `optional_artifacts::Setup` is
@@ -7844,7 +7892,10 @@ mod tests {
         evidence.push(repo_edit(RepoEditCategory::Docs));
 
         let decision = contract.evaluate(&evidence);
-        assert_eq!(missing_labels(&decision), vec!["implementation", "setup"]);
+        assert_eq!(
+            missing_labels(&decision),
+            vec!["implementation", "usage_docs", "setup"]
+        );
     }
 
     #[test]
@@ -8056,6 +8107,17 @@ mod tests {
             contract.evidence_command_hint(),
             Some("cargo test --manifest-path Cargo.toml")
         );
+        assert!(
+            contract.verification_required,
+            "controller evidence_command must make command evidence mandatory for coding"
+        );
+        let projection = super::super::required_behavior::project_behavior_contract(&contract);
+        assert!(
+            projection.as_ref().is_none_or(|projection| {
+                !super::super::required_behavior::behavior_projection_has_setup_label(projection)
+            }),
+            "controller-owned role=manifest/setup vocabulary must not contaminate setup bootstrap labels"
+        );
     }
 
     #[test]
@@ -8183,16 +8245,19 @@ mod tests {
             owned_test_artifacts: &[],
         });
 
-        assert!(matches!(
+        assert!(
+            matches!(
             action,
             ArtifactRecoveryAction::Continue {
-                missing,
-                target_hint: Some(RecoveryTargetHint { reason, .. }),
-            } if missing == vec![ArtifactRole::UsageDocs]
+                ref missing,
+                target_hint: Some(RecoveryTargetHint { ref reason, .. }),
+            } if missing == &vec![ArtifactRole::UsageDocs]
                 && reason.contains("required section headings are missing")
-                && reason.contains("Setup")
-                && reason.contains("Usage")
-        ));
+                && reason.to_ascii_lowercase().contains("setup")
+                && reason.to_ascii_lowercase().contains("usage")
+            ),
+            "docs prose-only mention must request heading repair, got {action:?}"
+        );
     }
 
     #[test]
@@ -8298,6 +8363,35 @@ mod tests {
                     reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/lib.rs".to_string(),
                 }),
             }
+        );
+    }
+
+    #[test]
+    fn controller_state_packet_evidence_command_runs_after_deliverables_exist() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+            ArtifactState::exists(ArtifactRole::Implementation, "src/lib.rs"),
+        ];
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::RunVerifier
         );
     }
 
@@ -10104,12 +10198,23 @@ mod tests {
                 .contains(&ArtifactRole::Setup)
         );
         assert!(has_required_setup_artifact(&install_only));
+        assert!(has_required_setup_install_intent(&install_only));
 
         // Build intent that mentions setup → Setup is optional, not required.
         let build_with_setup = TaskContract::from_request(
             "FastAPIでcrudのAPIを開発してください。テストコードも実装してください。",
         );
         assert!(!has_required_setup_artifact(&build_with_setup));
+        assert!(!has_required_setup_install_intent(&build_with_setup));
+
+        // Manifest deliverables use the Setup role but are not env-install
+        // bootstrap work.
+        let manifest_deliverable = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        assert!(has_required_setup_artifact(&manifest_deliverable));
+        assert!(!has_required_setup_install_intent(&manifest_deliverable));
     }
 
     /// `has_optional_setup_or_verifier_prerequisite` returns true when

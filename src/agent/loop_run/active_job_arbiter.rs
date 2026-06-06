@@ -36,7 +36,7 @@ use super::required_behavior::{
 };
 use super::task_contract::{
     ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract,
-    VerifierPrerequisiteSignal, has_required_setup_artifact,
+    VerifierPrerequisiteSignal, has_required_setup_install_intent,
 };
 use super::tool_policy::EffectiveToolPolicy;
 use super::worker_contract::{DiagnosticRepairWorkerRequest, TestAuthorWorkerRequest};
@@ -612,9 +612,10 @@ pub(super) fn select_active_job(candidates: &[JobCandidate]) -> ActiveJobSelecti
 /// 0. `artifact_ledger_overflowed == true` → false (Stage 4 fail-closed /
 ///    DR4-001). Ledger overflow means artifact state is ambiguous; we MUST
 ///    NOT freshly install Bash permission on top of unknown state.
-/// 1. `has_required_setup_artifact(contract)` → true. Primary (AD13), no
-///    confidence gate — `required_artifacts::Setup` is the strong pure-Install
-///    intent signal.
+/// 1. `has_required_setup_install_intent(contract)` → true. Primary (AD13), no
+///    confidence gate — install intent plus `required_artifacts::Setup` is the
+///    strong pure-Install signal. Manifest/config deliverables that also use
+///    `ArtifactRole::Setup` stay under MissingDeliverableJob.
 /// 2. Confidence gate: if `BehaviorContractProjection` is absent OR
 ///    `confidence < LOW_CONFIDENCE_THRESHOLD` → false (DR4-001 fail-closed).
 ///    The remaining secondary / fallback signals require deterministic
@@ -641,7 +642,7 @@ pub(super) fn should_install_setup_bootstrap(
     }
 
     // (1) Primary: required artifacts (no confidence gate).
-    if has_required_setup_artifact(contract) {
+    if has_required_setup_install_intent(contract) {
         return true;
     }
 
@@ -1463,6 +1464,29 @@ mod tests {
         assert!(should_install_setup_bootstrap(
             &contract,
             Some(&p),
+            &no_signal,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_false_for_manifest_deliverable_setup_role() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        let projection = project_behavior_contract(&contract);
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&super::super::task_contract::ArtifactRole::Setup),
+            "fixture must keep manifest as a required Setup-role deliverable"
+        );
+        assert!(!should_install_setup_bootstrap(
+            &contract,
+            projection.as_ref(),
             &no_signal,
             false
         ));

@@ -42,7 +42,7 @@ use super::artifact_completion_job::{
 };
 use super::required_behavior::{
     BehaviorContractProjection, BoundedLabelWithExcerpt, behavior_projection_has_setup_label,
-    behavior_projection_has_verifier_capability,
+    behavior_projection_has_verifier_capability, project_behavior_contract,
 };
 use super::task_contract::{
     ArtifactRole, TaskContract, VerifierPrerequisiteSignal,
@@ -304,6 +304,26 @@ fn should_install_setup_bootstrap_true_when_required_artifact_setup() {
     let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
     assert!(should_install_setup_bootstrap(
         &contract, None, &no_signal, false
+    ));
+}
+
+#[test]
+fn should_install_setup_bootstrap_false_for_required_manifest_deliverable() {
+    let contract = TaskContract::from_request(
+        r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+    );
+    assert!(
+        has_required_setup_artifact(&contract),
+        "manifest remains a required Setup-role deliverable"
+    );
+    let projection = project_behavior_contract(&contract);
+    let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+    assert!(!should_install_setup_bootstrap(
+        &contract,
+        projection.as_ref(),
+        &no_signal,
+        false
     ));
 }
 
