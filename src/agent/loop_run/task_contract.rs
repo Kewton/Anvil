@@ -1907,7 +1907,22 @@ pub(super) fn recovery_target_hint_for_blocking_obligation_diagnostic(
     artifact_excerpts: &ArtifactExcerpts,
     role: ArtifactRole,
 ) -> Option<RecoveryTargetHint> {
-    if let Some((identity, diagnostic)) = contract
+    blocking_obligation_diagnostic_for_role(contract, artifacts, artifact_excerpts, role)
+        .map(|diagnostic| diagnostic.target_hint)
+}
+
+pub(super) struct BlockingObligationDiagnostic {
+    pub(super) target_hint: RecoveryTargetHint,
+    pub(super) code: super::verifier::VerifierDiagnosticCode,
+}
+
+pub(super) fn blocking_obligation_diagnostic_for_role(
+    contract: &TaskContract,
+    artifacts: &[ArtifactState],
+    artifact_excerpts: &ArtifactExcerpts,
+    role: ArtifactRole,
+) -> Option<BlockingObligationDiagnostic> {
+    contract
         .required_identities_for_role(role)
         .into_iter()
         .filter_map(|identity| {
@@ -1925,25 +1940,25 @@ pub(super) fn recovery_target_hint_for_blocking_obligation_diagnostic(
             {
                 return None;
             }
-            Some((identity, diagnostic))
+            let reason = if diagnostic.code == super::verifier::VerifierDiagnosticCode::MissingFile
+            {
+                format!(
+                    "required deliverable obligation is still missing: {}",
+                    obligation_report_label(identity)
+                )
+            } else {
+                diagnostic.reason()
+            };
+            Some(BlockingObligationDiagnostic {
+                target_hint: RecoveryTargetHint {
+                    role,
+                    path: identity.path.clone(),
+                    reason,
+                },
+                code: diagnostic.code,
+            })
         })
         .next()
-    {
-        let reason = if diagnostic.code == super::verifier::VerifierDiagnosticCode::MissingFile {
-            format!(
-                "required deliverable obligation is still missing: {}",
-                obligation_report_label(identity)
-            )
-        } else {
-            diagnostic.reason()
-        };
-        return Some(RecoveryTargetHint {
-            role,
-            path: identity.path.clone(),
-            reason,
-        });
-    }
-    None
 }
 
 /// Issue #918 (P1): display cap (chars) for a single section/schema label.

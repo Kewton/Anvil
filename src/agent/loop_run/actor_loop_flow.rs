@@ -1496,6 +1496,12 @@ fn sync_post_tool_contract_recovery_target(
         args.contract_verifier_repair_edit_count,
         args.repo_edit_calls_made_this_turn,
     );
+    super::task_contract_recovery::record_obligation_diagnostic_attempt_for_action(
+        agent,
+        contract,
+        &action,
+        args.repo_edit_calls_made_this_turn,
+    );
     match action {
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
         | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {

@@ -139,6 +139,52 @@ pub(super) fn task_contract_recovery_action(
     action
 }
 
+pub(super) fn record_obligation_diagnostic_attempt_for_action(
+    agent: &mut Agent,
+    contract: &super::task_contract::TaskContract,
+    action: &super::task_contract::ArtifactRecoveryAction,
+    repo_edit_calls_made_this_turn: usize,
+) -> bool {
+    if repo_edit_calls_made_this_turn == 0 {
+        return false;
+    }
+    let super::task_contract::ArtifactRecoveryAction::Continue {
+        target_hint: Some(target_hint),
+        ..
+    } = action
+    else {
+        return false;
+    };
+    let Some((job_role, job_path)) = agent
+        .artifact_completion_job
+        .as_ref()
+        .map(|job| (job.role(), job.target_path().to_string()))
+    else {
+        return false;
+    };
+    if job_role != target_hint.role || job_path != target_hint.path {
+        return false;
+    }
+    let artifacts =
+        super::artifact_state_projection::task_contract_artifact_states(agent, contract);
+    let Some(blocking) = super::task_contract::blocking_obligation_diagnostic_for_role(
+        contract,
+        &artifacts,
+        &agent.task_contract_excerpts,
+        job_role,
+    )
+    .filter(|diagnostic| {
+        diagnostic.target_hint.path == job_path
+            && diagnostic.code != super::verifier::VerifierDiagnosticCode::MissingFile
+    }) else {
+        return false;
+    };
+    super::artifact_completion_record::record_artifact_completion_evidence_failure(
+        agent,
+        &blocking.target_hint.reason,
+    )
+}
+
 fn satisfied_artifact_job_action(
     agent: &Agent,
     contract: &super::task_contract::TaskContract,
@@ -260,7 +306,7 @@ pub(super) fn task_contract_recovery_target(
 mod tests {
     use super::*;
     use crate::agent::loop_run::artifact_completion_job::{
-        ArtifactCompletionJob, ArtifactCompletionStatus,
+        ArtifactAttemptOutcomeKind, ArtifactCompletionJob, ArtifactCompletionStatus,
     };
     use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
     use crate::agent::loop_run::commands::test_agent_with_config;
@@ -428,10 +474,10 @@ mod tests {
         let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
         match action {
             ArtifactRecoveryAction::Continue {
-                missing,
-                target_hint: Some(target_hint),
+                ref missing,
+                target_hint: Some(ref target_hint),
             } => {
-                assert_eq!(missing, vec![ArtifactRole::DataOutput]);
+                assert_eq!(missing, &vec![ArtifactRole::DataOutput]);
                 assert_eq!(target_hint.path, "output.csv");
                 assert!(
                     target_hint.reason.contains("schema_mismatch"),
@@ -447,5 +493,107 @@ mod tests {
             }),
             "schema-mismatched artifact must not be reported as a satisfied completion job"
         );
+        assert!(
+            !record_obligation_diagnostic_attempt_for_action(&mut agent, &contract, &action, 0),
+            "no repo edit means no semantic evidence failure attempt is recorded"
+        );
+        let exhausted =
+            record_obligation_diagnostic_attempt_for_action(&mut agent, &contract, &action, 1);
+        assert!(!exhausted, "first evidence failure should not exhaust");
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact completion job");
+        assert_eq!(job.attempts().len(), 1);
+        assert_eq!(job.remaining_budget(), 3);
+        assert_eq!(
+            job.attempts()[0].kind(),
+            ArtifactAttemptOutcomeKind::EvidenceFailed
+        );
+        assert!(job.attempts()[0].cluster_key().is_some());
+    }
+
+    #[test]
+    fn docs_required_section_failure_records_generic_evidence_failed_attempt() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = concat!(
+            "STATE_CONTROL_PACKET\n",
+            r#"{"objective":"Create README.md documentation.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs","schema":{"required_sections":["Setup","Usage"]}}]}"#
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::UsageDocs,
+                    path: "README.md".to_string(),
+                    reason: "missing docs artifact".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("docs artifact completion job"),
+        );
+        std::fs::write(
+            agent.work_root.join("README.md"),
+            "# Local Notes\n\n## Setup\n\nInstall the binary.\n",
+        )
+        .unwrap();
+        agent
+            .turn_edited_relative_paths
+            .insert("README.md".to_string());
+        agent.task_contract_excerpts.insert(
+            ArtifactRole::UsageDocs,
+            "# Local Notes\n\n## Setup\n\nInstall the binary.\n".to_string(),
+        );
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::RepoEdit {
+                category: RepoEditCategory::Docs,
+                count: 1,
+                path: Some("README.md".to_string()),
+            });
+        let recorded = agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "README.md".to_string(),
+            ArtifactRole::UsageDocs,
+            true,
+        );
+        assert!(recorded.is_some());
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                ref missing,
+                target_hint: Some(RecoveryTargetHint { ref path, .. }),
+            } if missing == &vec![ArtifactRole::UsageDocs] && path == "README.md"
+        ));
+        let exhausted =
+            record_obligation_diagnostic_attempt_for_action(&mut agent, &contract, &action, 1);
+        assert!(!exhausted, "first evidence failure should not exhaust");
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact completion job");
+        assert_eq!(job.attempts().len(), 1);
+        assert_eq!(
+            job.attempts()[0].kind(),
+            ArtifactAttemptOutcomeKind::EvidenceFailed
+        );
+        assert!(job.attempts()[0].cluster_key().is_some());
     }
 }

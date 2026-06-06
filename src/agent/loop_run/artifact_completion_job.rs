@@ -7,9 +7,10 @@
 //!   + `artifact_ownership` SSOTs — never re-canonicalized here),
 //! - the role-specific retry budget (`ARTIFACT_COMPLETION_ATTEMPT_LIMIT`),
 //! - the failure attempt history (`WrongTarget` / `NoTool` / `ProseOnly` /
-//!   `RolePolicyViolation`) — each attempt's user-controlled strings are run
-//!   through the `mask_secrets` → length cap → control-char neutralization
-//!   pipeline at construction time so consumers never observe raw input.
+//!   `RolePolicyViolation` / `EvidenceFailed`) — each attempt's
+//!   user-controlled strings are run through the `mask_secrets` → length cap
+//!   → control-char neutralization pipeline at construction time so consumers
+//!   never observe raw input.
 //!
 //! ## Visibility (DR3-001)
 //!
@@ -160,6 +161,12 @@ pub(super) enum ArtifactAttemptOutcomeKind {
     /// Variant subdivision is intentionally kept in `actual_actions` rather
     /// than as separate enum variants (DR2-006 / design judgement #8).
     RolePolicyViolation,
+    /// A target artifact was produced but failed a contract obligation
+    /// diagnostic, such as structured-data schema mismatch or missing docs
+    /// sections. This is intentionally generic: the diagnostic authority
+    /// decides the domain-specific failure, while the job lifecycle only
+    /// records "evidence for this deliverable failed".
+    EvidenceFailed,
 }
 
 impl ArtifactAttemptOutcomeKind {
@@ -173,6 +180,7 @@ impl ArtifactAttemptOutcomeKind {
             ArtifactAttemptOutcomeKind::NoTool => "no_tool",
             ArtifactAttemptOutcomeKind::ProseOnly => "prose_only",
             ArtifactAttemptOutcomeKind::RolePolicyViolation => "role_policy_violation",
+            ArtifactAttemptOutcomeKind::EvidenceFailed => "evidence_failed",
         }
     }
 }
@@ -209,7 +217,7 @@ impl BashPolicyViolationCategory {
 /// **Output schema (`PAYLOAD_SCHEMA_VERSION = 1` 不変)**:
 /// ```jsonc
 /// {
-///   "kind": "wrong_target" | "no_tool" | "prose_only" | "role_policy_violation",
+///   "kind": "wrong_target" | "no_tool" | "prose_only" | "role_policy_violation" | "evidence_failed",
 ///   "category": "bash_out_of_policy" | "other_role_violation", // RolePolicyViolation only
 ///   "actual_actions": ["<16-hex correlator>", ...]              // raw command / path NEVER included
 /// }
@@ -1536,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_attempt_outcome_kind_enum_is_4_variants_closed() {
+    fn test_artifact_attempt_outcome_kind_enum_is_5_variants_closed() {
         // Exhaustive match — adding a new variant requires updating this
         // arm (design judgement #8 / DR1-004 compile-time enforcement).
         for kind in [
@@ -1544,12 +1552,14 @@ mod tests {
             ArtifactAttemptOutcomeKind::NoTool,
             ArtifactAttemptOutcomeKind::ProseOnly,
             ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            ArtifactAttemptOutcomeKind::EvidenceFailed,
         ] {
             let label: &'static str = match kind {
                 ArtifactAttemptOutcomeKind::WrongTarget => "wrong_target",
                 ArtifactAttemptOutcomeKind::NoTool => "no_tool",
                 ArtifactAttemptOutcomeKind::ProseOnly => "prose_only",
                 ArtifactAttemptOutcomeKind::RolePolicyViolation => "role_policy_violation",
+                ArtifactAttemptOutcomeKind::EvidenceFailed => "evidence_failed",
             };
             assert!(!label.is_empty());
         }

@@ -465,7 +465,7 @@ fn attempt_outcome_to_json_value_uses_correlator_not_raw_command() {
 
 // ---------------------------------------------------------------------------
 // Acceptance (f) / DR1-004: ArtifactAttemptOutcomeKind::as_str returns the
-// fixed snake_case enum closed list. The 4 variants are pinned.
+// fixed snake_case enum closed list. The 5 variants are pinned.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -479,6 +479,10 @@ fn attempt_outcome_category_label_fixed_enum() {
         (
             ArtifactAttemptOutcomeKind::RolePolicyViolation,
             "role_policy_violation",
+        ),
+        (
+            ArtifactAttemptOutcomeKind::EvidenceFailed,
+            "evidence_failed",
         ),
     ];
     for (kind, label) in cases {

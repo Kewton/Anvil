@@ -13,6 +13,9 @@
 //!   `ArtifactAttemptOutcome::new` (`mask_secrets` + length cap +
 //!   control-char neutralize) and hashed at projection time (AD5 /
 //!   CB-004).
+//! - `record_artifact_completion_evidence_failure` — appends a generic
+//!   `EvidenceFailed` outcome when an owned target artifact fails a contract
+//!   obligation diagnostic.
 //! - `record_artifact_completion_outcome` (private) — shared core that
 //!   appends the outcome + triggers the turn-local
 //!   `artifact_completion_failed` diagnostic on Exhausted transition.
@@ -79,6 +82,36 @@ pub(super) fn record_artifact_completion_bash_violation(
     };
     let outcome = super::artifact_completion_job::ArtifactAttemptOutcome::new_bash_policy_violation(
         actual_actions,
+        expected_target,
+    );
+    record_artifact_completion_outcome(agent, outcome)
+}
+
+/// Record that the active artifact target exists but failed contract
+/// obligation evidence, for example a schema mismatch or missing required
+/// document section. Domain-specific diagnosis stays in the verifier /
+/// obligation layer; this function only maps that diagnosis into the generic
+/// artifact lifecycle budget.
+pub(super) fn record_artifact_completion_evidence_failure(
+    agent: &mut Agent,
+    diagnostic_reason: &str,
+) -> bool {
+    let (expected_target, role) = match agent.artifact_completion_job.as_ref() {
+        Some(job) => (job.target_path().to_string(), job.role()),
+        None => return false,
+    };
+    let cluster = super::semantic_failure::build_failure_cluster_from_observation(
+        diagnostic_reason,
+        "artifact obligation evidence satisfied",
+        &expected_target,
+        "artifact_obligation_diagnostic",
+        &[role],
+        Vec::new(),
+    );
+    let outcome = super::artifact_completion_job::ArtifactAttemptOutcome::with_failure_cluster(
+        super::artifact_completion_job::ArtifactAttemptOutcomeKind::EvidenceFailed,
+        cluster.cluster_key,
+        vec![format!("evidence_failed:{diagnostic_reason}")],
         expected_target,
     );
     record_artifact_completion_outcome(agent, outcome)
