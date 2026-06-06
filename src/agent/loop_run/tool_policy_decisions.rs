@@ -61,13 +61,41 @@ pub(super) fn answer_only_mode_active(agent: &Agent) -> bool {
     // `infer_work_mode_from_text(active_request_text())` bypassed the
     // second-pass result whenever the lexical pre-classifier still
     // inferred `AnswerOnly`, defeating the whole point of this Issue.
-    agent.session.mode_state.work_mode == WorkMode::AnswerOnly
+    //
+    // P15: do not let WorkMode override an ObjectiveContract that requires an
+    // artifact. Data/docs/research artifact tasks are not coding tasks, but
+    // they still need Write/Edit access to produce the requested deliverable.
+    let objective_requires_artifact = super::task_classification::task_contract_authority(agent)
+        .is_some_and(|contract| !contract.required_artifacts.is_empty());
+    answer_only_mode_active_for(
+        agent.session.mode_state.work_mode,
+        objective_requires_artifact,
+    )
+}
+
+fn answer_only_mode_active_for(work_mode: WorkMode, objective_requires_artifact: bool) -> bool {
+    work_mode == WorkMode::AnswerOnly && !objective_requires_artifact
 }
 
 pub(super) fn script_execution_requested(agent: &Agent) -> bool {
     super::workspace_access::active_request_text(agent)
         .as_deref()
         .is_some_and(request_explicitly_requests_script_execution)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answer_only_mode_is_inactive_when_objective_requires_artifact() {
+        assert!(!answer_only_mode_active_for(WorkMode::AnswerOnly, true));
+    }
+
+    #[test]
+    fn answer_only_mode_remains_active_for_read_only_objective() {
+        assert!(answer_only_mode_active_for(WorkMode::AnswerOnly, false));
+    }
 }
 
 pub(super) fn effective_tool_policy_error(

@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 use super::Agent;
 use super::read_target_helpers::latest_turn_preferred_read_edit_target;
+use super::task_contract::TaskKind;
 use super::tool_history::{focused_edit_target_already_read, has_successful_non_plan_repo_edit};
 use super::tool_policy::EffectiveToolPolicy;
 use crate::modes::plan_act::{ExecutionMode, WorkMode};
@@ -72,6 +73,29 @@ pub(super) fn local_llm_small_edit_target(agent: &Agent) -> Option<PathBuf> {
 
 pub(super) fn mode_policy_message(agent: &Agent) -> Option<ConversationMessage> {
     let work_mode = agent.session.mode_state.work_mode;
+    let contract = super::task_classification::task_contract_authority(agent);
+    let task_kind = contract.as_ref().map(|contract| contract.task_kind);
+    let objective_requires_artifact = contract
+        .as_ref()
+        .is_some_and(|contract| !contract.required_artifacts.is_empty());
+    mode_policy_text_for(work_mode, task_kind, objective_requires_artifact)
+        .map(str::to_string)
+        .map(ConversationMessage::system)
+}
+
+fn mode_policy_text_for(
+    work_mode: WorkMode,
+    task_kind: Option<TaskKind>,
+    objective_requires_artifact: bool,
+) -> Option<&'static str> {
+    if (work_mode != WorkMode::AnswerOnly || objective_requires_artifact)
+        && task_kind.is_some_and(|kind| kind != TaskKind::Coding)
+    {
+        return Some(
+            "[Mode Policy] Task kind is non-coding. Follow the objective contract and required artifacts/evidence. Do not create code scaffolds or coding-specific verification unless explicitly requested.",
+        );
+    }
+
     let text = match work_mode {
         WorkMode::Auto => return None,
         WorkMode::TypeScriptUi => {
@@ -90,5 +114,49 @@ pub(super) fn mode_policy_message(agent: &Agent) -> Option<ConversationMessage> 
             "[Mode Policy] Work mode is generic code. Follow the repository stack and avoid TypeScript UI deterministic fallback unless the request explicitly asks for a browser UI."
         }
     };
-    Some(ConversationMessage::system(text.to_string()))
+    Some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_coding_task_kind_suppresses_python_mode_policy() {
+        let text =
+            mode_policy_text_for(WorkMode::Python, Some(TaskKind::Data), true).expect("policy");
+        assert!(text.contains("Task kind is non-coding"), "got: {text}");
+        assert!(!text.contains("Python-oriented"), "got: {text}");
+    }
+
+    #[test]
+    fn non_coding_task_kind_suppresses_typescript_ui_mode_policy() {
+        let text = mode_policy_text_for(WorkMode::TypeScriptUi, Some(TaskKind::Research), true)
+            .expect("policy");
+        assert!(text.contains("Task kind is non-coding"), "got: {text}");
+        assert!(!text.contains("TypeScript UI"), "got: {text}");
+    }
+
+    #[test]
+    fn coding_task_kind_keeps_coding_mode_policy() {
+        let text =
+            mode_policy_text_for(WorkMode::Python, Some(TaskKind::Coding), true).expect("policy");
+        assert!(text.contains("Python-oriented"), "got: {text}");
+    }
+
+    #[test]
+    fn answer_only_policy_remains_stronger_without_artifact_requirement() {
+        let text = mode_policy_text_for(WorkMode::AnswerOnly, Some(TaskKind::Data), false)
+            .expect("policy");
+        assert!(text.contains("answer-only/read-only"), "got: {text}");
+        assert!(!text.contains("Task kind is non-coding"), "got: {text}");
+    }
+
+    #[test]
+    fn artifact_requirement_overrides_answer_only_mode_policy() {
+        let text =
+            mode_policy_text_for(WorkMode::AnswerOnly, Some(TaskKind::Data), true).expect("policy");
+        assert!(text.contains("Task kind is non-coding"), "got: {text}");
+        assert!(!text.contains("answer-only/read-only"), "got: {text}");
+    }
 }
