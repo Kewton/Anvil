@@ -369,6 +369,19 @@ impl EvalRecord {
             self.pam_eval.as_ref(),
         );
     }
+
+    pub fn refresh_completion_reason(&mut self) {
+        self.completion_reason = truncate_bytes(
+            &completion_reason_for_eval(
+                &self.final_outcome,
+                &self.changed_file_classes,
+                self.verify_commands.len(),
+                self.classified_task_kind.as_deref(),
+                &self.tool_calls,
+            ),
+            MAX_EVAL_COMPLETION_REASON_BYTES,
+        );
+    }
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -530,7 +543,13 @@ pub fn build_eval_record_with_terminal_context(
         last_failure_signature,
     ));
     let completion_reason = truncate_bytes(
-        &completion_reason_for_eval(final_outcome, &changed_file_classes, verify_commands.len()),
+        &completion_reason_for_eval(
+            final_outcome,
+            &changed_file_classes,
+            verify_commands.len(),
+            None,
+            tool_calls,
+        ),
         MAX_EVAL_COMPLETION_REASON_BYTES,
     );
 
@@ -981,6 +1000,8 @@ fn completion_reason_for_eval(
     final_outcome: &str,
     changed_file_classes: &ChangedFileClasses,
     verify_command_count: usize,
+    classified_task_kind: Option<&str>,
+    tool_calls: &[ToolCallSummary],
 ) -> String {
     if final_outcome != "done" {
         return final_outcome.to_string();
@@ -992,11 +1013,26 @@ fn completion_reason_for_eval(
         .test
         .saturating_add(changed_file_classes.impl_files)
         .saturating_add(changed_file_classes.setup);
-    if changed_count > 0 {
+    if changed_count > 0 || non_coding_artifact_tool_observed(classified_task_kind, tool_calls) {
         "artifact_obligations_satisfied".to_string()
     } else {
         "answer_or_plan_completion".to_string()
     }
+}
+
+fn non_coding_artifact_tool_observed(
+    classified_task_kind: Option<&str>,
+    tool_calls: &[ToolCallSummary],
+) -> bool {
+    let Some(kind) = classified_task_kind.and_then(normalize_classified_task_kind_for_eval) else {
+        return false;
+    };
+    if kind == "coding" {
+        return false;
+    }
+    tool_calls
+        .iter()
+        .any(|call| matches!(call.name.as_str(), "Write" | "Edit"))
 }
 
 fn obligation(
@@ -1358,6 +1394,78 @@ mod tests {
         rec.refresh_evaluation_taxonomy();
 
         assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
+    }
+
+    #[test]
+    fn completion_reason_uses_classified_non_coding_artifact_write() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-data-003",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        assert_eq!(rec.completion_reason, "answer_or_plan_completion");
+
+        rec.classified_task_kind = Some("data".to_string());
+        rec.refresh_completion_reason();
+
+        assert_eq!(rec.completion_reason, "artifact_obligations_satisfied");
+    }
+
+    #[test]
+    fn completion_reason_does_not_use_unknown_classified_kind() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-unknown-001",
+            12345,
+            "Create summary.json",
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+
+        rec.classified_task_kind = Some("not-a-kind".to_string());
+        rec.refresh_completion_reason();
+
+        assert_eq!(rec.completion_reason, "answer_or_plan_completion");
     }
 
     #[test]

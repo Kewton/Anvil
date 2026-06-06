@@ -4394,12 +4394,12 @@ pub(super) fn run_actor_loop(
         // Issue #925 (P8): surface the agent's CLASSIFIED task_kind for R5.
         // DR3-002: cross the agent→session boundary as a plain String (never the
         // agent `TaskKind` enum), like `record.pam_eval` above. Distinct from
-        // `evaluation_taxonomy.task_kind` (the eval heuristic) and independent of
-        // `refresh_evaluation_taxonomy()` (order-independent). `None` when no
+        // `evaluation_taxonomy.task_kind` fallback heuristics. `None` when no
         // per-turn classification authority exists (answer-only / plan turns).
         record.classified_task_kind = super::task_classification::task_contract_authority(agent)
             .map(|contract| contract.task_kind.as_str().to_string());
         record.refresh_evaluation_taxonomy();
+        record.refresh_completion_reason();
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }
