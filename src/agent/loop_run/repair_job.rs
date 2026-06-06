@@ -16,7 +16,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::no_progress_recovery::{NoProgressExhaustionReason, NoProgressRecoveryPolicy};
+use super::no_progress_recovery::{
+    NoProgressExhaustionReason, NoProgressRecoveryPolicy, RecoveryStrategy,
+};
 use super::repair_attempt_outcome::{
     MAX_REPAIR_ATTEMPT_OUTCOMES, RepairAttemptOutcome, RepairAttemptOutcomeKind,
     RepairRejectionKind, should_promote_to_exhausted_after_push,
@@ -1109,8 +1111,60 @@ impl RepairJob {
     pub(super) fn no_progress_diagnostic_payload(&self) -> serde_json::Value {
         let scope = self.no_progress_cluster_scope().unwrap_or_default();
         let candidate_roles = self.no_progress_candidate_roles();
-        self.no_progress_policy
-            .diagnostic_payload(&scope, &candidate_roles)
+        let mut payload = self
+            .no_progress_policy
+            .diagnostic_payload(&scope, &candidate_roles);
+        // Issue #1006: surface the deterministic forward strategy alongside the
+        // ban data so the diagnostic classifier (and the logs) see *which*
+        // strategy switch the controller has selected — a closed-enum label
+        // only, never raw paths or LLM prose.
+        if let Some(strategy) = self.no_progress_strategy()
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert(
+                "strategy".to_string(),
+                serde_json::Value::String(strategy.as_str().to_string()),
+            );
+        }
+        payload
+    }
+
+    /// Issue #1006: the deterministic forward strategy for the active cluster's
+    /// no-progress state. `None` when no bans exist or no cluster scope is
+    /// available (the legacy fail-fast path is unaffected).
+    ///
+    /// The `role` is the most recent no-progress observation's role (falling
+    /// back to the plan's preferred role), and `has_contract_conflict` reuses
+    /// the #994 contract-conflict classifier so the test/impl escalation is tied
+    /// to the same inter-artifact signal that drives `ContractConflictJob`.
+    pub(super) fn no_progress_strategy(&self) -> Option<RecoveryStrategy> {
+        if self.no_progress_policy.is_empty() {
+            return None;
+        }
+        let scope = self.no_progress_cluster_scope()?;
+        let candidate_roles = self.no_progress_candidate_roles();
+        let role = self
+            .no_progress_policy
+            .latest_no_progress_role(&scope)
+            .or_else(|| {
+                self.semantic_plan
+                    .as_ref()
+                    .map(|plan| plan.preferred_repair_role)
+            })?;
+        let has_contract_conflict = self
+            .semantic_plan
+            .as_ref()
+            .map(|plan| {
+                super::contract_conflict_job::classify_contract_conflict(&plan.semantic_report)
+                    .is_some()
+            })
+            .unwrap_or(false);
+        Some(self.no_progress_policy.classify_strategy(
+            &scope,
+            role,
+            &candidate_roles,
+            has_contract_conflict,
+        ))
     }
 
     /// Issue #990: whether the diagnostic LLM's selected `(role, path)` is
@@ -4766,6 +4820,138 @@ mod tests {
             &vec![serde_json::json!("test")],
             "forced role switch to the cluster's alternate role"
         );
+    }
+
+    #[test]
+    fn strategy_switches_role_on_repeated_same_failure() {
+        // Issue #1006 (AC1): when the same failure key recurs, the previous
+        // target role is banned and the deterministic strategy switches off it.
+        // The strategy is also surfaced in the diagnostic payload.
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs", "src/other.rs"],
+        );
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+        assert_eq!(
+            job.no_progress_strategy(),
+            Some(RecoveryStrategy::RetryDeterministicOperator),
+            "first no-progress retries the deterministic operator"
+        );
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[1], None),
+        });
+        assert!(!job.no_progress_policy.is_empty());
+        assert_eq!(
+            job.no_progress_strategy(),
+            Some(RecoveryStrategy::SwitchTargetRole),
+            "second same-failure-key no-progress switches target role"
+        );
+        let payload = job.no_progress_diagnostic_payload();
+        assert_eq!(payload["strategy"], serde_json::json!("switch_target_role"));
+    }
+
+    #[test]
+    fn strategy_routes_setup_failure_to_evidence_binding() {
+        // Issue #1006 (AC2): a setup-role no-progress routes to evidence binding
+        // / scaffold, never back to implementation repair — even when
+        // implementation is an available candidate role for the cluster.
+        let (mut job, targets) =
+            semantic_repair_job_with_targets_for_test("S", ArtifactRole::Setup, &["Cargo.toml"]);
+        if let Some(plan) = job.semantic_plan.as_mut()
+            && let Some(cluster) = plan.semantic_report.failure_clusters.get_mut(0)
+        {
+            cluster.involved_artifacts = vec![ArtifactRole::Setup, ArtifactRole::Implementation];
+        }
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+        let strategy = job.no_progress_strategy();
+        assert_eq!(strategy, Some(RecoveryStrategy::RouteToEvidenceBinding));
+        assert_ne!(strategy, Some(RecoveryStrategy::SwitchTargetRole));
+        let payload = job.no_progress_diagnostic_payload();
+        assert_eq!(
+            payload["strategy"],
+            serde_json::json!("route_to_evidence_binding")
+        );
+    }
+
+    #[test]
+    fn strategy_escalates_test_impl_conflict_to_contract() {
+        // Issue #1006 (AC3): a recurring inter-artifact (test/impl) conflict
+        // escalates to contract arbitration, tied to the #994 conflict
+        // classifier via the cluster's involved artifacts.
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        if let Some(plan) = job.semantic_plan.as_mut()
+            && let Some(cluster) = plan.semantic_report.failure_clusters.get_mut(0)
+        {
+            // Make the cluster an impl-vs-test conflict so `classify_contract_conflict`
+            // reports >= 2 involved roles.
+            cluster.involved_artifacts = vec![ArtifactRole::Implementation, ArtifactRole::Test];
+        }
+        for _ in 0..3 {
+            job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+                key: RepairAttemptKey::from_target(&targets[0], None),
+            });
+        }
+        assert_eq!(
+            job.no_progress_strategy(),
+            Some(RecoveryStrategy::EscalateToContractConflict)
+        );
+        let payload = job.no_progress_diagnostic_payload();
+        assert_eq!(
+            payload["strategy"],
+            serde_json::json!("escalate_to_contract_conflict")
+        );
+    }
+
+    #[test]
+    fn strategy_records_operator_missing_reason() {
+        // Issue #1006 (AC4): a single-role cluster that exhausts its only role
+        // yields the structured operator-missing strategy AND the matching
+        // terminal reason that is persisted via the safe-stop report.
+        let (mut job, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        if let Some(plan) = job.semantic_plan.as_mut()
+            && let Some(cluster) = plan.semantic_report.failure_clusters.get_mut(0)
+        {
+            // No alternate role available for the cluster.
+            cluster.involved_artifacts = vec![ArtifactRole::Implementation];
+        }
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+        job.apply_event(RepairJobEvent::TargetReassessmentRequired {
+            key: RepairAttemptKey::from_target(&targets[0], None),
+        });
+        assert_eq!(
+            job.no_progress_strategy(),
+            Some(RecoveryStrategy::OperatorMissing)
+        );
+        assert_eq!(
+            job.no_progress_exhaustion_reason(),
+            Some(NoProgressExhaustionReason::OperatorMissing)
+        );
+    }
+
+    #[test]
+    fn strategy_is_absent_without_no_progress_bans() {
+        // Issue #1006 (AC5): the legacy fail-fast path is unaffected — with no
+        // no-progress bans recorded there is no strategy and the diagnostic
+        // payload carries no `strategy` field.
+        let job = semantic_repair_job_for_test("A", ArtifactRole::Implementation);
+        assert_eq!(job.no_progress_strategy(), None);
+        let payload = job.no_progress_diagnostic_payload();
+        assert!(payload.get("strategy").is_none());
     }
 
     #[test]
