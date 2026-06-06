@@ -99,7 +99,11 @@ fn is_node_test_filename(name: &str) -> bool {
         .any(|suffix| lower.ends_with(suffix))
 }
 
-fn workspace_has_node_test_file(work_root: &Path) -> bool {
+/// True when a conventional Node test file exists at the workspace top level or
+/// under `tests` / `test` / `__tests__`. Shared with the `evidence_binding`
+/// adapter (`node_evidence_binding_plan_from_work_root`) so the Node test-file
+/// suffix list stays a single source of truth (DR3-001 / DRY).
+pub(super) fn workspace_has_node_test_file(work_root: &Path) -> bool {
     if dir_has_node_test_file(work_root) {
         return true;
     }
