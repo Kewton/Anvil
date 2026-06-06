@@ -67,9 +67,12 @@ pub(super) fn working_memory_message(agent: &mut Agent) -> Option<ConversationMe
         &agent.session.working_memory.touched_files,
         suspected_owned.as_deref(),
     );
-    agent
-        .session
-        .working_memory
+    let mut prompt_memory = agent.session.working_memory.clone();
+    if let Some(task) = prompt_memory.active_task.as_deref() {
+        let visible_task = super::task_contract::model_visible_request_text(task);
+        prompt_memory.active_task = (!visible_task.is_empty()).then_some(visible_task);
+    }
+    prompt_memory
         .format_for_prompt_with_precautions(&precautions_for_prompt)
         .map(ConversationMessage::system)
 }
@@ -112,6 +115,8 @@ pub(super) fn repo_context_message(agent: &mut Agent) -> Option<ConversationMess
     }
     refresh_working_memory(agent);
     let task = agent.session.working_memory.active_task.clone()?;
+    let prompt_task = super::task_contract::model_visible_request_text(&task);
+    let prompt_task = (!prompt_task.is_empty()).then_some(prompt_task);
 
     // Issue #469: cache key is widened to include graph ranking inputs.
     let suspected_files: Vec<PathBuf> = agent
@@ -154,7 +159,8 @@ pub(super) fn repo_context_message(agent: &mut Agent) -> Option<ConversationMess
         session_id: &session_id,
         model: Some(model.as_str()),
     };
-    let message = prompting::repo_context_message(&agent.work_root, Some(&task), &inputs);
+    let message =
+        prompting::repo_context_message(&agent.work_root, prompt_task.as_deref(), &inputs);
     agent.repo_context_cache = Some(super::RepoContextCache {
         task,
         work_root: agent.work_root.clone(),

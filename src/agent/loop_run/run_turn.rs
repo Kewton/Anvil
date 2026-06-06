@@ -48,9 +48,10 @@ pub(super) fn run_turn(
             // mode policy into a worker turn.
             agent.session.mode_state.work_mode = WorkMode::Auto;
         } else {
+            let classifier_input = super::task_contract::model_visible_request_text(input);
             let _ = super::classify_confirm_flow::classify_with_confirmation(
                 agent,
-                input,
+                &classifier_input,
                 "turn_start",
             );
         }

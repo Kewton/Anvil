@@ -93,6 +93,11 @@ pub(super) fn build_request_messages(
     if let Some(message) = super::tool_prep::mode_policy_message(agent) {
         messages.push(message);
     }
+    if let Some(contract) = super::task_classification::task_contract_authority(agent)
+        && let Some(note) = super::task_contract::objective_contract_prompt_message(&contract)
+    {
+        messages.push(ConversationMessage::system(note));
+    }
     if focused_edit_target.is_none() {
         append_general_request_context_messages(agent, &mut messages);
     }
@@ -107,9 +112,29 @@ pub(super) fn build_request_messages(
             successful_repo_edits,
         );
     } else {
-        messages.extend(agent.session.messages.clone());
+        messages.extend(model_visible_session_messages(&agent.session.messages));
     }
     messages
+}
+
+fn model_visible_session_messages(
+    session_messages: &[ConversationMessage],
+) -> Vec<ConversationMessage> {
+    session_messages
+        .iter()
+        .filter_map(|message| {
+            if message.role != "user" {
+                return Some(message.clone());
+            }
+            let visible = super::task_contract::model_visible_request_text(&message.content);
+            if visible.is_empty() {
+                return None;
+            }
+            let mut cloned = message.clone();
+            cloned.content = visible;
+            Some(cloned)
+        })
+        .collect()
 }
 
 fn append_general_request_context_messages(
@@ -387,5 +412,41 @@ fn append_focused_edit_request_messages(
             target,
             &agent.work_root,
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_visible_session_messages_strip_embedded_controller_packets_from_user_text() {
+        let raw = r#"Create summary.json only. STATE_CONTROL_PACKET {"required_artifacts":[{"path":"summary.json","role":"data"}]}. Write valid JSON."#;
+        let messages = vec![
+            ConversationMessage::user(raw.to_string()),
+            ConversationMessage::assistant("done".to_string(), Vec::new()),
+        ];
+
+        let visible = model_visible_session_messages(&messages);
+
+        assert_eq!(visible.len(), 2);
+        assert_eq!(
+            visible[0].content,
+            "Create summary.json only. Write valid JSON."
+        );
+        assert!(!visible[0].content.contains("STATE_CONTROL_PACKET"));
+        assert_eq!(visible[1], messages[1]);
+    }
+
+    #[test]
+    fn model_visible_session_messages_drop_pure_controller_packet_user_text() {
+        let messages = vec![ConversationMessage::user(
+            r#"STATE_CONTROL_PACKET {"required_artifacts":[{"path":"summary.json","role":"data"}]}"#
+                .to_string(),
+        )];
+
+        let visible = model_visible_session_messages(&messages);
+
+        assert!(visible.is_empty());
     }
 }

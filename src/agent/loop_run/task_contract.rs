@@ -714,11 +714,7 @@ struct ControllerStatePacket {
 
 impl ControllerStatePacket {
     fn parse(raw: &str) -> Option<Self> {
-        if !is_controller_state_packet(raw) {
-            return None;
-        }
-        let json_start = raw.find('{')?;
-        let value: serde_json::Value = serde_json::from_str(&raw[json_start..]).ok()?;
+        let (value, _) = controller_state_packet_value_and_range(raw)?;
         let required_artifacts = value
             .get("required_artifacts")
             .and_then(serde_json::Value::as_array)
@@ -775,6 +771,135 @@ impl ControllerStatePacket {
 
 pub(super) fn is_controller_state_packet(raw: &str) -> bool {
     raw.trim_start().starts_with("STATE_CONTROL_PACKET")
+}
+
+fn controller_state_packet_value_and_range(
+    raw: &str,
+) -> Option<(serde_json::Value, std::ops::Range<usize>)> {
+    let marker_start = raw.find("STATE_CONTROL_PACKET")?;
+    let json_start = marker_start + raw[marker_start..].find('{')?;
+    let tail = &raw[json_start..];
+    let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
+    let value = stream.next()?.ok()?;
+    let json_end = json_start + stream.byte_offset();
+    Some((value, marker_start..json_end))
+}
+
+pub(super) fn model_visible_request_text(raw: &str) -> String {
+    let Some((_, range)) = controller_state_packet_value_and_range(raw) else {
+        if let Some(marker_start) = raw.find("STATE_CONTROL_PACKET") {
+            return raw[..marker_start].trim_end().to_string();
+        }
+        return raw.trim().to_string();
+    };
+    let before = raw[..range.start].trim_end();
+    let after = raw[range.end..].trim_start_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '.' | '。' | ',' | '、' | ';' | '；')
+    });
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (false, false) => format!("{before} {after}"),
+    }
+}
+
+pub(super) fn objective_contract_prompt_message(contract: &TaskContract) -> Option<String> {
+    if contract.required_artifact_identities.is_empty() && contract.evidence_command_hint.is_none()
+    {
+        return None;
+    }
+
+    let objective = contract.objective_contract();
+    let mut lines = vec![
+        "[Objective Contract]".to_string(),
+        "This is the controller's sanitized contract for the current task. Follow it over guesses from mode labels or scaffolding habits.".to_string(),
+        format!(
+            "Objective kind: {}; deliverable spec: {}; evidence spec: {}.",
+            objective.objective_kind.label(),
+            objective.deliverable_kind.label(),
+            objective.evidence_kind.label()
+        ),
+    ];
+
+    if !contract.required_artifact_identities.is_empty() {
+        lines.push("Required deliverables:".to_string());
+        for obligation in &contract.required_artifact_identities {
+            lines.push(format!(
+                "- {}",
+                objective_contract_obligation_prompt_line(obligation)
+            ));
+        }
+    }
+
+    if let Some(command) = contract.evidence_command_hint() {
+        lines.push(format!(
+            "Required evidence command: {}",
+            mask_and_cap_label(command)
+        ));
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn objective_contract_obligation_prompt_line(obligation: &ArtifactObligation) -> String {
+    let mut parts = vec![format!(
+        "path={} role={} kind={}",
+        mask_obligation_value(&obligation.path),
+        obligation.role.label(),
+        obligation.kind.label()
+    )];
+
+    match obligation.schema.as_ref() {
+        Some(DeliverableSchema::JsonFields(fields)) if !fields.is_empty() => {
+            parts.push(format!(
+                "write a JSON object with exactly these top-level fields and no extra top-level fields: {}",
+                join_masked_labels(fields)
+            ));
+        }
+        Some(DeliverableSchema::StructuredRecord(schema)) if !schema.columns.is_empty() => {
+            let columns = join_masked_labels(&schema.columns);
+            if obligation.format == Some(DeliverableFormat::Json) {
+                parts.push(format!(
+                    "write a JSON object with exactly these top-level fields and no extra top-level fields: {columns}"
+                ));
+            } else {
+                parts.push(format!("include required columns: {columns}"));
+            }
+        }
+        Some(DeliverableSchema::RequiredSections(sections)) if !sections.is_empty() => {
+            parts.push(format!(
+                "include required sections: {}",
+                join_masked_labels(sections)
+            ));
+        }
+        _ => {}
+    }
+
+    if !obligation.required_sections.is_empty()
+        && !matches!(
+            obligation.schema.as_ref(),
+            Some(DeliverableSchema::RequiredSections(_))
+        )
+    {
+        parts.push(format!(
+            "include required sections: {}",
+            join_masked_labels(&obligation.required_sections)
+        ));
+    }
+
+    if !obligation.acceptance_criteria.is_empty() {
+        let criteria = obligation
+            .acceptance_criteria
+            .iter()
+            .take(MAX_ACCEPTANCE_CRITERIA)
+            .map(|criterion| mask_and_cap_label(criterion))
+            .collect::<Vec<_>>()
+            .join("|");
+        parts.push(format!("acceptance criteria: {criteria}"));
+    }
+
+    parts.join("; ")
 }
 
 fn controller_artifact_obligation(value: &serde_json::Value) -> Option<ArtifactObligation> {
@@ -7969,6 +8094,62 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint { reason, .. }),
             } if missing == vec![ArtifactRole::DataOutput] && reason.contains("schema_mismatch")
         ));
+    }
+
+    #[test]
+    fn embedded_controller_state_packet_creates_contract_but_is_hidden_from_model_text() {
+        let request = r#"Create summary.json only. STATE_CONTROL_PACKET {"objective":"Create summary.json","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data","schema":{"json_fields":["topic","status"]}}]}. Write valid JSON."#;
+        let contract = TaskContract::from_request(request);
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert_eq!(contract.classification().confidence, 1.0);
+        let obligation = required_obligation(&contract, ArtifactRole::DataOutput, "summary.json");
+        assert_eq!(obligation.kind, DeliverableKind::StructuredRecord);
+        assert_eq!(
+            model_visible_request_text(request),
+            "Create summary.json only. Write valid JSON."
+        );
+    }
+
+    #[test]
+    fn objective_contract_prompt_message_renders_schema_without_raw_packet() {
+        let request = r#"Create summary.json only. STATE_CONTROL_PACKET {"objective":"Create summary.json","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data","schema":{"json_fields":["topic","status"]}}]}. Write valid JSON."#;
+        let contract = TaskContract::from_request(request);
+
+        let message = objective_contract_prompt_message(&contract).expect("contract prompt");
+
+        assert!(message.contains("[Objective Contract]"));
+        assert!(message.contains("Objective kind: data"));
+        assert!(message.contains("path=summary.json"));
+        assert!(message.contains("role=data_output"));
+        assert!(message.contains("exactly these top-level fields"));
+        assert!(message.contains("topic|status"));
+        assert!(!message.contains("STATE_CONTROL_PACKET"));
+    }
+
+    #[test]
+    fn objective_contract_prompt_message_renders_document_sections() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create README.md documentation.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs","schema":{"required_sections":["Setup","Usage"]}}]}"#,
+        );
+
+        let message = objective_contract_prompt_message(&contract).expect("contract prompt");
+
+        assert!(message.contains("Objective kind: docs"));
+        assert!(message.contains("path=README.md"));
+        assert!(message.contains("include required sections: Setup|Usage"));
+        assert!(!message.contains("STATE_CONTROL_PACKET"));
+    }
+
+    #[test]
+    fn model_visible_request_text_strips_truncated_controller_packet_tail() {
+        let request = r#"Create summary.json only. STATE_CONTROL_PACKET {"required_artifacts":[{"#;
+
+        assert_eq!(
+            model_visible_request_text(request),
+            "Create summary.json only."
+        );
     }
 
     #[test]
