@@ -503,6 +503,134 @@ class TestTaskKindEvalReporting(unittest.TestCase):
         self.assertEqual(completed["terminal_success"]["ok"], 6)
         self.assertEqual(data["by_recovery_job_kind"][0]["recovery_job_kind"], "none")
 
+    def test_report_aggregates_success_terminal_failure_class_for_non_coding_set(
+        self,
+    ) -> None:
+        # Issue #1008: the expanded non-coding evaluation set
+        # (benchmarks/non-coding-lifecycle.yaml) runs on the shared lifecycle.
+        # Its per-TaskKind success rate, terminal state, and failure class must
+        # aggregate for every non-coding kind -- including `authoring`, which the
+        # existing by_task_kind / by_failure_authority tests do not cover.
+        with tempfile.TemporaryDirectory() as raw:
+            bench_root = pathlib.Path(raw) / "bench-root"
+            passing = [
+                ("docs", "docs/configuration-reference.md"),
+                ("data", "output/event-summary.csv"),
+                ("research", "research/logging-strategy-brief.md"),
+                ("ops", "runbooks/local-agent-triage.md"),
+            ]
+            for task_kind, modified_path in passing:
+                _make_run(
+                    bench_root / "qwen3" / task_kind / "pam_off" / "run-1",
+                    task_kind=task_kind,
+                    pam_variant="pam_off",
+                    modified_path=modified_path,
+                    final_outcome="done",
+                )
+            # One failing authoring run populates the failure-class dimension with
+            # a neutral (non-coding) terminal state and authority.
+            _make_run(
+                bench_root / "qwen3" / "authoring" / "pam_off" / "run-1",
+                task_kind="authoring",
+                pam_variant="pam_off",
+                modified_path="docs/agent-loop-onboarding.md",
+                rc=1,
+                final_outcome="evidence_failed",
+                failure_authority="artifact_classification",
+            )
+
+            data = json.loads(
+                subprocess.run(
+                    [sys.executable, str(REPORT), "--format", "json", str(bench_root)],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(REPO_ROOT),
+                    check=True,
+                ).stdout
+            )
+
+        def by_keys(items: list[dict[str, object]], **criteria: str) -> dict[str, object]:
+            for item in items:
+                if all(item.get(key) == value for key, value in criteria.items()):
+                    return item
+            raise AssertionError(f"missing {criteria}: {items}")
+
+        # Every non-coding kind is aggregated with a success-rate projection.
+        kinds = {item["task_kind"] for item in data["by_task_kind"]}
+        self.assertEqual(kinds, {"docs", "data", "research", "ops", "authoring"})
+        authoring = by_keys(data["by_task_kind"], task_kind="authoring")
+        self.assertEqual(authoring["runs"], 1)
+        self.assertEqual(authoring["terminal_success"]["ok"], 0)
+        self.assertEqual(authoring["terminal_success"]["total"], 1)
+
+        # Terminal-state aggregation separates the failing authoring run from the
+        # four completed runs (no coding vocabulary is projected onto it).
+        completed = by_keys(
+            data["by_generic_terminal_state"], generic_terminal_state="completed"
+        )
+        self.assertEqual(completed["runs"], 4)
+        failed = by_keys(
+            data["by_generic_terminal_state"], generic_terminal_state="evidence_failed"
+        )
+        self.assertEqual(failed["runs"], 1)
+
+        # Failure-class distribution carries the authoring failure.
+        artifact_cls = by_keys(
+            data["by_failure_authority"], failure_authority="artifact_classification"
+        )
+        self.assertEqual(artifact_cls["runs"], 1)
+
+    def test_analyze_deterministic_postcheck_for_non_coding_fixture_artifacts(
+        self,
+    ) -> None:
+        # Issue #1008 / AC3: the per-kind postcheck checker is deterministic and
+        # passes the fixture-shaped artifacts for docs/data/research/ops/authoring
+        # with no LLM judge. Each kind's artifact resolves to a stable reason.
+        cases = [
+            ("docs", "docs/configuration-reference.md", "docs_artifact"),
+            ("data", "output/event-summary.csv", "data_artifact"),
+            ("research", "research/logging-strategy-brief.md", "research_artifact"),
+            ("ops", "runbooks/local-agent-triage.md", "ops_artifact"),
+            ("authoring", "docs/agent-loop-onboarding.md", "authoring_artifact"),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            for idx, (task_kind, artifact, reason) in enumerate(cases, start=1):
+                run_dir = root / f"pass-{idx}"
+                _make_run(
+                    run_dir,
+                    task_kind=task_kind,
+                    pam_variant="pam_off",
+                    modified_path=artifact,
+                    final_outcome="done",
+                )
+                first = self._analyze(run_dir)
+                self.assertTrue(
+                    first["postcheck_success"],
+                    f"{task_kind} artifact {artifact} should pass deterministically",
+                )
+                self.assertEqual(first["postcheck_reason"], reason)
+                # Determinism: a second analysis yields the identical verdict.
+                second = self._analyze(run_dir)
+                self.assertEqual(
+                    first["postcheck_success"], second["postcheck_success"]
+                )
+                self.assertEqual(first["postcheck_reason"], second["postcheck_reason"])
+
+            # Negative: a non-docs artifact fails the authoring checker (proving
+            # the checker discriminates rather than always passing).
+            neg_dir = root / "authoring-neg"
+            _make_run(
+                neg_dir,
+                task_kind="authoring",
+                pam_variant="pam_off",
+                modified_path="src/lib.rs",
+                final_outcome="done",
+            )
+            neg = self._analyze(neg_dir)
+            self.assertFalse(neg["postcheck_success"])
+            self.assertEqual(neg["postcheck_reason"], "missing_authoring_artifact")
+
     def test_analyze_emits_worker_lifecycle_metrics_from_eval_log(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run_dir = pathlib.Path(raw) / "run-1"

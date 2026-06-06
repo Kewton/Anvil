@@ -5655,6 +5655,57 @@ mod tests {
         }
     }
 
+    // ---- Issue #1008: non-coding evaluation set divergence guard -----------
+    //
+    // The expanded non-coding evaluation set (`benchmarks/non-coding-lifecycle
+    // .yaml`) runs on the same lifecycle as coding. Each case must classify to
+    // its declared `category`, otherwise R5 (misroute fail-closed) would red a
+    // correct non-coding run. This pins prompt -> kind for every non-coding kind
+    // (docs / data / research / ops / authoring) against the real fixture file
+    // via `include_str!` (zero drift), and asserts every category is one of the
+    // five non-coding kinds (the suite is non-coding by construction).
+    #[test]
+    fn issue1008_non_coding_lifecycle_categories_match_agent_classifier() {
+        const YAML: &str = include_str!("../../../benchmarks/non-coding-lifecycle.yaml");
+        let cases = parse_benchmark_cases(YAML);
+        assert_eq!(
+            cases.len(),
+            5,
+            "expected the 5 non-coding-lifecycle cases (one per non-coding kind), \
+             parsed {}: {:?}",
+            cases.len(),
+            cases.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+        );
+        let mut seen_kinds = std::collections::BTreeSet::new();
+        for (name, category, prompt) in &cases {
+            assert!(
+                ["docs", "data", "research", "ops", "authoring"].contains(&category.as_str()),
+                "case `{name}` has category `{category}` — the non-coding evaluation \
+                 set must only contain non-coding kinds (no coding case)"
+            );
+            seen_kinds.insert(category.clone());
+            let classified = TaskContract::from_request(prompt).task_kind;
+            assert_eq!(
+                classified.as_str(),
+                category.as_str(),
+                "case `{name}`: agent classified `{}` but eval category is `{}` — \
+                 a misroute would make R5 fail a correct non-coding run. Adjust the \
+                 prompt wording or the category so they agree (no new YAML key).",
+                classified.as_str(),
+                category
+            );
+        }
+        // Every non-coding kind is exercised exactly once: the set is complete.
+        assert_eq!(
+            seen_kinds,
+            ["authoring", "data", "docs", "ops", "research"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the non-coding evaluation set must cover every non-coding TaskKind once"
+        );
+    }
+
     // ---- Issue #917 Phase 1: classification confidence / needs_confirm -----
 
     #[test]

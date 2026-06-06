@@ -384,6 +384,38 @@ mod tests {
     }
 
     #[test]
+    fn authoring_runner_emits_deterministic_content_evidence() {
+        // Issue #1008: authoring evidence is judged by the same deterministic
+        // content checker as docs (required-sections), with no LLM judge. A
+        // beginner-facing explainer with the requested sections passes.
+        let authoring =
+            evidence_runner_for_task_kind(TaskKind::Authoring).expect("authoring runner");
+        let output = authoring
+            .artifact_evidence(VerifierArtifact {
+                path: Some("docs/agent-loop-onboarding.md"),
+                excerpt: "## Setup\nFirst install the agent and open the config.\n## Example\nWalk through a beginner example of the loop.\n",
+                required_columns: &[],
+                required_sections: &[],
+            })
+            .expect("authoring evidence");
+        assert_eq!(
+            output,
+            EvidenceRunnerOutput::Completion(CompletionEvidence::RequiredSectionsPass {
+                path: Some("docs/agent-loop-onboarding.md".to_string()),
+            })
+        );
+
+        // Authoring is content-driven, not command/observation driven: the
+        // command and source-fetch surfaces stay inert (no coding-shaped
+        // verifier evidence is projected onto the prose terminal state).
+        assert_eq!(authoring.observe_command("printf ok", 0, true, None), None);
+        assert_eq!(
+            authoring.observe_source_fetch("https://example.test", true, None),
+            None
+        );
+    }
+
+    #[test]
     fn runner_failures_project_to_generic_terminal_states() {
         assert_eq!(
             EvidenceRunnerError::MissingRunner.generic_terminal_state(),
