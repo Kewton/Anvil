@@ -4153,7 +4153,7 @@ pub(super) fn run_actor_loop(
     // below this line).
     agent.session.iter_count_this_turn = last_iter.min(agent.config.max_iterations);
     agent.session.tool_calls_this_turn = tool_calls_made_this_turn;
-    let stats = build_stats(
+    let mut stats = build_stats(
         accumulated,
         final_verif.clone(),
         last_iter.min(agent.config.max_iterations),
@@ -4285,6 +4285,10 @@ pub(super) fn run_actor_loop(
             &cfg,
         );
         agent.last_auto_promote_outcome = Some(outcome);
+    }
+
+    if !exit_reason.is_success() && artifact_completion_exhausted_by_evidence_failure(agent) {
+        stats.terminal_outcome_label = Some("evidence_repair_exhausted");
     }
 
     // Issue #471: write structured eval log record (turn-level snapshot).
@@ -4538,6 +4542,7 @@ pub(super) fn build_stats(
         iter_used,
         iter_max,
         duration_secs,
+        terminal_outcome_label: None,
         changed_files: changed_files.into_boxed_slice(),
         all_changed_files: all_changed_files.into_boxed_slice(),
         total_changed,

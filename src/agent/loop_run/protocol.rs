@@ -685,6 +685,7 @@ mod tests {
             iter_used: 1,
             iter_max: 50,
             duration_secs: 0,
+            terminal_outcome_label: None,
             changed_files: files
                 .iter()
                 .map(|file| file.to_string())

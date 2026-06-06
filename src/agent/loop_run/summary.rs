@@ -431,6 +431,9 @@ pub(super) struct LoopStats {
     pub iter_used: usize,
     pub iter_max: usize,
     pub duration_secs: u64,
+    /// Optional generic lifecycle label for display surfaces. `ExitReason`
+    /// remains the legacy compatibility label.
+    pub terminal_outcome_label: Option<&'static str>,
     /// Display-capped changed files for summaries.
     pub changed_files: Box<[String]>,
     /// Complete changed file list for protocol-level evidence.
@@ -464,7 +467,9 @@ fn sanitize_filename(name: &str) -> String {
 
 pub(super) fn format_run_summary(reason: ExitReason, stats: &LoopStats) -> String {
     let mark = if reason.is_success() { "✔" } else { "✘" };
-    let label = reason.label();
+    let label = stats
+        .terminal_outcome_label
+        .unwrap_or_else(|| reason.label());
     let iter = format!("iter {}/{}", stats.iter_used, stats.iter_max);
     let duration = format!("duration {}s", stats.duration_secs);
 
@@ -505,6 +510,7 @@ mod tests {
             iter_used,
             iter_max,
             duration_secs,
+            terminal_outcome_label: None,
             changed_files: files
                 .iter()
                 .map(|file| (*file).to_string())
@@ -544,6 +550,15 @@ mod tests {
         let out = format_run_summary(ExitReason::MaxIterations, &s);
         assert!(out.starts_with("✘ max_iterations"), "got: {out}");
         assert!(out.contains("iter 40/40"), "got: {out}");
+    }
+
+    #[test]
+    fn generic_terminal_label_overrides_legacy_summary_label() {
+        let mut s = stats(5, 5, 12, vec!["output.csv"], 1);
+        s.terminal_outcome_label = Some("evidence_repair_exhausted");
+        let out = format_run_summary(ExitReason::MissingRepoEdits, &s);
+        assert!(out.starts_with("✘ evidence_repair_exhausted"), "got: {out}");
+        assert!(!out.starts_with("✘ missing_repo_edits"), "got: {out}");
     }
 
     #[test]

@@ -328,7 +328,11 @@ pub struct AutoPromoteOutcomeSummary {
 /// Issue #848: structured terminal-outcome classification for eval logs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalDiagnosticsSummary {
+    /// Legacy terminal label, kept compatible with `EvalRecord.final_outcome`.
     pub outcome: String,
+    /// Generic lifecycle terminal label used by new reporting surfaces.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generic_outcome: String,
     pub classification: String,
     pub satisfied_obligations: Vec<String>,
     pub missing_obligations: Vec<String>,
@@ -409,6 +413,7 @@ impl EvalRecord {
         let Some(diagnostics) = self.terminal_diagnostics.as_mut() else {
             return;
         };
+        diagnostics.generic_outcome = "evidence_repair_exhausted".to_string();
         diagnostics.classification = "evidence_repair_exhausted".to_string();
         if non_coding_artifact_tool_observed(self.classified_task_kind.as_deref(), &self.tool_calls)
         {
@@ -878,12 +883,31 @@ pub fn build_terminal_diagnostics_with_context(
 
     TerminalDiagnosticsSummary {
         outcome: final_outcome.to_string(),
+        generic_outcome: generic_terminal_outcome_for_legacy(final_outcome).to_string(),
         classification: classification.to_string(),
         satisfied_obligations,
         missing_obligations,
         verifier_status: verifier_status.to_string(),
         last_failure_signature,
         obligations,
+    }
+}
+
+fn generic_terminal_outcome_for_legacy(final_outcome: &str) -> &'static str {
+    match final_outcome {
+        "done" => "completed",
+        "missing_repo_edits" => "missing_deliverable",
+        "missing_verification" => "missing_evidence",
+        "verifier_failed" => "evidence_failed",
+        "safe_stop_verifier_weak" => "evidence_binding_failed",
+        "safe_stop_verifier_missing" => "evidence_runner_missing",
+        "repair_exhausted" => "evidence_repair_exhausted",
+        "repair_safe_stop" => "evidence_repair_safe_stop",
+        "max_iterations" | "plan_incomplete" => "control_loop_exhausted",
+        "tool_call_format_error" | "empty_responses" | "no_tool_calls" => "model_output_failure",
+        "transport_error" => "transport_failure",
+        "interrupted" => "interrupted",
+        _ => "control_loop_exhausted",
     }
 }
 
@@ -1662,6 +1686,12 @@ mod tests {
             Some("evidence_repair_exhausted")
         );
         assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|diag| diag.generic_outcome.as_str()),
+            Some("evidence_repair_exhausted")
+        );
+        assert_eq!(
             rec.evaluation_taxonomy.failure_authority,
             "artifact_evidence"
         );
@@ -1684,6 +1714,18 @@ mod tests {
             artifact_evidence.failure_domain.as_deref(),
             Some("evidence_repair_exhausted")
         );
+    }
+
+    #[test]
+    fn terminal_diagnostics_project_legacy_outcome_to_generic_lifecycle_outcome() {
+        let changed = ChangedFileClasses {
+            test: 0,
+            impl_files: 0,
+            setup: 0,
+        };
+        let diag = build_terminal_diagnostics("missing_repo_edits", &changed, 0);
+        assert_eq!(diag.outcome, "missing_repo_edits");
+        assert_eq!(diag.generic_outcome, "missing_deliverable");
     }
 
     #[test]
