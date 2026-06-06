@@ -382,6 +382,28 @@ impl EvalRecord {
             MAX_EVAL_COMPLETION_REASON_BYTES,
         );
     }
+
+    pub fn refresh_terminal_diagnostics(&mut self) {
+        if self.final_outcome != "done"
+            || !non_coding_artifact_tool_observed(
+                self.classified_task_kind.as_deref(),
+                &self.tool_calls,
+            )
+        {
+            return;
+        }
+        let Some(diagnostics) = self.terminal_diagnostics.as_mut() else {
+            return;
+        };
+        set_obligation(
+            &mut diagnostics.obligations,
+            "repo_edit",
+            "satisfied",
+            None,
+            "repository artifact edit was recorded through a non-coding tool call",
+        );
+        refresh_terminal_obligation_indexes(diagnostics);
+    }
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -1063,6 +1085,21 @@ fn set_obligation(
     }
 }
 
+fn refresh_terminal_obligation_indexes(diagnostics: &mut TerminalDiagnosticsSummary) {
+    diagnostics.satisfied_obligations = diagnostics
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.status == "satisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    diagnostics.missing_obligations = diagnostics
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.status == "unsatisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+}
+
 /// Replace absolute paths in a JSON string with `<path>` (opt-in via
 /// `ANVIL_EVAL_SCRUB_PATHS=1`). Applied after `mask_payload_inplace`
 /// (DR5 / design judgment #5).
@@ -1466,6 +1503,99 @@ mod tests {
         rec.refresh_completion_reason();
 
         assert_eq!(rec.completion_reason, "answer_or_plan_completion");
+    }
+
+    #[test]
+    fn terminal_diagnostics_mark_non_coding_artifact_write_as_repo_edit() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-data-004",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        let repo_edit_before = rec
+            .terminal_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.obligations.iter().find(|o| o.id == "repo_edit"))
+            .expect("repo_edit obligation before");
+        assert_eq!(repo_edit_before.status, "not_applicable");
+
+        rec.classified_task_kind = Some("data".to_string());
+        rec.refresh_terminal_diagnostics();
+
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        let repo_edit_after = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "repo_edit")
+            .expect("repo_edit obligation after");
+        assert_eq!(repo_edit_after.status, "satisfied");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"repo_edit".to_string())
+        );
+        assert!(!diag.missing_obligations.contains(&"repo_edit".to_string()));
+    }
+
+    #[test]
+    fn terminal_diagnostics_ignore_unknown_classified_artifact_write() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-unknown-002",
+            12345,
+            "Create summary.json",
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+
+        rec.classified_task_kind = Some("not-a-kind".to_string());
+        rec.refresh_terminal_diagnostics();
+
+        let repo_edit = rec
+            .terminal_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.obligations.iter().find(|o| o.id == "repo_edit"))
+            .expect("repo_edit obligation");
+        assert_eq!(repo_edit.status, "not_applicable");
     }
 
     #[test]

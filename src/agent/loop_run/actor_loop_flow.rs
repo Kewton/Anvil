@@ -4400,6 +4400,7 @@ pub(super) fn run_actor_loop(
             .map(|contract| contract.task_kind.as_str().to_string());
         record.refresh_evaluation_taxonomy();
         record.refresh_completion_reason();
+        record.refresh_terminal_diagnostics();
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }
