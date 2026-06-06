@@ -505,7 +505,7 @@ for model in "${cleaned_models[@]}"; do
       echo "Error: empty benchmark case name" >&2
       exit 1
     fi
-    if ! [[ "$task_kind" =~ ^(coding|docs|data|research|ops)$ ]]; then
+    if ! [[ "$task_kind" =~ ^(coding|docs|data|research|ops|authoring)$ ]]; then
       echo "Error: invalid task_kind/category for case $case_name: $task_kind" >&2
       exit 1
     fi
