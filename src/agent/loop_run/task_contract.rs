@@ -792,7 +792,22 @@ fn controller_artifact_obligation(value: &serde_json::Value) -> Option<ArtifactO
                 super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
             role_from_repo_edit(category)
         })?;
-    Some(ArtifactObligation::file(role, path))
+    let data_fields = controller_schema_labels(
+        value,
+        &["columns", "json_fields", "fields", "schema_fields"],
+    );
+    let required_sections =
+        controller_schema_labels(value, &["required_sections", "sections", "schema_sections"]);
+    let obligation = match role {
+        ArtifactRole::DataOutput if !data_fields.is_empty() => {
+            ArtifactObligation::structured_record(path, data_fields)
+        }
+        ArtifactRole::UsageDocs if !required_sections.is_empty() => {
+            ArtifactObligation::readme(path, required_sections)
+        }
+        _ => ArtifactObligation::file(role, path),
+    };
+    Some(obligation)
 }
 
 fn controller_artifact_role_from_label(raw: &str) -> Option<ArtifactRole> {
@@ -806,6 +821,67 @@ fn controller_artifact_role_from_label(raw: &str) -> Option<ArtifactRole> {
         "output_file" | "data_output" | "data" | "json" | "csv" => Some(ArtifactRole::DataOutput),
         _ => None,
     }
+}
+
+const MAX_CONTROLLER_SCHEMA_LABELS: usize = 32;
+
+fn controller_schema_labels(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        let labels = controller_schema_labels_from_value(value.get(*key));
+        if !labels.is_empty() {
+            return labels;
+        }
+    }
+    if let Some(schema) = value.get("schema") {
+        for key in keys {
+            let labels = controller_schema_labels_from_value(schema.get(*key));
+            if !labels.is_empty() {
+                return labels;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn controller_schema_labels_from_value(value: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let raw = match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        serde_json::Value::String(s) => s
+            .split(|ch| ch == ',' || ch == '|')
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let mut labels = Vec::new();
+    for label in raw.into_iter().filter_map(controller_schema_label) {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+        if labels.len() >= MAX_CONTROLLER_SCHEMA_LABELS {
+            break;
+        }
+    }
+    labels
+}
+
+fn controller_schema_label(raw: String) -> Option<String> {
+    let normalized = raw
+        .trim()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(mask_and_cap_label(&normalized))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2891,6 +2967,17 @@ fn deliverable_for_role(
     {
         return TaskDeliverable {
             kind: DeliverableKind::OpsRunbook,
+            role: Some(role),
+            path: Some(identity.path.clone()),
+            required_sections: identity.required_sections.clone(),
+        };
+    }
+    if let Some(identity) = required_artifact_identities
+        .iter()
+        .find(|identity| identity.role == role && !identity.required_sections.is_empty())
+    {
+        return TaskDeliverable {
+            kind: deliverable_kind_for_role(role),
             role: Some(role),
             path: Some(identity.path.clone()),
             required_sections: identity.required_sections.clone(),
@@ -7814,6 +7901,87 @@ mod tests {
         assert_eq!(
             contract.evidence_command_hint(),
             Some("cargo test --manifest-path Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn controller_state_packet_data_schema_creates_structured_obligation() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create summary.json with required fields.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data","schema":{"json_fields":["status","duration_seconds","warnings"]}}]}"#,
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert_eq!(contract.required_artifacts, vec![ArtifactRole::DataOutput]);
+        let obligation = required_obligation(&contract, ArtifactRole::DataOutput, "summary.json");
+        assert_eq!(obligation.kind, DeliverableKind::StructuredRecord);
+        assert_eq!(obligation.format, Some(DeliverableFormat::Json));
+        assert_eq!(
+            obligation
+                .structured_record_schema
+                .as_ref()
+                .map(|schema| schema.columns.as_slice()),
+            Some(
+                [
+                    "status".to_string(),
+                    "duration_seconds".to_string(),
+                    "warnings".to_string()
+                ]
+                .as_slice()
+            )
+        );
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "summary.json"));
+        let repair_state = VerifierRepairState::None;
+        let malformed = build_excerpts(&[(ArtifactRole::DataOutput, r#"{"x":1}"#)]);
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::DataOutput,
+                "summary.json",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &malformed,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: Some(RecoveryTargetHint { reason, .. }),
+            } if missing == vec![ArtifactRole::DataOutput] && reason.contains("schema_mismatch")
+        ));
+    }
+
+    #[test]
+    fn controller_state_packet_docs_schema_creates_required_sections_obligation() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create README.md documentation.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs","schema":{"required_sections":["Setup","Usage"]}}]}"#,
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        let obligation = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+        assert_eq!(
+            obligation.required_sections,
+            vec!["Setup".to_string(), "Usage".to_string()]
+        );
+        assert!(matches!(
+            obligation.schema.as_ref(),
+            Some(DeliverableSchema::RequiredSections(sections))
+                if sections == &vec!["Setup".to_string(), "Usage".to_string()]
+        ));
+        let deliverable = contract
+            .deliverables
+            .iter()
+            .find(|deliverable| deliverable.role == Some(ArtifactRole::UsageDocs))
+            .expect("docs deliverable");
+        assert_eq!(
+            deliverable.required_sections,
+            vec!["Setup".to_string(), "Usage".to_string()]
         );
     }
 

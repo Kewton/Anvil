@@ -43,9 +43,27 @@ pub(super) fn refresh_artifact_completion_satisfied(agent: &mut Agent) {
         Some(contract) => contract,
         None => return,
     };
+    let job_target = agent
+        .artifact_completion_job
+        .as_ref()
+        .map(|job| (job.role(), job.target_path().to_string()));
+    let artifacts =
+        super::artifact_state_projection::task_contract_artifact_states(agent, &task_contract);
     let projection = agent
         .artifact_ledger
         .required_artifacts_completed_projection(&task_contract);
+    if let Some((role, target_path)) = job_target
+        && projection.is_satisfied(role)
+        && super::task_contract::recovery_target_hint_for_blocking_obligation_diagnostic(
+            &task_contract,
+            &artifacts,
+            &agent.task_contract_excerpts,
+            role,
+        )
+        .is_some_and(|hint| hint.path == target_path)
+    {
+        return;
+    }
     if let Some(job) = agent.artifact_completion_job.as_mut() {
         job.record_satisfied_from_ledger(&projection);
     }

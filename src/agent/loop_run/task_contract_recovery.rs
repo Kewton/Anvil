@@ -441,5 +441,11 @@ mod tests {
             }
             other => panic!("expected schema repair Continue, got {other:?}"),
         }
+        assert!(
+            agent.artifact_completion_job.as_ref().is_some_and(|job| {
+                !matches!(job.status(), ArtifactCompletionStatus::Satisfied)
+            }),
+            "schema-mismatched artifact must not be reported as a satisfied completion job"
+        );
     }
 }
