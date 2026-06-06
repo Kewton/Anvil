@@ -825,7 +825,7 @@ fn verifier_diagnostic_for_obligation_parts(
             ));
         };
         if let Some(diagnostic) =
-            data_artifact_diagnostic(task_kind, &obligation.path, excerpt, &schema.columns)
+            data_schema_obligation_diagnostic(task_kind, &obligation.path, excerpt, &schema.columns)
         {
             return Some(diagnostic);
         }
@@ -971,6 +971,72 @@ fn data_artifact_diagnostic(
         ));
     }
     None
+}
+
+fn data_schema_obligation_diagnostic(
+    task_kind: TaskKind,
+    path: &str,
+    excerpt: &str,
+    required_columns: &[String],
+) -> Option<VerifierDiagnostic> {
+    if required_columns.is_empty() {
+        return data_artifact_diagnostic(task_kind, path, excerpt, required_columns);
+    }
+    if let Some(message) = json_object_exact_columns_diagnostic(path, excerpt, required_columns) {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            message,
+        ));
+    }
+    if let Some(message) = structured_data_parse_error(path, excerpt) {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            message,
+        ));
+    }
+    if excerpt.trim().is_empty() {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            "structured data evidence is empty",
+        ));
+    }
+    let observed = observed_data_columns(Some(path), excerpt, required_columns);
+    let missing = required_columns
+        .iter()
+        .filter(|column| !observed.iter().any(|seen| seen == *column))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(VerifierDiagnostic::new(
+        task_kind,
+        VerifierDiagnosticCode::SchemaMismatch,
+        ArtifactRole::DataOutput,
+        Some(path),
+        format!(
+            "structured data is missing required columns: {}; observed columns: {}; add all required columns",
+            display_schema_columns(&missing),
+            display_schema_columns(&observed)
+        ),
+    ))
+}
+
+pub(super) fn structured_data_schema_obligation_pass(
+    path: &str,
+    excerpt: &str,
+    required_columns: &[String],
+) -> bool {
+    data_schema_obligation_diagnostic(TaskKind::Data, path, excerpt, required_columns).is_none()
 }
 
 fn json_object_exact_columns_diagnostic(
@@ -2338,6 +2404,27 @@ mod tests {
             None,
             "accept-tier artifact must yield no blocking diagnostic"
         );
+    }
+
+    #[test]
+    fn data_schema_obligation_rejects_parse_ready_missing_columns() {
+        let required = vec!["Category".to_string(), "Total".to_string()];
+        let diagnostic = data_schema_obligation_diagnostic(
+            TaskKind::Data,
+            "output.csv",
+            "Category,Description\nA,long enough row to pass the loose accept tier\n",
+            &required,
+        )
+        .expect("schema obligation must reject missing declared columns");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
+        assert!(
+            diagnostic
+                .message
+                .contains("missing required columns: Total")
+        );
+        assert!(diagnostic.message.contains("Category"));
+        assert!(diagnostic.message.contains("Description"));
     }
 
     #[test]

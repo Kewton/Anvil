@@ -1584,8 +1584,7 @@ fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, exce
             .as_ref()
             .map(|schema| schema.columns.as_slice())
             .unwrap_or(&[]);
-        super::verifier::assess_structured_data(Some(&identity.path), excerpt, columns)
-            .is_accepted()
+        super::verifier::structured_data_schema_obligation_pass(&identity.path, excerpt, columns)
     })
 }
 
@@ -8602,7 +8601,7 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::DataOutput,
                     path: "output.csv".to_string(),
-                    reason: "structured verifier diagnostic: kind=schema_mismatch, task_kind=data, summary=structured data evidence is missing required columns or parse-ready records".to_string(),
+                    reason: "structured verifier diagnostic: kind=schema_mismatch, task_kind=data, summary=structured data is missing required columns: Category, Total; observed columns: x, y; add all required columns".to_string(),
                 }),
             }
         );
@@ -8937,26 +8936,36 @@ mod tests {
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
         let repair_state = VerifierRepairState::None;
+        let artifacts = [ArtifactState::exists(
+            ArtifactRole::DataOutput,
+            "output.csv",
+        )];
 
-        // Issue #921 (P4): a parse-ready CSV missing a declared column ("Total")
-        // used to dead-end as Continue under the conjunctive AND. The OR-tolerant
-        // SSOT now accept-tiers it (parse-ready, non-empty, above the char floor)
-        // so the Data task completes instead of looping. Truly broken/empty
-        // artifacts are still rejected (see `data_*_is_not_ready_*` /
-        // `data_*_unparseable_*` tests).
+        // Explicit Data schema columns are contract obligations. A parse-ready
+        // CSV missing a declared column must request targeted schema repair
+        // instead of completing just because the file is syntactically readable.
         let parse_ready_missing_column =
             build_excerpts(&[(ArtifactRole::DataOutput, "Category,Amount\nA,1\n")]);
-        assert_eq!(
-            plan_artifact_recovery(ArtifactRecoveryInputs {
-                contract: &contract,
-                evidence: &evidence,
-                artifacts: &[],
-                repair_state: &repair_state,
-                artifact_excerpts: &parse_ready_missing_column,
-                missing_verifier_suppress_retry: false,
-                owned_test_artifacts: &[],
-            }),
-            ArtifactRecoveryAction::Done
+        let missing_action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &parse_ready_missing_column,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert!(
+            matches!(
+                missing_action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(ref target),
+                } if missing == &vec![ArtifactRole::DataOutput]
+                    && target.reason.contains("missing required columns: Total")
+                    && target.reason.contains("observed columns: Amount, Category")
+            ),
+            "declared missing-column CSV must request schema repair, got {missing_action:?}"
         );
 
         let matching_columns =
@@ -8965,7 +8974,7 @@ mod tests {
             plan_artifact_recovery(ArtifactRecoveryInputs {
                 contract: &contract,
                 evidence: &evidence,
-                artifacts: &[],
+                artifacts: &artifacts,
                 repair_state: &repair_state,
                 artifact_excerpts: &matching_columns,
                 missing_verifier_suppress_retry: false,
@@ -9178,11 +9187,9 @@ mod tests {
 
     #[test]
     fn data_schema_mismatch_is_not_ready_just_because_path_exists() {
-        // Issue #921 (P4 / DD3): a missing-column excerpt that is ALSO below the
-        // char floor stays `Insufficient` and must keep dead-ending as Continue
-        // with a blocking schema_mismatch diagnostic. (Parse-ready missing-column
-        // excerpts now accept-tier complete — see
-        // `data_task_tracks_output_file_columns_as_structured_record_obligation`.)
+        // A schema obligation must require the declared columns even when the
+        // generic DataVerifier accept-tier would otherwise allow a weak
+        // parse-ready artifact.
         let contract = TaskContract::from_request(
             "Generate output.csv with columns Category and Total from the input CSV.",
         );
@@ -9212,18 +9219,17 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint {
                     role: ArtifactRole::DataOutput,
                     path: "output.csv".to_string(),
-                    reason: "structured verifier diagnostic: kind=schema_mismatch, task_kind=data, summary=structured data evidence is missing required columns or parse-ready records".to_string(),
+                    reason: "structured verifier diagnostic: kind=schema_mismatch, task_kind=data, summary=structured data is missing required columns: Category, Total; observed columns: x, y; add all required columns".to_string(),
                 }),
             }
         );
     }
 
     #[test]
-    fn data_parse_ready_missing_column_completes_via_accept_tier() {
-        // Issue #921 (P4 / DD1 / DD2): the production end-to-end pin that the
-        // S7-001 two-gate flow (required_role_satisfied → diagnostic None, then
-        // structured_record_excerpt_satisfies_obligations → accept) both pass for
-        // a parse-ready CSV missing a declared column, reaching completion.
+    fn data_parse_ready_missing_column_blocks_schema_obligation() {
+        // The generic DataVerifier accept-tier still exists, but a
+        // TaskContract schema obligation is stricter: declared columns must be
+        // observed for completion.
         let contract = TaskContract::from_request(
             "Generate output.csv with columns Category and Total from the input CSV.",
         );
@@ -9245,7 +9251,16 @@ mod tests {
             owned_test_artifacts: &[],
         });
 
-        assert_eq!(action, ArtifactRecoveryAction::Done);
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: Some(RecoveryTargetHint { reason, .. }),
+            } if missing == vec![ArtifactRole::DataOutput]
+                && reason.contains("missing required columns: Total")
+                && reason.contains("Category")
+                && reason.contains("Amount")
+        ));
     }
 
     #[test]

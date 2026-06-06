@@ -82,21 +82,33 @@ fn csv_with_no_declared_columns_completes() {
 }
 
 // ---------------------------------------------------------------------------
-// Case 2 — declared-but-missing column but parse-ready → completes (no dead-end).
+// Case 2 — declared-but-missing column but parse-ready → schema repair.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn declared_missing_column_but_parse_ready_completes() {
+fn declared_missing_column_but_parse_ready_requests_schema_repair() {
     let contract = TaskContract::from_request(
         "Generate output.csv with columns Category and Total from the input CSV.",
     );
     assert_eq!(contract.task_kind, TaskKind::Data);
 
-    // "Total" is declared but absent from the header; the artifact is parse-ready
-    // and above the char floor → AcceptTier → completion (the old conjunctive AND
-    // dead-end is resolved).
+    // "Total" is declared but absent from the header. A parse-ready artifact is
+    // not enough when the user requested explicit schema columns; the recovery
+    // target must carry a concrete schema diagnostic instead of accepting the
+    // partial output.
     let action = plan_data_output(&contract, "output.csv", "Category,Amount\nA,1\n");
-    assert_eq!(action, ArtifactRecoveryAction::Done);
+    assert!(
+        matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                ref missing,
+                target_hint: Some(ref target),
+            } if missing == &vec![ArtifactRole::DataOutput]
+                && target.reason.contains("missing required columns: Total")
+                && target.reason.contains("observed columns: Amount, Category")
+        ),
+        "declared missing-column CSV must request schema repair, got {action:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
