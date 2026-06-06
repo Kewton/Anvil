@@ -387,6 +387,9 @@ pub(super) struct ActorLoopPostToolCleanupArgs<'a> {
 
 pub(super) enum ActorLoopPostToolCleanupOutcome {
     Continue,
+    Done {
+        final_prose: String,
+    },
     Exit {
         reason: ExitReason,
         error_text: String,
@@ -1456,7 +1459,7 @@ pub(super) fn handle_actor_loop_post_tool_cleanup(
     agent: &mut Agent,
     args: ActorLoopPostToolCleanupArgs<'_>,
 ) -> ActorLoopPostToolCleanupOutcome {
-    sync_post_tool_contract_recovery_target(agent, &args);
+    let post_tool_contract_action = sync_post_tool_contract_recovery_target(agent, &args);
     super::reminder_pipeline::maybe_invoke_reminder(agent, args.interrupt_flag);
     run_post_tool_cleanup_compaction(
         agent,
@@ -1466,18 +1469,26 @@ pub(super) fn handle_actor_loop_post_tool_cleanup(
     if let Some(outcome) = post_tool_cleanup_interrupt_outcome(args.interrupt_flag) {
         return outcome;
     }
+    if matches!(
+        post_tool_contract_action,
+        Some(super::task_contract::ArtifactRecoveryAction::Done)
+    ) {
+        return ActorLoopPostToolCleanupOutcome::Done {
+            final_prose: "Completed requested repository changes.".to_string(),
+        };
+    }
     ActorLoopPostToolCleanupOutcome::Continue
 }
 
 fn sync_post_tool_contract_recovery_target(
     agent: &mut Agent,
     args: &ActorLoopPostToolCleanupArgs<'_>,
-) {
+) -> Option<super::task_contract::ArtifactRecoveryAction> {
     if agent.session.mode_state.mode == super::ExecutionMode::Plan {
-        return;
+        return None;
     }
     let Some(contract) = args.task_contract else {
-        return;
+        return None;
     };
     let action = super::task_contract_recovery::task_contract_recovery_action(
         agent,
@@ -1494,13 +1505,13 @@ fn sync_post_tool_contract_recovery_target(
                 args.contract_completion_retries.saturating_add(1),
             );
         }
-        super::task_contract::ArtifactRecoveryAction::RunVerifier
-        | super::task_contract::ArtifactRecoveryAction::Done => {
+        super::task_contract::ArtifactRecoveryAction::RunVerifier => {
             super::artifact_recovery_flow::clear_artifact_recovery_target(
                 agent,
                 "contract_artifacts_satisfied",
             );
         }
+        super::task_contract::ArtifactRecoveryAction::Done => {}
         super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
             super::artifact_recovery_flow::clear_artifact_recovery_target(
                 agent,
@@ -1508,6 +1519,7 @@ fn sync_post_tool_contract_recovery_target(
             );
         }
     }
+    Some(action)
 }
 
 fn run_post_tool_cleanup_compaction(
@@ -2234,6 +2246,9 @@ pub(super) fn handle_actor_loop_pre_reply_control_action(
         LoopControlAction::RunVerifier => Some(actor_loop_pre_reply_flow_outcome(
             super::verifier_orchestration::drive_task_contract_verifier(agent, flow_args),
         )),
+        LoopControlAction::Done => Some(ActorLoopPreReplyOutcome::Done {
+            final_prose: "Completed requested repository changes.".to_string(),
+        }),
         LoopControlAction::RequestModelTurn => None,
     }
 }
@@ -3895,6 +3910,13 @@ pub(super) fn run_actor_loop(
                 },
             ) {
                 ActorLoopPostToolCleanupOutcome::Continue => continue,
+                ActorLoopPostToolCleanupOutcome::Done {
+                    final_prose: next_final_prose,
+                } => {
+                    final_prose = next_final_prose;
+                    exit_reason = ExitReason::Done;
+                    break 'outer;
+                }
                 ActorLoopPostToolCleanupOutcome::Exit {
                     reason,
                     error_text: cleanup_error,
@@ -5303,6 +5325,93 @@ mod tests {
         assert_eq!(
             text,
             ExitReason::SafeStopVerifierMissing.default_error_text()
+        );
+    }
+
+    #[test]
+    fn post_tool_cleanup_exits_done_when_docs_artifact_is_satisfied() {
+        use super::super::artifact_completion_job::{
+            ArtifactCompletionJob, ArtifactCompletionStatus,
+        };
+        use super::super::artifact_ledger::LedgerAdmissionContext;
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{
+            ArtifactRole, RecoveryTargetHint, TaskContract, TaskKind,
+        };
+        use crate::config::Config;
+        use crate::session::store::ConversationMessage;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = concat!(
+            "STATE_CONTROL_PACKET\n",
+            r#"{"objective":"Create README.md documentation with Setup and Usage sections.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs"}]}"#
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::UsageDocs,
+                    path: "README.md".to_string(),
+                    reason: "missing docs artifact".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("docs artifact completion job"),
+        );
+        std::fs::write(
+            agent.work_root.join("README.md"),
+            "# Local Notes CLI\n\n## Setup\n\nInstall.\n\n## Usage\n\nRun notes.\n",
+        )
+        .unwrap();
+        assert!(
+            agent
+                .artifact_ledger
+                .record_repo_edit_event(
+                    &LedgerAdmissionContext::new(&agent.work_root, &scope),
+                    "README.md".to_string(),
+                    ArtifactRole::UsageDocs,
+                    true,
+                )
+                .is_some()
+        );
+
+        let interrupt = InterruptFlag::new_preset(false);
+        let outcome = handle_actor_loop_post_tool_cleanup(
+            &mut agent,
+            ActorLoopPostToolCleanupArgs {
+                task_contract: Some(&contract),
+                contract_verifier_repair_edit_count: None,
+                repo_edit_calls_made_this_turn: 1,
+                contract_completion_retries: 0,
+                tool_calls_made_this_turn: 1,
+                interrupt_flag: &interrupt,
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            ActorLoopPostToolCleanupOutcome::Done { .. }
+        ));
+        assert!(
+            agent
+                .artifact_completion_job
+                .as_ref()
+                .is_some_and(|job| { matches!(job.status(), ArtifactCompletionStatus::Satisfied) })
         );
     }
 }

@@ -171,8 +171,19 @@ pub(super) fn select_task_contract_verifier(
     owned_test_artifacts: &[String],
     test_execution_required: bool,
     workspace_scope: Option<&TaskWorkspaceScope>,
+    evidence_command_hint: Option<&str>,
     project_unit: Option<&ProjectUnit>,
 ) -> TaskContractVerifierSelection {
+    if let Some(plan) =
+        evidence_command_hint.and_then(AutoTestRunner::plan_from_evidence_command_hint)
+    {
+        let command_for_log = crate::session::feedback::mask_secrets(&plan.command);
+        return TaskContractVerifierSelection::LegacyRunnable {
+            plan,
+            command_for_log,
+        };
+    }
+
     if test_execution_required && workspace_scope.is_some() {
         let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
             work_root,
@@ -575,7 +586,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let scope = TaskWorkspaceScope::detect(dir.path(), "run tests");
         assert_eq!(
-            select_task_contract_verifier(dir.path(), &[], &[], &[], true, Some(&scope), None),
+            select_task_contract_verifier(
+                dir.path(),
+                &[],
+                &[],
+                &[],
+                true,
+                Some(&scope),
+                None,
+                None
+            ),
             TaskContractVerifierSelection::StructuredMissing {
                 outcome: TaskContractVerifierOutcome::SafeStop {
                     reason: SafeStopReason::VerifierMissing
@@ -586,10 +606,37 @@ mod tests {
     }
 
     #[test]
+    fn verifier_selection_uses_evidence_command_hint_without_owned_tests() {
+        let dir = tempdir().unwrap();
+        let scope = TaskWorkspaceScope::detect(dir.path(), "run tests");
+        let selection = select_task_contract_verifier(
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            true,
+            Some(&scope),
+            Some("cargo test --manifest-path Cargo.toml"),
+            None,
+        );
+
+        let TaskContractVerifierSelection::LegacyRunnable {
+            plan,
+            command_for_log,
+        } = selection
+        else {
+            panic!("expected evidence command hint to create a legacy verifier plan");
+        };
+        assert_eq!(plan.command, "cargo test --manifest-path Cargo.toml");
+        assert_eq!(plan.reason, "controller evidence command");
+        assert_eq!(command_for_log, "cargo test --manifest-path Cargo.toml");
+    }
+
+    #[test]
     fn verifier_selection_without_candidates_is_missing() {
         let dir = tempdir().unwrap();
         assert_eq!(
-            select_task_contract_verifier(dir.path(), &[], &[], &[], false, None, None),
+            select_task_contract_verifier(dir.path(), &[], &[], &[], false, None, None, None),
             TaskContractVerifierSelection::Missing
         );
     }

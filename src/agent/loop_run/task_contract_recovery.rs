@@ -50,6 +50,20 @@ pub(super) fn task_contract_recovery_action(
     repair_edit_count: Option<usize>,
     repo_edit_calls_made_this_turn: usize,
 ) -> super::task_contract::ArtifactRecoveryAction {
+    super::agent_misc::refresh_artifact_completion_satisfied(agent);
+    if agent.artifact_completion_job.as_ref().is_some_and(|job| {
+        matches!(
+            job.status(),
+            super::artifact_completion_job::ArtifactCompletionStatus::Satisfied
+        )
+    }) {
+        return if contract.verification_required {
+            super::task_contract::ArtifactRecoveryAction::RunVerifier
+        } else {
+            super::task_contract::ArtifactRecoveryAction::Done
+        };
+    }
+
     let verifier_repair_ready_to_verify = agent.task_contract_verifier_repair_pending
         && (repair_edit_count
             .is_some_and(|edit_count| repo_edit_calls_made_this_turn > edit_count)
@@ -215,4 +229,89 @@ pub(super) fn task_contract_recovery_target(
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::loop_run::artifact_completion_job::{
+        ArtifactCompletionJob, ArtifactCompletionStatus,
+    };
+    use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
+    use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::task_contract::{
+        ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract, TaskKind,
+    };
+    use crate::config::Config;
+    use crate::session::store::ConversationMessage;
+
+    #[test]
+    fn docs_artifact_satisfied_without_verification_returns_done() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = concat!(
+            "STATE_CONTROL_PACKET\n",
+            r#"{"objective":"Create README.md documentation with Setup and Usage sections.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs"}]}"#
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(
+            !contract.verification_required,
+            "plain docs artifact completion should not require a coding verifier"
+        );
+
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::UsageDocs,
+                    path: "README.md".to_string(),
+                    reason: "missing docs artifact".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("docs artifact completion job"),
+        );
+        std::fs::write(
+            agent.work_root.join("README.md"),
+            "# Local Notes CLI\n\n## Setup\n\nInstall the binary.\n\n## Usage\n\nRun notes from the shell.\n",
+        )
+        .unwrap();
+        let recorded = agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "README.md".to_string(),
+            ArtifactRole::UsageDocs,
+            true,
+        );
+        assert!(
+            recorded.is_some(),
+            "README.md repo edit must be admitted as UsageDocs evidence"
+        );
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
+        assert_eq!(action, ArtifactRecoveryAction::Done);
+        assert!(
+            agent
+                .artifact_completion_job
+                .as_ref()
+                .is_some_and(|job| { matches!(job.status(), ArtifactCompletionStatus::Satisfied) })
+        );
+    }
 }

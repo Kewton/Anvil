@@ -59,6 +59,7 @@ pub(super) enum LoopControlAction {
         next_action: VerifierBootstrapNextAction,
     },
     RunVerifier,
+    Done,
     RequestModelTurn,
 }
 
@@ -90,6 +91,13 @@ pub(super) fn determine_loop_control_action(inputs: LoopControlInputs) -> LoopCo
         Some(ArtifactRecoveryAction::RunVerifier)
     ) {
         return LoopControlAction::RunVerifier;
+    }
+
+    if matches!(
+        inputs.task_contract_action,
+        Some(ArtifactRecoveryAction::Done)
+    ) {
+        return LoopControlAction::Done;
     }
 
     LoopControlAction::RequestModelTurn
@@ -168,20 +176,20 @@ impl RecoveryOwner {
         match action {
             LoopControlAction::ContinueRepairJob { .. } => Self::RepairJob,
             LoopControlAction::ContinueMissingVerifierJob { .. } => Self::MissingVerifierJob,
-            LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => {
-                match task_contract_action {
-                    Some(
-                        ArtifactRecoveryAction::Continue { .. }
-                        | ArtifactRecoveryAction::RepairArtifact { .. },
-                    ) => Self::ArtifactCompletion,
-                    Some(
-                        ArtifactRecoveryAction::RunVerifier
-                        | ArtifactRecoveryAction::Done
-                        | ArtifactRecoveryAction::SafeStop { .. },
-                    )
-                    | None => Self::None,
-                }
-            }
+            LoopControlAction::RunVerifier
+            | LoopControlAction::Done
+            | LoopControlAction::RequestModelTurn => match task_contract_action {
+                Some(
+                    ArtifactRecoveryAction::Continue { .. }
+                    | ArtifactRecoveryAction::RepairArtifact { .. },
+                ) => Self::ArtifactCompletion,
+                Some(
+                    ArtifactRecoveryAction::RunVerifier
+                    | ArtifactRecoveryAction::Done
+                    | ArtifactRecoveryAction::SafeStop { .. },
+                )
+                | None => Self::None,
+            },
         }
     }
 
@@ -1766,6 +1774,14 @@ mod tests {
                 },
                 RecoveryOwner::ArtifactCompletion,
             ),
+            (
+                "artifact done",
+                LoopControlInputs {
+                    task_contract_action: Some(ArtifactRecoveryAction::Done),
+                    ..loop_inputs()
+                },
+                RecoveryOwner::None,
+            ),
         ];
 
         for (label, input, expected_owner) in cases {
@@ -1793,6 +1809,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn loop_control_done_action_completes_without_model_turn() {
+        let action = determine_loop_control_action(LoopControlInputs {
+            task_contract_action: Some(ArtifactRecoveryAction::Done),
+            ..loop_inputs()
+        });
+
+        assert_eq!(action, LoopControlAction::Done);
+        assert_eq!(
+            RecoveryOwner::from_control_action(&action, Some(&ArtifactRecoveryAction::Done)),
+            RecoveryOwner::None
+        );
     }
 
     #[test]

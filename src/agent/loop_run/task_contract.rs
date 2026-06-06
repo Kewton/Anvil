@@ -706,6 +706,108 @@ impl ProjectIntent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControllerStatePacket {
+    required_artifacts: Vec<ArtifactObligation>,
+    evidence_command: Option<String>,
+}
+
+impl ControllerStatePacket {
+    fn parse(raw: &str) -> Option<Self> {
+        if !is_controller_state_packet(raw) {
+            return None;
+        }
+        let json_start = raw.find('{')?;
+        let value: serde_json::Value = serde_json::from_str(&raw[json_start..]).ok()?;
+        let required_artifacts = value
+            .get("required_artifacts")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(controller_artifact_obligation)
+            .collect::<Vec<_>>();
+        let evidence_command = value
+            .get("evidence_command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string);
+        Some(Self {
+            required_artifacts,
+            evidence_command,
+        })
+    }
+
+    fn inferred_task_kind(&self) -> Option<TaskKind> {
+        if self.required_artifacts.is_empty() {
+            return None;
+        }
+        if self
+            .required_artifacts
+            .iter()
+            .any(|artifact| artifact.role == ArtifactRole::DataOutput)
+        {
+            Some(TaskKind::Data)
+        } else if self
+            .required_artifacts
+            .iter()
+            .all(|artifact| artifact.role == ArtifactRole::UsageDocs)
+        {
+            Some(TaskKind::Docs)
+        } else {
+            Some(TaskKind::Coding)
+        }
+    }
+
+    fn extend_contract_parts(
+        &self,
+        required: &mut Vec<ArtifactRole>,
+        required_artifact_identities: &mut Vec<ArtifactObligation>,
+    ) {
+        for identity in &self.required_artifacts {
+            if !required.contains(&identity.role) {
+                required.push(identity.role);
+            }
+            push_or_merge_artifact_obligation(required_artifact_identities, identity.clone());
+        }
+    }
+}
+
+pub(super) fn is_controller_state_packet(raw: &str) -> bool {
+    raw.trim_start().starts_with("STATE_CONTROL_PACKET")
+}
+
+fn controller_artifact_obligation(value: &serde_json::Value) -> Option<ArtifactObligation> {
+    let path = value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let role = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .and_then(controller_artifact_role_from_label)
+        .or_else(|| {
+            let category =
+                super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
+            role_from_repo_edit(category)
+        })?;
+    Some(ArtifactObligation::file(role, path))
+}
+
+fn controller_artifact_role_from_label(raw: &str) -> Option<ArtifactRole> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "source" | "implementation" | "impl" | "code" => Some(ArtifactRole::Implementation),
+        "test" | "tests" | "verifier" => Some(ArtifactRole::Test),
+        "manifest" | "setup" | "config" | "package_manifest" => Some(ArtifactRole::Setup),
+        "document" | "docs" | "usage_docs" | "runbook" | "research_notes" | "prose" => {
+            Some(ArtifactRole::UsageDocs)
+        }
+        "output_file" | "data_output" | "data" | "json" | "csv" => Some(ArtifactRole::DataOutput),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompletionProjectIntent {
     DocsOnly,
@@ -945,6 +1047,7 @@ pub(super) struct TaskContract {
     // by the per-turn authority's `needs_confirm()` gate. The `task_kind` above
     // is UNCHANGED by this field (D6: verifier gate does not regress).
     pub(super) classification_confidence: f32,
+    pub(super) evidence_command_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1987,6 +2090,13 @@ impl TaskContract {
     /// `task_classification.rs` takes its ELSE (kind-differs) branch and never
     /// runs the full-struct equality against the deterministic recompute.
     pub(super) fn from_request_with_kind(request: &str, forced_kind: Option<TaskKind>) -> Self {
+        let controller_state = ControllerStatePacket::parse(request);
+        let controller_task_kind = controller_state
+            .as_ref()
+            .and_then(ControllerStatePacket::inferred_task_kind);
+        let evidence_command_hint = controller_state
+            .as_ref()
+            .and_then(|state| state.evidence_command.clone());
         let lower = request.to_ascii_lowercase();
         // Issue #937 (DS3-001): the output-context mask is allocated exactly ONCE
         // per request and threaded by reference into every output-context surface
@@ -2018,6 +2128,9 @@ impl TaskContract {
         // triggers `needs_confirm()`).
         let (task_kind, classification_confidence) = match forced_kind {
             Some(k) => (k, 1.0_f32),
+            None if controller_task_kind.is_some() => {
+                (controller_task_kind.expect("checked Some above"), 1.0)
+            }
             None => (inferred_kind, if inferred_matched { 1.0 } else { 0.0 }),
         };
         // Issue #919 (Decision #5(a)): Authoring contracts never carry the
@@ -2082,6 +2195,10 @@ impl TaskContract {
         optional.dedup();
         let mut required_artifact_identities =
             explicit_artifact_obligations_from_request_with_scan(&scan, request);
+        if let Some(controller_state) = &controller_state {
+            controller_state
+                .extend_contract_parts(&mut required, &mut required_artifact_identities);
+        }
         if asks_for_data_output
             && required_artifact_identities
                 .iter()
@@ -2168,7 +2285,12 @@ impl TaskContract {
             completion_policy,
             required_behavior,
             classification_confidence,
+            evidence_command_hint,
         }
+    }
+
+    pub(super) fn evidence_command_hint(&self) -> Option<&str> {
+        self.evidence_command_hint.as_deref()
     }
 
     /// Issue #917 (P0.5): project the per-turn classification head. No added
@@ -7639,6 +7761,71 @@ mod tests {
                     role: ArtifactRole::Setup,
                     path: "Cargo.toml".to_string(),
                     reason: "required deliverable obligation is still missing: role=setup, kind=file, path=Cargo.toml".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn controller_state_packet_creates_path_obligations() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert_eq!(contract.classification().confidence, 1.0);
+        assert!(
+            contract
+                .required_artifact_identities
+                .contains(&ArtifactObligation::file(ArtifactRole::Setup, "Cargo.toml"))
+        );
+        assert!(
+            contract
+                .required_artifact_identities
+                .contains(&ArtifactObligation::file(
+                    ArtifactRole::Implementation,
+                    "src/lib.rs"
+                ))
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Setup));
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert_eq!(
+            contract.evidence_command_hint(),
+            Some("cargo test --manifest-path Cargo.toml")
+        );
+    }
+
+    #[test]
+    fn controller_state_packet_missing_deliverable_precedes_missing_evidence() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = Vec::new();
+        let repair_state = VerifierRepairState::None;
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &ArtifactExcerpts::new(),
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Continue {
+                missing: vec![ArtifactRole::Implementation, ArtifactRole::Setup],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "src/lib.rs".to_string(),
+                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/lib.rs".to_string(),
                 }),
             }
         );

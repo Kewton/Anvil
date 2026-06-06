@@ -200,11 +200,18 @@ pub(super) fn repo_change_request_text(
     active_task
         .map(str::trim)
         .filter(|task| !task.is_empty())
-        .and_then(extract_original_user_request)
+        .and_then(|task| restore_truncated_active_task(task, messages))
         .or_else(|| {
             active_task
                 .map(str::trim)
                 .filter(|task| !task.is_empty())
+                .and_then(extract_original_user_request)
+        })
+        .or_else(|| {
+            active_task
+                .map(str::trim)
+                .filter(|task| !task.is_empty())
+                .filter(|task| !stored_active_task_looks_truncated(task))
                 .filter(|task| !is_plan_wrapper_or_approval_text(task))
                 .map(ToString::to_string)
         })
@@ -226,6 +233,36 @@ pub(super) fn repo_change_request_text(
                 .map(|message| message.content.trim().to_string())
                 .filter(|content| !content.is_empty())
         })
+}
+
+fn restore_truncated_active_task(
+    active_task: &str,
+    messages: &[ConversationMessage],
+) -> Option<String> {
+    if !stored_active_task_looks_truncated(active_task) {
+        return None;
+    }
+    let prefix = active_task.strip_suffix("...")?.trim_end();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| {
+            extract_original_user_request(&message.content).or_else(|| {
+                (!is_plan_wrapper_or_approval_text(&message.content))
+                    .then(|| message.content.trim().to_string())
+                    .filter(|content| !content.is_empty())
+            })
+        })
+        .find(|candidate| candidate.trim_start().starts_with(prefix))
+}
+
+fn stored_active_task_looks_truncated(active_task: &str) -> bool {
+    active_task.ends_with("...") && active_task.chars().count() >= 240
 }
 
 fn extract_original_user_request(text: &str) -> Option<String> {
@@ -3698,6 +3735,27 @@ fn is_nested_project_root(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_change_request_text_restores_truncated_active_task_from_messages() {
+        let full = format!(
+            r#"STATE_CONTROL_PACKET
+{{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{{"path":"Cargo.toml","role":"manifest"}},{{"path":"src/lib.rs","role":"source"}}],"evidence_command":"cargo test --manifest-path Cargo.toml","completion_condition":"{}"}}"#,
+            "all required artifacts exist and evidence succeeds ".repeat(8)
+        );
+        let active = crate::session::store::truncate_entry(full.clone(), 240);
+        assert!(active.ends_with("..."));
+
+        let messages = vec![
+            ConversationMessage::user(full.clone()),
+            ConversationMessage::user("yes".to_string()),
+        ];
+
+        assert_eq!(
+            repo_change_request_text(Some(&active), &messages),
+            Some(full)
+        );
+    }
 
     #[test]
     fn feature_profile_classifies_abstract_business_primitives() {

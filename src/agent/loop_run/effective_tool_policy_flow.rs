@@ -212,7 +212,9 @@ fn priority_one_arbiter_candidates(agent: &Agent) -> Option<Vec<JobCandidate>> {
             }
             Some(Vec::new())
         }
-        LoopControlAction::RunVerifier | LoopControlAction::RequestModelTurn => None,
+        LoopControlAction::RunVerifier
+        | LoopControlAction::Done
+        | LoopControlAction::RequestModelTurn => None,
     }
 }
 

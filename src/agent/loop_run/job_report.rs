@@ -98,8 +98,22 @@ impl JobReport for ArtifactCompletionReport {
 pub(super) struct VerificationReport {
     pub turn_index: u64,
     pub job_present: bool,
-    /// `"Runnable" | "Weak" | "Missing" | "Absent"`.
+    /// `"CommandEvidence" | "Runnable" | "Weak" | "Missing" | "Absent"`.
     pub binding_kind: String,
+    /// Generic EvidenceRunner family (`coding_build_test`,
+    /// `docs_content_check`, ...). Additive telemetry: absent when the turn has
+    /// no objective/task authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_kind: Option<String>,
+    /// Generic objective evidence taxonomy (`test_run`, `content_check`, ...).
+    /// Additive telemetry: absent when the turn has no objective/task authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_kind: Option<String>,
+    /// Result of the latest evidence observation in this report:
+    /// `"passed" | "failed"`. Additive and absent when no current invocation
+    /// exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +241,52 @@ impl JobReport for ContractArbitrationReport {
 
 fn default_projection_status() -> String {
     "not_available".to_string()
+}
+
+fn verification_report_fields_from_invocation(
+    command: Option<&str>,
+    exit_code: Option<i32>,
+    recorded_at: Option<&str>,
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<serde_json::Value>,
+) {
+    let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) else {
+        return ("Absent".to_string(), None, None, None);
+    };
+    let command = crate::session::feedback::redact_verifier_command_for_storage(command);
+    if command.trim().is_empty() {
+        return ("Absent".to_string(), None, None, None);
+    }
+    let exit_code = exit_code.unwrap_or(-1);
+    let command_hash = crate::logging::stable_path_hash(&command);
+    let invocation = serde_json::json!({
+        "command": command,
+        "exit_code": exit_code,
+        "recorded_at": recorded_at.unwrap_or(""),
+    });
+    (
+        "CommandEvidence".to_string(),
+        Some(command_hash),
+        Some(if exit_code == 0 { "passed" } else { "failed" }.to_string()),
+        Some(invocation),
+    )
+}
+
+fn verification_report_runner_fields(
+    task_kind: Option<super::task_contract::TaskKind>,
+) -> (Option<String>, Option<String>) {
+    use super::evidence_runner::EvidenceRunner;
+    let Some(runner) = task_kind.and_then(super::evidence_runner::evidence_runner_for_task_kind)
+    else {
+        return (None, None);
+    };
+    (
+        Some(runner.kind().as_str().to_string()),
+        Some(runner.evidence_kind().label().to_string()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -365,8 +425,12 @@ impl super::Agent {
         // when no per-turn classification authority exists (answer-only / plan
         // turns). A fixed enum string (`coding/docs/data/research/ops`); it
         // still traverses the masked payload spine via `record_job_report`.
-        let task_kind = super::task_classification::task_contract_authority(self)
-            .map(|contract| contract.task_kind.as_str().to_string());
+        let task_kind_enum =
+            super::task_classification::task_contract_authority(self).map(|contract| {
+                let contract = contract.as_ref();
+                contract.task_kind
+            });
+        let task_kind = task_kind_enum.map(|kind| kind.as_str().to_string());
         let safe_stop = match linkage_reason_override {
             Some(reason) => SafeStopLinkage {
                 reason: Some(reason),
@@ -457,13 +521,35 @@ impl super::Agent {
             || self.task_contract_verifier_passed_this_actor_loop
             || safe_stop.report_emitted;
         if vr_observable {
+            let (runner_kind, evidence_kind) = verification_report_runner_fields(task_kind_enum);
+            let current_turn_invocation = if self.task_contract_verifier_passed_this_actor_loop
+                || self.task_contract_verifier_repair_pending
+                || self.repair_job.is_some()
+            {
+                self.session.last_verifier_invocation.as_ref()
+            } else {
+                None
+            };
+            let (binding_kind, command_hash, evidence_status, last_invocation) =
+                if let Some(invocation) = current_turn_invocation {
+                    verification_report_fields_from_invocation(
+                        Some(invocation.command.as_str()),
+                        Some(invocation.exit_code),
+                        Some(invocation.recorded_at.as_str()),
+                    )
+                } else {
+                    verification_report_fields_from_invocation(None, None, None)
+                };
             let vr = VerificationReport {
                 turn_index,
                 job_present: self.missing_verifier_job.is_some()
                     || self.task_contract_verifier_repair_pending,
-                binding_kind: "Absent".to_string(),
-                command_hash: None,
-                last_invocation: None,
+                binding_kind,
+                runner_kind,
+                evidence_kind,
+                evidence_status,
+                command_hash,
+                last_invocation,
                 safe_stop: safe_stop.clone(),
                 task_kind: task_kind.clone(),
             };
@@ -732,6 +818,86 @@ mod tests {
         assert_eq!(env["kind"], "agent.artifact_completion.report");
         assert_eq!(env["dedup_key"], "turn:7");
         assert!(env["payload"].is_object());
+    }
+
+    #[test]
+    fn verifier_report_projects_command_evidence_invocation() {
+        let (binding_kind, command_hash, evidence_status, last_invocation) =
+            verification_report_fields_from_invocation(
+                Some("cargo test --manifest-path Cargo.toml"),
+                Some(0),
+                Some("2026-06-06T00:00:00Z"),
+            );
+
+        assert_eq!(binding_kind, "CommandEvidence");
+        assert!(command_hash.is_some());
+        assert_eq!(evidence_status.as_deref(), Some("passed"));
+        let invocation = last_invocation.expect("invocation");
+        assert_eq!(
+            invocation["command"],
+            "cargo test --manifest-path Cargo.toml"
+        );
+        assert_eq!(invocation["exit_code"], 0);
+        assert_eq!(invocation["recorded_at"], "2026-06-06T00:00:00Z");
+    }
+
+    #[test]
+    fn verifier_report_marks_failed_command_evidence_invocation() {
+        let (binding_kind, command_hash, evidence_status, last_invocation) =
+            verification_report_fields_from_invocation(
+                Some("cargo test --manifest-path Cargo.toml"),
+                Some(101),
+                Some("2026-06-06T00:00:00Z"),
+            );
+
+        assert_eq!(binding_kind, "CommandEvidence");
+        assert!(command_hash.is_some());
+        assert_eq!(evidence_status.as_deref(), Some("failed"));
+        assert_eq!(
+            last_invocation.expect("invocation")["exit_code"],
+            serde_json::json!(101)
+        );
+    }
+
+    #[test]
+    fn verifier_report_projects_generic_runner_fields_from_task_kind() {
+        let (runner_kind, evidence_kind) = verification_report_runner_fields(Some(
+            crate::agent::loop_run::task_contract::TaskKind::Coding,
+        ));
+        assert_eq!(runner_kind.as_deref(), Some("coding_build_test"));
+        assert_eq!(evidence_kind.as_deref(), Some("test_run"));
+
+        let (runner_kind, evidence_kind) = verification_report_runner_fields(Some(
+            crate::agent::loop_run::task_contract::TaskKind::Docs,
+        ));
+        assert_eq!(runner_kind.as_deref(), Some("docs_content_check"));
+        assert_eq!(evidence_kind.as_deref(), Some("content_check"));
+    }
+
+    #[test]
+    fn verifier_report_keeps_absent_without_current_invocation() {
+        let (binding_kind, command_hash, evidence_status, last_invocation) =
+            verification_report_fields_from_invocation(None, None, None);
+
+        assert_eq!(binding_kind, "Absent");
+        assert_eq!(command_hash, None);
+        assert_eq!(evidence_status, None);
+        assert_eq!(last_invocation, None);
+    }
+
+    #[test]
+    fn verifier_report_redacts_command_before_persisting_invocation() {
+        let (_binding_kind, _command_hash, _evidence_status, last_invocation) =
+            verification_report_fields_from_invocation(
+                Some("env SECRET=topsecretvalue cargo test"),
+                Some(0),
+                Some("2026-06-06T00:00:00Z"),
+            );
+
+        let invocation = last_invocation.expect("invocation");
+        let command = invocation["command"].as_str().expect("command");
+        assert!(!command.contains("topsecretvalue"));
+        assert!(command.contains("SECRET=***"));
     }
 
     #[test]

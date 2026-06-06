@@ -1304,6 +1304,7 @@ mod tests {
             required_behavior,
             // Issue #917: synthetic test contract — neutral matched confidence.
             classification_confidence: 1.0,
+            evidence_command_hint: None,
         };
         ledger.required_artifacts_completed_projection(&contract)
     }

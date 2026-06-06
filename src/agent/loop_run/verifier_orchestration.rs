@@ -1496,6 +1496,14 @@ pub(super) fn build_task_contract_verifier_exit_zero_evidence_for_task_kind(
     if masked.trim().is_empty() {
         return None;
     }
+    if task_kind == TaskKind::Coding {
+        use super::evidence_runner::{EvidenceRunner, EvidenceRunnerOutput};
+        let runner = super::evidence_runner::evidence_runner_for_task_kind(task_kind)?;
+        return match runner.observe_command(&masked, 0, true, bound_count) {
+            Some(EvidenceRunnerOutput::Completion(evidence)) => Some(evidence),
+            _ => None,
+        };
+    }
     Some(verifier_for_task_kind(task_kind).pass_evidence(&masked, bound_count))
 }
 
@@ -2433,6 +2441,8 @@ pub(super) fn select_task_contract_verifier_once(
         super::success::recent_successful_bash_commands_since_last_user(&agent.session.messages);
     let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
         task_contract_verifier_test_binding(agent);
+    let evidence_command_hint = super::task_classification::task_contract_authority(agent)
+        .and_then(|contract| contract.evidence_command_hint().map(str::to_string));
     let active_request = super::workspace_access::active_request_text(agent);
     let task_contract_project_unit = super::verifier_driver::select_task_contract_project_unit(
         &agent.work_root,
@@ -2457,6 +2467,7 @@ pub(super) fn select_task_contract_verifier_once(
             &owned_test_artifacts,
             test_execution_required,
             workspace_scope_opt.as_ref(),
+            evidence_command_hint.as_deref(),
             task_contract_project_unit.as_ref(),
         ),
         workspace_scope_opt,

@@ -9,6 +9,7 @@ use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
 use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
+use super::completion_evidence::is_completion_verifier_command;
 use super::project_probe::ProjectUnit;
 use super::task_workspace_scope::TaskWorkspaceScope;
 
@@ -1538,6 +1539,23 @@ pub(super) struct AutoTestResult {
 pub(super) struct AutoTestRunner;
 
 impl AutoTestRunner {
+    pub(super) fn plan_from_evidence_command_hint(command: &str) -> Option<AutoTestPlan> {
+        let command = command.trim();
+        if command.is_empty() || command.len() > 300 {
+            return None;
+        }
+        if !is_completion_verifier_command(command) {
+            return None;
+        }
+        if !is_evidence_command_hint_allowed(command) {
+            return None;
+        }
+        Some(AutoTestPlan {
+            command: command.to_string(),
+            reason: "controller evidence command".to_string(),
+        })
+    }
+
     pub(super) fn detect(work_root: &Path, changed_files: &[String]) -> Option<AutoTestPlan> {
         Self::detect_candidate(work_root, changed_files).map(VerifierCandidate::into_plan)
     }
@@ -2849,6 +2867,24 @@ fn contains_blocked_shell_fragment(lower: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn is_evidence_command_hint_allowed(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    [
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "python -m pytest",
+        "python3 -m pytest",
+        "pytest",
+    ]
+    .iter()
+    .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix} ")))
+}
+
 fn is_project_level_verifier_command(lower: &str) -> bool {
     [
         "cargo test",
@@ -4082,6 +4118,30 @@ mod tests {
         let plan = AutoTestRunner::detect(dir.path(), &["tool.py".to_string()]);
         assert!(plan.is_some());
         assert_ne!(plan.unwrap().command, "rm -rf .");
+    }
+
+    #[test]
+    fn evidence_command_hint_accepts_safe_project_verifier() {
+        let plan = AutoTestRunner::plan_from_evidence_command_hint(
+            "cargo test --manifest-path Cargo.toml",
+        )
+        .expect("safe cargo test hint");
+
+        assert_eq!(plan.command, "cargo test --manifest-path Cargo.toml");
+        assert_eq!(plan.reason, "controller evidence command");
+    }
+
+    #[test]
+    fn evidence_command_hint_rejects_shell_control() {
+        assert!(
+            AutoTestRunner::plan_from_evidence_command_hint("cargo test || true").is_none(),
+            "controller hints must not be able to mask verifier failures"
+        );
+    }
+
+    #[test]
+    fn evidence_command_hint_rejects_non_verifier_command() {
+        assert!(AutoTestRunner::plan_from_evidence_command_hint("echo ok").is_none());
     }
 
     // --- Issue #450 AC1 / AC2 / NoVerifierAvailable -----------------------

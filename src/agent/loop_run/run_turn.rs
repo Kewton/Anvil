@@ -19,7 +19,7 @@ use super::interrupt::InterruptMonitor;
 use super::summary::LoopResult;
 use crate::agent::recovery;
 use crate::logging::log_llm_event;
-use crate::modes::plan_act::ExecutionMode;
+use crate::modes::plan_act::{ExecutionMode, WorkMode};
 
 pub(super) fn run_turn(
     agent: &mut Agent,
@@ -28,6 +28,7 @@ pub(super) fn run_turn(
     monitor: &mut InterruptMonitor,
 ) -> LoopResult {
     super::message_push::push_user_message(agent, input.to_string());
+    let controller_owned_turn = super::task_contract::is_controller_state_packet(input);
     // Issue #917 (P0.5): eager-populate the per-turn classification authority at
     // this single known point — right after the request is set, before any
     // reader and regardless of mode. `active_request_text` strips the auto-plan
@@ -40,8 +41,19 @@ pub(super) fn run_turn(
         // (now with `turn_index`) and drives the LLM second-pass via
         // `maybe_invoke_work_mode_confirm`. Final (LLM-corrected when
         // applicable) work_mode lives in `agent.session.mode_state.work_mode`.
-        let _ =
-            super::classify_confirm_flow::classify_with_confirmation(agent, input, "turn_start");
+        if controller_owned_turn {
+            // Controller-owned packets are execution state, not user intent.
+            // Keep them out of the natural-language WorkMode classifier so
+            // schema keys such as `required_artifacts` cannot inject Python/UI
+            // mode policy into a worker turn.
+            agent.session.mode_state.work_mode = WorkMode::Auto;
+        } else {
+            let _ = super::classify_confirm_flow::classify_with_confirmation(
+                agent,
+                input,
+                "turn_start",
+            );
+        }
         agent.maybe_compact_session(DEFAULT_KEEP_TAIL);
     }
     let _ = agent.refresh_plan_stage();

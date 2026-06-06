@@ -213,6 +213,26 @@ mod tests {
     }
 
     #[test]
+    fn coding_task_contract_verifier_uses_evidence_runner_output() {
+        use crate::agent::loop_run::evidence_runner::{
+            EvidenceRunner, EvidenceRunnerOutput, evidence_runner_for_task_kind,
+        };
+
+        let evidence = build_task_contract_verifier_exit_zero_evidence_for_task_kind(
+            TaskKind::Coding,
+            "cargo test --manifest-path Cargo.toml",
+            Some(2),
+        )
+        .expect("coding verifier evidence");
+        let runner = evidence_runner_for_task_kind(TaskKind::Coding).expect("coding runner");
+        let expected = runner
+            .observe_command("cargo test --manifest-path Cargo.toml", 0, true, Some(2))
+            .expect("runner evidence");
+
+        assert_eq!(expected, EvidenceRunnerOutput::Completion(evidence));
+    }
+
+    #[test]
     fn task_kind_verifier_builder_selects_docs_adapter() {
         let evidence = build_task_contract_verifier_exit_zero_evidence_for_task_kind(
             TaskKind::Docs,
