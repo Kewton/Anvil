@@ -9,9 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
+use super::scaffold_pipeline::ScaffoldFramework;
 use super::task_contract::{
-    ArtifactRole, ObjectiveDeliverableKind, ObjectiveEvidenceKind, RecoveryTargetHint,
-    TaskContract, TaskKind,
+    ArtifactRole, ObjectiveContract, ObjectiveDeliverableKind, ObjectiveEvidenceKind,
+    ObjectiveKind, RecoveryTargetHint, TaskContract, TaskKind,
 };
 
 pub(super) const MAX_CONTEXT_PACK_ENTRIES: usize = 8;
@@ -1223,6 +1224,545 @@ fn approximate_token_count(text: &str) -> usize {
     text.split_whitespace().count().max(text.len().div_ceil(4))
 }
 
+// ── Issue #1002: TaskExecutionContract + focused worker inputs ─────────────
+//
+// The classification-layer `ObjectiveContract` says *what* the lifecycle drives
+// toward. `TaskExecutionContract` is the *runtime* projection each worker reads:
+// it bundles the objective with the runtime profile, declared deliverables, the
+// public contract, the evidence requirement, the shared constraints, and the
+// repair policy — so a worker's input is the contract plus its target files
+// rather than a replay of prior turn logs. All six task kinds ride this one
+// lifecycle; runtime-specific differences (stack, scaffold, evidence command)
+// are closed into the profile / builder adapters instead of per-kind worker
+// types (RustWorker / NodeWorker / …).
+
+/// Runtime/stack profile. Lets one `WorkerKind` set serve every stack rather
+/// than spawning per-stack worker types (maintainability requirement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeProfile {
+    Rust,
+    Python,
+    Node,
+    TypeScript,
+    Unspecified,
+}
+
+impl RuntimeProfile {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            RuntimeProfile::Rust => "rust",
+            RuntimeProfile::Python => "python",
+            RuntimeProfile::Node => "node",
+            RuntimeProfile::TypeScript => "typescript",
+            RuntimeProfile::Unspecified => "unspecified",
+        }
+    }
+
+    /// Map the verifier stack-label vocabulary (`test_author_evidence_command_for_stack`)
+    /// into a runtime profile so a caller that already detected a stack can inject it.
+    pub(super) fn from_stack_label(stack_label: &str) -> Self {
+        match stack_label.trim().to_ascii_lowercase().as_str() {
+            "rust" => RuntimeProfile::Rust,
+            "python" => RuntimeProfile::Python,
+            "javascript" | "node" => RuntimeProfile::Node,
+            "typescript" => RuntimeProfile::TypeScript,
+            _ => RuntimeProfile::Unspecified,
+        }
+    }
+
+    fn from_path(path: &Path) -> Option<Self> {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("rs") => Some(RuntimeProfile::Rust),
+            Some("py") => Some(RuntimeProfile::Python),
+            Some("ts" | "tsx") => Some(RuntimeProfile::TypeScript),
+            Some("js" | "jsx" | "mjs" | "cjs") => Some(RuntimeProfile::Node),
+            _ => None,
+        }
+    }
+}
+
+/// Scaffold profile. `None` for tasks that do not provision a project skeleton;
+/// `Web(_)` reuses the existing scaffold-framework vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScaffoldProfile {
+    None,
+    Web(ScaffoldFramework),
+}
+
+impl ScaffoldProfile {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ScaffoldProfile::None => "none",
+            ScaffoldProfile::Web(framework) => framework.label(),
+        }
+    }
+}
+
+/// One declared deliverable in execution terms: an artifact role plus the
+/// concrete target path when the contract pinned one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExecutionDeliverable {
+    pub(super) role: ArtifactRole,
+    pub(super) path: Option<PathBuf>,
+}
+
+const MAX_PUBLIC_CONTRACT_SIGNATURES: usize = 6;
+
+/// The public interface a deliverable must satisfy. Bounded + masked at
+/// construction so the worker leads with the contract rather than prior logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct PublicContract {
+    goal: Option<String>,
+    signatures: Vec<String>,
+}
+
+impl PublicContract {
+    fn from_parts(goal: Option<String>, signatures: Vec<String>) -> Self {
+        let goal = goal
+            .map(|value| super::task_contract::mask_and_cap_recovery_field(&value))
+            .filter(|value| !value.trim().is_empty());
+        let mut contract = Self {
+            goal,
+            signatures: Vec::new(),
+        };
+        for signature in signatures {
+            contract.push_signature(&signature);
+        }
+        contract
+    }
+
+    pub(super) fn goal(&self) -> Option<&str> {
+        self.goal.as_deref()
+    }
+
+    pub(super) fn signatures(&self) -> &[String] {
+        &self.signatures
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.goal.is_none() && self.signatures.is_empty()
+    }
+
+    fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if let Some(goal) = &self.goal {
+            parts.push(goal.clone());
+        }
+        if !self.signatures.is_empty() {
+            parts.push(format!("satisfies: {}", self.signatures.join(", ")));
+        }
+        Some(parts.join("; "))
+    }
+
+    fn push_signature(&mut self, signature: &str) {
+        if self.signatures.len() >= MAX_PUBLIC_CONTRACT_SIGNATURES {
+            return;
+        }
+        let masked = super::task_contract::mask_and_cap_recovery_field(signature);
+        if !masked.trim().is_empty() && !self.signatures.contains(&masked) {
+            self.signatures.push(masked);
+        }
+    }
+}
+
+/// Evidence requirement: the evidence kind plus the deterministic local command
+/// when the runtime supplied one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExecutionEvidence {
+    pub(super) kind: ObjectiveEvidenceKind,
+    pub(super) command: Option<String>,
+}
+
+/// Constraints every worker shares: which tools and files it may touch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExecutionConstraints {
+    pub(super) allowed_tools: Vec<CapabilityAllowedTool>,
+    pub(super) allowed_files: Vec<PathBuf>,
+    pub(super) read_only: bool,
+}
+
+/// Repair policy: bounded strategies plus the change kinds a repair worker may
+/// use for the declared target roles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExecutionRepairPolicy {
+    pub(super) strategies: Vec<CapabilityRepairStrategy>,
+    pub(super) allowed_change_kinds: Vec<String>,
+}
+
+/// Runtime projection of a `TaskContract`. The eight headline fields are the
+/// lifecycle-common shape every worker reads; `deliverable_kind` backs the
+/// lossless [`Self::objective_contract`] compat projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TaskExecutionContract {
+    pub(super) objective_kind: ObjectiveKind,
+    pub(super) runtime_profile: RuntimeProfile,
+    pub(super) deliverables: Vec<ExecutionDeliverable>,
+    pub(super) scaffold_profile: ScaffoldProfile,
+    pub(super) public_contract: PublicContract,
+    pub(super) evidence: ExecutionEvidence,
+    pub(super) constraints: ExecutionConstraints,
+    pub(super) repair_policy: ExecutionRepairPolicy,
+    deliverable_kind: ObjectiveDeliverableKind,
+}
+
+impl TaskExecutionContract {
+    /// Build the runtime contract from the classification-layer `TaskContract`.
+    /// Reuses `objective_contract()` and `capability_spec_for_task_contract()`
+    /// as the single sources of truth so no parallel taxonomy is introduced.
+    pub(super) fn from_task_contract(contract: &TaskContract) -> Self {
+        let objective = contract.objective_contract();
+        let capability = capability_spec_for_task_contract(contract);
+        let deliverables = execution_deliverables_for_contract(contract, &capability);
+        let runtime_profile = runtime_profile_for_deliverables(&deliverables);
+        let public_contract = public_contract_for_task_contract(contract);
+        let allowed_files = deliverables
+            .iter()
+            .filter_map(|deliverable| deliverable.path.clone())
+            .collect();
+        let read_only = objective.deliverable_kind == ObjectiveDeliverableKind::Answer;
+        let allowed_change_kinds =
+            allowed_change_kinds_for_roles(&capability.required_artifacts, objective.task_kind);
+        Self {
+            objective_kind: objective.objective_kind,
+            runtime_profile,
+            deliverables,
+            scaffold_profile: ScaffoldProfile::None,
+            public_contract,
+            evidence: ExecutionEvidence {
+                kind: objective.evidence_kind,
+                command: None,
+            },
+            constraints: ExecutionConstraints {
+                allowed_tools: capability.allowed_tools,
+                allowed_files,
+                read_only,
+            },
+            repair_policy: ExecutionRepairPolicy {
+                strategies: capability.repair_strategies,
+                allowed_change_kinds,
+            },
+            deliverable_kind: objective.deliverable_kind,
+        }
+    }
+
+    /// Compat projection back to the read-only [`ObjectiveContract`] view, so the
+    /// existing generic lifecycle / telemetry consumers keep working unchanged.
+    pub(super) fn objective_contract(&self) -> ObjectiveContract {
+        ObjectiveContract {
+            task_kind: self.objective_kind.to_task_kind(),
+            objective_kind: self.objective_kind,
+            deliverable_kind: self.deliverable_kind,
+            evidence_kind: self.evidence.kind,
+        }
+    }
+
+    pub(super) fn with_runtime_profile(mut self, runtime_profile: RuntimeProfile) -> Self {
+        self.runtime_profile = runtime_profile;
+        self
+    }
+
+    pub(super) fn with_scaffold_profile(mut self, scaffold_profile: ScaffoldProfile) -> Self {
+        self.scaffold_profile = scaffold_profile;
+        self
+    }
+
+    pub(super) fn with_evidence_command(mut self, command: impl Into<String>) -> Self {
+        let command = command.into();
+        let trimmed = command.trim();
+        if !trimmed.is_empty() {
+            self.evidence.command = Some(trimmed.to_string());
+        }
+        self
+    }
+
+    pub(super) fn with_public_signature(mut self, signature: &str) -> Self {
+        self.public_contract.push_signature(signature);
+        self
+    }
+
+    /// Allowed change kind the repair worker may use for a given target role.
+    /// Prefers the entry already declared in this contract's repair policy (the
+    /// role is a declared deliverable) and otherwise falls back to that role's
+    /// canonical change kind, so a repair worker always has a bounded change kind
+    /// for whichever file the failure points at.
+    pub(super) fn allowed_change_kind_for_role(&self, role: ArtifactRole) -> String {
+        let target_role = DiagnosticRepairTargetRole::from_artifact_role(
+            role,
+            self.objective_kind.to_task_kind(),
+        );
+        let canonical = default_allowed_change_kind_for_target_role(target_role);
+        self.repair_policy
+            .allowed_change_kinds
+            .iter()
+            .find(|candidate| candidate.as_str() == canonical.as_str())
+            .cloned()
+            .unwrap_or(canonical)
+    }
+
+    /// Whether `role` is a declared deliverable in this contract's repair policy.
+    pub(super) fn repair_policy_declares_role(&self, role: ArtifactRole) -> bool {
+        let target_role = DiagnosticRepairTargetRole::from_artifact_role(
+            role,
+            self.objective_kind.to_task_kind(),
+        );
+        let canonical = default_allowed_change_kind_for_target_role(target_role);
+        self.repair_policy
+            .allowed_change_kinds
+            .iter()
+            .any(|candidate| candidate.as_str() == canonical.as_str())
+    }
+
+    /// Focused deliverable worker input: leads with the target file, the public
+    /// contract, the allowed files, and the evidence command. For a coding
+    /// objective the primary worker is [`WorkerKind::Implement`] (the
+    /// implementation worker); every other kind rides the same builder.
+    pub(super) fn deliverable_worker_request(
+        &self,
+        contract: &TaskContract,
+        target_path: Option<&str>,
+        public_contract_excerpt: Option<&str>,
+    ) -> DeliverableWorkerRequest {
+        let worker_kind = WorkerKind::primary_for_task_kind(self.objective_kind.to_task_kind());
+        let target_path = target_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                self.deliverables
+                    .iter()
+                    .find_map(|deliverable| deliverable.path.clone())
+            });
+        let mut public_contract = self.public_contract.clone();
+        if let Some(excerpt) = public_contract_excerpt {
+            public_contract.push_signature(excerpt);
+        }
+        let allowed_files = if self.constraints.allowed_files.is_empty() {
+            target_path.iter().cloned().collect()
+        } else {
+            self.constraints.allowed_files.clone()
+        };
+        let evidence_command = self.evidence.command.clone();
+
+        let mut context_pack =
+            WorkerContract::from_task_contract(contract, worker_kind).context_pack;
+        if let Some(target) = &target_path {
+            context_pack.push(ContextPackEntry::new(
+                ContextPackKind::Target,
+                "target_path",
+                target.to_string_lossy(),
+            ));
+        }
+        if !allowed_files.is_empty() {
+            context_pack.push(ContextPackEntry::new(
+                ContextPackKind::Target,
+                "allowed_files",
+                allowed_files
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
+        if let Some(summary) = public_contract.summary() {
+            context_pack.push(ContextPackEntry::new(
+                ContextPackKind::Contract,
+                "public_contract",
+                summary,
+            ));
+        }
+        if let Some(command) = &evidence_command {
+            context_pack.push(ContextPackEntry::new(
+                ContextPackKind::Evidence,
+                "evidence_command",
+                command.as_str(),
+            ));
+        }
+
+        DeliverableWorkerRequest {
+            worker_contract: WorkerContract::from_task_contract(contract, worker_kind)
+                .with_context_pack(context_pack),
+            worker_kind,
+            target_path,
+            allowed_files,
+            public_contract,
+            evidence_command,
+            output_contract: deliverable_worker_output_contract(self.objective_kind),
+        }
+    }
+
+    /// Repair worker input that draws the allowed change kind from this
+    /// execution contract's repair policy and delegates to the bounded
+    /// diagnostic-repair builder (failure observation + target file + allowed
+    /// change kind).
+    pub(super) fn repair_worker_request(
+        &self,
+        contract: &TaskContract,
+        diagnostic: &str,
+        target_hint: &RecoveryTargetHint,
+        evidence_command: Option<&str>,
+    ) -> DiagnosticRepairWorkerRequest {
+        let allowed_change_kind = self.allowed_change_kind_for_role(target_hint.role);
+        diagnostic_repair_worker_request_for_evidence_failed(
+            contract,
+            diagnostic,
+            target_hint,
+            &allowed_change_kind,
+            evidence_command,
+        )
+    }
+}
+
+/// Focused worker input for producing the primary deliverable. The context pack
+/// carries the contract, the target file, the allowed files, the public
+/// contract, and the evidence command — not a replay of prior turn logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DeliverableWorkerRequest {
+    pub(super) worker_contract: WorkerContract,
+    worker_kind: WorkerKind,
+    target_path: Option<PathBuf>,
+    allowed_files: Vec<PathBuf>,
+    public_contract: PublicContract,
+    evidence_command: Option<String>,
+    output_contract: &'static str,
+}
+
+impl DeliverableWorkerRequest {
+    pub(super) fn worker_kind(&self) -> WorkerKind {
+        self.worker_kind
+    }
+
+    pub(super) fn target_path(&self) -> Option<&Path> {
+        self.target_path.as_deref()
+    }
+
+    pub(super) fn allowed_files(&self) -> &[PathBuf] {
+        &self.allowed_files
+    }
+
+    pub(super) fn public_contract(&self) -> &PublicContract {
+        &self.public_contract
+    }
+
+    pub(super) fn evidence_command(&self) -> Option<&str> {
+        self.evidence_command.as_deref()
+    }
+
+    pub(super) fn output_contract(&self) -> &'static str {
+        self.output_contract
+    }
+
+    pub(super) fn policy_message(&self) -> String {
+        let worker = self.worker_kind.label();
+        let target = self
+            .target_path
+            .as_ref()
+            .map(|path| super::task_contract::mask_and_cap_recovery_field(&path.to_string_lossy()))
+            .unwrap_or_else(|| "the declared deliverable artifact".to_string());
+        let allowed_files = if self.allowed_files.is_empty() {
+            "only the declared deliverable target".to_string()
+        } else {
+            self.allowed_files
+                .iter()
+                .map(|path| {
+                    super::task_contract::mask_and_cap_recovery_field(&path.to_string_lossy())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let evidence = self
+            .evidence_command
+            .as_deref()
+            .map(super::task_contract::mask_and_cap_recovery_field)
+            .unwrap_or_else(|| "the configured local evidence check".to_string());
+        let public_contract = self
+            .public_contract
+            .summary()
+            .map(|summary| super::task_contract::mask_and_cap_recovery_field(&summary))
+            .unwrap_or_else(|| {
+                "infer the public behavior from the active request and project files".to_string()
+            });
+        format!(
+            "[{worker}] Own this turn. Produce `{target}`. Public contract: {public_contract}. Allowed files: {allowed_files}. Evidence: run `{evidence}` after the edit. Lead with the contract and the target file; do not restate prior turn logs or change unrelated files."
+        )
+    }
+}
+
+fn execution_deliverables_for_contract(
+    contract: &TaskContract,
+    capability: &CapabilitySpec,
+) -> Vec<ExecutionDeliverable> {
+    if !contract.required_artifact_identities.is_empty() {
+        return contract
+            .required_artifact_identities
+            .iter()
+            .map(|obligation| ExecutionDeliverable {
+                role: obligation.role,
+                path: Some(PathBuf::from(obligation.path.as_str())),
+            })
+            .collect();
+    }
+    capability
+        .required_artifacts
+        .iter()
+        .map(|role| ExecutionDeliverable {
+            role: *role,
+            path: None,
+        })
+        .collect()
+}
+
+fn runtime_profile_for_deliverables(deliverables: &[ExecutionDeliverable]) -> RuntimeProfile {
+    deliverables
+        .iter()
+        .filter_map(|deliverable| deliverable.path.as_deref())
+        .find_map(RuntimeProfile::from_path)
+        .unwrap_or(RuntimeProfile::Unspecified)
+}
+
+fn public_contract_for_task_contract(contract: &TaskContract) -> PublicContract {
+    let Some(projection) = super::required_behavior::project_behavior_contract(contract) else {
+        return PublicContract::default();
+    };
+    let goal = projection
+        .behavior_goal
+        .as_ref()
+        .map(|goal| goal.label.clone());
+    let signatures = projection
+        .required_capabilities
+        .iter()
+        .map(|capability| capability.label.clone())
+        .collect();
+    PublicContract::from_parts(goal, signatures)
+}
+
+fn allowed_change_kinds_for_roles(roles: &[ArtifactRole], task_kind: TaskKind) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for role in roles {
+        let target_role = DiagnosticRepairTargetRole::from_artifact_role(*role, task_kind);
+        let change_kind = default_allowed_change_kind_for_target_role(target_role);
+        if !out.contains(&change_kind) {
+            out.push(change_kind);
+        }
+    }
+    out
+}
+
+fn deliverable_worker_output_contract(objective_kind: ObjectiveKind) -> &'static str {
+    match objective_kind {
+        ObjectiveKind::Coding => {
+            "implementation_source_created_or_updated_for_the_declared_public_contract"
+        }
+        ObjectiveKind::Docs => "required_document_sections_created_or_updated",
+        ObjectiveKind::Data => "structured_output_file_created_or_updated",
+        ObjectiveKind::Research => "research_report_or_notes_created_with_source_slots",
+        ObjectiveKind::Ops => "command_observation_or_runbook_created_with_safety_notes",
+        ObjectiveKind::Authoring => "prose_artifact_created_or_updated_for_requested_audience",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1884,5 +2424,256 @@ mod tests {
             assert!(stage.eval_label.contains(stage.recovery_job_label()));
             assert!(stage.output_contract.len() > 12);
         }
+    }
+
+    // ── Issue #1002: TaskExecutionContract + focused worker inputs ─────────
+
+    #[test]
+    fn task_execution_contract_rides_all_six_task_kinds_and_round_trips_objective() {
+        let cases = [
+            (
+                "Create a Rust CLI word counter with Cargo tests and usage docs.",
+                ObjectiveKind::Coding,
+            ),
+            (
+                "Write README.md with install, validation, and rollback sections.",
+                ObjectiveKind::Docs,
+            ),
+            (
+                "Transform orders.csv into output.csv with id,total columns.",
+                ObjectiveKind::Data,
+            ),
+            (
+                "Investigate local LLM repair loops and produce a report in report.md with sources.",
+                ObjectiveKind::Research,
+            ),
+            (
+                "Prepare a deployment runbook with rollback and validation commands.",
+                ObjectiveKind::Ops,
+            ),
+            (
+                "Translate README.ja.md into English and write README.md.",
+                ObjectiveKind::Authoring,
+            ),
+        ];
+
+        for (request, expected_kind) in cases {
+            let contract = TaskContract::from_request(request);
+            let execution = TaskExecutionContract::from_task_contract(&contract);
+
+            assert_eq!(execution.objective_kind, expected_kind, "{request}");
+            // Every kind rides the same lifecycle: a deliverable, an evidence
+            // kind, shared constraints, and a repair policy.
+            assert!(!execution.deliverables.is_empty(), "{request}");
+            assert!(!execution.constraints.allowed_tools.is_empty(), "{request}");
+            assert!(!execution.repair_policy.strategies.is_empty(), "{request}");
+            assert!(
+                !execution.repair_policy.allowed_change_kinds.is_empty(),
+                "{request}"
+            );
+            // Compat projection is lossless against the existing ObjectiveContract.
+            assert_eq!(
+                execution.objective_contract(),
+                contract.objective_contract(),
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_profile_maps_stack_labels_and_paths() {
+        assert_eq!(
+            RuntimeProfile::from_stack_label("rust"),
+            RuntimeProfile::Rust
+        );
+        assert_eq!(
+            RuntimeProfile::from_stack_label("python"),
+            RuntimeProfile::Python
+        );
+        assert_eq!(
+            RuntimeProfile::from_stack_label("javascript"),
+            RuntimeProfile::Node
+        );
+        assert_eq!(
+            RuntimeProfile::from_stack_label("typescript"),
+            RuntimeProfile::TypeScript
+        );
+        assert_eq!(
+            RuntimeProfile::from_stack_label("rocket-science"),
+            RuntimeProfile::Unspecified
+        );
+
+        let rust = vec![ExecutionDeliverable {
+            role: ArtifactRole::Implementation,
+            path: Some(PathBuf::from("src/lib.rs")),
+        }];
+        assert_eq!(
+            runtime_profile_for_deliverables(&rust),
+            RuntimeProfile::Rust
+        );
+
+        let docs = vec![ExecutionDeliverable {
+            role: ArtifactRole::UsageDocs,
+            path: Some(PathBuf::from("README.md")),
+        }];
+        assert_eq!(
+            runtime_profile_for_deliverables(&docs),
+            RuntimeProfile::Unspecified
+        );
+    }
+
+    #[test]
+    fn deliverable_worker_request_is_focused_on_contract_and_target() {
+        let contract = TaskContract::from_request(
+            "Create a Rust slugify library and verify it with cargo test.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::Rust)
+            .with_evidence_command("cargo test");
+        let request = execution.deliverable_worker_request(
+            &contract,
+            Some("src/lib.rs"),
+            Some("pub fn slugify(input: &str) -> String"),
+        );
+
+        // Coding's primary worker IS the implementation worker.
+        assert_eq!(request.worker_kind(), WorkerKind::Implement);
+        assert_eq!(request.target_path(), Some(Path::new("src/lib.rs")));
+        assert_eq!(request.evidence_command(), Some("cargo test"));
+        assert!(!request.public_contract().is_empty());
+        assert_eq!(
+            request.output_contract(),
+            "implementation_source_created_or_updated_for_the_declared_public_contract"
+        );
+
+        // The context pack is the contract + target file, bounded — not a log replay.
+        let pack = &request.worker_contract.context_pack;
+        assert!(pack.entries().len() <= MAX_CONTEXT_PACK_ENTRIES);
+        assert!(
+            pack.entries()
+                .iter()
+                .any(|entry| entry.label() == "target_path")
+        );
+        assert!(
+            pack.entries()
+                .iter()
+                .any(|entry| entry.label() == "public_contract")
+        );
+        assert!(
+            pack.entries()
+                .iter()
+                .any(|entry| entry.label() == "evidence_command")
+        );
+
+        // The policy message leads with the target + contract and steers the
+        // worker away from re-dumping prior logs.
+        let message = request.policy_message();
+        assert!(message.contains("[implement]"));
+        assert!(message.contains("src/lib.rs"));
+        assert!(message.contains("cargo test"));
+        assert!(message.contains("do not restate prior turn logs"));
+    }
+
+    #[test]
+    fn deliverable_worker_request_covers_non_coding_primary_worker() {
+        let contract = TaskContract::from_request(
+            "Write README.md with install, validation, and rollback sections.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract);
+        let request = execution.deliverable_worker_request(&contract, Some("README.md"), None);
+
+        assert_eq!(request.worker_kind(), WorkerKind::Docs);
+        assert_eq!(request.target_path(), Some(Path::new("README.md")));
+        assert_eq!(
+            request.output_contract(),
+            "required_document_sections_created_or_updated"
+        );
+        assert!(request.policy_message().contains("[docs]"));
+    }
+
+    #[test]
+    fn repair_worker_request_draws_allowed_change_kind_from_policy() {
+        let contract = TaskContract::from_request(
+            "Create a Rust slugify library and verify it with cargo test.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract);
+
+        // The repair worker always resolves a bounded change kind for the file
+        // the failure points at, whether or not the role is a declared deliverable.
+        assert_eq!(
+            execution.allowed_change_kind_for_role(ArtifactRole::Implementation),
+            "implementation"
+        );
+        assert_eq!(
+            execution.allowed_change_kind_for_role(ArtifactRole::Test),
+            "test"
+        );
+        // Implementation is a declared deliverable for this coding contract.
+        assert!(execution.repair_policy_declares_role(ArtifactRole::Implementation));
+
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "src/lib.rs".to_string(),
+            reason: "compiler points at missing public function".to_string(),
+        };
+        let request = execution.repair_worker_request(
+            &contract,
+            "error[E0425]: cannot find function `slugify` in this scope",
+            &target_hint,
+            Some("cargo test"),
+        );
+
+        assert_eq!(request.failure_kind(), EvidenceFailureKind::CompileError);
+        assert_eq!(
+            request.target_role(),
+            DiagnosticRepairTargetRole::Implementation
+        );
+        assert_eq!(request.allowed_change_kind(), "implementation");
+        assert_eq!(request.evidence_command(), "cargo test");
+    }
+
+    #[test]
+    fn task_execution_contract_adapters_inject_runtime_specifics() {
+        let contract =
+            TaskContract::from_request("Build a Next.js dashboard and verify it with npm test.");
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::from_stack_label("typescript"))
+            .with_scaffold_profile(ScaffoldProfile::Web(ScaffoldFramework::Next))
+            .with_evidence_command("  npm test  ")
+            .with_public_signature("GET /api/metrics returns JSON");
+
+        assert_eq!(execution.runtime_profile, RuntimeProfile::TypeScript);
+        assert_eq!(
+            execution.scaffold_profile,
+            ScaffoldProfile::Web(ScaffoldFramework::Next)
+        );
+        assert_eq!(execution.evidence.command.as_deref(), Some("npm test"));
+        assert!(
+            execution
+                .public_contract
+                .signatures()
+                .iter()
+                .any(|signature| signature.contains("GET /api/metrics"))
+        );
+    }
+
+    #[test]
+    fn public_contract_is_bounded_and_deduped() {
+        let signatures: Vec<String> = (0..MAX_PUBLIC_CONTRACT_SIGNATURES + 4)
+            .map(|idx| format!("operation_{idx}"))
+            .collect();
+        let mut contract =
+            PublicContract::from_parts(Some("ship a slug API".to_string()), signatures);
+        // Duplicate + empty pushes are ignored.
+        contract.push_signature("operation_0");
+        contract.push_signature("   ");
+
+        assert_eq!(contract.signatures().len(), MAX_PUBLIC_CONTRACT_SIGNATURES);
+        assert_eq!(contract.goal(), Some("ship a slug API"));
+        let summary = contract
+            .summary()
+            .expect("non-empty contract has a summary");
+        assert!(summary.contains("ship a slug API"));
+        assert!(summary.contains("satisfies:"));
     }
 }
