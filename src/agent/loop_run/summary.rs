@@ -1,6 +1,7 @@
 use super::active_job_arbiter::RecoveryJobKind;
 use super::repair_job::{RepairNextAction, VerifierBootstrapNextAction};
 use super::task_contract::{ArtifactRecoveryAction, ArtifactRole};
+use crate::terminal_outcome::GenericTerminalState;
 
 #[allow(dead_code)] // Issue #888: additive generic state vocabulary for future serialized projections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,42 +63,6 @@ impl RunState {
             VerifierBootstrapNextAction::RequestSetupEdit => RunState::DeliverableMissing,
             VerifierBootstrapNextAction::RerunVerifier => RunState::CompletionReady,
             VerifierBootstrapNextAction::SafeStop { .. } => RunState::SafeStopped,
-        }
-    }
-}
-
-#[allow(dead_code)] // Issue #947: generic terminal vocabulary before every caller migrates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GenericTerminalState {
-    Completed,
-    MissingDeliverable,
-    MissingEvidence,
-    EvidenceFailed,
-    EvidenceBindingFailed,
-    EvidenceRunnerMissing,
-    EvidenceRepairExhausted,
-    EvidenceRepairSafeStop,
-    ControlLoopExhausted,
-    ModelOutputFailure,
-    TransportFailure,
-    Interrupted,
-}
-
-impl GenericTerminalState {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            GenericTerminalState::Completed => "completed",
-            GenericTerminalState::MissingDeliverable => "missing_deliverable",
-            GenericTerminalState::MissingEvidence => "missing_evidence",
-            GenericTerminalState::EvidenceFailed => "evidence_failed",
-            GenericTerminalState::EvidenceBindingFailed => "evidence_binding_failed",
-            GenericTerminalState::EvidenceRunnerMissing => "evidence_runner_missing",
-            GenericTerminalState::EvidenceRepairExhausted => "evidence_repair_exhausted",
-            GenericTerminalState::EvidenceRepairSafeStop => "evidence_repair_safe_stop",
-            GenericTerminalState::ControlLoopExhausted => "control_loop_exhausted",
-            GenericTerminalState::ModelOutputFailure => "model_output_failure",
-            GenericTerminalState::TransportFailure => "transport_failure",
-            GenericTerminalState::Interrupted => "interrupted",
         }
     }
 }

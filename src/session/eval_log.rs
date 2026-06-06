@@ -17,6 +17,7 @@ use crate::logging::mask_payload_inplace;
 use crate::session::anvil_score::AnvilScore;
 use crate::session::feedback::mask_secrets;
 use crate::session::precaution::{Precaution, PrecautionStatus};
+use crate::terminal_outcome::generic_label_for_legacy_terminal;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -883,31 +884,13 @@ pub fn build_terminal_diagnostics_with_context(
 
     TerminalDiagnosticsSummary {
         outcome: final_outcome.to_string(),
-        generic_outcome: generic_terminal_outcome_for_legacy(final_outcome).to_string(),
+        generic_outcome: generic_label_for_legacy_terminal(final_outcome).to_string(),
         classification: classification.to_string(),
         satisfied_obligations,
         missing_obligations,
         verifier_status: verifier_status.to_string(),
         last_failure_signature,
         obligations,
-    }
-}
-
-fn generic_terminal_outcome_for_legacy(final_outcome: &str) -> &'static str {
-    match final_outcome {
-        "done" => "completed",
-        "missing_repo_edits" => "missing_deliverable",
-        "missing_verification" => "missing_evidence",
-        "verifier_failed" => "evidence_failed",
-        "safe_stop_verifier_weak" => "evidence_binding_failed",
-        "safe_stop_verifier_missing" => "evidence_runner_missing",
-        "repair_exhausted" => "evidence_repair_exhausted",
-        "repair_safe_stop" => "evidence_repair_safe_stop",
-        "max_iterations" | "plan_incomplete" => "control_loop_exhausted",
-        "tool_call_format_error" | "empty_responses" | "no_tool_calls" => "model_output_failure",
-        "transport_error" => "transport_failure",
-        "interrupted" => "interrupted",
-        _ => "control_loop_exhausted",
     }
 }
 

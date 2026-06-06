@@ -7,9 +7,9 @@
 #![allow(dead_code)] // Extension seam; focused tests pin the shape before wiring broad callers.
 
 use super::completion_evidence::CompletionEvidence;
-use super::summary::GenericTerminalState;
 use super::task_contract::{ObjectiveEvidenceKind, TaskKind};
 use super::verifier::{VerifierArtifact, verifier_for_task_kind};
+use crate::terminal_outcome::GenericTerminalState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EvidenceRunnerKind {

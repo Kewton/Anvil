@@ -11,6 +11,7 @@ pub mod repo_graph;
 pub mod safety;
 pub mod session;
 pub mod system_prompt;
+pub(crate) mod terminal_outcome;
 pub mod tools;
 pub mod tui;
 pub mod util;

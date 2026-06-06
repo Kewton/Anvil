@@ -38,8 +38,8 @@ use super::active_job_arbiter::RecoveryJobKind;
 use super::evidence_runner::{EvidenceRunnerError, EvidenceRunnerKind};
 use super::generated_test_guard::{parse_toml_string_value, strip_toml_comment};
 use super::node_runner_manifest::complete_node_test_runner_manifest;
-use super::summary::GenericTerminalState;
 use super::task_contract::TaskKind;
+use crate::terminal_outcome::GenericTerminalState;
 
 /// Whether a single binding check (or the whole plan) resolved.
 ///
