@@ -404,6 +404,54 @@ impl EvalRecord {
         );
         refresh_terminal_obligation_indexes(diagnostics);
     }
+
+    pub fn mark_artifact_evidence_repair_exhausted(&mut self) {
+        let Some(diagnostics) = self.terminal_diagnostics.as_mut() else {
+            return;
+        };
+        diagnostics.classification = "evidence_repair_exhausted".to_string();
+        if non_coding_artifact_tool_observed(self.classified_task_kind.as_deref(), &self.tool_calls)
+        {
+            set_obligation(
+                &mut diagnostics.obligations,
+                "repo_edit",
+                "satisfied",
+                None,
+                "repository artifact edit was recorded through a non-coding tool call",
+            );
+        }
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_environment",
+            "not_applicable",
+            None,
+            "verification environment was not the artifact evidence blocker",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_evidence",
+            "not_applicable",
+            None,
+            "verifier evidence was not the artifact evidence blocker",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "repair_convergence",
+            "unsatisfied",
+            Some("evidence_repair_exhausted"),
+            "artifact evidence repair reached its controlled exhaustion terminal",
+        );
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "artifact_evidence",
+                "unsatisfied",
+                Some("evidence_repair_exhausted"),
+                "artifact exists but failed its required evidence obligation repeatedly",
+            ),
+        );
+        refresh_terminal_obligation_indexes(diagnostics);
+    }
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -935,6 +983,7 @@ fn failure_authority_for_eval(
         "model_output_failure" => "contract_extraction",
         "verification_environment_failure" => "verifier_setup",
         "verification_failure" => "implementation_bug",
+        "evidence_repair_exhausted" => "artifact_evidence",
         "control_loop_failure" => "repair_routing",
         "transport_failure" | "interrupted" => "repair_routing",
         _ => "repair_routing",
@@ -1082,6 +1131,20 @@ fn set_obligation(
         obligation.status = status.to_string();
         obligation.failure_domain = failure_domain.map(str::to_string);
         obligation.detail = detail.to_string();
+    }
+}
+
+fn upsert_obligation(
+    obligations: &mut Vec<TerminalObligationDiagnostic>,
+    new_obligation: TerminalObligationDiagnostic,
+) {
+    if let Some(existing) = obligations
+        .iter_mut()
+        .find(|obligation| obligation.id == new_obligation.id)
+    {
+        *existing = new_obligation;
+    } else {
+        obligations.push(new_obligation);
     }
 }
 
@@ -1556,6 +1619,71 @@ mod tests {
                 .contains(&"repo_edit".to_string())
         );
         assert!(!diag.missing_obligations.contains(&"repo_edit".to_string()));
+    }
+
+    #[test]
+    fn terminal_diagnostics_project_artifact_evidence_repair_exhausted() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-data-005",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "missing_repo_edits",
+        );
+        rec.classified_task_kind = Some("data".to_string());
+        rec.mark_artifact_evidence_repair_exhausted();
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.final_outcome, "missing_repo_edits");
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|diag| diag.classification.as_str()),
+            Some("evidence_repair_exhausted")
+        );
+        assert_eq!(
+            rec.evaluation_taxonomy.failure_authority,
+            "artifact_evidence"
+        );
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"repo_edit".to_string())
+        );
+        assert!(
+            diag.missing_obligations
+                .contains(&"artifact_evidence".to_string())
+        );
+        let artifact_evidence = diag
+            .obligations
+            .iter()
+            .find(|obligation| obligation.id == "artifact_evidence")
+            .expect("artifact evidence obligation");
+        assert_eq!(artifact_evidence.status, "unsatisfied");
+        assert_eq!(
+            artifact_evidence.failure_domain.as_deref(),
+            Some("evidence_repair_exhausted")
+        );
     }
 
     #[test]

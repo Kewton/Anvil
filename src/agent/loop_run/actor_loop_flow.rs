@@ -4404,6 +4404,9 @@ pub(super) fn run_actor_loop(
         // per-turn classification authority exists (answer-only / plan turns).
         record.classified_task_kind = super::task_classification::task_contract_authority(agent)
             .map(|contract| contract.task_kind.as_str().to_string());
+        if artifact_completion_exhausted_by_evidence_failure(agent) {
+            record.mark_artifact_evidence_repair_exhausted();
+        }
         record.refresh_evaluation_taxonomy();
         record.refresh_completion_reason();
         record.refresh_terminal_diagnostics();
@@ -4447,6 +4450,18 @@ pub(super) fn run_actor_loop(
         }
         Err((exit_reason, error_text, stats))
     }
+}
+
+fn artifact_completion_exhausted_by_evidence_failure(agent: &Agent) -> bool {
+    agent.artifact_completion_job.as_ref().is_some_and(|job| {
+        matches!(
+            job.status(),
+            super::artifact_completion_job::ArtifactCompletionStatus::Exhausted { .. }
+        ) && job.attempts().last().is_some_and(|attempt| {
+            attempt.kind()
+                == super::artifact_completion_job::ArtifactAttemptOutcomeKind::EvidenceFailed
+        })
+    })
 }
 
 pub(super) fn build_stats(
