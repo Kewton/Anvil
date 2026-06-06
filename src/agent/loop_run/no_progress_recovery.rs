@@ -62,6 +62,51 @@ impl NoProgressExhaustionReason {
     }
 }
 
+/// Issue #1006: the deterministic *forward* strategy the controller should
+/// switch to when the same failure key keeps recurring. Where
+/// [`NoProgressExhaustionReason`] explains *why convergence failed*, this enum
+/// decides *what to try next* — turning the policy from fail-fast into
+/// strategy-switching. Closed, `Copy`, and generic over [`ArtifactRole`] (no
+/// runtime-specific branches): the only inputs are the same-failure-key
+/// repetition count, the failing role, the alternate roles, and whether the
+/// failure is an inter-artifact contract conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryStrategy {
+    /// `same_failure_once`: try the deterministic operator again (no ban yet).
+    RetryDeterministicOperator,
+    /// `same_failure_twice`: the previous target role is banned — switch to an
+    /// alternate role rather than repeating the same role's repair.
+    SwitchTargetRole,
+    /// A setup-role no-progress never loops back into implementation repair; it
+    /// routes to the evidence-binding / scaffold-rebuild side (AC2). Role-driven,
+    /// not runtime-specific.
+    RouteToEvidenceBinding,
+    /// `same_failure_three_times` with an inter-artifact (e.g. test/impl)
+    /// disagreement: escalate to contract arbitration (AC3).
+    EscalateToContractConflict,
+    /// `same_failure_three_times` with no inter-artifact conflict and an
+    /// alternate role still available: rebuild via scaffold rather than keep
+    /// patching.
+    EscalateToScaffoldRebuild,
+    /// No alternate role / operator remains for the cluster — the structured
+    /// terminal reason (AC4). Keeps the `repair_exhausted` projection but records
+    /// *why* no further strategy exists.
+    OperatorMissing,
+}
+
+impl RecoveryStrategy {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryDeterministicOperator => "retry_deterministic_operator",
+            Self::SwitchTargetRole => "switch_target_role",
+            Self::RouteToEvidenceBinding => "route_to_evidence_binding",
+            Self::EscalateToContractConflict => "escalate_to_contract_conflict",
+            Self::EscalateToScaffoldRebuild => "escalate_to_scaffold_rebuild",
+            Self::OperatorMissing => "operator_missing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NoProgressObservation {
     scope: String,
@@ -291,6 +336,76 @@ impl NoProgressRecoveryPolicy {
             Some(NoProgressExhaustionReason::SameTargetSameDiagnostic)
         }
     }
+
+    /// Issue #1006: how many no-progress observations have accrued for `scope`,
+    /// across all roles. This is the repetition count of the *same failure key*
+    /// (the cluster scope) and drives the strategy-switch escalation tier.
+    pub(super) fn scope_no_progress_count(&self, scope: &str) -> usize {
+        let scope = Self::sanitize_scope(scope);
+        self.observations
+            .iter()
+            .filter(|obs| obs.scope == scope)
+            .count()
+    }
+
+    /// Issue #1006: the role of the most recent no-progress observation for
+    /// `scope`. Used to decide the role-driven strategy (e.g. a setup failure
+    /// routes to evidence binding). `None` when no observation exists.
+    pub(super) fn latest_no_progress_role(&self, scope: &str) -> Option<ArtifactRole> {
+        let scope = Self::sanitize_scope(scope);
+        self.observations
+            .iter()
+            .rev()
+            .find(|obs| obs.scope == scope)
+            .map(|obs| obs.role)
+    }
+
+    /// Issue #1006: the deterministic forward strategy for `scope`, given the
+    /// failing `role`, the cluster's `candidate_roles`, and whether the failure
+    /// is an inter-artifact contract conflict.
+    ///
+    /// The decision is keyed purely on the same-failure-key repetition count and
+    /// the closed role/conflict signals — there are no runtime-specific
+    /// branches. The `OperatorMissing` arm stays coherent with
+    /// [`Self::classify_exhaustion`] (both fire when no alternate role remains).
+    pub(super) fn classify_strategy(
+        &self,
+        scope: &str,
+        role: ArtifactRole,
+        candidate_roles: &[ArtifactRole],
+        has_contract_conflict: bool,
+    ) -> RecoveryStrategy {
+        let count = self.scope_no_progress_count(scope);
+        if count == 0 {
+            // No no-progress recorded yet: a deterministic operator attempt is
+            // the first strategy (same_failure_once is the next tier).
+            return RecoveryStrategy::RetryDeterministicOperator;
+        }
+        // AC2: a setup failure never loops back into implementation repair; it
+        // routes to the evidence-binding / scaffold-rebuild side. Role-driven so
+        // it stays runtime-agnostic.
+        if role == ArtifactRole::Setup {
+            return RecoveryStrategy::RouteToEvidenceBinding;
+        }
+        // AC4: no alternate role / operator remains — the structured terminal
+        // reason, regardless of how many times we have retried.
+        if self.required_next_roles(scope, candidate_roles).is_empty() {
+            return RecoveryStrategy::OperatorMissing;
+        }
+        match count {
+            1 => RecoveryStrategy::RetryDeterministicOperator,
+            2 => RecoveryStrategy::SwitchTargetRole,
+            _ => {
+                if has_contract_conflict {
+                    // AC3: an inter-artifact (test/impl) disagreement escalates
+                    // to contract arbitration.
+                    RecoveryStrategy::EscalateToContractConflict
+                } else {
+                    RecoveryStrategy::EscalateToScaffoldRebuild
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +543,164 @@ mod tests {
         assert_eq!(policy.banned_targets_for(SCOPE_A).len(), 1);
         // ... but two observations under the same role still ban the role.
         assert!(policy.is_role_banned(SCOPE_A, ArtifactRole::Implementation));
+    }
+
+    // --- Issue #1006: deterministic strategy-switch decision table -----------
+
+    #[test]
+    fn scope_count_and_latest_role_track_observations() {
+        let mut policy = NoProgressRecoveryPolicy::new();
+        assert_eq!(policy.scope_no_progress_count(SCOPE_A), 0);
+        assert_eq!(policy.latest_no_progress_role(SCOPE_A), None);
+
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Test, "tests/a.rs");
+        assert_eq!(policy.scope_no_progress_count(SCOPE_A), 2);
+        // The most recent observation's role.
+        assert_eq!(
+            policy.latest_no_progress_role(SCOPE_A),
+            Some(ArtifactRole::Test)
+        );
+        // A different cluster scope is unaffected.
+        assert_eq!(policy.scope_no_progress_count(SCOPE_B), 0);
+    }
+
+    #[test]
+    fn strategy_same_failure_once_retries_deterministic_operator() {
+        let mut policy = NoProgressRecoveryPolicy::new();
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        assert_eq!(
+            policy.classify_strategy(
+                SCOPE_A,
+                ArtifactRole::Implementation,
+                &[ArtifactRole::Implementation, ArtifactRole::Test],
+                false,
+            ),
+            RecoveryStrategy::RetryDeterministicOperator
+        );
+    }
+
+    #[test]
+    fn strategy_same_failure_twice_switches_target_role() {
+        // AC1: a second no-progress under the same role bans the role and the
+        // strategy switches off it.
+        let mut policy = NoProgressRecoveryPolicy::new();
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/other.rs");
+        assert!(policy.is_role_banned(SCOPE_A, ArtifactRole::Implementation));
+        assert_eq!(
+            policy.classify_strategy(
+                SCOPE_A,
+                ArtifactRole::Implementation,
+                &[ArtifactRole::Implementation, ArtifactRole::Test],
+                false,
+            ),
+            RecoveryStrategy::SwitchTargetRole
+        );
+    }
+
+    #[test]
+    fn strategy_setup_routes_to_evidence_binding() {
+        // AC2: a setup-role no-progress routes to evidence binding / scaffold,
+        // never back to implementation repair — even when implementation is an
+        // available candidate role.
+        let mut policy = NoProgressRecoveryPolicy::new();
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Setup, "Cargo.toml");
+        let strategy = policy.classify_strategy(
+            SCOPE_A,
+            ArtifactRole::Setup,
+            &[ArtifactRole::Setup, ArtifactRole::Implementation],
+            false,
+        );
+        assert_eq!(strategy, RecoveryStrategy::RouteToEvidenceBinding);
+        assert_ne!(strategy, RecoveryStrategy::SwitchTargetRole);
+    }
+
+    #[test]
+    fn strategy_three_times_with_conflict_escalates_to_contract() {
+        // AC3: a recurring inter-artifact (test/impl) conflict escalates to
+        // contract arbitration.
+        let mut policy = NoProgressRecoveryPolicy::new();
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        assert_eq!(
+            policy.classify_strategy(
+                SCOPE_A,
+                ArtifactRole::Implementation,
+                &[ArtifactRole::Implementation, ArtifactRole::Test],
+                true,
+            ),
+            RecoveryStrategy::EscalateToContractConflict
+        );
+    }
+
+    #[test]
+    fn strategy_three_times_without_conflict_rebuilds_scaffold() {
+        let mut policy = NoProgressRecoveryPolicy::new();
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        assert_eq!(
+            policy.classify_strategy(
+                SCOPE_A,
+                ArtifactRole::Implementation,
+                &[ArtifactRole::Implementation, ArtifactRole::Test],
+                false,
+            ),
+            RecoveryStrategy::EscalateToScaffoldRebuild
+        );
+    }
+
+    #[test]
+    fn strategy_operator_missing_when_no_alternate_role() {
+        // AC4: a single-role cluster exhausting its only role yields the
+        // structured operator-missing strategy.
+        let mut policy = NoProgressRecoveryPolicy::new();
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        policy.record_no_progress(SCOPE_A, ArtifactRole::Implementation, "src/lib.rs");
+        // Only Implementation is a candidate, and it is now role-banned.
+        assert_eq!(
+            policy.classify_strategy(
+                SCOPE_A,
+                ArtifactRole::Implementation,
+                &[ArtifactRole::Implementation],
+                false,
+            ),
+            RecoveryStrategy::OperatorMissing
+        );
+        // Coherent with the terminal classification.
+        assert_eq!(
+            policy.classify_exhaustion(SCOPE_A, &[ArtifactRole::Implementation]),
+            Some(NoProgressExhaustionReason::OperatorMissing)
+        );
+    }
+
+    #[test]
+    fn strategy_labels_are_stable() {
+        assert_eq!(
+            RecoveryStrategy::RetryDeterministicOperator.as_str(),
+            "retry_deterministic_operator"
+        );
+        assert_eq!(
+            RecoveryStrategy::SwitchTargetRole.as_str(),
+            "switch_target_role"
+        );
+        assert_eq!(
+            RecoveryStrategy::RouteToEvidenceBinding.as_str(),
+            "route_to_evidence_binding"
+        );
+        assert_eq!(
+            RecoveryStrategy::EscalateToContractConflict.as_str(),
+            "escalate_to_contract_conflict"
+        );
+        assert_eq!(
+            RecoveryStrategy::EscalateToScaffoldRebuild.as_str(),
+            "escalate_to_scaffold_rebuild"
+        );
+        assert_eq!(
+            RecoveryStrategy::OperatorMissing.as_str(),
+            "operator_missing"
+        );
     }
 }
