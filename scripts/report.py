@@ -500,6 +500,224 @@ TRANSITION_RATE_METRICS = (
     "deterministic_operator_hit",
 )
 
+# Issue #1007: repair-to-pass lifecycle metrics. These collapse the per-run
+# `failure_observation` projection + recovery-strategy counts (plus the optional
+# `worker_lifecycle` bools, when emitted) into a funnel that shows *where in the
+# lifecycle* runs get stuck rather than only the terminal pass rate. report.py
+# does not import analyze_run.py (it shells out per run), so the terminal-state
+# vocabulary the predicates need is restated locally here. The labels are kept
+# aligned with `analyze_run.py` generic terminal states.
+#
+# Reaching any of these terminals implies a deliverable was actually produced
+# (the run advanced past the scaffold/deliverable stage).
+_POST_DELIVERABLE_TERMINAL_STATES = frozenset(
+    {
+        "completed",
+        "missing_evidence",
+        "evidence_runner_missing",
+        "evidence_binding_failed",
+        "evidence_failed",
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }
+)
+# Terminals that imply an evidence runner bound AND executed. Note this EXCLUDES
+# `evidence_binding_failed` (runner could not bind) and `evidence_runner_missing`
+# (no runner at all) — those are exactly the not-runnable cases.
+_EVIDENCE_RUNNABLE_TERMINAL_STATES = frozenset(
+    {
+        "completed",
+        "evidence_failed",
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }
+)
+# Terminals that imply a repair loop ran against a failing diagnostic.
+_REPAIR_REACHED_TERMINAL_STATES = frozenset(
+    {
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }
+)
+
+
+def _obs_int(obs: dict, key: str) -> int | None:
+    value = obs.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _lifecycle_passed_deliverable(obs: dict, row: dict) -> bool:
+    """True when the run produced its deliverable (scaffold complete).
+
+    Prefers the explicit `worker_lifecycle.deliverable_created` bool when the
+    eval log emits it; otherwise falls back to terminal-state / generated-file
+    signals. A `missing_deliverable` terminal is a hard False.
+    """
+    created = row.get("deliverable_created")
+    if isinstance(created, bool):
+        return created
+    if obs.get("missing_deliverable") is True:
+        return False
+    if obs.get("terminal_state") in _POST_DELIVERABLE_TERMINAL_STATES:
+        return True
+    generated = _obs_int(obs, "generated_file_count")
+    return generated is not None and generated > 0
+
+
+def _lifecycle_evidence_runnable(obs: dict, row: dict) -> bool:
+    """True when an evidence runner bound and ran for the run.
+
+    Prefers `worker_lifecycle.runner_bound`; otherwise uses the
+    `evidence_runner_executed` flag or a runner-ran terminal state. Binding
+    failures and runner-missing terminals are not runnable.
+    """
+    bound = row.get("runner_bound")
+    if isinstance(bound, bool):
+        return bound
+    if obs.get("evidence_runner_executed") is True:
+        return True
+    return obs.get("terminal_state") in _EVIDENCE_RUNNABLE_TERMINAL_STATES
+
+
+def _lifecycle_reached_repair(obs: dict, row: dict) -> bool:
+    """True when the run entered the repair/recovery loop.
+
+    Signals: `worker_lifecycle.repair_applied`, a non-zero `repair_count` on the
+    failure observation (which falls back to the controller recovery-strategy
+    count when the eval log does not emit an explicit repair count), or a repair
+    terminal state.
+    """
+    if row.get("repair_applied") is True:
+        return True
+    repair_count = _obs_int(obs, "repair_count")
+    if repair_count is not None and repair_count >= 1:
+        return True
+    return obs.get("terminal_state") in _REPAIR_REACHED_TERMINAL_STATES
+
+
+def _lifecycle_run_passed(obs: dict, row: dict) -> bool:
+    """True when the run ultimately passed (postcheck success / completed)."""
+    ps = obs.get("postcheck_success")
+    if isinstance(ps, bool):
+        return ps
+    ps = row.get("postcheck_success")
+    if isinstance(ps, bool):
+        return ps
+    return obs.get("terminal_state") == "completed"
+
+
+def _lifecycle_strategy_switches(row: dict) -> int:
+    """Number of controller recovery-strategy switches for the run.
+
+    `recovery_strategy_count` is the count of *distinct* controller strategies
+    attempted (deduped at source), so the number of switches is that count minus
+    the initial strategy. Falls back to the deduped label-list length.
+    """
+    count = row.get("recovery_strategy_count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        strategies = row.get("recovery_strategies")
+        count = len(strategies) if isinstance(strategies, list) else 0
+    return max(0, count - 1)
+
+
+def _lifecycle_operator_missing(obs: dict, row: dict) -> bool:
+    """True when recovery exhausted with no deterministic operator available.
+
+    Mirrors the agent-side `NoProgressExhaustionReason::OperatorMissing` intent:
+    the repair loop ran out of road and no deterministic operator ever fired.
+    """
+    terminal = obs.get("terminal_state")
+    recovery_exhausted = (
+        terminal in _REPAIR_REACHED_TERMINAL_STATES
+        or obs.get("failure_class") == "recovery_exhausted"
+    )
+    if not recovery_exhausted:
+        return False
+    return obs.get("deterministic_operator_hit") is not True
+
+
+def _lifecycle_observation_rows(rows: list[dict]) -> list[dict]:
+    return [
+        row
+        for row in rows
+        if not row.get("_failed") and isinstance(row.get("failure_observation"), dict)
+    ]
+
+
+def _lifecycle_metrics(rows: list[dict]) -> dict:
+    """Aggregate per-run lifecycle signals into repair-to-pass funnel metrics.
+
+    The denominator (``runs``) is every analyzed run that carries a
+    ``failure_observation`` (successful runs included, exactly like
+    :func:`_transition_metrics`), so each rate is comparable across reports.
+    """
+    observed = _lifecycle_observation_rows(rows)
+    total = len(observed)
+    scaffold_ok = 0
+    evidence_ok = 0
+    binding_failures = 0
+    repair_reached = 0
+    repair_converted = 0
+    same_failure_repeated = 0
+    strategy_switches = 0
+    operator_missing = 0
+    for row in observed:
+        obs = row["failure_observation"]
+        if _lifecycle_passed_deliverable(obs, row):
+            scaffold_ok += 1
+        if _lifecycle_evidence_runnable(obs, row):
+            evidence_ok += 1
+        if obs.get("terminal_state") == "evidence_binding_failed":
+            binding_failures += 1
+        if _lifecycle_reached_repair(obs, row):
+            repair_reached += 1
+            if _lifecycle_run_passed(obs, row):
+                repair_converted += 1
+        if obs.get("same_diagnostic_repeated") is True:
+            same_failure_repeated += 1
+        strategy_switches += _lifecycle_strategy_switches(row)
+        if _lifecycle_operator_missing(obs, row):
+            operator_missing += 1
+    return {
+        "runs": total,
+        "first_pass_scaffold_complete": {
+            "ok": scaffold_ok,
+            "total": total,
+            "rate": _ratio(scaffold_ok, total),
+        },
+        "first_evidence_runnable": {
+            "ok": evidence_ok,
+            "total": total,
+            "rate": _ratio(evidence_ok, total),
+        },
+        "binding_failure_count": binding_failures,
+        "repair_loop_reached": repair_reached,
+        "repair_to_pass_conversion": {
+            "reached": repair_reached,
+            "converted": repair_converted,
+            "rate": _ratio(repair_converted, repair_reached),
+        },
+        "same_failure_repeated_count": same_failure_repeated,
+        "strategy_switch_count": strategy_switches,
+        "operator_missing_count": operator_missing,
+    }
+
+
+def _lifecycle_metrics_by_task_kind(rows: list[dict]) -> list[dict]:
+    """Per-task_kind lifecycle metrics (Issue #1007 AC4)."""
+    groups: dict[str, list[dict]] = {}
+    for row in _lifecycle_observation_rows(rows):
+        kind = str(row.get("task_kind", "coding"))
+        groups.setdefault(kind, []).append(row)
+    out: list[dict] = []
+    for kind in sorted(groups):
+        item: dict = {"task_kind": kind}
+        item.update(_lifecycle_metrics(groups[kind]))
+        out.append(item)
+    return out
+
 
 def _transition_metrics(rows: list[dict]) -> dict:
     """Aggregate per-run failure_observation flags into transition metrics.
@@ -939,6 +1157,81 @@ def _render_transition_metrics_summary(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _fmt_conversion_cell(stat: dict) -> str:
+    reached = stat.get("reached", 0)
+    converted = stat.get("converted", 0)
+    rate = stat.get("rate")
+    pct = "N/A" if not isinstance(rate, (int, float)) else f"{rate * 100:.0f}%"
+    return f"{converted}/{reached} ({pct})"
+
+
+_LIFECYCLE_BY_KIND_HEADERS = (
+    "task_kind",
+    "runs",
+    "first_pass_scaffold_complete",
+    "first_evidence_runnable",
+    "binding_failure_count",
+    "repair_loop_reached",
+    "repair_to_pass_conversion",
+    "same_failure_repeated_count",
+    "strategy_switch_count",
+    "operator_missing_count",
+)
+
+
+def _render_lifecycle_metrics_summary(rows: list[dict]) -> list[str]:
+    metrics = _lifecycle_metrics(rows)
+    lines = ["## Lifecycle Metrics", ""]
+    if metrics["runs"] == 0:
+        lines.append("(no completed analyses)")
+        return lines
+    lines.append("| metric | value |")
+    lines.append("|-----|-----|")
+    lines.append(f"| runs | {metrics['runs']} |")
+    lines.append(
+        f"| first_pass_scaffold_complete | "
+        f"{_fmt_rate_cell(metrics['first_pass_scaffold_complete'])} |"
+    )
+    lines.append(
+        f"| first_evidence_runnable | "
+        f"{_fmt_rate_cell(metrics['first_evidence_runnable'])} |"
+    )
+    lines.append(f"| binding_failure_count | {metrics['binding_failure_count']} |")
+    lines.append(f"| repair_loop_reached | {metrics['repair_loop_reached']} |")
+    lines.append(
+        f"| repair_to_pass_conversion | "
+        f"{_fmt_conversion_cell(metrics['repair_to_pass_conversion'])} |"
+    )
+    lines.append(
+        f"| same_failure_repeated_count | {metrics['same_failure_repeated_count']} |"
+    )
+    lines.append(f"| strategy_switch_count | {metrics['strategy_switch_count']} |")
+    lines.append(f"| operator_missing_count | {metrics['operator_missing_count']} |")
+
+    by_kind = _lifecycle_metrics_by_task_kind(rows)
+    if by_kind:
+        lines.append("")
+        lines.append("### Lifecycle Metrics By Task Kind")
+        lines.append("")
+        lines.append("| " + " | ".join(_LIFECYCLE_BY_KIND_HEADERS) + " |")
+        lines.append("|" + "|".join("-----" for _ in _LIFECYCLE_BY_KIND_HEADERS) + "|")
+        for item in by_kind:
+            cells = [
+                _md_escape_cell(str(item["task_kind"])),
+                str(item["runs"]),
+                _fmt_rate_cell(item["first_pass_scaffold_complete"]),
+                _fmt_rate_cell(item["first_evidence_runnable"]),
+                str(item["binding_failure_count"]),
+                str(item["repair_loop_reached"]),
+                _fmt_conversion_cell(item["repair_to_pass_conversion"]),
+                str(item["same_failure_repeated_count"]),
+                str(item["strategy_switch_count"]),
+                str(item["operator_missing_count"]),
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
 def _worker_lifecycle_rows(rows: list[dict]) -> list[dict]:
     lifecycle_keys = {
         "worker_kind",
@@ -1014,6 +1307,8 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
         parts.append("")
         parts.extend(_render_transition_metrics_summary(rows))
         parts.append("")
+        parts.extend(_render_lifecycle_metrics_summary(rows))
+        parts.append("")
         if _worker_lifecycle_rows(rows):
             parts.extend(_render_worker_lifecycle_summary(rows))
             parts.append("")
@@ -1072,6 +1367,9 @@ def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
         ),
         "by_failure_authority": _grouped_quality(analyzed, ["failure_authority"]),
         "transition_metrics": _transition_metrics(analyzed),
+        # Issue #1007: repair-to-pass lifecycle funnel + TaskKind breakdown.
+        "lifecycle_metrics": _lifecycle_metrics(analyzed),
+        "lifecycle_metrics_by_task_kind": _lifecycle_metrics_by_task_kind(analyzed),
     }
     return json.dumps(out, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
 

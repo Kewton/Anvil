@@ -92,3 +92,23 @@ Generated: 2026-06-02T03:27:36+00:00
 |-----|-----|
 | none | 3 |
 | unknown | 1 |
+
+## Lifecycle Metrics
+
+| metric | value |
+|-----|-----|
+| runs | 4 |
+| first_pass_scaffold_complete | 4/4 (100%) |
+| first_evidence_runnable | 3/4 (75%) |
+| binding_failure_count | 0 |
+| repair_loop_reached | 0 |
+| repair_to_pass_conversion | 0/0 (N/A) |
+| same_failure_repeated_count | 0 |
+| strategy_switch_count | 0 |
+| operator_missing_count | 0 |
+
+### Lifecycle Metrics By Task Kind
+
+| task_kind | runs | first_pass_scaffold_complete | first_evidence_runnable | binding_failure_count | repair_loop_reached | repair_to_pass_conversion | same_failure_repeated_count | strategy_switch_count | operator_missing_count |
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+| coding | 4 | 4/4 (100%) | 3/4 (75%) | 0 | 0 | 0/0 (N/A) | 0 | 0 | 0 |
