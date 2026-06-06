@@ -286,14 +286,13 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "web app",
             "frontend",
             "front-end",
-            "ui",
-            "ux",
             "画面",
             "アプリ",
             "ゲーム",
             "フロントエンド",
         ],
-    );
+    ) || contains_ascii_token(&lower, "ui")
+        || contains_ascii_token(&lower, "ux");
     let explicit_ui_framework = contains_any(
         &lower,
         &["next.js", "nextjs", "react", "nuxt", "vue", "vite", "tsx"],
@@ -442,7 +441,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     if explicit_edit {
         candidates.push(WorkModeCandidate {
             work_mode: WorkMode::GenericCode,
-            intent: "code",
+            intent: "generic-edit",
             confidence: 0.7,
             evidence: vec!["edit-intent"],
         });
@@ -508,7 +507,7 @@ fn mode_reason(mode: WorkMode) -> &'static str {
             "UI, frontend, TypeScript, or browser app signals outscore alternatives"
         }
         WorkMode::GenericCode => {
-            "request has edit intent without a specific language or artifact mode"
+            "request has generic file-edit or artifact intent without a more specific mode"
         }
         WorkMode::Unknown | WorkMode::Auto => "request lacks enough mode-specific signals",
     }
@@ -816,6 +815,32 @@ mod tests {
             infer_work_mode_from_text("docs/ui-guidelines.mdを更新してください"),
             WorkMode::Docs
         );
+    }
+
+    #[test]
+    fn mode_classifier_does_not_treat_required_artifacts_as_ui_signal() {
+        let classification = classify_work_mode_json(
+            r#"Create summary.json only. STATE_CONTROL_PACKET {"required_artifacts":[{"path":"summary.json","role":"data"}]}. Write valid JSON."#,
+        );
+
+        assert_eq!(classification.work_mode, WorkMode::GenericCode);
+        assert_eq!(classification.intent, "generic-edit");
+        assert!(
+            !classification
+                .alternatives
+                .iter()
+                .any(|candidate| candidate.work_mode == WorkMode::TypeScriptUi),
+            "unexpected UI candidate from required_artifacts: {:?}",
+            classification.alternatives
+        );
+    }
+
+    #[test]
+    fn mode_classifier_still_detects_explicit_ui_token() {
+        let classification = classify_work_mode_json("UI artifactを作成してください");
+
+        assert_eq!(classification.work_mode, WorkMode::TypeScriptUi);
+        assert!(classification.evidence.contains(&"ui-or-frontend-signal"));
     }
 
     #[test]
