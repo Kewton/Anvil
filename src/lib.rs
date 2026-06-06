@@ -67,10 +67,11 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         return sessions_cli::dispatch(&state_root, &workspace_key, &workspace_root, action);
     }
 
-    let (config, warnings) = Config::load(args)?;
+    let (mut config, warnings) = Config::load(args)?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
+    config.cwd = ensure_workspace_root(&config.cwd)?;
 
     let state_root = resolve_state_root(&config)?;
     let workspace_key = compute_workspace_key(&config.cwd);
@@ -317,6 +318,25 @@ pub fn resolve_state_root(config: &Config) -> Result<PathBuf, String> {
     }
 }
 
+pub fn ensure_workspace_root(cwd: &Path) -> Result<PathBuf, String> {
+    if cwd.exists() && !cwd.is_dir() {
+        return Err(format!(
+            "workspace root is not a directory: {}",
+            cwd.display()
+        ));
+    }
+    if !cwd.exists() {
+        std::fs::create_dir_all(cwd)
+            .map_err(|err| format!("failed to create workspace root {}: {err}", cwd.display()))?;
+    }
+    std::fs::canonicalize(cwd).map_err(|err| {
+        format!(
+            "failed to canonicalize workspace root {}: {err}",
+            cwd.display()
+        )
+    })
+}
+
 pub fn compute_workspace_key(cwd: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -444,8 +464,30 @@ fn create_symlink_best_effort(link: &Path, target: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_state_dirs, symlink_anvil_dirs};
+    use super::{ensure_state_dirs, ensure_workspace_root, symlink_anvil_dirs};
     use tempfile::tempdir;
+
+    #[test]
+    fn ensure_workspace_root_creates_missing_root_and_returns_canonical_path() {
+        let parent = tempdir().unwrap();
+        let missing = parent.path().join("greenfield").join("app");
+
+        let ensured = ensure_workspace_root(&missing).unwrap();
+
+        assert!(missing.is_dir());
+        assert_eq!(ensured, missing.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn ensure_workspace_root_rejects_file_path() {
+        let parent = tempdir().unwrap();
+        let file_path = parent.path().join("not-a-dir");
+        std::fs::write(&file_path, "x").unwrap();
+
+        let err = ensure_workspace_root(&file_path).unwrap_err();
+
+        assert!(err.contains("workspace root is not a directory"));
+    }
 
     #[test]
     fn symlink_anvil_dirs_does_not_create_anvil_dir_implicitly() {
