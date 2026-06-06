@@ -106,11 +106,11 @@ pub struct EvalRecord {
     /// (`TaskContract.task_kind.as_str()`), post-set from the agent layer.
     ///
     /// DR3-002: the session layer never imports the agent `TaskKind` enum; the
-    /// agent passes a plain string. This is deliberately DISTINCT from
-    /// `evaluation_taxonomy.task_kind` (the eval-side prompt heuristic) — it is
-    /// the agent's actual routing decision. `None` when no per-turn
-    /// classification authority existed (e.g. answer-only / plan turns).
-    /// `analyze_run.py` reads this top-level field for the R5 misroute gate.
+    /// agent passes a plain string. `evaluation_taxonomy.task_kind` prefers this
+    /// value when present and falls back to the eval-side prompt heuristic when
+    /// no per-turn classification authority existed (e.g. answer-only / plan
+    /// turns). `analyze_run.py` also reads this top-level field for the R5
+    /// misroute gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classified_task_kind: Option<String>,
 }
@@ -365,6 +365,7 @@ impl EvalRecord {
             &self.final_outcome,
             &self.changed_file_classes,
             self.terminal_diagnostics.as_ref(),
+            self.classified_task_kind.as_deref(),
             self.pam_eval.as_ref(),
         );
     }
@@ -545,6 +546,7 @@ pub fn build_eval_record_with_terminal_context(
         final_outcome,
         &changed_file_classes,
         terminal_diagnostics.as_ref(),
+        None,
         None,
     );
 
@@ -833,13 +835,17 @@ fn build_evaluation_taxonomy(
     final_outcome: &str,
     changed_file_classes: &ChangedFileClasses,
     terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
+    classified_task_kind: Option<&str>,
     pam_eval: Option<&PamEvalSummary>,
 ) -> EvaluationTaxonomySummary {
     let failure_authority =
         failure_authority_for_eval(final_outcome, changed_file_classes, terminal_diagnostics);
     EvaluationTaxonomySummary {
         pam_variant: pam_variant_for_eval(pam_eval).to_string(),
-        task_kind: infer_eval_task_kind(task).to_string(),
+        task_kind: classified_task_kind
+            .and_then(normalize_classified_task_kind_for_eval)
+            .unwrap_or_else(|| infer_eval_task_kind(task))
+            .to_string(),
         anvil_terminal_class: if final_outcome == "done" {
             "success".to_string()
         } else {
@@ -847,6 +853,18 @@ fn build_evaluation_taxonomy(
         },
         outcome_agreement: "external_postcheck_unavailable".to_string(),
         failure_authority: failure_authority.to_string(),
+    }
+}
+
+fn normalize_classified_task_kind_for_eval(raw: &str) -> Option<&'static str> {
+    match raw {
+        "coding" => Some("coding"),
+        "docs" => Some("docs"),
+        "data" => Some("data"),
+        "research" => Some("research"),
+        "ops" => Some("ops"),
+        "authoring" => Some("authoring"),
+        _ => None,
     }
 }
 
@@ -1115,6 +1133,7 @@ mod tests {
                     1,
                 )),
                 None,
+                None,
             ),
             completion_reason: "verifier_evidence_satisfied".to_string(),
             final_outcome: "done".to_string(),
@@ -1275,6 +1294,70 @@ mod tests {
         rec.refresh_evaluation_taxonomy();
 
         assert_eq!(rec.evaluation_taxonomy.task_kind, "data");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_prefers_classified_task_kind_when_available() {
+        let mut rec = build_eval_record(
+            "sess-data-002",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "coding");
+
+        rec.classified_task_kind = Some("data".to_string());
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "data");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_ignores_unknown_classified_task_kind() {
+        let mut rec = build_eval_record(
+            "sess-docs-001",
+            12345,
+            "Update README.md with usage documentation",
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+
+        rec.classified_task_kind = Some("not-a-kind".to_string());
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
     }
 
     #[test]
