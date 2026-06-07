@@ -1545,6 +1545,33 @@ impl ObjectiveLifecycleStage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObjectiveEvidenceStage {
+    MissingEvidence { evidence_kind: EvidenceSpec },
+    SatisfiedOrNotRequired,
+}
+
+impl ObjectiveEvidenceStage {
+    fn into_recovery_action(
+        self,
+        missing_verifier_suppress_retry: bool,
+    ) -> Option<ArtifactRecoveryAction> {
+        match self {
+            ObjectiveEvidenceStage::MissingEvidence { .. } => {
+                // Once a MissingVerifierJob is in flight and no in-scope edit
+                // has landed, ask for repair instead of re-triggering the same
+                // missing-evidence loop.
+                if missing_verifier_suppress_retry {
+                    Some(ArtifactRecoveryAction::RepairArtifact { target_hint: None })
+                } else {
+                    Some(ArtifactRecoveryAction::RunVerifier)
+                }
+            }
+            ObjectiveEvidenceStage::SatisfiedOrNotRequired => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #636: behavior coverage judgement (private to task_contract).
 // ---------------------------------------------------------------------------
@@ -1835,19 +1862,15 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
         )
     });
 
-    if !verifier_passed
-        && (inputs.contract.verification_required
-            || (existing_unverified_used && code_or_test_required))
+    if let Some(action) = objective_evidence_stage(
+        &inputs,
+        verifier_passed,
+        existing_unverified_used,
+        code_or_test_required,
+    )
+    .into_recovery_action(inputs.missing_verifier_suppress_retry)
     {
-        // Issue #646 (A1/B2): once a MissingVerifierJob is in flight and no
-        // in-scope edit has landed, refuse to re-trigger RunVerifier. The
-        // model needs to first produce an in-scope verifier or implementation
-        // edit; without this gate the NoVerifier → RunVerifier → NoVerifier
-        // loop runs until `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`.
-        if inputs.missing_verifier_suppress_retry {
-            return ArtifactRecoveryAction::RepairArtifact { target_hint: None };
-        }
-        return ArtifactRecoveryAction::RunVerifier;
+        return action;
     }
 
     // Issue #651 Phase 5: when the caller has populated the SSOT
@@ -1894,6 +1917,26 @@ fn objective_deliverable_stage(
         ),
         missing,
     }
+}
+
+fn objective_evidence_stage(
+    inputs: &ArtifactRecoveryInputs<'_>,
+    verifier_passed: bool,
+    existing_unverified_used: bool,
+    code_or_test_required: bool,
+) -> ObjectiveEvidenceStage {
+    if verifier_passed {
+        return ObjectiveEvidenceStage::SatisfiedOrNotRequired;
+    }
+
+    if inputs.contract.verification_required || (existing_unverified_used && code_or_test_required)
+    {
+        return ObjectiveEvidenceStage::MissingEvidence {
+            evidence_kind: inputs.contract.objective_contract().evidence_kind,
+        };
+    }
+
+    ObjectiveEvidenceStage::SatisfiedOrNotRequired
 }
 
 fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRole) -> bool {
@@ -7732,6 +7775,86 @@ mod tests {
                     ObjectiveLifecycleStage::MissingDeliverable { ref missing, .. }
                         if missing == &vec![role]
                 ),
+                "request={request}"
+            );
+        }
+    }
+
+    #[test]
+    fn objective_evidence_stage_uses_objective_evidence_kind_for_missing_coding_evidence() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+            ArtifactState::exists(ArtifactRole::Implementation, "src/lib.rs"),
+        ];
+        let excerpts = ArtifactExcerpts::new();
+        let repair_state = VerifierRepairState::None;
+        let inputs = ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        };
+
+        let stage = objective_evidence_stage(&inputs, false, false, true);
+
+        assert_eq!(
+            stage,
+            ObjectiveEvidenceStage::MissingEvidence {
+                evidence_kind: ObjectiveEvidenceKind::TestRun
+            }
+        );
+        assert_eq!(
+            stage.clone().into_recovery_action(false),
+            Some(ArtifactRecoveryAction::RunVerifier)
+        );
+        assert_eq!(
+            stage.into_recovery_action(true),
+            Some(ArtifactRecoveryAction::RepairArtifact { target_hint: None })
+        );
+    }
+
+    #[test]
+    fn objective_evidence_stage_is_satisfied_or_not_required_for_docs_and_data() {
+        let cases = [
+            (
+                "Update README.md with installation and usage sections.",
+                ObjectiveEvidenceKind::ContentCheck,
+            ),
+            (
+                "Generate output.csv with columns Category and Total.",
+                ObjectiveEvidenceKind::SchemaCheck,
+            ),
+        ];
+
+        for (request, evidence_kind) in cases {
+            let contract = TaskContract::from_request(request);
+            assert_eq!(contract.objective_contract().evidence_kind, evidence_kind);
+            let evidence = EvidenceSet::new();
+            let excerpts = ArtifactExcerpts::new();
+            let repair_state = VerifierRepairState::None;
+            let inputs = ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &[],
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            };
+
+            assert_eq!(
+                objective_evidence_stage(&inputs, false, false, false),
+                ObjectiveEvidenceStage::SatisfiedOrNotRequired,
                 "request={request}"
             );
         }
