@@ -27,6 +27,7 @@ pub(super) enum GeneratedTestPreflightFailureKind {
     BrittleRustBinaryProbe,
     UnsupportedContractAssertion,
     MissingContractCoverage,
+    SelfReferentialVerifier,
 }
 
 impl GeneratedTestPreflightFailureKind {
@@ -41,6 +42,7 @@ impl GeneratedTestPreflightFailureKind {
             Self::BrittleRustBinaryProbe => "test_bug",
             Self::UnsupportedContractAssertion => "test_bug",
             Self::MissingContractCoverage => "test_bug",
+            Self::SelfReferentialVerifier => "test_bug",
         }
     }
 
@@ -55,6 +57,7 @@ impl GeneratedTestPreflightFailureKind {
             Self::BrittleRustBinaryProbe => "brittle_rust_binary_probe",
             Self::UnsupportedContractAssertion => "unsupported_contract_assertion",
             Self::MissingContractCoverage => "missing_contract_coverage",
+            Self::SelfReferentialVerifier => "self_referential_verifier",
         }
     }
 }
@@ -200,6 +203,17 @@ fn generated_test_preflight_with_source(
             relative_path,
             GeneratedTestPreflightFailureKind::UnsupportedContractAssertion,
             "generated test asserts non-ASCII behavior not present in the task contract",
+        ));
+    }
+    if let Some(command) = super::node_test_evidence_quality::self_referential_node_verifier_command(
+        work_root,
+        relative_path,
+        &source,
+    ) {
+        return Err(diagnostic(
+            relative_path,
+            GeneratedTestPreflightFailureKind::SelfReferentialVerifier,
+            &format!("generated JS test recursively invokes its verifier command: {command}"),
         ));
     }
     if rust_test_requires_cargo_manifest(relative_path, &source)
@@ -1061,6 +1075,85 @@ fn runs_cli() {
 
         generated_test_preflight(root.path(), &contract, "tests/index.test.js")
             .expect("valid package.json should not block JS tests");
+    }
+
+    #[test]
+    fn preflight_rejects_javascript_test_that_recursively_runs_npm_test() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_valid_package_manifest(root.path());
+        write_test_file(
+            root.path(),
+            "tests/index.test.js",
+            r#"import test from 'node:test';
+import { execSync } from 'node:child_process';
+
+test('verifier smoke', () => {
+  execSync('npm test', { stdio: 'inherit' });
+});
+"#,
+        );
+        let contract =
+            TaskContract::from_request("Implement a Node JSON formatter CLI and add tests");
+        let err = generated_test_preflight(root.path(), &contract, "tests/index.test.js")
+            .expect_err("recursive npm verifier must be rejected");
+
+        assert_eq!(
+            err.failure_kind,
+            GeneratedTestPreflightFailureKind::SelfReferentialVerifier
+        );
+        assert_eq!(err.failure_kind.reason_code(), "self_referential_verifier");
+    }
+
+    #[test]
+    fn preflight_rejects_javascript_test_that_recursively_runs_node_test() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_valid_package_manifest(root.path());
+        write_test_file(
+            root.path(),
+            "tests/index.test.js",
+            r#"import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+
+test('verifier smoke', () => {
+  spawnSync('node', ['--test'], { stdio: 'inherit' });
+});
+"#,
+        );
+        let contract =
+            TaskContract::from_request("Implement a Node JSON formatter CLI and add tests");
+        let err = generated_test_preflight(root.path(), &contract, "tests/index.test.js")
+            .expect_err("recursive node verifier must be rejected");
+
+        assert_eq!(
+            err.failure_kind,
+            GeneratedTestPreflightFailureKind::SelfReferentialVerifier
+        );
+    }
+
+    #[test]
+    fn preflight_allows_javascript_test_that_invokes_sut_cli() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_valid_package_manifest(root.path());
+        write_test_file(
+            root.path(),
+            "tests/index.test.js",
+            r#"import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+
+test('formats json through the cli', () => {
+  const output = execFileSync('node', ['src/index.js'], {
+    input: '{"b":2,"a":1}'
+  }).toString();
+  assert.equal(output.trim(), '{"a":1,"b":2}');
+});
+"#,
+        );
+        let contract =
+            TaskContract::from_request("Implement a Node JSON formatter CLI and add tests");
+
+        generated_test_preflight(root.path(), &contract, "tests/index.test.js")
+            .expect("SUT child-process invocation should remain valid verifier evidence");
     }
 
     #[test]

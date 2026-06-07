@@ -76,6 +76,7 @@ mod active_job_arbiter;
 // in-crate consumer via `super::actor_loop_flow::*`.
 mod actor_loop_flow;
 mod cargo_manifest_summary;
+mod node_test_evidence_quality;
 mod package_manifest_summary;
 // Anti-pattern extraction + retrieval flow extracted from `turn.rs`
 // (parent #680). Hosts `maybe_extract_anti_pattern` and
