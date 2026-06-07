@@ -332,6 +332,15 @@ fn parse_json_relaxed(raw: &str) -> Option<Value> {
         if let Some(parsed) = repair_json_candidate(&candidate) {
             return Some(parsed);
         }
+        let escaped_control_chars = escape_control_chars_in_json_strings(&candidate);
+        if escaped_control_chars != candidate {
+            if let Ok(parsed) = serde_json::from_str(&escaped_control_chars) {
+                return Some(parsed);
+            }
+            if let Some(parsed) = repair_json_candidate(&escaped_control_chars) {
+                return Some(parsed);
+            }
+        }
         let balanced = balance_braces(&candidate);
         if balanced != candidate {
             if let Ok(parsed) = serde_json::from_str(&balanced) {
@@ -340,10 +349,51 @@ fn parse_json_relaxed(raw: &str) -> Option<Value> {
             if let Some(parsed) = repair_json_candidate(&balanced) {
                 return Some(parsed);
             }
+            let escaped_balanced = escape_control_chars_in_json_strings(&balanced);
+            if escaped_balanced != balanced {
+                if let Ok(parsed) = serde_json::from_str(&escaped_balanced) {
+                    return Some(parsed);
+                }
+                if let Some(parsed) = repair_json_candidate(&escaped_balanced) {
+                    return Some(parsed);
+                }
+            }
         }
     }
 
     None
+}
+
+fn escape_control_chars_in_json_strings(raw: &str) -> String {
+    let mut fixed = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            fixed.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => {
+                fixed.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                fixed.push(ch);
+                in_string = !in_string;
+            }
+            '\n' if in_string => fixed.push_str("\\n"),
+            '\r' if in_string => fixed.push_str("\\r"),
+            '\t' if in_string => fixed.push_str("\\t"),
+            ch if in_string && ch.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(fixed, "\\u{:04x}", ch as u32);
+            }
+            _ => fixed.push(ch),
+        }
+    }
+    fixed
 }
 
 fn balance_braces(raw: &str) -> String {
@@ -436,6 +486,11 @@ fn repair_json_candidate(raw: &str) -> Option<Value> {
     {
         return Some(parsed);
     }
+    if let Some(fixed) = repair_extra_terminal_closer(raw)
+        && let Ok(parsed) = serde_json::from_str(&fixed)
+    {
+        return Some(parsed);
+    }
 
     let without_commas = trailing_commas.replace_all(raw, "$1").into_owned();
     let quoted_keys = bare_keys.replace_all(&without_commas, "$1\"$2\"$3");
@@ -443,7 +498,23 @@ fn repair_json_candidate(raw: &str) -> Option<Value> {
     serde_json::from_str(&single_to_double).ok().or_else(|| {
         repair_terminal_bracket_swap(&single_to_double)
             .and_then(|fixed| serde_json::from_str(&fixed).ok())
+            .or_else(|| {
+                repair_extra_terminal_closer(&single_to_double)
+                    .and_then(|fixed| serde_json::from_str(&fixed).ok())
+            })
     })
+}
+
+fn repair_extra_terminal_closer(raw: &str) -> Option<String> {
+    let (curly, square, in_string) = bracket_balance(raw);
+    if in_string {
+        return None;
+    }
+    match (curly, square) {
+        (-1, 0) => remove_last_non_ws(raw, '}'),
+        (0, -1) => remove_last_non_ws(raw, ']'),
+        _ => None,
+    }
 }
 
 fn repair_terminal_bracket_swap(raw: &str) -> Option<String> {
@@ -480,6 +551,19 @@ fn bracket_balance(raw: &str) -> (i32, i32, bool) {
         }
     }
     (curly, square, in_string)
+}
+
+fn remove_last_non_ws(raw: &str, expected: char) -> Option<String> {
+    let (idx, ch) = raw
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    if ch != expected {
+        return None;
+    }
+    let mut fixed = raw.to_string();
+    fixed.remove(idx);
+    Some(fixed)
 }
 
 fn replace_last_non_ws(raw: &str, from: char, to: char) -> Option<String> {
@@ -604,6 +688,28 @@ mod tests {
         assert_eq!(
             tool_calls[0].arguments,
             json!({"path":"src/app/page.tsx","old_string":"old","new_string":"new"})
+        );
+    }
+
+    #[test]
+    fn extracts_edit_with_toml_array_header_in_string_argument() {
+        let allowed = vec!["Edit".to_string()];
+        let input = r#"<think>
+
+</think>
+
+<anvil_tool_call>{"name":"Edit","arguments":{"path":"Cargo.toml","old_string":"[package]\nname = \"password_strength\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"password_strength\"\npath = \"src/lib.rs\"","new_string":"[package]\nname = \"password_strength\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"password_strength\"\npath = \"src/lib.rs\"\n\n[[test]]\nname = \"password_strength_tests\"\npath = \"tests/password_strength.rs\""}}}</anvil_tool_call>"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Edit");
+        assert_eq!(tool_calls[0].arguments["path"], "Cargo.toml");
+        assert!(
+            tool_calls[0].arguments["new_string"]
+                .as_str()
+                .unwrap()
+                .contains("[[test]]")
         );
     }
 

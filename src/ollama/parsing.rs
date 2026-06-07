@@ -443,6 +443,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_generate_response_accepts_recovered_edit_with_nested_toml_arrays() {
+        let body = r#"{
+          "response":"<think>\n\n</think>\n\n<anvil_tool_call>{\"name\":\"Edit\",\"arguments\":{\"path\":\"Cargo.toml\",\"old_string\":\"[package]\\nname = \\\"password_strength\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\n\\n[lib]\\nname = \\\"password_strength\\\"\\npath = \\\"src/lib.rs\\\"\",\"new_string\":\"[package]\\nname = \\\"password_strength\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2021\\\"\\n\\n[lib]\\nname = \\\"password_strength\\\"\\npath = \\\"src/lib.rs\\\"\\n\\n[[test]]\\nname = \\\"password_strength_tests\\\"\\npath = \\\"tests/password_strength.rs\\\"\"}}}</anvil_tool_call>",
+          "done_reason":"stop"
+        }"#;
+        let reply = parse_generate_response(body, &["Edit".to_string()]).unwrap();
+
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "Edit");
+        assert_eq!(reply.tool_calls[0].arguments["path"], "Cargo.toml");
+        assert!(
+            reply.tool_calls[0].arguments["new_string"]
+                .as_str()
+                .unwrap()
+                .contains("[[test]]")
+        );
+    }
+
+    #[test]
     fn parse_chat_response_reads_native_tool_calls() {
         let body = r#"{
           "message": {
