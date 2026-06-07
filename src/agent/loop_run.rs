@@ -2099,6 +2099,11 @@ pub struct Agent {
     /// via `run_turn`), so the OnceCell idempotency + this cap together
     /// guarantee one dispatch per turn.
     pub(super) task_kind_confirm_called_this_turn: bool,
+    /// Per-turn cap for the ProjectProfile second-pass confirmation. This runs
+    /// at the same task-contract authority boundary as TaskKind confirmation,
+    /// but refines objective deliverable/evidence details rather than tool
+    /// policy or the coarse task kind.
+    pub(super) project_profile_confirm_called_this_turn: bool,
     /// Issue #579: per-turn cap for the FeedbackKind second-pass confirmation.
     /// Reset at the top of every `run_turn` (DR2-005), consumed only when the
     /// orchestrator actually dispatches to the sidecar LLM (i.e.
@@ -2764,6 +2769,7 @@ impl Agent {
             tester_called_this_turn: false,
             work_mode_confirm_called_this_turn: false,
             task_kind_confirm_called_this_turn: false,
+            project_profile_confirm_called_this_turn: false,
             feedback_kind_confirm_called_this_turn: false,
             quality_confirm_called_this_turn: false,
             last_quality_confirm_result: None,

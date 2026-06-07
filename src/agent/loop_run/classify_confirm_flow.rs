@@ -27,13 +27,19 @@ use super::feedback_kind_confirm::{
     self, FEEDBACK_KIND_CONFIRM_TIMEOUT_SECS, FeedbackKindConfirmInputs,
     FeedbackKindConfirmOutcome, run_feedback_kind_confirm_with_strategy,
 };
+use super::project_profile::{
+    self, PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD, PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS,
+    ProjectProfileConfirmation,
+};
 use super::quality::quality_first_pass_observation;
 use super::quality_confirm::{
     self, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmInputs, QualityConfirmOutcome,
     QualityConfirmation, QualityConfirmationSource, run_quality_confirm_with_strategy,
     should_request_quality_confirmation,
 };
-use super::task_contract::{TaskClassification, TaskKind};
+use super::task_contract::{
+    ArtifactRole, ProjectIntent, TaskClassification, TaskContract, TaskKind,
+};
 use super::task_kind_confirm::{
     self, TASK_KIND_CONFIRM_TIMEOUT_SECS, TaskKindConfirmInputs, TaskKindConfirmOutcome,
     TaskKindConfirmationSource, build_task_kind_confirm_log_payload,
@@ -46,7 +52,7 @@ use super::work_mode_confirm::{
 };
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{ModeClassification, WorkMode, classify_work_mode_json};
-use crate::session::feedback::FeedbackKind;
+use crate::session::feedback::{FeedbackKind, mask_secrets};
 use crate::session::store::ConversationMessage;
 
 /// Issue #576: SSoT wrapper that classifies user input with
@@ -625,6 +631,205 @@ fn run_task_kind_confirm_attempt(
     }
 }
 
+// ===========================================================================
+// ProjectProfile second-pass confirm dispatch.
+// ===========================================================================
+
+/// Confirm the objective profile behind the already-built first-pass
+/// `TaskContract`. This is intentionally narrower than WorkMode/TaskKind:
+/// WorkMode still decides tool access, TaskKind still decides the coarse task
+/// class, and ProjectProfile only adjusts objective-level deliverable/evidence
+/// details such as "README section, not environment setup".
+pub(super) fn maybe_invoke_project_profile_confirm(
+    agent: &mut Agent,
+    first_pass: &TaskContract,
+    raw_input: &str,
+    turn_index: usize,
+) -> Option<ProjectProfileConfirmation> {
+    let session_id = agent.session_store.session_id().to_string();
+    let sidecar_model = agent.models.sidecar.clone();
+    let env_disabled =
+        project_profile::project_profile_confirm_disabled(|k: &str| std::env::var(k));
+
+    if agent.project_profile_confirm_called_this_turn {
+        log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
+            status: "skipped",
+            session_id: &session_id,
+            sidecar_model: sidecar_model.as_deref(),
+            turn_index,
+            first_pass,
+            latency_ms: None,
+            reason: Some("per_turn_cap_consumed"),
+            profile: None,
+        });
+        return None;
+    }
+    if agent.session.mode_state.mode == crate::modes::plan_act::ExecutionMode::Plan {
+        log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
+            status: "skipped",
+            session_id: &session_id,
+            sidecar_model: sidecar_model.as_deref(),
+            turn_index,
+            first_pass,
+            latency_ms: None,
+            reason: Some("plan_mode"),
+            profile: None,
+        });
+        return None;
+    }
+    if env_disabled {
+        log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
+            status: "skipped",
+            session_id: &session_id,
+            sidecar_model: sidecar_model.as_deref(),
+            turn_index,
+            first_pass,
+            latency_ms: None,
+            reason: Some("env_disabled"),
+            profile: None,
+        });
+        return None;
+    }
+    if !should_request_project_profile_confirm(first_pass, raw_input) {
+        return None;
+    }
+
+    let Some(sidecar_name) = sidecar_model.as_ref() else {
+        log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
+            status: "fallback",
+            session_id: &session_id,
+            sidecar_model: None,
+            turn_index,
+            first_pass,
+            latency_ms: None,
+            reason: Some("sidecar_unavailable"),
+            profile: None,
+        });
+        return None;
+    };
+
+    agent.project_profile_confirm_called_this_turn = true;
+    let masked_input = mask_secrets(raw_input);
+    let project_intent = ProjectIntent::from_request(&masked_input);
+    let prompt = project_profile::build_project_profile_confirm_prompt(
+        &masked_input,
+        project_intent
+            .language
+            .unwrap_or(super::task_contract::ProjectLanguage::Unknown),
+        project_intent
+            .shape
+            .unwrap_or(super::task_contract::ProjectShape::Unknown),
+        &project_profile_first_pass_summary(first_pass),
+    );
+    let confirm_client = agent
+        .client
+        .clone_with_overrides(PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS, 768)
+        .ok();
+    let attempt_started = Instant::now();
+    let raw_reply = match confirm_client.as_ref() {
+        Some(c) => c
+            .chat_text(
+                sidecar_name,
+                &[ConversationMessage::user(prompt.to_string())],
+            )
+            .map(|reply| reply.content),
+        None => Err("client clone_with_overrides failed".to_string()),
+    };
+    let latency_ms = attempt_started.elapsed().as_millis() as u64;
+    let profile = raw_reply
+        .ok()
+        .and_then(|reply| project_profile::parse_project_profile_confirmation(&reply));
+    let adopted = profile
+        .as_ref()
+        .is_some_and(project_profile_confirmation_authoritative);
+    log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
+        status: if adopted { "confirmed" } else { "fallback" },
+        session_id: &session_id,
+        sidecar_model: sidecar_model.as_deref(),
+        turn_index,
+        first_pass,
+        latency_ms: Some(latency_ms),
+        reason: if adopted {
+            None
+        } else {
+            Some("unusable_or_low_confidence")
+        },
+        profile: profile.as_ref(),
+    });
+    profile.filter(project_profile_confirmation_authoritative)
+}
+
+fn should_request_project_profile_confirm(first_pass: &TaskContract, raw_input: &str) -> bool {
+    if first_pass.required_artifacts.is_empty() {
+        return false;
+    }
+    if raw_input.contains("STATE_CONTROL_PACKET") {
+        return false;
+    }
+    if first_pass.task_kind != TaskKind::Coding {
+        return true;
+    }
+    first_pass
+        .required_artifacts
+        .iter()
+        .chain(first_pass.optional_artifacts.iter())
+        .any(|role| matches!(role, ArtifactRole::UsageDocs | ArtifactRole::DataOutput))
+}
+
+fn project_profile_confirmation_authoritative(profile: &ProjectProfileConfirmation) -> bool {
+    profile.confidence >= PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD
+}
+
+fn project_profile_first_pass_summary(first_pass: &TaskContract) -> String {
+    format!(
+        "task_kind={}, intent={:?}, required_artifacts={:?}, optional_artifacts={:?}, verification_required={}",
+        first_pass.task_kind.as_str(),
+        first_pass.intent,
+        first_pass.required_artifacts,
+        first_pass.optional_artifacts,
+        first_pass.verification_required
+    )
+}
+
+struct ProjectProfileConfirmLogArgs<'a> {
+    status: &'static str,
+    session_id: &'a str,
+    sidecar_model: Option<&'a str>,
+    turn_index: usize,
+    first_pass: &'a TaskContract,
+    latency_ms: Option<u64>,
+    reason: Option<&'a str>,
+    profile: Option<&'a ProjectProfileConfirmation>,
+}
+
+fn log_project_profile_confirm_outcome(args: ProjectProfileConfirmLogArgs<'_>) {
+    log_llm_event(
+        "agent.project_profile.classified",
+        serde_json::json!({
+            "session_id": args.session_id,
+            "turn_index": args.turn_index,
+            "status": args.status,
+            "model": args.sidecar_model,
+            "first_pass_task_kind": args.first_pass.task_kind.as_str(),
+            "first_pass_required_artifacts": args.first_pass.required_artifacts.iter().map(|role| role.label()).collect::<Vec<_>>(),
+            "latency_ms": args.latency_ms,
+            "reason": args.reason,
+            "profile": args.profile.map(|profile| serde_json::json!({
+                "language": profile.language.map(|language| format!("{language:?}")),
+                "shape": profile.shape.map(|shape| format!("{shape:?}")),
+                "deliverable_kind": profile.deliverable_kind.map(|kind| format!("{kind:?}")),
+                "primary_artifacts": profile.primary_artifacts.clone(),
+                "forbidden_artifacts": profile.forbidden_artifacts.iter().map(|artifact| format!("{artifact:?}")).collect::<Vec<_>>(),
+                "evidence_kind": profile.evidence_kind.map(|kind| format!("{kind:?}")),
+                "needs_environment_setup": profile.needs_environment_setup,
+                "preferred_runner": profile.preferred_runner.clone(),
+                "confidence": profile.confidence,
+                "reason": profile.reason.clone(),
+            })),
+        }),
+    );
+}
+
 #[cfg(test)]
 mod objective_artifact_work_mode_tests {
     use super::*;
@@ -740,5 +945,44 @@ mod task_kind_preflight_tests {
             preflight_task_kind_skip_reason(false, ExecutionMode::Act, false),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod project_profile_confirm_tests {
+    use super::*;
+
+    #[test]
+    fn project_profile_confirm_requested_for_document_contract() {
+        let contract = TaskContract::from_request("Write README.md with setup and usage sections.");
+
+        assert!(should_request_project_profile_confirm(
+            &contract,
+            "Write README.md with setup and usage sections."
+        ));
+    }
+
+    #[test]
+    fn project_profile_confirm_skips_plain_coding_contract() {
+        let contract = TaskContract::from_request(
+            "Create a Rust library in src/lib.rs with tests and run cargo test.",
+        );
+
+        assert!(!should_request_project_profile_confirm(
+            &contract,
+            "Create a Rust library in src/lib.rs with tests and run cargo test."
+        ));
+    }
+
+    #[test]
+    fn project_profile_confirm_skips_state_packet_requests() {
+        let contract = TaskContract::from_request(
+            "STATE_CONTROL_PACKET {\"required_artifacts\":[]} Write README.md",
+        );
+
+        assert!(!should_request_project_profile_confirm(
+            &contract,
+            "STATE_CONTROL_PACKET {\"required_artifacts\":[]} Write README.md"
+        ));
     }
 }

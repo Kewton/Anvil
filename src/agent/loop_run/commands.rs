@@ -1319,6 +1319,9 @@ impl Agent {
         // classification memo, not a cap) is reset separately in
         // `handle_user_message`.
         self.task_kind_confirm_called_this_turn = false;
+        // ProjectProfile confirm shares the task-contract authority boundary
+        // with TaskKind confirm, so reset the cap at the same user-input edge.
+        self.project_profile_confirm_called_this_turn = false;
         // Issue #592: reset the photon user-feedback per-turn cap on the same
         // boundary. Must run BEFORE Plan-mode early returns so the thumbs/
         // correct/rule commands are dispatchable even from Plan mode.

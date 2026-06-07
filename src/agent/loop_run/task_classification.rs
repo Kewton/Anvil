@@ -72,13 +72,21 @@ pub(super) fn populate_task_contract_authority(agent: &mut Agent) {
     } else {
         None
     };
-    // Single `set`: the overridden contract (rebuilt coherently via
-    // `from_request_with_kind`, D2) when the confirm overrode the kind, else the
-    // deterministic first pass. `set` returns `Err` only if another path won the
-    // race within this turn, which is harmless here.
-    let contract = match forced_kind {
-        Some(kind) => Rc::new(TaskContract::from_request_with_kind(&request, Some(kind))),
-        None => Rc::new(first_pass),
+    let turn_index = agent.current_turn_index;
+    let project_profile = super::classify_confirm_flow::maybe_invoke_project_profile_confirm(
+        agent,
+        &first_pass,
+        &request,
+        turn_index,
+    );
+    // Single `set`: the overridden/profile-confirmed contract is rebuilt
+    // coherently via the construction SSOT before the OnceCell is sealed; every
+    // downstream reader observes the same objective contract.
+    let contract = match (forced_kind, project_profile.as_ref()) {
+        (None, None) => Rc::new(first_pass),
+        (kind, profile) => Rc::new(TaskContract::from_request_with_kind_and_project_profile(
+            &request, kind, profile,
+        )),
     };
     let _ = agent.task_contract_this_turn.set(contract);
 }
@@ -126,7 +134,11 @@ pub(super) fn task_contract_authority(agent: &Agent) -> Option<Rc<TaskContract>>
         // from the deterministic first pass, the first pass must have been
         // low-confidence (i.e. eligible for confirm).
         let first_pass = TaskContract::from_request(&request);
-        if contract.task_kind == first_pass.task_kind {
+        if agent.project_profile_confirm_called_this_turn {
+            // The ProjectProfile second pass may keep the coarse task kind while
+            // refining objective-level details such as deliverable/evidence roles.
+            // That is a legal divergence from the deterministic first pass.
+        } else if contract.task_kind == first_pass.task_kind {
             debug_assert_eq!(
                 **contract, first_pass,
                 "task classification divergence: memo != recompute(active_request_text)"

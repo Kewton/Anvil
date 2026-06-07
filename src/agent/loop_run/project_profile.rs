@@ -11,6 +11,9 @@ use super::task_contract::{ProjectLanguage, ProjectShape};
 use crate::agent::loop_run::lifecycle::extract_first_json_object;
 use crate::ollama::xml_fallback::strip_think_tags;
 
+pub(super) const PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS: u64 = 10;
+pub(super) const PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD: f32 = 0.70;
+
 #[derive(Debug, Clone, Copy)]
 struct LanguageProfile {
     language: ProjectLanguage,
@@ -172,45 +175,103 @@ fn explicit_entrypoint_shape(lower: &str) -> Option<ProjectShape> {
     None
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ProjectProfileConfirmation {
     pub(super) language: Option<ProjectLanguage>,
     pub(super) shape: Option<ProjectShape>,
+    pub(super) deliverable_kind: Option<ProfileDeliverableKind>,
+    pub(super) primary_artifacts: Vec<String>,
+    pub(super) forbidden_artifacts: Vec<ForbiddenArtifact>,
+    pub(super) evidence_kind: Option<ProfileEvidenceKind>,
+    pub(super) needs_environment_setup: Option<bool>,
     pub(super) preferred_runner: Option<String>,
     pub(super) confidence: f32,
     pub(super) reason: Option<String>,
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProfileDeliverableKind {
+    Code,
+    Document,
+    Data,
+    ResearchReport,
+    CommandObservation,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProfileEvidenceKind {
+    TestRun,
+    ContentCheck,
+    SchemaCheck,
+    CommandObservation,
+    SourceFetch,
+    None,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForbiddenArtifact {
+    SourceCode,
+    Tests,
+    Setup,
+    Unknown,
+}
+
 pub(super) fn build_project_profile_confirm_prompt(
     request: &str,
     language: ProjectLanguage,
     shape: ProjectShape,
+    first_pass_summary: &str,
 ) -> String {
     format!(
         concat!(
             "Classify the user's objective profile for a local-first agent.\n",
-            "Return exactly one JSON object with keys: language, shape, preferred_runner, confidence, reason.\n",
+            "Return exactly one JSON object with keys: language, shape, deliverable_kind, ",
+            "primary_artifacts, forbidden_artifacts, evidence_kind, needs_environment_setup, ",
+            "preferred_runner, confidence, reason.\n",
             "Allowed language values: rust, node, python, docs, unknown.\n",
             "Allowed shape values: cli, library, api, web_app, documentation, unknown.\n",
+            "Allowed deliverable_kind values: code, document, data, research_report, command_observation, none, unknown.\n",
+            "Allowed forbidden_artifacts values: source_code, tests, setup. Use [] when none.\n",
+            "Allowed evidence_kind values: test_run, content_check, schema_check, command_observation, source_fetch, none, unknown.\n",
+            "confidence must be a number from 0.0 to 1.0, not a word.\n",
             "Use preferred_runner only when evidence should be produced by a command, otherwise null.\n",
+            "If the user forbids source code or tests, put that in forbidden_artifacts.\n",
+            "If setup is a document section rather than environment work, set needs_environment_setup=false.\n",
             "Do not write prose outside JSON.\n\n",
             "First pass: language={:?}, shape={:?}\n",
+            "First pass contract summary: {}\n",
             "User request:\n{}"
         ),
-        language, shape, request
+        language, shape, first_pass_summary, request
     )
 }
 
-#[allow(dead_code)]
 pub(super) fn parse_project_profile_confirmation(raw: &str) -> Option<ProjectProfileConfirmation> {
     let stripped = strip_think_tags(raw);
     let json = extract_first_json_object(&stripped)?;
-    let decoded: ProjectProfileConfirmationWire = serde_json::from_str(json).ok()?;
+    let decoded = decode_project_profile_confirmation_wire(json)?;
     Some(ProjectProfileConfirmation {
         language: decoded.language.as_deref().and_then(parse_language),
         shape: decoded.shape.as_deref().and_then(parse_shape),
+        deliverable_kind: decoded
+            .deliverable_kind
+            .as_deref()
+            .and_then(parse_deliverable_kind),
+        primary_artifacts: sanitize_artifact_paths(decoded.primary_artifacts.unwrap_or_default()),
+        forbidden_artifacts: decoded
+            .forbidden_artifacts
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|value| parse_forbidden_artifact(value))
+            .collect(),
+        evidence_kind: decoded
+            .evidence_kind
+            .as_deref()
+            .and_then(parse_evidence_kind),
+        needs_environment_setup: decoded.needs_environment_setup,
         preferred_runner: decoded
             .preferred_runner
             .filter(|runner| runner.len() <= 128),
@@ -219,13 +280,138 @@ pub(super) fn parse_project_profile_confirmation(raw: &str) -> Option<ProjectPro
     })
 }
 
+fn decode_project_profile_confirmation_wire(json: &str) -> Option<ProjectProfileConfirmationWire> {
+    serde_json::from_str(json).ok().or_else(|| {
+        let normalized = normalize_jsonish_constants(json);
+        serde_json::from_str(&normalized).ok()
+    })
+}
+
+pub(super) fn project_profile_confirm_disabled<F>(getenv: F) -> bool
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    matches!(
+        getenv("ANVIL_NO_PROJECT_PROFILE_CONFIRM")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ProjectProfileConfirmationWire {
     language: Option<String>,
     shape: Option<String>,
+    deliverable_kind: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
+    primary_artifacts: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
+    forbidden_artifacts: Option<Vec<String>>,
+    evidence_kind: Option<String>,
+    needs_environment_setup: Option<bool>,
     preferred_runner: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_confidence")]
     confidence: Option<f32>,
     reason: Option<String>,
+}
+
+fn deserialize_optional_string_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(string_vec_from_value))
+}
+
+fn string_vec_from_value(value: serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(value) => value
+            .split([',', '|'])
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn normalize_jsonish_constants(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            normalized.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            normalized.push(ch);
+            continue;
+        }
+
+        if ch.is_ascii_alphabetic() {
+            let mut token = String::from(ch);
+            while chars.peek().is_some_and(|next| next.is_ascii_alphabetic()) {
+                token.push(chars.next().expect("peeked"));
+            }
+            match token.as_str() {
+                "None" => normalized.push_str("null"),
+                "True" => normalized.push_str("true"),
+                "False" => normalized.push_str("false"),
+                _ => normalized.push_str(&token),
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+
+    normalized
+}
+
+fn deserialize_optional_confidence<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(parse_confidence_value))
+}
+
+fn parse_confidence_value(value: serde_json::Value) -> Option<f32> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().map(|value| value as f32),
+        serde_json::Value::String(label) => parse_confidence_label(&label),
+        _ => None,
+    }
+}
+
+fn parse_confidence_label(label: &str) -> Option<f32> {
+    let normalized = label.trim().to_ascii_lowercase();
+    if let Ok(value) = normalized.parse::<f32>() {
+        return Some(value);
+    }
+    match normalized.as_str() {
+        "high" => Some(0.85),
+        "medium" | "moderate" => Some(0.50),
+        "low" => Some(0.25),
+        _ => None,
+    }
 }
 
 fn parse_language(value: &str) -> Option<ProjectLanguage> {
@@ -249,6 +435,66 @@ fn parse_shape(value: &str) -> Option<ProjectShape> {
         "unknown" => Some(ProjectShape::Unknown),
         _ => None,
     }
+}
+
+fn parse_deliverable_kind(value: &str) -> Option<ProfileDeliverableKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "code" | "source_code" | "implementation" => Some(ProfileDeliverableKind::Code),
+        "document" | "docs" | "documentation" => Some(ProfileDeliverableKind::Document),
+        "data" | "data_output" => Some(ProfileDeliverableKind::Data),
+        "research_report" | "report" => Some(ProfileDeliverableKind::ResearchReport),
+        "command_observation" | "ops" | "shell" => Some(ProfileDeliverableKind::CommandObservation),
+        "none" | "answer_only" => Some(ProfileDeliverableKind::None),
+        "unknown" => Some(ProfileDeliverableKind::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_evidence_kind(value: &str) -> Option<ProfileEvidenceKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "test_run" | "tests" | "cargo test" | "npm test" | "pytest" => {
+            Some(ProfileEvidenceKind::TestRun)
+        }
+        "content_check" | "document_check" => Some(ProfileEvidenceKind::ContentCheck),
+        "schema_check" | "data_schema" => Some(ProfileEvidenceKind::SchemaCheck),
+        "command_observation" | "shell_observation" => {
+            Some(ProfileEvidenceKind::CommandObservation)
+        }
+        "source_fetch" | "source_check" => Some(ProfileEvidenceKind::SourceFetch),
+        "none" => Some(ProfileEvidenceKind::None),
+        "unknown" => Some(ProfileEvidenceKind::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_forbidden_artifact(value: &str) -> Option<ForbiddenArtifact> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "source_code" | "code" | "implementation" => Some(ForbiddenArtifact::SourceCode),
+        "tests" | "test" => Some(ForbiddenArtifact::Tests),
+        "setup" | "environment_setup" => Some(ForbiddenArtifact::Setup),
+        "unknown" => Some(ForbiddenArtifact::Unknown),
+        _ => None,
+    }
+}
+
+fn sanitize_artifact_paths(paths: Vec<String>) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    for path in paths.into_iter().take(8) {
+        let trimmed = path.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > 160
+            || trimmed.starts_with('/')
+            || trimmed.contains("..")
+            || trimmed.contains('\0')
+            || trimmed.chars().any(char::is_control)
+        {
+            continue;
+        }
+        if !sanitized.iter().any(|existing| existing == trimmed) {
+            sanitized.push(trimmed.to_string());
+        }
+    }
+    sanitized
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -293,12 +539,16 @@ mod tests {
 
     #[test]
     fn llm_profile_confirmation_parser_accepts_think_wrapped_json() {
-        let raw = r#"<think>draft</think>{"language":"python","shape":"api","preferred_runner":"pytest","confidence":0.82,"reason":"FastAPI request"}"#;
+        let raw = r#"<think>draft</think>{"language":"python","shape":"api","deliverable_kind":"code","primary_artifacts":["app/main.py"],"forbidden_artifacts":[],"evidence_kind":"test_run","needs_environment_setup":true,"preferred_runner":"pytest","confidence":0.82,"reason":"FastAPI request"}"#;
 
         let parsed = parse_project_profile_confirmation(raw).expect("parse profile");
 
         assert_eq!(parsed.language, Some(ProjectLanguage::Python));
         assert_eq!(parsed.shape, Some(ProjectShape::Api));
+        assert_eq!(parsed.deliverable_kind, Some(ProfileDeliverableKind::Code));
+        assert_eq!(parsed.primary_artifacts, vec!["app/main.py"]);
+        assert_eq!(parsed.evidence_kind, Some(ProfileEvidenceKind::TestRun));
+        assert_eq!(parsed.needs_environment_setup, Some(true));
         assert_eq!(parsed.preferred_runner.as_deref(), Some("pytest"));
         assert_eq!(parsed.confidence, 0.82);
     }
@@ -313,5 +563,65 @@ mod tests {
         assert_eq!(parsed.language, None);
         assert_eq!(parsed.shape, None);
         assert_eq!(parsed.confidence, 1.0);
+    }
+
+    #[test]
+    fn llm_profile_confirmation_parser_accepts_label_confidence() {
+        let parsed = parse_project_profile_confirmation(
+            r#"{"language":"docs","shape":"documentation","deliverable_kind":"document","primary_artifacts":["README.md"],"evidence_kind":"content_check","confidence":"high"}"#,
+        )
+        .expect("parse profile");
+
+        assert_eq!(parsed.confidence, 0.85);
+        assert_eq!(
+            parsed.deliverable_kind,
+            Some(ProfileDeliverableKind::Document)
+        );
+    }
+
+    #[test]
+    fn llm_profile_confirmation_parser_accepts_jsonish_none_array() {
+        let parsed = parse_project_profile_confirmation(
+            r#"{"language":"docs","shape":"cli","deliverable_kind":"document","primary_artifacts":["README.md"],"forbidden_artifacts":[None],"evidence_kind":"none","needs_environment_setup":False,"confidence":0.85}"#,
+        )
+        .expect("parse profile");
+
+        assert_eq!(parsed.primary_artifacts, vec!["README.md"]);
+        assert!(parsed.forbidden_artifacts.is_empty());
+        assert_eq!(parsed.needs_environment_setup, Some(false));
+        assert_eq!(parsed.confidence, 0.85);
+    }
+
+    #[test]
+    fn llm_profile_confirmation_parser_captures_non_goals_and_document_setup() {
+        let parsed = parse_project_profile_confirmation(
+            r#"{"language":"docs","shape":"documentation","deliverable_kind":"document","primary_artifacts":["README.md","../escape.md"],"forbidden_artifacts":["source_code","tests"],"evidence_kind":"content_check","needs_environment_setup":false,"confidence":0.91}"#,
+        )
+        .expect("parse profile");
+
+        assert_eq!(
+            parsed.deliverable_kind,
+            Some(ProfileDeliverableKind::Document)
+        );
+        assert_eq!(parsed.primary_artifacts, vec!["README.md"]);
+        assert_eq!(
+            parsed.forbidden_artifacts,
+            vec![ForbiddenArtifact::SourceCode, ForbiddenArtifact::Tests]
+        );
+        assert_eq!(
+            parsed.evidence_kind,
+            Some(ProfileEvidenceKind::ContentCheck)
+        );
+        assert_eq!(parsed.needs_environment_setup, Some(false));
+    }
+
+    #[test]
+    fn project_profile_confirm_disable_env_accepts_boolean_values() {
+        assert!(project_profile_confirm_disabled(|_| Ok("true".to_string())));
+        assert!(project_profile_confirm_disabled(|_| Ok("1".to_string())));
+        assert!(!project_profile_confirm_disabled(|_| Ok("0".to_string())));
+        assert!(!project_profile_confirm_disabled(|_| Err(
+            std::env::VarError::NotPresent
+        )));
     }
 }

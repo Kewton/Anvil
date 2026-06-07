@@ -1,4 +1,8 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
+use super::project_profile::{
+    ForbiddenArtifact, PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD, ProfileDeliverableKind,
+    ProfileEvidenceKind, ProjectProfileConfirmation,
+};
 use super::required_behavior::{self, RequiredBehaviorContract};
 use crate::tools::bash::BashCommandClass;
 
@@ -720,6 +724,22 @@ impl ProjectIntent {
             verification,
             confidence,
         }
+    }
+
+    fn apply_profile_confirmation(&mut self, profile: &ProjectProfileConfirmation) {
+        if !project_profile_confirmation_is_authoritative(profile) {
+            return;
+        }
+        if let Some(language) = profile.language {
+            self.language = Some(language);
+        }
+        if let Some(shape) = profile.shape {
+            self.shape = Some(shape);
+        }
+        if let Some(verification) = verification_requirement_from_profile(profile) {
+            self.verification = verification;
+        }
+        self.confidence = self.confidence.max(profile.confidence);
     }
 
     fn verification_required(self) -> bool {
@@ -2536,6 +2556,14 @@ impl TaskContract {
     /// `task_classification.rs` takes its ELSE (kind-differs) branch and never
     /// runs the full-struct equality against the deterministic recompute.
     pub(super) fn from_request_with_kind(request: &str, forced_kind: Option<TaskKind>) -> Self {
+        Self::from_request_with_kind_and_project_profile(request, forced_kind, None)
+    }
+
+    pub(super) fn from_request_with_kind_and_project_profile(
+        request: &str,
+        forced_kind: Option<TaskKind>,
+        project_profile: Option<&ProjectProfileConfirmation>,
+    ) -> Self {
         let request_view = RequestInferenceView::from_raw(request);
         let request_for_inference = request_view.visible_text();
         let controller_task_kind = request_view
@@ -2552,7 +2580,12 @@ impl TaskContract {
         // (research / data / docs / default-DataOutput inference). Transient,
         // judgement-only, never stored.
         let scan = OutputContextScan::new(request_for_inference);
-        let project_intent = ProjectIntent::from_request(request_for_inference);
+        let mut project_intent = ProjectIntent::from_request(request_for_inference);
+        let project_profile = project_profile
+            .filter(|profile| project_profile_confirmation_is_authoritative(profile));
+        if let Some(profile) = project_profile {
+            project_intent.apply_profile_confirmation(profile);
+        }
         let mut intent = project_intent.intent;
         let asks_for_tests = request_asks_for_test_artifact(request_for_inference, &lower);
         let asks_for_usage_docs = request_asks_for_usage_docs(request_for_inference, &lower);
@@ -2576,11 +2609,18 @@ impl TaskContract {
         // #917 2-value confidence applies (matched → 1.0 / no-match → 0.0; only
         // the no-keyword-match fallthrough lands below the confirm threshold and
         // triggers `needs_confirm()`).
+        let profile_task_kind = project_profile.and_then(task_kind_from_profile_confirmation);
         let (task_kind, classification_confidence) = match forced_kind {
             Some(k) => (k, 1.0_f32),
             None if controller_task_kind.is_some() => {
                 (controller_task_kind.expect("checked Some above"), 1.0)
             }
+            None if profile_task_kind.is_some() => (
+                profile_task_kind.expect("checked Some above"),
+                project_profile
+                    .map(|profile| profile.confidence)
+                    .unwrap_or(1.0_f32),
+            ),
             None => (inferred_kind, if inferred_matched { 1.0 } else { 0.0 }),
         };
         // Issue #919 (Decision #5(a)): Authoring contracts never carry the
@@ -2593,6 +2633,10 @@ impl TaskContract {
         }
         let mut required = Vec::new();
         let mut optional = Vec::new();
+        let profile_forbids_impl =
+            project_profile.is_some_and(profile_forbids_implementation_artifact);
+        let profile_forbids_tests = project_profile.is_some_and(profile_forbids_test_artifacts);
+        let profile_forbids_setup = project_profile.is_some_and(profile_forbids_setup_artifact);
 
         if task_kind == TaskKind::Coding
             && request_asks_for_implementation_artifact(
@@ -2602,10 +2646,11 @@ impl TaskContract {
                 asks_for_usage_docs,
                 asks_for_setup,
             )
+            && !profile_forbids_impl
         {
             required.push(ArtifactRole::Implementation);
         }
-        if asks_for_tests {
+        if asks_for_tests && !profile_forbids_tests {
             required.push(ArtifactRole::Test);
         }
         if asks_for_usage_docs {
@@ -2619,7 +2664,7 @@ impl TaskContract {
         if task_kind == TaskKind::Authoring {
             required.push(ArtifactRole::UsageDocs);
         }
-        if asks_for_setup {
+        if asks_for_setup && !profile_forbids_setup {
             if matches!(intent, TaskIntent::Install) {
                 required.push(ArtifactRole::Setup);
             } else {
@@ -2628,6 +2673,9 @@ impl TaskContract {
         }
         if asks_for_data_output {
             required.push(ArtifactRole::DataOutput);
+        }
+        if let Some(role) = required_artifact_role_from_profile(project_profile) {
+            required.push(role);
         }
 
         // Issue #922 (P5 / DD3): a research task that intends a written report
@@ -2648,6 +2696,12 @@ impl TaskContract {
         if let Some(controller_state) = &request_view.controller_state {
             controller_state
                 .extend_contract_parts(&mut required, &mut required_artifact_identities);
+        }
+        for identity in inferred_artifact_obligations_from_project_profile(project_profile) {
+            if !required.contains(&identity.role) {
+                required.push(identity.role);
+            }
+            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
         }
         if asks_for_data_output
             && required_artifact_identities
@@ -4285,6 +4339,119 @@ fn preferred_runner_for_language(language: ProjectLanguage) -> Option<&'static s
     }
 }
 
+fn project_profile_confirmation_is_authoritative(profile: &ProjectProfileConfirmation) -> bool {
+    profile.confidence >= PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD
+}
+
+fn task_kind_from_profile_confirmation(profile: &ProjectProfileConfirmation) -> Option<TaskKind> {
+    match profile.deliverable_kind? {
+        ProfileDeliverableKind::Code => Some(TaskKind::Coding),
+        ProfileDeliverableKind::Document => Some(TaskKind::Docs),
+        ProfileDeliverableKind::Data => Some(TaskKind::Data),
+        ProfileDeliverableKind::ResearchReport => Some(TaskKind::Research),
+        ProfileDeliverableKind::CommandObservation => Some(TaskKind::Ops),
+        ProfileDeliverableKind::None | ProfileDeliverableKind::Unknown => None,
+    }
+}
+
+fn required_artifact_role_from_profile(
+    profile: Option<&ProjectProfileConfirmation>,
+) -> Option<ArtifactRole> {
+    let profile = profile?;
+    match profile.deliverable_kind? {
+        ProfileDeliverableKind::Code => Some(ArtifactRole::Implementation),
+        ProfileDeliverableKind::Document | ProfileDeliverableKind::ResearchReport => {
+            Some(ArtifactRole::UsageDocs)
+        }
+        ProfileDeliverableKind::Data => Some(ArtifactRole::DataOutput),
+        ProfileDeliverableKind::CommandObservation
+        | ProfileDeliverableKind::None
+        | ProfileDeliverableKind::Unknown => None,
+    }
+}
+
+fn verification_requirement_from_profile(
+    profile: &ProjectProfileConfirmation,
+) -> Option<VerificationRequirement> {
+    match profile.evidence_kind? {
+        ProfileEvidenceKind::TestRun => Some(VerificationRequirement::Required {
+            preferred_runner: preferred_runner_from_profile(profile)
+                .or_else(|| profile.language.and_then(preferred_runner_for_language)),
+        }),
+        ProfileEvidenceKind::ContentCheck | ProfileEvidenceKind::SchemaCheck => {
+            Some(VerificationRequirement::ArtifactOnly)
+        }
+        ProfileEvidenceKind::CommandObservation | ProfileEvidenceKind::SourceFetch => {
+            let runner = preferred_runner_from_profile(profile)?;
+            Some(VerificationRequirement::Required {
+                preferred_runner: Some(runner),
+            })
+        }
+        ProfileEvidenceKind::None => Some(VerificationRequirement::NotRequired),
+        ProfileEvidenceKind::Unknown => None,
+    }
+}
+
+fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option<&'static str> {
+    let runner = profile.preferred_runner.as_deref()?.trim();
+    match runner {
+        "cargo test" => Some("cargo test"),
+        "npm test" => Some("npm test"),
+        "pytest" => Some("pytest"),
+        _ => None,
+    }
+}
+
+fn profile_forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool {
+    profile
+        .forbidden_artifacts
+        .iter()
+        .any(|artifact| matches!(artifact, ForbiddenArtifact::SourceCode))
+        || matches!(
+            profile.deliverable_kind,
+            Some(
+                ProfileDeliverableKind::Document
+                    | ProfileDeliverableKind::Data
+                    | ProfileDeliverableKind::ResearchReport
+                    | ProfileDeliverableKind::CommandObservation
+                    | ProfileDeliverableKind::None
+            )
+        )
+}
+
+fn profile_forbids_test_artifacts(profile: &ProjectProfileConfirmation) -> bool {
+    profile
+        .forbidden_artifacts
+        .iter()
+        .any(|artifact| matches!(artifact, ForbiddenArtifact::Tests))
+        || matches!(
+            profile.evidence_kind,
+            Some(
+                ProfileEvidenceKind::ContentCheck
+                    | ProfileEvidenceKind::SchemaCheck
+                    | ProfileEvidenceKind::CommandObservation
+                    | ProfileEvidenceKind::SourceFetch
+                    | ProfileEvidenceKind::None
+            )
+        )
+}
+
+fn profile_forbids_setup_artifact(profile: &ProjectProfileConfirmation) -> bool {
+    profile
+        .forbidden_artifacts
+        .iter()
+        .any(|artifact| matches!(artifact, ForbiddenArtifact::Setup))
+        || (profile.needs_environment_setup == Some(false)
+            && matches!(
+                profile.deliverable_kind,
+                Some(
+                    ProfileDeliverableKind::Document
+                        | ProfileDeliverableKind::Data
+                        | ProfileDeliverableKind::ResearchReport
+                )
+            ))
+}
+
 fn project_intent_confidence(
     intent: TaskIntent,
     language: ProjectLanguage,
@@ -5024,6 +5191,32 @@ fn inferred_artifact_obligations_from_project_intent(
         ProjectLanguage::Docs | ProjectLanguage::Unknown => {}
     }
     obligations
+}
+
+fn inferred_artifact_obligations_from_project_profile(
+    profile: Option<&ProjectProfileConfirmation>,
+) -> Vec<ArtifactObligation> {
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    let Some(deliverable_kind) = profile.deliverable_kind else {
+        return Vec::new();
+    };
+    let role = match deliverable_kind {
+        ProfileDeliverableKind::Document | ProfileDeliverableKind::ResearchReport => {
+            ArtifactRole::UsageDocs
+        }
+        ProfileDeliverableKind::Data => ArtifactRole::DataOutput,
+        ProfileDeliverableKind::Code => ArtifactRole::Implementation,
+        ProfileDeliverableKind::CommandObservation
+        | ProfileDeliverableKind::None
+        | ProfileDeliverableKind::Unknown => return Vec::new(),
+    };
+    profile
+        .primary_artifacts
+        .iter()
+        .map(|path| ArtifactObligation::file(role, path.as_str()))
+        .collect()
 }
 
 fn push_or_merge_artifact_obligation(
@@ -10971,6 +11164,58 @@ Create the README file."#;
                 .contains(&ArtifactRole::Implementation)
         );
         assert!(!contract.required_artifacts.contains(&ArtifactRole::Test));
+    }
+
+    #[test]
+    fn llm_project_profile_document_override_removes_code_and_setup_requirements() {
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{"language":"docs","shape":"documentation","deliverable_kind":"document","primary_artifacts":["README.md"],"forbidden_artifacts":["source_code","tests"],"evidence_kind":"content_check","needs_environment_setup":false,"confidence":0.93,"reason":"README only"}"#,
+        )
+        .expect("profile");
+        let contract = TaskContract::from_request_with_kind_and_project_profile(
+            "Write README.md with setup, usage, and troubleshooting sections for a small local backup CLI.",
+            None,
+            Some(&profile),
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(!contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert!(!contract.required_artifacts.contains(&ArtifactRole::Setup));
+        assert!(!contract.optional_artifacts.contains(&ArtifactRole::Setup));
+        assert!(
+            contract
+                .required_artifact_identities
+                .iter()
+                .any(|identity| identity.role == ArtifactRole::UsageDocs
+                    && identity.path == "README.md")
+        );
+    }
+
+    #[test]
+    fn llm_project_profile_command_evidence_without_runner_does_not_require_verifier() {
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{"language":"docs","shape":"cli","deliverable_kind":"document","primary_artifacts":["README.md"],"forbidden_artifacts":[],"evidence_kind":"command_observation","preferred_runner":null,"needs_environment_setup":false,"confidence":1.0}"#,
+        )
+        .expect("profile");
+        let contract = TaskContract::from_request_with_kind_and_project_profile(
+            "Write README.md with setup and usage sections.",
+            None,
+            Some(&profile),
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert!(!contract.verification_required);
+        assert!(!contract.objective_contract().evidence_required);
     }
 
     /// Compositional regression: the public `request_asks_for_setup` API
