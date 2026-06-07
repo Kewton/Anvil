@@ -4303,6 +4303,7 @@ fn infer_project_language(request: &str, lower: &str) -> ProjectLanguage {
 }
 
 fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
+    let explicit_entrypoint_shape = explicit_entrypoint_project_shape(lower);
     let docs = contains_any(
         lower,
         &[
@@ -4348,9 +4349,9 @@ fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
         ],
     ) || contains_any(request, &["アプリ", "フロントエンド", "画面"]);
 
-    if cli {
+    if cli || matches!(explicit_entrypoint_shape, Some(ProjectShape::Cli)) {
         ProjectShape::Cli
-    } else if library {
+    } else if library || matches!(explicit_entrypoint_shape, Some(ProjectShape::Library)) {
         ProjectShape::Library
     } else if api {
         ProjectShape::Api
@@ -4361,6 +4362,16 @@ fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
     } else {
         ProjectShape::Unknown
     }
+}
+
+fn explicit_entrypoint_project_shape(lower: &str) -> Option<ProjectShape> {
+    if contains_any(lower, &["src/main.rs", "main.py"]) {
+        return Some(ProjectShape::Cli);
+    }
+    if contains_any(lower, &["src/lib.rs", "lib.rs"]) {
+        return Some(ProjectShape::Library);
+    }
+    None
 }
 
 fn infer_verification_requirement(
@@ -6916,6 +6927,29 @@ mod tests {
         let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
         assert_eq!(readme.format, Some(DeliverableFormat::Markdown));
         assert_eq!(readme.required_sections, default_readme_required_sections());
+    }
+
+    #[test]
+    fn rust_tdd_request_with_lib_path_requires_manifest_obligation() {
+        let request = "TDDで進めてください。まず tests/password_strength.rs に失敗するテストを書き、その後 src/lib.rs に password_score(password: &str) -> u8 を実装してください。cargo test --manifest-path Cargo.toml が成功するまで進めてください。";
+        let intent = ProjectIntent::from_request(request);
+
+        assert_eq!(intent.language, Some(ProjectLanguage::Rust));
+        assert_eq!(intent.shape, Some(ProjectShape::Library));
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Setup, "Cargo.toml").format,
+            Some(DeliverableFormat::Toml)
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Implementation, "src/lib.rs").format,
+            Some(DeliverableFormat::RustSource)
+        );
+        assert_eq!(
+            required_obligation(&contract, ArtifactRole::Test, "tests/password_strength.rs").format,
+            Some(DeliverableFormat::RustSource)
+        );
     }
 
     #[test]
