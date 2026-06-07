@@ -179,7 +179,7 @@ pub(super) fn artifact_directed_recovery_message_body(
         ""
     };
     format!(
-        "[Artifact Directed Recovery] Missing role: {role_label}. Target file: {target_display}. Reason: {reason_display}. Allowed tools for this turn are {allowed} on that exact target path only.{read_guidance} Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
+        "[Artifact Directed Recovery] Missing role: {role_label}. Target file: {target_display}. Reason: {reason_display}. Allowed tools for this turn are {allowed}. Write/Edit must stay on that exact target path; Read may inspect workspace files needed to produce the target.{read_guidance} Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
     )
 }
 

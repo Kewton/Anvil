@@ -1212,6 +1212,7 @@ mod capability_matrix_e2e_tests;
 // -net no-override) without Ollama. `#[cfg(test)]` keeps it out of the
 // production binary; the explicit `mod` is required. No facade re-export (DR3-001).
 mod project_profile;
+mod project_profile_projection;
 mod summary;
 mod task_contract;
 #[cfg(test)]

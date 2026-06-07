@@ -14,6 +14,10 @@ use crate::ollama::xml_fallback::strip_think_tags;
 pub(super) const PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS: u64 = 10;
 pub(super) const PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD: f32 = 0.70;
 
+pub(super) fn confirmation_is_authoritative(profile: &ProjectProfileConfirmation) -> bool {
+    profile.confidence >= PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LanguageProfile {
     language: ProjectLanguage,
@@ -231,12 +235,19 @@ pub(super) fn build_project_profile_confirm_prompt(
             "Return exactly one JSON object with keys: language, shape, deliverable_kind, ",
             "primary_artifacts, forbidden_artifacts, evidence_kind, needs_environment_setup, ",
             "preferred_runner, confidence, reason.\n",
+            "The user request is authoritative. The first pass is only a low-priority hint and may be wrong.\n",
+            "If first-pass language, shape, task kind, setup, or coding signals conflict with the user request, ignore the first pass.\n",
             "Allowed language values: rust, node, python, docs, unknown.\n",
             "Allowed shape values: cli, library, api, web_app, documentation, unknown.\n",
             "Allowed deliverable_kind values: code, document, data, research_report, command_observation, none, unknown.\n",
             "Allowed forbidden_artifacts values: source_code, tests, setup. Use [] when none.\n",
             "Allowed evidence_kind values: test_run, content_check, schema_check, command_observation, source_fetch, none, unknown.\n",
             "confidence must be a number from 0.0 to 1.0, not a word.\n",
+            "All enum values must be quoted JSON strings. primary_artifacts must be an array of path strings, not objects.\n",
+            "JSON, CSV, TSV, and other structured output files are deliverable_kind=data, not code.\n",
+            "Do not infer rust/library/api from the first pass when the user explicitly says no source code, tests, or scripts.\n",
+            "primary_artifacts must contain only output deliverables the agent should create or modify; never include files the user asks to read, inspect, summarize, or use as input.\n",
+            "When both input and output files are mentioned, list only the output file(s) in primary_artifacts.\n",
             "Use preferred_runner only when evidence should be produced by a command, otherwise null.\n",
             "If the user forbids source code or tests, put that in forbidden_artifacts.\n",
             "If setup is a document section rather than environment work, set needs_environment_setup=false.\n",
@@ -302,19 +313,43 @@ where
 
 #[derive(Debug, Deserialize)]
 struct ProjectProfileConfirmationWire {
+    #[serde(default, deserialize_with = "deserialize_optional_string_scalar")]
     language: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_scalar")]
     shape: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_scalar")]
     deliverable_kind: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
     primary_artifacts: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_string_vec")]
     forbidden_artifacts: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_scalar")]
     evidence_kind: Option<String>,
     needs_environment_setup: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_scalar")]
     preferred_runner: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_confidence")]
     confidence: Option<f32>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_scalar")]
     reason: Option<String>,
+}
+
+fn deserialize_optional_string_scalar<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(string_scalar_from_value))
+}
+
+fn string_scalar_from_value(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .find_map(|item| item.as_str().map(str::to_string)),
+        _ => None,
+    }
 }
 
 fn deserialize_optional_string_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -329,7 +364,7 @@ fn string_vec_from_value(value: serde_json::Value) -> Vec<String> {
     match value {
         serde_json::Value::Array(items) => items
             .into_iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
+            .filter_map(string_from_artifact_value)
             .collect(),
         serde_json::Value::String(value) => value
             .split([',', '|'])
@@ -338,6 +373,17 @@ fn string_vec_from_value(value: serde_json::Value) -> Vec<String> {
             .map(str::to_string)
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+fn string_from_artifact_value(value: serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value),
+        serde_json::Value::Object(object) => ["path", "name", "file"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(|value| value.as_str()))
+            .map(str::to_string),
+        _ => None,
     }
 }
 
@@ -577,6 +623,56 @@ mod tests {
             parsed.deliverable_kind,
             Some(ProfileDeliverableKind::Document)
         );
+    }
+
+    #[test]
+    fn llm_profile_confirmation_parser_accepts_singleton_enum_arrays() {
+        let parsed = parse_project_profile_confirmation(
+            r#"{"language":["docs"],"shape":["documentation"],"deliverable_kind":["document"],"primary_artifacts":["README.md"],"forbidden_artifacts":["source_code"],"evidence_kind":["content_check"],"needs_environment_setup":false,"confidence":0.92}"#,
+        )
+        .expect("parse profile");
+
+        assert_eq!(parsed.language, Some(ProjectLanguage::Docs));
+        assert_eq!(parsed.shape, Some(ProjectShape::Documentation));
+        assert_eq!(
+            parsed.deliverable_kind,
+            Some(ProfileDeliverableKind::Document)
+        );
+        assert_eq!(
+            parsed.evidence_kind,
+            Some(ProfileEvidenceKind::ContentCheck)
+        );
+        assert_eq!(parsed.confidence, 0.92);
+    }
+
+    #[test]
+    fn llm_profile_confirmation_parser_accepts_artifact_object_arrays() {
+        let parsed = parse_project_profile_confirmation(
+            r#"{"language":"docs","shape":"unknown","deliverable_kind":"data","primary_artifacts":[{"name":"summary.json","action":"create"}],"forbidden_artifacts":[],"evidence_kind":"schema_check","confidence":0.9}"#,
+        )
+        .expect("parse profile");
+
+        assert_eq!(parsed.primary_artifacts, vec!["summary.json"]);
+        assert_eq!(parsed.deliverable_kind, Some(ProfileDeliverableKind::Data));
+        assert_eq!(parsed.evidence_kind, Some(ProfileEvidenceKind::SchemaCheck));
+    }
+
+    #[test]
+    fn project_profile_prompt_marks_primary_artifacts_as_outputs_only() {
+        let prompt = build_project_profile_confirm_prompt(
+            "Read inventory.csv and create summary.json.",
+            ProjectLanguage::Unknown,
+            ProjectShape::Unknown,
+            "task_kind=data",
+        );
+
+        assert!(prompt.contains("only output deliverables"));
+        assert!(prompt.contains("never include files the user asks to read"));
+        assert!(prompt.contains("list only the output file"));
+        assert!(prompt.contains("structured output files are deliverable_kind=data"));
+        assert!(prompt.contains("array of path strings"));
+        assert!(prompt.contains("first pass is only a low-priority hint"));
+        assert!(prompt.contains("user request, ignore the first pass"));
     }
 
     #[test]

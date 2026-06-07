@@ -1,7 +1,7 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
-use super::project_profile::{
-    ForbiddenArtifact, PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD, ProfileDeliverableKind,
-    ProfileEvidenceKind, ProjectProfileConfirmation,
+use super::project_profile::ProjectProfileConfirmation;
+use super::project_profile_projection::{
+    ProjectProfileContractInputs, contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
 use crate::tools::bash::BashCommandClass;
@@ -726,20 +726,17 @@ impl ProjectIntent {
         }
     }
 
-    fn apply_profile_confirmation(&mut self, profile: &ProjectProfileConfirmation) {
-        if !project_profile_confirmation_is_authoritative(profile) {
-            return;
-        }
-        if let Some(language) = profile.language {
+    fn apply_profile_contract_inputs(&mut self, inputs: &ProjectProfileContractInputs) {
+        if let Some(language) = inputs.language {
             self.language = Some(language);
         }
-        if let Some(shape) = profile.shape {
+        if let Some(shape) = inputs.shape {
             self.shape = Some(shape);
         }
-        if let Some(verification) = verification_requirement_from_profile(profile) {
+        if let Some(verification) = inputs.verification {
             self.verification = verification;
         }
-        self.confidence = self.confidence.max(profile.confidence);
+        self.confidence = self.confidence.max(inputs.confidence);
     }
 
     fn verification_required(self) -> bool {
@@ -2581,10 +2578,9 @@ impl TaskContract {
         // judgement-only, never stored.
         let scan = OutputContextScan::new(request_for_inference);
         let mut project_intent = ProjectIntent::from_request(request_for_inference);
-        let project_profile = project_profile
-            .filter(|profile| project_profile_confirmation_is_authoritative(profile));
-        if let Some(profile) = project_profile {
-            project_intent.apply_profile_confirmation(profile);
+        let project_profile_inputs = contract_inputs_from_confirmation(project_profile);
+        if let Some(inputs) = &project_profile_inputs {
+            project_intent.apply_profile_contract_inputs(inputs);
         }
         let mut intent = project_intent.intent;
         let asks_for_tests = request_asks_for_test_artifact(request_for_inference, &lower);
@@ -2609,7 +2605,9 @@ impl TaskContract {
         // #917 2-value confidence applies (matched → 1.0 / no-match → 0.0; only
         // the no-keyword-match fallthrough lands below the confirm threshold and
         // triggers `needs_confirm()`).
-        let profile_task_kind = project_profile.and_then(task_kind_from_profile_confirmation);
+        let profile_task_kind = project_profile_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.task_kind);
         let (task_kind, classification_confidence) = match forced_kind {
             Some(k) => (k, 1.0_f32),
             None if controller_task_kind.is_some() => {
@@ -2617,8 +2615,9 @@ impl TaskContract {
             }
             None if profile_task_kind.is_some() => (
                 profile_task_kind.expect("checked Some above"),
-                project_profile
-                    .map(|profile| profile.confidence)
+                project_profile_inputs
+                    .as_ref()
+                    .map(|inputs| inputs.confidence)
                     .unwrap_or(1.0_f32),
             ),
             None => (inferred_kind, if inferred_matched { 1.0 } else { 0.0 }),
@@ -2633,10 +2632,15 @@ impl TaskContract {
         }
         let mut required = Vec::new();
         let mut optional = Vec::new();
-        let profile_forbids_impl =
-            project_profile.is_some_and(profile_forbids_implementation_artifact);
-        let profile_forbids_tests = project_profile.is_some_and(profile_forbids_test_artifacts);
-        let profile_forbids_setup = project_profile.is_some_and(profile_forbids_setup_artifact);
+        let profile_forbids_impl = project_profile_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.forbids_implementation);
+        let profile_forbids_tests = project_profile_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.forbids_tests);
+        let profile_forbids_setup = project_profile_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.forbids_setup);
 
         if task_kind == TaskKind::Coding
             && request_asks_for_implementation_artifact(
@@ -2674,7 +2678,10 @@ impl TaskContract {
         if asks_for_data_output {
             required.push(ArtifactRole::DataOutput);
         }
-        if let Some(role) = required_artifact_role_from_profile(project_profile) {
+        if let Some(role) = project_profile_inputs
+            .as_ref()
+            .and_then(|inputs| inputs.required_role)
+        {
             required.push(role);
         }
 
@@ -2697,7 +2704,12 @@ impl TaskContract {
             controller_state
                 .extend_contract_parts(&mut required, &mut required_artifact_identities);
         }
-        for identity in inferred_artifact_obligations_from_project_profile(project_profile) {
+        for identity in project_profile_inputs
+            .as_ref()
+            .into_iter()
+            .flat_map(|inputs| inputs.artifact_obligations.iter())
+            .cloned()
+        {
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
@@ -3506,6 +3518,11 @@ fn default_docs_path_from_request(request: &str) -> String {
 fn required_doc_sections_from_request(request: &str) -> Vec<String> {
     let lower = request.to_ascii_lowercase();
     let mut sections = Vec::new();
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["overview", "summary"]) || contains_any(request, &["概要", "要約"]),
+        "overview",
+    );
     let mentions_setup = contains_any(&lower, &["setup", "getting started"])
         || contains_any(request, &["セットアップ", "導入"]);
     let mentions_installation = contains_any(&lower, &["install", "installation"])
@@ -3525,10 +3542,23 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
             || contains_any(request, &["使用方法", "使い方", "利用方法", "例"]),
         "usage",
     );
+    let test_artifacts_negated = request_negates_test_artifacts(request, &lower);
+    let explicit_testing_section = contains_any(
+        &lower,
+        &[
+            "test method",
+            "testing section",
+            "testing sections",
+            "tests section",
+            "tests sections",
+        ],
+    ) || contains_any(request, &["テスト方法"]);
     push_section_if(
         &mut sections,
-        contains_any(&lower, &["test method", "testing", "tests", "verify"])
-            || contains_any(request, &["テスト方法", "テスト", "検証"]),
+        explicit_testing_section
+            || (!test_artifacts_negated
+                && (contains_any(&lower, &["testing", "tests"])
+                    || contains_any(request, &["テスト", "検証"]))),
         "testing",
     );
     push_section_if(
@@ -4330,126 +4360,13 @@ fn infer_verification_requirement(
     }
 }
 
-fn preferred_runner_for_language(language: ProjectLanguage) -> Option<&'static str> {
+pub(super) fn preferred_runner_for_language(language: ProjectLanguage) -> Option<&'static str> {
     match language {
         ProjectLanguage::Rust => Some("cargo test"),
         ProjectLanguage::Node => Some("npm test"),
         ProjectLanguage::Python => Some("pytest"),
         ProjectLanguage::Docs | ProjectLanguage::Unknown => None,
     }
-}
-
-fn project_profile_confirmation_is_authoritative(profile: &ProjectProfileConfirmation) -> bool {
-    profile.confidence >= PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD
-}
-
-fn task_kind_from_profile_confirmation(profile: &ProjectProfileConfirmation) -> Option<TaskKind> {
-    match profile.deliverable_kind? {
-        ProfileDeliverableKind::Code => Some(TaskKind::Coding),
-        ProfileDeliverableKind::Document => Some(TaskKind::Docs),
-        ProfileDeliverableKind::Data => Some(TaskKind::Data),
-        ProfileDeliverableKind::ResearchReport => Some(TaskKind::Research),
-        ProfileDeliverableKind::CommandObservation => Some(TaskKind::Ops),
-        ProfileDeliverableKind::None | ProfileDeliverableKind::Unknown => None,
-    }
-}
-
-fn required_artifact_role_from_profile(
-    profile: Option<&ProjectProfileConfirmation>,
-) -> Option<ArtifactRole> {
-    let profile = profile?;
-    match profile.deliverable_kind? {
-        ProfileDeliverableKind::Code => Some(ArtifactRole::Implementation),
-        ProfileDeliverableKind::Document | ProfileDeliverableKind::ResearchReport => {
-            Some(ArtifactRole::UsageDocs)
-        }
-        ProfileDeliverableKind::Data => Some(ArtifactRole::DataOutput),
-        ProfileDeliverableKind::CommandObservation
-        | ProfileDeliverableKind::None
-        | ProfileDeliverableKind::Unknown => None,
-    }
-}
-
-fn verification_requirement_from_profile(
-    profile: &ProjectProfileConfirmation,
-) -> Option<VerificationRequirement> {
-    match profile.evidence_kind? {
-        ProfileEvidenceKind::TestRun => Some(VerificationRequirement::Required {
-            preferred_runner: preferred_runner_from_profile(profile)
-                .or_else(|| profile.language.and_then(preferred_runner_for_language)),
-        }),
-        ProfileEvidenceKind::ContentCheck | ProfileEvidenceKind::SchemaCheck => {
-            Some(VerificationRequirement::ArtifactOnly)
-        }
-        ProfileEvidenceKind::CommandObservation | ProfileEvidenceKind::SourceFetch => {
-            let runner = preferred_runner_from_profile(profile)?;
-            Some(VerificationRequirement::Required {
-                preferred_runner: Some(runner),
-            })
-        }
-        ProfileEvidenceKind::None => Some(VerificationRequirement::NotRequired),
-        ProfileEvidenceKind::Unknown => None,
-    }
-}
-
-fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option<&'static str> {
-    let runner = profile.preferred_runner.as_deref()?.trim();
-    match runner {
-        "cargo test" => Some("cargo test"),
-        "npm test" => Some("npm test"),
-        "pytest" => Some("pytest"),
-        _ => None,
-    }
-}
-
-fn profile_forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::SourceCode))
-        || matches!(
-            profile.deliverable_kind,
-            Some(
-                ProfileDeliverableKind::Document
-                    | ProfileDeliverableKind::Data
-                    | ProfileDeliverableKind::ResearchReport
-                    | ProfileDeliverableKind::CommandObservation
-                    | ProfileDeliverableKind::None
-            )
-        )
-}
-
-fn profile_forbids_test_artifacts(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::Tests))
-        || matches!(
-            profile.evidence_kind,
-            Some(
-                ProfileEvidenceKind::ContentCheck
-                    | ProfileEvidenceKind::SchemaCheck
-                    | ProfileEvidenceKind::CommandObservation
-                    | ProfileEvidenceKind::SourceFetch
-                    | ProfileEvidenceKind::None
-            )
-        )
-}
-
-fn profile_forbids_setup_artifact(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::Setup))
-        || (profile.needs_environment_setup == Some(false)
-            && matches!(
-                profile.deliverable_kind,
-                Some(
-                    ProfileDeliverableKind::Document
-                        | ProfileDeliverableKind::Data
-                        | ProfileDeliverableKind::ResearchReport
-                )
-            ))
 }
 
 fn project_intent_confidence(
@@ -4620,9 +4537,15 @@ pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool
         &[
             "do not create code or tests",
             "do not create tests or code",
+            "do not create source code or tests",
+            "do not create tests or source code",
+            "do not create source code, tests",
             "do not write code or tests",
+            "do not write source code or tests",
             "do not add code or tests",
+            "do not add source code or tests",
             "do not implement code or tests",
+            "do not implement source code or tests",
             "do not create tests",
             "do not add tests",
             "do not write tests",
@@ -5191,32 +5114,6 @@ fn inferred_artifact_obligations_from_project_intent(
         ProjectLanguage::Docs | ProjectLanguage::Unknown => {}
     }
     obligations
-}
-
-fn inferred_artifact_obligations_from_project_profile(
-    profile: Option<&ProjectProfileConfirmation>,
-) -> Vec<ArtifactObligation> {
-    let Some(profile) = profile else {
-        return Vec::new();
-    };
-    let Some(deliverable_kind) = profile.deliverable_kind else {
-        return Vec::new();
-    };
-    let role = match deliverable_kind {
-        ProfileDeliverableKind::Document | ProfileDeliverableKind::ResearchReport => {
-            ArtifactRole::UsageDocs
-        }
-        ProfileDeliverableKind::Data => ArtifactRole::DataOutput,
-        ProfileDeliverableKind::Code => ArtifactRole::Implementation,
-        ProfileDeliverableKind::CommandObservation
-        | ProfileDeliverableKind::None
-        | ProfileDeliverableKind::Unknown => return Vec::new(),
-    };
-    profile
-        .primary_artifacts
-        .iter()
-        .map(|path| ArtifactObligation::file(role, path.as_str()))
-        .collect()
 }
 
 fn push_or_merge_artifact_obligation(
@@ -7164,6 +7061,24 @@ mod tests {
         assert_eq!(
             readme.required_sections,
             vec!["setup".to_string(), "usage".to_string()]
+        );
+    }
+
+    #[test]
+    fn docs_verify_instruction_does_not_become_testing_section() {
+        let contract = TaskContract::from_request(
+            "Create README.md only with Overview, Setup, and Usage sections. Do not create source code or tests. Verify by reading README.md.",
+        );
+
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+
+        assert_eq!(
+            readme.required_sections,
+            vec![
+                "overview".to_string(),
+                "setup".to_string(),
+                "usage".to_string()
+            ]
         );
     }
 

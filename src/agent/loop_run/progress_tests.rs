@@ -10101,10 +10101,36 @@ export default function App() {
         .expect("expected policy error");
 
         assert!(
-            err.contains("only allows Read, Write, or Edit on app/main.py"),
+            err.contains("only allows Write or Edit on app/main.py"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("Read may inspect workspace files"),
             "got: {err}"
         );
         assert!(!err.contains("secret-token"), "got: {err}");
+    }
+
+    #[test]
+    fn artifact_directed_policy_allows_workspace_read_before_target_write() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("data")).unwrap();
+        let target = work_root.join("summary.json");
+        std::fs::write(
+            work_root.join("data/inventory.csv"),
+            "service,status\napi,ok\n",
+        )
+        .unwrap();
+
+        let err = artifact_directed_tool_policy_error(
+            "Read",
+            &json!({"path":"data/inventory.csv"}),
+            &target,
+            work_root,
+        );
+
+        assert_eq!(err, None);
     }
 
     // -------------------------------------------------------------

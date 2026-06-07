@@ -28,18 +28,16 @@ use super::feedback_kind_confirm::{
     FeedbackKindConfirmOutcome, run_feedback_kind_confirm_with_strategy,
 };
 use super::project_profile::{
-    self, PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD, PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS,
-    ProjectProfileConfirmation,
+    self, PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS, ProjectProfileConfirmation,
 };
+use super::project_profile_projection::should_confirm_project_profile;
 use super::quality::quality_first_pass_observation;
 use super::quality_confirm::{
     self, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmInputs, QualityConfirmOutcome,
     QualityConfirmation, QualityConfirmationSource, run_quality_confirm_with_strategy,
     should_request_quality_confirmation,
 };
-use super::task_contract::{
-    ArtifactRole, ProjectIntent, TaskClassification, TaskContract, TaskKind,
-};
+use super::task_contract::{ProjectIntent, TaskClassification, TaskContract, TaskKind};
 use super::task_kind_confirm::{
     self, TASK_KIND_CONFIRM_TIMEOUT_SECS, TaskKindConfirmInputs, TaskKindConfirmOutcome,
     TaskKindConfirmationSource, build_task_kind_confirm_log_payload,
@@ -741,7 +739,7 @@ pub(super) fn maybe_invoke_project_profile_confirm(
         .and_then(|reply| project_profile::parse_project_profile_confirmation(&reply));
     let adopted = profile
         .as_ref()
-        .is_some_and(project_profile_confirmation_authoritative);
+        .is_some_and(project_profile::confirmation_is_authoritative);
     log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
         status: if adopted { "confirmed" } else { "fallback" },
         session_id: &session_id,
@@ -756,28 +754,14 @@ pub(super) fn maybe_invoke_project_profile_confirm(
         },
         profile: profile.as_ref(),
     });
-    profile.filter(project_profile_confirmation_authoritative)
+    profile.filter(project_profile::confirmation_is_authoritative)
 }
 
 fn should_request_project_profile_confirm(first_pass: &TaskContract, raw_input: &str) -> bool {
-    if first_pass.required_artifacts.is_empty() {
-        return false;
-    }
     if raw_input.contains("STATE_CONTROL_PACKET") {
         return false;
     }
-    if first_pass.task_kind != TaskKind::Coding {
-        return true;
-    }
-    first_pass
-        .required_artifacts
-        .iter()
-        .chain(first_pass.optional_artifacts.iter())
-        .any(|role| matches!(role, ArtifactRole::UsageDocs | ArtifactRole::DataOutput))
-}
-
-fn project_profile_confirmation_authoritative(profile: &ProjectProfileConfirmation) -> bool {
-    profile.confidence >= PROJECT_PROFILE_CONFIRM_CONFIDENCE_THRESHOLD
+    should_confirm_project_profile(first_pass)
 }
 
 fn project_profile_first_pass_summary(first_pass: &TaskContract) -> String {

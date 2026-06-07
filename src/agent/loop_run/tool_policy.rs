@@ -326,7 +326,7 @@ pub(super) fn effective_tool_policy_error_for_call_with_scope(
                 })
                 .unwrap_or_else(|| "the active target".to_string());
             return Some(format!(
-                "artifact-directed recovery rejected Bash; only allows Read, Write, or Edit on {target_display}"
+                "artifact-directed recovery rejected Bash; only allows Write or Edit on {target_display}; Read may inspect workspace files"
             ));
         }
         return Some(restricted_tool_policy_error(
@@ -409,6 +409,15 @@ pub(super) fn artifact_directed_tool_policy_error(
     target: &Path,
     work_root: &Path,
 ) -> Option<String> {
+    if name == "Read"
+        && arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw_path| workspace_relative_path_for_tool_arg(work_root, raw_path))
+            .is_some()
+    {
+        return None;
+    }
     // CB-003: SSOT target match — compare on the workspace-relative
     // canonical form derived from `resolve_user_path` (used by both
     // `task_workspace_scope` and `ArtifactCompletionJob.target_path`).
@@ -434,7 +443,7 @@ pub(super) fn artifact_directed_tool_policy_error(
             .replace('\\', "/"),
     );
     Some(format!(
-        "artifact-directed recovery rejected {rejected_tool}; only allows Read, Write, or Edit on {path_display}"
+        "artifact-directed recovery rejected {rejected_tool}; only allows Write or Edit on {path_display}; Read may inspect workspace files"
     ))
 }
 
