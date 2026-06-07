@@ -30,7 +30,9 @@ use super::feedback_kind_confirm::{
 use super::project_profile::{
     self, PROJECT_PROFILE_CONFIRM_TIMEOUT_SECS, ProjectProfileConfirmation,
 };
-use super::project_profile_projection::should_confirm_project_profile;
+use super::project_profile_projection::{
+    project_profile_adoption_decision, should_confirm_project_profile,
+};
 use super::quality::quality_first_pass_observation;
 use super::quality_confirm::{
     self, QUALITY_CONFIRM_TIMEOUT_SECS, QualityConfirmInputs, QualityConfirmOutcome,
@@ -737,24 +739,22 @@ pub(super) fn maybe_invoke_project_profile_confirm(
     let profile = raw_reply
         .ok()
         .and_then(|reply| project_profile::parse_project_profile_confirmation(&reply));
-    let adopted = profile
-        .as_ref()
-        .is_some_and(project_profile::confirmation_is_authoritative);
+    let adoption = project_profile_adoption_decision(profile.as_ref(), first_pass);
     log_project_profile_confirm_outcome(ProjectProfileConfirmLogArgs {
-        status: if adopted { "confirmed" } else { "fallback" },
+        status: if adoption.is_adopted() {
+            "confirmed"
+        } else {
+            "fallback"
+        },
         session_id: &session_id,
         sidecar_model: sidecar_model.as_deref(),
         turn_index,
         first_pass,
         latency_ms: Some(latency_ms),
-        reason: if adopted {
-            None
-        } else {
-            Some("unusable_or_low_confidence")
-        },
+        reason: adoption.fallback_reason(),
         profile: profile.as_ref(),
     });
-    profile.filter(project_profile::confirmation_is_authoritative)
+    profile.filter(|_| adoption.is_adopted())
 }
 
 fn should_request_project_profile_confirm(first_pass: &TaskContract, raw_input: &str) -> bool {

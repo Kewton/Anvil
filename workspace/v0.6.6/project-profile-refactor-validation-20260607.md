@@ -156,3 +156,44 @@ Models:
   - deliverables are writable targets,
   - evidence checks run after deliverables,
   - artifact repair must never turn readable inputs or forbidden setup manifests into required deliverables.
+
+## 2026-06-07 Adoption And Evidence Follow-Up
+
+### Code Changes
+
+- Added `ProjectProfileAdoptionDecision` so profile adoption is a typed decision with loggable fallback reasons.
+- Narrowed contradiction rejection to the harmful case observed in validation: a high-confidence profile that tries to turn a non-source objective into `SourceFiles`.
+- Allowed data/docs/research profiles to correct a bad first-pass setup/ops objective instead of being rejected because the first pass was already contaminated.
+- Hardened ProjectProfile parsing for unquoted enum values such as `deliverable_kind: data` and `evidence_kind: content_check`.
+- Changed DataOutput completion so raw repo edits do not count as completion evidence without structured-data evidence or an artifact excerpt.
+- Changed missing-role target selection to prefer explicit contract identities, avoiding fallback drift from `summary.json` to conventional `output.csv`.
+- Filtered ProjectProfile-derived DataOutput artifact paths through the existing output-context scan, so input files such as `inventory.csv` are not promoted to writable deliverables when the sidecar misplaces them in `primary_artifacts`.
+
+### Static Validation
+
+- `cargo test project_profile --lib`: pass, 25 tests
+- `cargo test project_profile_projection --lib`: pass, 8 tests
+- `cargo test data_capability_e2e_tests --lib`: pass, 15 tests
+- `cargo test data_output_repo_edit_without_excerpt_is_not_completion_authority --lib`: pass
+- `cargo test data_schema_mismatch_is_not_ready_just_because_path_exists --lib`: pass
+- `cargo fmt --all -- --check`: pass
+- `cargo clippy --all-targets -- -D warnings`: pass
+- `cargo test --lib`: pass, 3870 tests
+
+### Local LLM Revalidation
+
+| Case | Workspace | Result | Notes |
+| --- | --- | --- | --- |
+| data CSV -> JSON | `/private/tmp/anvil-profile-data-adopt5.Beu1T2` | pass once | Wrote `summary.json` with `total_count=5`, `total_value=950`; no setup/source/test files. |
+| data CSV -> JSON repeat | `/private/tmp/anvil-profile-data-adopt7.ZUNozv` | partial | Input file was no longer edited, but `summary.json` had `total_value=850`; controller still accepted parse-ready but semantically wrong data. |
+| research source -> report | `/private/tmp/anvil-profile-research-adopt.k6e9WH` | pass | Wrote `report.md`; no Cargo/package drift. Sidecar classified as document, which is acceptable for a written report artifact. |
+| ops observation | `/private/tmp/anvil-profile-ops-adopt.hFCiaH` | partial pass | Wrote `ops-observation.md`, but did not actually run `pwd`; ops still needs command-observation evidence enforcement. |
+| Rust TDD initials | `/private/tmp/anvil-profile-coding-adopt.zmsRr5` | pass | Created `Cargo.toml`, `src/lib.rs`, `tests/lib.rs`; Anvil ran `cargo test` and completed. |
+
+### Updated Interpretation
+
+- The biggest improvement is not prompt wording alone. It is separating profile adoption from `TaskContract` construction and using typed deliverable/evidence semantics to decide whether the profile can override a bad first pass.
+- Data success required two layers: LLM-side semantic classification (`deliverable_kind=data`) and controller-side evidence discipline (DataOutput cannot complete on file existence alone).
+- Data is still not robust. The controller now protects input files from being promoted to writable deliverables, but it does not verify transformation semantics such as `total_value = sum(count * price)`.
+- Research no longer falls into code scaffolding, but report-style research currently projects through the document path. That is acceptable for the artifact lifecycle, but future reporting should preserve `research_report` when the sidecar provides it.
+- Ops remains the weakest non-coding lane: it can create the requested observation file, but command-observation evidence is not yet enforced.

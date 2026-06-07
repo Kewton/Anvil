@@ -392,6 +392,7 @@ fn normalize_jsonish_constants(input: &str) -> String {
     let mut chars = input.chars().peekable();
     let mut in_string = false;
     let mut escaped = false;
+    let mut expecting_value = false;
 
     while let Some(ch) = chars.next() {
         if in_string {
@@ -412,18 +413,48 @@ fn normalize_jsonish_constants(input: &str) -> String {
             continue;
         }
 
+        if ch == ':' {
+            expecting_value = true;
+            normalized.push(ch);
+            continue;
+        }
+
+        if ch == '[' || ch == ',' {
+            expecting_value = true;
+            normalized.push(ch);
+            continue;
+        }
+
+        if expecting_value && ch.is_ascii_whitespace() {
+            normalized.push(ch);
+            continue;
+        }
+
         if ch.is_ascii_alphabetic() {
             let mut token = String::from(ch);
-            while chars.peek().is_some_and(|next| next.is_ascii_alphabetic()) {
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_' || *next == '-')
+            {
                 token.push(chars.next().expect("peeked"));
             }
             match token.as_str() {
                 "None" => normalized.push_str("null"),
                 "True" => normalized.push_str("true"),
                 "False" => normalized.push_str("false"),
+                "null" | "true" | "false" => normalized.push_str(&token),
+                _ if expecting_value => {
+                    normalized.push('"');
+                    normalized.push_str(&token);
+                    normalized.push('"');
+                }
                 _ => normalized.push_str(&token),
             }
+            expecting_value = false;
         } else {
+            if !ch.is_ascii_whitespace() {
+                expecting_value = false;
+            }
             normalized.push(ch);
         }
     }
@@ -655,6 +686,34 @@ mod tests {
         assert_eq!(parsed.primary_artifacts, vec!["summary.json"]);
         assert_eq!(parsed.deliverable_kind, Some(ProfileDeliverableKind::Data));
         assert_eq!(parsed.evidence_kind, Some(ProfileEvidenceKind::SchemaCheck));
+    }
+
+    #[test]
+    fn llm_profile_confirmation_parser_accepts_unquoted_enum_values() {
+        let parsed = parse_project_profile_confirmation(
+            r#"{
+                "language": null,
+                "shape": unknown,
+                "deliverable_kind": data,
+                "primary_artifacts": ["/inventory.csv", "/summary.json"],
+                "forbidden_artifacts": [],
+                "evidence_kind": content_check,
+                "needs_environment_setup": false,
+                "preferred_runner": null,
+                "confidence": 0.95,
+                "reason": "data processing"
+            }"#,
+        )
+        .expect("parse profile");
+
+        assert_eq!(parsed.shape, Some(ProjectShape::Unknown));
+        assert_eq!(parsed.deliverable_kind, Some(ProfileDeliverableKind::Data));
+        assert_eq!(
+            parsed.evidence_kind,
+            Some(ProfileEvidenceKind::ContentCheck)
+        );
+        assert!(parsed.primary_artifacts.is_empty());
+        assert_eq!(parsed.confidence, 0.95);
     }
 
     #[test]

@@ -14,6 +14,27 @@ use super::task_contract::{
     TaskContract, TaskKind, VerificationRequirement, preferred_runner_for_language,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectProfileAdoptionDecision {
+    Adopt,
+    RejectLowConfidence,
+    RejectContradictoryObjective,
+}
+
+impl ProjectProfileAdoptionDecision {
+    pub(super) fn is_adopted(self) -> bool {
+        matches!(self, Self::Adopt)
+    }
+
+    pub(super) fn fallback_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Adopt => None,
+            Self::RejectLowConfidence => Some("unusable_or_low_confidence"),
+            Self::RejectContradictoryObjective => Some("objective_contract_conflict"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ProjectProfileContractInputs {
     pub(super) task_kind: Option<TaskKind>,
@@ -26,6 +47,22 @@ pub(super) struct ProjectProfileContractInputs {
     pub(super) forbids_tests: bool,
     pub(super) forbids_setup: bool,
     pub(super) confidence: f32,
+}
+
+pub(super) fn project_profile_adoption_decision(
+    profile: Option<&ProjectProfileConfirmation>,
+    first_pass: &TaskContract,
+) -> ProjectProfileAdoptionDecision {
+    let Some(profile) = profile else {
+        return ProjectProfileAdoptionDecision::RejectLowConfidence;
+    };
+    if !project_profile::confirmation_is_authoritative(profile) {
+        return ProjectProfileAdoptionDecision::RejectLowConfidence;
+    }
+    if profile_conflicts_with_first_pass_objective(profile, first_pass) {
+        return ProjectProfileAdoptionDecision::RejectContradictoryObjective;
+    }
+    ProjectProfileAdoptionDecision::Adopt
 }
 
 pub(super) fn contract_inputs_from_confirmation(
@@ -69,6 +106,44 @@ fn source_deliverable_has_mixed_objective_roles(required: &[ArtifactRole]) -> bo
     required
         .iter()
         .any(|role| matches!(role, ArtifactRole::UsageDocs | ArtifactRole::DataOutput))
+}
+
+fn profile_conflicts_with_first_pass_objective(
+    profile: &ProjectProfileConfirmation,
+    first_pass: &TaskContract,
+) -> bool {
+    let Some(profile_deliverable) = objective_deliverable_kind_from_profile(profile) else {
+        return false;
+    };
+    if profile_deliverable != ObjectiveDeliverableKind::SourceFiles {
+        return false;
+    }
+    let objective = first_pass.objective_contract();
+    if !objective.has_required_deliverables() {
+        return false;
+    }
+    if source_deliverable_has_mixed_objective_roles(&objective.required_deliverables) {
+        return true;
+    }
+    !matches!(
+        objective.deliverable_kind,
+        ObjectiveDeliverableKind::SourceFiles
+    )
+}
+
+fn objective_deliverable_kind_from_profile(
+    profile: &ProjectProfileConfirmation,
+) -> Option<ObjectiveDeliverableKind> {
+    match profile.deliverable_kind? {
+        ProfileDeliverableKind::Code => Some(ObjectiveDeliverableKind::SourceFiles),
+        ProfileDeliverableKind::Document => Some(ObjectiveDeliverableKind::DocumentSections),
+        ProfileDeliverableKind::Data => Some(ObjectiveDeliverableKind::OutputFile),
+        ProfileDeliverableKind::ResearchReport => Some(ObjectiveDeliverableKind::ResearchNotes),
+        ProfileDeliverableKind::CommandObservation => {
+            Some(ObjectiveDeliverableKind::CommandObservation)
+        }
+        ProfileDeliverableKind::None | ProfileDeliverableKind::Unknown => None,
+    }
 }
 
 fn task_kind_from_profile(profile: &ProjectProfileConfirmation) -> Option<TaskKind> {
@@ -166,6 +241,14 @@ fn forbids_setup_artifact(profile: &ProjectProfileConfirmation) -> bool {
         .forbidden_artifacts
         .iter()
         .any(|artifact| matches!(artifact, ForbiddenArtifact::Setup))
+        || (matches!(
+            profile.deliverable_kind,
+            Some(
+                ProfileDeliverableKind::Document
+                    | ProfileDeliverableKind::Data
+                    | ProfileDeliverableKind::ResearchReport
+            )
+        ) && !matches!(profile.evidence_kind, Some(ProfileEvidenceKind::TestRun)))
         || (profile.needs_environment_setup == Some(false)
             && matches!(
                 profile.deliverable_kind,
@@ -267,5 +350,153 @@ mod tests {
         assert!(should_confirm_project_profile(&docs));
         assert!(!should_confirm_project_profile(&coding));
         assert!(should_confirm_project_profile(&mixed));
+    }
+
+    #[test]
+    fn code_profile_conflicting_with_research_objective_is_not_adopted() {
+        let first_pass = TaskContract::from_request(
+            "Read source.md and write a concise research report to report.md. Do not create source code or tests.",
+        );
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"rust",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["src/main.rs"],
+                "forbidden_artifacts":[],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":true,
+                "preferred_runner":"cargo test",
+                "confidence":0.95,
+                "reason":"first pass suggested Rust"
+            }"#,
+        )
+        .expect("profile");
+
+        assert_eq!(
+            project_profile_adoption_decision(Some(&profile), &first_pass),
+            ProjectProfileAdoptionDecision::RejectContradictoryObjective
+        );
+    }
+
+    #[test]
+    fn data_profile_can_override_first_pass_setup_objective() {
+        let first_pass = TaskContract::from_request(
+            "Read inventory.csv and write summary.json containing total_count and total_value. Do not create source code, tests, scripts, Cargo.toml, package.json, or setup files.",
+        );
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"data",
+                "primary_artifacts":["summary.json"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"schema_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"structured JSON output"
+            }"#,
+        )
+        .expect("profile");
+
+        assert_eq!(
+            project_profile_adoption_decision(Some(&profile), &first_pass),
+            ProjectProfileAdoptionDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn adopted_data_profile_without_primary_artifacts_keeps_request_output_path_not_setup() {
+        let request = "Read inventory.csv and write summary.json containing total_count and total_value. Do not create source code, tests, scripts, Cargo.toml, package.json, or setup files.";
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"data",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"schema_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"structured JSON output"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::DataOutput)
+        );
+        assert_eq!(
+            contract.required_identities_for_role(ArtifactRole::DataOutput),
+            vec![&ArtifactObligation::file(
+                ArtifactRole::DataOutput,
+                "summary.json"
+            )]
+        );
+        assert!(
+            contract
+                .required_identities_for_role(ArtifactRole::Setup)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn adopted_data_profile_filters_primary_input_paths_through_output_context() {
+        let request = "Read inventory.csv and write summary.json containing total_count and total_value. Do not create source code, tests, scripts, Cargo.toml, package.json, or setup files.";
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"data",
+                "primary_artifacts":["inventory.csv"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"schema_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"structured JSON output"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+        assert_eq!(
+            contract.required_identities_for_role(ArtifactRole::DataOutput),
+            vec![&ArtifactObligation::file(
+                ArtifactRole::DataOutput,
+                "summary.json"
+            )]
+        );
+    }
+
+    #[test]
+    fn non_source_profile_without_test_run_forbids_setup_even_when_setup_flag_drifts_true() {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"data",
+                "primary_artifacts":["summary.json"],
+                "forbidden_artifacts":[],
+                "evidence_kind":"schema_check",
+                "needs_environment_setup":true,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"data output"
+            }"#,
+        )
+        .expect("profile");
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+
+        assert_eq!(inputs.task_kind, Some(TaskKind::Data));
+        assert!(inputs.forbids_setup);
     }
 }

@@ -2087,9 +2087,16 @@ fn artifact_identity_satisfied_for_verification(
     // Issue #919: path-existence observation must still see a raw repo edit
     // (DR3-002 only governs *completion authority*, not whether the path exists);
     // the Authoring accept-tier is enforced by `verifier_diagnostic_for_obligation`.
+    let completion_evidence_observed =
+        artifact_identity_observed_in_evidence(evidence, identity, false);
     let path_exists = artifact_identity_path_ready_for_verification(artifacts, identity)
-        || artifact_identity_observed_in_evidence(evidence, identity, false);
+        || completion_evidence_observed;
     let excerpt = artifact_excerpts.get(&identity.role).map(String::as_str);
+    if identity.role == ArtifactRole::DataOutput {
+        return excerpt
+            .map(|excerpt| data_output_identity_excerpt_satisfies(identity, excerpt))
+            .unwrap_or_else(|| data_output_structured_evidence_observed(evidence, identity));
+    }
     let Some(diagnostic) = super::verifier::verifier_diagnostic_for_obligation(
         task_kind,
         identity,
@@ -2101,6 +2108,43 @@ fn artifact_identity_satisfied_for_verification(
     diagnostic.code == super::verifier::VerifierDiagnosticCode::EvidenceMissing
         && excerpt.is_none()
         && path_exists
+}
+
+fn data_output_identity_excerpt_satisfies(identity: &ArtifactObligation, excerpt: &str) -> bool {
+    let columns = identity
+        .structured_record_schema
+        .as_ref()
+        .map(|schema| schema.columns.as_slice())
+        .unwrap_or(&[]);
+    if columns.is_empty() {
+        return super::verifier::assess_structured_data(Some(&identity.path), excerpt, &[])
+            .is_accepted();
+    }
+    super::verifier::structured_data_schema_obligation_pass(&identity.path, excerpt, columns)
+}
+
+fn data_output_structured_evidence_observed(
+    evidence: &EvidenceSet,
+    identity: &ArtifactObligation,
+) -> bool {
+    evidence.iter().any(|item| match item {
+        CompletionEvidence::StructuredDataPass {
+            path: Some(path),
+            columns,
+        } => {
+            normalized_artifact_path_eq(path, &identity.path)
+                && identity
+                    .structured_record_schema
+                    .as_ref()
+                    .is_none_or(|schema| {
+                        schema
+                            .columns
+                            .iter()
+                            .all(|column| columns.iter().any(|observed| observed == column))
+                    })
+        }
+        _ => false,
+    })
 }
 
 fn artifact_identity_path_ready_for_verification(
@@ -2253,6 +2297,16 @@ fn recovery_target_hint_for_missing_with_contract(
     ) {
         return Some(target_hint);
     }
+    if let Some(identity) = contract.required_identities_for_role(role).first() {
+        return Some(RecoveryTargetHint {
+            role,
+            path: identity.path.clone(),
+            reason: format!(
+                "required deliverable obligation is still missing: {}",
+                obligation_report_label(identity)
+            ),
+        });
+    }
     recovery_target_hint_for_missing(artifacts, missing)
 }
 
@@ -2292,6 +2346,7 @@ pub(super) fn blocking_obligation_diagnostic_for_role(
             if diagnostic.code == super::verifier::VerifierDiagnosticCode::EvidenceMissing
                 && excerpt.is_none()
                 && path_exists
+                && role != ArtifactRole::DataOutput
             {
                 return None;
             }
@@ -2710,6 +2765,11 @@ impl TaskContract {
             .flat_map(|inputs| inputs.artifact_obligations.iter())
             .cloned()
         {
+            if identity.role == ArtifactRole::DataOutput
+                && !data_path_has_output_context_with_scan(&scan, &identity.path)
+            {
+                continue;
+            }
             if !required.contains(&identity.role) {
                 required.push(identity.role);
             }
@@ -7817,7 +7877,6 @@ mod tests {
             missing_verifier_suppress_retry: false,
             owned_test_artifacts: &[],
         });
-
         assert!(matches!(
             action,
             ArtifactRecoveryAction::Continue {
@@ -9902,6 +9961,53 @@ Create the README file."#;
     }
 
     #[test]
+    fn data_output_repo_edit_without_excerpt_is_not_completion_authority() {
+        let request = "Read inventory.csv and write summary.json containing total_count and total_value. Do not create source code, tests, scripts, Cargo.toml, package.json, or setup files.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"data",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"schema_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"structured JSON output"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "summary.json"));
+        let repair_state = VerifierRepairState::None;
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[ArtifactState::exists(
+                ArtifactRole::DataOutput,
+                "summary.json",
+            )],
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert!(matches!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: Some(RecoveryTargetHint { role, path, .. }),
+            } if missing == vec![ArtifactRole::DataOutput]
+                && role == ArtifactRole::DataOutput
+                && path == "summary.json"
+        ));
+    }
+
+    #[test]
     fn data_parse_ready_missing_column_blocks_schema_obligation() {
         // The generic DataVerifier accept-tier still exists, but a
         // TaskContract schema obligation is stricter: declared columns must be
@@ -9926,7 +10032,6 @@ Create the README file."#;
             missing_verifier_suppress_retry: false,
             owned_test_artifacts: &[],
         });
-
         assert!(matches!(
             action,
             ArtifactRecoveryAction::Continue {
