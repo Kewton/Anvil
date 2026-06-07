@@ -28,7 +28,8 @@ pub(super) fn run_turn(
     monitor: &mut InterruptMonitor,
 ) -> LoopResult {
     super::message_push::push_user_message(agent, input.to_string());
-    let controller_owned_turn = super::task_contract::is_controller_state_packet(input);
+    let request_view = super::task_contract::RequestInferenceView::from_raw(input);
+    let controller_owned_turn = request_view.is_controller_owned_turn();
     // Issue #917 (P0.5): eager-populate the per-turn classification authority at
     // this single known point — right after the request is set, before any
     // reader and regardless of mode. `active_request_text` strips the auto-plan
@@ -48,10 +49,10 @@ pub(super) fn run_turn(
             // mode policy into a worker turn.
             agent.session.mode_state.work_mode = WorkMode::Auto;
         } else {
-            let classifier_input = super::task_contract::model_visible_request_text(input);
+            let classifier_input = request_view.visible_text();
             let _ = super::classify_confirm_flow::classify_with_confirmation(
                 agent,
-                &classifier_input,
+                classifier_input,
                 "turn_start",
             );
         }

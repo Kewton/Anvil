@@ -713,8 +713,7 @@ struct ControllerStatePacket {
 }
 
 impl ControllerStatePacket {
-    fn parse(raw: &str) -> Option<Self> {
-        let (value, _) = controller_state_packet_value_and_range(raw)?;
+    fn from_value(value: &serde_json::Value) -> Self {
         let required_artifacts = value
             .get("required_artifacts")
             .and_then(serde_json::Value::as_array)
@@ -728,10 +727,10 @@ impl ControllerStatePacket {
             .map(str::trim)
             .filter(|command| !command.is_empty())
             .map(str::to_string);
-        Some(Self {
+        Self {
             required_artifacts,
             evidence_command,
-        })
+        }
     }
 
     fn inferred_task_kind(&self) -> Option<TaskKind> {
@@ -769,8 +768,48 @@ impl ControllerStatePacket {
     }
 }
 
-pub(super) fn is_controller_state_packet(raw: &str) -> bool {
-    raw.trim_start().starts_with("STATE_CONTROL_PACKET")
+/// Single parsed view of a raw request used by controller/state code.
+///
+/// The controller packet is structural state. Natural-language inference,
+/// WorkMode classification, and model-visible prompt history must use
+/// `visible_text`, not the raw request, so schema keys cannot leak into task or
+/// tool policy decisions.
+#[derive(Debug, Clone)]
+pub(super) struct RequestInferenceView {
+    visible_text: String,
+    controller_state: Option<ControllerStatePacket>,
+    controller_packet_at_start: bool,
+}
+
+impl RequestInferenceView {
+    pub(super) fn from_raw(raw: &str) -> Self {
+        let parsed_packet = controller_state_packet_value_and_range(raw);
+        let (controller_state, visible_text) = match parsed_packet {
+            Some((value, range)) => (
+                Some(ControllerStatePacket::from_value(&value)),
+                model_visible_request_text_from_packet_range(raw, range),
+            ),
+            None => (None, model_visible_request_text_without_packet(raw)),
+        };
+        let controller_packet_at_start = raw.trim_start().starts_with("STATE_CONTROL_PACKET");
+        Self {
+            visible_text,
+            controller_state,
+            controller_packet_at_start,
+        }
+    }
+
+    pub(super) fn visible_text(&self) -> &str {
+        &self.visible_text
+    }
+
+    pub(super) fn into_visible_text(self) -> String {
+        self.visible_text
+    }
+
+    pub(super) fn is_controller_owned_turn(&self) -> bool {
+        self.controller_packet_at_start
+    }
 }
 
 fn controller_state_packet_value_and_range(
@@ -786,12 +825,20 @@ fn controller_state_packet_value_and_range(
 }
 
 pub(super) fn model_visible_request_text(raw: &str) -> String {
-    let Some((_, range)) = controller_state_packet_value_and_range(raw) else {
-        if let Some(marker_start) = raw.find("STATE_CONTROL_PACKET") {
-            return raw[..marker_start].trim_end().to_string();
-        }
-        return raw.trim().to_string();
-    };
+    RequestInferenceView::from_raw(raw).into_visible_text()
+}
+
+fn model_visible_request_text_without_packet(raw: &str) -> String {
+    if let Some(marker_start) = raw.find("STATE_CONTROL_PACKET") {
+        return raw[..marker_start].trim_end().to_string();
+    }
+    raw.trim().to_string()
+}
+
+fn model_visible_request_text_from_packet_range(
+    raw: &str,
+    range: std::ops::Range<usize>,
+) -> String {
     let before = raw[..range.start].trim_end();
     let after = raw[range.end..].trim_start_matches(|ch: char| {
         ch.is_whitespace() || matches!(ch, '.' | '。' | ',' | '、' | ';' | '；')
@@ -2343,17 +2390,14 @@ impl TaskContract {
     /// `task_classification.rs` takes its ELSE (kind-differs) branch and never
     /// runs the full-struct equality against the deterministic recompute.
     pub(super) fn from_request_with_kind(request: &str, forced_kind: Option<TaskKind>) -> Self {
-        let controller_state = ControllerStatePacket::parse(request);
-        let natural_request = if controller_state.is_some() {
-            model_visible_request_text(request)
-        } else {
-            request.to_string()
-        };
-        let request_for_inference = natural_request.as_str();
-        let controller_task_kind = controller_state
+        let request_view = RequestInferenceView::from_raw(request);
+        let request_for_inference = request_view.visible_text();
+        let controller_task_kind = request_view
+            .controller_state
             .as_ref()
             .and_then(ControllerStatePacket::inferred_task_kind);
-        let evidence_command_hint = controller_state
+        let evidence_command_hint = request_view
+            .controller_state
             .as_ref()
             .and_then(|state| state.evidence_command.clone());
         let lower = request_for_inference.to_ascii_lowercase();
@@ -2455,7 +2499,7 @@ impl TaskContract {
         optional.dedup();
         let mut required_artifact_identities =
             explicit_artifact_obligations_from_request_with_scan(&scan, request_for_inference);
-        if let Some(controller_state) = &controller_state {
+        if let Some(controller_state) = &request_view.controller_state {
             controller_state
                 .extend_contract_parts(&mut required, &mut required_artifact_identities);
         }
@@ -8304,6 +8348,33 @@ mod tests {
             model_visible_request_text(request),
             "Create summary.json only."
         );
+    }
+
+    #[test]
+    fn request_inference_view_keeps_controller_state_out_of_visible_text() {
+        let request = r#"Create summary.json only. STATE_CONTROL_PACKET {"objective":"Create summary.json","required_artifacts":[{"path":"summary.json","role":"data","schema":{"json_fields":["topic","status"]}}]}. Write valid JSON."#;
+        let view = RequestInferenceView::from_raw(request);
+
+        assert!(view.controller_state.is_some());
+        assert!(!view.is_controller_owned_turn());
+        assert_eq!(
+            view.visible_text(),
+            "Create summary.json only. Write valid JSON."
+        );
+        assert!(!view.visible_text().contains("STATE_CONTROL_PACKET"));
+        assert!(!view.visible_text().contains("required_artifacts"));
+    }
+
+    #[test]
+    fn request_inference_view_marks_leading_packet_as_controller_owned_turn() {
+        let request = r#"STATE_CONTROL_PACKET
+{"objective":"Create README.md documentation.","required_artifacts":[{"path":"README.md","role":"docs","schema":{"required_sections":["Setup","Usage"]}}]}
+Create the README file."#;
+        let view = RequestInferenceView::from_raw(request);
+
+        assert!(view.controller_state.is_some());
+        assert!(view.is_controller_owned_turn());
+        assert_eq!(view.visible_text(), "Create the README file.");
     }
 
     #[test]
