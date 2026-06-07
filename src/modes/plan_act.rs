@@ -364,6 +364,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         ],
     );
     let primary_code_task = request_has_primary_code_task(raw, &lower);
+    let generic_code_stack_signal = request_has_generic_code_stack_signal(raw, &lower);
 
     let mut candidates = Vec::<WorkModeCandidate>::new();
     if explicit_no_edit || (answer_request && !explicit_edit) {
@@ -439,11 +440,17 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         });
     }
     if explicit_edit {
+        let mut confidence: f32 = 0.7;
+        let mut evidence = vec!["edit-intent"];
+        if generic_code_stack_signal && !explicit_python_artifact && !explicit_ui_framework {
+            confidence = 0.92;
+            evidence.push("generic-code-stack-signal");
+        }
         candidates.push(WorkModeCandidate {
             work_mode: WorkMode::GenericCode,
             intent: "generic-edit",
-            confidence: 0.7,
-            evidence: vec!["edit-intent"],
+            confidence,
+            evidence,
         });
     }
     if candidates.is_empty() {
@@ -571,6 +578,29 @@ fn request_has_primary_code_task(raw: &str, lower: &str) -> bool {
         || mentions_stack_as_build_target(raw, lower);
 
     production_action && code_subject
+}
+
+fn request_has_generic_code_stack_signal(raw: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "cargo test",
+            "cargo.toml",
+            "rust",
+            ".rs",
+            "src/lib.rs",
+            "go test",
+            "golang",
+            "maven",
+            "gradle",
+            "java",
+            "kotlin",
+            "swift",
+            "node --test",
+            "node.js",
+            "nodejs",
+        ],
+    ) || contains_any(raw, &["Rustで", "Cargo.toml", "標準入力"])
 }
 
 fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
@@ -765,6 +795,24 @@ mod tests {
         assert_eq!(rust_library.work_mode, WorkMode::GenericCode);
         assert!(rust_library.requires_tests);
         assert!(rust_library.evidence.contains(&"edit-intent"));
+        assert!(rust_library.evidence.contains(&"generic-code-stack-signal"));
+        assert!(
+            rust_library.confidence >= WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD,
+            "Rust/Cargo generic-code signals should not need LLM mode confirmation: {:?}",
+            rust_library
+        );
+
+        let rust_tdd = classify_work_mode_json(
+            "TDDで進めてください。まず tests/password_strength.rs に失敗するテストを書き、その後 src/lib.rs に password_score(password: &str) -> u8 を実装してください。cargo test --manifest-path Cargo.toml が成功するまで進めてください。",
+        );
+        assert_eq!(rust_tdd.work_mode, WorkMode::GenericCode);
+        assert!(rust_tdd.requires_tests);
+        assert!(rust_tdd.evidence.contains(&"generic-code-stack-signal"));
+        assert!(
+            !should_request_confirmation(&rust_tdd, ""),
+            "Rust/Cargo TDD request should stay controller-classified without second-pass override: {:?}",
+            rust_tdd
+        );
     }
 
     #[test]
