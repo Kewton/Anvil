@@ -1954,7 +1954,7 @@ impl AutoTestRunner {
 fn run_structured_generated_test_preflight(
     runner_program: &str,
     env_plan: &HermeticEnvPlan,
-    _work_root: &Path,
+    work_root: &Path,
     command: &VerifierCommand,
     display_command: &str,
 ) -> Result<Option<AutoTestResult>, String> {
@@ -1981,7 +1981,9 @@ fn run_structured_generated_test_preflight(
         "cargo" => {
             let mut args = vec!["test".to_string(), "--no-run".to_string()];
             for path in command.bound_test_artifacts() {
-                let Some(name) = cargo_integration_test_name(path) else {
+                let Some(name) = cargo_integration_test_name_for_manifest(work_root, path)
+                    .or_else(|| cargo_integration_test_name(path))
+                else {
                     return Ok(None);
                 };
                 args.push("--test".to_string());
@@ -2721,18 +2723,101 @@ struct CargoManifestEvidence {
     has_explicit_test_target: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CargoTestTarget {
+    name: String,
+    path: String,
+}
+
 impl CargoManifestEvidence {
     fn from_str(raw: &str) -> Self {
         Self {
-            has_explicit_test_target: raw
-                .lines()
-                .map(str::trim_start)
-                .filter(|line| !line.starts_with('#'))
-                .any(|line| {
-                    parse_toml_array_section(line).is_some_and(|section| section == "test")
-                }),
+            has_explicit_test_target: cargo_test_targets_from_manifest(raw).has_explicit_section,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CargoTestTargets {
+    has_explicit_section: bool,
+    targets: Vec<CargoTestTarget>,
+}
+
+fn cargo_test_targets_from_manifest(raw: &str) -> CargoTestTargets {
+    let mut parsed = CargoTestTargets::default();
+    let mut in_test_section = false;
+    let mut current_name: Option<String> = None;
+    let mut current_path: Option<String> = None;
+
+    for line in raw.lines().map(str::trim_start) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(section) = parse_toml_array_section(line) {
+            push_cargo_test_target(&mut parsed.targets, &mut current_name, &mut current_path);
+            in_test_section = section == "test";
+            if in_test_section {
+                parsed.has_explicit_section = true;
+            }
+            continue;
+        }
+        if parse_toml_section(line).is_some() {
+            push_cargo_test_target(&mut parsed.targets, &mut current_name, &mut current_path);
+            in_test_section = false;
+            continue;
+        }
+        if !in_test_section {
+            continue;
+        }
+        if let Some(value) = parse_toml_string_value(line, "name") {
+            current_name = Some(value);
+        } else if let Some(value) = parse_toml_string_value(line, "path") {
+            current_path = Some(value);
+        }
+    }
+    push_cargo_test_target(&mut parsed.targets, &mut current_name, &mut current_path);
+    parsed
+}
+
+fn push_cargo_test_target(
+    targets: &mut Vec<CargoTestTarget>,
+    name: &mut Option<String>,
+    path: &mut Option<String>,
+) {
+    let (Some(name_value), Some(path_value)) = (name.take(), path.take()) else {
+        return;
+    };
+    if name_value.is_empty() || path_value.is_empty() {
+        return;
+    }
+    targets.push(CargoTestTarget {
+        name: name_value,
+        path: path_value,
+    });
+}
+
+fn parse_toml_string_value(line: &str, key: &str) -> Option<String> {
+    let (raw_key, raw_value) = line.split_once('=')?;
+    if raw_key.trim() != key {
+        return None;
+    }
+    let value = raw_value.trim();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &value[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+fn cargo_integration_test_name_for_manifest(work_root: &Path, path: &str) -> Option<String> {
+    let manifest = std::fs::read_to_string(work_root.join("Cargo.toml")).ok()?;
+    cargo_test_targets_from_manifest(&manifest)
+        .targets
+        .into_iter()
+        .find(|target| target.path == path)
+        .map(|target| target.name)
 }
 
 fn parse_toml_section(trimmed: &str) -> Option<String> {
@@ -4333,6 +4418,42 @@ mod tests {
         )
         .expect("write");
         assert!(has_cargo_manifest(dir.path()));
+    }
+
+    #[test]
+    fn cargo_test_targets_from_manifest_maps_explicit_path_to_name() {
+        let parsed = cargo_test_targets_from_manifest(
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\n\n[[test]]\nname = \"password_strength_tests\"\npath = \"tests/password_strength.rs\"\n",
+        );
+
+        assert!(parsed.has_explicit_section);
+        assert_eq!(
+            parsed.targets,
+            vec![CargoTestTarget {
+                name: "password_strength_tests".to_string(),
+                path: "tests/password_strength.rs".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cargo_manifest_target_name_precedes_path_stem_for_preflight() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"password_strength\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"password_strength_tests\"\npath = \"tests/password_strength.rs\"\n",
+        )
+        .expect("write");
+
+        assert_eq!(
+            cargo_integration_test_name_for_manifest(dir.path(), "tests/password_strength.rs")
+                .as_deref(),
+            Some("password_strength_tests")
+        );
+        assert_eq!(
+            cargo_integration_test_name("tests/password_strength.rs").as_deref(),
+            Some("password_strength")
+        );
     }
 
     /// `package_json_has_test_script` is true iff `scripts.test` is a real
