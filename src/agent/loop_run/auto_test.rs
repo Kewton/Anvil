@@ -2679,35 +2679,11 @@ impl PackageJsonEvidence {
     }
 
     fn from_str(raw: &str) -> Option<Self> {
-        let json = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-        let scripts = json
-            .get("scripts")
-            .and_then(serde_json::Value::as_object)
-            .map(|scripts| {
-                scripts
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|script| !script.is_empty())
-                            .map(|script| (name.to_ascii_lowercase(), script.to_string()))
-                    })
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let mut packages = BTreeSet::new();
-        for section in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
-            if let Some(deps) = json.get(section).and_then(serde_json::Value::as_object) {
-                packages.extend(deps.keys().map(|name| name.to_ascii_lowercase()));
-            }
-        }
-        Some(Self { scripts, packages })
+        let summary = super::package_manifest_summary::parse_package_manifest_summary(raw).ok()?;
+        Some(Self {
+            scripts: summary.scripts,
+            packages: summary.packages,
+        })
     }
 
     fn has_script(&self, name: &str) -> bool {

@@ -49,73 +49,17 @@ pub(super) fn validate_setup_artifact_candidate(
 }
 
 fn validate_cargo_manifest(source: &str) -> Result<(), SetupArtifactValidationError> {
-    let mut saw_package = false;
-    let mut saw_workspace = false;
-    let mut saw_package_name = false;
-    let mut saw_package_only_target_section = false;
-    let mut in_package = false;
-
-    for raw_line in source.lines() {
-        let line = super::generated_test_guard::strip_toml_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            if !line.ends_with(']') {
-                return Err(SetupArtifactValidationError::InvalidCargoManifest(
-                    "malformed table header".to_string(),
-                ));
-            }
-            in_package = line == "[package]";
-            saw_package |= in_package;
-            saw_workspace |= line == "[workspace]";
-            saw_package_only_target_section |=
-                matches!(line, "[lib]" | "[[bin]]" | "[[bench]]" | "[[test]]");
-            continue;
-        }
-        if in_package
-            && let Some((key, value)) = line.split_once('=')
-            && key.trim() == "name"
-        {
-            let Some(value) = super::generated_test_guard::parse_toml_string_value(value.trim())
-            else {
-                return Err(SetupArtifactValidationError::InvalidCargoManifest(
-                    "[package] name is malformed".to_string(),
-                ));
-            };
-            saw_package_name = !value.is_empty();
-        }
-    }
-
-    if saw_package_only_target_section && !saw_package {
-        return Err(SetupArtifactValidationError::InvalidCargoManifest(
-            "target sections require a [package] section".to_string(),
-        ));
-    }
-    if saw_package && !saw_package_name {
-        return Err(SetupArtifactValidationError::InvalidCargoManifest(
-            "[package] does not declare a non-empty name".to_string(),
-        ));
-    }
-    if !saw_package && !saw_workspace {
-        return Err(SetupArtifactValidationError::InvalidCargoManifest(
-            "missing [package] or [workspace] section".to_string(),
-        ));
-    }
-
-    Ok(())
+    super::cargo_manifest_summary::cargo_manifest_readiness(source)
+        .map(|_| ())
+        .map_err(|err| {
+            SetupArtifactValidationError::InvalidCargoManifest(err.message().to_string())
+        })
 }
 
 fn validate_package_json(source: &str) -> Result<(), SetupArtifactValidationError> {
-    let value = serde_json::from_str::<serde_json::Value>(source).map_err(|_| {
-        SetupArtifactValidationError::InvalidPackageJson("not valid JSON".to_string())
-    })?;
-    if !value.is_object() {
-        return Err(SetupArtifactValidationError::InvalidPackageJson(
-            "top-level value must be an object".to_string(),
-        ));
-    }
-    Ok(())
+    super::package_manifest_summary::package_manifest_readiness(source)
+        .map(|_| ())
+        .map_err(|err| SetupArtifactValidationError::InvalidPackageJson(err.message().to_string()))
 }
 
 #[cfg(test)]
@@ -207,6 +151,16 @@ mod tests {
         assert_eq!(
             err.message("package.json"),
             "repair candidate package.json is invalid: top-level value must be an object"
+        );
+    }
+
+    #[test]
+    fn rejects_non_object_package_json_scripts() {
+        let err =
+            validate_setup_artifact_candidate("package.json", r#"{"scripts":"oops"}"#).unwrap_err();
+        assert_eq!(
+            err.message("package.json"),
+            "repair candidate package.json is invalid: scripts must be an object when declared"
         );
     }
 }

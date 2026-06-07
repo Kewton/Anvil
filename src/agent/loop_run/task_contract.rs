@@ -1997,6 +1997,7 @@ fn objective_deliverable_stage(
         }
         missing.push(*role);
     }
+    order_missing_deliverables_for_recovery(&mut missing);
 
     if missing.is_empty() {
         return ObjectiveLifecycleStage::DeliverablesSatisfied;
@@ -2011,6 +2012,13 @@ fn objective_deliverable_stage(
         ),
         missing,
     }
+}
+
+fn order_missing_deliverables_for_recovery(missing: &mut [ArtifactRole]) {
+    missing.sort_by_key(|role| match role {
+        ArtifactRole::Setup => 0,
+        _ => 1,
+    });
 }
 
 fn objective_evidence_stage(
@@ -3636,6 +3644,9 @@ fn default_docs_path_from_request(request: &str) -> String {
 }
 
 fn required_doc_sections_from_request(request: &str) -> Vec<String> {
+    if let Some(sections) = explicit_required_sections_list_from_request(request) {
+        return sections;
+    }
     let lower = request.to_ascii_lowercase();
     let mut sections = Vec::new();
     push_section_if(
@@ -3691,6 +3702,54 @@ fn required_doc_sections_from_request(request: &str) -> Vec<String> {
         sections.push("overview".to_string());
     }
     sections
+}
+
+fn explicit_required_sections_list_from_request(request: &str) -> Option<Vec<String>> {
+    let lower = request.to_ascii_lowercase();
+    let marker = ["sections:", "sections："]
+        .into_iter()
+        .find_map(|marker| lower.find(marker).map(|idx| (idx, marker.len())))?;
+    let after = &request[marker.0 + marker.1..];
+    let end = after
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '.' | '\n' | '\r').then_some(idx))
+        .unwrap_or(after.len());
+    let list = &after[..end];
+    let sections = list
+        .split([',', ';', '、', '，'])
+        .filter_map(normalize_explicit_section_label)
+        .take(12)
+        .collect::<Vec<_>>();
+    (!sections.is_empty()).then_some(sections)
+}
+
+fn normalize_explicit_section_label(raw: &str) -> Option<String> {
+    let mut label = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']' | '(' | ')' | ':'));
+    for prefix in ["and ", "or "] {
+        if label
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            label = label[prefix.len()..].trim();
+        }
+    }
+    let normalized = label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if normalized.len() < 2
+        || normalized.len() > 80
+        || normalized.contains("do not")
+        || normalized.contains("source code")
+        || normalized.contains("package.json")
+        || normalized.contains("cargo.toml")
+    {
+        return None;
+    }
+    Some(normalized)
 }
 
 // ============================================================================
@@ -7296,6 +7355,26 @@ mod tests {
     }
 
     #[test]
+    fn docs_colon_sections_list_becomes_exact_required_sections() {
+        let contract = TaskContract::from_request(
+            "Create README.md with sections: Prerequisites, Rotation, Rollback, Validation, Incident Response. This is a docs-only runbook task. Do not create source code, tests, package.json, Cargo.toml, or setup files.",
+        );
+
+        let readme = required_obligation(&contract, ArtifactRole::UsageDocs, "README.md");
+
+        assert_eq!(
+            readme.required_sections,
+            vec![
+                "prerequisites".to_string(),
+                "rotation".to_string(),
+                "rollback".to_string(),
+                "validation".to_string(),
+                "incident response".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn python_cli_main_py_alone_leaves_tests_and_readme_missing() {
         let contract = TaskContract::from_request(
             "Create a Python CLI in main.py with tests and README.md usage docs.",
@@ -8068,11 +8147,11 @@ mod tests {
         assert_eq!(
             objective_deliverable_stage(&inputs, &observed_artifacts(&evidence)),
             ObjectiveLifecycleStage::MissingDeliverable {
-                missing: vec![ArtifactRole::Implementation, ArtifactRole::Setup],
+                missing: vec![ArtifactRole::Setup, ArtifactRole::Implementation],
                 target_hint: Some(RecoveryTargetHint {
-                    role: ArtifactRole::Implementation,
-                    path: "src/lib.rs".to_string(),
-                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/lib.rs".to_string(),
+                    role: ArtifactRole::Setup,
+                    path: "Cargo.toml".to_string(),
+                    reason: "required deliverable obligation is still missing: role=setup, kind=file, path=Cargo.toml".to_string(),
                 }),
             }
         );
@@ -9150,11 +9229,11 @@ Create the README file."#;
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::Continue {
-                missing: vec![ArtifactRole::Implementation, ArtifactRole::Setup],
+                missing: vec![ArtifactRole::Setup, ArtifactRole::Implementation],
                 target_hint: Some(RecoveryTargetHint {
-                    role: ArtifactRole::Implementation,
-                    path: "src/lib.rs".to_string(),
-                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/lib.rs".to_string(),
+                    role: ArtifactRole::Setup,
+                    path: "Cargo.toml".to_string(),
+                    reason: "required deliverable obligation is still missing: role=setup, kind=file, path=Cargo.toml".to_string(),
                 }),
             }
         );
@@ -9530,11 +9609,11 @@ Create the README file."#;
         assert_eq!(
             action,
             ArtifactRecoveryAction::Continue {
-                missing: vec![ArtifactRole::Test, ArtifactRole::Setup],
+                missing: vec![ArtifactRole::Setup, ArtifactRole::Test],
                 target_hint: Some(RecoveryTargetHint {
-                    role: ArtifactRole::Test,
-                    path: "tests/cli.rs".to_string(),
-                    reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/cli.rs".to_string(),
+                    role: ArtifactRole::Setup,
+                    path: "Cargo.toml".to_string(),
+                    reason: "required deliverable obligation is still missing: role=setup, kind=file, path=Cargo.toml".to_string(),
                 }),
             }
         );

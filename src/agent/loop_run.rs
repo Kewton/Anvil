@@ -75,6 +75,8 @@ mod active_job_arbiter;
 // is intentionally *not* re-exported (DR3-001) — `turn.rs` is the only
 // in-crate consumer via `super::actor_loop_flow::*`.
 mod actor_loop_flow;
+mod cargo_manifest_summary;
+mod package_manifest_summary;
 // Anti-pattern extraction + retrieval flow extracted from `turn.rs`
 // (parent #680). Hosts `maybe_extract_anti_pattern` and
 // `try_inject_anti_pattern_message` (free fns over `&mut Agent`) plus

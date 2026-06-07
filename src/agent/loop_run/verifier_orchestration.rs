@@ -2580,10 +2580,85 @@ pub(super) fn handle_task_contract_verifier_pass(
     }
 }
 
+fn maybe_recover_unbound_verifier_binding(
+    agent: &mut Agent,
+    last_iter: usize,
+) -> Option<super::actor_loop_flow::TaskContractVerifierFlowOutcome> {
+    let task_kind = super::task_classification::task_contract_authority(agent)
+        .map(|contract| contract.task_kind)
+        .unwrap_or(TaskKind::Coding);
+    let plan =
+        super::evidence_binding::evidence_binding_plan_after_scaffold(task_kind, &agent.work_root);
+    let Some(recovery_job_kind) = plan.recovery_job_kind() else {
+        return None;
+    };
+    let failed_checks: Vec<_> = plan.failed_checks().collect();
+    log_llm_event(
+        "agent.evidence_binding.failed",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "task_kind": task_kind.as_str(),
+            "generic_terminal_state": plan.generic_terminal_state().map(|state| state.label()),
+            "recovery_job_kind": recovery_job_kind.as_str(),
+            "failed_checks": failed_checks.iter().map(|check| serde_json::json!({
+                "kind": check.kind.as_str(),
+                "reference": check.reference,
+                "candidates": check.candidates,
+            })).collect::<Vec<_>>(),
+        }),
+    );
+
+    if !failed_checks.iter().any(|check| {
+        matches!(
+            check.kind,
+            super::evidence_binding::BindingCheckKind::ManifestIdentity
+                | super::evidence_binding::BindingCheckKind::TestScript
+        ) && matches!(check.reference.as_str(), "package.json" | "scripts.test")
+    }) {
+        return None;
+    }
+
+    match super::scaffold_pipeline::maybe_materialize_node_test_runner_manifest(agent) {
+        Ok(Some(path)) => {
+            agent.controller_policy_ledger.record(
+                super::controller_policy::ControllerRecoveryStrategy::DeterministicFallback,
+            );
+            super::turn_helpers::write_stdout_rendered(
+                &super::actor_loop_flow::format_iteration_status(
+                    last_iter,
+                    agent.config.max_iterations,
+                    "Evidence binding",
+                    &format!("Completed missing Node test runner manifest binding in {path}."),
+                    agent.footer.current_cols(),
+                ),
+                true,
+            );
+            super::message_push::push_system_note(
+                agent,
+                format!(
+                    "[Evidence Binding Recovery] Completed the unbound Node test runner manifest: {path}. Run the verifier again using the now-bound `npm test` evidence path."
+                ),
+            );
+            Some(super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue)
+        }
+        Ok(None) => None,
+        Err(err) => Some(
+            super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
+                reason: ExitReason::TransportError,
+                error_text: err,
+            },
+        ),
+    }
+}
+
 pub(super) fn handle_task_contract_verifier_no_verifier(
     agent: &mut Agent,
     args: TaskContractVerifierFlowArgs<'_, '_>,
 ) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    if let Some(outcome) = maybe_recover_unbound_verifier_binding(agent, args.last_iter) {
+        return outcome;
+    }
     if agent.missing_verifier_job.is_none() {
         agent.missing_verifier_job = Some(super::repair_job::MissingVerifierJob::new(
             TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT as u8,
@@ -3467,5 +3542,30 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.reason_label(), "cheap_check_unavailable");
+    }
+
+    #[test]
+    fn no_verifier_path_materializes_unbound_node_runner_manifest() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(
+            temp.path().join("tests").join("cli.test.js"),
+            "import test from 'node:test';\ntest('ok', () => {});\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let outcome = maybe_recover_unbound_verifier_binding(&mut agent, 4);
+
+        assert!(matches!(
+            outcome,
+            Some(super::super::actor_loop_flow::TaskContractVerifierFlowOutcome::Continue)
+        ));
+        let manifest = std::fs::read_to_string(temp.path().join("package.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(json["scripts"]["test"].as_str(), Some("node --test"));
     }
 }

@@ -35,9 +35,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::active_job_arbiter::RecoveryJobKind;
+use super::cargo_manifest_summary::{normalize_cargo_ident, parse_cargo_manifest_summary};
 use super::evidence_runner::{EvidenceRunnerError, EvidenceRunnerKind};
-use super::generated_test_guard::{parse_toml_string_value, strip_toml_comment};
-use super::node_runner_manifest::complete_node_test_runner_manifest;
+use super::package_manifest_summary::parse_package_manifest_summary;
 use super::task_contract::TaskKind;
 use crate::terminal_outcome::GenericTerminalState;
 
@@ -422,7 +422,7 @@ pub(super) struct RustTestReferences {
 /// Normalize a crate/bin identifier the way cargo does for `use` idents and
 /// `CARGO_BIN_EXE_*` env var names: `-` becomes `_`. Case is preserved.
 fn normalize_crate_ident(name: &str) -> String {
-    name.replace('-', "_")
+    normalize_cargo_ident(name)
 }
 
 const BUILTIN_CRATES: &[&str] = &["std", "core", "alloc", "proc_macro", "test"];
@@ -508,106 +508,20 @@ fn referenced_binary_handles(source: &str) -> BTreeSet<String> {
     names
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ManifestSection {
-    Package,
-    Lib,
-    Bin,
-    Dependencies,
-    Other,
-}
-
 /// Parse the binding-relevant identities from a `Cargo.toml` source string.
 ///
-/// Reuses the shared `strip_toml_comment` / `parse_toml_string_value` helpers
-/// (no `toml` crate dependency, no ad hoc string mutation) and only tracks the
-/// `[package]` / `[lib]` / `[[bin]]` / dependency sections.
+/// Delegates manifest interpretation to `cargo_manifest_summary`; this adapter
+/// only projects the typed manifest summary into evidence-binding identities.
 pub(super) fn parse_cargo_binding_identities(manifest_source: &str) -> CargoBindingIdentities {
-    let mut identities = CargoBindingIdentities::default();
-    let mut section = ManifestSection::Other;
-    for raw_line in manifest_source.lines() {
-        let line = strip_toml_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(inner) = line.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
-            section = if inner.trim() == "bin" {
-                ManifestSection::Bin
-            } else {
-                ManifestSection::Other
-            };
-            continue;
-        }
-        if let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            section = classify_table_header(inner.trim(), &mut identities);
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        match section {
-            ManifestSection::Package if key == "name" => {
-                identities.package_name =
-                    parse_toml_string_value(value.trim()).filter(|s| !s.is_empty());
-            }
-            ManifestSection::Lib if key == "name" => {
-                identities.lib_name =
-                    parse_toml_string_value(value.trim()).filter(|s| !s.is_empty());
-            }
-            ManifestSection::Bin if key == "name" => {
-                if let Some(name) = parse_toml_string_value(value.trim()).filter(|s| !s.is_empty())
-                {
-                    identities.bin_names.insert(name);
-                }
-            }
-            ManifestSection::Dependencies if !key.is_empty() => {
-                identities
-                    .dependencies
-                    .insert(normalize_crate_ident(strip_quotes(key)));
-            }
-            _ => {}
-        }
+    let Ok(summary) = parse_cargo_manifest_summary(manifest_source) else {
+        return CargoBindingIdentities::default();
+    };
+    CargoBindingIdentities {
+        package_name: summary.package_name,
+        lib_name: summary.lib_name,
+        bin_names: summary.bin_names,
+        dependencies: summary.dependencies,
     }
-    identities
-}
-
-/// Classify a single-bracket table header and record `[<table>.<dep>]`
-/// sub-table dependency keys as a side effect.
-fn classify_table_header(header: &str, identities: &mut CargoBindingIdentities) -> ManifestSection {
-    match header {
-        "package" => ManifestSection::Package,
-        "lib" => ManifestSection::Lib,
-        "dependencies" | "dev-dependencies" | "build-dependencies" => ManifestSection::Dependencies,
-        other => {
-            if let Some(dep) = dependency_subtable_key(other) {
-                identities
-                    .dependencies
-                    .insert(normalize_crate_ident(strip_quotes(dep)));
-                ManifestSection::Other
-            } else if other.ends_with(".dependencies") {
-                // e.g. `target.'cfg(unix)'.dependencies`
-                ManifestSection::Dependencies
-            } else {
-                ManifestSection::Other
-            }
-        }
-    }
-}
-
-/// For a `[dependencies.foo]` / `[dev-dependencies.foo]` / `[build-dependencies.foo]`
-/// sub-table header, return the dependency key (`foo`).
-fn dependency_subtable_key(header: &str) -> Option<&str> {
-    for prefix in ["dependencies.", "dev-dependencies.", "build-dependencies."] {
-        if let Some(rest) = header.strip_prefix(prefix) {
-            return Some(rest);
-        }
-    }
-    None
-}
-
-fn strip_quotes(value: &str) -> &str {
-    value.trim().trim_matches('"').trim_matches('\'')
 }
 
 /// Build the Rust evidence binding plan from a manifest source and a set of test
@@ -774,11 +688,13 @@ pub(super) fn node_evidence_binding_plan(
                 "package.json".to_string(),
                 vec!["package.json".to_string()],
             ));
-            // A `Some(completion)` means the runner cannot bind a usable
-            // `scripts.test` yet; `None` means it is already bindable (or the
-            // manifest is malformed and must not be clobbered → bound,
-            // conservatively).
-            let bound = complete_node_test_runner_manifest(Some(source)).is_none();
+            // Malformed manifests are conservatively treated as bound here: the
+            // setup-artifact validator owns manifest-shape rejection and the
+            // deterministic runner-manifest operator must not clobber malformed
+            // user JSON. Valid manifests bind only when `scripts.test` exists.
+            let bound = parse_package_manifest_summary(source)
+                .map(|summary| summary.has_script("test"))
+                .unwrap_or(true);
             let candidates = if bound {
                 vec!["scripts.test".to_string()]
             } else {

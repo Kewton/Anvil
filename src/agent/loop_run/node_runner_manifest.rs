@@ -20,6 +20,8 @@
 
 use serde_json::{Map, Value};
 
+use super::package_manifest_summary::parse_package_manifest_summary;
+
 /// The deterministic test command bound into a completed manifest. Matches
 /// the empty-workspace Node scaffold (`scaffold_pipeline::node_skeleton_files`)
 /// so the two deterministic paths agree.
@@ -86,13 +88,14 @@ pub(super) fn complete_node_test_runner_manifest(
             contents: created_manifest_contents(),
         });
     };
+    let summary = parse_package_manifest_summary(raw).ok()?;
+    if summary.has_script("test") {
+        return None;
+    }
     let value = serde_json::from_str::<Value>(raw).ok()?;
     let Value::Object(mut object) = value else {
         return None;
     };
-    if manifest_has_usable_test_script(&object) {
-        return None;
-    }
     let scripts = object
         .entry("scripts".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -109,21 +112,6 @@ pub(super) fn complete_node_test_runner_manifest(
     Some(NodeManifestCompletion {
         action: NodeManifestAction::AddTestScript,
         contents,
-    })
-}
-
-/// True when the manifest already declares a non-empty `test` script. The
-/// key match is case-insensitive so an existing `"Test"` is not duplicated;
-/// `detect_node_scripts` normalizes script names the same way.
-fn manifest_has_usable_test_script(object: &Map<String, Value>) -> bool {
-    let Some(scripts) = object.get("scripts").and_then(Value::as_object) else {
-        return false;
-    };
-    scripts.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("test")
-            && value
-                .as_str()
-                .is_some_and(|script| !script.trim().is_empty())
     })
 }
 
