@@ -6,7 +6,31 @@
 //! predicates so retry/replan policy does not keep accumulating inside
 //! `RepairJob::next_action`.
 
-use super::repair_job::{RejectedAttempt, RepairAttemptKey};
+use super::repair_job::{
+    RejectedAttempt, RepairAttemptKey, RepairNextAction, RepairTerminalReason,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiagnosticRecoveryKind {
+    RequestDiagnostic,
+    Replan,
+}
+
+pub(super) fn diagnostic_recovery_action(
+    kind: DiagnosticRecoveryKind,
+    diagnostic_budget_available: bool,
+    terminal_reason: RepairTerminalReason,
+) -> RepairNextAction {
+    if !diagnostic_budget_available {
+        return RepairNextAction::SafeStop {
+            reason: terminal_reason,
+        };
+    }
+    match kind {
+        DiagnosticRecoveryKind::RequestDiagnostic => RepairNextAction::RequestDiagnostic,
+        DiagnosticRecoveryKind::Replan => RepairNextAction::Replan,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RejectionEscalationKind {
@@ -150,6 +174,44 @@ mod tests {
 
     fn rejected(key: RepairAttemptKey, reason: RejectedAttemptReason) -> RejectedAttempt {
         RejectedAttempt { key, reason }
+    }
+
+    #[test]
+    fn diagnostic_recovery_requests_diagnostic_while_budget_remains() {
+        assert_eq!(
+            diagnostic_recovery_action(
+                DiagnosticRecoveryKind::RequestDiagnostic,
+                true,
+                RepairTerminalReason::DiagnosticUnavailable,
+            ),
+            RepairNextAction::RequestDiagnostic
+        );
+    }
+
+    #[test]
+    fn diagnostic_recovery_replans_while_budget_remains() {
+        assert_eq!(
+            diagnostic_recovery_action(
+                DiagnosticRecoveryKind::Replan,
+                true,
+                RepairTerminalReason::PatchRejectedRepeatedly,
+            ),
+            RepairNextAction::Replan
+        );
+    }
+
+    #[test]
+    fn diagnostic_recovery_safe_stops_when_budget_is_exhausted() {
+        assert_eq!(
+            diagnostic_recovery_action(
+                DiagnosticRecoveryKind::Replan,
+                false,
+                RepairTerminalReason::PatchRejectedRepeatedly,
+            ),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::PatchRejectedRepeatedly
+            }
+        );
     }
 
     #[test]

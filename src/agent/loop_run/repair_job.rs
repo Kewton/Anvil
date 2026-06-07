@@ -1294,19 +1294,19 @@ impl RepairJob {
     }
 
     fn request_diagnostic_or_safe_stop(&self, reason: RepairTerminalReason) -> RepairNextAction {
-        if self.diagnostic_retry_budget_available() {
-            RepairNextAction::RequestDiagnostic
-        } else {
-            RepairNextAction::SafeStop { reason }
-        }
+        super::repair_lifecycle::diagnostic_recovery_action(
+            super::repair_lifecycle::DiagnosticRecoveryKind::RequestDiagnostic,
+            self.diagnostic_retry_budget_available(),
+            reason,
+        )
     }
 
     fn replan_or_safe_stop(&self, reason: RepairTerminalReason) -> RepairNextAction {
-        if self.diagnostic_retry_budget_available() {
-            RepairNextAction::Replan
-        } else {
-            RepairNextAction::SafeStop { reason }
-        }
+        super::repair_lifecycle::diagnostic_recovery_action(
+            super::repair_lifecycle::DiagnosticRecoveryKind::Replan,
+            self.diagnostic_retry_budget_available(),
+            reason,
+        )
     }
 
     fn next_action_for_improved_verifier_observation(&self) -> Option<RepairNextAction> {

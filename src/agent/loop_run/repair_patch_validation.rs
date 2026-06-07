@@ -732,11 +732,11 @@ pub(super) fn validate_repair_candidate_contents(
 ) -> Result<(), RepairCandidateContentError> {
     use super::project_verifier::{ProjectVerifier, ProjectVerifierOutcome};
 
-    if candidate_contents.trim().is_empty() {
-        return Err(RepairCandidateContentError::CheapCheckFailed(format!(
-            "repair candidate must not empty target file {relative_path}"
-        )));
-    }
+    super::setup_artifact_validation::validate_setup_artifact_candidate(
+        relative_path,
+        candidate_contents,
+    )
+    .map_err(|err| RepairCandidateContentError::CheapCheckFailed(err.message(relative_path)))?;
 
     match ProjectVerifier::for_path(relative_path) {
         None => {
@@ -1778,6 +1778,26 @@ mod tests {
         assert_eq!(
             err.into_cheap_check_outcome().to_string(),
             "repair candidate must not empty target file Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn candidate_content_validation_rejects_invalid_setup_artifact_candidate() {
+        let err = validate_repair_candidate_contents(
+            "Cargo.toml",
+            "[[bin]]\nname = \"palindrome\"\npath = \"src/main.rs\"\n\n[lib]\nname = \"palindrome\"\n",
+            false,
+            super::super::task_contract::TaskKind::Coding,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RepairCandidateContentError::CheapCheckFailed(_)
+        ));
+        assert_eq!(
+            err.into_cheap_check_outcome().to_string(),
+            "repair candidate Cargo.toml is invalid: target sections require a [package] section"
         );
     }
 
