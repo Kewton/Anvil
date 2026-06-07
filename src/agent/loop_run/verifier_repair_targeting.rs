@@ -701,6 +701,38 @@ mod tests {
     }
 
     #[test]
+    fn recovery_target_hint_for_diagnostic_path_admits_setup_syntax_targets() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(
+            work_root.join("Cargo.toml"),
+            "[[bin]]\nname = anvil_is_palindrome\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let edited = |path: &str| path == "Cargo.toml";
+        let unchanged = |_: &str| false;
+        let admission = RepairTargetAdmissionContext {
+            work_root,
+            scope: &scope,
+            edited_this_session_for: &edited,
+            scaffold_changed_for: &unchanged,
+        };
+
+        let hint = recovery_target_hint_for_diagnostic_path(
+            work_root,
+            "Cargo.toml",
+            "manifest syntax error",
+            super::super::VerifierDiagnosticFailureKind::CompileOrSyntaxError,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(hint.path, "Cargo.toml");
+        assert_eq!(hint.role, super::super::task_contract::ArtifactRole::Setup);
+    }
+
+    #[test]
     fn recovery_target_hint_for_diagnostic_path_rejects_unowned_existing_targets() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();

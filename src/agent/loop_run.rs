@@ -2665,6 +2665,7 @@ impl VerifierDiagnosticFailureKind {
             self,
             Self::DependencyMissing
                 | Self::InvalidManifest
+                | Self::CompileOrSyntaxError
                 | Self::EvidenceMissing
                 | Self::ConfigOrVerifierError
         )

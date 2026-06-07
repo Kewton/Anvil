@@ -1782,15 +1782,22 @@ pub(super) fn validate_verifier_repair_post_apply_candidate(
     .map_err(
         super::repair_patch_validation::DuplicateBindingRepairError::into_validation_failure,
     )?;
-    super::repair_patch_validation::validate_repair_candidate_contents(
+    match super::repair_patch_validation::validate_repair_candidate_contents(
         relative_path,
         contents,
         used_whitespace_fallback,
         task_kind,
-    )
-    .map_err(
-        super::repair_patch_validation::RepairCandidateContentError::into_cheap_check_outcome,
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(super::repair_patch_validation::RepairCandidateContentError::Unavailable)
+            if super::verifier::capability_for(task_kind).allows_process_exec() =>
+        {
+            // Rust single-file cheap checks intentionally defer on crate-context
+            // errors. The full verifier is the evidence authority, so keep the
+            // already safety-checked edit and let the next verifier run decide.
+        }
+        Err(err) => return Err(err.into_cheap_check_outcome().into()),
+    }
     Ok(())
 }
 
@@ -3422,4 +3429,42 @@ pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnos
         }),
     );
     VerifierDiagnosticPassOutcome::Accepted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_apply_candidate_defers_coding_unavailable_to_full_verifier() {
+        let context = super::super::repair_job::RepairJob::new_for_test();
+
+        let result = validate_verifier_repair_post_apply_candidate(
+            &context,
+            "src/lib.rs",
+            "fn value() {}\n",
+            "use crate::missing;\nfn value() {}\n",
+            false,
+            super::super::task_contract::TaskKind::Coding,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn post_apply_candidate_keeps_non_coding_unavailable_fail_closed() {
+        let context = super::super::repair_job::RepairJob::new_for_test();
+
+        let err = validate_verifier_repair_post_apply_candidate(
+            &context,
+            "src/lib.rs",
+            "fn value() {}\n",
+            "use crate::missing;\nfn value() {}\n",
+            false,
+            super::super::task_contract::TaskKind::Docs,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.reason_label(), "cheap_check_unavailable");
+    }
 }

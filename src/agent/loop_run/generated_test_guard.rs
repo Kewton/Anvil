@@ -84,6 +84,19 @@ pub(super) fn preflight_owned_test_artifacts_for_verifier(
                     admitted_sources.push((path.clone(), source));
                 }
             }
+            Err(diagnostic)
+                if diagnostic.failure_kind == GeneratedTestPreflightFailureKind::InvalidManifest =>
+            {
+                // A broken manifest is setup evidence, not proof that the
+                // generated test itself is unsafe. Keep the test bound so the
+                // verifier can observe the setup failure and route repair to
+                // setup/config instead of collapsing into NoVerifier.
+                if let Ok(source) = std::fs::read_to_string(work_root.join(path)) {
+                    admitted_sources.push((path.clone(), source));
+                }
+                admitted.push(path.clone());
+                rejected.push(diagnostic);
+            }
             Err(diagnostic) => rejected.push(diagnostic),
         }
     }
@@ -1225,6 +1238,43 @@ fn test_add_positive() {
 
         assert_eq!(report.admitted, vec!["tests/add.rs".to_string()]);
         assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+    }
+
+    #[test]
+    fn report_keeps_test_bound_when_manifest_is_invalid_setup_evidence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[[bin]]\nname = \"palindrome\"\npath = \"src/main.rs\"\n\n[lib]\ncrate-type = [\"lib\"]\n",
+        )
+        .expect("write manifest");
+        write_test_file(
+            root.path(),
+            "tests/palindrome.rs",
+            r#"use palindrome::is_palindrome;
+
+#[test]
+fn mixed_case() {
+    assert!(is_palindrome("RaceCar"));
+}
+"#,
+        );
+        let contract = TaskContract::from_request(
+            "Create Cargo.toml, src/lib.rs, and tests/palindrome.rs. Run cargo test.",
+        );
+
+        let report = preflight_owned_test_artifacts_for_verifier(
+            root.path(),
+            &contract,
+            &["tests/palindrome.rs".to_string()],
+        );
+
+        assert_eq!(report.admitted, vec!["tests/palindrome.rs".to_string()]);
+        assert_eq!(report.rejected.len(), 1);
+        assert_eq!(
+            report.rejected[0].failure_kind,
+            GeneratedTestPreflightFailureKind::InvalidManifest
+        );
     }
 
     #[test]

@@ -84,9 +84,8 @@ pub(super) fn parse_patch_proposal_reply(reply: &str) -> Result<PatchProposal, P
     {
         return Err(PatchProposalError::ToolMarkup);
     }
-    let json = extract_last_json_object(reply).ok_or(PatchProposalError::JsonMissing)?;
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|_| PatchProposalError::JsonMalformed)?;
+    let json = extract_patch_proposal_json_object(reply)?;
+    let value = parse_patch_proposal_json_value(&json)?;
     let object = value.as_object().ok_or(PatchProposalError::ObjectMissing)?;
     let target_path = object
         .get("target_path")
@@ -130,6 +129,187 @@ pub(super) fn parse_patch_proposal_reply(reply: &str) -> Result<PatchProposal, P
         explanation,
         risk,
     })
+}
+
+fn extract_patch_proposal_json_object(reply: &str) -> Result<String, PatchProposalError> {
+    if let Some(json) = extract_last_json_object(reply) {
+        return Ok(json.to_string());
+    }
+    repair_schema_key_quotes(reply)
+        .and_then(|repaired| extract_last_json_object(&repaired).map(str::to_string))
+        .ok_or(PatchProposalError::JsonMissing)
+}
+
+fn parse_patch_proposal_json_value(json: &str) -> Result<serde_json::Value, PatchProposalError> {
+    if let Ok(value) = serde_json::from_str(json) {
+        return Ok(value);
+    }
+    let mut candidates = Vec::new();
+    if let Some(repaired) = repair_schema_key_quotes(json) {
+        if let Some(second_pass) = repair_surplus_array_closers(&repaired) {
+            candidates.push(second_pass);
+        }
+        candidates.push(repaired);
+    }
+    if let Some(repaired) = repair_surplus_array_closers(json) {
+        candidates.push(repaired);
+    }
+    candidates
+        .iter()
+        .find_map(|candidate| serde_json::from_str(candidate).ok())
+        .ok_or(PatchProposalError::JsonMalformed)
+}
+
+fn repair_schema_key_quotes(raw: &str) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "target_path",
+        "path",
+        "edits",
+        "old_string",
+        "new_string",
+        "replace_all",
+        "reason",
+        "explanation",
+        "risk",
+    ];
+    let mut out = String::with_capacity(raw.len() + 8);
+    let mut idx = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut previous_significant: Option<char> = None;
+    let mut changed = false;
+
+    while idx < raw.len() {
+        let ch = raw[idx..].chars().next()?;
+        if in_string {
+            out.push(ch);
+            idx += ch.len_utf8();
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if previous_significant.is_some_and(|prev| prev == '{' || prev == ',') {
+            let mut whitespace_end = idx;
+            while whitespace_end < raw.len() {
+                let ws = raw[whitespace_end..].chars().next()?;
+                if !ws.is_whitespace() {
+                    break;
+                }
+                out.push(ws);
+                whitespace_end += ws.len_utf8();
+            }
+            if whitespace_end != idx {
+                idx = whitespace_end;
+                if idx >= raw.len() {
+                    break;
+                }
+            }
+            if let Some((key, delimiter_len)) = schema_key_quote_repair(raw, idx, KEYS) {
+                out.push('"');
+                out.push_str(key);
+                out.push_str("\":");
+                idx += key.len() + delimiter_len;
+                previous_significant = Some(':');
+                changed = true;
+                continue;
+            }
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+                previous_significant = Some(ch);
+            }
+            _ => {
+                out.push(ch);
+                if !ch.is_whitespace() {
+                    previous_significant = Some(ch);
+                }
+            }
+        }
+        idx += ch.len_utf8();
+    }
+
+    changed.then_some(out)
+}
+
+fn schema_key_quote_repair<'a>(
+    raw: &'a str,
+    idx: usize,
+    keys: &'a [&'a str],
+) -> Option<(&'a str, usize)> {
+    keys.iter().copied().find_map(|key| {
+        let rest = raw.get(idx..)?;
+        if !rest.starts_with(key) {
+            return None;
+        }
+        let after_key = idx + key.len();
+        let after = raw.get(after_key..)?;
+        if after.starts_with("\":") {
+            Some((key, 2))
+        } else if after.starts_with(':') {
+            Some((key, 1))
+        } else {
+            None
+        }
+    })
+}
+
+fn repair_surplus_array_closers(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut stack = Vec::<char>::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut changed = false;
+
+    for ch in raw.chars() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                stack.push(ch);
+                out.push(ch);
+            }
+            '}' => {
+                if stack.last() == Some(&'{') {
+                    stack.pop();
+                }
+                out.push(ch);
+            }
+            ']' => {
+                if stack.last() == Some(&'[') {
+                    stack.pop();
+                    out.push(ch);
+                } else {
+                    changed = true;
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    changed.then_some(out)
 }
 
 pub(super) fn validate_patch_proposal_for_action(
@@ -324,5 +504,37 @@ mod tests {
         assert_eq!(proposal.edits[0].new_string, "new");
         assert_eq!(proposal.edits[0].reason, "fix");
         assert!(proposal.edits[0].replace_all);
+    }
+
+    #[test]
+    fn patch_proposal_repairs_unquoted_schema_key() {
+        let reply = r#"{"path":"src/lib.rs","old_string":"fn value() -> i32 { 1 }",new_string":"pub fn value() -> i32 { 1 }","reason":"export function"}"#;
+
+        let proposal = parse_patch_proposal_reply(reply).unwrap();
+
+        assert_eq!(proposal.target_path, "src/lib.rs");
+        assert_eq!(proposal.edits[0].old_string, "fn value() -> i32 { 1 }");
+        assert_eq!(proposal.edits[0].new_string, "pub fn value() -> i32 { 1 }");
+    }
+
+    #[test]
+    fn patch_proposal_repairs_surplus_array_closer() {
+        let reply = r#"{"path":"src/lib.rs","edits":[{"old_string":"fn value() -> i32 { 1 }","new_string":"pub fn value() -> i32 { 1 }","reason":"export function"}]],"reason":"fix"}"#;
+
+        let proposal = parse_patch_proposal_reply(reply).unwrap();
+
+        assert_eq!(proposal.target_path, "src/lib.rs");
+        assert_eq!(proposal.edits.len(), 1);
+        assert_eq!(proposal.edits[0].new_string, "pub fn value() -> i32 { 1 }");
+    }
+
+    #[test]
+    fn patch_proposal_repairs_combined_schema_drift() {
+        let reply = r#"{"path":"src/lib.rs","edits":[{"old_string":"fn value() -> i32 { 1 }",new_string":"pub fn value() -> i32 { 1 }","reason":"export function"}]],"reason":"fix"}"#;
+
+        let proposal = parse_patch_proposal_reply(reply).unwrap();
+
+        assert_eq!(proposal.target_path, "src/lib.rs");
+        assert_eq!(proposal.edits[0].new_string, "pub fn value() -> i32 { 1 }");
     }
 }
