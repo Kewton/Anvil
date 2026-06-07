@@ -624,10 +624,6 @@ fn generated_suite_contract_coverage_gap(
     {
         return None;
     }
-    let needles = contract_coverage_needles(contract);
-    if needles.is_empty() {
-        return None;
-    }
     let combined = sources
         .iter()
         .map(|(_, source)| source.as_str())
@@ -647,6 +643,14 @@ fn generated_suite_contract_coverage_gap(
         );
     }
 
+    if explicit_test_identities_satisfied_by_sources(contract, sources) {
+        return None;
+    }
+
+    let needles = contract_coverage_needles(contract);
+    if needles.is_empty() {
+        return None;
+    }
     if needles
         .iter()
         .any(|needle| source_covers_required_term(&combined, needle))
@@ -657,6 +661,24 @@ fn generated_suite_contract_coverage_gap(
         "generated test suite does not cover any task-contract signal: {}",
         needles.join(",")
     ))
+}
+
+fn explicit_test_identities_satisfied_by_sources(
+    contract: &TaskContract,
+    sources: &[(String, String)],
+) -> bool {
+    let required_test_paths = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|identity| identity.role == ArtifactRole::Test)
+        .map(|identity| identity.path.as_str())
+        .collect::<Vec<_>>();
+    !required_test_paths.is_empty()
+        && required_test_paths.iter().all(|required_path| {
+            sources.iter().any(|(path, _)| {
+                super::task_contract::normalized_artifact_path_eq(path, required_path)
+            })
+        })
 }
 
 fn contract_coverage_needles(contract: &TaskContract) -> Vec<String> {
@@ -1166,6 +1188,43 @@ fn runs_cli_with_file_arg() {
             GeneratedTestPreflightFailureKind::MissingContractCoverage
         );
         assert_eq!(report.rejected[0].failure_kind.as_str(), "test_bug");
+    }
+
+    #[test]
+    fn report_accepts_explicit_test_identity_even_when_generic_terms_are_filtered() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_valid_cargo_manifest(root.path());
+        write_test_file(
+            root.path(),
+            "tests/add.rs",
+            r#"use generated_test_guard_fixture::add;
+
+#[test]
+fn test_add_positive() {
+    assert_eq!(add(2, 3), 5);
+}
+"#,
+        );
+        let contract = TaskContract::from_request(
+            "Create Cargo.toml, src/lib.rs with add(a: i32, b: i32) -> i32, and tests/add.rs tests. Run cargo test --manifest-path Cargo.toml.",
+        );
+        assert!(
+            contract
+                .required_artifact_identities
+                .iter()
+                .any(|identity| identity.role == ArtifactRole::Test
+                    && identity.path == "tests/add.rs"),
+            "fixture must exercise an explicit test deliverable identity"
+        );
+
+        let report = preflight_owned_test_artifacts_for_verifier(
+            root.path(),
+            &contract,
+            &["tests/add.rs".to_string()],
+        );
+
+        assert_eq!(report.admitted, vec!["tests/add.rs".to_string()]);
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
     }
 
     #[test]
