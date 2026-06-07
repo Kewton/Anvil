@@ -732,6 +732,12 @@ pub(super) fn validate_repair_candidate_contents(
 ) -> Result<(), RepairCandidateContentError> {
     use super::project_verifier::{ProjectVerifier, ProjectVerifierOutcome};
 
+    if candidate_contents.trim().is_empty() {
+        return Err(RepairCandidateContentError::CheapCheckFailed(format!(
+            "repair candidate must not empty target file {relative_path}"
+        )));
+    }
+
     match ProjectVerifier::for_path(relative_path) {
         None => {
             if used_whitespace_fallback && path_is_whitespace_sensitive(relative_path) {
@@ -1752,6 +1758,26 @@ mod tests {
                 super::super::task_contract::TaskKind::Coding,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn candidate_content_validation_rejects_empty_target_file_candidate() {
+        let err = validate_repair_candidate_contents(
+            "Cargo.toml",
+            " \n\t",
+            false,
+            super::super::task_contract::TaskKind::Coding,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RepairCandidateContentError::CheapCheckFailed(_)
+        ));
+        assert_eq!(
+            err.into_cheap_check_outcome().to_string(),
+            "repair candidate must not empty target file Cargo.toml"
         );
     }
 

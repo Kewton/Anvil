@@ -2572,6 +2572,7 @@ pub(super) fn handle_task_contract_verifier_pass(
     agent.repair_job_artifact_attempts = 0;
     *args.task_contract_verifier_passed_in_loop = true;
     agent.task_contract_verifier_passed_this_actor_loop = true;
+    agent.prepare_final_verification_job_report_after_success();
     super::actor_loop_flow::TaskContractVerifierFlowOutcome::Done {
         final_prose: format!(
             "Completed requested repository changes and verified them with `{safe_command}`."

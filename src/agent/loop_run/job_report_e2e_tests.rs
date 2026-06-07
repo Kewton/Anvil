@@ -327,6 +327,77 @@ fn repair_exhausted_linkage_propagates_to_three_reports() {
     }
 }
 
+#[test]
+fn final_verifier_success_report_supersedes_same_turn_repair_exhausted_snapshot() {
+    use crate::agent::loop_run::repair_job::StopReason;
+    use crate::session::store::VerifierInvocationRecord;
+
+    let session_id = unique_session_id("final-ve");
+    let _ = shared_log_path();
+    let (mut agent, _td) = build_live_agent(&session_id);
+
+    agent
+        .safe_stop_report_emitted
+        .insert(StopReason::RepairExhausted);
+    agent.session.last_verifier_invocation = Some(VerifierInvocationRecord {
+        command: "cargo test".to_string(),
+        exit_code: 101,
+        recorded_at: "2026-06-07T13:08:14Z".to_string(),
+    });
+    agent.task_contract_verifier_repair_pending = true;
+    agent.maybe_emit_job_reports_with_linkage(None);
+
+    agent.session.last_verifier_invocation = Some(VerifierInvocationRecord {
+        command: "cargo test".to_string(),
+        exit_code: 0,
+        recorded_at: "2026-06-07T13:09:46Z".to_string(),
+    });
+    agent.task_contract_verifier_repair_pending = false;
+    agent.task_contract_verifier_passed_this_actor_loop = true;
+    agent.prepare_final_verification_job_report_after_success();
+    agent.maybe_emit_job_reports_with_linkage(None);
+
+    let recs = events_by_name(&session_id, EVENT_VE);
+    assert_eq!(
+        recs.len(),
+        2,
+        "final verifier success must remain observable after an earlier same-turn safe-stop snapshot"
+    );
+
+    let first_report = recs[0]
+        .get("payload")
+        .and_then(|v| v.get("payload"))
+        .expect("first verification report payload");
+    assert_eq!(
+        first_report.get("evidence_status").and_then(|v| v.as_str()),
+        Some("failed")
+    );
+    assert_eq!(
+        first_report
+            .get("safe_stop")
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str()),
+        Some("repair_exhausted")
+    );
+
+    let final_report = recs[1]
+        .get("payload")
+        .and_then(|v| v.get("payload"))
+        .expect("final verification report payload");
+    assert_eq!(
+        final_report.get("evidence_status").and_then(|v| v.as_str()),
+        Some("passed")
+    );
+    assert_eq!(
+        final_report
+            .get("safe_stop")
+            .and_then(|v| v.get("report_emitted"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "the final verifier success report should not inherit stale safe-stop linkage"
+    );
+}
+
 /// Issue #663 (Codex CB-003 regression guard): when multiple `StopReason`
 /// variants land in `safe_stop_report_emitted` during the same turn, the
 /// `SafeStopLinkage.reason` carried by the end-of-turn finalizer must be

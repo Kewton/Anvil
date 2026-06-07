@@ -1475,11 +1475,7 @@ impl RepairJob {
         let packet = contract.and_then(|contract| {
             self.assessment.as_ref().and_then(|assessment| {
                 assessment.repair_target_hint.as_ref().map(|hint| {
-                    RepairPacket::for_diagnostic_failure(
-                        contract,
-                        hint,
-                        assessment.failure_kind,
-                    )
+                    RepairPacket::for_diagnostic_failure(contract, hint, assessment.failure_kind)
                 })
             })
         });

@@ -647,6 +647,24 @@ impl super::Agent {
         }
     }
 
+    /// Allow a verifier-pass terminal snapshot to supersede an earlier
+    /// same-turn safe-stop snapshot.
+    ///
+    /// A repair path can emit `repair_exhausted` linkage before a later
+    /// controller repair succeeds and reruns the full verifier. The safe-stop
+    /// event remains in the event stream as history, but the final
+    /// `agent.verification.report` must be observable with the passing
+    /// invocation instead of being suppressed by the per-turn dedup key.
+    pub(super) fn prepare_final_verification_job_report_after_success(&mut self) {
+        let key = format!(
+            "{}::turn:{}",
+            VerificationReport::EVENT_NAME,
+            self.current_turn_index as u64
+        );
+        self.job_report_dedup_keys.remove(&key);
+        self.safe_stop_report_emitted.clear();
+    }
+
     /// Read the SafeStopLinkage from per-turn dedup state.
     ///
     /// The `safe_stop_report_emitted` HashSet holds every StopReason

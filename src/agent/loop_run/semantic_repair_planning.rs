@@ -534,7 +534,10 @@ mod tests {
 
     #[test]
     fn invalid_manifest_diagnostic_allows_setup_target_role() {
-        let setup = hint(super::super::task_contract::ArtifactRole::Setup, "Cargo.toml");
+        let setup = hint(
+            super::super::task_contract::ArtifactRole::Setup,
+            "Cargo.toml",
+        );
         let implementation = hint(
             super::super::task_contract::ArtifactRole::Implementation,
             "src/lib.rs",
@@ -558,7 +561,10 @@ mod tests {
         )
         .expect("setup target remains selectable");
 
-        assert_eq!(selected.role, super::super::task_contract::ArtifactRole::Setup);
+        assert_eq!(
+            selected.role,
+            super::super::task_contract::ArtifactRole::Setup
+        );
         assert_eq!(selected.path, "Cargo.toml");
     }
 }

@@ -85,7 +85,8 @@ pub(super) fn preflight_owned_test_artifacts_for_verifier(
                 }
             }
             Err(diagnostic)
-                if diagnostic.failure_kind == GeneratedTestPreflightFailureKind::InvalidManifest =>
+                if diagnostic.failure_kind
+                    == GeneratedTestPreflightFailureKind::InvalidManifest =>
             {
                 // A broken manifest is setup evidence, not proof that the
                 // generated test itself is unsafe. Keep the test bound so the

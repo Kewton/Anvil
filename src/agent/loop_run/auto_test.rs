@@ -1748,7 +1748,11 @@ impl AutoTestRunner {
     }
 
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
-        Self::run_with_timeout(work_root, plan, Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS))
+        Self::run_with_timeout(
+            work_root,
+            plan,
+            Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS),
+        )
     }
 
     fn run_with_timeout(
