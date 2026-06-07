@@ -197,18 +197,11 @@ fn satisfied_artifact_job_action(
     ) {
         return None;
     }
-    let missing = vec![job.role()];
     if let Some(target_hint) =
-        super::task_contract::recovery_target_hint_for_blocking_obligation_diagnostic(
-            contract,
-            artifacts,
-            &agent.task_contract_excerpts,
-            job.role(),
-        )
-        .filter(|hint| hint.path == job.target_path())
+        first_blocking_required_obligation_hint(contract, artifacts, &agent.task_contract_excerpts)
     {
         return Some(super::task_contract::ArtifactRecoveryAction::Continue {
-            missing,
+            missing: vec![target_hint.role],
             target_hint: Some(target_hint),
         });
     }
@@ -216,6 +209,21 @@ fn satisfied_artifact_job_action(
         super::task_contract::ArtifactRecoveryAction::RunVerifier
     } else {
         super::task_contract::ArtifactRecoveryAction::Done
+    })
+}
+
+fn first_blocking_required_obligation_hint(
+    contract: &super::task_contract::TaskContract,
+    artifacts: &[super::task_contract::ArtifactState],
+    artifact_excerpts: &super::task_contract::ArtifactExcerpts,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    contract.required_artifacts.iter().find_map(|role| {
+        super::task_contract::recovery_target_hint_for_blocking_obligation_diagnostic(
+            contract,
+            artifacts,
+            artifact_excerpts,
+            *role,
+        )
     })
 }
 
@@ -412,6 +420,97 @@ mod tests {
                 .artifact_completion_job
                 .as_ref()
                 .is_some_and(|job| { matches!(job.status(), ArtifactCompletionStatus::Satisfied) })
+        );
+    }
+
+    #[test]
+    fn satisfied_impl_job_still_blocks_on_missing_manifest_deliverable() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = concat!(
+            "STATE_CONTROL_PACKET\n",
+            r#"{"objective":"Create Rust slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+            "\nCreate the Rust library."
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert!(contract.verification_required);
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "src/lib.rs".to_string(),
+                    reason: "missing implementation artifact".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("implementation artifact completion job"),
+        );
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+        std::fs::write(
+            agent.work_root.join("src/lib.rs"),
+            "pub fn slugify(input: &str) -> String { input.to_ascii_lowercase() }\n",
+        )
+        .unwrap();
+        agent
+            .turn_edited_relative_paths
+            .insert("src/lib.rs".to_string());
+        agent.task_contract_excerpts.insert(
+            ArtifactRole::Implementation,
+            "pub fn slugify(input: &str) -> String { input.to_ascii_lowercase() }\n".to_string(),
+        );
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::RepoEdit {
+                category: RepoEditCategory::Impl,
+                count: 1,
+                path: Some("src/lib.rs".to_string()),
+            });
+        let recorded = agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "src/lib.rs".to_string(),
+            ArtifactRole::Implementation,
+            true,
+        );
+        assert!(
+            recorded.is_some(),
+            "src/lib.rs repo edit must be admitted as implementation evidence"
+        );
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(RecoveryTargetHint {
+                        role: ArtifactRole::Setup,
+                        ref path,
+                        ..
+                    }),
+                } if missing == &vec![ArtifactRole::Setup] && path == "Cargo.toml"
+            ),
+            "satisfied impl job must not advance to verifier while Cargo.toml is missing: {action:?}"
+        );
+        assert!(
+            agent
+                .artifact_completion_job
+                .as_ref()
+                .is_some_and(|job| { matches!(job.status(), ArtifactCompletionStatus::Satisfied) }),
+            "implementation job should remain satisfied while the next missing deliverable is selected"
         );
     }
 
