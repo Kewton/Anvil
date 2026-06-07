@@ -2727,6 +2727,10 @@ pub(super) fn run_task_contract_verifier_once(
         return TaskContractVerifierOutcome::Disabled;
     }
 
+    if task_contract_pre_verifier_binding_is_unbound(agent) {
+        return TaskContractVerifierOutcome::NoVerifier;
+    }
+
     let (verifier_selection, workspace_scope_opt) =
         select_task_contract_verifier_once(agent, changed_files);
     match verifier_selection {
@@ -2786,6 +2790,21 @@ pub(super) fn run_task_contract_verifier_once(
             handle_absent_task_contract_verifier_selection(agent)
         }
     }
+}
+
+fn task_contract_pre_verifier_binding_is_unbound(agent: &mut Agent) -> bool {
+    let task_kind = super::task_classification::task_contract_authority(agent)
+        .map(|contract| contract.task_kind)
+        .unwrap_or(TaskKind::Coding);
+    let plan =
+        super::evidence_binding::evidence_binding_plan_after_scaffold(task_kind, &agent.work_root);
+    plan.failed_checks().any(|check| {
+        matches!(
+            check.kind,
+            super::evidence_binding::BindingCheckKind::ManifestIdentity
+                | super::evidence_binding::BindingCheckKind::TestScript
+        )
+    })
 }
 
 pub(super) fn drive_task_contract_verifier(

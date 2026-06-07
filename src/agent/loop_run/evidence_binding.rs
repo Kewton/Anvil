@@ -692,7 +692,9 @@ pub(super) fn node_evidence_binding_plan(
             // setup-artifact validator owns manifest-shape rejection and the
             // deterministic runner-manifest operator must not clobber malformed
             // user JSON. Valid manifests bind only when `scripts.test` exists.
-            let bound = parse_package_manifest_summary(source)
+            let summary = parse_package_manifest_summary(source);
+            let bound = summary
+                .as_ref()
                 .map(|summary| summary.has_script("test"))
                 .unwrap_or(true);
             let candidates = if bound {
@@ -706,6 +708,16 @@ pub(super) fn node_evidence_binding_plan(
                 "scripts.test".to_string(),
                 candidates,
             ));
+            if let Ok(summary) = summary
+                && let Some(runner_binding) = summary.test_script_runner_binding()
+            {
+                plan.checks.push(BindingCheck::resolved(
+                    BindingCheckKind::TestScript,
+                    runner_binding.bound,
+                    runner_binding.reference,
+                    runner_binding.candidates,
+                ));
+            }
         }
     }
     plan
@@ -1283,6 +1295,34 @@ mod after_scaffold_tests {
         assert_eq!(plan.status(), EvidenceBindingStatus::Bound);
         assert!(plan.is_bound());
         assert_eq!(plan.recovery_job_kind(), None);
+        assert!(plan.failed_checks().next().is_none());
+    }
+
+    #[test]
+    fn node_manifest_with_undeclared_test_runner_dependency_is_unbound() {
+        let manifest = r#"{"name":"app","scripts":{"test":"node node_modules/jest/bin/jest.js"}}"#;
+        let plan = node_evidence_binding_plan(Some(manifest), true);
+
+        assert_eq!(plan.status(), EvidenceBindingStatus::Unbound);
+        let failure = plan
+            .failed_checks()
+            .find(|check| check.reference == "scripts.test.runner:jest")
+            .expect("runner dependency binding failure");
+        assert_eq!(failure.kind, BindingCheckKind::TestScript);
+        assert!(failure.candidates.is_empty());
+    }
+
+    #[test]
+    fn node_manifest_with_declared_test_runner_dependency_is_bound() {
+        let manifest = r#"{
+            "name":"app",
+            "scripts":{"test":"vitest run"},
+            "devDependencies":{"vitest":"^1.0.0"}
+        }"#;
+        let plan = node_evidence_binding_plan(Some(manifest), true);
+
+        assert_eq!(plan.status(), EvidenceBindingStatus::Bound);
+        assert_eq!(plan.binding_error(), None);
         assert!(plan.failed_checks().next().is_none());
     }
 

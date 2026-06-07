@@ -21,6 +21,26 @@ impl PackageManifestSummary {
             .get(&name.to_ascii_lowercase())
             .is_some_and(|script| !script.trim().is_empty())
     }
+
+    pub(super) fn test_script_runner_binding(&self) -> Option<PackageTestScriptRunnerBinding> {
+        let script = self.scripts.get("test")?;
+        let required = package_runner_required_by_test_script(script)?;
+        let bound = self.packages.contains(&required);
+        Some(PackageTestScriptRunnerBinding {
+            reference: format!("scripts.test.runner:{required}"),
+            required_runner: required,
+            bound,
+            candidates: self.packages.iter().cloned().collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PackageTestScriptRunnerBinding {
+    pub(super) reference: String,
+    pub(super) required_runner: String,
+    pub(super) bound: bool,
+    pub(super) candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +130,123 @@ pub(super) fn package_manifest_readiness(
     parse_package_manifest_summary(source)
 }
 
+fn package_runner_required_by_test_script(script: &str) -> Option<String> {
+    let tokens = shell_like_words(script);
+    let first = tokens.first()?.to_ascii_lowercase();
+    if first == "npm" && npm_test_script_is_recursive(&tokens) {
+        return Some("scripts.test".to_string());
+    }
+    if first == "node" {
+        return node_command_package_runner_requirement(&tokens[1..]);
+    }
+    node_test_runner_package_name(&first)
+}
+
+fn npm_test_script_is_recursive(tokens: &[String]) -> bool {
+    matches!(
+        tokens,
+        [npm, test, ..] if npm.eq_ignore_ascii_case("npm") && test.eq_ignore_ascii_case("test")
+    ) || matches!(
+        tokens,
+        [npm, run, test, ..]
+            if npm.eq_ignore_ascii_case("npm")
+                && run.eq_ignore_ascii_case("run")
+                && test.eq_ignore_ascii_case("test")
+    )
+}
+
+fn node_command_package_runner_requirement(tokens: &[String]) -> Option<String> {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token == "--test" {
+            return None;
+        }
+        if let Some(name) = package_name_from_node_modules_path(token) {
+            return Some(name);
+        }
+        if token.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+fn node_test_runner_package_name(token: &str) -> Option<String> {
+    let candidate = token
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches("node_modules/.bin/")
+        .to_ascii_lowercase();
+    [
+        "jest", "vitest", "mocha", "ava", "tap", "tape", "uvu", "jasmine",
+    ]
+    .contains(&candidate.as_str())
+    .then_some(candidate)
+}
+
+fn package_name_from_node_modules_path(token: &str) -> Option<String> {
+    let normalized = token.replace('\\', "/");
+    let after = normalized.split("node_modules/").nth(1)?;
+    if after.starts_with(".bin/") {
+        return node_test_runner_package_name(after.trim_start_matches(".bin/"));
+    }
+    if after.starts_with('@') {
+        let mut parts = after.split('/');
+        let scope = parts.next()?;
+        let name = parts.next()?;
+        return Some(format!("{scope}/{name}").to_ascii_lowercase());
+    }
+    after
+        .split('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn shell_like_words(script: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in script.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if ch == active {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +268,57 @@ mod tests {
         assert!(summary.packages.contains("react"));
         assert!(summary.packages.contains("vitest"));
         assert_eq!(summary.module_type, Some(PackageModuleType::EsModule));
+    }
+
+    #[test]
+    fn test_script_runner_binding_detects_missing_direct_runner_package() {
+        let summary =
+            parse_package_manifest_summary(r#"{"scripts":{"test":"vitest run"}}"#).unwrap();
+        let binding = summary
+            .test_script_runner_binding()
+            .expect("runner binding");
+
+        assert_eq!(binding.required_runner, "vitest");
+        assert_eq!(binding.reference, "scripts.test.runner:vitest");
+        assert!(!binding.bound);
+        assert!(binding.candidates.is_empty());
+    }
+
+    #[test]
+    fn test_script_runner_binding_binds_declared_runner_package() {
+        let summary = parse_package_manifest_summary(
+            r#"{"scripts":{"test":"jest"},"devDependencies":{"jest":"^30.0.0"}}"#,
+        )
+        .unwrap();
+        let binding = summary
+            .test_script_runner_binding()
+            .expect("runner binding");
+
+        assert_eq!(binding.required_runner, "jest");
+        assert!(binding.bound);
+        assert_eq!(binding.candidates, vec!["jest".to_string()]);
+    }
+
+    #[test]
+    fn test_script_runner_binding_detects_node_modules_runner_path() {
+        let summary = parse_package_manifest_summary(
+            r#"{"scripts":{"test":"node --experimental-vm-modules node_modules/jest/bin/jest.js"}}"#,
+        )
+        .unwrap();
+        let binding = summary
+            .test_script_runner_binding()
+            .expect("runner binding");
+
+        assert_eq!(binding.required_runner, "jest");
+        assert!(!binding.bound);
+    }
+
+    #[test]
+    fn native_node_test_script_has_no_package_runner_requirement() {
+        let summary =
+            parse_package_manifest_summary(r#"{"scripts":{"test":"node --test"}}"#).unwrap();
+
+        assert!(summary.test_script_runner_binding().is_none());
     }
 
     #[test]
