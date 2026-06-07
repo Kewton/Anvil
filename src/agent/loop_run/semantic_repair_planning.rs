@@ -97,7 +97,10 @@ pub(super) fn sort_admitted_by_authority_role_priority(
     admitted: &mut [super::task_contract::RecoveryTargetHint],
     spec_authority: super::spec_authority::SpecAuthority,
     failure_kind: super::VerifierDiagnosticFailureKind,
+    preferred_repair_role: super::task_contract::ArtifactRole,
 ) {
+    let preferred_role_is_actionable = preferred_role_priority_can_apply(failure_kind)
+        && diagnostic_role_is_actionable_for_preference(preferred_repair_role, failure_kind);
     let primary_rank_for = |role: super::task_contract::ArtifactRole| -> u8 {
         if matches!(failure_kind, super::VerifierDiagnosticFailureKind::TestBug) {
             return match role {
@@ -143,6 +146,20 @@ pub(super) fn sort_admitted_by_authority_role_priority(
                     super::task_contract::ArtifactRole::Setup => 3,
                     super::task_contract::ArtifactRole::DataOutput => 4,
                 },
+            };
+        }
+        if preferred_role_is_actionable {
+            let default_rank = match role {
+                super::task_contract::ArtifactRole::Implementation => 0,
+                super::task_contract::ArtifactRole::UsageDocs => 1,
+                super::task_contract::ArtifactRole::Setup => 2,
+                super::task_contract::ArtifactRole::Test => 3,
+                super::task_contract::ArtifactRole::DataOutput => 4,
+            };
+            return if role == preferred_repair_role {
+                0
+            } else {
+                default_rank + 1
             };
         }
         match role {
@@ -204,7 +221,12 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
         admitted.dedup_by(|a, b| a.role == b.role && a.path == b.path);
         // Role priority sort (TestBug override / SetupRepair defensive /
         // default impl-first). Stable sort with (rank, path) tie-breaker.
-        sort_admitted_by_authority_role_priority(&mut admitted, spec_authority, failure_kind);
+        sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            spec_authority,
+            failure_kind,
+            report.preferred_repair_role,
+        );
         cluster.admitted_cluster_targets = admitted;
     }
 }
@@ -248,14 +270,42 @@ fn diagnostic_target_role_matches_failure_kind(
     hint: &super::task_contract::RecoveryTargetHint,
     failure_kind: super::VerifierDiagnosticFailureKind,
 ) -> bool {
+    diagnostic_role_matches_failure_kind(hint.role, failure_kind)
+}
+
+fn diagnostic_role_matches_failure_kind(
+    role: super::task_contract::ArtifactRole,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+) -> bool {
     let kind = super::repair_brief::legacy_kind_to_allowed_change_kind_for_role(
         failure_kind.as_str(),
-        Some(hint.role),
+        Some(role),
     );
     if kind == super::repair_brief::AllowedChangeKind::InsufficientEvidence {
         return true;
     }
-    super::repair_action::allowed_change_kind_allows_target_role(kind, hint.role)
+    super::repair_action::allowed_change_kind_allows_target_role(kind, role)
+}
+
+fn diagnostic_role_is_actionable_for_preference(
+    role: super::task_contract::ArtifactRole,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+) -> bool {
+    let kind = super::repair_brief::legacy_kind_to_allowed_change_kind_for_role(
+        failure_kind.as_str(),
+        Some(role),
+    );
+    kind != super::repair_brief::AllowedChangeKind::InsufficientEvidence
+        && super::repair_action::allowed_change_kind_allows_target_role(kind, role)
+}
+
+fn preferred_role_priority_can_apply(failure_kind: super::VerifierDiagnosticFailureKind) -> bool {
+    matches!(
+        failure_kind,
+        super::VerifierDiagnosticFailureKind::CompileOrSyntaxError
+            | super::VerifierDiagnosticFailureKind::RuntimeError
+            | super::VerifierDiagnosticFailureKind::LocalImportContractMismatch
+    )
 }
 
 pub(super) fn build_semantic_failure_report_from_legacy(

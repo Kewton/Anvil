@@ -13342,6 +13342,7 @@ export default function App() {
             &mut admitted,
             super::super::spec_authority::SpecAuthority::UserRequest,
             super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            super::super::task_contract::ArtifactRole::Implementation,
         );
         assert_eq!(
             admitted[0].role,
@@ -13372,6 +13373,7 @@ export default function App() {
             &mut admitted,
             super::super::spec_authority::SpecAuthority::LlmGeneratedTest,
             super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            super::super::task_contract::ArtifactRole::Test,
         );
         assert_eq!(
             admitted[0].role,
@@ -13402,6 +13404,7 @@ export default function App() {
             &mut admitted,
             super::super::spec_authority::SpecAuthority::ImplementationContract,
             super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            super::super::task_contract::ArtifactRole::Test,
         );
         assert_eq!(
             admitted[0].role,
@@ -13429,6 +13432,7 @@ export default function App() {
             &mut admitted,
             super::super::spec_authority::SpecAuthority::UserRequest,
             super::super::VerifierDiagnosticFailureKind::TestBug,
+            super::super::task_contract::ArtifactRole::Test,
         );
         assert_eq!(
             admitted[0].role,
@@ -13458,12 +13462,43 @@ export default function App() {
             &mut admitted,
             super::super::spec_authority::SpecAuthority::ImplementationContract,
             super::super::VerifierDiagnosticFailureKind::DependencyMissing,
+            super::super::task_contract::ArtifactRole::Setup,
         );
         assert_eq!(
             admitted[0].role,
             super::super::task_contract::ArtifactRole::Setup,
             "DependencyMissing defensive: setup-first"
         );
+    }
+
+    #[test]
+    fn cb017_sort_preferred_test_before_setup_for_compile_error() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Setup,
+                path: "package.json".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/cli.test.js".to_string(),
+                reason: String::new(),
+            },
+        ];
+
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::BehaviorContract,
+            super::super::VerifierDiagnosticFailureKind::CompileOrSyntaxError,
+            super::super::task_contract::ArtifactRole::Test,
+        );
+
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Test,
+            "diagnostic preferred test repair must not be hidden behind setup secondary target"
+        );
+        assert_eq!(admitted[0].path, "tests/cli.test.js");
     }
 
     /// CR-5 V2: ties are broken by path order so the sort is deterministic
@@ -13486,6 +13521,7 @@ export default function App() {
             &mut admitted,
             super::super::spec_authority::SpecAuthority::UserRequest,
             super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            super::super::task_contract::ArtifactRole::Implementation,
         );
         assert_eq!(
             admitted[0].path, "app/a.py",

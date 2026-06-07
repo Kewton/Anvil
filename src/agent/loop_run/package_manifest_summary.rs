@@ -12,6 +12,7 @@ use serde_json::Value;
 pub(super) struct PackageManifestSummary {
     pub(super) scripts: BTreeMap<String, String>,
     pub(super) packages: BTreeSet<String>,
+    pub(super) module_type: Option<PackageModuleType>,
 }
 
 impl PackageManifestSummary {
@@ -19,6 +20,22 @@ impl PackageManifestSummary {
         self.scripts
             .get(&name.to_ascii_lowercase())
             .is_some_and(|script| !script.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PackageModuleType {
+    EsModule,
+    CommonJs,
+}
+
+impl PackageModuleType {
+    fn from_package_json_type(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "module" => Some(Self::EsModule),
+            "commonjs" => Some(Self::CommonJs),
+            _ => None,
+        }
     }
 }
 
@@ -63,6 +80,11 @@ pub(super) fn parse_package_manifest_summary(
         None => BTreeMap::new(),
     };
 
+    let module_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(PackageModuleType::from_package_json_type);
+
     let mut packages = BTreeSet::new();
     for section in [
         "dependencies",
@@ -75,7 +97,11 @@ pub(super) fn parse_package_manifest_summary(
         }
     }
 
-    Ok(PackageManifestSummary { scripts, packages })
+    Ok(PackageManifestSummary {
+        scripts,
+        packages,
+        module_type,
+    })
 }
 
 pub(super) fn package_manifest_readiness(
@@ -92,6 +118,7 @@ mod tests {
     fn parses_scripts_and_dependencies() {
         let summary = parse_package_manifest_summary(
             r#"{
+              "type": "module",
               "scripts": { "Test": "node --test", "build": "vite build" },
               "dependencies": { "react": "latest" },
               "devDependencies": { "vitest": "^1.0.0" }
@@ -103,12 +130,20 @@ mod tests {
         assert!(summary.has_script("build"));
         assert!(summary.packages.contains("react"));
         assert!(summary.packages.contains("vitest"));
+        assert_eq!(summary.module_type, Some(PackageModuleType::EsModule));
     }
 
     #[test]
     fn missing_scripts_is_ready_but_not_bindable() {
         let summary = package_manifest_readiness(r#"{"name":"app"}"#).unwrap();
         assert!(!summary.has_script("test"));
+        assert_eq!(summary.module_type, None);
+    }
+
+    #[test]
+    fn parses_commonjs_module_type() {
+        let summary = package_manifest_readiness(r#"{"type":"commonjs"}"#).unwrap();
+        assert_eq!(summary.module_type, Some(PackageModuleType::CommonJs));
     }
 
     #[test]

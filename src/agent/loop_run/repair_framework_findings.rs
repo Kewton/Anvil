@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use super::package_manifest_summary::{PackageModuleType, parse_package_manifest_summary};
 use super::repair_assertion_analysis::pytest_output_suggests_shared_state_leak;
 use super::repair_python_test_analysis::{
     excerpt_has_disconnected_fixture_state_assertion, line_mentions_identifier,
@@ -25,6 +26,7 @@ pub(crate) enum VerifierDiagnosticFrameworkFindingKind {
     TestOnlyMissingImportSymbol,
     DisconnectedSetupStateAssignment,
     RustIntegrationTestCrateImportMismatch,
+    NodeModuleSyntaxMismatch,
 }
 
 impl VerifierDiagnosticFrameworkFindingKind {
@@ -45,6 +47,7 @@ impl VerifierDiagnosticFrameworkFindingKind {
             Self::RustIntegrationTestCrateImportMismatch => {
                 "rust_integration_test_crate_import_mismatch"
             }
+            Self::NodeModuleSyntaxMismatch => "node_module_syntax_mismatch",
         }
     }
 }
@@ -65,7 +68,8 @@ pub(crate) fn findings_for_diagnostic(
 ) -> Vec<VerifierDiagnosticFrameworkFinding> {
     let looks_like_pytest = output_or_command_looks_like_pytest(command, output_excerpt);
     let looks_like_cargo = output_or_command_looks_like_cargo(command, output_excerpt);
-    if !looks_like_pytest && !looks_like_cargo {
+    let looks_like_node = output_or_command_looks_like_node(command, output_excerpt);
+    if !looks_like_pytest && !looks_like_cargo && !looks_like_node {
         return Vec::new();
     }
     let mut findings = Vec::new();
@@ -75,6 +79,16 @@ pub(crate) fn findings_for_diagnostic(
         }
         if excerpt.role != ArtifactRole::Test {
             continue;
+        }
+        if looks_like_node
+            && node_test_module_syntax_mismatch(work_root, &excerpt.path, &excerpt.excerpt)
+        {
+            findings.push(VerifierDiagnosticFrameworkFinding {
+                kind: VerifierDiagnosticFrameworkFindingKind::NodeModuleSyntaxMismatch,
+                path: excerpt.path.clone(),
+                role: excerpt.role,
+                summary: "package.json module settings make this generated Node test run with a module format that conflicts with the test source import/require API; repair the test module syntax before changing implementation behavior".to_string(),
+            });
         }
         if looks_like_cargo
             && excerpt.path.ends_with(".rs")
@@ -189,6 +203,112 @@ pub(crate) fn output_or_command_looks_like_cargo(command: &str, output_excerpt: 
         || signal.contains("\ncargo ")
         || signal.contains("error[e")
         || signal.contains("could not compile")
+}
+
+pub(crate) fn output_or_command_looks_like_node(command: &str, output_excerpt: &str) -> bool {
+    let signal = format!("{command}\n{output_excerpt}").to_ascii_lowercase();
+    signal.starts_with("npm ")
+        || signal.contains("\nnpm ")
+        || signal.starts_with("node ")
+        || signal.contains("\nnode ")
+        || signal.contains("node.js v")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeModuleFormat {
+    EsModule,
+    CommonJs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct JavascriptModuleSyntax {
+    uses_static_esm: bool,
+    uses_commonjs_require: bool,
+    uses_create_require: bool,
+}
+
+fn node_test_module_syntax_mismatch(work_root: &Path, relative_path: &str, excerpt: &str) -> bool {
+    let Some(format) = node_module_format_for_path(
+        Path::new(relative_path),
+        package_manifest_module_type(work_root),
+    ) else {
+        return false;
+    };
+    let source = read_capped_workspace_artifact(work_root, relative_path)
+        .unwrap_or_else(|| excerpt.to_string());
+    let syntax = javascript_module_syntax(&source);
+    match format {
+        NodeModuleFormat::EsModule => syntax.uses_commonjs_require && !syntax.uses_create_require,
+        NodeModuleFormat::CommonJs => syntax.uses_static_esm,
+    }
+}
+
+fn node_module_format_for_path(
+    relative_path: &Path,
+    package_module_type: Option<PackageModuleType>,
+) -> Option<NodeModuleFormat> {
+    let extension = relative_path
+        .extension()
+        .and_then(|ext| ext.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mjs" => Some(NodeModuleFormat::EsModule),
+        "cjs" => Some(NodeModuleFormat::CommonJs),
+        "js" => match package_module_type {
+            Some(PackageModuleType::EsModule) => Some(NodeModuleFormat::EsModule),
+            Some(PackageModuleType::CommonJs) | None => Some(NodeModuleFormat::CommonJs),
+        },
+        _ => None,
+    }
+}
+
+fn package_manifest_module_type(work_root: &Path) -> Option<PackageModuleType> {
+    let raw = read_capped_workspace_artifact(work_root, "package.json")?;
+    parse_package_manifest_summary(&raw).ok()?.module_type
+}
+
+fn javascript_module_syntax(source: &str) -> JavascriptModuleSyntax {
+    let mut syntax = JavascriptModuleSyntax::default();
+    for line in source.lines() {
+        let line = strip_javascript_line_comment(line);
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
+            syntax.uses_static_esm = true;
+        }
+        if trimmed.contains("createRequire(") {
+            syntax.uses_create_require = true;
+        }
+        if javascript_line_uses_commonjs_require(trimmed) {
+            syntax.uses_commonjs_require = true;
+        }
+    }
+    syntax
+}
+
+fn javascript_line_uses_commonjs_require(line: &str) -> bool {
+    line.match_indices("require(")
+        .any(|(index, _)| !line[..index].ends_with("create"))
+}
+
+fn strip_javascript_line_comment(line: &str) -> &str {
+    line.split_once("//").map(|(head, _)| head).unwrap_or(line)
+}
+
+fn read_capped_workspace_artifact(work_root: &Path, relative_path: &str) -> Option<String> {
+    const MAX_DIAGNOSTIC_SOURCE_BYTES: u64 = 256 * 1024;
+
+    let relative = Path::new(relative_path);
+    if relative.is_absolute() || !is_workspace_artifact_admitted_relative_path(relative) {
+        return None;
+    }
+    let path = work_root.join(relative);
+    if std::fs::metadata(&path).ok()?.len() > MAX_DIAGNOSTIC_SOURCE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 pub(crate) fn missing_python_module_name_from_output(output: &str) -> Option<String> {
@@ -890,6 +1010,110 @@ mod tests {
             "",
             "error[E0432]: unresolved import"
         ));
+    }
+
+    #[test]
+    fn node_signal_detection_uses_command_and_output() {
+        assert!(output_or_command_looks_like_node("npm test", ""));
+        assert!(output_or_command_looks_like_node(
+            "node tests/cli.test.js",
+            ""
+        ));
+        assert!(output_or_command_looks_like_node("", "Node.js v24.0.0"));
+    }
+
+    #[test]
+    fn node_framework_finding_flags_esm_test_using_commonjs_require() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"type":"module"}"#).unwrap();
+        let test_source = r#"import test from "node:test";
+import assert from "node:assert/strict";
+const fs = require("node:fs");
+
+test("reads a fixture", () => {
+  assert.equal(typeof fs.readFileSync, "function");
+});
+"#;
+        std::fs::write(temp.path().join("tests/cli.test.js"), test_source).unwrap();
+
+        let findings = findings_for_diagnostic(
+            temp.path(),
+            "npm test",
+            "ReferenceError: require is not defined in ES module scope",
+            &[VerifierDiagnosticFileExcerpt {
+                path: "tests/cli.test.js".to_string(),
+                role: ArtifactRole::Test,
+                excerpt: test_source.to_string(),
+            }],
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            VerifierDiagnosticFrameworkFindingKind::NodeModuleSyntaxMismatch
+        );
+        assert_eq!(findings[0].path, "tests/cli.test.js");
+    }
+
+    #[test]
+    fn node_framework_finding_flags_commonjs_test_using_static_import() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"name":"app"}"#).unwrap();
+        let test_source = r#"import test from "node:test";
+import assert from "node:assert/strict";
+
+test("works", () => assert.equal(1, 1));
+"#;
+        std::fs::write(temp.path().join("tests/cli.test.js"), test_source).unwrap();
+
+        let findings = findings_for_diagnostic(
+            temp.path(),
+            "node tests/cli.test.js",
+            "SyntaxError: Cannot use import statement outside a module",
+            &[VerifierDiagnosticFileExcerpt {
+                path: "tests/cli.test.js".to_string(),
+                role: ArtifactRole::Test,
+                excerpt: test_source.to_string(),
+            }],
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            VerifierDiagnosticFrameworkFindingKind::NodeModuleSyntaxMismatch
+        );
+    }
+
+    #[test]
+    fn node_framework_finding_allows_create_require_in_esm_test() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(temp.path().join("package.json"), r#"{"type":"module"}"#).unwrap();
+        let test_source = r#"import test from "node:test";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const fs = require("node:fs");
+
+test("reads a fixture", () => {
+  if (!fs.readFileSync) throw new Error("missing fs");
+});
+"#;
+        std::fs::write(temp.path().join("tests/cli.test.js"), test_source).unwrap();
+
+        let findings = findings_for_diagnostic(
+            temp.path(),
+            "npm test",
+            "",
+            &[VerifierDiagnosticFileExcerpt {
+                path: "tests/cli.test.js".to_string(),
+                role: ArtifactRole::Test,
+                excerpt: test_source.to_string(),
+            }],
+        );
+
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]

@@ -527,6 +527,7 @@ fn framework_finding_can_override_diagnostic_kind(
                 VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingLocalModuleImport
                     | VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingImportSymbol
                     | VerifierDiagnosticFrameworkFindingKind::RustIntegrationTestCrateImportMismatch
+                    | VerifierDiagnosticFrameworkFindingKind::NodeModuleSyntaxMismatch
             )
         }
         super::VerifierDiagnosticFailureKind::CompileOrSyntaxError => false,
@@ -540,6 +541,7 @@ fn framework_finding_can_override_diagnostic_kind(
                 | VerifierDiagnosticFrameworkFindingKind::DisconnectedFixtureStateAssertion
                 | VerifierDiagnosticFrameworkFindingKind::TestOnlyMissingImportSymbol
                 | VerifierDiagnosticFrameworkFindingKind::DisconnectedSetupStateAssignment
+                | VerifierDiagnosticFrameworkFindingKind::NodeModuleSyntaxMismatch
         ),
         super::VerifierDiagnosticFailureKind::AssertionMismatch
         | super::VerifierDiagnosticFailureKind::RuntimeError
@@ -784,6 +786,43 @@ mod tests {
         );
         assert_eq!(artifact_role_from_assessment_str("unknown"), None);
         assert_eq!(artifact_role_from_assessment_str("nonsense"), None);
+    }
+
+    #[test]
+    fn node_module_syntax_framework_finding_overrides_config_diagnostic_to_test_repair() {
+        let mut parsed = ParsedVerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::ConfigOrVerifierError,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            repair_targets: vec![ParsedVerifierRepairTarget {
+                path: "src/index.js".to_string(),
+                confidence: 0.8,
+                reason: "diagnostic selected implementation".to_string(),
+            }],
+            repair_plan: Vec::new(),
+            secondary_targets: Vec::new(),
+            do_not_edit_tests_without_evidence: true,
+            summary: None,
+        };
+        let findings = vec![VerifierDiagnosticFrameworkFinding {
+            kind: VerifierDiagnosticFrameworkFindingKind::NodeModuleSyntaxMismatch,
+            path: "tests/cli.test.js".to_string(),
+            role: ArtifactRole::Test,
+            summary: "package.json type conflicts with test source syntax".to_string(),
+        }];
+
+        assert!(apply_framework_findings_to_parsed_assessment(
+            &mut parsed,
+            &findings
+        ));
+
+        assert_eq!(
+            parsed.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::TestBug
+        );
+        assert_eq!(parsed.probable_cause_role, Some(ArtifactRole::Test));
+        assert!(!parsed.do_not_edit_tests_without_evidence);
+        assert_eq!(parsed.repair_targets[0].path, "tests/cli.test.js");
+        assert_eq!(parsed.repair_targets[1].path, "src/index.js");
     }
 
     #[test]
