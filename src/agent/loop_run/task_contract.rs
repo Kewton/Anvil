@@ -1568,8 +1568,8 @@ impl ObjectiveLifecycleStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ObjectiveEvidenceStage {
-    MissingEvidence { evidence_kind: EvidenceSpec },
-    SatisfiedOrNotRequired,
+    MissingEvidence { runner: ObjectiveEvidenceRunner },
+    SatisfiedOrNotRequired { runner: ObjectiveEvidenceRunner },
 }
 
 impl ObjectiveEvidenceStage {
@@ -1588,8 +1588,31 @@ impl ObjectiveEvidenceStage {
                     Some(ArtifactRecoveryAction::RunVerifier)
                 }
             }
-            ObjectiveEvidenceStage::SatisfiedOrNotRequired => None,
+            ObjectiveEvidenceStage::SatisfiedOrNotRequired { .. } => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObjectiveEvidenceRunner {
+    Command(EvidenceSpec),
+    ArtifactAcceptance(EvidenceSpec),
+    NotRequired,
+}
+
+impl ObjectiveEvidenceRunner {
+    fn for_objective(objective: &ObjectiveContract) -> Self {
+        if objective.requires_evidence() {
+            Self::Command(objective.evidence_kind)
+        } else if objective.has_required_deliverables() {
+            Self::ArtifactAcceptance(objective.evidence_kind)
+        } else {
+            Self::NotRequired
+        }
+    }
+
+    fn command(evidence_kind: EvidenceSpec) -> Self {
+        Self::Command(evidence_kind)
     }
 }
 
@@ -1948,18 +1971,29 @@ fn objective_evidence_stage(
     existing_unverified_used: bool,
     code_or_test_required: bool,
 ) -> ObjectiveEvidenceStage {
-    if verifier_passed {
-        return ObjectiveEvidenceStage::SatisfiedOrNotRequired;
-    }
-
     let objective = inputs.contract.objective_contract();
-    if objective.requires_evidence() || (existing_unverified_used && code_or_test_required) {
-        return ObjectiveEvidenceStage::MissingEvidence {
-            evidence_kind: objective.evidence_kind,
+    let default_runner = ObjectiveEvidenceRunner::for_objective(&objective);
+    if verifier_passed {
+        return ObjectiveEvidenceStage::SatisfiedOrNotRequired {
+            runner: default_runner,
         };
     }
 
-    ObjectiveEvidenceStage::SatisfiedOrNotRequired
+    if objective.requires_evidence() {
+        return ObjectiveEvidenceStage::MissingEvidence {
+            runner: default_runner,
+        };
+    }
+
+    if existing_unverified_used && code_or_test_required {
+        return ObjectiveEvidenceStage::MissingEvidence {
+            runner: ObjectiveEvidenceRunner::command(objective.evidence_kind),
+        };
+    }
+
+    ObjectiveEvidenceStage::SatisfiedOrNotRequired {
+        runner: default_runner,
+    }
 }
 
 fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRole) -> bool {
@@ -7861,7 +7895,7 @@ mod tests {
         assert_eq!(
             stage,
             ObjectiveEvidenceStage::MissingEvidence {
-                evidence_kind: ObjectiveEvidenceKind::TestRun
+                runner: ObjectiveEvidenceRunner::Command(ObjectiveEvidenceKind::TestRun)
             }
         );
         assert_eq!(
@@ -7875,7 +7909,7 @@ mod tests {
     }
 
     #[test]
-    fn objective_evidence_stage_is_satisfied_or_not_required_for_docs_and_data() {
+    fn objective_evidence_stage_uses_artifact_acceptance_runner_for_docs_and_data() {
         let cases = [
             (
                 "Update README.md with installation and usage sections.",
@@ -7905,10 +7939,36 @@ mod tests {
 
             assert_eq!(
                 objective_evidence_stage(&inputs, false, false, false),
-                ObjectiveEvidenceStage::SatisfiedOrNotRequired,
+                ObjectiveEvidenceStage::SatisfiedOrNotRequired {
+                    runner: ObjectiveEvidenceRunner::ArtifactAcceptance(evidence_kind)
+                },
                 "request={request}"
             );
         }
+    }
+
+    #[test]
+    fn objective_evidence_runner_is_not_required_for_answer_only() {
+        let contract = TaskContract::from_request("Explain Rust ownership in one paragraph.");
+        let evidence = EvidenceSet::new();
+        let excerpts = ArtifactExcerpts::new();
+        let repair_state = VerifierRepairState::None;
+        let inputs = ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &[],
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        };
+
+        assert_eq!(
+            objective_evidence_stage(&inputs, false, false, false),
+            ObjectiveEvidenceStage::SatisfiedOrNotRequired {
+                runner: ObjectiveEvidenceRunner::NotRequired
+            }
+        );
     }
 
     #[test]
