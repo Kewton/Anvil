@@ -2239,6 +2239,13 @@ pub(super) fn handle_actor_loop_pre_reply_control_action(
     args: &mut ActorLoopPreReplyArgs<'_, '_>,
     control_state: &ActorLoopPreReplyControlState,
 ) -> Option<ActorLoopPreReplyOutcome> {
+    if matches!(
+        control_state.loop_control_action,
+        LoopControlAction::RunVerifier | LoopControlAction::ContinueMissingVerifierJob { .. }
+    ) && maybe_handle_pre_reply_command_observation_evidence_action(agent, args)
+    {
+        return None;
+    }
     let flow_args = super::verifier_orchestration::TaskContractVerifierFlowArgs {
         before_snapshot: args.before_snapshot,
         accumulated: args.accumulated,
@@ -2277,6 +2284,24 @@ pub(super) fn handle_actor_loop_pre_reply_control_action(
         }),
         LoopControlAction::RequestModelTurn => None,
     }
+}
+
+fn maybe_handle_pre_reply_command_observation_evidence_action(
+    agent: &mut Agent,
+    args: &ActorLoopPreReplyArgs<'_, '_>,
+) -> bool {
+    let Some(contract) = args.task_contract else {
+        return false;
+    };
+    if !task_contract_requires_command_observation_evidence(agent, contract) {
+        return false;
+    }
+    emit_command_observation_evidence_request(
+        agent,
+        args.last_iter,
+        "A command-observation objective needs an actual Bash command result.",
+    );
+    true
 }
 
 pub(super) fn handle_actor_loop_pre_reply_fallbacks(
@@ -2767,6 +2792,9 @@ pub(super) fn handle_actor_loop_task_contract_run_verifier(
     agent
         .controller_policy_ledger
         .record(ControllerRecoveryStrategy::EvidenceAction);
+    if let Some(outcome) = maybe_handle_command_observation_evidence_action(agent, &args) {
+        return outcome;
+    }
     match super::verifier_orchestration::drive_task_contract_verifier(
         agent,
         super::verifier_orchestration::TaskContractVerifierFlowArgs {
@@ -2794,6 +2822,64 @@ pub(super) fn handle_actor_loop_task_contract_run_verifier(
             ActorLoopTaskContractReplyOutcome::Exit { reason, error_text }
         }
     }
+}
+
+fn maybe_handle_command_observation_evidence_action(
+    agent: &mut Agent,
+    args: &ActorLoopTaskContractReplyArgs<'_, '_>,
+) -> Option<ActorLoopTaskContractReplyOutcome> {
+    let contract = args.task_contract?;
+    if !task_contract_requires_command_observation_evidence(agent, contract) {
+        return None;
+    }
+    emit_command_observation_evidence_request(
+        agent,
+        args.last_iter,
+        "A command-observation objective needs an actual Bash command result.",
+    );
+    Some(ActorLoopTaskContractReplyOutcome::Continue)
+}
+
+fn task_contract_requires_command_observation_evidence(
+    agent: &Agent,
+    contract: &super::task_contract::TaskContract,
+) -> bool {
+    let objective = contract.objective_contract();
+    objective.evidence_kind == super::task_contract::ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        && objective.requires_evidence()
+        && !super::task_contract::objective_evidence_satisfied_for_contract(
+            &agent.task_contract_evidence_set_this_turn,
+            contract,
+        )
+}
+
+fn emit_command_observation_evidence_request(
+    agent: &mut Agent,
+    last_iter: usize,
+    detail: &'static str,
+) {
+    super::artifact_recovery_flow::clear_artifact_recovery_target(
+        agent,
+        "command_observation_evidence_required",
+    );
+    agent.missing_verifier_job = None;
+    agent.task_contract_verifier_repair_pending = false;
+    super::turn_helpers::write_stdout_rendered(
+        &format_iteration_status(
+            last_iter,
+            agent.config.max_iterations,
+            "Command evidence missing",
+            detail,
+            agent.footer.current_cols(),
+        ),
+        true,
+    );
+    let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
+    let note = format!(
+        "[Command Observation Evidence] The required artifact exists, but the objective still lacks actual command-observation evidence. Use Bash now to execute the local command explicitly requested in the active task, then update the artifact only if the observed output differs. Do not invent command output from the workspace path. Active task: {}",
+        super::task_contract::mask_and_cap_recovery_field(&active_request)
+    );
+    super::message_push::push_system_note(agent, note);
 }
 
 pub(super) fn handle_actor_loop_task_contract_safe_stop(

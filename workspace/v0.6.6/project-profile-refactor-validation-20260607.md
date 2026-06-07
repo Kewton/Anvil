@@ -197,3 +197,67 @@ Models:
 - Data is still not robust. The controller now protects input files from being promoted to writable deliverables, but it does not verify transformation semantics such as `total_value = sum(count * price)`.
 - Research no longer falls into code scaffolding, but report-style research currently projects through the document path. That is acceptable for the artifact lifecycle, but future reporting should preserve `research_report` when the sidecar provides it.
 - Ops remains the weakest non-coding lane: it can create the requested observation file, but command-observation evidence is not yet enforced.
+
+## 2026-06-07 CommandObservation Evidence Follow-Up
+
+### Code Changes
+
+- Preserved ProjectProfile `evidence_kind=command_observation` as `ObjectiveEvidenceKind::SafetyBoundaryEvidence` even when the deliverable is a document.
+- Added `CompletionEvidence::CommandObservation` and routed `EvidenceRunnerKind::OpsCommandObservation` through the same completion evidence set used by objective lifecycle decisions.
+- Added an ObjectiveContract-based Bash-only `EvidenceAction` tool policy:
+  - waits until required deliverables are present,
+  - allows only `Bash` while safety-boundary evidence is missing,
+  - releases after successful command observation evidence is recorded.
+- Added pre-reply and reply-side command-observation evidence handling so `RunVerifier` / stale `MissingVerifierJob` do not fall back to coding verifier authoring.
+- Kept simple file deliverables with `SafetyBoundaryEvidence` out of docs section behavior checks when the obligation has no explicit schema/required sections.
+- Kept existing docs required-section failures covered so this does not weaken normal docs validation.
+
+### Static Validation
+
+- `cargo test command_observation --lib`: pass, 9 tests
+- `cargo test evidence_runner --lib`: pass, 11 tests
+- `cargo test docs_required_section_failure_records_generic_evidence_failed_attempt --lib`: pass
+- `cargo check --lib`: pass
+- `cargo build`: pass
+
+### Local LLM Revalidation
+
+Models:
+
+- main: `qwen3.5:9b`
+- sidecar: `qwen3.5:2b`
+
+Prompt:
+
+```text
+Run the local command `pwd` and write ops-observation.md containing the exact observed current directory from that command. Do not create source code, tests, scripts, Cargo.toml, package.json, or setup files.
+```
+
+| Workspace | Result | Notes |
+| --- | --- | --- |
+| `/private/tmp/anvil-command-observation-work4.jdbBL6` | fail | False success was blocked, but model kept rewriting the file instead of running Bash. |
+| `/private/tmp/anvil-command-observation-work5.S1XOQF` | partial | Bash-only policy rejected extra Write attempts and eventually induced `Bash pwd`, but evidence did not reach task-contract completion because an artifact target was still active. |
+| `/private/tmp/anvil-command-observation-work6.2P4n6m` | partial | Command evidence was recorded, but docs behavior coverage reselected the same UsageDocs artifact after Bash. |
+| `/private/tmp/anvil-command-observation-work7.D4XODZ` | fail | ProjectProfile confirmed `SafetyBoundaryEvidence`, but pre-reply control dispatched MissingVerifierJob before the command-evidence handler ran. |
+| `/private/tmp/anvil-command-observation-work8.zImTZm` | fail | Pre-reply handler emitted the command-evidence note but returned `Continue`, so the model never received the Bash-only turn. |
+| `/private/tmp/anvil-command-observation-work9.P0YtBg` | pass | Completed in 3 iterations: extra `Read` failed, wrote `ops-observation.md`, controller required actual command evidence, model ran `Bash pwd`, and Anvil completed. |
+
+Final generated file:
+
+```text
+# Observation
+
+Current working directory: /private/tmp/anvil-command-observation-work9.P0YtBg
+```
+
+Final evidence log:
+
+- `agent.project_profile.classified`: `deliverable_kind=Document`, `evidence_kind=CommandObservation`
+- `agent.completion_evidence.observed`: `repo_edit` for `ops-observation.md`
+- `agent.completion_evidence.observed`: `ops_command_observation`, `exit_status=0`, `safety_boundary_passed=true`
+
+### Updated Interpretation
+
+- The fix that mattered was not another prompt phrase. It was preserving objective evidence separately from deliverable kind, then letting controller policy require the missing evidence action.
+- `CommandObservation` is now a small proof that the intended architecture works: the LLM can classify the semantic need, while the controller turns that into a typed contract, a Bash-only tool policy, and deterministic completion evidence.
+- The remaining risk is content binding. The controller confirms that the command was run and that the document exists, but it does not yet compare command stdout against document content for arbitrary commands. That should be a future EvidenceRunner-level check, not a docs-specific string rule.

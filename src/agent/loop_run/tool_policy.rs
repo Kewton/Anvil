@@ -41,6 +41,10 @@ pub(super) enum EffectiveToolPolicyReason {
     /// Issue #664: SetupBootstrap policy projection — `Bash` only,
     /// command-level filter via `crate::tools::bash::is_setup_command`.
     SetupBootstrap,
+    /// Objective evidence collection policy. This is not a task-kind mode:
+    /// the ObjectiveContract has declared that the next missing authority is
+    /// an observed local command result.
+    EvidenceAction,
 }
 
 impl EffectiveToolPolicyReason {
@@ -53,6 +57,7 @@ impl EffectiveToolPolicyReason {
             Self::FocusedEditRecovery => "focused_edit_recovery",
             Self::LocalLlmSmallEditAfterRead => "local_llm_small_edit_after_read",
             Self::SetupBootstrap => "setup_bootstrap",
+            Self::EvidenceAction => "evidence_action",
         }
     }
 }
@@ -169,6 +174,15 @@ impl EffectiveToolPolicy {
             focused_edit: None,
             artifact_directed: None,
             reason: EffectiveToolPolicyReason::SetupBootstrap,
+        }
+    }
+
+    pub(super) fn evidence_action_bash_only() -> Self {
+        Self {
+            allowed_tools: Some(vec!["Bash"]),
+            focused_edit: None,
+            artifact_directed: None,
+            reason: EffectiveToolPolicyReason::EvidenceAction,
         }
     }
 

@@ -144,6 +144,14 @@ pub(crate) enum CompletionEvidence {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+    /// A local command was actually executed and observed through the safety
+    /// boundary. This is the completion authority for command-observation
+    /// objectives; prose that merely describes a command result is not enough.
+    CommandObservation {
+        command: String,
+        exit_status: i32,
+        safety_boundary_passed: bool,
+    },
     /// The model produced an answer-only reply (no tool calls). Reserved
     /// for AnswerOnly protocol acceptance.
     AnswerOnly,

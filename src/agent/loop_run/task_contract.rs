@@ -369,7 +369,7 @@ impl ObjectiveContract {
             };
         }
 
-        let (deliverable_kind, evidence_kind) = match contract.task_kind {
+        let (deliverable_kind, default_evidence_kind) = match contract.task_kind {
             TaskKind::Coding => (
                 ObjectiveDeliverableKind::SourceFiles,
                 ObjectiveEvidenceKind::TestRun,
@@ -395,6 +395,9 @@ impl ObjectiveContract {
                 ObjectiveEvidenceKind::ContentAcceptance,
             ),
         };
+        let evidence_kind = contract
+            .objective_evidence_kind_override
+            .unwrap_or(default_evidence_kind);
 
         Self {
             task_kind: contract.task_kind,
@@ -402,7 +405,10 @@ impl ObjectiveContract {
             deliverable_kind,
             evidence_kind,
             required_deliverables: contract.required_artifacts.clone(),
-            evidence_required: contract.completion_policy.verification_required(),
+            evidence_required: contract.completion_policy.verification_required()
+                || contract
+                    .objective_evidence_kind_override
+                    .is_some_and(objective_evidence_kind_requires_command_evidence),
         }
     }
 
@@ -417,6 +423,13 @@ impl ObjectiveContract {
     pub(super) fn requires_evidence(&self) -> bool {
         self.evidence_required
     }
+}
+
+fn objective_evidence_kind_requires_command_evidence(evidence_kind: ObjectiveEvidenceKind) -> bool {
+    matches!(
+        evidence_kind,
+        ObjectiveEvidenceKind::TestRun | ObjectiveEvidenceKind::SafetyBoundaryEvidence
+    )
 }
 
 #[allow(dead_code)] // Issue #864: generic deliverable variants are part of the model before every producer is wired.
@@ -1191,6 +1204,11 @@ impl CompletionPolicy {
                 self.project_intent == CompletionProjectIntent::DocsOnly
                     || self.required_artifacts.contains(&ArtifactRole::UsageDocs)
             }
+            CompletionEvidence::CommandObservation {
+                exit_status,
+                safety_boundary_passed,
+                ..
+            } => self.task_kind == TaskKind::Ops && *exit_status == 0 && *safety_boundary_passed,
             CompletionEvidence::AnswerOnly => {
                 self.project_intent == CompletionProjectIntent::AnswerOnly
             }
@@ -1264,6 +1282,7 @@ pub(super) fn is_deterministic_completion_authority_evidence(
             | CompletionEvidence::RequiredSectionsPass { .. }
             | CompletionEvidence::StructuredDataPass { .. }
             | CompletionEvidence::ReportCompletenessPass { .. }
+            | CompletionEvidence::CommandObservation { .. }
             | CompletionEvidence::AnswerOnly
     )
 }
@@ -1331,6 +1350,7 @@ pub(super) struct TaskContract {
     // is UNCHANGED by this field (D6: verifier gate does not regress).
     pub(super) classification_confidence: f32,
     pub(super) evidence_command_hint: Option<String>,
+    pub(super) objective_evidence_kind_override: Option<ObjectiveEvidenceKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1860,7 +1880,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     }
 
     let observed = observed_artifacts(inputs.evidence);
-    let verifier_passed = has_build_test_verifier(inputs.evidence);
+    let objective_evidence_satisfied = objective_evidence_satisfied(inputs.evidence, &objective);
 
     if let Some(action) = objective_deliverable_stage(&inputs, &observed).into_recovery_action() {
         return action;
@@ -1900,6 +1920,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
                     // completion authority). Gate the docs section-coverage on
                     // `task_kind != Ops` so a runbook is not re-judged as docs.
                     inputs.contract.task_kind == TaskKind::Ops
+                        || command_observation_usage_docs_behavior_satisfied(inputs.contract)
                         || usage_docs_excerpt_satisfies_obligations(inputs.contract, excerpt)
                 }
                 ArtifactRole::Setup => true,
@@ -1936,7 +1957,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
 
     if let Some(action) = objective_evidence_stage(
         &inputs,
-        verifier_passed,
+        objective_evidence_satisfied,
         existing_unverified_used,
         code_or_test_required,
     )
@@ -1994,13 +2015,13 @@ fn objective_deliverable_stage(
 
 fn objective_evidence_stage(
     inputs: &ArtifactRecoveryInputs<'_>,
-    verifier_passed: bool,
+    objective_evidence_satisfied: bool,
     existing_unverified_used: bool,
     code_or_test_required: bool,
 ) -> ObjectiveEvidenceStage {
     let objective = inputs.contract.objective_contract();
     let default_runner = ObjectiveEvidenceRunner::for_objective(&objective);
-    if verifier_passed {
+    if objective_evidence_satisfied {
         return ObjectiveEvidenceStage::SatisfiedOrNotRequired {
             runner: default_runner,
         };
@@ -2068,7 +2089,7 @@ fn required_role_satisfied(
     }
     identities.iter().all(|identity| {
         artifact_identity_satisfied_for_verification(
-            contract.task_kind,
+            contract,
             evidence,
             artifacts,
             artifact_excerpts,
@@ -2078,7 +2099,7 @@ fn required_role_satisfied(
 }
 
 fn artifact_identity_satisfied_for_verification(
-    task_kind: TaskKind,
+    contract: &TaskContract,
     evidence: &EvidenceSet,
     artifacts: &[ArtifactState],
     artifact_excerpts: &ArtifactExcerpts,
@@ -2092,13 +2113,16 @@ fn artifact_identity_satisfied_for_verification(
     let path_exists = artifact_identity_path_ready_for_verification(artifacts, identity)
         || completion_evidence_observed;
     let excerpt = artifact_excerpts.get(&identity.role).map(String::as_str);
+    if command_observation_file_identity_satisfied(contract, identity, path_exists) {
+        return true;
+    }
     if identity.role == ArtifactRole::DataOutput {
         return excerpt
             .map(|excerpt| data_output_identity_excerpt_satisfies(identity, excerpt))
             .unwrap_or_else(|| data_output_structured_evidence_observed(evidence, identity));
     }
     let Some(diagnostic) = super::verifier::verifier_diagnostic_for_obligation(
-        task_kind,
+        contract.task_kind,
         identity,
         excerpt,
         path_exists,
@@ -2108,6 +2132,28 @@ fn artifact_identity_satisfied_for_verification(
     diagnostic.code == super::verifier::VerifierDiagnosticCode::EvidenceMissing
         && excerpt.is_none()
         && path_exists
+}
+
+fn command_observation_file_identity_satisfied(
+    contract: &TaskContract,
+    identity: &ArtifactObligation,
+    path_exists: bool,
+) -> bool {
+    let objective = contract.objective_contract();
+    objective.evidence_kind == ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        && path_exists
+        && identity.schema.is_none()
+        && identity.required_sections.is_empty()
+}
+
+fn command_observation_usage_docs_behavior_satisfied(contract: &TaskContract) -> bool {
+    let objective = contract.objective_contract();
+    let identities = contract.required_identities_for_role(ArtifactRole::UsageDocs);
+    objective.evidence_kind == ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        && !identities.is_empty()
+        && identities
+            .iter()
+            .all(|identity| identity.schema.is_none() && identity.required_sections.is_empty())
 }
 
 fn data_output_identity_excerpt_satisfies(identity: &ArtifactObligation, excerpt: &str) -> bool {
@@ -2868,6 +2914,9 @@ impl TaskContract {
             required_behavior,
             classification_confidence,
             evidence_command_hint,
+            objective_evidence_kind_override: project_profile_inputs
+                .as_ref()
+                .and_then(|inputs| inputs.evidence_kind),
         }
     }
 
@@ -3010,7 +3059,8 @@ impl TaskContract {
         if !missing.is_empty() {
             return CompletionDecision::Continue { missing };
         }
-        if policy.verification_required() && !has_build_test_verifier(evidence) {
+        let objective = self.objective_contract();
+        if objective.requires_evidence() && !objective_evidence_satisfied(evidence, &objective) {
             return CompletionDecision::Verify;
         }
         // Issue #651 Task 4.1: test-execution gate. Only fires under the
@@ -5916,6 +5966,7 @@ fn observed_artifacts(evidence: &EvidenceSet) -> Vec<ArtifactRole> {
             CompletionEvidence::ReportCompletenessPass { .. } => {
                 roles.push(ArtifactRole::UsageDocs)
             }
+            CompletionEvidence::CommandObservation { .. } => {}
             CompletionEvidence::AnswerOnly => {}
         }
     }
@@ -6005,6 +6056,52 @@ fn has_build_test_verifier(evidence: &EvidenceSet) -> bool {
             }
         )
     })
+}
+
+fn has_successful_command_observation(evidence: &EvidenceSet) -> bool {
+    evidence.iter().any(|item| {
+        matches!(
+            item,
+            CompletionEvidence::CommandObservation {
+                exit_status: 0,
+                safety_boundary_passed: true,
+                ..
+            }
+        )
+    })
+}
+
+pub(super) fn objective_evidence_satisfied_for_contract(
+    evidence: &EvidenceSet,
+    contract: &TaskContract,
+) -> bool {
+    objective_evidence_satisfied(evidence, &contract.objective_contract())
+}
+
+fn objective_evidence_satisfied(evidence: &EvidenceSet, objective: &ObjectiveContract) -> bool {
+    match objective.evidence_kind {
+        ObjectiveEvidenceKind::TestRun => has_build_test_verifier(evidence),
+        ObjectiveEvidenceKind::SafetyBoundaryEvidence => {
+            has_successful_command_observation(evidence)
+        }
+        ObjectiveEvidenceKind::ContentCheck | ObjectiveEvidenceKind::ContentAcceptance => {
+            evidence.iter().any(|item| {
+                matches!(
+                    item,
+                    CompletionEvidence::RequiredSectionsPass { .. }
+                        | CompletionEvidence::ReportCompletenessPass { .. }
+                        | CompletionEvidence::AnswerOnly
+                )
+            })
+        }
+        ObjectiveEvidenceKind::SchemaCheck => evidence
+            .iter()
+            .any(|item| matches!(item, CompletionEvidence::StructuredDataPass { .. })),
+        ObjectiveEvidenceKind::SourceFetchEvidence => evidence
+            .iter()
+            .any(|item| matches!(item, CompletionEvidence::ReportCompletenessPass { .. })),
+        ObjectiveEvidenceKind::FileLayoutCheck => false,
+    }
 }
 
 /// Issue #651 PR-001 + Issue #661 (iteration-3 Task 4.1): stricter sibling
@@ -6842,6 +6939,14 @@ mod tests {
         }
     }
 
+    fn command_observation(command: &str, exit_status: i32) -> CompletionEvidence {
+        CompletionEvidence::CommandObservation {
+            command: command.to_string(),
+            exit_status,
+            safety_boundary_passed: true,
+        }
+    }
+
     #[test]
     fn issue905_completion_authority_predicate_lists_deterministic_evidence_only() {
         let evidence = [
@@ -6856,6 +6961,11 @@ mod tests {
             },
             CompletionEvidence::ReportCompletenessPass {
                 path: Some("report.md".to_string()),
+            },
+            CompletionEvidence::CommandObservation {
+                command: "pwd".to_string(),
+                exit_status: 0,
+                safety_boundary_passed: true,
             },
             CompletionEvidence::AnswerOnly,
         ];
@@ -9033,6 +9143,164 @@ Create the README file."#;
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn command_observation_profile_requires_real_command_evidence_without_runner_hint() {
+        let request = "Run pwd and capture the observation. Do not create source code, tests, Cargo.toml, package.json, or setup files.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"the objective is observing a shell command result"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(contract.task_kind, TaskKind::Ops);
+        assert!(contract.objective_contract().requires_evidence());
+
+        let empty = EvidenceSet::new();
+        assert_eq!(contract.evaluate(&empty), CompletionDecision::Verify);
+
+        let mut observed = EvidenceSet::new();
+        observed.push(command_observation("pwd", 0));
+        assert_eq!(contract.evaluate(&observed), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn command_observation_failure_does_not_satisfy_safety_evidence() {
+        let request = "Run pwd and capture the observation.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"the objective is observing a shell command result"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        let mut failed = EvidenceSet::new();
+        failed.push(command_observation("pwd", 1));
+
+        assert_eq!(contract.evaluate(&failed), CompletionDecision::Verify);
+    }
+
+    #[test]
+    fn document_deliverable_with_command_observation_requires_both_file_and_command() {
+        let request =
+            "Run pwd and write ops-observation.md containing the exact observed directory.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["ops-observation.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"the document must be grounded in an executed command"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        let objective = contract.objective_contract();
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(
+            objective.evidence_kind,
+            ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        );
+        assert!(objective.requires_evidence());
+
+        let mut file_only = EvidenceSet::new();
+        file_only.push(repo_edit_path(RepoEditCategory::Docs, "ops-observation.md"));
+        assert_eq!(contract.evaluate(&file_only), CompletionDecision::Verify);
+
+        let mut complete = file_only.clone();
+        complete.push(command_observation("pwd", 0));
+        assert_eq!(contract.evaluate(&complete), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn command_observation_plan_accepts_simple_file_after_observed_command() {
+        let request =
+            "Run pwd and write ops-observation.md containing the exact observed directory.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["ops-observation.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"the document must be grounded in an executed command"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        let artifacts = vec![ArtifactState::changed_at(
+            ArtifactRole::UsageDocs,
+            "ops-observation.md",
+        )];
+        let repair_state = VerifierRepairState::None;
+        let mut file_only = EvidenceSet::new();
+        file_only.push(repo_edit_path(RepoEditCategory::Docs, "ops-observation.md"));
+        let mut excerpts = ArtifactExcerpts::new();
+        excerpts.insert(
+            ArtifactRole::UsageDocs,
+            "/private/tmp/anvil-command-observation-work".to_string(),
+        );
+
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &file_only,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::RunVerifier
+        );
+
+        let mut complete = file_only;
+        complete.push(command_observation("pwd", 0));
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &complete,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
         );
     }
 
@@ -11222,7 +11490,7 @@ Create the README file."#;
     }
 
     #[test]
-    fn llm_project_profile_command_evidence_without_runner_does_not_require_verifier() {
+    fn llm_project_profile_command_evidence_without_runner_requires_command_evidence() {
         let profile = super::super::project_profile::parse_project_profile_confirmation(
             r#"{"language":"docs","shape":"cli","deliverable_kind":"document","primary_artifacts":["README.md"],"forbidden_artifacts":[],"evidence_kind":"command_observation","preferred_runner":null,"needs_environment_setup":false,"confidence":1.0}"#,
         )
@@ -11235,7 +11503,11 @@ Create the README file."#;
 
         assert_eq!(contract.task_kind, TaskKind::Docs);
         assert!(!contract.verification_required);
-        assert!(!contract.objective_contract().evidence_required);
+        assert!(contract.objective_contract().evidence_required);
+        assert_eq!(
+            contract.objective_contract().evidence_kind,
+            ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        );
     }
 
     /// Compositional regression: the public `request_asks_for_setup` API

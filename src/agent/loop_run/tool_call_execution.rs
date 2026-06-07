@@ -373,6 +373,8 @@ fn observe_evidence_from_bash_outcome(
         }
     }
 
+    observe_task_evidence_runner_command(agent, outcome);
+
     // Issue #607 (β): build VerifierExitZero evidence for BuildTest |
     // EnvSetup exit-zero outcomes (per `build_verifier_exit_zero_evidence`).
     let Some(evidence) = build_verifier_exit_zero_evidence(outcome) else {
@@ -409,4 +411,135 @@ fn observe_evidence_from_bash_outcome(
             "command_class": class.as_str(),
         }),
     );
+}
+
+fn observe_task_evidence_runner_command(
+    agent: &mut Agent,
+    outcome: &crate::tools::bash::BashExecutionOutcome,
+) {
+    use super::evidence_runner::{EvidenceRunner, EvidenceRunnerOutput};
+    use crate::tools::bash::BashCommandClass;
+
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
+        return;
+    };
+    if contract.task_kind == super::task_contract::TaskKind::Coding {
+        return;
+    }
+    let objective = contract.objective_contract();
+    let Some(runner) = super::evidence_runner::evidence_runner_for_objective(&objective) else {
+        return;
+    };
+    let safety_boundary_passed = outcome.blocked_reason.is_none()
+        && !outcome.timed_out
+        && !outcome.interrupted
+        && !matches!(outcome.class, BashCommandClass::Dangerous);
+    let command = crate::session::feedback::redact_verifier_command_for_storage(&outcome.command);
+    if command.trim().is_empty() {
+        return;
+    }
+    let Some(EvidenceRunnerOutput::Completion(evidence)) = runner.observe_command(
+        &command,
+        outcome.exit_code.unwrap_or(-1),
+        safety_boundary_passed,
+        None,
+    ) else {
+        return;
+    };
+    agent.evidence_set_this_turn.push(evidence.clone());
+    agent.task_contract_evidence_set_this_turn.push(evidence);
+    crate::logging::log_completion_evidence_observed(
+        agent.current_turn_index,
+        0,
+        runner.kind().as_str(),
+        serde_json::json!({
+            "source": "task_evidence_runner_command",
+            "exit_status": outcome.exit_code.unwrap_or(-1),
+            "safety_boundary_passed": safety_boundary_passed,
+        }),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::completion_evidence::CompletionEvidence;
+    use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
+    use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTarget, TaskContract};
+    use crate::config::Config;
+    use crate::session::store::ConversationMessage;
+    use crate::tools::bash::BashExecutionOutcome;
+
+    use super::*;
+
+    #[test]
+    fn command_observation_evidence_reaches_task_contract_with_artifact_target_active() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request =
+            "Run pwd and write ops-observation.md containing the exact observed directory.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["ops-observation.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"the document must be grounded in an observed local command"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(contract))
+            .expect("unset task contract cell");
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::UsageDocs,
+            path: "ops-observation.md".to_string(),
+            reason: "missing command observation document".to_string(),
+            attempt: 1,
+        });
+
+        observe_task_evidence_runner_command(
+            &mut agent,
+            &BashExecutionOutcome {
+                command: "pwd".to_string(),
+                exit_code: Some(0),
+                stdout: "/tmp/example\n".to_string(),
+                ..BashExecutionOutcome::default()
+            },
+        );
+
+        assert!(
+            agent
+                .task_contract_evidence_set_this_turn
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    CompletionEvidence::CommandObservation {
+                        command,
+                        exit_status: 0,
+                        safety_boundary_passed: true
+                    } if command == "pwd"
+                )),
+            "task contract evidence: {:?}",
+            agent.task_contract_evidence_set_this_turn
+        );
+    }
 }

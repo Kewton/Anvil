@@ -7,7 +7,7 @@
 #![allow(dead_code)] // Extension seam; focused tests pin the shape before wiring broad callers.
 
 use super::completion_evidence::CompletionEvidence;
-use super::task_contract::{ObjectiveEvidenceKind, TaskKind};
+use super::task_contract::{ObjectiveContract, ObjectiveEvidenceKind, TaskKind};
 use super::verifier::{VerifierArtifact, verifier_for_task_kind};
 use crate::terminal_outcome::GenericTerminalState;
 
@@ -143,13 +143,13 @@ impl EvidenceRunner for TaskEvidenceRunner {
                             .pass_evidence(command, bound_artifacts_count),
                     )
                 }),
-            EvidenceRunnerKind::OpsCommandObservation => Some(
-                EvidenceRunnerOutput::CommandObservation(CommandObservationEvidence {
+            EvidenceRunnerKind::OpsCommandObservation => Some(EvidenceRunnerOutput::Completion(
+                CompletionEvidence::CommandObservation {
                     command: command.to_string(),
                     exit_status,
                     safety_boundary_passed,
-                }),
-            ),
+                },
+            )),
             EvidenceRunnerKind::DocsContentCheck
             | EvidenceRunnerKind::DataSchemaCheck
             | EvidenceRunnerKind::ResearchSourceFetch
@@ -216,6 +216,44 @@ pub(super) fn evidence_runner_for_task_kind(task_kind: TaskKind) -> Option<TaskE
             EvidenceRunnerKind::AuthoringContentCheck,
             ObjectiveEvidenceKind::ContentAcceptance,
         ),
+    })
+}
+
+pub(super) fn evidence_runner_for_objective(
+    objective: &ObjectiveContract,
+) -> Option<TaskEvidenceRunner> {
+    Some(match objective.evidence_kind {
+        ObjectiveEvidenceKind::SafetyBoundaryEvidence => TaskEvidenceRunner::new(
+            objective.task_kind,
+            EvidenceRunnerKind::OpsCommandObservation,
+            ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+        ),
+        ObjectiveEvidenceKind::TestRun => TaskEvidenceRunner::new(
+            objective.task_kind,
+            EvidenceRunnerKind::CodingBuildTest,
+            ObjectiveEvidenceKind::TestRun,
+        ),
+        ObjectiveEvidenceKind::ContentCheck => TaskEvidenceRunner::new(
+            objective.task_kind,
+            EvidenceRunnerKind::DocsContentCheck,
+            ObjectiveEvidenceKind::ContentCheck,
+        ),
+        ObjectiveEvidenceKind::SchemaCheck => TaskEvidenceRunner::new(
+            objective.task_kind,
+            EvidenceRunnerKind::DataSchemaCheck,
+            ObjectiveEvidenceKind::SchemaCheck,
+        ),
+        ObjectiveEvidenceKind::SourceFetchEvidence => TaskEvidenceRunner::new(
+            objective.task_kind,
+            EvidenceRunnerKind::ResearchSourceFetch,
+            ObjectiveEvidenceKind::SourceFetchEvidence,
+        ),
+        ObjectiveEvidenceKind::ContentAcceptance => TaskEvidenceRunner::new(
+            objective.task_kind,
+            EvidenceRunnerKind::AuthoringContentCheck,
+            ObjectiveEvidenceKind::ContentAcceptance,
+        ),
+        ObjectiveEvidenceKind::FileLayoutCheck => return None,
     })
 }
 
@@ -373,8 +411,8 @@ mod tests {
         let ops = evidence_runner_for_task_kind(TaskKind::Ops).expect("ops runner");
         assert_eq!(
             ops.observe_command("printf ok", 0, true, None),
-            Some(EvidenceRunnerOutput::CommandObservation(
-                CommandObservationEvidence {
+            Some(EvidenceRunnerOutput::Completion(
+                CompletionEvidence::CommandObservation {
                     command: "printf ok".to_string(),
                     exit_status: 0,
                     safety_boundary_passed: true,

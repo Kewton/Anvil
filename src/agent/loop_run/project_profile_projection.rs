@@ -10,8 +10,9 @@ use super::project_profile::{
     ProjectProfileConfirmation,
 };
 use super::task_contract::{
-    ArtifactObligation, ArtifactRole, ObjectiveDeliverableKind, ProjectLanguage, ProjectShape,
-    TaskContract, TaskKind, VerificationRequirement, preferred_runner_for_language,
+    ArtifactObligation, ArtifactRole, ObjectiveDeliverableKind, ObjectiveEvidenceKind,
+    ProjectLanguage, ProjectShape, TaskContract, TaskKind, VerificationRequirement,
+    preferred_runner_for_language,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub(super) struct ProjectProfileContractInputs {
     pub(super) language: Option<ProjectLanguage>,
     pub(super) shape: Option<ProjectShape>,
     pub(super) verification: Option<VerificationRequirement>,
+    pub(super) evidence_kind: Option<ObjectiveEvidenceKind>,
     pub(super) required_role: Option<ArtifactRole>,
     pub(super) artifact_obligations: Vec<ArtifactObligation>,
     pub(super) forbids_implementation: bool,
@@ -76,6 +78,7 @@ pub(super) fn contract_inputs_from_confirmation(
         language: profile.language,
         shape: profile.shape,
         verification: verification_requirement(profile),
+        evidence_kind: objective_evidence_kind_from_profile(profile),
         required_role,
         artifact_obligations: artifact_obligations(profile, required_role),
         forbids_implementation: forbids_implementation_artifact(profile),
@@ -146,6 +149,21 @@ fn objective_deliverable_kind_from_profile(
     }
 }
 
+fn objective_evidence_kind_from_profile(
+    profile: &ProjectProfileConfirmation,
+) -> Option<ObjectiveEvidenceKind> {
+    match profile.evidence_kind? {
+        ProfileEvidenceKind::TestRun => Some(ObjectiveEvidenceKind::TestRun),
+        ProfileEvidenceKind::ContentCheck => Some(ObjectiveEvidenceKind::ContentCheck),
+        ProfileEvidenceKind::SchemaCheck => Some(ObjectiveEvidenceKind::SchemaCheck),
+        ProfileEvidenceKind::CommandObservation => {
+            Some(ObjectiveEvidenceKind::SafetyBoundaryEvidence)
+        }
+        ProfileEvidenceKind::SourceFetch => Some(ObjectiveEvidenceKind::SourceFetchEvidence),
+        ProfileEvidenceKind::None | ProfileEvidenceKind::Unknown => None,
+    }
+}
+
 fn task_kind_from_profile(profile: &ProjectProfileConfirmation) -> Option<TaskKind> {
     match profile.deliverable_kind? {
         ProfileDeliverableKind::Code => Some(TaskKind::Coding),
@@ -182,9 +200,8 @@ fn verification_requirement(
             Some(VerificationRequirement::ArtifactOnly)
         }
         ProfileEvidenceKind::CommandObservation | ProfileEvidenceKind::SourceFetch => {
-            let runner = preferred_runner_from_profile(profile)?;
             Some(VerificationRequirement::Required {
-                preferred_runner: Some(runner),
+                preferred_runner: preferred_runner_from_profile(profile),
             })
         }
         ProfileEvidenceKind::None => Some(VerificationRequirement::NotRequired),
@@ -326,6 +343,10 @@ mod tests {
             Some(VerificationRequirement::ArtifactOnly)
         );
         assert_eq!(
+            inputs.evidence_kind,
+            Some(ObjectiveEvidenceKind::ContentCheck)
+        );
+        assert_eq!(
             inputs.artifact_obligations,
             vec![ArtifactObligation::file(
                 ArtifactRole::UsageDocs,
@@ -335,6 +356,38 @@ mod tests {
         assert!(inputs.forbids_implementation);
         assert!(inputs.forbids_tests);
         assert!(inputs.forbids_setup);
+    }
+
+    #[test]
+    fn document_with_command_observation_keeps_independent_evidence_kind() {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["ops-observation.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"document must be grounded in a command observation"
+            }"#,
+        )
+        .expect("profile");
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+
+        assert_eq!(inputs.task_kind, Some(TaskKind::Docs));
+        assert_eq!(
+            inputs.evidence_kind,
+            Some(ObjectiveEvidenceKind::SafetyBoundaryEvidence)
+        );
+        assert_eq!(
+            inputs.verification,
+            Some(VerificationRequirement::Required {
+                preferred_runner: None
+            })
+        );
     }
 
     #[test]

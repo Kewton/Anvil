@@ -39,6 +39,10 @@ use super::verifier_orchestration::verifier_repair_policy_for_target_hint;
 use crate::modes::plan_act::{ExecutionMode, WorkMode};
 
 pub(super) fn effective_tool_policy(agent: &Agent) -> EffectiveToolPolicy {
+    if let Some(policy) = objective_evidence_action_policy(agent) {
+        return policy;
+    }
+
     // Issue #660: `AnswerOnlyMode` is a pre-arbitration gate (priority 0
     // in §4 of the design policy). The arbiter never sees it; we early-
     // return before constructing any selectable `JobCandidate`.
@@ -79,6 +83,44 @@ pub(super) fn effective_tool_policy(agent: &Agent) -> EffectiveToolPolicy {
     let candidates = build_arbiter_candidates(agent);
     let selection = select_active_job(&candidates);
     project_policy(&selection)
+}
+
+fn objective_evidence_action_policy(agent: &Agent) -> Option<EffectiveToolPolicy> {
+    let contract = super::task_classification::task_contract_authority(agent)?;
+    let objective = contract.objective_contract();
+    if objective.evidence_kind
+        != super::task_contract::ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        || !objective.requires_evidence()
+        || super::task_contract::objective_evidence_satisfied_for_contract(
+            &agent.task_contract_evidence_set_this_turn,
+            &contract,
+        )
+        || !objective_required_deliverables_ready(agent, &contract)
+    {
+        return None;
+    }
+
+    Some(EffectiveToolPolicy::evidence_action_bash_only())
+}
+
+fn objective_required_deliverables_ready(
+    agent: &Agent,
+    contract: &super::task_contract::TaskContract,
+) -> bool {
+    let objective = contract.objective_contract();
+    if !objective.has_required_deliverables() {
+        return true;
+    }
+    let projection = agent
+        .artifact_ledger
+        .required_artifacts_completed_projection(contract);
+    if projection.overflowed() {
+        return false;
+    }
+    objective
+        .required_deliverables()
+        .iter()
+        .all(|role| projection.is_satisfied(*role))
 }
 
 /// Issue #660: build the arbiter candidate list from the same source
@@ -361,5 +403,135 @@ fn focused_edit_policy_for_target(
         EffectiveToolPolicy::focused_edit(reason, vec!["Edit"], target, target_already_read)
     } else {
         EffectiveToolPolicy::focused_edit(reason, vec!["Read", "Edit"], target, target_already_read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
+    use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::completion_evidence::CompletionEvidence;
+    use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
+    use crate::agent::loop_run::task_contract::{ArtifactRole, TaskContract};
+    use crate::agent::loop_run::tool_policy::EffectiveToolPolicyReason;
+    use crate::config::Config;
+    use crate::session::store::ConversationMessage;
+
+    use super::*;
+
+    fn command_observation_docs_contract(request: &str) -> TaskContract {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["ops-observation.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"the document must be grounded in an observed local command"
+            }"#,
+        )
+        .expect("profile");
+        TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile))
+    }
+
+    fn seed_active_contract(
+        agent: &mut crate::agent::loop_run::Agent,
+        request: &str,
+        contract: TaskContract,
+    ) -> Rc<TaskContract> {
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let contract = Rc::new(contract);
+        agent
+            .task_contract_this_turn
+            .set(contract.clone())
+            .expect("unset task contract cell");
+        contract
+    }
+
+    #[test]
+    fn command_observation_evidence_policy_waits_for_deliverable() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request =
+            "Run pwd and write ops-observation.md containing the exact observed directory.";
+        let contract = command_observation_docs_contract(request);
+        seed_active_contract(&mut agent, request, contract);
+
+        let policy = effective_tool_policy(&agent);
+
+        assert_ne!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
+    }
+
+    #[test]
+    fn command_observation_evidence_policy_allows_only_bash_after_deliverable() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request =
+            "Run pwd and write ops-observation.md containing the exact observed directory.";
+        let contract = seed_active_contract(
+            &mut agent,
+            request,
+            command_observation_docs_contract(request),
+        );
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        std::fs::write(agent.work_root.join("ops-observation.md"), "pending\n").unwrap();
+        agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "ops-observation.md".to_string(),
+            ArtifactRole::UsageDocs,
+            true,
+        );
+
+        let policy = effective_tool_policy(&agent);
+
+        assert_eq!(
+            contract.objective_contract().required_deliverables().len(),
+            1
+        );
+        assert_eq!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
+        assert_eq!(policy.allowed_tool_names_for_prompt(), Some(&["Bash"][..]));
+    }
+
+    #[test]
+    fn command_observation_evidence_policy_releases_after_observed_command() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request =
+            "Run pwd and write ops-observation.md containing the exact observed directory.";
+        seed_active_contract(
+            &mut agent,
+            request,
+            command_observation_docs_contract(request),
+        );
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        std::fs::write(agent.work_root.join("ops-observation.md"), "pending\n").unwrap();
+        agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "ops-observation.md".to_string(),
+            ArtifactRole::UsageDocs,
+            true,
+        );
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::CommandObservation {
+                command: "pwd".to_string(),
+                exit_status: 0,
+                safety_boundary_passed: true,
+            });
+
+        let policy = effective_tool_policy(&agent);
+
+        assert_ne!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
     }
 }
