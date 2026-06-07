@@ -248,7 +248,10 @@ fn diagnostic_target_role_matches_failure_kind(
     hint: &super::task_contract::RecoveryTargetHint,
     failure_kind: super::VerifierDiagnosticFailureKind,
 ) -> bool {
-    let kind = super::repair_brief::legacy_kind_to_allowed_change_kind(failure_kind.as_str());
+    let kind = super::repair_brief::legacy_kind_to_allowed_change_kind_for_role(
+        failure_kind.as_str(),
+        Some(hint.role),
+    );
     if kind == super::repair_brief::AllowedChangeKind::InsufficientEvidence {
         return true;
     }
@@ -512,4 +515,50 @@ pub(super) fn build_semantic_repair_plan_from_report_with_authority_input(
         semantic_report: report,
         assessment_generation_at_creation: assessment_generation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hint(
+        role: super::super::task_contract::ArtifactRole,
+        path: &str,
+    ) -> super::super::task_contract::RecoveryTargetHint {
+        super::super::task_contract::RecoveryTargetHint {
+            role,
+            path: path.to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn invalid_manifest_diagnostic_allows_setup_target_role() {
+        let setup = hint(super::super::task_contract::ArtifactRole::Setup, "Cargo.toml");
+        let implementation = hint(
+            super::super::task_contract::ArtifactRole::Implementation,
+            "src/lib.rs",
+        );
+
+        assert!(diagnostic_target_role_matches_failure_kind(
+            &setup,
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest
+        ));
+        assert!(diagnostic_target_role_matches_failure_kind(
+            &implementation,
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest
+        ));
+
+        let selected = first_role_kind_compatible_diagnostic_target(
+            std::slice::from_ref(&setup),
+            &[],
+            &[],
+            &[implementation],
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest,
+        )
+        .expect("setup target remains selectable");
+
+        assert_eq!(selected.role, super::super::task_contract::ArtifactRole::Setup);
+        assert_eq!(selected.path, "Cargo.toml");
+    }
 }

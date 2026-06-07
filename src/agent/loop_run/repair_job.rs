@@ -29,7 +29,7 @@ use super::repair_packet::{
 };
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
-use super::task_contract::{ArtifactRole, DeliverableKind, RecoveryTargetHint};
+use super::task_contract::{ArtifactRole, DeliverableKind, RecoveryTargetHint, TaskContract};
 #[cfg(test)]
 use super::tool_history::{
     focused_edit_target_already_read, latest_successful_read_existing_path,
@@ -1390,13 +1390,18 @@ impl RepairJob {
 
     #[allow(dead_code)] // helper for the next_action migration surface.
     fn repeated_rejected_attempt(&self) -> Option<&RejectedAttempt> {
-        self.rejected_attempts.iter().rev().find(|attempt| {
-            self.rejected_attempts
-                .iter()
-                .filter(|candidate| *candidate == *attempt)
-                .count()
-                >= REPEATED_REJECTED_ATTEMPT_THRESHOLD
-        })
+        let active_key = self.current_repair_attempt_key(None)?;
+        self.rejected_attempts
+            .iter()
+            .rev()
+            .filter(|attempt| attempt.key == active_key)
+            .find(|attempt| {
+                self.rejected_attempts
+                    .iter()
+                    .filter(|candidate| *candidate == *attempt)
+                    .count()
+                    >= REPEATED_REJECTED_ATTEMPT_THRESHOLD
+            })
     }
 
     fn repeated_rejected_correction_class(&self) -> Option<&RejectedAttempt> {
@@ -1457,6 +1462,32 @@ impl RepairJob {
 
     pub(super) fn activate_correction_job(&mut self, packet: RepairPacket) {
         self.correction_job = Some(CorrectionJob::from_packet(packet, &self.failure_signature));
+    }
+
+    pub(super) fn sync_correction_job_from_current_assessment(
+        &mut self,
+        contract: Option<&TaskContract>,
+    ) {
+        self.repair_target_hint = self
+            .assessment
+            .as_ref()
+            .and_then(|assessment| assessment.repair_target_hint.clone());
+        let packet = contract.and_then(|contract| {
+            self.assessment.as_ref().and_then(|assessment| {
+                assessment.repair_target_hint.as_ref().map(|hint| {
+                    RepairPacket::for_diagnostic_failure(
+                        contract,
+                        hint,
+                        assessment.failure_kind,
+                    )
+                })
+            })
+        });
+        if let Some(packet) = packet {
+            self.activate_correction_job(packet);
+        } else {
+            self.correction_job = None;
+        }
     }
 
     pub(super) fn active_correction_attempt_key(
@@ -3828,6 +3859,34 @@ mod tests {
         });
 
         assert_eq!(job.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn repair_job_repeated_rejects_do_not_block_different_active_target() {
+        let previous_target = recovery_target(ArtifactRole::Test, "tests/palindrome.rs");
+        let previous_key = RepairAttemptKey::from_target(&previous_target, None);
+        let active_target = recovery_target(ArtifactRole::Setup, "Cargo.toml");
+        let job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(active_target.clone())),
+            rejected_attempts: vec![
+                RejectedAttempt {
+                    key: previous_key.clone(),
+                    reason: RejectedAttemptReason::MalformedPatch,
+                },
+                RejectedAttempt {
+                    key: previous_key,
+                    reason: RejectedAttemptReason::MalformedPatch,
+                },
+            ],
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: active_target
+            }
+        );
     }
 
     #[test]
@@ -7176,6 +7235,64 @@ mod tests {
             path: path.to_string(),
             reason: "rebind fixture".to_string(),
         }
+    }
+
+    fn setup_hint(path: &str) -> RecoveryTargetHint {
+        RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Setup,
+            path: path.to_string(),
+            reason: "rebind fixture".to_string(),
+        }
+    }
+
+    #[test]
+    fn correction_job_sync_uses_rebound_assessment_target() {
+        let mut report =
+            multi_cluster_report_fixture(VerifierDiagnosticFailureKind::InvalidManifest, 1);
+        report.preferred_repair_role = super::super::task_contract::ArtifactRole::Setup;
+        let cargo_target = setup_hint("Cargo.toml");
+        report.failure_clusters[0].admitted_cluster_targets = vec![cargo_target.clone()];
+
+        let mut job = job_with_first_cluster_plan(&report);
+        let stale_impl_target = impl_hint("src/lib.rs");
+        job.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::InvalidManifest,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Implementation),
+            needed_reads: vec![stale_impl_target.clone()],
+            repair_target_hint: Some(stale_impl_target.clone()),
+            repair_plan: vec![stale_impl_target],
+            summary: Some("Cargo manifest is missing a test target name.".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+
+        rebind_legacy_assessment_to_current_cluster(&mut job);
+        let contract = super::super::task_contract::TaskContract::from_request(
+            "Create a Rust library and run cargo test.",
+        );
+        job.sync_correction_job_from_current_assessment(Some(&contract));
+
+        let rebound_assessment_target = job
+            .assessment
+            .as_ref()
+            .and_then(|assessment| assessment.repair_target_hint.as_ref())
+            .expect("rebound assessment target");
+        assert_eq!(rebound_assessment_target.role, cargo_target.role);
+        assert_eq!(rebound_assessment_target.path, cargo_target.path);
+
+        let correction_target = job
+            .correction_job
+            .as_ref()
+            .and_then(CorrectionJob::target_hint)
+            .expect("correction target");
+        assert_eq!(correction_target.role, cargo_target.role);
+        assert_eq!(correction_target.path, cargo_target.path);
+
+        assert!(matches!(
+            job.next_action(),
+            RepairNextAction::RequestPatch { target_hint }
+                if target_hint.role == cargo_target.role && target_hint.path == cargo_target.path
+        ));
     }
 
     /// CR-4 V2: cluster_key 変化時のみ `applied_repair_intents.clear()`。

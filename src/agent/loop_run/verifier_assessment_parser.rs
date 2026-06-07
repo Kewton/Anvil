@@ -110,6 +110,8 @@ pub(super) fn extract_diagnostic_reply_json_value(reply: &str) -> Option<serde_j
         .ok()
         .or_else(|| repair_adjacent_top_level_objects(json_text))
         .or_else(|| repair_failure_clusters_tail_fields(json_text))
+        .or_else(|| repair_unclosed_objects_before_array_end(json_text))
+        .or_else(|| repair_truncated_failure_clusters_tail(json_text))
 }
 
 pub(super) fn parse_semantic_failure_report_from_reply(
@@ -265,6 +267,93 @@ fn repair_failure_clusters_tail_fields(raw: &str) -> Option<serde_json::Value> {
         index += 1;
     }
     None
+}
+
+fn repair_truncated_failure_clusters_tail(raw: &str) -> Option<serde_json::Value> {
+    let key_start = raw.find("\"failure_clusters\"")?;
+    let prefix_end = raw[..key_start].rfind(',')?;
+    let prefix = raw[..prefix_end].trim_end();
+    if !prefix.starts_with('{') {
+        return None;
+    }
+    let mut repaired = String::with_capacity(prefix.len() + 1);
+    repaired.push_str(prefix);
+    repaired.push('}');
+    let value = serde_json::from_str::<serde_json::Value>(&repaired).ok()?;
+    legacy_diagnostic_fields_present(&value).then_some(value)
+}
+
+fn repair_unclosed_objects_before_array_end(raw: &str) -> Option<serde_json::Value> {
+    let mut repaired = String::with_capacity(raw.len() + 8);
+    let mut stack = Vec::<u8>::new();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut changed = false;
+
+    for byte in raw.bytes() {
+        if in_string {
+            repaired.push(byte as char);
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => {
+                in_string = true;
+                repaired.push('"');
+            }
+            b'{' | b'[' => {
+                stack.push(byte);
+                repaired.push(byte as char);
+            }
+            b'}' => {
+                if stack.last() == Some(&b'{') {
+                    stack.pop();
+                }
+                repaired.push('}');
+            }
+            b']' => {
+                while stack.last() == Some(&b'{')
+                    && stack
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .is_some_and(|parent| *parent == b'[')
+                {
+                    repaired.push('}');
+                    stack.pop();
+                    changed = true;
+                }
+                if stack.last() == Some(&b'[') {
+                    stack.pop();
+                }
+                repaired.push(']');
+            }
+            _ => repaired.push(byte as char),
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    serde_json::from_str(&repaired)
+        .ok()
+        .or_else(|| repair_truncated_failure_clusters_tail(&repaired))
+}
+
+fn legacy_diagnostic_fields_present(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.contains_key("failure_kind")
+        && (object.contains_key("repair_targets") || object.contains_key("targets"))
+        && object.contains_key("repair_plan")
 }
 
 fn repair_adjacent_top_level_objects(raw: &str) -> Option<serde_json::Value> {
@@ -837,5 +926,78 @@ mod tests {
         assert_eq!(report.preferred_repair_role, ArtifactRole::Setup);
         assert_eq!(report.failure_clusters.len(), 1);
         assert!(report.repair_hypothesis.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn diagnostic_parser_recovers_legacy_fields_from_truncated_failure_clusters() {
+        let reply = r#"{
+            "failure_kind":"compile_or_syntax_error",
+            "probable_cause_role":"test",
+            "repair_targets":[
+                {"path":"tests/palindrome.rs","confidence":1.0,"reason":"invalid Rust comment syntax"}
+            ],
+            "repair_plan":[
+                {"target":"tests/palindrome.rs","intent":"replace markdown heading with Rust comment","confidence":1.0}
+            ],
+            "secondary_targets":[],
+            "do_not_edit_tests_without_evidence":true,
+            "summary":"Fix syntax error in tests/palindrome.rs.",
+            "failure_clusters":[
+                {
+                    "observed":"expected one of `!` or `[`, found `Palindrome`",
+                    "expected":"valid Rust source",
+                    "input_shape":"Rust test file",
+                    "assertion_shape":"compile succeeds",
+                    "affected_cases":["tests/palindrome.rs"],
+                    "involved_artifacts":["test"]
+                },
+                {
+                    "observed":"repeated cluster starts but response is truncated""#;
+
+        let assessment =
+            parse_verifier_repair_assessment_reply(reply).expect("legacy assessment parses");
+
+        assert_eq!(
+            assessment.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::CompileOrSyntaxError
+        );
+        assert_eq!(assessment.probable_cause_role, Some(ArtifactRole::Test));
+        assert_eq!(assessment.repair_targets[0].path, "tests/palindrome.rs");
+    }
+
+    #[test]
+    fn diagnostic_parser_recovers_missing_target_object_close_before_truncated_clusters() {
+        let reply = r#"{
+            "failure_kind":"invalid_manifest",
+            "probable_cause_role":"setup",
+            "repair_targets":[
+                {"path":"Cargo.toml","confidence":1.0,"reason":"test target name is required"],
+            "repair_plan":[
+                {"target":"Cargo.toml","intent":"add a name to the test target","confidence":1.0}
+            ],
+            "secondary_targets":[],
+            "do_not_edit_tests_without_evidence":true,
+            "summary":"Fix Cargo.toml by adding a valid test target name.",
+            "failure_clusters":[
+                {
+                    "observed":"test target test.name is required",
+                    "expected":"[[test]] has a name",
+                    "input_shape":"Cargo.toml [[test]]",
+                    "assertion_shape":"manifest parse",
+                    "affected_cases":["cargo test"],
+                    "involved_artifacts":["setup"]
+                },
+                {
+                    "observed":"repeated cluster starts but response is truncated""#;
+
+        let assessment =
+            parse_verifier_repair_assessment_reply(reply).expect("legacy assessment parses");
+
+        assert_eq!(
+            assessment.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest
+        );
+        assert_eq!(assessment.probable_cause_role, Some(ArtifactRole::Setup));
+        assert_eq!(assessment.repair_targets[0].path, "Cargo.toml");
     }
 }
