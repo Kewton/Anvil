@@ -106,41 +106,238 @@ pub(super) fn extract_diagnostic_reply_json_value(reply: &str) -> Option<serde_j
         }
         &trimmed[start..=end]
     };
-    serde_json::from_str(json_text).ok()
+    serde_json::from_str(json_text)
+        .ok()
+        .or_else(|| repair_adjacent_top_level_objects(json_text))
+        .or_else(|| repair_failure_clusters_tail_fields(json_text))
 }
 
 pub(super) fn parse_semantic_failure_report_from_reply(
     reply: &str,
 ) -> Option<super::semantic_failure::SemanticFailureReport> {
     let value = extract_diagnostic_reply_json_value(reply)?;
-    super::semantic_failure::parse_semantic_failure_report(&value).or_else(|| {
+    super::semantic_failure::parse_semantic_failure_report(&value)
+        .or_else(|| parse_nested_semantic_failure_report(&value))
+        .or_else(|| parse_inline_cluster_semantic_failure_report(&value))
+}
+
+fn parse_nested_semantic_failure_report(
+    value: &serde_json::Value,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    let object = value.as_object()?;
+    let nested = object
+        .get("SemanticFailureReport")
+        .or_else(|| object.get("semantic_failure_report"))?;
+    let mut nested = nested.clone();
+    let nested_object = nested.as_object_mut()?;
+    if !nested_object.contains_key("failure_kind") {
+        let failure_kind = object
+            .get("failure_kind")
+            .or_else(|| object.get("failure_type"))?;
+        nested_object.insert("failure_kind".to_string(), failure_kind.clone());
+    }
+    if !nested_object.contains_key("preferred_repair_role")
+        && let Some(role) = object
+            .get("probable_cause_role")
+            .or_else(|| object.get("root_cause_role"))
+            .or_else(|| object.get("role"))
+    {
+        nested_object.insert("preferred_repair_role".to_string(), role.clone());
+    }
+    if !nested_object.contains_key("confidence")
+        && let Some(confidence) = object.get("confidence")
+    {
+        nested_object.insert("confidence".to_string(), confidence.clone());
+    }
+    super::semantic_failure::parse_semantic_failure_report(&nested)
+}
+
+fn parse_inline_cluster_semantic_failure_report(
+    value: &serde_json::Value,
+) -> Option<super::semantic_failure::SemanticFailureReport> {
+    let object = value.as_object()?;
+    let carrier = object
+        .get("failure_clusters")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .find(|cluster| cluster_contains_report_fields(cluster))?;
+    let mut normalized = value.clone();
+    let normalized_object = normalized.as_object_mut()?;
+    for key in [
+        "contract_conflict",
+        "preferred_repair_role",
+        "repair_hypothesis",
+        "confidence",
+    ] {
+        if !normalized_object.contains_key(key)
+            && let Some(field) = carrier.get(key)
+        {
+            normalized_object.insert(key.to_string(), field.clone());
+        }
+    }
+    if let Some(clusters) = normalized_object
+        .get_mut("failure_clusters")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        clusters.retain(|cluster| {
+            cluster
+                .as_object()
+                .is_some_and(cluster_contains_observation_fields)
+        });
+    }
+    super::semantic_failure::parse_semantic_failure_report(&normalized)
+}
+
+fn cluster_contains_report_fields(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    [
+        "contract_conflict",
+        "preferred_repair_role",
+        "repair_hypothesis",
+        "confidence",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
+fn cluster_contains_observation_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    [
+        "observed",
+        "expected",
+        "input_shape",
+        "assertion_shape",
+        "affected_cases",
+        "involved_artifacts",
+        "target_paths",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
+fn repair_failure_clusters_tail_fields(raw: &str) -> Option<serde_json::Value> {
+    let key_start = raw.find("\"failure_clusters\"")?;
+    let array_start = raw[key_start..].find('[')? + key_start;
+    let bytes = raw.as_bytes();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut bracket_depth = 1usize;
+    let mut brace_depth = 0usize;
+    let mut index = array_start + 1;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                if bracket_depth == 0 {
+                    return None;
+                }
+            }
+            b'{' => brace_depth = brace_depth.saturating_add(1),
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b',' if bracket_depth == 1 && brace_depth == 0 => {
+                if starts_with_report_field_tail(&raw[index + 1..]) {
+                    let mut repaired = String::with_capacity(raw.len() + 1);
+                    repaired.push_str(&raw[..index]);
+                    repaired.push(']');
+                    repaired.push_str(&raw[index..]);
+                    return serde_json::from_str(&repaired).ok();
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn repair_adjacent_top_level_objects(raw: &str) -> Option<serde_json::Value> {
+    let parts = split_adjacent_top_level_objects(raw)?;
+    let mut merged = serde_json::Map::new();
+    for part in parts {
+        let value = serde_json::from_str::<serde_json::Value>(part).ok()?;
         let object = value.as_object()?;
-        let nested = object
-            .get("SemanticFailureReport")
-            .or_else(|| object.get("semantic_failure_report"))?;
-        let mut nested = nested.clone();
-        let nested_object = nested.as_object_mut()?;
-        if !nested_object.contains_key("failure_kind") {
-            let failure_kind = object
-                .get("failure_kind")
-                .or_else(|| object.get("failure_type"))?;
-            nested_object.insert("failure_kind".to_string(), failure_kind.clone());
+        for (key, value) in object {
+            merged.insert(key.clone(), value.clone());
         }
-        if !nested_object.contains_key("preferred_repair_role")
-            && let Some(role) = object
-                .get("probable_cause_role")
-                .or_else(|| object.get("root_cause_role"))
-                .or_else(|| object.get("role"))
-        {
-            nested_object.insert("preferred_repair_role".to_string(), role.clone());
+    }
+    Some(serde_json::Value::Object(merged))
+}
+
+fn split_adjacent_top_level_objects(raw: &str) -> Option<Vec<&str>> {
+    let bytes = raw.as_bytes();
+    let mut parts = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if byte == b'\\' {
+                escape = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
         }
-        if !nested_object.contains_key("confidence")
-            && let Some(confidence) = object.get("confidence")
-        {
-            nested_object.insert("confidence".to_string(), confidence.clone());
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                let left = raw[start..index].trim();
+                let right = raw[index + 1..].trim_start();
+                if left.starts_with('{') && left.ends_with('}') && right.starts_with('{') {
+                    parts.push(left);
+                    start = index + 1;
+                }
+            }
+            _ => {}
         }
-        super::semantic_failure::parse_semantic_failure_report(&nested)
-    })
+        index += 1;
+    }
+
+    let tail = raw[start..].trim();
+    if parts.is_empty() || !tail.starts_with('{') || !tail.ends_with('}') {
+        return None;
+    }
+    parts.push(tail);
+    Some(parts)
+}
+
+fn starts_with_report_field_tail(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    [
+        "\"contract_conflict\"",
+        "\"preferred_repair_role\"",
+        "\"repair_hypothesis\"",
+        "\"confidence\"",
+    ]
+    .iter()
+    .any(|field| trimmed.starts_with(field))
 }
 
 pub(super) fn verifier_failure_type_for_diagnostic_kind(
@@ -498,5 +695,147 @@ mod tests {
         );
         assert_eq!(artifact_role_from_assessment_str("unknown"), None);
         assert_eq!(artifact_role_from_assessment_str("nonsense"), None);
+    }
+
+    #[test]
+    fn semantic_report_parser_recovers_inline_cluster_report_fields() {
+        let reply = r#"{
+            "failure_kind":"compile_or_syntax_error",
+            "probable_cause_role":"test",
+            "repair_targets":[
+                {"path":"tests/index.test.js","confidence":1.0,"reason":"SyntaxError in test file"}
+            ],
+            "repair_plan":[
+                {"target":"tests/index.test.js","intent":"complete the try/catch statement","confidence":1.0}
+            ],
+            "summary":"test runner crashed due to invalid JavaScript syntax",
+            "failure_clusters":[
+                {
+                    "observed":"SyntaxError: Missing catch or finally after try",
+                    "expected":"Valid JavaScript test file",
+                    "input_shape":"try block in generated test",
+                    "assertion_shape":"Node module load failure",
+                    "affected_cases":["tests/index.test.js"],
+                    "involved_artifacts":["test"]
+                },
+                {
+                    "contract_conflict":{
+                        "implementation":"",
+                        "test":"Incomplete catch block in tests/index.test.js.",
+                        "usage_docs":""
+                    },
+                    "preferred_repair_role":"test",
+                    "repair_hypothesis":"The generated test file has an incomplete try/catch statement.",
+                    "confidence":1.0
+                }
+            ]
+        }"#;
+
+        let report = parse_semantic_failure_report_from_reply(reply).expect("semantic parse ok");
+
+        assert_eq!(
+            report.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::CompileOrSyntaxError
+        );
+        assert_eq!(report.preferred_repair_role, ArtifactRole::Test);
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert!(report.repair_hypothesis.contains("try/catch"));
+        assert!(report.contract_conflict.test.contains("Incomplete catch"));
+    }
+
+    #[test]
+    fn diagnostic_parser_recovers_report_fields_leaked_out_of_cluster_array() {
+        let reply = r#"{
+            "failure_kind":"compile_or_syntax_error",
+            "probable_cause_role":"test",
+            "repair_targets":[
+                {"path":"tests/index.test.js","confidence":1.0,"reason":"ReferenceError in test file"}
+            ],
+            "repair_plan":[
+                {"target":"tests/index.test.js","intent":"replace framework globals with node:test imports","confidence":1.0}
+            ],
+            "summary":"test runner failed because describe is not defined",
+            "failure_clusters":[
+                {
+                    "observed":"ReferenceError: describe is not defined",
+                    "expected":"test runner APIs available before assertions",
+                    "input_shape":"plain node test script",
+                    "assertion_shape":"framework global call",
+                    "affected_cases":["tests/index.test.js"],
+                    "involved_artifacts":["test"]
+                },
+            "contract_conflict":{
+                "implementation":"",
+                "test":"Test file uses unavailable framework globals.",
+                "usage_docs":""
+            },
+            "preferred_repair_role":"test",
+            "repair_hypothesis":"Use Node's built-in test API or a configured test framework.",
+            "confidence":1.0
+        }"#;
+
+        let assessment =
+            parse_verifier_repair_assessment_reply(reply).expect("legacy assessment parses");
+        assert_eq!(
+            assessment.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::CompileOrSyntaxError
+        );
+        assert_eq!(assessment.probable_cause_role, Some(ArtifactRole::Test));
+        assert_eq!(assessment.repair_targets[0].path, "tests/index.test.js");
+
+        let report = parse_semantic_failure_report_from_reply(reply).expect("semantic parse ok");
+        assert_eq!(report.preferred_repair_role, ArtifactRole::Test);
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert!(report.contract_conflict.test.contains("framework globals"));
+    }
+
+    #[test]
+    fn diagnostic_parser_merges_adjacent_legacy_and_semantic_objects() {
+        let reply = r#"{
+            "failure_kind":"invalid_manifest",
+            "probable_cause_role":"setup",
+            "repair_targets":[
+                {"path":"Cargo.toml","confidence":0.9,"reason":"missing test.name"}
+            ],
+            "repair_plan":[
+                {"target":"Cargo.toml","intent":"add name to the test target","confidence":1.0}
+            ],
+            "summary":"Cargo manifest is missing the test target name."
+        },{
+            "failure_clusters":[
+                {
+                    "observed":"test target test.name is required",
+                    "expected":"each [[test]] section has a name",
+                    "input_shape":"Cargo.toml [[test]] section",
+                    "assertion_shape":"manifest parse error",
+                    "affected_cases":["cargo test"],
+                    "involved_artifacts":["setup"]
+                },
+                {
+                    "contract_conflict":{
+                        "implementation":"",
+                        "test":"",
+                        "usage_docs":""
+                    },
+                    "preferred_repair_role":"setup",
+                    "repair_hypothesis":"Cargo.toml needs a test target name.",
+                    "confidence":1.0
+                }
+            ]
+        }"#;
+
+        let assessment =
+            parse_verifier_repair_assessment_reply(reply).expect("legacy assessment parses");
+        assert_eq!(
+            assessment.failure_kind,
+            super::super::VerifierDiagnosticFailureKind::InvalidManifest
+        );
+        assert_eq!(assessment.probable_cause_role, Some(ArtifactRole::Setup));
+        assert_eq!(assessment.repair_targets[0].path, "Cargo.toml");
+
+        let report = parse_semantic_failure_report_from_reply(reply).expect("semantic parse ok");
+        assert_eq!(report.preferred_repair_role, ArtifactRole::Setup);
+        assert_eq!(report.failure_clusters.len(), 1);
+        assert!(report.repair_hypothesis.contains("Cargo.toml"));
     }
 }

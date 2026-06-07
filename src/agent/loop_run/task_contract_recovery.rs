@@ -95,7 +95,8 @@ pub(super) fn task_contract_recovery_action(
     if matches!(
         action,
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
-    ) {
+    ) && !missing_owned_test_repair_action(contract, &owned_test_artifacts, &action)
+    {
         let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
         let scope = super::workspace_access::current_workspace_scope(agent);
         let probe = super::project_probe::probe_completion(
@@ -137,6 +138,21 @@ pub(super) fn task_contract_recovery_action(
         }
     }
     action
+}
+
+fn missing_owned_test_repair_action(
+    contract: &super::task_contract::TaskContract,
+    owned_test_artifacts: &[String],
+    action: &super::task_contract::ArtifactRecoveryAction,
+) -> bool {
+    if !contract.completion_policy.test_execution_required() || !owned_test_artifacts.is_empty() {
+        return false;
+    }
+    matches!(
+        action,
+        super::task_contract::ArtifactRecoveryAction::Continue { missing, .. }
+            if missing.contains(&super::task_contract::ArtifactRole::Test)
+    )
 }
 
 pub(super) fn record_obligation_diagnostic_attempt_for_action(
@@ -328,6 +344,108 @@ mod tests {
     };
     use crate::config::Config;
     use crate::session::store::ConversationMessage;
+
+    #[test]
+    fn completion_probe_does_not_override_missing_owned_test_repair() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = concat!(
+            "# CSV to JSON CLI Tool\n\n",
+            "A Node.js CLI tool that converts CSV input to JSON array output.\n\n",
+            "## Features\n",
+            "- Support stdin or file path as input\n",
+            "- Parse quoted commas and escaped quotes correctly\n",
+            "- Fail clearly on malformed rows\n",
+            "- Output JSON array to stdout\n\n",
+            "## Usage\n",
+            "From file path: node index.js data.csv\n",
+            "From stdin: cat data.csv | node index.js\n\n",
+            "## Installation\nnpm install\n\n",
+            "## Testing\nnpm test"
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(contract.completion_policy.test_execution_required());
+
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        std::fs::write(
+            agent.work_root.join("index.js"),
+            "function parseCsv(input) { return []; }\nmodule.exports = { parseCsv };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("tests/index.test.js"),
+            "const { test } = require('node:test');\ntest('smoke', () => {});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("README.md"),
+            "# CSV to JSON CLI Tool\n\n## Installation\nnpm install\n\n## Testing\nnpm test\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("package.json"),
+            r#"{"name":"csv-to-json-cli","scripts":{"test":"node --test tests/index.test.js"}}"#,
+        )
+        .unwrap();
+
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        for (path, role, category) in [
+            (
+                "index.js",
+                ArtifactRole::Implementation,
+                RepoEditCategory::Impl,
+            ),
+            (
+                "tests/index.test.js",
+                ArtifactRole::Test,
+                RepoEditCategory::Test,
+            ),
+            ("README.md", ArtifactRole::UsageDocs, RepoEditCategory::Docs),
+            ("package.json", ArtifactRole::Setup, RepoEditCategory::Setup),
+        ] {
+            agent.turn_edited_relative_paths.insert(path.to_string());
+            agent
+                .task_contract_evidence_set_this_turn
+                .push(CompletionEvidence::RepoEdit {
+                    category,
+                    count: 1,
+                    path: Some(path.to_string()),
+                });
+            let recorded = agent.artifact_ledger.record_repo_edit_event(
+                &LedgerAdmissionContext::new(&agent.work_root, &scope),
+                path.to_string(),
+                role,
+                true,
+            );
+            assert!(recorded.is_some(), "repo edit must be recorded: {path}");
+        }
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 4);
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(RecoveryTargetHint {
+                        role: ArtifactRole::Test,
+                        ref path,
+                        ..
+                    }),
+                } if missing == &vec![ArtifactRole::Test] && path == "tests/index.test.js"
+            ),
+            "preflight-rejected tests must stay in Test repair instead of completion-probe RunVerifier: {action:?}"
+        );
+    }
 
     #[test]
     fn docs_artifact_satisfied_without_verification_returns_done() {

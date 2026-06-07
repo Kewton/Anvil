@@ -1748,11 +1748,7 @@ impl AutoTestRunner {
     }
 
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
-        Self::run_with_timeout(
-            work_root,
-            plan,
-            Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
-        )
+        Self::run_with_timeout(work_root, plan, Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS))
     }
 
     fn run_with_timeout(
@@ -1901,6 +1897,13 @@ impl AutoTestRunner {
                 None => None,
             };
 
+        if structured_node_dependency_setup_required(work_root, command)
+            && let Some(result) =
+                run_structured_node_dependency_setup(&runner_program, &env_plan, display_command)?
+        {
+            return Ok(result);
+        }
+
         let mut child_cmd = Command::new(runner_program);
         child_cmd
             .args(command.args())
@@ -1925,7 +1928,7 @@ impl AutoTestRunner {
         crate::tools::bash::apply_unix_pgroup(&mut child_cmd);
         let output = wait_with_auto_test_timeout(
             &mut child_cmd,
-            Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+            Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS),
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -2019,7 +2022,7 @@ fn run_structured_preflight_command(
     crate::tools::bash::apply_unix_pgroup(&mut preflight_cmd);
     let output = wait_with_auto_test_timeout(
         &mut preflight_cmd,
-        Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+        Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS),
     )
     .map_err(|err| format!("generated test preflight {err}"))?;
     if output.status.success() {
@@ -2082,6 +2085,87 @@ fn structured_python_dependency_site_dir(work_root: &Path) -> PathBuf {
         .join("site")
 }
 
+fn structured_node_dependency_setup_required(work_root: &Path, command: &VerifierCommand) -> bool {
+    if command.runner() != "npm" || !command.args().iter().any(|arg| arg == "test") {
+        return false;
+    }
+    if work_root.join("node_modules").is_dir() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(work_root.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    package_json_declares_dependency_table(&value)
+}
+
+fn package_json_declares_dependency_table(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .any(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|deps| !deps.is_empty())
+    })
+}
+
+fn run_structured_node_dependency_setup(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    let mut setup_cmd = Command::new(runner_program);
+    setup_cmd
+        .args(["install", "--ignore-scripts"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_plan.apply_to(&mut setup_cmd);
+    crate::tools::bash::apply_unix_pgroup(&mut setup_cmd);
+
+    let output = wait_with_auto_test_timeout(
+        &mut setup_cmd,
+        Duration::from_secs(AUTO_TEST_DEPENDENCY_SETUP_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("structured Node dependency setup {err}"))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut combined = String::new();
+    combined.push_str(&stdout);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+    let setup_display = format!("npm install --ignore-scripts + {display_command}");
+    let redacted = crate::session::feedback::redact_verifier_command_for_storage(&setup_display);
+    Ok(Some(AutoTestResult {
+        command: redacted,
+        passed: false,
+        output: truncate(&formatted, MAX_OUTPUT_BYTES),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    }))
+}
+
 fn run_structured_python_dependency_setup(
     runner_program: &str,
     env_plan: &HermeticEnvPlan,
@@ -2116,7 +2200,7 @@ fn run_structured_python_dependency_setup(
 
     let output = wait_with_auto_test_timeout(
         &mut setup_cmd,
-        Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+        Duration::from_secs(AUTO_TEST_DEPENDENCY_SETUP_TIMEOUT_SECS),
     )
     .map_err(|err| format!("structured Python dependency setup {err}"))?;
     if output.status.success() {
@@ -2172,10 +2256,16 @@ fn structured_python_dependency_site_pythonpath(
     })
 }
 
-/// Issue #651 Task 2.3: upper bound on a structured verifier process.
-/// 300s mirrors the value used by the legacy `auto_test::run` path's
-/// implicit wait (kept conservative to avoid breaking long test suites).
-const AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS: u64 = 300;
+/// Upper bound for one verifier evidence command.
+///
+/// Local-first repair needs verifier hangs to become typed failure evidence
+/// quickly enough for the next repair turn. Dependency installation keeps a
+/// separate, longer bound below because network / cache setup is a different
+/// evidence phase from running generated or project tests.
+const AUTO_TEST_RUN_TIMEOUT_SECS: u64 = 60;
+
+/// Upper bound for structured dependency setup before the actual verifier run.
+const AUTO_TEST_DEPENDENCY_SETUP_TIMEOUT_SECS: u64 = 300;
 
 /// Issue #651 Task 2.3: execution-time validator for
 /// `VerifierCommand.bound_test_artifacts`.
@@ -5102,6 +5192,52 @@ dev = [
             structured_python_pytest_dependency_setup_packages(dir.path(), &cargo_command),
             None
         );
+    }
+
+    #[test]
+    fn structured_node_dependency_setup_required_for_npm_test_dependencies_without_node_modules() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^1.0.0"}}"#,
+        )
+        .expect("package");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_npm_test(&owned).expect("npm test");
+
+        assert!(structured_node_dependency_setup_required(
+            dir.path(),
+            &command
+        ));
+    }
+
+    #[test]
+    fn structured_node_dependency_setup_skips_when_dependencies_absent_or_installed() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node tests/index.test.js"}}"#,
+        )
+        .expect("package");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_npm_test(&owned).expect("npm test");
+
+        assert!(!structured_node_dependency_setup_required(
+            dir.path(),
+            &command
+        ));
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"dependencies":{"vitest":"^1.0.0"}}"#,
+        )
+        .expect("package with deps");
+        std::fs::create_dir(dir.path().join("node_modules")).expect("node_modules");
+
+        assert!(!structured_node_dependency_setup_required(
+            dir.path(),
+            &command
+        ));
     }
 
     #[test]

@@ -2689,6 +2689,22 @@ impl TaskContract {
         let asks_for_setup = request_asks_for_setup(request_for_inference, &lower);
         let asks_for_data_output =
             request_asks_for_data_output_artifact_with_scan(&scan, request_for_inference);
+        let asks_for_implementation = request_asks_for_implementation_artifact(
+            request_for_inference,
+            &lower,
+            asks_for_tests,
+            asks_for_usage_docs,
+            asks_for_setup,
+        );
+        let project_intent_implies_implementation =
+            project_intent_implies_implementation_artifact(&project_intent)
+                && !test_only_without_implementation_signal(
+                    asks_for_tests,
+                    asks_for_usage_docs,
+                    asks_for_setup,
+                    asks_for_data_output,
+                    asks_for_implementation,
+                );
         let TaskKindInference {
             kind: inferred_kind,
             matched: inferred_matched,
@@ -2744,13 +2760,7 @@ impl TaskContract {
             .is_some_and(|inputs| inputs.forbids_setup);
 
         if task_kind == TaskKind::Coding
-            && request_asks_for_implementation_artifact(
-                request_for_inference,
-                &lower,
-                asks_for_tests,
-                asks_for_usage_docs,
-                asks_for_setup,
-            )
+            && (asks_for_implementation || project_intent_implies_implementation)
             && !profile_forbids_impl
         {
             required.push(ArtifactRole::Implementation);
@@ -4611,6 +4621,9 @@ pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool
     contains_any(
         lower,
         &[
+            "npm test",
+            "cargo test",
+            "node --test",
             "test code",
             "unit test",
             "unit tests",
@@ -4639,6 +4652,36 @@ pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool
             "テスト作成",
         ],
     )
+}
+
+fn project_intent_implies_implementation_artifact(project_intent: &ProjectIntent) -> bool {
+    if !matches!(
+        project_intent.language,
+        Some(ProjectLanguage::Rust | ProjectLanguage::Node | ProjectLanguage::Python)
+    ) || !matches!(
+        project_intent.shape,
+        Some(ProjectShape::Cli | ProjectShape::Library | ProjectShape::Api | ProjectShape::WebApp)
+    ) || !matches!(
+        project_intent.verification,
+        VerificationRequirement::Required { .. }
+    ) {
+        return false;
+    }
+    true
+}
+
+fn test_only_without_implementation_signal(
+    asks_for_tests: bool,
+    asks_for_usage_docs: bool,
+    asks_for_setup: bool,
+    asks_for_data_output: bool,
+    asks_for_implementation: bool,
+) -> bool {
+    asks_for_tests
+        && !asks_for_usage_docs
+        && !asks_for_setup
+        && !asks_for_data_output
+        && !asks_for_implementation
 }
 
 pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool {

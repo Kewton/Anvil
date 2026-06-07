@@ -1154,9 +1154,19 @@ fn markdown_heading_present(excerpt: &str, section: &str) -> bool {
         .lines()
         .filter_map(markdown_heading_label)
         .map(|label| normalize_section_heading_label(&label))
-        .any(|label| {
-            label == normalized_section || label.starts_with(&format!("{normalized_section} "))
-        })
+        .any(|label| section_heading_label_matches(&label, &normalized_section))
+}
+
+fn section_heading_label_matches(label: &str, required_section: &str) -> bool {
+    label == required_section
+        || label.starts_with(&format!("{required_section} "))
+        || common_section_heading_variant(label, required_section)
+}
+
+fn common_section_heading_variant(label: &str, required_section: &str) -> bool {
+    // Keep contract section labels stable while accepting common heading wording.
+    matches!(required_section, "test" | "tests")
+        && (label == "testing" || label == "tests" || label.starts_with("testing "))
 }
 
 fn markdown_heading_label(line: &str) -> Option<String> {
@@ -2839,6 +2849,12 @@ mod tests {
         assert!(required_section_headings_present(
             "## Setup:\nInstall it.\n\n## Usage notes\nRun it.\n",
             &sections
+        ));
+
+        let test_section = vec!["test".to_string()];
+        assert!(required_section_headings_present(
+            "## Testing\nRun `npm test`.\n",
+            &test_section
         ));
     }
 }

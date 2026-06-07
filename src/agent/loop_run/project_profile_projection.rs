@@ -118,20 +118,48 @@ fn profile_conflicts_with_first_pass_objective(
     let Some(profile_deliverable) = objective_deliverable_kind_from_profile(profile) else {
         return false;
     };
-    if profile_deliverable != ObjectiveDeliverableKind::SourceFiles {
-        return false;
-    }
     let objective = first_pass.objective_contract();
     if !objective.has_required_deliverables() {
         return false;
     }
-    if source_deliverable_has_mixed_objective_roles(&objective.required_deliverables) {
+    if profile_deliverable == ObjectiveDeliverableKind::SourceFiles {
+        if source_deliverable_has_mixed_objective_roles(&objective.required_deliverables) {
+            return true;
+        }
+        return !matches!(
+            objective.deliverable_kind,
+            ObjectiveDeliverableKind::SourceFiles
+        );
+    }
+
+    if profile_deliverable != ObjectiveDeliverableKind::SourceFiles
+        && matches!(
+            objective.deliverable_kind,
+            ObjectiveDeliverableKind::SourceFiles
+        )
+        && first_pass_requires_code_setup_or_test(first_pass)
+    {
         return true;
     }
-    !matches!(
-        objective.deliverable_kind,
-        ObjectiveDeliverableKind::SourceFiles
-    )
+
+    false
+}
+
+fn first_pass_requires_code_setup_or_test(first_pass: &TaskContract) -> bool {
+    first_pass.required_artifacts.iter().any(|role| {
+        matches!(
+            role,
+            ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup
+        )
+    }) || first_pass
+        .required_artifact_identities
+        .iter()
+        .any(|identity| {
+            matches!(
+                identity.role,
+                ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup
+            )
+        })
 }
 
 fn objective_deliverable_kind_from_profile(
@@ -296,6 +324,56 @@ mod tests {
     use super::super::project_profile::parse_project_profile_confirmation;
     use super::*;
 
+    fn node_csv_markdown_prompt() -> &'static str {
+        r#"# CSV to JSON CLI Tool
+
+A Node.js CLI tool that converts CSV input to JSON array output.
+
+## Features
+- Support stdin or file path as input
+- Parse quoted commas and escaped quotes correctly
+- Fail clearly on malformed rows
+- Output JSON array to stdout
+
+## Usage
+
+### From file path
+```bash
+node index.js data.csv
+```
+
+### From stdin
+```bash
+cat data.csv | node index.js
+```
+
+### Example
+Given `data.csv`:
+```csv
+name,age,city
+"Alice",30,"New York"
+"Bob",25,"Los Angeles"
+```
+
+Running `node index.js data.csv` outputs:
+```json
+[
+  {"name": "Alice", "age": "30", "city": "New York"},
+  {"name": "Bob", "age": "25", "city": "Los Angeles"}
+]
+```
+
+## Installation
+```bash
+npm install
+```
+
+## Testing
+```bash
+npm test
+```"#
+    }
+
     #[test]
     fn low_confidence_confirmation_is_not_projected() {
         let profile = parse_project_profile_confirmation(
@@ -422,6 +500,72 @@ mod tests {
                 "preferred_runner":"cargo test",
                 "confidence":0.95,
                 "reason":"first pass suggested Rust"
+            }"#,
+        )
+        .expect("profile");
+
+        assert_eq!(
+            project_profile_adoption_decision(Some(&profile), &first_pass),
+            ProjectProfileAdoptionDecision::RejectContradictoryObjective
+        );
+    }
+
+    #[test]
+    fn document_profile_conflicting_with_readme_formatted_node_cli_is_not_adopted() {
+        let first_pass = TaskContract::from_request(node_csv_markdown_prompt());
+        assert_eq!(first_pass.task_kind, TaskKind::Coding);
+        assert!(
+            first_pass
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(first_pass.required_artifacts.contains(&ArtifactRole::Setup));
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"docs",
+                "shape":"documentation",
+                "deliverable_kind":"document",
+                "primary_artifacts":["README.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"content_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"markdown prompt looked like docs"
+            }"#,
+        )
+        .expect("profile");
+
+        assert_eq!(
+            project_profile_adoption_decision(Some(&profile), &first_pass),
+            ProjectProfileAdoptionDecision::RejectContradictoryObjective
+        );
+    }
+
+    #[test]
+    fn command_observation_profile_conflicting_with_node_cli_is_not_adopted() {
+        let first_pass = TaskContract::from_request(
+            "Create a small Node.js CSV summarizer CLI. Implement the CLI, package.json, and tests. Run npm test before finishing.",
+        );
+        assert_eq!(first_pass.task_kind, TaskKind::Coding);
+        assert!(
+            first_pass
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(first_pass.required_artifacts.contains(&ArtifactRole::Test));
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"rust",
+                "shape":"cli",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":[],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":true,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"misread run npm test as the deliverable"
             }"#,
         )
         .expect("profile");
