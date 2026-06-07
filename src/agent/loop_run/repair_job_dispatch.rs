@@ -428,22 +428,25 @@ fn handle_repair_job_patch_provider_step(
             dispatch_after_repair_patch_rejection(agent, args.last_iter, error, Some(target_hint))
         }
         VerifierRepairPassOutcome::Unavailable { relative_path } => {
+            let outcome = agent.repair_job.as_ref().and_then(|job| {
+                super::repair_job::no_candidate_repair_attempt_outcome_for_active_target(
+                    job,
+                    Some(&target_hint),
+                )
+            });
             super::verifier_orchestration::record_controller_verifier_repair_invalid(
                 agent,
                 &format!(
-                    "verifier repair unavailable: no safe cheap check available for {relative_path}"
+                    "verifier repair unavailable: cheap check unavailable for {relative_path}"
                 ),
-                None,
+                outcome,
             );
-            write_repair_job_step_status(
+            dispatch_after_repair_patch_rejection(
                 agent,
                 args.last_iter,
-                "Verifier repair",
-                &format!(
-                    "No safe cheap check available for {relative_path}; continuing through repair job state."
-                ),
-            );
-            TaskContractVerifierFlowOutcome::Continue
+                format!("verifier repair unavailable for {relative_path}"),
+                Some(target_hint),
+            )
         }
         VerifierRepairPassOutcome::Skipped => TaskContractVerifierFlowOutcome::Exit {
             reason: ExitReason::VerifierFailed,

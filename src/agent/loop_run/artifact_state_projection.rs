@@ -143,8 +143,12 @@ fn task_contract_artifact_states_legacy(
             if matches!(
                 ownership,
                 super::artifact_ownership::ArtifactOwnership::Owned
-            ) || evidence_gated_explicit_existing_candidate(contract, *role, &path)
-            {
+            ) || evidence_gated_explicit_existing_candidate(
+                &agent.work_root,
+                contract,
+                *role,
+                &path,
+            ) {
                 states.push(super::task_contract::ArtifactState::exists(*role, path));
             }
         }
@@ -216,7 +220,12 @@ fn task_contract_artifact_states_from_ledger(
                 continue;
             }
             if !matches!(ev.ownership, ArtifactOwnership::Owned)
-                && !evidence_gated_explicit_existing_candidate(contract, *role, &ev.path)
+                && !evidence_gated_explicit_existing_candidate(
+                    &agent.work_root,
+                    contract,
+                    *role,
+                    &ev.path,
+                )
             {
                 continue;
             }
@@ -247,15 +256,53 @@ fn task_contract_artifact_states_from_ledger(
 }
 
 fn evidence_gated_explicit_existing_candidate(
+    work_root: &std::path::Path,
     contract: &super::task_contract::TaskContract,
     role: super::task_contract::ArtifactRole,
     path: &str,
 ) -> bool {
     contract.objective_contract().requires_evidence()
+        && explicit_existing_candidate_has_substantive_content(work_root, role, path)
         && contract
             .required_identities_for_role(role)
             .iter()
             .any(|identity| super::task_contract::normalized_artifact_path_eq(path, &identity.path))
+}
+
+fn explicit_existing_candidate_has_substantive_content(
+    work_root: &std::path::Path,
+    role: super::task_contract::ArtifactRole,
+    path: &str,
+) -> bool {
+    let Ok(contents) = std::fs::read_to_string(work_root.join(path)) else {
+        return false;
+    };
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if code_like_role_needs_non_comment_content(role) && line_is_code_comment(trimmed) {
+            return false;
+        }
+        true
+    })
+}
+
+fn code_like_role_needs_non_comment_content(role: super::task_contract::ArtifactRole) -> bool {
+    matches!(
+        role,
+        super::task_contract::ArtifactRole::Implementation
+            | super::task_contract::ArtifactRole::Test
+            | super::task_contract::ArtifactRole::Setup
+    )
+}
+
+fn line_is_code_comment(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
 }
 
 /// Issue #659 (Task 3.2): masked observability emit when the legacy and

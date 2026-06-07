@@ -3284,6 +3284,83 @@ def test_app():\n    items_db.clear()\n    next_id.value = 1\n    assert app is 
     }
 
     #[test]
+    fn target_specific_unavailable_repair_records_no_candidate_outcome() {
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .and_then(|assessment| assessment.repair_target_hint.as_ref())
+            .expect("fixture includes a repair target");
+        let expected_cluster = context
+            .semantic_plan
+            .as_ref()
+            .expect("fixture includes semantic plan")
+            .failure_cluster_id
+            .clone();
+
+        let outcome =
+            super::super::repair_job::no_candidate_repair_attempt_outcome_for_active_target(
+                &context,
+                Some(target),
+            )
+            .expect("semantic plan + active target must produce a bounded outcome");
+
+        assert_eq!(outcome.cluster, expected_cluster);
+        assert_eq!(outcome.role, target.role);
+        assert_eq!(
+            outcome.kind,
+            super::super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoCandidate,
+            "cheap-check unavailable must not be budgeted as a malformed LLM reply"
+        );
+    }
+
+    #[test]
+    fn no_candidate_invalid_repair_forces_target_reassessment() {
+        use crate::agent::loop_run::commands::test_agent_with_config;
+        use crate::config::Config;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let context = verifier_test_context_for("tests/test_main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .and_then(|assessment| assessment.repair_target_hint.as_ref())
+            .expect("fixture includes a repair target")
+            .clone();
+        let outcome =
+            super::super::repair_job::no_candidate_repair_attempt_outcome_for_active_target(
+                &context,
+                Some(&target),
+            );
+        agent.repair_job = Some(context);
+
+        super::super::verifier_orchestration::record_controller_verifier_repair_invalid(
+            &mut agent,
+            "verifier repair unavailable: cheap check unavailable for tests/test_main.py",
+            outcome,
+        );
+
+        let job = agent
+            .repair_job
+            .as_ref()
+            .expect("repair job remains active");
+        assert_eq!(
+            job.lifecycle_events.last(),
+            Some(
+                &super::super::repair_job::RepairJobEvent::TargetReassessmentRequired {
+                    key: super::super::repair_job::RepairAttemptKey::from_target(&target, None),
+                }
+            ),
+            "no-candidate repair outcomes must re-enter target selection instead of retrying the same target"
+        );
+        assert!(job.no_progress_selection_banned(target.role, &target.path));
+        assert_eq!(
+            job.next_action(),
+            super::super::repair_job::RepairNextAction::Replan
+        );
+    }
+
+    #[test]
     fn verifier_repair_ready_to_verify_preempts_artifact_completion() {
         use crate::agent::loop_run::commands::test_agent_with_config;
         use crate::config::Config;

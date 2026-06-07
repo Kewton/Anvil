@@ -3146,6 +3146,10 @@ pub(super) fn record_controller_verifier_repair_invalid(
             }),
         };
         if let Some(o) = effective_outcome {
+            let target_reassessment_required = matches!(
+                o.kind,
+                super::repair_attempt_outcome::RepairAttemptOutcomeKind::RejectedNoCandidate
+            );
             if let (Some(target_hint), Some(reason)) = (
                 active_target_hint.as_ref(),
                 super::repair_job::rejected_reason_for_repair_attempt_outcome_kind(&o.kind),
@@ -3159,8 +3163,15 @@ pub(super) fn record_controller_verifier_repair_invalid(
                             failure_domain_for_rejected_attempt(reason),
                         )
                     });
-                context
-                    .apply_event(super::repair_job::RepairJobEvent::PatchRejected { key, reason });
+                context.apply_event(super::repair_job::RepairJobEvent::PatchRejected {
+                    key: key.clone(),
+                    reason,
+                });
+                if target_reassessment_required {
+                    context.apply_event(
+                        super::repair_job::RepairJobEvent::TargetReassessmentRequired { key },
+                    );
+                }
                 lifecycle_reject_recorded = true;
             }
             promotion_result = Some(match active_target_hint.as_ref() {
