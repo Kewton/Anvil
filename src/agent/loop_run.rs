@@ -513,6 +513,7 @@ mod repair_brief;
 // adapter over TaskContract + RepairJob state; repair loop ownership stays
 // with the repair modules.
 mod repair_job;
+mod repair_lifecycle;
 // Issue #990 (parent #988, Issue B): failure-cluster-scoped no-progress
 // recovery policy. Connects the `TargetReassessmentRequired` event (#987) to
 // deterministic target/role bans + forced role switch + `repair_exhausted`

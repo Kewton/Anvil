@@ -1210,10 +1210,7 @@ impl RepairJob {
                 reason: RepairTerminalReason::DiagnosticUnavailable,
             };
         }
-        if self.repeated_rejected_attempt().is_some() {
-            return self.replan_or_safe_stop(RepairTerminalReason::PatchRejectedRepeatedly);
-        }
-        if self.repeated_rejected_correction_class().is_some() {
+        if self.rejected_attempt_escalation().is_some() {
             return self.replan_or_safe_stop(RepairTerminalReason::PatchRejectedRepeatedly);
         }
         if self.assessment.is_none() {
@@ -1388,39 +1385,18 @@ impl RepairJob {
         }
     }
 
-    #[allow(dead_code)] // helper for the next_action migration surface.
-    fn repeated_rejected_attempt(&self) -> Option<&RejectedAttempt> {
-        let active_key = self.current_repair_attempt_key(None)?;
-        self.rejected_attempts
-            .iter()
-            .rev()
-            .filter(|attempt| attempt.key == active_key)
-            .find(|attempt| {
-                self.rejected_attempts
-                    .iter()
-                    .filter(|candidate| *candidate == *attempt)
-                    .count()
-                    >= REPEATED_REJECTED_ATTEMPT_THRESHOLD
-            })
-    }
-
-    fn repeated_rejected_correction_class(&self) -> Option<&RejectedAttempt> {
-        let active_key = self.active_correction_attempt_key(None)?;
-        let active_domain = active_key.failure_domain?;
-        let active_kind = active_key.correction_kind?;
-        self.rejected_attempts.iter().rev().find(|attempt| {
-            attempt.key.failure_domain == Some(active_domain)
-                && attempt.key.correction_kind == Some(active_kind)
-                && self
-                    .rejected_attempts
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.key.failure_domain == Some(active_domain)
-                            && candidate.key.correction_kind == Some(active_kind)
-                    })
-                    .count()
-                    >= REPEATED_CORRECTION_CLASS_STOP_THRESHOLD
-        })
+    fn rejected_attempt_escalation(
+        &self,
+    ) -> Option<super::repair_lifecycle::RejectionEscalation<'_>> {
+        let active_attempt_key = self.current_repair_attempt_key(None);
+        let active_correction_key = self.active_correction_attempt_key(None);
+        super::repair_lifecycle::first_rejection_escalation(
+            &self.rejected_attempts,
+            active_attempt_key.as_ref(),
+            active_correction_key.as_ref(),
+            REPEATED_REJECTED_ATTEMPT_THRESHOLD,
+            REPEATED_CORRECTION_CLASS_STOP_THRESHOLD,
+        )
     }
 
     fn current_repair_attempt_key(
