@@ -205,7 +205,7 @@ fn satisfied_artifact_job_action(
             target_hint: Some(target_hint),
         });
     }
-    Some(if contract.verification_required {
+    Some(if contract.objective_contract().requires_evidence() {
         super::task_contract::ArtifactRecoveryAction::RunVerifier
     } else {
         super::task_contract::ArtifactRecoveryAction::Done
@@ -217,14 +217,18 @@ fn first_blocking_required_obligation_hint(
     artifacts: &[super::task_contract::ArtifactState],
     artifact_excerpts: &super::task_contract::ArtifactExcerpts,
 ) -> Option<super::task_contract::RecoveryTargetHint> {
-    contract.required_artifacts.iter().find_map(|role| {
-        super::task_contract::recovery_target_hint_for_blocking_obligation_diagnostic(
-            contract,
-            artifacts,
-            artifact_excerpts,
-            *role,
-        )
-    })
+    contract
+        .objective_contract()
+        .required_deliverables()
+        .iter()
+        .find_map(|role| {
+            super::task_contract::recovery_target_hint_for_blocking_obligation_diagnostic(
+                contract,
+                artifacts,
+                artifact_excerpts,
+                *role,
+            )
+        })
 }
 
 pub(super) fn task_contract_recovery_target(

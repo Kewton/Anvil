@@ -428,8 +428,8 @@ pub(super) fn capability_spec_for_task_contract(contract: &TaskContract) -> Capa
     let mut defaults = capability_defaults_for_task_kind(objective.task_kind);
     defaults.deliverable_kind = objective.deliverable_kind;
     defaults.evidence_kind = objective.evidence_kind;
-    if !contract.required_artifacts.is_empty() {
-        defaults.required_artifacts = contract.required_artifacts.clone();
+    if objective.has_required_deliverables() {
+        defaults.required_artifacts = objective.required_deliverables.clone();
     }
     defaults.into_spec()
 }
@@ -1373,6 +1373,7 @@ impl PublicContract {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ExecutionEvidence {
     pub(super) kind: ObjectiveEvidenceKind,
+    pub(super) required: bool,
     pub(super) command: Option<String>,
 }
 
@@ -1433,6 +1434,7 @@ impl TaskExecutionContract {
             public_contract,
             evidence: ExecutionEvidence {
                 kind: objective.evidence_kind,
+                required: objective.evidence_required,
                 command: None,
             },
             constraints: ExecutionConstraints {
@@ -1456,6 +1458,8 @@ impl TaskExecutionContract {
             objective_kind: self.objective_kind,
             deliverable_kind: self.deliverable_kind,
             evidence_kind: self.evidence.kind,
+            required_deliverables: required_deliverables_from_execution(&self.deliverables),
+            evidence_required: self.evidence.required,
         }
     }
 
@@ -1688,6 +1692,18 @@ impl DeliverableWorkerRequest {
             "[{worker}] Own this turn. Produce `{target}`. Public contract: {public_contract}. Allowed files: {allowed_files}. Evidence: run `{evidence}` after the edit. Lead with the contract and the target file; do not restate prior turn logs or change unrelated files."
         )
     }
+}
+
+fn required_deliverables_from_execution(
+    deliverables: &[ExecutionDeliverable],
+) -> Vec<ArtifactRole> {
+    let mut roles = Vec::new();
+    for deliverable in deliverables {
+        if !roles.contains(&deliverable.role) {
+            roles.push(deliverable.role);
+        }
+    }
+    roles
 }
 
 fn execution_deliverables_for_contract(

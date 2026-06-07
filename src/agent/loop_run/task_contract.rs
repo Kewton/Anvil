@@ -336,7 +336,7 @@ impl ObjectiveEvidenceKind {
 pub(super) type EvidenceSpec = ObjectiveEvidenceKind;
 
 #[allow(dead_code)] // Issue #947: read-only ObjectiveContract projection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ObjectiveContract {
     /// Classification-layer kind (kept for back-compat with existing readers).
     pub(super) task_kind: TaskKind,
@@ -345,6 +345,11 @@ pub(super) struct ObjectiveContract {
     pub(super) objective_kind: ObjectiveKind,
     pub(super) deliverable_kind: DeliverableSpec,
     pub(super) evidence_kind: EvidenceSpec,
+    /// Required deliverable roles in lifecycle order. This is the objective
+    /// layer's projection of the older `TaskContract.required_artifacts` field.
+    pub(super) required_deliverables: Vec<ArtifactRole>,
+    /// Whether command/external evidence is mandatory after deliverables.
+    pub(super) evidence_required: bool,
 }
 
 impl ObjectiveContract {
@@ -355,6 +360,8 @@ impl ObjectiveContract {
                 objective_kind: ObjectiveKind::from_task_kind(contract.task_kind),
                 deliverable_kind: ObjectiveDeliverableKind::Answer,
                 evidence_kind: ObjectiveEvidenceKind::ContentAcceptance,
+                required_deliverables: Vec::new(),
+                evidence_required: false,
             };
         }
 
@@ -390,7 +397,21 @@ impl ObjectiveContract {
             objective_kind: ObjectiveKind::from_task_kind(contract.task_kind),
             deliverable_kind,
             evidence_kind,
+            required_deliverables: contract.required_artifacts.clone(),
+            evidence_required: contract.completion_policy.verification_required(),
         }
+    }
+
+    pub(super) fn required_deliverables(&self) -> &[ArtifactRole] {
+        &self.required_deliverables
+    }
+
+    pub(super) fn has_required_deliverables(&self) -> bool {
+        !self.required_deliverables.is_empty()
+    }
+
+    pub(super) fn requires_evidence(&self) -> bool {
+        self.evidence_required
     }
 }
 
@@ -1775,8 +1796,9 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     // Issue #922 (DD4 / S7-001 / DR1-001): relax the Explain short-circuit only
     // for a research task with a required report obligation (shared signal with
     // `project_intent_from_required_artifacts`); all other kinds unchanged.
-    let research_report_obligation = inputs.contract.task_kind == TaskKind::Research
-        && !inputs.contract.required_artifacts.is_empty();
+    let objective = inputs.contract.objective_contract();
+    let research_report_obligation =
+        objective.task_kind == TaskKind::Research && objective.has_required_deliverables();
     if matches!(inputs.contract.intent, TaskIntent::Explain) && !research_report_obligation {
         return ArtifactRecoveryAction::Done;
     }
@@ -1804,7 +1826,7 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     // If the excerpt is absent for a role we skip its check (back-compat).
     // Setup is treated as covered (no excerpt-level coverage rule yet).
     if behavior_coverage_enabled(inputs.contract) && !inputs.artifact_excerpts.is_empty() {
-        for role in inputs.contract.required_artifacts.iter() {
+        for role in objective.required_deliverables() {
             if !observed.contains(role) {
                 continue;
             }
@@ -1851,11 +1873,11 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     }
 
     let existing_unverified_used = inputs.artifacts.iter().any(|artifact| {
-        inputs.contract.required_artifacts.contains(&artifact.role)
+        objective.required_deliverables().contains(&artifact.role)
             && artifact.kind == ArtifactStateKind::ExistsButUnverified
             && !observed.contains(&artifact.role)
     });
-    let code_or_test_required = inputs.contract.required_artifacts.iter().any(|role| {
+    let code_or_test_required = objective.required_deliverables().iter().any(|role| {
         matches!(
             role,
             ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup
@@ -1889,8 +1911,9 @@ fn objective_deliverable_stage(
     inputs: &ArtifactRecoveryInputs<'_>,
     observed: &[ArtifactRole],
 ) -> ObjectiveLifecycleStage {
+    let objective = inputs.contract.objective_contract();
     let mut missing = Vec::new();
-    for role in &inputs.contract.required_artifacts {
+    for role in objective.required_deliverables() {
         if required_role_satisfied(
             inputs.contract,
             inputs.evidence,
@@ -1929,10 +1952,10 @@ fn objective_evidence_stage(
         return ObjectiveEvidenceStage::SatisfiedOrNotRequired;
     }
 
-    if inputs.contract.verification_required || (existing_unverified_used && code_or_test_required)
-    {
+    let objective = inputs.contract.objective_contract();
+    if objective.requires_evidence() || (existing_unverified_used && code_or_test_required) {
         return ObjectiveEvidenceStage::MissingEvidence {
-            evidence_kind: inputs.contract.objective_contract().evidence_kind,
+            evidence_kind: objective.evidence_kind,
         };
     }
 
@@ -7437,6 +7460,34 @@ mod tests {
             assert_eq!(projection.deliverable_kind.label(), deliverable_label);
             assert_eq!(projection.evidence_kind.label(), evidence_label);
         }
+    }
+
+    #[test]
+    fn objective_contract_carries_lifecycle_obligations() {
+        let coding = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        )
+        .objective_contract();
+        assert_eq!(
+            coding.required_deliverables(),
+            &[ArtifactRole::Implementation, ArtifactRole::Setup]
+        );
+        assert!(coding.requires_evidence());
+
+        let docs = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create README.md documentation.","next_required_action":"artifact","required_artifacts":[{"path":"README.md","role":"docs","schema":{"required_sections":["Setup","Usage"]}}]}"#,
+        )
+        .objective_contract();
+        assert_eq!(docs.required_deliverables(), &[ArtifactRole::UsageDocs]);
+        assert!(!docs.requires_evidence());
+
+        let answer =
+            TaskContract::from_request("Explain Rust ownership briefly").objective_contract();
+        assert_eq!(answer.deliverable_kind, ObjectiveDeliverableKind::Answer);
+        assert!(!answer.has_required_deliverables());
+        assert!(!answer.requires_evidence());
     }
 
     #[test]
