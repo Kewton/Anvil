@@ -161,8 +161,11 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
             nested_arguments_object
                 .and_then(|inner| inner.get("name").or_else(|| inner.get("tool")))
                 .and_then(Value::as_str)
+        })
+        .map(|name| normalize_name(name, allowed_tools))
+        .or_else(|| {
+            infer_tool_name_from_arguments(object, nested_arguments_object, allowed_tools)
         })?;
-    let normalized_name = normalize_name(name, allowed_tools);
     let arguments = object
         .get("arguments")
         .and_then(normalize_arguments_value)
@@ -181,9 +184,63 @@ fn parse_tool_call_object(raw: &str, allowed_tools: &[String]) -> Option<(String
             }
         });
     Some((
-        normalized_name.clone(),
-        normalize_tool_call_arguments(&normalized_name, arguments),
+        name.clone(),
+        normalize_tool_call_arguments(&name, arguments),
     ))
+}
+
+fn infer_tool_name_from_arguments(
+    object: &serde_json::Map<String, Value>,
+    nested_arguments_object: Option<&serde_json::Map<String, Value>>,
+    allowed_tools: &[String],
+) -> Option<String> {
+    let args = nested_arguments_object.unwrap_or(object);
+    let mut candidates = Vec::new();
+
+    if has_any_key(args, &["command", "cmd"]) {
+        maybe_push_allowed_tool(&mut candidates, "Bash", allowed_tools);
+    }
+    if has_any_key(args, &["path", "file", "file_path", "filepath", "filename"]) {
+        if has_any_key(args, &["old_string", "old", "old_text", "oldText", "find"])
+            && has_any_key(
+                args,
+                &[
+                    "new_string",
+                    "new",
+                    "new_text",
+                    "newText",
+                    "replacement",
+                    "replace_with",
+                ],
+            )
+        {
+            maybe_push_allowed_tool(&mut candidates, "Edit", allowed_tools);
+        } else if has_any_key(args, &["content", "contents", "body", "text"]) {
+            maybe_push_allowed_tool(&mut candidates, "Write", allowed_tools);
+        } else {
+            maybe_push_allowed_tool(&mut candidates, "Read", allowed_tools);
+        }
+    }
+    if has_any_key(args, &["pattern", "query", "glob"]) {
+        maybe_push_allowed_tool(&mut candidates, "Grep", allowed_tools);
+        maybe_push_allowed_tool(&mut candidates, "Glob", allowed_tools);
+    }
+
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn has_any_key(map: &serde_json::Map<String, Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| map.contains_key(*key))
+}
+
+fn maybe_push_allowed_tool(candidates: &mut Vec<String>, name: &str, allowed_tools: &[String]) {
+    if let Some(allowed) = allowed_tools
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(name))
+    {
+        candidates.push(allowed.clone());
+    }
 }
 
 fn strip_name_from_arguments(value: Value) -> Value {
@@ -605,6 +662,42 @@ mod tests {
             tool_calls[0].arguments,
             json!({"path":"plans/plan.md","content":"hello"})
         );
+    }
+
+    #[test]
+    fn infers_unterminated_write_call_from_argument_shape() {
+        let allowed = vec![
+            "Read".to_string(),
+            "Write".to_string(),
+            "Edit".to_string(),
+            "Bash".to_string(),
+        ];
+        let input = r#"Cargo.toml にテスト設定を追加しました。
+
+<anvil_tool_call>{"arguments":{"path":"tests/password_strength.rs","content":"use password_strength::password_score;\n"}}"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "Write");
+        assert_eq!(
+            tool_calls[0].arguments["path"],
+            "tests/password_strength.rs"
+        );
+        assert_eq!(
+            tool_calls[0].arguments["content"],
+            "use password_strength::password_score;\n"
+        );
+        assert!(remaining.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn does_not_infer_ambiguous_pattern_tool_name() {
+        let allowed = vec!["Grep".to_string(), "Glob".to_string()];
+        let input = r#"<anvil_tool_call>{"arguments":{"pattern":"*.rs"}}"#;
+        let (tool_calls, remaining) = extract_tool_calls(input, &allowed);
+
+        assert!(tool_calls.is_empty());
+        assert!(remaining.contains("<anvil_tool_call>"));
     }
 
     #[test]
