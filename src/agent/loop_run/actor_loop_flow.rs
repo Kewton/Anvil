@@ -2199,6 +2199,7 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
             task_contract_action: pre_model_task_contract_action.clone(),
         },
     );
+    sync_pre_model_task_contract_recovery_target(agent, pre_model_task_contract_action.as_ref());
     let recovery_owner = RecoveryOwner::from_control_action(
         &loop_control_action,
         pre_model_task_contract_action.as_ref(),
@@ -2212,6 +2213,27 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
         recovery_owner,
         loop_control_action,
     }
+}
+
+fn sync_pre_model_task_contract_recovery_target(
+    agent: &mut Agent,
+    action: Option<&super::task_contract::ArtifactRecoveryAction>,
+) {
+    let Some(
+        action @ (super::task_contract::ArtifactRecoveryAction::Continue { .. }
+        | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. }),
+    ) = action
+    else {
+        return;
+    };
+    let attempt = agent
+        .current_artifact_recovery_target
+        .as_ref()
+        .map(|target| target.attempt.saturating_add(1))
+        .unwrap_or(1);
+    super::set_artifact_recovery_target::set_artifact_recovery_target_for_action(
+        agent, action, attempt,
+    );
 }
 
 pub(super) fn handle_actor_loop_pre_reply_control_action(
@@ -5353,6 +5375,107 @@ mod tests {
             text,
             ExitReason::SafeStopVerifierMissing.default_error_text()
         );
+    }
+
+    #[test]
+    fn pre_model_contract_sync_installs_missing_test_target_before_policy_selection() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{ArtifactRole, TaskContract};
+        use crate::config::Config;
+        use crate::session::store::ConversationMessage;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("src")).unwrap();
+        std::fs::write(
+            agent.work_root.join("Cargo.toml"),
+            "[package]\nname = \"tdd-sync\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("src/lib.rs"),
+            "pub fn password_strength(_: &str) -> &'static str { \"weak\" }\n",
+        )
+        .unwrap();
+
+        let request = concat!(
+            "STATE_CONTROL_PACKET\n",
+            r#"{"objective":"Use TDD to add password_strength behavior and passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"tests/password_strength.rs","role":"test"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+            "\nFollow TDD and create the missing test file first."
+        );
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+
+        let contract = TaskContract::from_request(request);
+        assert_eq!(
+            contract
+                .required_identities_for_role(ArtifactRole::Test)
+                .first()
+                .map(|identity| identity.path.as_str()),
+            Some("tests/password_strength.rs")
+        );
+        let action = super::super::task_contract_recovery::task_contract_recovery_action(
+            &mut agent, &contract, None, 0,
+        );
+        let expected_target = match &action {
+            super::super::task_contract::ArtifactRecoveryAction::Continue {
+                target_hint: Some(target_hint),
+                ..
+            } => (target_hint.role, target_hint.path.clone()),
+            other => panic!("expected contract-owned artifact recovery, got {other:?}"),
+        };
+        let before_snapshot = capture_repo_snapshot(&agent.work_root);
+        let accumulated = Vec::new();
+        let mut repo_edit_calls = 0usize;
+        let mut contract_verification_retries = 0usize;
+        let mut contract_verifier_repair_edit_count = None;
+        let mut repo_change_retries = 0usize;
+        let mut verifier_repair_retries = 0usize;
+        let mut verify_commands = Vec::new();
+        let mut verifier_passed = false;
+        let mut framework_fallback_materialized = false;
+        let interrupt = InterruptFlag::new_preset(false);
+
+        let state = build_actor_loop_pre_reply_control_state(
+            &mut agent,
+            &ActorLoopPreReplyArgs {
+                before_snapshot: &before_snapshot,
+                accumulated: &accumulated,
+                task_contract: Some(&contract),
+                repo_edit_calls_made_this_turn: &mut repo_edit_calls,
+                contract_verification_retries: &mut contract_verification_retries,
+                contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
+                repo_change_retries: &mut repo_change_retries,
+                verifier_repair_retries: &mut verifier_repair_retries,
+                task_contract_verify_commands_collected: &mut verify_commands,
+                task_contract_verifier_passed_in_loop: &mut verifier_passed,
+                framework_app_fallback_materialized: &mut framework_fallback_materialized,
+                action_expectation: recovery::ActionExpectation::RepoChange,
+                stream_output: false,
+                last_iter: 1,
+                interrupt_flag: &interrupt,
+            },
+        );
+
+        assert_eq!(state.recovery_owner, RecoveryOwner::ArtifactCompletion);
+        let target = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("missing test obligation must install artifact target before model request");
+        assert_eq!(target.role, expected_target.0);
+        assert_eq!(target.path, expected_target.1);
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact target sync must also install the completion job");
+        assert_eq!(job.role(), expected_target.0);
+        assert_eq!(job.target_path(), expected_target.1);
     }
 
     #[test]

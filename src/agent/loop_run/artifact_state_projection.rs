@@ -143,7 +143,8 @@ fn task_contract_artifact_states_legacy(
             if matches!(
                 ownership,
                 super::artifact_ownership::ArtifactOwnership::Owned
-            ) {
+            ) || evidence_gated_explicit_existing_candidate(contract, *role, &path)
+            {
                 states.push(super::task_contract::ArtifactState::exists(*role, path));
             }
         }
@@ -214,7 +215,9 @@ fn task_contract_artifact_states_from_ledger(
             if matches!(ev.origin, ArtifactOrigin::Scaffold) {
                 continue;
             }
-            if !matches!(ev.ownership, ArtifactOwnership::Owned) {
+            if !matches!(ev.ownership, ArtifactOwnership::Owned)
+                && !evidence_gated_explicit_existing_candidate(contract, *role, &ev.path)
+            {
                 continue;
             }
             if exists_seen.insert(ev.path.as_str()) {
@@ -241,6 +244,18 @@ fn task_contract_artifact_states_from_ledger(
         }
     }
     states
+}
+
+fn evidence_gated_explicit_existing_candidate(
+    contract: &super::task_contract::TaskContract,
+    role: super::task_contract::ArtifactRole,
+    path: &str,
+) -> bool {
+    contract.objective_contract().requires_evidence()
+        && contract
+            .required_identities_for_role(role)
+            .iter()
+            .any(|identity| super::task_contract::normalized_artifact_path_eq(path, &identity.path))
 }
 
 /// Issue #659 (Task 3.2): masked observability emit when the legacy and

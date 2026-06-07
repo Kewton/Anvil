@@ -291,6 +291,59 @@ fn task_contract_artifact_states_uses_ledger_projection() {
     );
 }
 
+#[test]
+fn explicit_evidence_gated_existing_candidate_counts_as_deliverable() {
+    let session_id = unique_session_id("states-explicit-existing");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("src")).unwrap();
+    std::fs::write(
+        work_root.join("src/lib.rs"),
+        "pub fn password_strength(_: &str) -> &'static str { \"weak\" }\n",
+    )
+    .unwrap();
+
+    let contract = TaskContract::from_request(
+        r#"STATE_CONTROL_PACKET
+{"objective":"Use TDD to add password_strength behavior and passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"tests/password_strength.rs","role":"test"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+    );
+    assert!(contract.objective_contract().requires_evidence());
+
+    let states = super::artifact_state_projection::task_contract_artifact_states_for_test(
+        &mut agent, &contract,
+    );
+    assert!(
+        states.iter().any(|state| {
+            state.role == ArtifactRole::Implementation
+                && state.path.as_deref() == Some("src/lib.rs")
+                && state.kind == ArtifactStateKind::ExistsButUnverified
+        }),
+        "explicit evidence-gated existing source must reach deliverable planning: {states:?}"
+    );
+
+    let evidence = super::completion_evidence::EvidenceSet::new();
+    let repair_state = super::task_contract::VerifierRepairState::None;
+    assert_eq!(
+        super::task_contract::plan_artifact_recovery(super::task_contract::ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &states,
+            repair_state: &repair_state,
+            artifact_excerpts: &super::task_contract::ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        }),
+        super::task_contract::ArtifactRecoveryAction::Continue {
+            missing: vec![ArtifactRole::Test],
+            target_hint: Some(super::task_contract::RecoveryTargetHint {
+                role: ArtifactRole::Test,
+                path: "tests/password_strength.rs".to_string(),
+                reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/password_strength.rs".to_string(),
+            }),
+        }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 3.3: owned_test_artifacts_for_verifier
 // ---------------------------------------------------------------------------

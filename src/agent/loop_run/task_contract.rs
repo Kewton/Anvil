@@ -1578,15 +1578,8 @@ impl ObjectiveEvidenceStage {
         missing_verifier_suppress_retry: bool,
     ) -> Option<ArtifactRecoveryAction> {
         match self {
-            ObjectiveEvidenceStage::MissingEvidence { .. } => {
-                // Once a MissingVerifierJob is in flight and no in-scope edit
-                // has landed, ask for repair instead of re-triggering the same
-                // missing-evidence loop.
-                if missing_verifier_suppress_retry {
-                    Some(ArtifactRecoveryAction::RepairArtifact { target_hint: None })
-                } else {
-                    Some(ArtifactRecoveryAction::RunVerifier)
-                }
+            ObjectiveEvidenceStage::MissingEvidence { runner } => {
+                runner.missing_recovery_action(missing_verifier_suppress_retry)
             }
             ObjectiveEvidenceStage::SatisfiedOrNotRequired { .. } => None,
         }
@@ -1613,6 +1606,26 @@ impl ObjectiveEvidenceRunner {
 
     fn command(evidence_kind: EvidenceSpec) -> Self {
         Self::Command(evidence_kind)
+    }
+
+    fn missing_recovery_action(
+        self,
+        missing_verifier_suppress_retry: bool,
+    ) -> Option<ArtifactRecoveryAction> {
+        match self {
+            ObjectiveEvidenceRunner::Command(_) => {
+                // Once a MissingVerifierJob is in flight and no in-scope edit
+                // has landed, ask for repair instead of re-triggering the same
+                // missing-evidence loop.
+                if missing_verifier_suppress_retry {
+                    Some(ArtifactRecoveryAction::RepairArtifact { target_hint: None })
+                } else {
+                    Some(ArtifactRecoveryAction::RunVerifier)
+                }
+            }
+            ObjectiveEvidenceRunner::ArtifactAcceptance(_)
+            | ObjectiveEvidenceRunner::NotRequired => None,
+        }
     }
 }
 
@@ -7968,6 +7981,29 @@ mod tests {
             ObjectiveEvidenceStage::SatisfiedOrNotRequired {
                 runner: ObjectiveEvidenceRunner::NotRequired
             }
+        );
+    }
+
+    #[test]
+    fn objective_evidence_runner_action_only_commands_invoke_legacy_verifier() {
+        assert_eq!(
+            ObjectiveEvidenceRunner::Command(ObjectiveEvidenceKind::TestRun)
+                .missing_recovery_action(false),
+            Some(ArtifactRecoveryAction::RunVerifier)
+        );
+        assert_eq!(
+            ObjectiveEvidenceRunner::Command(ObjectiveEvidenceKind::TestRun)
+                .missing_recovery_action(true),
+            Some(ArtifactRecoveryAction::RepairArtifact { target_hint: None })
+        );
+        assert_eq!(
+            ObjectiveEvidenceRunner::ArtifactAcceptance(ObjectiveEvidenceKind::ContentCheck)
+                .missing_recovery_action(false),
+            None
+        );
+        assert_eq!(
+            ObjectiveEvidenceRunner::NotRequired.missing_recovery_action(false),
+            None
         );
     }
 
