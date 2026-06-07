@@ -35,7 +35,7 @@ use super::required_behavior::{
     BehaviorContractProjection, LOW_CONFIDENCE_THRESHOLD, behavior_projection_has_setup_label,
 };
 use super::task_contract::{
-    ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract,
+    ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract, TaskKind,
     VerifierPrerequisiteSignal, has_required_setup_install_intent,
 };
 use super::tool_policy::EffectiveToolPolicy;
@@ -681,11 +681,18 @@ pub(super) fn should_install_setup_bootstrap(
     // wording (旧 AD9). Pure verifier-capability labels without a Setup
     // anchor (e.g. derived "test" from `Add tests`) cannot reach step
     // (4) so the false-positive surface is bounded.
-    if behavior_projection_has_setup_label(p) {
+    if behavior_projection_has_setup_label(p) && projection_setup_bootstrap_allowed(contract) {
         return true;
     }
 
     false
+}
+
+fn projection_setup_bootstrap_allowed(contract: &TaskContract) -> bool {
+    !matches!(
+        contract.task_kind,
+        TaskKind::Authoring | TaskKind::Docs | TaskKind::Data | TaskKind::Research
+    )
 }
 
 #[allow(dead_code)] // Issue #948: projection seam; first production consumers are telemetry/reporting follow-ups.
@@ -1487,6 +1494,24 @@ mod tests {
         assert!(!should_install_setup_bootstrap(
             &contract,
             projection.as_ref(),
+            &no_signal,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_install_setup_bootstrap_false_for_readme_setup_section_docs() {
+        let contract = TaskContract::from_request(
+            "Write README.md with setup, usage, and troubleshooting sections for a backup CLI.",
+        );
+        let projection = projection_with_setup_label();
+        let no_signal = VerifierPrerequisiteSignal::from_sources(false, None);
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert!(!contract.optional_artifacts.contains(&ArtifactRole::Setup));
+        assert!(!should_install_setup_bootstrap(
+            &contract,
+            Some(&projection),
             &no_signal,
             false
         ));

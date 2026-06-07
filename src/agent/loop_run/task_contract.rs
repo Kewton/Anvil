@@ -1046,10 +1046,7 @@ fn controller_schema_labels_from_value(value: Option<&serde_json::Value>) -> Vec
             .filter_map(serde_json::Value::as_str)
             .map(str::to_string)
             .collect::<Vec<_>>(),
-        serde_json::Value::String(s) => s
-            .split(|ch| ch == ',' || ch == '|')
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
+        serde_json::Value::String(s) => s.split([',', '|']).map(str::to_string).collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     let mut labels = Vec::new();
@@ -4240,138 +4237,11 @@ fn infer_intent(request: &str, lower: &str) -> TaskIntent {
 }
 
 fn infer_project_language(request: &str, lower: &str) -> ProjectLanguage {
-    let rust = contains_any(
-        lower,
-        &["rust", "cargo", "crate", "cargo.toml", ".rs", "rustc"],
-    ) || request.contains("Rust");
-    let node = contains_any(
-        lower,
-        &[
-            "node",
-            "node.js",
-            "nodejs",
-            "npm",
-            "package.json",
-            "javascript",
-            "typescript",
-            ".js",
-            ".ts",
-            "tsx",
-            "jsx",
-        ],
-    );
-    let python = contains_any(
-        lower,
-        &[
-            "python",
-            "python3",
-            "pytest",
-            "pip",
-            "fastapi",
-            "flask",
-            "django",
-            ".py",
-            "requirements.txt",
-        ],
-    ) || request.contains("Python");
-    let docs = contains_any(
-        lower,
-        &[
-            "readme",
-            "markdown",
-            ".md",
-            "docs/",
-            "documentation",
-            "manual",
-        ],
-    ) || contains_any(
-        request,
-        &["README", "ドキュメント", "仕様書", "設計書", "手順書"],
-    );
-
-    if rust {
-        ProjectLanguage::Rust
-    } else if node {
-        ProjectLanguage::Node
-    } else if python {
-        ProjectLanguage::Python
-    } else if docs {
-        ProjectLanguage::Docs
-    } else {
-        ProjectLanguage::Unknown
-    }
+    super::project_profile::infer_language(request, lower)
 }
 
 fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
-    let explicit_entrypoint_shape = explicit_entrypoint_project_shape(lower);
-    let docs = contains_any(
-        lower,
-        &[
-            "readme",
-            "markdown",
-            ".md",
-            "docs/",
-            "documentation",
-            "manual",
-        ],
-    ) || contains_any(
-        request,
-        &["README", "ドキュメント", "仕様書", "設計書", "手順書"],
-    );
-    let cli = contains_any(lower, &["cli", "command", "stdin", "stdout"])
-        || contains_any(request, &["標準入力", "コマンド"]);
-    let library = contains_any(lower, &["library", "crate", "package", "module"])
-        || contains_any(
-            request,
-            &["ライブラリ", "クレート", "パッケージ", "モジュール"],
-        );
-    let api = contains_ascii_token(lower, "api")
-        || contains_any(
-            lower,
-            &[
-                "crud", "endpoint", "server", "backend", "fastapi", "flask", "django",
-            ],
-        )
-        || contains_any(request, &["エンドポイント", "サーバ", "バックエンド"]);
-    let web_app = contains_any(
-        lower,
-        &[
-            "web app",
-            "browser app",
-            "frontend",
-            "front-end",
-            "next.js",
-            "nextjs",
-            "react",
-            "vue",
-            "nuxt",
-            "svelte",
-        ],
-    ) || contains_any(request, &["アプリ", "フロントエンド", "画面"]);
-
-    if cli || matches!(explicit_entrypoint_shape, Some(ProjectShape::Cli)) {
-        ProjectShape::Cli
-    } else if library || matches!(explicit_entrypoint_shape, Some(ProjectShape::Library)) {
-        ProjectShape::Library
-    } else if api {
-        ProjectShape::Api
-    } else if web_app {
-        ProjectShape::WebApp
-    } else if docs {
-        ProjectShape::Documentation
-    } else {
-        ProjectShape::Unknown
-    }
-}
-
-fn explicit_entrypoint_project_shape(lower: &str) -> Option<ProjectShape> {
-    if contains_any(lower, &["src/main.rs", "main.py"]) {
-        return Some(ProjectShape::Cli);
-    }
-    if contains_any(lower, &["src/lib.rs", "lib.rs"]) {
-        return Some(ProjectShape::Library);
-    }
-    None
+    super::project_profile::infer_shape(request, lower)
 }
 
 fn infer_verification_requirement(
@@ -4626,18 +4496,25 @@ pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &st
             "do not create code or tests",
             "do not create tests or code",
             "do not create code",
+            "do not create source code",
             "do not add code",
+            "do not add source code",
             "do not write code",
+            "do not write source code",
             "do not implement code",
             "do not change code",
             "do not modify code",
             "don't create code",
+            "don't create source code",
             "don't add code",
             "don't write code",
+            "don't write source code",
             "don't implement code",
             "no code",
+            "no source code",
             "no code changes",
             "without code",
+            "without source code",
             "without code changes",
             "code changes are not required",
             "code changes not required",
@@ -4923,12 +4800,73 @@ fn request_contains_jp_setup_marker_unnegated(request: &str, needle: &str) -> bo
 }
 
 pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
-    SETUP_MARKER_NEEDLES_ASCII
+    let explicit_setup_file = contains_any(lower, &["package.json", "requirements.txt"]);
+    if explicit_setup_file {
+        return true;
+    }
+    let setup_marker = SETUP_MARKER_NEEDLES_ASCII
         .iter()
+        .filter(|needle| !matches!(**needle, "package.json" | "requirements"))
         .any(|needle| lower_contains_setup_token_unnegated(lower, needle))
         || SETUP_MARKER_NEEDLES_JP
             .iter()
-            .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle))
+            .any(|needle| request_contains_jp_setup_marker_unnegated(request, needle));
+    setup_marker && !request_treats_setup_as_document_content(request, lower)
+}
+
+fn request_treats_setup_as_document_content(request: &str, lower: &str) -> bool {
+    let scan = OutputContextScan::new(request);
+    let docs_output = request_asks_for_usage_docs(request, lower)
+        || request_names_explicit_output_docs(&scan, request)
+        || contains_any(lower, &["readme", "markdown", ".md", "docs/"]);
+    if !docs_output {
+        return false;
+    }
+    let document_action = contains_any(
+        lower,
+        &[
+            "write",
+            "update",
+            "edit",
+            "add",
+            "document",
+            "documentation",
+            "section",
+            "sections",
+            "heading",
+            "headings",
+            "manual",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "追記",
+            "更新",
+            "編集",
+            "作成",
+            "書いて",
+            "セクション",
+            "見出し",
+        ],
+    );
+    if !document_action {
+        return false;
+    }
+    let direct_environment_action = contains_any(
+        lower,
+        &[
+            "install dependencies",
+            "install dependency",
+            "setup environment",
+            "bootstrap environment",
+            "npm install",
+            "pnpm install",
+            "yarn install",
+            "pip install",
+            "cargo install",
+        ],
+    ) || contains_any(request, &["依存をインストール", "環境構築"]);
+    !direct_environment_action
 }
 
 /// Issue #937 (判断#6, DS3-001): the default/standalone DataOutput gate, evaluated
@@ -10988,6 +10926,51 @@ Create the README file."#;
         assert!(lower_contains_setup_token_unnegated(&lower, "install"));
         assert!(lower_contains_setup_token_unnegated(&lower, "dependencies"));
         assert!(request_asks_for_setup(req, &lower));
+    }
+
+    #[test]
+    fn request_asks_for_setup_false_for_readme_setup_section() {
+        let req =
+            "Write README.md with setup, usage, and troubleshooting sections for a backup CLI.";
+        let lower = req.to_ascii_lowercase();
+
+        assert!(!request_asks_for_setup(req, &lower));
+    }
+
+    #[test]
+    fn readme_setup_section_routes_to_docs_without_setup_artifact() {
+        let contract = TaskContract::from_request(
+            "Write README.md with setup, usage, and troubleshooting sections for a backup CLI.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(!contract.required_artifacts.contains(&ArtifactRole::Setup));
+        assert!(!contract.optional_artifacts.contains(&ArtifactRole::Setup));
+    }
+
+    #[test]
+    fn readme_with_no_source_code_non_goal_does_not_require_implementation() {
+        let contract = TaskContract::from_request(
+            "Write README.md with setup, usage, and troubleshooting sections for a small local backup CLI. Do not create source code.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(!contract.required_artifacts.contains(&ArtifactRole::Test));
     }
 
     /// Compositional regression: the public `request_asks_for_setup` API

@@ -83,21 +83,6 @@ pub(super) fn script_execution_requested(agent: &Agent) -> bool {
         .is_some_and(request_explicitly_requests_script_execution)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn answer_only_mode_is_inactive_when_objective_requires_artifact() {
-        assert!(!answer_only_mode_active_for(WorkMode::AnswerOnly, true));
-    }
-
-    #[test]
-    fn answer_only_mode_remains_active_for_read_only_objective() {
-        assert!(answer_only_mode_active_for(WorkMode::AnswerOnly, false));
-    }
-}
-
 pub(super) fn effective_tool_policy_error(
     agent: &Agent,
     name: &str,
@@ -116,4 +101,19 @@ pub(super) fn effective_tool_policy_error(
         &agent.work_root,
         scope.as_ref(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answer_only_mode_is_inactive_when_objective_requires_artifact() {
+        assert!(!answer_only_mode_active_for(WorkMode::AnswerOnly, true));
+    }
+
+    #[test]
+    fn answer_only_mode_remains_active_for_read_only_objective() {
+        assert!(answer_only_mode_active_for(WorkMode::AnswerOnly, false));
+    }
 }

@@ -125,6 +125,7 @@ pub(crate) fn runtime_context_messages(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn runtime_context_messages_with_env<F>(
     cwd: &Path,
     work_root: &Path,

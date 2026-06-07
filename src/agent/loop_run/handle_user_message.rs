@@ -17,6 +17,7 @@ use super::photon_feedback_derive::build_rerun_prompt_hint_if_eligible;
 use super::summary::LoopResult;
 use crate::session::store::ConversationMessage;
 
+#[allow(clippy::result_large_err)]
 pub(super) fn handle_user_message(
     agent: &mut Agent,
     input: &str,

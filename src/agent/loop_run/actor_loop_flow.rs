@@ -1487,9 +1487,7 @@ fn sync_post_tool_contract_recovery_target(
     if agent.session.mode_state.mode == super::ExecutionMode::Plan {
         return None;
     }
-    let Some(contract) = args.task_contract else {
-        return None;
-    };
+    let contract = args.task_contract?;
     let action = super::task_contract_recovery::task_contract_recovery_action(
         agent,
         contract,
@@ -3237,6 +3235,7 @@ pub(super) fn missing_repo_edits_finalize_outcome() -> PostReplyRecoveryOutcome 
     }
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn run_actor_loop(
     agent: &mut Agent,
     action_expectation: recovery::ActionExpectation,

@@ -164,6 +164,7 @@ pub(super) fn structured_verifier_invocation_report(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn select_task_contract_verifier(
     work_root: &Path,
     changed_files: &[String],

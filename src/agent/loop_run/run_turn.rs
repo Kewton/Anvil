@@ -21,6 +21,7 @@ use crate::agent::recovery;
 use crate::logging::log_llm_event;
 use crate::modes::plan_act::{ExecutionMode, WorkMode};
 
+#[allow(clippy::result_large_err)]
 pub(super) fn run_turn(
     agent: &mut Agent,
     input: &str,
