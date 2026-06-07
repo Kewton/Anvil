@@ -1521,6 +1521,30 @@ pub(super) struct ArtifactRecoveryInputs<'a> {
     pub(super) owned_test_artifacts: &'a [String],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObjectiveLifecycleStage {
+    MissingDeliverable {
+        missing: Vec<ArtifactRole>,
+        target_hint: Option<RecoveryTargetHint>,
+    },
+    DeliverablesSatisfied,
+}
+
+impl ObjectiveLifecycleStage {
+    fn into_recovery_action(self) -> Option<ArtifactRecoveryAction> {
+        match self {
+            ObjectiveLifecycleStage::MissingDeliverable {
+                missing,
+                target_hint,
+            } => Some(ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint,
+            }),
+            ObjectiveLifecycleStage::DeliverablesSatisfied => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #636: behavior coverage judgement (private to task_contract).
 // ---------------------------------------------------------------------------
@@ -1738,31 +1762,9 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
 
     let observed = observed_artifacts(inputs.evidence);
     let verifier_passed = has_build_test_verifier(inputs.evidence);
-    let mut missing = Vec::new();
-    for role in &inputs.contract.required_artifacts {
-        if required_role_satisfied(
-            inputs.contract,
-            inputs.evidence,
-            inputs.artifacts,
-            inputs.artifact_excerpts,
-            &observed,
-            *role,
-        ) {
-            continue;
-        }
-        missing.push(*role);
-    }
 
-    if !missing.is_empty() {
-        return ArtifactRecoveryAction::Continue {
-            target_hint: recovery_target_hint_for_missing_with_contract(
-                inputs.contract,
-                inputs.artifacts,
-                inputs.artifact_excerpts,
-                &missing,
-            ),
-            missing,
-        };
+    if let Some(action) = objective_deliverable_stage(&inputs, &observed).into_recovery_action() {
+        return action;
     }
 
     if let Some(action) = missing_owned_test_artifact_action(&inputs) {
@@ -1858,6 +1860,40 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
         .contract
         .evaluate_with_owned_test_artifacts(inputs.evidence, inputs.owned_test_artifacts)
         .into()
+}
+
+fn objective_deliverable_stage(
+    inputs: &ArtifactRecoveryInputs<'_>,
+    observed: &[ArtifactRole],
+) -> ObjectiveLifecycleStage {
+    let mut missing = Vec::new();
+    for role in &inputs.contract.required_artifacts {
+        if required_role_satisfied(
+            inputs.contract,
+            inputs.evidence,
+            inputs.artifacts,
+            inputs.artifact_excerpts,
+            observed,
+            *role,
+        ) {
+            continue;
+        }
+        missing.push(*role);
+    }
+
+    if missing.is_empty() {
+        return ObjectiveLifecycleStage::DeliverablesSatisfied;
+    }
+
+    ObjectiveLifecycleStage::MissingDeliverable {
+        target_hint: recovery_target_hint_for_missing_with_contract(
+            inputs.contract,
+            inputs.artifacts,
+            inputs.artifact_excerpts,
+            &missing,
+        ),
+        missing,
+    }
 }
 
 fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRole) -> bool {
@@ -7574,6 +7610,131 @@ mod tests {
             ),
             Some(super::super::active_job_arbiter::RecoveryJobKind::MissingDeliverableJob)
         );
+    }
+
+    #[test]
+    fn objective_lifecycle_stage_blocks_evidence_until_controller_deliverables_exist() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = Vec::new();
+        let excerpts = ArtifactExcerpts::new();
+        let repair_state = VerifierRepairState::None;
+        let inputs = ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        };
+
+        assert_eq!(
+            objective_deliverable_stage(&inputs, &observed_artifacts(&evidence)),
+            ObjectiveLifecycleStage::MissingDeliverable {
+                missing: vec![ArtifactRole::Implementation, ArtifactRole::Setup],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "src/lib.rs".to_string(),
+                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=src/lib.rs".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn objective_lifecycle_stage_reaches_evidence_only_after_deliverables_are_satisfied() {
+        let contract = TaskContract::from_request(
+            r#"STATE_CONTROL_PACKET
+{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"Cargo.toml","role":"manifest"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Setup, "Cargo.toml"));
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "src/lib.rs"));
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Setup, "Cargo.toml"),
+            ArtifactState::exists(ArtifactRole::Implementation, "src/lib.rs"),
+        ];
+        let excerpts = ArtifactExcerpts::new();
+        let repair_state = VerifierRepairState::None;
+        let inputs = ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        };
+
+        assert_eq!(
+            objective_deliverable_stage(&inputs, &observed_artifacts(&evidence)),
+            ObjectiveLifecycleStage::DeliverablesSatisfied
+        );
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::RunVerifier
+        );
+    }
+
+    #[test]
+    fn objective_lifecycle_stage_is_generic_for_docs_and_data_deliverables() {
+        let cases = [
+            (
+                "Update README.md with installation and usage sections.",
+                ObjectiveDeliverableKind::DocumentSections,
+                ObjectiveEvidenceKind::ContentCheck,
+                ArtifactRole::UsageDocs,
+            ),
+            (
+                "Generate output.csv with columns Category and Total.",
+                ObjectiveDeliverableKind::OutputFile,
+                ObjectiveEvidenceKind::SchemaCheck,
+                ArtifactRole::DataOutput,
+            ),
+        ];
+
+        for (request, deliverable_kind, evidence_kind, role) in cases {
+            let contract = TaskContract::from_request(request);
+            let objective = contract.objective_contract();
+            assert_eq!(
+                objective.deliverable_kind, deliverable_kind,
+                "request={request}"
+            );
+            assert_eq!(objective.evidence_kind, evidence_kind, "request={request}");
+            let evidence = EvidenceSet::new();
+            let excerpts = ArtifactExcerpts::new();
+            let repair_state = VerifierRepairState::None;
+            let inputs = ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &[],
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            };
+
+            assert!(
+                matches!(
+                    objective_deliverable_stage(&inputs, &observed_artifacts(&evidence)),
+                    ObjectiveLifecycleStage::MissingDeliverable { ref missing, .. }
+                        if missing == &vec![role]
+                ),
+                "request={request}"
+            );
+        }
     }
 
     #[test]
