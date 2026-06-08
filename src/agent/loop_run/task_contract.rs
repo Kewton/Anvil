@@ -6,7 +6,7 @@ use super::contract_request_signals::{
 use super::project_profile::ProjectProfileConfirmation;
 use super::project_profile_projection::{
     ProfileForbiddenRoles, ProjectProfileContractInputs, adopt_contract_task_kind,
-    contract_inputs_from_confirmation,
+    apply_profile_contract_inputs, contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
 use crate::tools::bash::BashCommandClass;
@@ -813,19 +813,6 @@ impl ProjectIntent {
             verification,
             confidence,
         }
-    }
-
-    fn apply_profile_contract_inputs(&mut self, inputs: &ProjectProfileContractInputs) {
-        if let Some(language) = inputs.language {
-            self.language = Some(language);
-        }
-        if let Some(shape) = inputs.shape {
-            self.shape = Some(shape);
-        }
-        if let Some(verification) = inputs.verification {
-            self.verification = verification;
-        }
-        self.confidence = self.confidence.max(inputs.confidence);
     }
 
     fn verification_required(self) -> bool {
@@ -3142,7 +3129,7 @@ impl TaskContract {
         let mut project_intent = ProjectIntent::from_request(request_for_inference);
         let project_profile_inputs = contract_inputs_from_confirmation(project_profile);
         if let Some(inputs) = &project_profile_inputs {
-            project_intent.apply_profile_contract_inputs(inputs);
+            apply_profile_contract_inputs(&mut project_intent, inputs);
         }
         let mut intent = project_intent.intent;
         let request_inputs =
@@ -8286,7 +8273,7 @@ mod tests {
         )];
         let excerpts = build_excerpts(&[(
             ArtifactRole::UsageDocs,
-            "## Checklist\n- record pwd\n## Validation\n- record ls\n## Risk\nLow local-only risk.",
+            "## Current Directory\n/private/tmp/anvil-ops\n\n## File List\nops\n\n## Checklist\n- [x] Ran `pwd`\n- [x] Ran `ls`\n\n## Acceptance Criteria\n- [x] `pwd` command executed and output captured\n- [x] `ls` command executed and output captured",
         )]);
         let repair_state = VerifierRepairState::None;
         let artifact_only = plan_artifact_recovery(ArtifactRecoveryInputs {

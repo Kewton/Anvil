@@ -11,7 +11,7 @@ use super::project_profile::{
 };
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, ObjectiveDeliverableKind, ObjectiveEvidenceKind,
-    ProjectLanguage, ProjectShape, TaskContract, TaskKind, VerificationRequirement,
+    ProjectIntent, ProjectLanguage, ProjectShape, TaskContract, TaskKind, VerificationRequirement,
     preferred_runner_for_language,
 };
 
@@ -110,6 +110,22 @@ pub(super) fn contract_inputs_from_confirmation(
         forbids_usage_docs: forbids_usage_docs_artifact(profile),
         confidence: profile.confidence,
     })
+}
+
+pub(super) fn apply_profile_contract_inputs(
+    project_intent: &mut ProjectIntent,
+    inputs: &ProjectProfileContractInputs,
+) {
+    if let Some(language) = inputs.language {
+        project_intent.language = Some(language);
+    }
+    if let Some(shape) = inputs.shape {
+        project_intent.shape = Some(shape);
+    }
+    if let Some(verification) = inputs.verification {
+        project_intent.verification = verification;
+    }
+    project_intent.confidence = project_intent.confidence.max(inputs.confidence);
 }
 
 pub(super) fn should_confirm_project_profile(first_pass: &TaskContract) -> bool {
@@ -387,6 +403,7 @@ fn artifact_obligations(
 #[cfg(test)]
 mod tests {
     use super::super::project_profile::parse_project_profile_confirmation;
+    use super::super::task_contract::{ProjectIntent, ProjectLanguage, ProjectShape};
     use super::*;
 
     fn node_csv_markdown_prompt() -> &'static str {
@@ -499,6 +516,39 @@ npm test
         assert!(inputs.forbids_implementation);
         assert!(inputs.forbids_tests);
         assert!(inputs.forbids_setup);
+    }
+
+    #[test]
+    fn profile_contract_inputs_apply_to_project_intent_in_projection_layer() {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"cli",
+                "deliverable_kind":"code",
+                "primary_artifacts":["stats.py"],
+                "forbidden_artifacts":[],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":true,
+                "preferred_runner":"pytest",
+                "confidence":0.95,
+                "reason":"Python CLI with tests"
+            }"#,
+        )
+        .expect("profile");
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+        let mut intent = ProjectIntent::from_request("Create a tiny utility.");
+
+        apply_profile_contract_inputs(&mut intent, &inputs);
+
+        assert_eq!(intent.language, Some(ProjectLanguage::Python));
+        assert_eq!(intent.shape, Some(ProjectShape::Cli));
+        assert_eq!(
+            intent.verification,
+            VerificationRequirement::Required {
+                preferred_runner: Some("pytest")
+            }
+        );
+        assert!(intent.confidence >= 0.95);
     }
 
     #[test]
