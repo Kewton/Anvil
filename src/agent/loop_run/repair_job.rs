@@ -27,6 +27,7 @@ use super::repair_brief::AllowedChangeKind;
 use super::repair_packet::{
     CorrectionKind, DeliverableFailureDomain, RepairPacket, obligation_id_for_parts,
 };
+use super::repair_target_decision::{RepairTargetAuthority, RepairTargetDecision};
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::{ArtifactRole, DeliverableKind, RecoveryTargetHint, TaskContract};
@@ -288,6 +289,9 @@ pub(super) struct RepairJob {
     /// v0.4.16: bounded event history for the repair lifecycle. This is
     /// controller state only; it is not serialized into sessions.
     pub(super) lifecycle_events: Vec<RepairJobEvent>,
+    /// Latest controller-applied patch undo record. This is consumed only when
+    /// verifier rerun evidence proves the patch worsened the objective.
+    pub(super) pending_patch_undo: Option<PendingRepairPatchUndo>,
     /// v0.4.16: normalized reject ledger used by `next_action()` to avoid
     /// repeating the same invalid patch family.
     pub(super) rejected_attempts: Vec<RejectedAttempt>,
@@ -661,6 +665,14 @@ impl RepairAttemptKey {
             correction_kind: Some(packet.correction_kind),
         }
     }
+
+    fn to_target_hint(&self) -> RecoveryTargetHint {
+        RecoveryTargetHint {
+            role: self.role,
+            path: self.path.clone(),
+            reason: "applied repair target".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +825,12 @@ pub(super) struct RejectedAttempt {
     pub(super) reason: RejectedAttemptReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingRepairPatchUndo {
+    pub(super) key: RepairAttemptKey,
+    pub(super) undo: super::repair_patch_executor::AppliedRepairPatchUndo,
+}
+
 /// v0.4.16: structured events consumed by the repair lifecycle. They are
 /// intentionally compact and closed over enum values so verifier/LLM text does
 /// not become controller state.
@@ -829,6 +847,9 @@ pub(super) enum RepairJobEvent {
         reason: RejectedAttemptReason,
     },
     PatchApplied {
+        key: RepairAttemptKey,
+    },
+    PatchReverted {
         key: RepairAttemptKey,
     },
     VerifierObserved {
@@ -1008,6 +1029,7 @@ impl RepairJob {
             repair_target_attempt_outcomes: Vec::new(),
             exhausted_repair_targets: Vec::new(),
             lifecycle_events: Vec::new(),
+            pending_patch_undo: None,
             rejected_attempts: Vec::new(),
             no_progress_policy: NoProgressRecoveryPolicy::new(),
         }
@@ -1062,6 +1084,15 @@ impl RepairJob {
                     let path = key.path.clone();
                     self.no_progress_policy
                         .record_no_progress(&scope, role, &path);
+                }
+            }
+            RepairJobEvent::PatchReverted { key } => {
+                if self
+                    .pending_patch_undo
+                    .as_ref()
+                    .is_some_and(|pending| pending.key == *key)
+                {
+                    self.pending_patch_undo = None;
                 }
             }
             RepairJobEvent::PatchApplied { .. } | RepairJobEvent::VerifierObserved { .. } => {}
@@ -1276,6 +1307,27 @@ impl RepairJob {
         )
     }
 
+    fn latest_applied_patch_key(&self) -> Option<&RepairAttemptKey> {
+        let mut latest_apply_was_reverted = false;
+        self.lifecycle_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                RepairJobEvent::PatchReverted { .. } => {
+                    latest_apply_was_reverted = true;
+                    None
+                }
+                RepairJobEvent::PatchApplied { key } => {
+                    if latest_apply_was_reverted {
+                        None
+                    } else {
+                        Some(key)
+                    }
+                }
+                _ => None,
+            })
+    }
+
     fn push_rejected_attempt(&mut self, attempt: RejectedAttempt) {
         if self.rejected_attempts.len() >= MAX_REJECTED_ATTEMPTS {
             self.rejected_attempts.remove(0);
@@ -1372,6 +1424,7 @@ impl RepairJob {
                 self.request_diagnostic_or_safe_stop(RepairTerminalReason::DiagnosticUnavailable),
             ),
             RepairJobEvent::PatchApplied { .. } => Some(RepairNextAction::RerunVerifier),
+            RepairJobEvent::PatchReverted { .. } => Some(RepairNextAction::RerunVerifier),
             RepairJobEvent::VerifierObserved { delta } => {
                 self.next_action_for_verifier_delta(*delta)
             }
@@ -1412,33 +1465,104 @@ impl RepairJob {
     }
 
     fn current_repair_target_hint_for_next_action(&self) -> Option<RecoveryTargetHint> {
-        if let Some(target) = self
-            .correction_job
+        self.current_repair_target_decision().target_hint()
+    }
+
+    pub(super) fn current_repair_target_decision(&self) -> RepairTargetDecision {
+        let failure_context = super::repair_operator::FailureContext::from_repair_job(Some(self));
+        let selection = super::repair_operator::select(
+            super::repair_operator::classify(&failure_context),
+            failure_context.target_role,
+        );
+        let preferred_role = if selection.candidates.is_empty() {
+            None
+        } else {
+            selection
+                .single_candidate_target_role()
+                .or(selection.target_role)
+        };
+        let (target_hint, authority) = self
+            .current_repair_target_hint_matching_role(preferred_role)
+            .or_else(|| self.current_repair_target_hint_legacy_order())
+            .unwrap_or((None, RepairTargetAuthority::None));
+        let target_role = target_hint
             .as_ref()
-            .and_then(CorrectionJob::target_hint)
-        {
-            return Some(target);
-        }
-        if let Some(target) = self.current_unexhausted_semantic_target() {
-            return Some(target.clone());
-        }
-        if let Some(target) = self.current_unexhausted_semantic_changed_file_target() {
-            return Some(target.clone());
-        }
-        if let Some(target) = self.current_unexhausted_semantic_observed_target() {
-            return Some(target.clone());
-        }
-        self.assessment
+            .map(|hint| hint.role)
+            .or(preferred_role);
+        RepairTargetDecision::new(
+            selection.failure_class,
+            target_role,
+            target_hint,
+            authority,
+            selection.candidates,
+        )
+    }
+
+    fn current_repair_target_hint_matching_role(
+        &self,
+        role: Option<ArtifactRole>,
+    ) -> Option<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
+        let role = role?;
+        self.current_repair_target_candidates()
+            .into_iter()
+            .find(|(hint, _)| hint.as_ref().is_some_and(|hint| hint.role == role))
+    }
+
+    fn current_repair_target_hint_legacy_order(
+        &self,
+    ) -> Option<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
+        self.current_repair_target_candidates()
+            .into_iter()
+            .find(|(hint, _)| hint.is_some())
+    }
+
+    fn current_repair_target_candidates(
+        &self,
+    ) -> Vec<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
+        let assessment_plan_target = self.assessment.as_ref().and_then(|assessment| {
+            assessment
+                .repair_plan
+                .get(self.applied_repair_intents.len())
+                .cloned()
+        });
+        let assessment_hint = self
+            .assessment
             .as_ref()
-            .and_then(|assessment| {
-                assessment
-                    .repair_plan
-                    .get(self.applied_repair_intents.len())
-                    .cloned()
-                    .or_else(|| assessment.repair_target_hint.clone())
-            })
-            .or_else(|| self.repair_target_hint.clone())
-            .or_else(|| self.target_hint.clone())
+            .and_then(|assessment| assessment.repair_target_hint.clone());
+        vec![
+            (
+                self.correction_job
+                    .as_ref()
+                    .and_then(CorrectionJob::target_hint),
+                RepairTargetAuthority::CorrectionJob,
+            ),
+            (
+                self.current_unexhausted_semantic_target().cloned(),
+                RepairTargetAuthority::SemanticCluster,
+            ),
+            (
+                self.current_unexhausted_semantic_changed_file_target()
+                    .cloned(),
+                RepairTargetAuthority::SemanticChangedFile,
+            ),
+            (
+                self.current_unexhausted_semantic_observed_target().cloned(),
+                RepairTargetAuthority::SemanticObservedTarget,
+            ),
+            (
+                assessment_plan_target,
+                RepairTargetAuthority::AssessmentPlan,
+            ),
+            (assessment_hint, RepairTargetAuthority::AssessmentHint),
+            (
+                self.repair_target_hint.clone(),
+                RepairTargetAuthority::RepairJobHint,
+            ),
+            (
+                self.target_hint.clone(),
+                RepairTargetAuthority::InitialFailureHint,
+            ),
+        ]
     }
 
     pub(super) fn begin_next_repair_step(&mut self) -> RepairStep {
@@ -2637,17 +2761,15 @@ pub(super) fn apply_verifier_rerun_observation(
     let previous_cluster_id = previous_context
         .and_then(|context| context.semantic_plan.as_ref())
         .map(|plan| plan.failure_cluster_id.clone());
-    let previous_repair_target_hint = previous_context
-        .and_then(verifier_repair_effective_target_hint)
-        .cloned();
+    let previous_applied_patch_key = previous_repair_attempt_key_for_rerun(previous_context);
     let target_reassessment_key = target_reassessment_key_after_rerun(
         previous_context,
-        previous_repair_target_hint.as_ref(),
+        previous_applied_patch_key.as_ref(),
         repair_context,
     );
     let applied_outcome_promotion = record_applied_repair_outcome_for_rerun(
         repair_context,
-        previous_repair_target_hint.as_ref(),
+        previous_applied_patch_key.as_ref(),
     );
     apply_semantic_repair_dispatch_after_rerun(repair_context, previous_cluster_id.as_ref());
     if let Some(key) = target_reassessment_key {
@@ -2660,15 +2782,31 @@ pub(super) fn apply_verifier_rerun_observation(
     applied_outcome_promotion
 }
 
+fn previous_repair_attempt_key_for_rerun(
+    previous_context: Option<&RepairJob>,
+) -> Option<RepairAttemptKey> {
+    let previous = previous_context?;
+    previous.latest_applied_patch_key().cloned().or_else(|| {
+        verifier_repair_effective_target_hint(previous)
+            .map(|target_hint| RepairAttemptKey::from_target(target_hint, None))
+    })
+}
+
 fn target_reassessment_key_after_rerun(
     previous_context: Option<&RepairJob>,
-    previous_repair_target_hint: Option<&RecoveryTargetHint>,
+    previous_applied_patch_key: Option<&RepairAttemptKey>,
     repair_context: &RepairJob,
 ) -> Option<RepairAttemptKey> {
     let previous = previous_context?;
-    let target_hint = previous_repair_target_hint?;
+    let applied_key = previous_applied_patch_key?;
     if previous.applied_repair_intents.is_empty() {
         return None;
+    }
+    if matches!(
+        repair_context.rerun_outcome,
+        Some(VerifierRepairRerunOutcome::Worsened)
+    ) {
+        return Some(applied_key.clone());
     }
     if repair_context.repair_attempt < 2 {
         return None;
@@ -2682,23 +2820,27 @@ fn target_reassessment_key_after_rerun(
     ) {
         return None;
     }
-    Some(RepairAttemptKey::from_target(target_hint, None))
+    Some(applied_key.clone())
 }
 
 fn record_applied_repair_outcome_for_rerun(
     repair_context: &mut RepairJob,
-    previous_repair_target_hint: Option<&RecoveryTargetHint>,
+    previous_applied_patch_key: Option<&RepairAttemptKey>,
 ) -> Option<PromotionResult> {
     let kind = repair_attempt_outcome_kind_from_rerun(repair_context.rerun_outcome?);
     let plan = repair_context.semantic_plan.as_ref()?;
+    let attempted_role = previous_applied_patch_key
+        .map(|key| key.role)
+        .unwrap_or(plan.preferred_repair_role);
     let outcome = RepairAttemptOutcome {
         cluster: plan.failure_cluster_id.clone(),
-        role: plan.preferred_repair_role,
+        role: attempted_role,
         kind,
     };
-    Some(match previous_repair_target_hint {
-        Some(target_hint) => {
-            repair_context.record_repair_attempt_outcome_for_target(outcome, target_hint)
+    Some(match previous_applied_patch_key {
+        Some(key) => {
+            let target_hint = key.to_target_hint();
+            repair_context.record_repair_attempt_outcome_for_target(outcome, &target_hint)
         }
         None => repair_context.record_repair_attempt_outcome(outcome),
     })
@@ -2942,6 +3084,7 @@ pub(super) fn verifier_repair_context_from_failure(
         lifecycle_events: previous_context
             .map(|context| context.lifecycle_events.clone())
             .unwrap_or_default(),
+        pending_patch_undo: previous_context.and_then(|context| context.pending_patch_undo.clone()),
         rejected_attempts: previous_context
             .map(|context| context.rejected_attempts.clone())
             .unwrap_or_default(),
@@ -4290,6 +4433,36 @@ mod tests {
     }
 
     #[test]
+    fn patch_reverted_clears_pending_undo_and_reruns_verifier() {
+        let target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let key = RepairAttemptKey::from_target(
+            &target,
+            Some(AllowedChangeKind::FixImplementationBehavior),
+        );
+        let undo = super::super::repair_patch_executor::AppliedRepairPatchUndo {
+            relative_path: target.path.clone(),
+            canonical_path: std::path::PathBuf::from("/tmp/app-main.py"),
+            preimage_contents: "old".to_string(),
+            preimage_hash: "pre".to_string(),
+            postimage_hash: "post".to_string(),
+        };
+        let mut job = RepairJob {
+            pending_patch_undo: Some(PendingRepairPatchUndo {
+                key: key.clone(),
+                undo,
+            }),
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchApplied { key: key.clone() });
+        job.apply_event(RepairJobEvent::PatchReverted { key });
+
+        assert!(job.pending_patch_undo.is_none());
+        assert_eq!(job.latest_applied_patch_key(), None);
+        assert_eq!(job.next_action(), RepairNextAction::RerunVerifier);
+    }
+
+    #[test]
     fn synthetic_verifier_e2e_malformed_diagnostics_end_in_safe_stop() {
         let mut job = RepairJob::new_for_test();
         for attempt in 0
@@ -4935,6 +5108,109 @@ mod tests {
             })
         );
         assert_eq!(current.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn worsened_after_repair_forces_target_reassessment_even_when_signature_changes() {
+        let (mut previous, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        previous.failure_signature = "old-signature".to_string();
+        previous.repair_attempt = 1;
+        previous.applied_repair_intents = vec!["intent-fingerprint".to_string()];
+        previous.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(targets[0].clone()),
+            repair_plan: vec![targets[0].clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+
+        let mut current = RepairJob {
+            failure_signature: "new-worse-signature".to_string(),
+            previous_failure_signature: Some(previous.failure_signature.clone()),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::Worsened),
+            repair_attempt: 1,
+            lifecycle_events: Vec::new(),
+            ..previous.clone()
+        };
+
+        let _ = apply_verifier_rerun_observation(&mut current, Some(&previous));
+
+        assert_eq!(
+            current.lifecycle_events.last(),
+            Some(&RepairJobEvent::TargetReassessmentRequired {
+                key: RepairAttemptKey::from_target(&targets[0], None),
+            })
+        );
+        assert!(current.no_progress_selection_banned(ArtifactRole::Implementation, "src/lib.rs"));
+        assert_eq!(current.next_action(), RepairNextAction::Replan);
+    }
+
+    #[test]
+    fn target_reassessment_uses_applied_patch_key_not_next_repair_plan_candidate() {
+        let (mut previous, targets) = semantic_repair_job_with_targets_for_test(
+            "A",
+            ArtifactRole::Implementation,
+            &["src/lib.rs"],
+        );
+        let impl_target = targets[0].clone();
+        let generated_test_target = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/test_main.py".to_string(),
+            reason: "next repair-plan candidate".to_string(),
+        };
+        let applied_impl_key = RepairAttemptKey::from_target(&impl_target, None);
+        previous.failure_signature = "same-failure-after-impl-patch".to_string();
+        previous.repair_attempt = 1;
+        previous.applied_repair_intents = vec!["impl-intent".to_string()];
+        previous.lifecycle_events = vec![RepairJobEvent::PatchApplied {
+            key: applied_impl_key.clone(),
+        }];
+        previous.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(ArtifactRole::Implementation),
+            needed_reads: Vec::new(),
+            repair_target_hint: Some(impl_target),
+            repair_plan: vec![targets[0].clone(), generated_test_target.clone()],
+            summary: None,
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+
+        assert_eq!(
+            verifier_repair_effective_target_hint(&previous),
+            Some(&generated_test_target),
+            "legacy repair-plan cursor points at the next candidate after one applied intent"
+        );
+
+        let mut current = RepairJob {
+            failure_signature: previous.failure_signature.clone(),
+            previous_failure_signature: Some(previous.failure_signature.clone()),
+            rerun_outcome: Some(VerifierRepairRerunOutcome::SameFailureRemaining),
+            repair_attempt: 2,
+            lifecycle_events: Vec::new(),
+            ..previous.clone()
+        };
+
+        let _ = apply_verifier_rerun_observation(&mut current, Some(&previous));
+
+        assert_eq!(
+            current.lifecycle_events.last(),
+            Some(&RepairJobEvent::TargetReassessmentRequired {
+                key: applied_impl_key
+            })
+        );
+        assert!(current.no_progress_selection_banned(ArtifactRole::Implementation, "src/lib.rs"));
+        assert!(
+            !current.no_progress_selection_banned(ArtifactRole::Test, "tests/test_main.py"),
+            "the next repair-plan candidate must remain available for reassessment"
+        );
     }
 
     #[test]
@@ -7400,6 +7676,78 @@ mod tests {
             job.next_action(),
             RepairNextAction::RequestPatch { target_hint }
                 if target_hint.role == cargo_target.role && target_hint.path == cargo_target.path
+        ));
+    }
+
+    #[test]
+    fn repair_target_decision_prefers_semantic_operator_role_over_stale_correction_target() {
+        let mut report = multi_cluster_report_fixture(VerifierDiagnosticFailureKind::TestBug, 1);
+        report.preferred_repair_role = super::super::task_contract::ArtifactRole::Test;
+        let test_target = recovery_target(
+            super::super::task_contract::ArtifactRole::Test,
+            "tests/test_password_strength.py",
+        );
+        report.failure_clusters[0].admitted_cluster_targets = vec![test_target.clone()];
+
+        let mut job = job_with_first_cluster_plan(&report);
+        let stale_impl_target = impl_hint("password_strength.py");
+        job.assessment = Some(super::super::VerifierRepairAssessment {
+            failure_kind: VerifierDiagnosticFailureKind::AssertionMismatch,
+            failure_type: VerifierFailureType::Unknown,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Implementation),
+            needed_reads: vec![stale_impl_target.clone()],
+            repair_target_hint: Some(stale_impl_target.clone()),
+            repair_plan: vec![stale_impl_target],
+            summary: Some("legacy diagnostic target points at implementation".to_string()),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        });
+        let contract = super::super::task_contract::TaskContract::from_request(
+            "Implement a password strength checker and keep the generated tests aligned.",
+        );
+        job.sync_correction_job_from_current_assessment(Some(&contract));
+
+        let correction_target = job
+            .correction_job
+            .as_ref()
+            .and_then(CorrectionJob::target_hint)
+            .expect("legacy correction target");
+        assert_eq!(
+            correction_target.role,
+            super::super::task_contract::ArtifactRole::Implementation
+        );
+
+        let decision = job.current_repair_target_decision();
+        assert_eq!(
+            decision.failure_class,
+            Some(super::super::repair_operator::FailureClass::TestArtifactMismatch)
+        );
+        assert_eq!(
+            decision.target_role,
+            Some(super::super::task_contract::ArtifactRole::Test)
+        );
+        assert_eq!(
+            decision.authority,
+            super::super::repair_target_decision::RepairTargetAuthority::SemanticCluster
+        );
+        assert_eq!(
+            decision
+                .target_hint
+                .as_ref()
+                .map(|hint| (hint.role, hint.path.as_str())),
+            Some((
+                super::super::task_contract::ArtifactRole::Test,
+                "tests/test_password_strength.py"
+            ))
+        );
+        assert!(
+            decision
+                .operator_candidates
+                .contains(&super::super::repair_operator::OperatorId::GeneratedTestExpectation)
+        );
+        assert!(matches!(
+            job.next_action(),
+            RepairNextAction::RequestPatch { target_hint }
+                if target_hint.role == test_target.role && target_hint.path == test_target.path
         ));
     }
 

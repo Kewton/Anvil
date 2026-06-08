@@ -1554,14 +1554,25 @@ pub(super) fn filter_against_request(
 /// Pure fn / no I/O.
 fn extract_behavior_goal(scan: &str) -> Option<BoundedLabelWithExcerpt> {
     let normalized = normalize_control_chars(scan);
+    if let Some(goal) = extract_first_behavior_goal_sentence(&normalized, looks_like_spec_section) {
+        return Some(goal);
+    }
+    extract_first_behavior_goal_sentence(&normalized, |trimmed| {
+        let lower = trimmed.to_ascii_lowercase();
+        contains_imperative_verb(&lower)
+    })
+}
+
+fn extract_first_behavior_goal_sentence(
+    normalized: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> Option<BoundedLabelWithExcerpt> {
     for sentence in split_into_sentences(&normalized) {
         let trimmed = sentence.trim();
         if trimmed.is_empty() || looks_like_negation(trimmed) {
             continue;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        // 最低 1 つの imperative verb / operation keyword を含む文だけを採用。
-        if !contains_imperative_verb(&lower) {
+        if !predicate(trimmed) {
             continue;
         }
         if contains_redaction_sentinel(trimmed) {
@@ -1578,6 +1589,22 @@ fn extract_behavior_goal(scan: &str) -> Option<BoundedLabelWithExcerpt> {
         });
     }
     None
+}
+
+fn looks_like_spec_section(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    const STRONG_SPEC_MARKERS: &[&str] = &[
+        "contract:",
+        "spec:",
+        "specification:",
+        "requirements:",
+        "要件:",
+        "仕様:",
+        "仕様は",
+    ];
+    STRONG_SPEC_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker) || sentence.contains(marker))
 }
 
 /// Issue #665 — Task 3.2: non-goal 文（do not / don't / は対象外 / しない / 不要 /
@@ -2200,6 +2227,29 @@ mod tests {
             goal.label
         );
         assert!(goal.excerpt.is_some());
+    }
+
+    #[test]
+    fn issue665_extract_behavior_goal_prefers_explicit_contract_sentence() {
+        let c = extract(
+            "TDD task. First create pytest tests in tests/test_password_strength.py. \
+             Scoring contract: empty string is 0; add 1 point each for length at least 8, uppercase, lowercase, digit, symbol; cap at 5.",
+        );
+        let goal = c.behavior_goal.expect("behavior_goal should be Some");
+        assert!(
+            goal.excerpt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Scoring contract"),
+            "goal = {goal:?}"
+        );
+        assert!(
+            goal.excerpt
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cap at 5"),
+            "goal = {goal:?}"
+        );
     }
 
     /// Phase 3 / Task 3.1: 否定文だけの request では behavior_goal は抽出しない。

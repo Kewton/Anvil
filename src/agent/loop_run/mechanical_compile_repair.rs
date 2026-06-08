@@ -105,26 +105,30 @@ pub(super) fn try_apply_mechanical_compile_repair(
         candidate.updated_contents,
         fingerprint,
     );
-    if let Err(err) = super::repair_patch_executor::apply_validated_repair_edit(&edit) {
-        log_mechanical_repair_skipped(agent, target_hint, candidate.kind, "apply_failed");
-        log_llm_event(
-            "agent.verifier_mechanical_repair.apply_failed",
-            serde_json::json!({
-                "session_id": agent.session_store.session_id(),
-                "path": target_hint.path,
-                "kind": candidate.kind.label(),
-                "error": mask_secrets(&err),
-            }),
-        );
-        return MechanicalCompileRepairOutcome::Skipped {
-            reason: "apply_failed",
-        };
-    }
+    let undo = match super::repair_patch_executor::apply_validated_repair_edit(&edit) {
+        Ok(undo) => undo,
+        Err(err) => {
+            log_mechanical_repair_skipped(agent, target_hint, candidate.kind, "apply_failed");
+            log_llm_event(
+                "agent.verifier_mechanical_repair.apply_failed",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "path": target_hint.path,
+                    "kind": candidate.kind.label(),
+                    "error": mask_secrets(&err),
+                }),
+            );
+            return MechanicalCompileRepairOutcome::Skipped {
+                reason: "apply_failed",
+            };
+        }
+    };
     super::verifier_orchestration::record_controller_verifier_repair_edit(
         agent,
         &edit.relative_path,
         &edit.fingerprint,
         target_hint,
+        undo,
     );
     log_llm_event(
         "agent.verifier_mechanical_repair.applied",

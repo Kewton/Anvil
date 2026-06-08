@@ -721,12 +721,9 @@ fn contract_coverage_needles(contract: &TaskContract) -> Vec<String> {
     // "add" or "create". Domain terms and explicit criteria are safer
     // static signals for generated-test coverage.
     if let Some(terms) = contract.required_behavior.domain_terms.as_ref() {
-        needles.extend(
-            terms
-                .iter()
-                .map(|term| term.to_ascii_lowercase())
-                .filter(|term| coverage_term_is_informative(term)),
-        );
+        for term in terms {
+            needles.extend(coverage_needles_for_domain_term(term));
+        }
     }
     for criterion in contract
         .required_artifact_identities
@@ -744,6 +741,24 @@ fn contract_coverage_needles(contract: &TaskContract) -> Vec<String> {
     needles.sort();
     needles.dedup();
     needles
+}
+
+fn coverage_needles_for_domain_term(term: &str) -> Vec<String> {
+    let lower = term.to_ascii_lowercase();
+    let normalized = lower
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.')
+        .to_string();
+    let mut out = Vec::new();
+    if coverage_term_is_informative(&normalized) {
+        out.push(normalized.clone());
+    }
+    if let Some(leaf) = normalized.rsplit('.').find(|part| !part.is_empty())
+        && leaf != normalized
+        && coverage_term_is_informative(leaf)
+    {
+        out.push(leaf.to_string());
+    }
+    out
 }
 
 fn explicit_io_coverage_needles(contract: &TaskContract) -> Vec<&'static str> {
@@ -1261,6 +1276,76 @@ fn unrelated_math() {
             GeneratedTestPreflightFailureKind::MissingContractCoverage
         );
         assert_eq!(report.rejected[0].failure_kind.as_str(), "test_bug");
+    }
+
+    #[test]
+    fn report_admits_tdd_callable_signature_tests_with_contract_terms() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_test_file(
+            root.path(),
+            "tests/test_password_strength.py",
+            r#"import pytest
+from password_strength import score_password
+
+
+def test_empty_string():
+    assert score_password("") == 0
+
+
+def test_length_at_least_8():
+    assert score_password("abcdefgh") == 1
+    assert score_password("abc") == 0
+
+
+def test_contains_uppercase():
+    assert score_password("Abcdefgh") >= 1
+    assert score_password("abcdefgh") == 0
+
+
+def test_contains_lowercase():
+    assert score_password("ABCDEFGH") == 0
+    assert score_password("Abcdefgh") >= 1
+
+
+def test_contains_digit():
+    assert score_password("abcdefgh") == 0
+    assert score_password("abcdefg1") >= 1
+
+
+def test_contains_symbol():
+    assert score_password("abcdefgh") == 0
+    assert score_password("abcdefg!") >= 1
+
+
+def test_combined_criteria():
+    assert score_password("Abcdefg1!") == 5
+
+
+def test_cap_at_5():
+    assert score_password("Abcdefg1!@#$%") == 5
+    assert score_password("A1!") == 3
+"#,
+        );
+        let contract = TaskContract::from_request(
+            "Create a Python project in this directory. Implement password_strength.score_password(password: str) -> int. Scoring contract: empty string is 0; add 1 point each for length at least 8, contains uppercase, contains lowercase, contains digit, contains symbol; cap at 5. Use TDD: create pytest tests covering empty input, each individual criterion, combined criteria, and the cap. Run pytest and keep the files minimal.",
+        );
+
+        let report = preflight_owned_test_artifacts_for_verifier(
+            root.path(),
+            &contract,
+            &["tests/test_password_strength.py".to_string()],
+        );
+
+        assert_eq!(
+            report.admitted,
+            vec!["tests/test_password_strength.py".to_string()],
+            "report={report:?}"
+        );
+        assert!(
+            report.rejected.is_empty(),
+            "unexpected preflight rejection: {:?}",
+            report.rejected
+        );
     }
 
     #[test]

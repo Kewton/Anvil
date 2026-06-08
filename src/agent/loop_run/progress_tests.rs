@@ -1289,6 +1289,50 @@ mod inner {
     }
 
     #[test]
+    fn verifier_repair_pass_prompt_surfaces_observed_expected_pairs_as_hard_boundary() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(
+            work_root.join("tests/test_password_strength.py"),
+            "def test_score():\n    assert score_password(\"abcdefgh\") == 1\n",
+        )
+        .unwrap();
+        let hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_password_strength.py".to_string(),
+            reason: "test expectation repair".to_string(),
+        };
+        let mut context = verifier_context_for("tests/test_password_strength.py");
+        context.output_excerpt =
+            r#"FAILED tests/test_password_strength.py::test_score > assert score_password("abcdefgh") == 1 E AssertionError: assert 2 == 1"#
+                .to_string();
+        context.target_hint = Some(hint.clone());
+        context.repair_target_hint = Some(hint.clone());
+        context.changed_file_hints = vec![hint.clone()];
+        if let Some(assessment) = context.assessment.as_mut() {
+            assessment.probable_cause_role = Some(hint.role);
+            assessment.needed_reads = vec![hint.clone()];
+            assessment.repair_target_hint = Some(hint.clone());
+            assessment.repair_plan = vec![hint.clone()];
+        }
+
+        let messages =
+            verifier_repair_pass_messages(work_root, &context, &hint, "fix tests", None).unwrap();
+        let payload = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(payload.contains("observed_expected_pairs"));
+        assert!(payload.contains("\"observed\":\"2\""));
+        assert!(payload.contains("\"expected\":\"1\""));
+        assert!(payload.contains("observed_expected_pairs is the hard boundary"));
+        assert!(payload.contains("do not edit assertions absent from observed_expected_pairs"));
+    }
+
+    #[test]
     fn verifier_repair_pass_prompt_surfaces_repeated_signature_invariant() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();
@@ -1354,7 +1398,8 @@ mod inner {
         assert!(payload.contains("selected_target.role is test"));
         assert!(payload.contains("do not delete assertion lines"));
         assert!(payload.contains("prefer repairing test setup/isolation/imports"));
-        assert!(payload.contains("observed/expected pair appears in output_excerpt"));
+        assert!(payload.contains("observed_expected_pairs is the hard boundary"));
+        assert!(payload.contains("observed_expected_pairs or output_excerpt"));
         assert!(payload.contains("test-local fixture or fake state"));
         assert!(payload.contains("public behavior"));
         assert!(payload.contains("missing internal symbol"));

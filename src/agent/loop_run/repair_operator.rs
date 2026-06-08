@@ -279,6 +279,22 @@ impl OperatorSelection {
             .find(|descriptor| descriptor.kind == OperatorKind::Deterministic)
             .map(|descriptor| descriptor.id)
     }
+
+    /// The single target role implied by the selected candidate set, if all
+    /// candidates agree. This is a typed projection for repair-target admission;
+    /// callers must still choose an admitted path separately.
+    pub(super) fn single_candidate_target_role(&self) -> Option<TargetRole> {
+        let mut roles = self
+            .candidates
+            .iter()
+            .filter_map(|id| descriptor_for(*id).map(|descriptor| descriptor.target_role));
+        let first = roles.next()?;
+        if roles.all(|role| role == first) {
+            Some(first)
+        } else {
+            None
+        }
+    }
 }
 
 /// Resolve a failure class (and optional target role) to its registered
@@ -328,11 +344,11 @@ impl FailureContext {
             format!("{error_kind}\n{}", job.output_excerpt)
         };
         let failure_kind = job.semantic_plan.as_ref().map(|plan| plan.semantic_cause);
-        let target_role = job.target_hint.as_ref().map(|hint| hint.role).or_else(|| {
-            job.semantic_plan
-                .as_ref()
-                .map(|plan| plan.preferred_repair_role)
-        });
+        let target_role = job
+            .semantic_plan
+            .as_ref()
+            .map(|plan| plan.preferred_repair_role)
+            .or_else(|| job.target_hint.as_ref().map(|hint| hint.role));
         Self {
             failure_kind,
             diagnostic,

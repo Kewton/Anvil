@@ -94,8 +94,7 @@ fn observed_assert_update_matches_repair_context(
         return false;
     }
 
-    let diagnostic_text = repair_context_diagnostic_text(context);
-    let observed_pairs = observed_assert_equal_pairs(&diagnostic_text);
+    let observed_pairs = observed_pairs_for_repair_context(context);
     if observed_pairs.is_empty() {
         return false;
     }
@@ -143,8 +142,7 @@ fn disconnected_fixture_assertion_update_matches(
     if added_asserts.len() < deleted_asserts.len() {
         return false;
     }
-    let diagnostic_text = repair_context_diagnostic_text(context);
-    let observed_pairs = observed_assert_equal_pairs(&diagnostic_text);
+    let observed_pairs = observed_pairs_for_repair_context(context);
     deleted_asserts.iter().all(|line| {
         let fixture_observation = disconnected_fixtures
             .iter()
@@ -199,6 +197,21 @@ fn repair_context_diagnostic_text(context: &super::repair_job::RepairJob) -> Str
         context.output_excerpt,
         context.repair_error.as_deref().unwrap_or("")
     )
+}
+
+fn observed_pairs_for_repair_context(
+    context: &super::repair_job::RepairJob,
+) -> Vec<(String, String)> {
+    let pairs = super::failure_packet::FailurePacket::from_repair_job(context)
+        .observed_expected_pairs
+        .into_iter()
+        .map(|pair| (pair.observed, pair.expected))
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        observed_assert_equal_pairs(&repair_context_diagnostic_text(context))
+    } else {
+        pairs
+    }
 }
 
 fn missing_import_name_from_output(output: &str) -> Option<(String, String)> {
@@ -276,7 +289,47 @@ fn identifier_is_safe(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::VerifierDiagnosticFailureKind;
+    use super::super::repair_job::{RepairJob, SemanticRepairPlan};
+    use super::super::semantic_failure::parse_semantic_failure_report;
+    use super::super::spec_authority::SpecAuthority;
+    use super::super::task_contract::ArtifactRole;
     use super::*;
+
+    fn test_bug_repair_job_with_output(output_excerpt: &str) -> RepairJob {
+        let report = parse_semantic_failure_report(&serde_json::json!({
+            "failure_kind": "test_bug",
+            "confidence": 0.95,
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "generated test expected literals contradict explicit behavior",
+            "failure_clusters": [{
+                "observed": "implementation follows cumulative score",
+                "expected": "tests expect isolated criterion score",
+                "input_shape": "assert equal",
+                "assertion_shape": "assert_equal",
+                "involved_artifacts": ["test"],
+                "affected_cases": ["test_length_at_least_8"],
+            }],
+        }))
+        .expect("semantic report parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+
+        RepairJob {
+            output_excerpt: output_excerpt.to_string(),
+            semantic_plan: Some(SemanticRepairPlan {
+                semantic_report: report,
+                failure_cluster_id: cluster_id,
+                semantic_cause: VerifierDiagnosticFailureKind::TestBug,
+                spec_authority: SpecAuthority::UserRequest,
+                preferred_repair_role: ArtifactRole::Test,
+                repair_hypothesis: "generated test expected literals contradict explicit behavior"
+                    .to_string(),
+                expected_improvement: None,
+                assessment_generation_at_creation: 0,
+            }),
+            ..RepairJob::new_for_test()
+        }
+    }
 
     #[test]
     fn missing_import_parser_extracts_symbol_and_module() {
@@ -297,5 +350,41 @@ mod tests {
         assert!(source_imports_name_from_module(
             source, "app.main", "COUNTER"
         ));
+    }
+
+    #[test]
+    fn generated_test_expectation_repair_uses_structured_flattened_observed_pairs() {
+        let before = r#"
+def test_length_at_least_8():
+    assert score_password("abcdefgh") == 1
+    assert score_password("abc") == 0
+
+def test_contains_uppercase():
+    assert score_password("A") == 1
+    assert score_password("abc") == 0
+"#;
+        let after = r#"
+def test_length_at_least_8():
+    assert score_password("abcdefgh") == 2
+    assert score_password("abc") == 1
+
+def test_contains_uppercase():
+    assert score_password("A") == 1
+    assert score_password("abc") == 1
+"#;
+        let output = r#"FAILED tests/test_password_strength.py::test_length_at_least_8 > assert score_password("abcdefgh") == 1 E AssertionError: assert 2 == 1 E where 2 = score_password('abcdefgh') FAILED tests/test_password_strength.py::test_contains_uppercase > assert score_password("abc") == 0 E AssertionError: assert 1 == 0 E where 1 = score_password('abc')"#;
+        let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ],
+            &job,
+            before,
+            after,
+        );
+
+        assert!(filtered.is_empty());
     }
 }

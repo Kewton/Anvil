@@ -4376,6 +4376,7 @@ fn request_has_explicit_coding_subject(request: &str, lower: &str) -> bool {
         ],
     ) || mentions_stack_as_build_target(request, lower)
         || contains_implementation_file_hint(lower)
+        || contains_callable_signature_hint(lower)
 }
 
 /// Issue #919 (Decision #1): does the request name an explicit user-provided
@@ -4731,7 +4732,8 @@ pub(super) fn request_asks_for_implementation_artifact(
             "fix",
             "refactor",
         ],
-    ) || contains_any(request, &["作成", "開発", "実装", "修正", "構築"]);
+    ) || contains_dotted_callable_change_action(lower)
+        || contains_any(request, &["作成", "開発", "実装", "修正", "構築"]);
     let edit_action = production_action
         || contains_any(lower, &["write", "add", "update", "modify", "edit"])
         || contains_any(request, &["追加", "追記", "更新", "変更", "編集"]);
@@ -4774,7 +4776,8 @@ pub(super) fn request_asks_for_implementation_artifact(
             ],
         )
         || mentions_stack_as_build_target(request, lower)
-        || contains_implementation_file_hint(lower);
+        || contains_implementation_file_hint(lower)
+        || contains_callable_signature_hint(lower);
 
     if support_artifact_requested {
         production_action && code_subject
@@ -4854,6 +4857,9 @@ fn test_only_without_implementation_signal(
 }
 
 pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool {
+    if negated_artifact_list_contains(lower, &["tests", "test files", "test file"]) {
+        return true;
+    }
     contains_any(
         lower,
         &[
@@ -4899,6 +4905,43 @@ pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool
             "テストは禁止",
         ],
     )
+}
+
+fn negated_artifact_list_contains(lower: &str, artifact_tokens: &[&str]) -> bool {
+    const PREFIXES: &[&str] = &[
+        "do not create",
+        "do not write",
+        "do not add",
+        "do not implement",
+        "don't create",
+        "don't write",
+        "don't add",
+        "don't implement",
+    ];
+
+    PREFIXES.iter().any(|prefix| {
+        lower.match_indices(prefix).any(|(idx, _)| {
+            let clause = negated_artifact_clause(&lower[idx + prefix.len()..]);
+            artifact_tokens
+                .iter()
+                .any(|token| contains_ascii_token(clause, token))
+        })
+    })
+}
+
+fn negated_artifact_clause(after_prefix: &str) -> &str {
+    let sentence_end = after_prefix
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '.' | '\n' | '\r' | ';').then_some(idx))
+        .unwrap_or(after_prefix.len());
+    let sentence = &after_prefix[..sentence_end];
+    sentence
+        .split(" but ")
+        .next()
+        .unwrap_or(sentence)
+        .split(" however ")
+        .next()
+        .unwrap_or(sentence)
 }
 
 pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &str) -> bool {
@@ -6527,6 +6570,72 @@ fn contains_implementation_file_hint(lower: &str) -> bool {
     ]
     .iter()
     .any(|suffix| lower_contains_file_suffix(lower, suffix))
+}
+
+fn contains_callable_signature_hint(lower: &str) -> bool {
+    lower.contains('(')
+        && lower.contains(')')
+        && (lower.contains("->") || contains_dotted_callable_hint(lower))
+}
+
+fn contains_dotted_callable_change_action(lower: &str) -> bool {
+    dotted_callable_starts(lower).into_iter().any(|start| {
+        last_ascii_word(&lower[..start]).is_some_and(|word| {
+            matches!(
+                word,
+                "add" | "implement" | "create" | "write" | "update" | "modify"
+            )
+        })
+    })
+}
+
+fn contains_dotted_callable_hint(lower: &str) -> bool {
+    !dotted_callable_starts(lower).is_empty()
+}
+
+fn dotted_callable_starts(lower: &str) -> Vec<usize> {
+    lower
+        .match_indices('(')
+        .filter_map(|(paren_idx, _)| {
+            lower[paren_idx..].contains(')').then_some(())?;
+            dotted_identifier_start_before_paren(&lower[..paren_idx])
+        })
+        .collect()
+}
+
+fn dotted_identifier_start_before_paren(before_paren: &str) -> Option<usize> {
+    let trimmed = before_paren.trim_end();
+    if !trimmed
+        .chars()
+        .last()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let mut start = trimmed.len();
+    for (idx, ch) in trimmed.char_indices().rev() {
+        if ch == '.' || ch == '_' || ch.is_ascii_alphanumeric() {
+            start = idx;
+        } else {
+            break;
+        }
+    }
+    let token = &trimmed[start..];
+    let valid = token.contains('.')
+        && token.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        });
+    valid.then_some(start)
+}
+
+fn last_ascii_word(prefix: &str) -> Option<&str> {
+    prefix
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .next_back()
 }
 
 fn lower_contains_file_suffix(lower: &str, suffix: &str) -> bool {
@@ -8724,6 +8833,7 @@ mod tests {
             "Update README.md with validation steps. Do not create tests or code.",
             "Update README.md with validation steps. Do not write code or tests.",
             "Update README.md with validation steps. No code changes and no tests.",
+            "Create docs/runbook.md with exactly these sections: Overview, Setup, Rollback, Verification. This is a documentation-only task. Do not create source code, package files, or tests. Keep the content concise and concrete.",
         ];
 
         for request in cases {
@@ -8756,6 +8866,15 @@ mod tests {
     }
 
     #[test]
+    fn negated_artifact_list_stops_at_contrast_before_test_request() {
+        let request = "Create README.md. Do not create source code, but add tests for the documented command.";
+        let lower = request.to_ascii_lowercase();
+
+        assert!(!request_negates_test_artifacts(request, &lower));
+        assert!(request_asks_for_test_artifact(request, &lower));
+    }
+
+    #[test]
     fn test_only_contract_does_not_require_implementation() {
         let contract = TaskContract::from_request("FastAPIのテストコードを実装してください");
         let mut evidence = EvidenceSet::new();
@@ -8765,6 +8884,68 @@ mod tests {
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Verify);
         evidence.push(build_test());
         assert_eq!(contract.evaluate(&evidence), CompletionDecision::Done);
+    }
+
+    #[test]
+    fn tdd_callable_signature_requires_implementation_and_tests() {
+        let request = "Create a Python project in this directory. Implement password_strength.score_password(password: str) -> int. Scoring contract: empty string is 0; add 1 point each for length at least 8, contains uppercase, contains lowercase, contains digit, contains symbol; cap at 5. Use TDD: create pytest tests covering empty input, each individual criterion, combined criteria, and the cap. Run pytest and keep the files minimal.";
+        let lower = request.to_ascii_lowercase();
+        let contract = TaskContract::from_request(request);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Test));
+
+        assert!(request_asks_for_implementation_artifact(
+            request, &lower, true, false, false
+        ));
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert_eq!(
+            missing_labels(&contract.evaluate(&evidence)),
+            vec!["implementation"]
+        );
+    }
+
+    #[test]
+    fn feature_add_dotted_callable_requires_implementation_and_tests() {
+        let request = "In this existing Python project, add stats.median(numbers) with behavior: odd length returns the middle sorted value, even length returns the average of the two middle sorted values, and empty input raises ValueError. Preserve mean. Add pytest coverage for odd, even, unsorted, and empty input. Run pytest and keep changes minimal.";
+        let lower = request.to_ascii_lowercase();
+        let contract = TaskContract::from_request(request);
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit(RepoEditCategory::Test));
+
+        assert!(contains_callable_signature_hint(&lower));
+        assert!(contains_dotted_callable_change_action(&lower));
+        assert!(request_asks_for_implementation_artifact(
+            request, &lower, true, false, false
+        ));
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::Implementation)
+        );
+        assert!(contract.required_artifacts.contains(&ArtifactRole::Test));
+        assert_eq!(
+            missing_labels(&contract.evaluate(&evidence)),
+            vec!["implementation"]
+        );
+    }
+
+    #[test]
+    fn test_only_dotted_callable_coverage_does_not_require_implementation() {
+        let request = "Add pytest coverage for stats.median(numbers).";
+        let lower = request.to_ascii_lowercase();
+
+        assert!(contains_callable_signature_hint(&lower));
+        assert!(!contains_dotted_callable_change_action(&lower));
+        assert!(!request_asks_for_implementation_artifact(
+            request, &lower, true, false, false
+        ));
     }
 
     #[test]

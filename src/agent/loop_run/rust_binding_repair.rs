@@ -209,24 +209,28 @@ fn apply_prepared(agent: &mut Agent, prepared: PreparedBindingEdit) -> RustBindi
         updated_contents,
         fingerprint,
     );
-    if let Err(err) = super::repair_patch_executor::apply_validated_repair_edit(&edit) {
-        log_binding_repair_skipped(agent, operator, &edit.relative_path, "apply_failed");
-        log_llm_event(
-            "agent.verifier_rust_binding_repair.apply_failed",
-            serde_json::json!({
-                "session_id": agent.session_store.session_id(),
-                "operator": operator,
-                "path": mask_secrets(&edit.relative_path),
-                "error": mask_secrets(&err),
-            }),
-        );
-        return skipped("apply_failed");
-    }
+    let undo = match super::repair_patch_executor::apply_validated_repair_edit(&edit) {
+        Ok(undo) => undo,
+        Err(err) => {
+            log_binding_repair_skipped(agent, operator, &edit.relative_path, "apply_failed");
+            log_llm_event(
+                "agent.verifier_rust_binding_repair.apply_failed",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "operator": operator,
+                    "path": mask_secrets(&edit.relative_path),
+                    "error": mask_secrets(&err),
+                }),
+            );
+            return skipped("apply_failed");
+        }
+    };
     super::verifier_orchestration::record_controller_verifier_repair_edit(
         agent,
         &edit.relative_path,
         &edit.fingerprint,
         &target_hint,
+        undo,
     );
     log_llm_event(
         "agent.verifier_rust_binding_repair.applied",

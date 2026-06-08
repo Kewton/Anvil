@@ -365,24 +365,28 @@ pub(super) fn try_apply_cargo_dependency_repair(agent: &mut Agent) -> CargoDepen
         completion.contents,
         fingerprint,
     );
-    if let Err(err) = super::repair_patch_executor::apply_validated_repair_edit(&edit) {
-        log_cargo_dependency_skipped(agent, &added_label, "apply_failed");
-        log_llm_event(
-            "agent.verifier_cargo_dependency_repair.apply_failed",
-            serde_json::json!({
-                "session_id": agent.session_store.session_id(),
-                "path": MANIFEST_RELATIVE_PATH,
-                "added": added_label,
-                "error": mask_secrets(&err),
-            }),
-        );
-        return skipped("apply_failed");
-    }
+    let undo = match super::repair_patch_executor::apply_validated_repair_edit(&edit) {
+        Ok(undo) => undo,
+        Err(err) => {
+            log_cargo_dependency_skipped(agent, &added_label, "apply_failed");
+            log_llm_event(
+                "agent.verifier_cargo_dependency_repair.apply_failed",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "path": MANIFEST_RELATIVE_PATH,
+                    "added": added_label,
+                    "error": mask_secrets(&err),
+                }),
+            );
+            return skipped("apply_failed");
+        }
+    };
     super::verifier_orchestration::record_controller_verifier_repair_edit(
         agent,
         &edit.relative_path,
         &edit.fingerprint,
         &target_hint,
+        undo,
     );
     log_llm_event(
         "agent.verifier_cargo_dependency_repair.applied",

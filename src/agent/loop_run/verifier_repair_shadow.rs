@@ -13,11 +13,15 @@ pub(super) fn build_verifier_repair_pipeline_shadow_payload(
     let packet = failure_packet_for_verifier_pipeline_shadow(context, assessment);
     let brief_result = super::repair_brief::repair_brief_from_legacy_diagnostic(
         legacy_repair_brief_input_for_shadow(parsed, assessment),
-    );
+    )
+    .map(|brief| normalize_shadow_brief_for_packet(brief, &packet, assessment));
 
     match brief_result {
         Ok(brief) => {
-            let action_payload = match super::repair_action::build_repair_action(&brief, &packet) {
+            let evidence = authority_evidence_for_shadow(context, &packet);
+            let action_payload = match super::repair_authority::build_repair_action_with_authority(
+                &brief, &packet, &evidence,
+            ) {
                 Ok(action) => serde_json::json!({
                     "status": "accepted",
                     "target_role": action.target_role.label(),
@@ -103,7 +107,8 @@ fn failure_packet_for_verifier_pipeline_shadow(
     context: &super::repair_job::RepairJob,
     assessment: &super::VerifierRepairAssessment,
 ) -> super::failure_packet::FailurePacket {
-    let mut candidate_artifacts = Vec::new();
+    let base = super::failure_packet::FailurePacket::from_repair_job(context);
+    let mut candidate_artifacts = base.candidate_artifacts;
     for (hint, reason) in assessment
         .repair_target_hint
         .iter()
@@ -130,15 +135,19 @@ fn failure_packet_for_verifier_pipeline_shadow(
         push_shadow_candidate_artifact(&mut candidate_artifacts, hint, reason);
     }
 
-    super::failure_packet::FailurePacket::new(
+    let mut packet = super::failure_packet::FailurePacket::new(
         &context.command,
         assessment.failure_kind.as_str(),
         &context.output_excerpt,
-        Vec::new(),
-        Vec::new(),
+        base.affected_cases,
+        base.observed_expected_pairs,
         candidate_artifacts,
-        Vec::new(),
-    )
+        base.prior_attempts,
+    );
+    if packet.timeout_kind.is_none() {
+        packet.timeout_kind = context.timeout_kind;
+    }
+    packet
 }
 
 fn verifier_repair_action_for_context(
@@ -149,8 +158,57 @@ fn verifier_repair_action_for_context(
     let brief = super::repair_brief::repair_brief_from_legacy_diagnostic(
         legacy_repair_brief_input_from_assessment(assessment, 0.6),
     )
+    .map(|brief| normalize_shadow_brief_for_packet(brief, &packet, assessment))
     .ok()?;
-    super::repair_action::build_repair_action(&brief, &packet).ok()
+    let evidence = authority_evidence_for_shadow(context, &packet);
+    super::repair_authority::build_repair_action_with_authority(&brief, &packet, &evidence).ok()
+}
+
+fn normalize_shadow_brief_for_packet(
+    mut brief: super::repair_brief::RepairBrief,
+    packet: &super::failure_packet::FailurePacket,
+    assessment: &super::VerifierRepairAssessment,
+) -> super::repair_brief::RepairBrief {
+    let target_is_test = brief
+        .repair_target
+        .as_ref()
+        .is_some_and(|target| target.role == super::task_contract::ArtifactRole::Test);
+    if target_is_test
+        && !packet.observed_expected_pairs.is_empty()
+        && matches!(
+            assessment.failure_kind,
+            super::VerifierDiagnosticFailureKind::AssertionMismatch
+                | super::VerifierDiagnosticFailureKind::BadTest
+                | super::VerifierDiagnosticFailureKind::TestBug
+        )
+    {
+        brief.allowed_change_kind =
+            super::repair_brief::AllowedChangeKind::FixGeneratedTestExpectation;
+    }
+    brief
+}
+
+fn authority_evidence_for_shadow(
+    context: &super::repair_job::RepairJob,
+    packet: &super::failure_packet::FailurePacket,
+) -> super::repair_authority::AuthorityEvidence {
+    let spec_authority = context
+        .semantic_plan
+        .as_ref()
+        .map(|plan| plan.spec_authority);
+    super::repair_authority::AuthorityEvidence {
+        user_request_has_explicit_spec: spec_authority
+            == Some(super::spec_authority::SpecAuthority::UserRequest),
+        behavior_contract_present: matches!(
+            spec_authority,
+            Some(
+                super::spec_authority::SpecAuthority::BehaviorContract
+                    | super::spec_authority::SpecAuthority::UserRequest
+            )
+        ),
+        observed_expected_pair_count: packet.observed_expected_pairs.len(),
+        candidate_artifact_count: packet.candidate_artifacts.len(),
+    }
 }
 
 fn push_shadow_candidate_artifact(
@@ -210,4 +268,113 @@ fn normalize_shadow_path(path: &str) -> String {
         .replace('\\', "/")
         .trim_start_matches("./")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_target() -> super::super::task_contract::RecoveryTargetHint {
+        super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Test,
+            path: "tests/test_password_strength.py".to_string(),
+            reason: "verifier output names this test artifact".to_string(),
+        }
+    }
+
+    fn test_assessment() -> super::super::VerifierRepairAssessment {
+        let target = test_target();
+        super::super::VerifierRepairAssessment {
+            failure_kind: super::super::VerifierDiagnosticFailureKind::TestBug,
+            failure_type: super::super::VerifierFailureType::AssertionFailure,
+            probable_cause_role: Some(super::super::task_contract::ArtifactRole::Test),
+            needed_reads: vec![target.clone()],
+            repair_target_hint: Some(target.clone()),
+            repair_plan: vec![target],
+            summary: Some(
+                "generated test expected literal contradicts behavior contract".to_string(),
+            ),
+            source: super::super::VerifierRepairAssessmentSource::DiagnosticPass,
+        }
+    }
+
+    fn test_brief() -> super::super::repair_brief::RepairBrief {
+        super::super::repair_brief::RepairBrief {
+            failure_summary: "assertion mismatch".to_string(),
+            root_cause: "generated test bug".to_string(),
+            source_of_truth: super::super::repair_brief::SourceOfTruth::Unknown,
+            repair_target: Some(super::super::repair_brief::RepairBriefTarget {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/test_password_strength.py".to_string(),
+            }),
+            allowed_change_kind:
+                super::super::repair_brief::AllowedChangeKind::FixTestImportOrSetup,
+            must_preserve: Vec::new(),
+            concrete_fix_intent: "fix test expectation".to_string(),
+            confidence: 0.9,
+            source: super::super::repair_brief::RepairBriefSource::DiagnosticLlm,
+        }
+    }
+
+    fn assertion_packet() -> super::super::failure_packet::FailurePacket {
+        super::super::failure_packet::FailurePacket::new(
+            "python3 -m pytest",
+            "test_bug",
+            "E AssertionError: assert 2 == 1",
+            Vec::new(),
+            vec![super::super::failure_packet::ObservedExpectedPair {
+                observed: "2".to_string(),
+                expected: "1".to_string(),
+                assertion_shape: "assert_equal".to_string(),
+            }],
+            vec![super::super::failure_packet::CandidateArtifact::new(
+                super::super::task_contract::ArtifactRole::Test,
+                "tests/test_password_strength.py",
+                "verifier output names this test artifact",
+            )],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_bug_with_observed_expected_pair_projects_to_expectation_repair() {
+        let packet = assertion_packet();
+        let assessment = test_assessment();
+        let normalized = normalize_shadow_brief_for_packet(test_brief(), &packet, &assessment);
+
+        assert_eq!(
+            normalized.allowed_change_kind,
+            super::super::repair_brief::AllowedChangeKind::FixGeneratedTestExpectation
+        );
+
+        let evidence = super::super::repair_authority::AuthorityEvidence {
+            user_request_has_explicit_spec: true,
+            behavior_contract_present: true,
+            observed_expected_pair_count: packet.observed_expected_pairs.len(),
+            candidate_artifact_count: packet.candidate_artifacts.len(),
+        };
+        let action = super::super::repair_authority::build_repair_action_with_authority(
+            &normalized,
+            &packet,
+            &evidence,
+        )
+        .expect("authorized generated test expectation repair");
+        assert_eq!(
+            action.allowed_change_kind,
+            super::super::repair_brief::AllowedChangeKind::FixGeneratedTestExpectation
+        );
+    }
+
+    #[test]
+    fn test_bug_without_observed_expected_pair_keeps_import_setup_repair() {
+        let mut packet = assertion_packet();
+        packet.observed_expected_pairs.clear();
+        let assessment = test_assessment();
+        let normalized = normalize_shadow_brief_for_packet(test_brief(), &packet, &assessment);
+
+        assert_eq!(
+            normalized.allowed_change_kind,
+            super::super::repair_brief::AllowedChangeKind::FixTestImportOrSetup
+        );
+    }
 }

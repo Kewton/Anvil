@@ -75,13 +75,49 @@ pub(super) fn build_repair_action_with_authority(
     packet: &FailurePacket,
     evidence: &AuthorityEvidence,
 ) -> Result<RepairAction, RepairPlanRejection> {
-    validate_authority_consistency(brief, packet, evidence)?;
-    build_repair_action(brief, packet).map_err(RepairPlanRejection::Action)
+    let admitted_brief = controller_authorized_generated_test_brief(brief, evidence);
+    validate_authority_consistency(&admitted_brief, packet, evidence)?;
+    build_repair_action(&admitted_brief, packet).map_err(RepairPlanRejection::Action)
+}
+
+fn controller_authorized_generated_test_brief(
+    brief: &RepairBrief,
+    evidence: &AuthorityEvidence,
+) -> RepairBrief {
+    if brief.allowed_change_kind != AllowedChangeKind::FixGeneratedTestExpectation
+        || evidence.observed_expected_pair_count == 0
+        || !evidence.has_explicit_spec_authority()
+        || !matches!(
+            brief.source_of_truth,
+            SourceOfTruth::Unknown | SourceOfTruth::LlmGeneratedTest
+        )
+    {
+        return brief.clone();
+    }
+    let mut admitted = brief.clone();
+    admitted.source_of_truth = if evidence.user_request_has_explicit_spec {
+        SourceOfTruth::UserRequest
+    } else {
+        SourceOfTruth::BehaviorContract
+    };
+    admitted
 }
 
 fn validate_authority_consistency(
     brief: &RepairBrief,
     packet: &FailurePacket,
+    evidence: &AuthorityEvidence,
+) -> Result<(), RepairPlanRejection> {
+    validate_claimed_authority_source(brief, evidence)?;
+    validate_dependency_or_config_target(brief)?;
+    validate_generated_test_expectation_authority(brief)?;
+    validate_observed_value_implementation_authority(brief, packet, evidence)?;
+
+    Ok(())
+}
+
+fn validate_claimed_authority_source(
+    brief: &RepairBrief,
     evidence: &AuthorityEvidence,
 ) -> Result<(), RepairPlanRejection> {
     if matches!(brief.source_of_truth, SourceOfTruth::Ambiguous)
@@ -99,6 +135,11 @@ fn validate_authority_consistency(
     {
         return Err(RepairPlanRejection::AmbiguousAuthority);
     }
+
+    Ok(())
+}
+
+fn validate_dependency_or_config_target(brief: &RepairBrief) -> Result<(), RepairPlanRejection> {
     if brief.allowed_change_kind == AllowedChangeKind::FixDependencyOrConfig
         && let Some(target) = brief.repair_target.as_ref()
         && target.role != ArtifactRole::Setup
@@ -108,6 +149,12 @@ fn validate_authority_consistency(
         ));
     }
 
+    Ok(())
+}
+
+fn validate_generated_test_expectation_authority(
+    brief: &RepairBrief,
+) -> Result<(), RepairPlanRejection> {
     if brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation {
         if matches!(
             brief.source_of_truth,
@@ -117,22 +164,14 @@ fn validate_authority_consistency(
         }
     }
 
-    // Assertion/value mismatches are observations. When the LLM tries to
-    // resolve them by editing generated expectations, the proposal needs an
-    // external or controller-derived source of truth. The verifier literal
-    // alone is never enough, but UserRequest / BehaviorContract /
-    // ImplementationContract / UsageDocs can authorize fixing a generated
-    // test that contradicts that source.
-    if !packet.observed_expected_pairs.is_empty()
-        && brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation
-        && matches!(
-            brief.source_of_truth,
-            SourceOfTruth::Unknown | SourceOfTruth::Ambiguous | SourceOfTruth::LlmGeneratedTest
-        )
-    {
-        return Err(RepairPlanRejection::AmbiguousAuthority);
-    }
+    Ok(())
+}
 
+fn validate_observed_value_implementation_authority(
+    brief: &RepairBrief,
+    packet: &FailurePacket,
+    evidence: &AuthorityEvidence,
+) -> Result<(), RepairPlanRejection> {
     // Exact observed/expected assertion pairs come from verifier output, not
     // from the user's specification. For implementation edits that try to
     // satisfy such values, require an external authority signal; otherwise a
@@ -314,6 +353,102 @@ mod tests {
         .unwrap();
 
         assert_eq!(action.target_role, ArtifactRole::Test);
+    }
+
+    #[test]
+    fn controller_user_request_evidence_authorizes_unknown_generated_test_expectation_fix() {
+        let packet = packet(ArtifactRole::Test, "tests/test_main.py");
+        let evidence = AuthorityEvidence {
+            user_request_has_explicit_spec: true,
+            behavior_contract_present: false,
+            observed_expected_pair_count: 1,
+            candidate_artifact_count: 1,
+        };
+
+        let action = build_repair_action_with_authority(
+            &test_brief("tests/test_main.py", SourceOfTruth::Unknown),
+            &packet,
+            &evidence,
+        )
+        .unwrap();
+
+        assert_eq!(action.target_role, ArtifactRole::Test);
+        assert_eq!(
+            action.allowed_change_kind,
+            AllowedChangeKind::FixGeneratedTestExpectation
+        );
+    }
+
+    #[test]
+    fn controller_behavior_contract_evidence_authorizes_llm_generated_test_expectation_fix() {
+        let packet = packet(ArtifactRole::Test, "tests/test_main.py");
+        let evidence = AuthorityEvidence {
+            user_request_has_explicit_spec: false,
+            behavior_contract_present: true,
+            observed_expected_pair_count: 1,
+            candidate_artifact_count: 1,
+        };
+
+        let action = build_repair_action_with_authority(
+            &test_brief("tests/test_main.py", SourceOfTruth::LlmGeneratedTest),
+            &packet,
+            &evidence,
+        )
+        .unwrap();
+
+        assert_eq!(action.target_role, ArtifactRole::Test);
+    }
+
+    #[test]
+    fn controller_evidence_does_not_authorize_ambiguous_generated_test_expectation_fix() {
+        let packet = packet(ArtifactRole::Test, "tests/test_main.py");
+        let evidence = AuthorityEvidence {
+            user_request_has_explicit_spec: true,
+            behavior_contract_present: true,
+            observed_expected_pair_count: 1,
+            candidate_artifact_count: 1,
+        };
+
+        assert_eq!(
+            build_repair_action_with_authority(
+                &test_brief("tests/test_main.py", SourceOfTruth::Ambiguous),
+                &packet,
+                &evidence,
+            ),
+            Err(RepairPlanRejection::AmbiguousAuthority)
+        );
+    }
+
+    #[test]
+    fn controller_evidence_requires_observed_expected_pairs_for_unknown_generated_test_fix() {
+        let packet = FailurePacket::new(
+            "pytest",
+            "assertion_failure",
+            "assertion failed without structured pair",
+            Vec::new(),
+            Vec::new(),
+            vec![CandidateArtifact::new(
+                ArtifactRole::Test,
+                "tests/test_main.py",
+                "changed test",
+            )],
+            Vec::new(),
+        );
+        let evidence = AuthorityEvidence {
+            user_request_has_explicit_spec: true,
+            behavior_contract_present: false,
+            observed_expected_pair_count: 0,
+            candidate_artifact_count: 1,
+        };
+
+        assert_eq!(
+            build_repair_action_with_authority(
+                &test_brief("tests/test_main.py", SourceOfTruth::Unknown),
+                &packet,
+                &evidence,
+            ),
+            Err(RepairPlanRejection::TestExpectationWithoutAuthority)
+        );
     }
 
     #[test]

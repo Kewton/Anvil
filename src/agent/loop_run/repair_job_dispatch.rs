@@ -133,6 +133,7 @@ fn handle_repair_job_verifier_failure(
         &mut repair_context,
         Some(&previous_repair_context),
     );
+    rollback_worsened_repair_patch(agent, &mut repair_context);
     *args.contract_verifier_repair_edit_count = Some(args.repo_edit_calls_made_this_turn);
     agent.task_contract_verifier_repair_pending = true;
     if let Some(outcome) = repair_context.rerun_outcome {
@@ -184,6 +185,56 @@ fn handle_repair_job_verifier_failure(
         ),
     );
     TaskContractVerifierFlowOutcome::Continue
+}
+
+fn rollback_worsened_repair_patch(agent: &mut Agent, repair_context: &mut repair_job::RepairJob) {
+    if !matches!(
+        repair_context.rerun_outcome,
+        Some(super::VerifierRepairRerunOutcome::Worsened)
+    ) {
+        return;
+    }
+    let Some(pending) = repair_context.pending_patch_undo.clone() else {
+        log_llm_event(
+            "agent.verifier_repair_patch.rollback_skipped",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "reason": "missing_undo",
+            }),
+        );
+        return;
+    };
+    match super::repair_patch_executor::revert_applied_repair_patch(&pending.undo) {
+        Ok(()) => {
+            repair_context.apply_event(repair_job::RepairJobEvent::PatchReverted {
+                key: pending.key.clone(),
+            });
+            log_llm_event(
+                "agent.verifier_repair_patch.rolled_back",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "path": pending.undo.relative_path,
+                    "role": pending.key.role.label(),
+                    "reason": "worsened_verifier_rerun",
+                }),
+            );
+        }
+        Err(err) => {
+            let compact = super::repair_job::sanitize_repair_job_text_with_char_cap(
+                &format!("repair rollback failed: {err}"),
+                240,
+            );
+            agent.session.working_memory.note_error(compact.clone());
+            log_llm_event(
+                "agent.verifier_repair_patch.rollback_failed",
+                serde_json::json!({
+                    "session_id": agent.session_store.session_id(),
+                    "path": pending.undo.relative_path,
+                    "error": compact,
+                }),
+            );
+        }
+    }
 }
 
 fn handle_repair_job_verifier_no_verifier(
@@ -317,6 +368,24 @@ fn handle_repair_job_patch_provider_step(
         "Verifier repair",
         "Running controller-applied repair pass for the selected target.",
     );
+    if let Some(job) = agent.repair_job.as_ref() {
+        let decision = job.current_repair_target_decision();
+        log_llm_event(
+            "agent.repair_target_decision.selected",
+            serde_json::json!({
+                "session_id": agent.session_store.session_id(),
+                "turn_index": agent.current_turn_index,
+                "decision": decision.to_json_value(),
+                "dispatched_target": {
+                    "role": target_hint.role.label(),
+                    "path": target_hint.path,
+                },
+                "matches_dispatched_target": decision.target_hint.as_ref().is_some_and(|hint| {
+                    hint.role == target_hint.role && hint.path == target_hint.path
+                }),
+            }),
+        );
+    }
     // Issue #1005: capture the failure projection before the deterministic
     // operator chain runs so the RepairOperatorRegistry observation reflects the
     // failure being repaired. Recording is purely additive — the existing

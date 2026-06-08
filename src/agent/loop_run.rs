@@ -553,6 +553,10 @@ mod rust_binding_repair;
 // session-observation over the existing operators (no re-implementation). Not
 // re-exported (DR3-001).
 mod repair_operator;
+// v0.6.9 P0: admitted repair-target decision boundary. Keeps failure-class /
+// operator / target-role / target-hint handoff explicit without expanding
+// benchmark-specific repair rules.
+mod repair_target_decision;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
