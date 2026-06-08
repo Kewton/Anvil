@@ -96,6 +96,10 @@ mod case_record_flow;
 // points + 4 private attempt/resolution helpers, all free fns over
 // `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod classify_confirm_flow;
+mod completion_probe_gate;
+mod contract_bound_generation;
+mod deliverable_freshness;
+mod runtime_capability;
 // Tester invocation flow extracted from `turn.rs` (parent #680). Hosts
 // `try_invoke_tester` (pub(super)) and 5 private helpers as free fns
 // over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade

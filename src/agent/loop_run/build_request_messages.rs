@@ -40,6 +40,7 @@ use super::tool_history::{
 };
 use super::tool_policy::{EffectiveToolPolicy, focused_edit_policy_violation_feedback_note};
 use super::turn_helpers::RetrievalInjection;
+use super::worker_contract::TaskExecutionContract;
 use crate::agent::prompting;
 use crate::agent::recovery;
 use crate::modes::plan_act::ExecutionMode;
@@ -98,6 +99,9 @@ pub(super) fn build_request_messages(
     {
         messages.push(ConversationMessage::system(note));
     }
+    if let Some(contract) = super::task_classification::task_contract_authority(agent) {
+        append_contract_runtime_messages(&contract, &mut messages);
+    }
     if focused_edit_target.is_none() {
         append_general_request_context_messages(agent, &mut messages);
     }
@@ -115,6 +119,25 @@ pub(super) fn build_request_messages(
         messages.extend(model_visible_session_messages(&agent.session.messages));
     }
     messages
+}
+
+fn append_contract_runtime_messages(
+    contract: &super::task_contract::TaskContract,
+    messages: &mut Vec<ConversationMessage>,
+) {
+    let execution = TaskExecutionContract::from_task_contract(contract);
+    if let Some(message) =
+        super::runtime_capability::runtime_capability_message_for_execution(&execution)
+    {
+        messages.push(message);
+    }
+    if let Some(message) =
+        super::contract_bound_generation::contract_bound_generation_message_for_execution(
+            &execution,
+        )
+    {
+        messages.push(message);
+    }
 }
 
 fn model_visible_session_messages(

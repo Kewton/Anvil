@@ -29,7 +29,6 @@
 use super::Agent;
 use super::verifier_orchestration::synthesized_missing_implementation_target_path_for_request;
 use super::workspace_candidates::existing_workspace_candidate_for_role_in_scope;
-use crate::logging::log_llm_event;
 
 fn task_contract_repair_state(
     agent: &Agent,
@@ -92,67 +91,24 @@ pub(super) fn task_contract_recovery_action(
             owned_test_artifacts: &owned_test_artifacts,
         },
     );
-    if matches!(
+    if !matches!(
         action,
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
-    ) && !missing_owned_test_repair_action(contract, &owned_test_artifacts, &action)
+            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. }
+    ) && let Some(fresh_action) =
+        super::deliverable_freshness::stale_supporting_deliverable_action(contract, &artifacts)
     {
-        let request = super::workspace_access::active_request_text(agent).unwrap_or_default();
-        let scope = super::workspace_access::current_workspace_scope(agent);
-        let probe = super::project_probe::probe_completion(
-            &agent.work_root,
-            &request,
-            contract,
-            &scope,
-            &agent.turn_edited_relative_paths,
-        );
-        match probe {
-            super::project_probe::CompletionProbeDecision::RunVerifier {
-                reason,
-                project_unit,
-            } => {
-                log_llm_event(
-                    "agent.completion_probe.decision",
-                    serde_json::json!({
-                        "session_id": agent.session_store.session_id(),
-                        "turn_index": agent.current_turn_index,
-                        "decision": "run_verifier",
-                        "reason": reason,
-                        "project_unit": project_unit.summary(),
-                    }),
-                );
-                return super::task_contract::ArtifactRecoveryAction::RunVerifier;
-            }
-            super::project_probe::CompletionProbeDecision::RejectStackMismatch { reason } => {
-                log_llm_event(
-                    "agent.completion_probe.decision",
-                    serde_json::json!({
-                        "session_id": agent.session_store.session_id(),
-                        "turn_index": agent.current_turn_index,
-                        "decision": "reject_stack_mismatch",
-                        "reason": reason,
-                    }),
-                );
-            }
-            super::project_probe::CompletionProbeDecision::KeepArtifactFlow => {}
-        }
+        return fresh_action;
+    }
+    if let Some(probe_action) = super::completion_probe_gate::completion_probe_override(
+        agent,
+        contract,
+        &action,
+        &owned_test_artifacts,
+    ) {
+        return probe_action;
     }
     action
-}
-
-fn missing_owned_test_repair_action(
-    contract: &super::task_contract::TaskContract,
-    owned_test_artifacts: &[String],
-    action: &super::task_contract::ArtifactRecoveryAction,
-) -> bool {
-    if !contract.completion_policy.test_execution_required() || !owned_test_artifacts.is_empty() {
-        return false;
-    }
-    matches!(
-        action,
-        super::task_contract::ArtifactRecoveryAction::Continue { missing, .. }
-            if missing.contains(&super::task_contract::ArtifactRole::Test)
-    )
 }
 
 pub(super) fn record_obligation_diagnostic_attempt_for_action(
