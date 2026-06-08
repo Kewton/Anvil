@@ -541,3 +541,40 @@ This changes the next architecture priority:
 This keeps the design generic: the controller should not add task-specific
 success exceptions. It should collect typed artifacts, run appropriately scoped
 evidence, and let the LLM advise repair targets from structured failure packets.
+
+## Continuation Update: Evidence Scope Repair Validation
+
+Further minimal implementation/validation showed that P1 must be made more
+precise.
+
+Adding `evidence_scope` to the diagnostic payload was useful but not enough.
+Actual local-LLM feature-improvement runs still exhausted repair because the
+diagnostic candidate set did not include the existing test file named by the
+verifier failure. The controller had treated the changed implementation file as
+the primary target, even though full-suite pytest reported
+`tests/test_sales.py::test_total`.
+
+The updated direction is:
+
+1. Controller responsibility:
+   - record whether evidence came from a project suite or artifact-filtered run
+   - extract safe verifier-output artifact paths
+   - provide those artifacts as typed candidates/excerpts
+   - keep this structural, not task-specific
+2. LLM responsibility:
+   - judge whether the failing artifact conflicts with higher-authority objective
+     evidence
+   - choose implementation vs test/setup/docs/data repair target semantically
+3. Controller responsibility after LLM:
+   - admit only safe, in-scope, contract-preserving targets
+   - reject weakening/noop/wrong-target repairs
+
+This means the next milestone is not "add another repair prompt". It is:
+
+> Make failure artifact candidates complete and typed enough for the diagnostic
+> LLM to make a real authority decision.
+
+The Rust TDD validation passed after these changes, which suggests the added
+scope/candidate plumbing did not regress hard coding tasks. The Python
+feature-improvement case remains open and should be used as the next repair
+convergence fixture.
