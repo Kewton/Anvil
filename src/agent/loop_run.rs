@@ -588,6 +588,8 @@ mod verifier_assessment_parser;
 // v0.4.26: task-contract verifier outcome normalization boundary. Keeps
 // pass/fail/transport classification separate from the actor-loop dispatcher
 // while command execution and state transitions remain in turn.rs.
+mod verifier_diagnostic_payload;
+mod verifier_diagnostic_prompt;
 mod verifier_driver;
 // v0.4.25: diagnostic LLM attempt schedule and timeout constants.
 mod verifier_diagnostic_attempt;

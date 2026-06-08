@@ -97,8 +97,16 @@ const ALLOWLIST: &[AllowlistedRenderer] = &[
     // Choke C — the dispatcher's artifact-directed Bash-rejection branch renders a
     // `policy_target_path`-derived target (Issue #931 CB-002).
     rndr("tool_policy.rs", "effective_tool_policy_error_for_call_with_scope"),
-    // Choke D — verifier_orchestration.rs json! wire payload builders.
-    rndr("verifier_orchestration.rs", "verifier_diagnostic_messages"),
+    // Choke D — verifier diagnostic / repair json! wire payload builders.
+    rndr("verifier_diagnostic_payload.rs", "safe_file_excerpts_payload"),
+    rndr("verifier_diagnostic_payload.rs", "framework_findings_payload"),
+    rndr("verifier_diagnostic_payload.rs", "failure_location_payload"),
+    rndr("verifier_diagnostic_payload.rs", "changed_candidates_payload"),
+    rndr("verifier_diagnostic_payload.rs", "push_candidate_if_absent"),
+    rndr(
+        "verifier_diagnostic_payload.rs",
+        "exhausted_repair_targets_payload",
+    ),
     rndr("verifier_orchestration.rs", "verifier_repair_pass_messages"),
     rndr("verifier_orchestration.rs", "verifier_repair_repeated_failure_invariant"),
 ];
@@ -118,6 +126,10 @@ fn loop_run_sources() -> Vec<(&'static str, &'static str)> {
         ("recovery_messages.rs", include_str!("recovery_messages.rs")),
         ("focused_edit_recovery.rs", include_str!("focused_edit_recovery.rs")),
         ("verifier_orchestration.rs", include_str!("verifier_orchestration.rs")),
+        (
+            "verifier_diagnostic_payload.rs",
+            include_str!("verifier_diagnostic_payload.rs"),
+        ),
         ("tool_policy.rs", include_str!("tool_policy.rs")),
         ("build_request_messages.rs", include_str!("build_request_messages.rs")),
     ]

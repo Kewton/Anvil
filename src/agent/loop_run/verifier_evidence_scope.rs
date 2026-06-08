@@ -10,6 +10,7 @@ use super::completion_evidence::is_completion_verifier_command;
 use super::repair_job::RepairJob;
 use super::task_contract::ArtifactRole;
 use super::verifier_failure_artifacts::verifier_output_failure_hints;
+use crate::session::feedback::mask_secrets;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VerifierEvidenceScopeKind {
@@ -51,9 +52,9 @@ impl VerifierEvidenceScopePacket {
             "command_references_changed_candidate": self.command_references_changed_candidate,
             "changed_candidate_count": self.changed_candidate_count,
             "changed_test_candidate_count": self.changed_test_candidate_count,
-            "current_repair_target_path": self.current_repair_target_path.as_deref(),
+            "current_repair_target_path": self.current_repair_target_path.as_deref().map(mask_secrets),
             "current_repair_target_role": self.current_repair_target_role.map(ArtifactRole::label),
-            "failure_location_path": self.failure_location_path.as_deref(),
+            "failure_location_path": self.failure_location_path.as_deref().map(mask_secrets),
             "failure_location_role": self.failure_location_role.map(ArtifactRole::label),
             "failure_location_differs_from_current_target": self.failure_location_differs_from_current_target,
             "post_repair_rerun": self.post_repair_rerun,
