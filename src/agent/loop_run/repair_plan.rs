@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_test_expectation_requires_external_authority() {
+    fn generated_test_expectation_accepts_controller_derived_authority() {
         let proposal = RepairPlanProposal::from_brief(brief(
             ArtifactRole::Test,
             "tests/test_main.py",
@@ -165,15 +165,13 @@ mod tests {
             AllowedChangeKind::FixGeneratedTestExpectation,
         ));
 
-        assert_eq!(
-            validate_repair_plan_proposal(
-                &proposal,
-                &packet(ArtifactRole::Test, "tests/test_main.py"),
-                &authority(),
-            )
-            .unwrap_err()
-            .as_str(),
-            "test_expectation_without_authority"
-        );
+        let accepted = validate_repair_plan_proposal(
+            &proposal,
+            &packet(ArtifactRole::Test, "tests/test_main.py"),
+            &authority(),
+        )
+        .expect("controller-derived implementation contract should authorize generated test fix");
+
+        assert_eq!(accepted.action.target_role, ArtifactRole::Test);
     }
 }

@@ -1723,6 +1723,21 @@ mod tests {
     }
 
     #[test]
+    fn repair_intent_payload_allows_password_domain_source_code() {
+        assert!(
+            validate_repair_intent_text_payload(RepairIntentTextPayload {
+                old_string: "def password_score(password: str) -> int:\n    return 0\n",
+                new_string: "def password_score(password: str) -> int:\n    if not password:\n        return 0\n    return 1\n",
+                reason: "align generated tests with the objective contract",
+                relative_path: "password_strength.py",
+                current_total_edit_bytes: 0,
+                max_total_edit_bytes: 2048,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn repair_intent_payload_allows_shell_text_only_in_shell_files() {
         let non_shell = validate_repair_intent_text_payload(RepairIntentTextPayload {
             old_string: "run = \"safe\"",

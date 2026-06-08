@@ -128,23 +128,27 @@ pub(super) fn sort_admitted_by_authority_role_priority(
             failure_kind,
             super::VerifierDiagnosticFailureKind::AssertionMismatch
         ) {
+            if preferred_role_is_actionable && role == preferred_repair_role {
+                return 0;
+            }
+            let offset = u8::from(preferred_role_is_actionable);
             return match spec_authority {
                 super::spec_authority::SpecAuthority::UserRequest
                 | super::spec_authority::SpecAuthority::BehaviorContract => match role {
-                    super::task_contract::ArtifactRole::Implementation => 0,
-                    super::task_contract::ArtifactRole::Test => 1,
-                    super::task_contract::ArtifactRole::UsageDocs => 2,
-                    super::task_contract::ArtifactRole::Setup => 3,
-                    super::task_contract::ArtifactRole::DataOutput => 4,
+                    super::task_contract::ArtifactRole::Implementation => offset,
+                    super::task_contract::ArtifactRole::Test => offset + 1,
+                    super::task_contract::ArtifactRole::UsageDocs => offset + 2,
+                    super::task_contract::ArtifactRole::Setup => offset + 3,
+                    super::task_contract::ArtifactRole::DataOutput => offset + 4,
                 },
                 super::spec_authority::SpecAuthority::VerifiedPublicInterface
                 | super::spec_authority::SpecAuthority::ImplementationContract
                 | super::spec_authority::SpecAuthority::LlmGeneratedTest => match role {
-                    super::task_contract::ArtifactRole::Test => 0,
-                    super::task_contract::ArtifactRole::Implementation => 1,
-                    super::task_contract::ArtifactRole::UsageDocs => 2,
-                    super::task_contract::ArtifactRole::Setup => 3,
-                    super::task_contract::ArtifactRole::DataOutput => 4,
+                    super::task_contract::ArtifactRole::Test => offset,
+                    super::task_contract::ArtifactRole::Implementation => offset + 1,
+                    super::task_contract::ArtifactRole::UsageDocs => offset + 2,
+                    super::task_contract::ArtifactRole::Setup => offset + 3,
+                    super::task_contract::ArtifactRole::DataOutput => offset + 4,
                 },
             };
         }
@@ -277,15 +281,6 @@ fn diagnostic_role_matches_failure_kind(
     role: super::task_contract::ArtifactRole,
     failure_kind: super::VerifierDiagnosticFailureKind,
 ) -> bool {
-    // Plain assertion mismatches are implementation-repair evidence at this
-    // selection boundary. Generated-test repairs must arrive as TestBug or via
-    // the stale-assertion helper, so LLM target order cannot silently flip the
-    // lifecycle into test editing.
-    if role == super::task_contract::ArtifactRole::Test
-        && failure_kind == super::VerifierDiagnosticFailureKind::AssertionMismatch
-    {
-        return false;
-    }
     let kind = super::repair_brief::legacy_kind_to_allowed_change_kind_for_role(
         failure_kind.as_str(),
         Some(role),
@@ -314,6 +309,7 @@ fn preferred_role_priority_can_apply(failure_kind: super::VerifierDiagnosticFail
         super::VerifierDiagnosticFailureKind::CompileOrSyntaxError
             | super::VerifierDiagnosticFailureKind::RuntimeError
             | super::VerifierDiagnosticFailureKind::LocalImportContractMismatch
+            | super::VerifierDiagnosticFailureKind::AssertionMismatch
     )
 }
 

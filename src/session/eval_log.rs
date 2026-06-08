@@ -838,6 +838,31 @@ pub fn build_terminal_diagnostics_with_context(
                 "verification evidence was not reached because tool-call parsing failed",
             );
         }
+        "missing_verification" if verify_command_count == 0 => {
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "required verifier evidence was not observed before terminal handling",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "verification evidence is absent because no verifier command was recorded",
+            );
+        }
+        "missing_verification" => {
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "unsatisfied",
+                Some("verification_failure"),
+                "required verifier evidence remained incomplete after verifier execution",
+            );
+        }
         "safe_stop_verifier_missing" => {
             set_obligation(
                 &mut obligations,
@@ -929,6 +954,7 @@ fn classify_terminal_outcome_with_context(
         "repair_exhausted" if verify_command_count == 0 => "verification_environment_failure",
         "repair_exhausted" if changed_count == 0 => "model_output_failure",
         "repair_exhausted" => "control_loop_failure",
+        "missing_verification" if verify_command_count == 0 => "verification_environment_failure",
         "missing_verification" | "verifier_failed" | "safe_stop_verifier_weak" => {
             "verification_failure"
         }
@@ -1925,6 +1951,45 @@ mod tests {
                 .missing_obligations
                 .contains(&"verification_environment".to_string())
         );
+    }
+
+    #[test]
+    fn missing_verification_without_command_is_verifier_setup_authority() {
+        let rec = build_eval_record(
+            "sess-verify-missing",
+            12345,
+            "Use TDD for a Python scorer",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 1,
+                impl_files: 1,
+                setup: 1,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "missing_verification",
+        );
+
+        let diagnostics = rec.terminal_diagnostics.as_ref().unwrap();
+        assert_eq!(
+            diagnostics.classification,
+            "verification_environment_failure"
+        );
+        assert_eq!(diagnostics.verifier_status, "not_observed");
+        assert!(
+            diagnostics
+                .missing_obligations
+                .contains(&"verification_environment".to_string())
+        );
+        assert_eq!(rec.evaluation_taxonomy.failure_authority, "verifier_setup");
     }
 
     #[test]

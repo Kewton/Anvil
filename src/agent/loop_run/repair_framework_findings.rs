@@ -27,6 +27,7 @@ pub(crate) enum VerifierDiagnosticFrameworkFindingKind {
     DisconnectedSetupStateAssignment,
     RustIntegrationTestCrateImportMismatch,
     NodeModuleSyntaxMismatch,
+    LocalProviderMissingImportSymbol,
 }
 
 impl VerifierDiagnosticFrameworkFindingKind {
@@ -48,6 +49,7 @@ impl VerifierDiagnosticFrameworkFindingKind {
                 "rust_integration_test_crate_import_mismatch"
             }
             Self::NodeModuleSyntaxMismatch => "node_module_syntax_mismatch",
+            Self::LocalProviderMissingImportSymbol => "python_local_provider_missing_import_symbol",
         }
     }
 }
@@ -183,6 +185,23 @@ pub(crate) fn findings_for_diagnostic(
                 path: excerpt.path.clone(),
                 role: excerpt.role,
                 summary: "pytest collection fails because the generated test imports a non-existent symbol from a local implementation module; repair the test import/setup or replace the internal-helper check with public behavior assertions".to_string(),
+            });
+        }
+        if let Some((provider_path, module, name)) =
+            pytest_output_local_provider_missing_import_symbol(
+                work_root,
+                output_excerpt,
+                &excerpt.path,
+                &excerpt.excerpt,
+            )
+        {
+            findings.push(VerifierDiagnosticFrameworkFinding {
+                kind: VerifierDiagnosticFrameworkFindingKind::LocalProviderMissingImportSymbol,
+                path: provider_path,
+                role: ArtifactRole::Implementation,
+                summary: format!(
+                    "pytest collection imports `{name}` from local module `{module}`, but the provider source does not define that exported name; repair the provider export unless higher-authority objective evidence says the test imported the wrong internal helper",
+                ),
             });
         }
     }
@@ -724,6 +743,27 @@ fn pytest_output_has_test_only_missing_import_symbol(
     python_local_module_file_exists(work_root, &module)
 }
 
+fn pytest_output_local_provider_missing_import_symbol(
+    work_root: &Path,
+    output_excerpt: &str,
+    test_path: &str,
+    test_excerpt: &str,
+) -> Option<(String, String, String)> {
+    let (name, module) = missing_python_import_name_from_output(output_excerpt)?;
+    if !output_excerpt.replace('\\', "/").contains(test_path) {
+        return None;
+    }
+    if !python_source_imports_name_from_module(test_excerpt, &module, &name) {
+        return None;
+    }
+    let provider_path = python_local_module_relative_path(work_root, &module)?;
+    let provider_source = read_capped_workspace_artifact(work_root, &provider_path)?;
+    if python_source_defines_top_level_name(&provider_source, &name) {
+        return None;
+    }
+    Some((provider_path, module, name))
+}
+
 fn cargo_output_has_test_only_unresolved_crate_import(
     work_root: &Path,
     output_excerpt: &str,
@@ -865,7 +905,9 @@ fn missing_python_import_name_from_output(output: &str) -> Option<(String, Strin
             continue;
         };
         let module = rest[..module_end].trim();
-        if python_identifier_is_safe(name) && python_module_name_is_safe(module) {
+        if python_identifier_is_safe(name)
+            && python_module_name_for_import_validation_is_safe(module)
+        {
             return Some((name.to_string(), module.to_string()));
         }
     }
@@ -873,13 +915,73 @@ fn missing_python_import_name_from_output(output: &str) -> Option<(String, Strin
 }
 
 fn python_local_module_file_exists(work_root: &Path, module: &str) -> bool {
-    let relative = module.replace('.', "/");
-    work_root.join(format!("{relative}.py")).is_file()
-        || work_root.join(relative).join("__init__.py").is_file()
+    python_local_module_relative_path(work_root, module).is_some()
 }
 
-fn python_module_name_is_safe(module: &str) -> bool {
-    module.split('.').count() >= 2 && module.split('.').all(python_identifier_is_safe)
+fn python_local_module_relative_path(work_root: &Path, module: &str) -> Option<String> {
+    if !python_module_name_for_import_validation_is_safe(module) {
+        return None;
+    }
+    let relative = module.replace('.', "/");
+    let file = format!("{relative}.py");
+    if workspace_python_artifact_exists(work_root, &file) {
+        return Some(file);
+    }
+    let init = format!("{relative}/__init__.py");
+    workspace_python_artifact_exists(work_root, &init).then_some(init)
+}
+
+fn workspace_python_artifact_exists(work_root: &Path, relative: &str) -> bool {
+    let relative_path = Path::new(relative);
+    is_workspace_artifact_admitted_relative_path(relative_path)
+        && work_root.join(relative_path).is_file()
+}
+
+fn python_source_defines_top_level_name(source: &str, name: &str) -> bool {
+    source.lines().any(|line| {
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            return false;
+        }
+        let stripped = strip_python_inline_comment(line);
+        let trimmed = stripped.trim();
+        trimmed.starts_with(&format!("def {name}("))
+            || trimmed.starts_with(&format!("async def {name}("))
+            || trimmed.starts_with(&format!("class {name}("))
+            || trimmed.starts_with(&format!("class {name}:"))
+            || python_top_level_assignment_defines_name(trimmed, name)
+            || python_top_level_import_defines_name(trimmed, name)
+    })
+}
+
+fn python_top_level_import_defines_name(line: &str, name: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("import ") {
+        return rest.split(',').any(|raw| {
+            let parts = raw.split_whitespace().collect::<Vec<_>>();
+            match parts.as_slice() {
+                [module, "as", alias] => {
+                    *alias == name && python_module_name_for_import_validation_is_safe(module)
+                }
+                [module] => module.split('.').next().is_some_and(|root| {
+                    root == name && python_module_name_for_import_validation_is_safe(module)
+                }),
+                _ => false,
+            }
+        });
+    }
+    if let Some(rest) = line.strip_prefix("from ") {
+        let Some((_module, imports)) = rest.split_once(" import ") else {
+            return false;
+        };
+        return imports.split(',').any(|raw| {
+            let parts = raw.split_whitespace().collect::<Vec<_>>();
+            match parts.as_slice() {
+                [imported, "as", alias] => *alias == name && python_identifier_is_safe(imported),
+                [imported] => *imported == name && python_identifier_is_safe(imported),
+                _ => false,
+            }
+        });
+    }
+    false
 }
 
 fn python_source_imports_module(source: &str, module: &str) -> bool {
@@ -1114,6 +1216,79 @@ test("reads a fixture", () => {
         );
 
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn pytest_single_file_provider_missing_import_symbol_is_framework_finding() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(
+            temp.path().join("main.py"),
+            "def cli_main():\n    return 0\n",
+        )
+        .unwrap();
+        let test_source = "from main import merge_toml_files\n\n\
+def test_merge_toml_files():\n    assert callable(merge_toml_files)\n";
+
+        let findings = findings_for_diagnostic(
+            temp.path(),
+            "python3 -B -m pytest -p no:cacheprovider tests/test_main.py",
+            "ERROR collecting tests/test_main.py\n\
+tests/test_main.py:1: in <module>\n\
+    from main import merge_toml_files\n\
+E   ImportError: cannot import name 'merge_toml_files' from 'main' (/tmp/work/main.py)\n",
+            &[VerifierDiagnosticFileExcerpt {
+                path: "tests/test_main.py".to_string(),
+                role: ArtifactRole::Test,
+                excerpt: test_source.to_string(),
+            }],
+        );
+
+        let finding = findings
+            .iter()
+            .find(|finding| {
+                finding.kind
+                    == VerifierDiagnosticFrameworkFindingKind::LocalProviderMissingImportSymbol
+            })
+            .expect("single-file provider import mismatch finding");
+        assert_eq!(finding.path, "main.py");
+        assert_eq!(finding.role, ArtifactRole::Implementation);
+        assert!(finding.summary.contains("merge_toml_files"));
+    }
+
+    #[test]
+    fn pytest_single_file_provider_defined_symbol_is_not_framework_finding() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("tests")).unwrap();
+        std::fs::write(
+            temp.path().join("main.py"),
+            "def merge_toml_files():\n    return {}\n",
+        )
+        .unwrap();
+        let test_source = "from main import merge_toml_files\n\n\
+def test_merge_toml_files():\n    assert callable(merge_toml_files)\n";
+
+        let findings = findings_for_diagnostic(
+            temp.path(),
+            "python3 -B -m pytest -p no:cacheprovider tests/test_main.py",
+            "ERROR collecting tests/test_main.py\n\
+tests/test_main.py:1: in <module>\n\
+    from main import merge_toml_files\n\
+E   ImportError: cannot import name 'merge_toml_files' from 'main' (/tmp/work/main.py)\n",
+            &[VerifierDiagnosticFileExcerpt {
+                path: "tests/test_main.py".to_string(),
+                role: ArtifactRole::Test,
+                excerpt: test_source.to_string(),
+            }],
+        );
+
+        assert!(
+            !findings.iter().any(|finding| {
+                finding.kind
+                    == VerifierDiagnosticFrameworkFindingKind::LocalProviderMissingImportSymbol
+            }),
+            "provider already defines the symbol, got {findings:?}"
+        );
     }
 
     #[test]

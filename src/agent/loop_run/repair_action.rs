@@ -74,14 +74,9 @@ pub(super) fn build_repair_action(
         return Err(RepairActionRejection::RoleMismatch);
     }
     if brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation
-        && brief.source_of_truth == SourceOfTruth::UserRequest
-    {
-        return Err(RepairActionRejection::TestExpectationBlockedByUserRequest);
-    }
-    if brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation
         && matches!(
             brief.source_of_truth,
-            SourceOfTruth::Unknown | SourceOfTruth::Ambiguous
+            SourceOfTruth::Unknown | SourceOfTruth::Ambiguous | SourceOfTruth::LlmGeneratedTest
         )
     {
         return Err(RepairActionRejection::TestExpectationWithoutAuthority);
@@ -246,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_action_blocks_test_expectation_under_user_request() {
+    fn repair_action_allows_test_expectation_with_user_request_authority() {
         let test_packet = FailurePacket::new(
             "pytest",
             "assertion_failure",
@@ -267,9 +262,11 @@ mod tests {
         });
         brief.allowed_change_kind = AllowedChangeKind::FixGeneratedTestExpectation;
 
+        let action = build_repair_action(&brief, &test_packet).unwrap();
+        assert_eq!(action.target_role, ArtifactRole::Test);
         assert_eq!(
-            build_repair_action(&brief, &test_packet),
-            Err(RepairActionRejection::TestExpectationBlockedByUserRequest)
+            action.allowed_change_kind,
+            AllowedChangeKind::FixGeneratedTestExpectation
         );
     }
 

@@ -101,6 +101,11 @@ fn handle_repair_job_verifier_failure(
     output: String,
 ) -> TaskContractVerifierFlowOutcome {
     *args.contract_verification_retries += 1;
+    if let Some(sanitized) =
+        super::verifier_skill::sanitize_verify_command_for_case_record(&command)
+    {
+        args.task_contract_verify_commands_collected.push(sanitized);
+    }
     let mut repair_context = verifier_repair_context_from_failure(
         &agent.work_root,
         &command,

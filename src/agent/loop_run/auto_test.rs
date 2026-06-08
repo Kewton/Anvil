@@ -1600,11 +1600,32 @@ impl AutoTestRunner {
         recent_successful_bash_commands: &[String],
         project_unit: Option<&ProjectUnit>,
     ) -> Option<VerifierCandidate> {
-        let candidates = if let Some(project_unit) = project_unit {
-            verifier_candidates_from_project_unit(project_unit)
-        } else {
-            detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands)
-        };
+        let candidates = verifier_candidates_for_selection(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+            &[],
+            project_unit,
+        );
+        let selected = select_verifier_candidate(candidates.clone());
+        emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
+        selected
+    }
+
+    fn detect_candidate_with_project_unit_and_owned_test_artifacts(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        owned_test_artifacts: &[String],
+        project_unit: Option<&ProjectUnit>,
+    ) -> Option<VerifierCandidate> {
+        let candidates = verifier_candidates_for_selection(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+            owned_test_artifacts,
+            project_unit,
+        );
         let selected = select_verifier_candidate(candidates.clone());
         emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
         selected
@@ -1677,10 +1698,13 @@ impl AutoTestRunner {
         if owned_test_artifacts.is_empty() {
             return OwnedTestVerifierPlan::Missing;
         }
-        let Some(candidate) = Self::detect_candidate_with_project_unit(
+        let changed_files_with_owned_tests =
+            changed_files_with_owned_test_artifacts(changed_files, owned_test_artifacts);
+        let Some(candidate) = Self::detect_candidate_with_project_unit_and_owned_test_artifacts(
             work_root,
-            changed_files,
+            &changed_files_with_owned_tests,
             recent_successful_bash_commands,
+            owned_test_artifacts,
             project_unit,
         ) else {
             return OwnedTestVerifierPlan::Missing;
@@ -2631,6 +2655,99 @@ fn verifier_candidates_from_project_unit(project_unit: &ProjectUnit) -> Vec<Veri
             })
         })
         .collect()
+}
+
+fn verifier_candidates_for_selection(
+    work_root: &Path,
+    changed_files: &[String],
+    recent_successful_bash_commands: &[String],
+    owned_test_artifacts: &[String],
+    project_unit: Option<&ProjectUnit>,
+) -> Vec<VerifierCandidate> {
+    let Some(project_unit) = project_unit else {
+        return detect_verifier_candidates(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+        );
+    };
+    let candidates = verifier_candidates_from_project_unit(project_unit);
+    if !candidates.is_empty() || !project_unit_allows_owned_test_fallback(project_unit) {
+        return candidates;
+    }
+    let owned_changed_files =
+        changed_files_with_owned_test_artifacts(changed_files, owned_test_artifacts);
+    detect_verifier_candidates(
+        work_root,
+        &owned_changed_files,
+        recent_successful_bash_commands,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        project_unit_candidate_matches_observed_stack(project_unit, candidate.source)
+            && candidate_source_matches_owned_test_artifacts(candidate.source, owned_test_artifacts)
+    })
+    .collect()
+}
+
+fn project_unit_allows_owned_test_fallback(project_unit: &ProjectUnit) -> bool {
+    project_unit
+        .artifact_roles
+        .contains(&super::task_contract::ArtifactRole::Test)
+}
+
+fn project_unit_candidate_matches_observed_stack(
+    project_unit: &ProjectUnit,
+    source: VerifierCandidateSource,
+) -> bool {
+    match source {
+        VerifierCandidateSource::PythonTests | VerifierCandidateSource::PythonCompileFallback => {
+            project_unit.observed_stacks.contains(&"python")
+        }
+        VerifierCandidateSource::CargoManifest => project_unit.observed_stacks.contains(&"rust"),
+        VerifierCandidateSource::PackageJsonScripts
+        | VerifierCandidateSource::NativeNodeFramework => {
+            project_unit.observed_stacks.contains(&"node")
+                || project_unit.observed_stacks.contains(&"typescript")
+        }
+        VerifierCandidateSource::ProjectInstruction
+        | VerifierCandidateSource::RecentSuccessfulBash => false,
+    }
+}
+
+fn candidate_source_matches_owned_test_artifacts(
+    source: VerifierCandidateSource,
+    owned_test_artifacts: &[String],
+) -> bool {
+    match source {
+        VerifierCandidateSource::PythonTests => owned_test_artifacts
+            .iter()
+            .any(|path| path.ends_with(".py")),
+        VerifierCandidateSource::CargoManifest => owned_test_artifacts
+            .iter()
+            .any(|path| path.ends_with(".rs")),
+        VerifierCandidateSource::PackageJsonScripts
+        | VerifierCandidateSource::NativeNodeFramework => owned_test_artifacts.iter().any(|path| {
+            matches!(
+                Path::new(path).extension().and_then(|ext| ext.to_str()),
+                Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
+            )
+        }),
+        VerifierCandidateSource::ProjectInstruction
+        | VerifierCandidateSource::RecentSuccessfulBash
+        | VerifierCandidateSource::PythonCompileFallback => false,
+    }
+}
+
+fn changed_files_with_owned_test_artifacts(
+    changed_files: &[String],
+    owned_test_artifacts: &[String],
+) -> Vec<String> {
+    let mut out = changed_files.to_vec();
+    out.extend(owned_test_artifacts.iter().cloned());
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn emit_verifier_candidate_telemetry(
@@ -5082,6 +5199,96 @@ dev = [
             &["tests/test_main.py".to_string()],
             Some(&project_unit),
         );
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    #[test]
+    fn owned_python_test_fallback_restores_runnable_when_project_unit_lost_candidate() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            dir.path().join("password_strength.py"),
+            "def password_score(password: str) -> int:\n    return 0\n",
+        )
+        .expect("impl");
+        std::fs::write(
+            dir.path().join("tests/test_password_strength.py"),
+            "from password_strength import password_score\n\ndef test_empty():\n    assert password_score('') == 0\n",
+        )
+        .expect("test");
+        std::fs::write(
+            dir.path().join("pytest.ini"),
+            "[pytest]\ntestpaths = tests\n",
+        )
+        .expect("pytest");
+
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Setup);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: Vec::new(),
+            observed_stacks: vec!["python"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::Medium,
+        };
+        let owned = vec!["tests/test_password_strength.py".to_string()];
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["pytest.ini".to_string()],
+            &[],
+            &owned,
+            Some(&project_unit),
+        );
+
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected owned python test fallback runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_test_fallback_does_not_cross_stack_or_extension() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='outer'\nversion='0.0.0'\n",
+        )
+        .expect("manifest");
+        std::fs::write(dir.path().join("src.rs"), "pub fn value()->u8{1}\n").expect("rust");
+        std::fs::write(
+            dir.path().join("tests/test_main.py"),
+            "def test_x(): pass\n",
+        )
+        .expect("python test");
+
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: vec!["Cargo.toml".to_string()],
+            artifact_roles,
+            verifier_candidates: Vec::new(),
+            observed_stacks: vec!["rust"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::Medium,
+        };
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["pytest.ini".to_string()],
+            &[],
+            &["tests/test_main.py".to_string()],
+            Some(&project_unit),
+        );
+
         assert_eq!(plan, OwnedTestVerifierPlan::Missing);
     }
 

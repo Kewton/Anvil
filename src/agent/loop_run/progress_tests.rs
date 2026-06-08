@@ -4670,8 +4670,7 @@ E   assert [{'id': 1}] == []\n";
     }
 
     #[test]
-    fn verifier_diagnostic_stale_assertion_keeps_role_kind_compatible_target_after_failed_non_test_repair()
-     {
+    fn verifier_diagnostic_stale_assertion_retargets_test_after_failed_non_test_repair() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
         let app = work_root.join("app").join("main.py");
@@ -4726,11 +4725,11 @@ E   assert [{'id': 1}] == []\n";
                 .repair_target_hint
                 .as_ref()
                 .map(|hint| hint.path.as_str()),
-            Some("app/main.py")
+            Some("tests/test_health.py")
         );
         assert_eq!(
             assessment.repair_plan.first().map(|hint| hint.role),
-            Some(super::super::task_contract::ArtifactRole::Implementation)
+            Some(super::super::task_contract::ArtifactRole::Test)
         );
     }
 
@@ -4802,8 +4801,7 @@ E   assert [{'id': 1}] == []\n";
     }
 
     #[test]
-    fn verifier_diagnostic_stale_assertion_keeps_role_kind_compatible_target_after_improved_non_test_repair()
-     {
+    fn verifier_diagnostic_stale_assertion_retargets_test_after_improved_non_test_repair() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
         let app = work_root.join("app").join("main.py");
@@ -4852,12 +4850,12 @@ E   assert [{'id': 1}] == []\n";
                 .repair_target_hint
                 .as_ref()
                 .map(|hint| hint.path.as_str()),
-            Some("app/main.py")
+            Some("tests/test_health.py")
         );
     }
 
     #[test]
-    fn verifier_diagnostic_prefers_role_kind_compatible_target_over_llm_order() {
+    fn verifier_diagnostic_respects_admitted_test_target_for_assertion_mismatch() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
         let app = work_root.join("main.py");
@@ -4897,17 +4895,17 @@ E   assert [{'id': 1}] == []\n";
                 .repair_target_hint
                 .as_ref()
                 .map(|hint| hint.path.as_str()),
-            Some("main.py"),
-            "assertion_mismatch maps to implementation repair unless a stronger admitted test-repair kind exists"
+            Some("tests/test_main.py"),
+            "assertion_mismatch target selection should preserve the admitted diagnostic target"
         );
         assert_eq!(
             assessment.repair_plan.first().map(|hint| hint.role),
-            Some(super::super::task_contract::ArtifactRole::Implementation)
+            Some(super::super::task_contract::ArtifactRole::Test)
         );
     }
 
     #[test]
-    fn verifier_diagnostic_uses_secondary_target_when_primary_target_role_mismatches_kind() {
+    fn verifier_diagnostic_keeps_primary_test_target_over_secondary_for_assertion_mismatch() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
         let app = work_root.join("main.py");
@@ -4947,16 +4945,17 @@ E   assert [{'id': 1}] == []\n";
                 .repair_target_hint
                 .as_ref()
                 .map(|hint| hint.path.as_str()),
-            Some("main.py")
+            Some("tests/test_main.py")
         );
         assert_eq!(
             assessment.repair_plan.first().map(|hint| hint.role),
-            Some(super::super::task_contract::ArtifactRole::Implementation)
+            Some(super::super::task_contract::ArtifactRole::Test)
         );
     }
 
     #[test]
-    fn verifier_diagnostic_uses_changed_candidate_when_primary_target_role_mismatches_kind() {
+    fn verifier_diagnostic_keeps_primary_test_target_over_changed_candidate_for_assertion_mismatch()
+    {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();
         let app = work_root.join("main.py");
@@ -4995,11 +4994,11 @@ E   assert [{'id': 1}] == []\n";
                 .repair_target_hint
                 .as_ref()
                 .map(|hint| hint.path.as_str()),
-            Some("main.py")
+            Some("tests/test_main.py")
         );
         assert_eq!(
             assessment.repair_plan.first().map(|hint| hint.role),
-            Some(super::super::task_contract::ArtifactRole::Implementation)
+            Some(super::super::task_contract::ArtifactRole::Test)
         );
     }
 
@@ -13411,6 +13410,34 @@ export default function App() {
             super::super::task_contract::ArtifactRole::Test,
             "when implementation contract is authoritative, stale generated tests are the preferred repair target"
         );
+    }
+
+    #[test]
+    fn cb017_sort_respects_preferred_test_under_behavior_contract_authority() {
+        let mut admitted = vec![
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Implementation,
+                path: "password_strength.py".to_string(),
+                reason: String::new(),
+            },
+            super::super::task_contract::RecoveryTargetHint {
+                role: super::super::task_contract::ArtifactRole::Test,
+                path: "tests/test_password_strength.py".to_string(),
+                reason: String::new(),
+            },
+        ];
+        super::sort_admitted_by_authority_role_priority(
+            &mut admitted,
+            super::super::spec_authority::SpecAuthority::BehaviorContract,
+            super::super::VerifierDiagnosticFailureKind::AssertionMismatch,
+            super::super::task_contract::ArtifactRole::Test,
+        );
+        assert_eq!(
+            admitted[0].role,
+            super::super::task_contract::ArtifactRole::Test,
+            "semantic preferred_repair_role=test must not be hidden by broad behavior-contract authority"
+        );
+        assert_eq!(admitted[0].path, "tests/test_password_strength.py");
     }
 
     /// CR-5: TestBug override flips the order — Test must come first.
