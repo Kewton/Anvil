@@ -5971,11 +5971,11 @@ E   assert [{'id': 1}] == []\n";
             );
         }
         assert!(
-            prompt.contains("under 3000 characters"),
+            prompt.contains("under 1800 characters"),
             "diagnostic prompt must bound structured output size: {prompt}",
         );
         assert!(
-            prompt.contains("at most 2 failure_clusters"),
+            prompt.contains("exactly 1 failure_clusters entry"),
             "diagnostic prompt must force grouped, bounded clusters: {prompt}",
         );
     }

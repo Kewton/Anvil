@@ -277,6 +277,15 @@ fn diagnostic_role_matches_failure_kind(
     role: super::task_contract::ArtifactRole,
     failure_kind: super::VerifierDiagnosticFailureKind,
 ) -> bool {
+    // Plain assertion mismatches are implementation-repair evidence at this
+    // selection boundary. Generated-test repairs must arrive as TestBug or via
+    // the stale-assertion helper, so LLM target order cannot silently flip the
+    // lifecycle into test editing.
+    if role == super::task_contract::ArtifactRole::Test
+        && failure_kind == super::VerifierDiagnosticFailureKind::AssertionMismatch
+    {
+        return false;
+    }
     let kind = super::repair_brief::legacy_kind_to_allowed_change_kind_for_role(
         failure_kind.as_str(),
         Some(role),

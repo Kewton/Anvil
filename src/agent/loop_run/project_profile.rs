@@ -94,8 +94,8 @@ const SHAPE_PROFILES: &[ShapeProfile] = &[
     },
     ShapeProfile {
         shape: ProjectShape::Library,
-        lower_markers: &["library", "crate", "package", "module"],
-        ascii_tokens: &[],
+        lower_markers: &["library", "crate", "module"],
+        ascii_tokens: &["package"],
         case_markers: &["ライブラリ", "クレート", "パッケージ", "モジュール"],
     },
     ShapeProfile {
@@ -579,9 +579,21 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
-    haystack
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
-        .any(|token| token == needle)
+    haystack.match_indices(needle).any(|(index, _)| {
+        let before = haystack[..index].chars().next_back();
+        let after_index = index + needle.len();
+        let after = haystack[after_index..].chars().next();
+        let after_dot_char = haystack[after_index..]
+            .strip_prefix('.')
+            .and_then(|tail| tail.chars().next());
+        !before.is_some_and(is_ascii_token_char)
+            && !after.is_some_and(is_ascii_token_char)
+            && !after_dot_char.is_some_and(|ch| ch.is_ascii_alphanumeric())
+    })
+}
+
+fn is_ascii_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
 #[cfg(test)]
@@ -603,6 +615,23 @@ mod tests {
         let lower = request.to_ascii_lowercase();
 
         assert_eq!(infer_shape(request, &lower), ProjectShape::Cli);
+    }
+
+    #[test]
+    fn profile_inference_keeps_package_word_but_not_package_json_as_library_shape() {
+        let package_request = "Build a Node package for slugifying strings";
+        let package_lower = package_request.to_ascii_lowercase();
+        assert_eq!(
+            infer_shape(package_request, &package_lower),
+            ProjectShape::Library
+        );
+
+        let manifest_request = "add dependencies to package.json";
+        let manifest_lower = manifest_request.to_ascii_lowercase();
+        assert_eq!(
+            infer_shape(manifest_request, &manifest_lower),
+            ProjectShape::Unknown
+        );
     }
 
     #[test]

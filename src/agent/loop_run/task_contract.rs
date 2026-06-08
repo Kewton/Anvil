@@ -2787,8 +2787,10 @@ impl TaskContract {
         if task_kind == TaskKind::Authoring {
             required.push(ArtifactRole::UsageDocs);
         }
+        let setup_required = matches!(intent, TaskIntent::Install)
+            && !request_asks_for_code_work(request_for_inference, &lower);
         if asks_for_setup && !profile_forbids_setup {
-            if matches!(intent, TaskIntent::Install) {
+            if setup_required {
                 required.push(ArtifactRole::Setup);
             } else {
                 optional.push(ArtifactRole::Setup);
