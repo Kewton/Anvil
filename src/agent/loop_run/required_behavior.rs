@@ -917,8 +917,25 @@ impl RequiredBehaviorContract {
         let lower = excerpt.to_ascii_lowercase();
         terms
             .iter()
-            .any(|term| !term.is_empty() && lower.contains(&term.to_ascii_lowercase()))
+            .any(|term| domain_term_matches_excerpt(term, &lower))
     }
+}
+
+fn domain_term_matches_excerpt(term: &str, lower_excerpt: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    let lower_term = term.to_ascii_lowercase();
+    if lower_excerpt.contains(&lower_term) {
+        return true;
+    }
+    domain_term_tail(&lower_term)
+        .is_some_and(|tail| tail.len() >= 3 && lower_excerpt.contains(tail))
+}
+
+fn domain_term_tail(term: &str) -> Option<&str> {
+    term.rsplit(|ch| matches!(ch, '.' | '/' | '-' | '_'))
+        .find(|part| !part.is_empty())
 }
 
 // ---------------------------------------------------------------------------

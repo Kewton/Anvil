@@ -1460,6 +1460,7 @@ impl TaskExecutionContract {
             evidence_kind: self.evidence.kind,
             required_deliverables: required_deliverables_from_execution(&self.deliverables),
             evidence_required: self.evidence.required,
+            required_evidence_commands: self.evidence.command.iter().cloned().collect::<Vec<_>>(),
         }
     }
 

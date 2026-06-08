@@ -1224,6 +1224,7 @@ mod capability_matrix_e2e_tests;
 // gate propagation, sidecar-None determinism, matched==true immutability, lazy
 // -net no-override) without Ollama. `#[cfg(test)]` keeps it out of the
 // production binary; the explicit `mod` is required. No facade re-export (DR3-001).
+mod contract_request_signals;
 mod project_profile;
 mod project_profile_projection;
 mod summary;

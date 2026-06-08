@@ -899,12 +899,15 @@ fn verifier_diagnostic_for_obligation_parts(
             "research evidence does not meet section coverage or open-ended report floor",
         ));
     }
-    // Issue #923 (DR3-003): the tiered Ops gate applies only to OpsRunbook
-    // obligations, so a setup/install artifact routed to `TaskKind::Ops` is not
-    // judged as a runbook. `obligation.required_sections` carries the
-    // request-derived mandatory sections (canonical labels, DR4-002).
+    // Issue #923 (DR3-003): the tiered Ops gate applies only to typed Ops
+    // document obligations, so a setup/install artifact routed to `TaskKind::Ops`
+    // is not judged as a runbook. `CommandOutput` uses the same content gate but
+    // additionally requires command-observation evidence at the objective layer.
     if task_kind == TaskKind::Ops
-        && obligation.kind == DeliverableKind::OpsRunbook
+        && matches!(
+            obligation.kind,
+            DeliverableKind::OpsRunbook | DeliverableKind::CommandOutput
+        )
         && let Some(excerpt) = excerpt
         && !ops_runbook_pass(excerpt, &obligation.required_sections)
     {

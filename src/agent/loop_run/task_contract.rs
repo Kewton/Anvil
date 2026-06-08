@@ -1,7 +1,12 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
+use super::contract_request_signals::{
+    contains_callable_signature_hint, contains_dotted_callable_change_action,
+    contains_implementation_file_hint, negated_artifact_list_contains,
+};
 use super::project_profile::ProjectProfileConfirmation;
 use super::project_profile_projection::{
-    ProjectProfileContractInputs, contract_inputs_from_confirmation,
+    ProfileForbiddenRoles, ProjectProfileContractInputs, adopt_contract_task_kind,
+    contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
 use crate::tools::bash::BashCommandClass;
@@ -354,6 +359,7 @@ pub(super) struct ObjectiveContract {
     pub(super) required_deliverables: Vec<ArtifactRole>,
     /// Whether command/external evidence is mandatory after deliverables.
     pub(super) evidence_required: bool,
+    pub(super) required_evidence_commands: Vec<String>,
 }
 
 impl ObjectiveContract {
@@ -366,6 +372,7 @@ impl ObjectiveContract {
                 evidence_kind: ObjectiveEvidenceKind::ContentAcceptance,
                 required_deliverables: Vec::new(),
                 evidence_required: false,
+                required_evidence_commands: Vec::new(),
             };
         }
 
@@ -408,7 +415,12 @@ impl ObjectiveContract {
             evidence_required: contract.completion_policy.verification_required()
                 || contract
                     .objective_evidence_kind_override
-                    .is_some_and(objective_evidence_kind_requires_command_evidence),
+                    .is_some_and(objective_evidence_kind_requires_command_evidence)
+                || contract
+                    .required_artifact_identities
+                    .iter()
+                    .any(|identity| identity.kind == DeliverableKind::CommandOutput),
+            required_evidence_commands: required_evidence_commands_from_contract(contract),
         }
     }
 
@@ -423,6 +435,24 @@ impl ObjectiveContract {
     pub(super) fn requires_evidence(&self) -> bool {
         self.evidence_required
     }
+}
+
+fn required_evidence_commands_from_contract(contract: &TaskContract) -> Vec<String> {
+    let mut commands = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|identity| identity.kind == DeliverableKind::CommandOutput)
+        .flat_map(|identity| {
+            identity
+                .acceptance_criteria
+                .iter()
+                .filter_map(|criterion| criterion.strip_prefix("command:"))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    commands
 }
 
 fn objective_evidence_kind_requires_command_evidence(evidence_kind: ObjectiveEvidenceKind) -> bool {
@@ -696,6 +726,27 @@ impl DeliverableObligation {
             schema: None,
             required_sections,
             acceptance_criteria: Vec::new(),
+            structured_record_schema: None,
+        }
+    }
+
+    fn command_output(
+        path: impl Into<String>,
+        required_sections: Vec<String>,
+        required_commands: Vec<String>,
+    ) -> Self {
+        let path = validated_obligation_path(path.into());
+        Self {
+            role: ArtifactRole::UsageDocs,
+            kind: DeliverableKind::CommandOutput,
+            format: DeliverableFormat::from_path(&path),
+            path,
+            schema: None,
+            required_sections,
+            acceptance_criteria: required_commands
+                .into_iter()
+                .map(|command| format!("command:{command}"))
+                .collect(),
             structured_record_schema: None,
         }
     }
@@ -1739,11 +1790,17 @@ fn implementation_excerpt_satisfies_completion(contract: &TaskContract, excerpt:
     if implementation_excerpt_is_obviously_placeholder(excerpt) {
         return false;
     }
+    if excerpt_satisfies_behavior(contract, excerpt) {
+        return true;
+    }
+    if implementation_excerpt_requires_behavior_hit(contract) {
+        return false;
+    }
     // Deterministic behavior labels are useful when they match, but they
     // are too brittle to be a hard multilingual semantic gate. The
     // verifier/repair pipeline owns semantic correctness after artifacts
     // exist; artifact completion only blocks obvious placeholder bodies.
-    excerpt_satisfies_behavior(contract, excerpt) || !excerpt.trim().is_empty()
+    !excerpt.trim().is_empty()
 }
 
 /// At least two of {setup, run, verification} surface categories must
@@ -1789,7 +1846,9 @@ fn usage_docs_obligation_has_content_gate(identity: &ArtifactObligation) -> bool
         )
         || matches!(
             identity.kind,
-            DeliverableKind::ResearchNotes | DeliverableKind::OpsRunbook
+            DeliverableKind::ResearchNotes
+                | DeliverableKind::OpsRunbook
+                | DeliverableKind::CommandOutput
         )
 }
 
@@ -2058,7 +2117,10 @@ fn objective_deliverable_stage(
 fn order_missing_deliverables_for_recovery(missing: &mut [ArtifactRole]) {
     missing.sort_by_key(|role| match role {
         ArtifactRole::Setup => 0,
-        _ => 1,
+        ArtifactRole::Implementation => 1,
+        ArtifactRole::Test => 2,
+        ArtifactRole::DataOutput => 3,
+        ArtifactRole::UsageDocs => 4,
     });
 }
 
@@ -2154,7 +2216,8 @@ fn required_role_satisfied(
 ) -> bool {
     let identities = contract.required_identities_for_role(role);
     if identities.is_empty() {
-        return observed.contains(&role) || artifact_ready_for_verification(artifacts, role);
+        return (observed.contains(&role) || artifact_ready_for_verification(artifacts, role))
+            && role_deliverable_content_satisfied(contract, artifact_excerpts, role);
     }
     let usage_docs_content_gate =
         role == ArtifactRole::UsageDocs && usage_docs_role_has_content_gate(contract);
@@ -2173,7 +2236,7 @@ fn required_role_satisfied(
         && contract.task_kind != TaskKind::Ops
         && observed.contains(&role)
     {
-        return true;
+        return role_deliverable_content_satisfied(contract, artifact_excerpts, role);
     }
     identities.iter().all(|identity| {
         artifact_identity_satisfied_for_verification(
@@ -2183,7 +2246,67 @@ fn required_role_satisfied(
             artifact_excerpts,
             identity,
         )
-    })
+    }) && role_deliverable_content_satisfied(contract, artifact_excerpts, role)
+}
+
+fn role_deliverable_content_satisfied(
+    contract: &TaskContract,
+    artifact_excerpts: &ArtifactExcerpts,
+    role: ArtifactRole,
+) -> bool {
+    if !behavior_coverage_enabled(contract) {
+        return true;
+    }
+    let Some(excerpt) = artifact_excerpts.get(&role).map(String::as_str) else {
+        return true;
+    };
+    match role {
+        ArtifactRole::Implementation => {
+            implementation_excerpt_satisfies_completion(contract, excerpt)
+        }
+        ArtifactRole::Test | ArtifactRole::Setup => true,
+        ArtifactRole::UsageDocs => {
+            contract.task_kind == TaskKind::Ops
+                || command_observation_usage_docs_behavior_satisfied(contract)
+                || usage_docs_excerpt_satisfies_obligations(contract, excerpt)
+        }
+        ArtifactRole::DataOutput => {
+            structured_record_excerpt_satisfies_obligations(contract, excerpt)
+        }
+    }
+}
+
+fn implementation_excerpt_requires_behavior_hit(contract: &TaskContract) -> bool {
+    let identities = contract.required_identities_for_role(ArtifactRole::Implementation);
+    contract
+        .required_behavior
+        .domain_terms
+        .as_ref()
+        .is_some_and(|terms| {
+            terms.iter().any(|term| {
+                domain_term_is_code_like_contract(term)
+                    && !domain_term_matches_required_identity_path(term, &identities)
+            })
+        })
+}
+
+fn domain_term_is_code_like_contract(term: &str) -> bool {
+    let trimmed = term
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation());
+    !trimmed.is_empty()
+        && trimmed.split_whitespace().count() == 1
+        && (trimmed.contains('.') || trimmed.contains('_') || trimmed.contains('-'))
+}
+
+fn domain_term_matches_required_identity_path(
+    term: &str,
+    identities: &[&ArtifactObligation],
+) -> bool {
+    let term = term.trim_matches(|ch: char| ch.is_ascii_punctuation());
+    identities
+        .iter()
+        .any(|identity| identity.path.as_str() == term)
 }
 
 fn artifact_identity_satisfied_for_verification(
@@ -2721,6 +2844,236 @@ fn sanitized_file_stem(path: &str) -> Option<&str> {
     Some(stem)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContractRequestInputs {
+    asks_for_tests: bool,
+    asks_for_usage_docs: bool,
+    asks_for_setup: bool,
+    asks_for_data_output: bool,
+    asks_for_implementation: bool,
+    project_intent_implies_implementation: bool,
+}
+
+impl ContractRequestInputs {
+    fn collect(
+        scan: &OutputContextScan,
+        request_for_inference: &str,
+        lower: &str,
+        project_intent: &ProjectIntent,
+    ) -> Self {
+        let asks_for_tests = request_asks_for_test_artifact(request_for_inference, lower);
+        let asks_for_usage_docs = request_asks_for_usage_docs(request_for_inference, lower);
+        let asks_for_setup = request_asks_for_setup(request_for_inference, lower);
+        let asks_for_data_output =
+            request_asks_for_data_output_artifact_with_scan(scan, request_for_inference);
+        let asks_for_implementation = request_asks_for_implementation_artifact(
+            request_for_inference,
+            lower,
+            asks_for_tests,
+            asks_for_usage_docs,
+            asks_for_setup,
+        );
+        let project_intent_implies_implementation =
+            project_intent_implies_implementation_artifact(project_intent)
+                && !test_only_without_implementation_signal(
+                    asks_for_tests,
+                    asks_for_usage_docs,
+                    asks_for_setup,
+                    asks_for_data_output,
+                    asks_for_implementation,
+                );
+
+        Self {
+            asks_for_tests,
+            asks_for_usage_docs,
+            asks_for_setup,
+            asks_for_data_output,
+            asks_for_implementation,
+            project_intent_implies_implementation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactContractParts {
+    required: Vec<ArtifactRole>,
+    optional: Vec<ArtifactRole>,
+    required_artifact_identities: Vec<ArtifactObligation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactRoleSeed {
+    required: Vec<ArtifactRole>,
+    optional: Vec<ArtifactRole>,
+    research_report_intended: bool,
+}
+
+struct ArtifactContractBuildInputs<'a> {
+    scan: &'a OutputContextScan,
+    request: &'a str,
+    lower: &'a str,
+    task_kind: TaskKind,
+    intent: TaskIntent,
+    request_inputs: ContractRequestInputs,
+    project_intent: &'a ProjectIntent,
+    profile_inputs: Option<&'a ProjectProfileContractInputs>,
+    controller_state: Option<&'a ControllerStatePacket>,
+}
+
+fn build_artifact_contract_parts(inputs: ArtifactContractBuildInputs<'_>) -> ArtifactContractParts {
+    let mut role_seed = seed_artifact_roles(&inputs);
+    let mut required_artifact_identities = build_required_artifact_identities(
+        &inputs,
+        &mut role_seed.required,
+        role_seed.research_report_intended,
+    );
+    role_seed.required.sort();
+    role_seed.required.dedup();
+    required_artifact_identities
+        .sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
+
+    ArtifactContractParts {
+        required: role_seed.required,
+        optional: role_seed.optional,
+        required_artifact_identities,
+    }
+}
+
+fn seed_artifact_roles(inputs: &ArtifactContractBuildInputs<'_>) -> ArtifactRoleSeed {
+    let mut required = Vec::new();
+    let mut optional = Vec::new();
+    let profile_forbids = ProfileForbiddenRoles::from_inputs(inputs.profile_inputs);
+
+    if inputs.task_kind == TaskKind::Coding
+        && (inputs.request_inputs.asks_for_implementation
+            || inputs.request_inputs.project_intent_implies_implementation)
+        && !profile_forbids.implementation
+    {
+        required.push(ArtifactRole::Implementation);
+    }
+    if inputs.request_inputs.asks_for_tests && !profile_forbids.tests {
+        required.push(ArtifactRole::Test);
+    }
+    if inputs.request_inputs.asks_for_usage_docs && !profile_forbids.usage_docs {
+        required.push(ArtifactRole::UsageDocs);
+    }
+    if inputs.task_kind == TaskKind::Authoring && !profile_forbids.usage_docs {
+        required.push(ArtifactRole::UsageDocs);
+    }
+    let setup_required = matches!(inputs.intent, TaskIntent::Install)
+        && !request_asks_for_code_work(inputs.request, inputs.lower);
+    if inputs.request_inputs.asks_for_setup && !profile_forbids.setup {
+        if setup_required {
+            required.push(ArtifactRole::Setup);
+        } else {
+            optional.push(ArtifactRole::Setup);
+        }
+    }
+    if inputs.request_inputs.asks_for_data_output {
+        required.push(ArtifactRole::DataOutput);
+    }
+    if let Some(role) = inputs
+        .profile_inputs
+        .and_then(|inputs| inputs.required_role)
+    {
+        required.push(role);
+    }
+
+    let research_report_intended = inputs.task_kind == TaskKind::Research
+        && research_report_artifact_intended_with_scan(inputs.scan, inputs.request);
+    if research_report_intended {
+        required.push(ArtifactRole::UsageDocs);
+    }
+
+    optional.sort();
+    optional.dedup();
+
+    ArtifactRoleSeed {
+        required,
+        optional,
+        research_report_intended,
+    }
+}
+
+fn build_required_artifact_identities(
+    inputs: &ArtifactContractBuildInputs<'_>,
+    required: &mut Vec<ArtifactRole>,
+    research_report_intended: bool,
+) -> Vec<ArtifactObligation> {
+    let mut required_artifact_identities =
+        explicit_artifact_obligations_from_request_with_scan(inputs.scan, inputs.request);
+    if let Some(controller_state) = inputs.controller_state {
+        controller_state.extend_contract_parts(required, &mut required_artifact_identities);
+    }
+    for identity in inputs
+        .profile_inputs
+        .into_iter()
+        .flat_map(|inputs| inputs.artifact_obligations.iter())
+        .cloned()
+    {
+        if identity.role == ArtifactRole::DataOutput
+            && !data_path_has_output_context_with_scan(inputs.scan, &identity.path)
+        {
+            continue;
+        }
+        if profile_obligation_shadowed_by_prior_identity(&required_artifact_identities, &identity) {
+            continue;
+        }
+        if !required.contains(&identity.role) {
+            required.push(identity.role);
+        }
+        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+    }
+    if inputs.request_inputs.asks_for_data_output
+        && required_artifact_identities
+            .iter()
+            .any(|identity| identity.role == ArtifactRole::DataOutput)
+    {
+        required.push(ArtifactRole::DataOutput);
+    }
+    required_artifact_identities.retain(|identity| required.contains(&identity.role));
+    for identity in
+        inferred_artifact_obligations_from_project_intent(inputs.project_intent, required)
+    {
+        if inferred_obligation_shadowed_by_explicit_identity(
+            &required_artifact_identities,
+            &identity,
+        ) {
+            continue;
+        }
+        if !required.contains(&identity.role) {
+            required.push(identity.role);
+        }
+        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+    }
+    for identity in inferred_docs_obligations_from_request(inputs.request, inputs.lower, required) {
+        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+    }
+    if research_report_intended {
+        let sections = required_research_sections_from_request(inputs.request);
+        let path = research_report_path_from_request_with_scan(inputs.scan, inputs.request);
+        push_or_merge_artifact_obligation(
+            &mut required_artifact_identities,
+            ArtifactObligation::research_report(path, sections),
+        );
+    }
+    for identity in inferred_data_obligations_from_request_with_scan(inputs.scan, inputs.request) {
+        if !required.contains(&identity.role) {
+            required.push(identity.role);
+        }
+        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+    }
+    for identity in
+        inferred_ops_obligations_from_request(inputs.request, inputs.lower, inputs.task_kind)
+    {
+        if !required.contains(&identity.role) {
+            required.push(identity.role);
+        }
+        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
+    }
+    required_artifact_identities
+}
+
 impl From<CompletionDecision> for ArtifactRecoveryAction {
     fn from(decision: CompletionDecision) -> Self {
         match decision {
@@ -2791,27 +3144,8 @@ impl TaskContract {
             project_intent.apply_profile_contract_inputs(inputs);
         }
         let mut intent = project_intent.intent;
-        let asks_for_tests = request_asks_for_test_artifact(request_for_inference, &lower);
-        let asks_for_usage_docs = request_asks_for_usage_docs(request_for_inference, &lower);
-        let asks_for_setup = request_asks_for_setup(request_for_inference, &lower);
-        let asks_for_data_output =
-            request_asks_for_data_output_artifact_with_scan(&scan, request_for_inference);
-        let asks_for_implementation = request_asks_for_implementation_artifact(
-            request_for_inference,
-            &lower,
-            asks_for_tests,
-            asks_for_usage_docs,
-            asks_for_setup,
-        );
-        let project_intent_implies_implementation =
-            project_intent_implies_implementation_artifact(&project_intent)
-                && !test_only_without_implementation_signal(
-                    asks_for_tests,
-                    asks_for_usage_docs,
-                    asks_for_setup,
-                    asks_for_data_output,
-                    asks_for_implementation,
-                );
+        let request_inputs =
+            ContractRequestInputs::collect(&scan, request_for_inference, &lower, &project_intent);
         let TaskKindInference {
             kind: inferred_kind,
             matched: inferred_matched,
@@ -2819,9 +3153,9 @@ impl TaskContract {
             request_for_inference,
             &lower,
             intent,
-            asks_for_tests,
-            asks_for_usage_docs,
-            asks_for_setup,
+            request_inputs.asks_for_tests,
+            request_inputs.asks_for_usage_docs,
+            request_inputs.asks_for_setup,
         );
         // Issue #926 (D2): a confirmed override substitutes the kind at the
         // single bind point so the entire cascade below rebuilds from it; an
@@ -2829,23 +3163,13 @@ impl TaskContract {
         // #917 2-value confidence applies (matched → 1.0 / no-match → 0.0; only
         // the no-keyword-match fallthrough lands below the confirm threshold and
         // triggers `needs_confirm()`).
-        let profile_task_kind = project_profile_inputs
-            .as_ref()
-            .and_then(|inputs| inputs.task_kind);
-        let (task_kind, classification_confidence) = match forced_kind {
-            Some(k) => (k, 1.0_f32),
-            None if controller_task_kind.is_some() => {
-                (controller_task_kind.expect("checked Some above"), 1.0)
-            }
-            None if profile_task_kind.is_some() => (
-                profile_task_kind.expect("checked Some above"),
-                project_profile_inputs
-                    .as_ref()
-                    .map(|inputs| inputs.confidence)
-                    .unwrap_or(1.0_f32),
-            ),
-            None => (inferred_kind, if inferred_matched { 1.0 } else { 0.0 }),
-        };
+        let (task_kind, classification_confidence) = adopt_contract_task_kind(
+            forced_kind,
+            controller_task_kind,
+            project_profile_inputs.as_ref(),
+            inferred_kind,
+            inferred_matched,
+        );
         // Issue #919 (Decision #5(a)): Authoring contracts never carry the
         // Explain intent. Trigger B may have classified `intent = Explain` (e.g.
         // `summarize`); override it to `Build` so the contract acquires a
@@ -2854,160 +3178,21 @@ impl TaskContract {
         if task_kind == TaskKind::Authoring {
             intent = TaskIntent::Build;
         }
-        let mut required = Vec::new();
-        let mut optional = Vec::new();
-        let profile_forbids_impl = project_profile_inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.forbids_implementation);
-        let profile_forbids_tests = project_profile_inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.forbids_tests);
-        let profile_forbids_setup = project_profile_inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.forbids_setup);
-        let profile_forbids_usage_docs = project_profile_inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.forbids_usage_docs);
-
-        if task_kind == TaskKind::Coding
-            && (asks_for_implementation || project_intent_implies_implementation)
-            && !profile_forbids_impl
-        {
-            required.push(ArtifactRole::Implementation);
-        }
-        if asks_for_tests && !profile_forbids_tests {
-            required.push(ArtifactRole::Test);
-        }
-        if asks_for_usage_docs && !profile_forbids_usage_docs {
-            required.push(ArtifactRole::UsageDocs);
-        }
-        // Issue #919 (Decision #5(a)): Authoring requires the UsageDocs role even
-        // when no docs *topic* word was present (Trigger B). Pushing it here lets
-        // the explicit `summary.md`/`README.md` obligation survive the
-        // `required_artifact_identities.retain(|id| required.contains(&id.role))`
-        // below — without it the obligation is dropped exactly as it is today.
-        if task_kind == TaskKind::Authoring && !profile_forbids_usage_docs {
-            required.push(ArtifactRole::UsageDocs);
-        }
-        let setup_required = matches!(intent, TaskIntent::Install)
-            && !request_asks_for_code_work(request_for_inference, &lower);
-        if asks_for_setup && !profile_forbids_setup {
-            if setup_required {
-                required.push(ArtifactRole::Setup);
-            } else {
-                optional.push(ArtifactRole::Setup);
-            }
-        }
-        if asks_for_data_output {
-            required.push(ArtifactRole::DataOutput);
-        }
-        if let Some(role) = project_profile_inputs
-            .as_ref()
-            .and_then(|inputs| inputs.required_role)
-        {
-            required.push(role);
-        }
-
-        // Issue #922 (P5 / DD3): a research task that intends a written report
-        // gets a required `UsageDocs` obligation so the report flows through
-        // `assess_research_report` and gates completion (instead of completing
-        // answer-only or trivially). Added to `required` BEFORE the `retain`
-        // below so any explicit report path obligation survives (DR3-002).
-        let research_report_intended = task_kind == TaskKind::Research
-            && research_report_artifact_intended_with_scan(&scan, request_for_inference);
-        if research_report_intended {
-            required.push(ArtifactRole::UsageDocs);
-        }
-
-        optional.sort();
-        optional.dedup();
-        let mut required_artifact_identities =
-            explicit_artifact_obligations_from_request_with_scan(&scan, request_for_inference);
-        if let Some(controller_state) = &request_view.controller_state {
-            controller_state
-                .extend_contract_parts(&mut required, &mut required_artifact_identities);
-        }
-        for identity in project_profile_inputs
-            .as_ref()
-            .into_iter()
-            .flat_map(|inputs| inputs.artifact_obligations.iter())
-            .cloned()
-        {
-            if identity.role == ArtifactRole::DataOutput
-                && !data_path_has_output_context_with_scan(&scan, &identity.path)
-            {
-                continue;
-            }
-            if profile_obligation_shadowed_by_prior_identity(
-                &required_artifact_identities,
-                &identity,
-            ) {
-                continue;
-            }
-            if !required.contains(&identity.role) {
-                required.push(identity.role);
-            }
-            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-        }
-        if asks_for_data_output
-            && required_artifact_identities
-                .iter()
-                .any(|identity| identity.role == ArtifactRole::DataOutput)
-        {
-            required.push(ArtifactRole::DataOutput);
-        }
-        required_artifact_identities.retain(|identity| required.contains(&identity.role));
-        for identity in
-            inferred_artifact_obligations_from_project_intent(&project_intent, &required)
-        {
-            if inferred_obligation_shadowed_by_explicit_identity(
-                &required_artifact_identities,
-                &identity,
-            ) {
-                continue;
-            }
-            if !required.contains(&identity.role) {
-                required.push(identity.role);
-            }
-            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-        }
-        for identity in
-            inferred_docs_obligations_from_request(request_for_inference, &lower, &required)
-        {
-            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-        }
-        // Issue #922 (P5 / DD3): bridge the research report obligation. Merges
-        // into an explicit same-path `file` obligation (absorbing its
-        // `RequiredSections` schema) or is added fresh. UsageDocs role reuse
-        // (S7-002) + `ResearchNotes` kind + research sections; path is admitted.
-        if research_report_intended {
-            let sections = required_research_sections_from_request(request_for_inference);
-            let path = research_report_path_from_request_with_scan(&scan, request_for_inference);
-            push_or_merge_artifact_obligation(
-                &mut required_artifact_identities,
-                ArtifactObligation::research_report(path, sections),
-            );
-        }
-        for identity in
-            inferred_data_obligations_from_request_with_scan(&scan, request_for_inference)
-        {
-            if !required.contains(&identity.role) {
-                required.push(identity.role);
-            }
-            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-        }
-        for identity in
-            inferred_ops_obligations_from_request(request_for_inference, &lower, task_kind)
-        {
-            if !required.contains(&identity.role) {
-                required.push(identity.role);
-            }
-            push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-        }
-        required.sort();
-        required.dedup();
-        required_artifact_identities
-            .sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
+        let ArtifactContractParts {
+            required,
+            optional,
+            required_artifact_identities,
+        } = build_artifact_contract_parts(ArtifactContractBuildInputs {
+            scan: &scan,
+            request: request_for_inference,
+            lower: &lower,
+            task_kind,
+            intent,
+            request_inputs,
+            project_intent: &project_intent,
+            profile_inputs: project_profile_inputs.as_ref(),
+            controller_state: request_view.controller_state.as_ref(),
+        });
         let deliverables = deliverables_from_contract_parts(
             request_for_inference,
             task_kind,
@@ -4907,43 +5092,6 @@ pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool
     )
 }
 
-fn negated_artifact_list_contains(lower: &str, artifact_tokens: &[&str]) -> bool {
-    const PREFIXES: &[&str] = &[
-        "do not create",
-        "do not write",
-        "do not add",
-        "do not implement",
-        "don't create",
-        "don't write",
-        "don't add",
-        "don't implement",
-    ];
-
-    PREFIXES.iter().any(|prefix| {
-        lower.match_indices(prefix).any(|(idx, _)| {
-            let clause = negated_artifact_clause(&lower[idx + prefix.len()..]);
-            artifact_tokens
-                .iter()
-                .any(|token| contains_ascii_token(clause, token))
-        })
-    })
-}
-
-fn negated_artifact_clause(after_prefix: &str) -> &str {
-    let sentence_end = after_prefix
-        .char_indices()
-        .find_map(|(idx, ch)| matches!(ch, '.' | '\n' | '\r' | ';').then_some(idx))
-        .unwrap_or(after_prefix.len());
-    let sentence = &after_prefix[..sentence_end];
-    sentence
-        .split(" but ")
-        .next()
-        .unwrap_or(sentence)
-        .split(" however ")
-        .next()
-        .unwrap_or(sentence)
-}
-
 pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &str) -> bool {
     contains_any(
         lower,
@@ -5586,13 +5734,110 @@ fn inferred_ops_obligations_from_request(
     lower: &str,
     task_kind: TaskKind,
 ) -> Vec<ArtifactObligation> {
-    if task_kind != TaskKind::Ops || !request_asks_for_ops_task(request, lower) {
+    if task_kind != TaskKind::Ops {
         return Vec::new();
     }
-    vec![ArtifactObligation::ops_runbook(
-        default_ops_runbook_path_from_request(request),
-        required_ops_sections_from_request(request),
-    )]
+    let required_sections = required_ops_sections_from_request(request);
+    if request_asks_for_ops_task(request, lower) {
+        return vec![ArtifactObligation::ops_runbook(
+            default_ops_runbook_path_from_request(request),
+            required_sections,
+        )];
+    }
+    explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .filter(|identity| identity.role == ArtifactRole::UsageDocs)
+        .map(|identity| {
+            ArtifactObligation::command_output(
+                identity.path,
+                required_sections.clone(),
+                required_command_observations_from_request(request),
+            )
+        })
+        .collect()
+}
+
+fn required_command_observations_from_request(request: &str) -> Vec<String> {
+    let mut commands = backtick_command_observations_from_request(request);
+    if commands.is_empty() {
+        commands.extend(run_clause_command_observations_from_request(request));
+    }
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn backtick_command_observations_from_request(request: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut in_backtick = false;
+    let mut start = 0usize;
+    for (idx, ch) in request.char_indices() {
+        if ch != '`' {
+            continue;
+        }
+        if in_backtick {
+            if let Some(command) = normalize_required_command_observation(&request[start..idx]) {
+                commands.push(command);
+            }
+            in_backtick = false;
+        } else {
+            in_backtick = true;
+            start = idx + ch.len_utf8();
+        }
+    }
+    commands
+}
+
+fn run_clause_command_observations_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let Some(run_idx) = lower.find("run ") else {
+        return Vec::new();
+    };
+    let after_start = run_idx + "run ".len();
+    let after = &request[after_start..];
+    let after_lower = &lower[after_start..];
+    let end = [", then", " then ", ". ", "\n"]
+        .into_iter()
+        .filter_map(|marker| after_lower.find(marker))
+        .min()
+        .unwrap_or(after.len());
+    after[..end]
+        .split([',', ';'])
+        .flat_map(|chunk| chunk.split(" and "))
+        .filter_map(normalize_required_command_observation)
+        .collect()
+}
+
+fn normalize_required_command_observation(raw: &str) -> Option<String> {
+    let command = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ':' | '.'));
+    if command.is_empty()
+        || command.len() > 80
+        || command.chars().any(|ch| {
+            matches!(
+                ch,
+                '|' | '&' | ';' | '<' | '>' | '$' | '(' | ')' | '\n' | '\r'
+            )
+        })
+    {
+        return None;
+    }
+    let first = command.split_whitespace().next().unwrap_or_default();
+    if first.is_empty()
+        || !first
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
+    {
+        return None;
+    }
+    if matches!(
+        first.to_ascii_lowercase().as_str(),
+        "create" | "write" | "edit" | "add" | "make" | "produce" | "document"
+    ) {
+        return None;
+    }
+    Some(command.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Issue #923 (CB-002 / DR4-001): honor an explicit markdown path the user named
@@ -5648,12 +5893,16 @@ fn extract_required_columns_from_request(request: &str) -> Vec<String> {
         .unwrap_or(tail)
         .replace(['`', '"', '\''], " ");
     let mut columns = Vec::new();
-    for raw in window.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')) {
-        let token = raw.trim();
-        if token.is_empty() {
-            continue;
-        }
+    let tokens = window
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
         let lower = token.to_ascii_lowercase();
+        if structured_row_count_token_before_row_marker(&tokens, index) {
+            break;
+        }
         if matches!(
             lower.as_str(),
             "column"
@@ -5679,9 +5928,29 @@ fn extract_required_columns_from_request(request: &str) -> Vec<String> {
         if columns.iter().any(|existing| existing == token) {
             continue;
         }
-        columns.push(token.to_string());
+        columns.push((*token).to_string());
     }
     columns
+}
+
+fn structured_row_count_token_before_row_marker(tokens: &[&str], index: usize) -> bool {
+    if !structured_count_token(tokens[index]) {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(index + 1)
+        .take(3)
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| matches!(token.as_str(), "row" | "rows" | "record" | "records"))
+}
+
+fn structured_count_token(token: &str) -> bool {
+    token.chars().all(|ch| ch.is_ascii_digit())
+        || matches!(
+            token.to_ascii_lowercase().as_str(),
+            "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine" | "ten"
+        )
 }
 
 const EXPECTED_STRUCTURED_ROWS_MAX: usize = 8;
@@ -6414,6 +6683,29 @@ fn has_successful_command_observation(evidence: &EvidenceSet) -> bool {
     })
 }
 
+fn has_successful_command_observation_for(evidence: &EvidenceSet, required: &str) -> bool {
+    evidence.iter().any(|item| {
+        let CompletionEvidence::CommandObservation {
+            command,
+            exit_status: 0,
+            safety_boundary_passed: true,
+        } = item
+        else {
+            return false;
+        };
+        command_observation_matches_required(command, required)
+    })
+}
+
+fn command_observation_matches_required(actual: &str, required: &str) -> bool {
+    let actual = actual.split_whitespace().collect::<Vec<_>>();
+    let required = required.split_whitespace().collect::<Vec<_>>();
+    if actual.is_empty() || required.is_empty() {
+        return false;
+    }
+    actual == required || (required.len() == 1 && actual.first() == required.first())
+}
+
 pub(super) fn objective_evidence_satisfied_for_contract(
     evidence: &EvidenceSet,
     contract: &TaskContract,
@@ -6425,7 +6717,14 @@ fn objective_evidence_satisfied(evidence: &EvidenceSet, objective: &ObjectiveCon
     match objective.evidence_kind {
         ObjectiveEvidenceKind::TestRun => has_build_test_verifier(evidence),
         ObjectiveEvidenceKind::SafetyBoundaryEvidence => {
-            has_successful_command_observation(evidence)
+            if objective.required_evidence_commands.is_empty() {
+                has_successful_command_observation(evidence)
+            } else {
+                objective
+                    .required_evidence_commands
+                    .iter()
+                    .all(|command| has_successful_command_observation_for(evidence, command))
+            }
         }
         ObjectiveEvidenceKind::ContentCheck | ObjectiveEvidenceKind::ContentAcceptance => {
             evidence.iter().any(|item| {
@@ -6561,91 +6860,6 @@ fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
         &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
     ) || (request.contains("Rust")
         && contains_any(request, &["ライブラリ", "クレート", "パッケージ"]))
-}
-
-fn contains_implementation_file_hint(lower: &str) -> bool {
-    [
-        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".go", ".java", ".kt",
-        ".swift",
-    ]
-    .iter()
-    .any(|suffix| lower_contains_file_suffix(lower, suffix))
-}
-
-fn contains_callable_signature_hint(lower: &str) -> bool {
-    lower.contains('(')
-        && lower.contains(')')
-        && (lower.contains("->") || contains_dotted_callable_hint(lower))
-}
-
-fn contains_dotted_callable_change_action(lower: &str) -> bool {
-    dotted_callable_starts(lower).into_iter().any(|start| {
-        last_ascii_word(&lower[..start]).is_some_and(|word| {
-            matches!(
-                word,
-                "add" | "implement" | "create" | "write" | "update" | "modify"
-            )
-        })
-    })
-}
-
-fn contains_dotted_callable_hint(lower: &str) -> bool {
-    !dotted_callable_starts(lower).is_empty()
-}
-
-fn dotted_callable_starts(lower: &str) -> Vec<usize> {
-    lower
-        .match_indices('(')
-        .filter_map(|(paren_idx, _)| {
-            lower[paren_idx..].contains(')').then_some(())?;
-            dotted_identifier_start_before_paren(&lower[..paren_idx])
-        })
-        .collect()
-}
-
-fn dotted_identifier_start_before_paren(before_paren: &str) -> Option<usize> {
-    let trimmed = before_paren.trim_end();
-    if !trimmed
-        .chars()
-        .last()
-        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-    let mut start = trimmed.len();
-    for (idx, ch) in trimmed.char_indices().rev() {
-        if ch == '.' || ch == '_' || ch.is_ascii_alphanumeric() {
-            start = idx;
-        } else {
-            break;
-        }
-    }
-    let token = &trimmed[start..];
-    let valid = token.contains('.')
-        && token.split('.').all(|part| {
-            !part.is_empty()
-                && part
-                    .chars()
-                    .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        });
-    valid.then_some(start)
-}
-
-fn last_ascii_word(prefix: &str) -> Option<&str> {
-    prefix
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .next_back()
-}
-
-fn lower_contains_file_suffix(lower: &str, suffix: &str) -> bool {
-    lower.match_indices(suffix).any(|(idx, _)| {
-        let after_idx = idx + suffix.len();
-        lower[after_idx..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !ch.is_ascii_alphanumeric())
-    })
 }
 
 /// Issue #920: intentional 1:1 decision point — every role has a distinct,
@@ -7720,6 +7934,83 @@ mod tests {
     }
 
     #[test]
+    fn existing_implementation_behavior_gap_precedes_missing_test_recovery() {
+        let contract = TaskContract::from_request(
+            "Add stats.median(numbers) to stats.py. Preserve mean behavior. Add pytest coverage for median odd, median even, and empty input.",
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = vec![
+            ArtifactState::exists(ArtifactRole::Implementation, "stats.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_stats.py"),
+        ];
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::Implementation,
+            "def mean(numbers):\n    return sum(numbers) / len(numbers)\n",
+        )]);
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        let ArtifactRecoveryAction::Continue {
+            missing,
+            target_hint: Some(target_hint),
+        } = action
+        else {
+            panic!("expected implementation recovery, got {action:?}");
+        };
+        assert!(
+            missing.contains(&ArtifactRole::Implementation),
+            "missing roles should include implementation: {missing:?}"
+        );
+        assert_eq!(target_hint.role, ArtifactRole::Implementation);
+        assert_eq!(target_hint.path, "stats.py");
+    }
+
+    #[test]
+    fn feature_add_starts_with_implementation_before_tests_when_unobserved() {
+        let contract = TaskContract::from_request(
+            "Add stats.median(numbers) to stats.py. Preserve mean behavior. Add pytest coverage for median odd, median even, and empty input.",
+        );
+        let evidence = EvidenceSet::new();
+        let artifacts = Vec::new();
+        let excerpts = ArtifactExcerpts::new();
+        let repair_state = VerifierRepairState::None;
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert_eq!(
+            action,
+            ArtifactRecoveryAction::Continue {
+                missing: vec![
+                    ArtifactRole::Implementation,
+                    ArtifactRole::Test,
+                ],
+                target_hint: Some(RecoveryTargetHint {
+                    role: ArtifactRole::Implementation,
+                    path: "stats.py".to_string(),
+                    reason: "required deliverable obligation is still missing: role=implementation, kind=file, path=stats.py".to_string(),
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn rust_cli_setup_only_partial_state_targets_missing_implementation() {
         let contract = TaskContract::from_request(
             "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
@@ -8045,6 +8336,81 @@ mod tests {
             default_ops_runbook_path_from_request("Prepare a deployment runbook checklist"),
             "runbook.md"
         );
+    }
+
+    #[test]
+    fn confirmed_ops_with_explicit_markdown_path_creates_runbook_obligation() {
+        let contract = TaskContract::from_request_with_kind(
+            "Run pwd and ls, then create ops/observation.md summarizing the observed current directory and file list. Do not create source code, package manifests, or tests.",
+            Some(TaskKind::Ops),
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Ops);
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs)
+        );
+        let obligation =
+            required_obligation(&contract, ArtifactRole::UsageDocs, "ops/observation.md");
+        assert_eq!(obligation.kind, DeliverableKind::CommandOutput);
+        assert_eq!(
+            contract.objective_contract().evidence_kind,
+            ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        );
+        let objective = contract.objective_contract();
+        assert!(objective.requires_evidence());
+        assert_eq!(
+            objective.required_evidence_commands,
+            vec!["ls".to_string(), "pwd".to_string()]
+        );
+
+        let artifacts = vec![ArtifactState::changed_at(
+            ArtifactRole::UsageDocs,
+            "ops/observation.md",
+        )];
+        let excerpts = build_excerpts(&[(
+            ArtifactRole::UsageDocs,
+            "## Checklist\n- record pwd\n## Validation\n- record ls\n## Risk\nLow local-only risk.",
+        )]);
+        let repair_state = VerifierRepairState::None;
+        let artifact_only = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &EvidenceSet::new(),
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert_eq!(artifact_only, ArtifactRecoveryAction::RunVerifier);
+
+        let mut partially_observed = EvidenceSet::new();
+        partially_observed.push(command_observation("pwd", 0));
+        partially_observed.push(repo_edit_path(RepoEditCategory::Docs, "ops/observation.md"));
+        let partial = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &partially_observed,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert_eq!(partial, ArtifactRecoveryAction::RunVerifier);
+
+        let mut observed = partially_observed;
+        observed.push(command_observation("ls", 0));
+        let complete = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &observed,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &excerpts,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+        assert_eq!(complete, ArtifactRecoveryAction::Done);
     }
 
     #[test]
@@ -10559,6 +10925,61 @@ Create the README file."#;
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn data_task_does_not_treat_row_count_word_as_column() {
+        let contract = TaskContract::from_request(
+            "Create data/output.csv only. It must have columns id,total and exactly two rows: 1,100 and 2,250. Do not create source code, package manifests, tests, or README.",
+        );
+        let obligation =
+            required_obligation(&contract, ArtifactRole::DataOutput, "data/output.csv");
+        let schema = obligation
+            .structured_record_schema
+            .as_ref()
+            .expect("data output carries structured schema");
+        assert_eq!(schema.columns, vec!["id".to_string(), "total".to_string()]);
+        assert_eq!(
+            schema.expected_rows,
+            vec![
+                vec!["1".to_string(), "100".to_string()],
+                vec!["2".to_string(), "250".to_string()]
+            ]
+        );
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "data/output.csv"));
+        let artifacts = [ArtifactState::exists(
+            ArtifactRole::DataOutput,
+            "data/output.csv",
+        )];
+        let repair_state = VerifierRepairState::None;
+        let extra_column_rows =
+            build_excerpts(&[(ArtifactRole::DataOutput, "id,total,two\n1,100,2\n2,250,2\n")]);
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &extra_column_rows,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(ref target),
+                } if missing.contains(&ArtifactRole::DataOutput)
+                    && target.path == "data/output.csv"
+                    && target.reason.contains("expected id, total")
+                    && target.reason.contains("observed id, total, two")
+            ),
+            "row-count words must not become columns or accept extra-column output, got {action:?}"
         );
     }
 

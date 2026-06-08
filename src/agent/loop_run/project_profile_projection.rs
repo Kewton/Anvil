@@ -52,6 +52,28 @@ pub(super) struct ProjectProfileContractInputs {
     pub(super) confidence: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ProfileForbiddenRoles {
+    pub(super) implementation: bool,
+    pub(super) tests: bool,
+    pub(super) setup: bool,
+    pub(super) usage_docs: bool,
+}
+
+impl ProfileForbiddenRoles {
+    pub(super) fn from_inputs(inputs: Option<&ProjectProfileContractInputs>) -> Self {
+        let Some(inputs) = inputs else {
+            return Self::default();
+        };
+        Self {
+            implementation: inputs.forbids_implementation,
+            tests: inputs.forbids_tests,
+            setup: inputs.forbids_setup,
+            usage_docs: inputs.forbids_usage_docs,
+        }
+    }
+}
+
 pub(super) fn project_profile_adoption_decision(
     profile: Option<&ProjectProfileConfirmation>,
     first_pass: &TaskContract,
@@ -162,6 +184,27 @@ fn first_pass_requires_code_setup_or_test(first_pass: &TaskContract) -> bool {
                 ArtifactRole::Implementation | ArtifactRole::Test | ArtifactRole::Setup
             )
         })
+}
+
+pub(super) fn adopt_contract_task_kind(
+    forced_kind: Option<TaskKind>,
+    controller_task_kind: Option<TaskKind>,
+    profile_inputs: Option<&ProjectProfileContractInputs>,
+    inferred_kind: TaskKind,
+    inferred_matched: bool,
+) -> (TaskKind, f32) {
+    if let Some(kind) = forced_kind {
+        return (kind, 1.0);
+    }
+    if let Some(kind) = controller_task_kind {
+        return (kind, 1.0);
+    }
+    if let Some(inputs) = profile_inputs
+        && let Some(kind) = inputs.task_kind
+    {
+        return (kind, inputs.confidence);
+    }
+    (inferred_kind, if inferred_matched { 1.0 } else { 0.0 })
 }
 
 fn objective_deliverable_kind_from_profile(
@@ -650,6 +693,55 @@ npm test
             Some(ObjectiveEvidenceKind::SchemaCheck)
         );
         assert!(inputs.forbids_usage_docs);
+    }
+
+    #[test]
+    fn contract_task_kind_adoption_priority_is_centralized() {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"data",
+                "primary_artifacts":["summary.csv"],
+                "forbidden_artifacts":[],
+                "evidence_kind":"schema_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.92,
+                "reason":"structured data output"
+            }"#,
+        )
+        .expect("profile");
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+
+        assert_eq!(
+            adopt_contract_task_kind(
+                Some(TaskKind::Docs),
+                Some(TaskKind::Research),
+                Some(&inputs),
+                TaskKind::Coding,
+                true,
+            ),
+            (TaskKind::Docs, 1.0)
+        );
+        assert_eq!(
+            adopt_contract_task_kind(
+                None,
+                Some(TaskKind::Research),
+                Some(&inputs),
+                TaskKind::Coding,
+                true,
+            ),
+            (TaskKind::Research, 1.0)
+        );
+        assert_eq!(
+            adopt_contract_task_kind(None, None, Some(&inputs), TaskKind::Coding, true),
+            (TaskKind::Data, 0.92)
+        );
+        assert_eq!(
+            adopt_contract_task_kind(None, None, None, TaskKind::Coding, false),
+            (TaskKind::Coding, 0.0)
+        );
     }
 
     #[test]

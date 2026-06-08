@@ -4,6 +4,8 @@ use super::repair_target_admission::RepairTargetAdmissionContext;
 use super::verifier_assessment_parser::ParsedVerifierRepairAssessment;
 use super::verifier_repair_targeting::recovery_target_hint_for_diagnostic_path;
 
+const LEGACY_SECONDARY_TARGET_REASON: &str = "diagnostic secondary target";
+
 pub(super) fn merge_legacy_targets_into_clusters(
     report: &mut super::semantic_failure::SemanticFailureReport,
     parsed: &ParsedVerifierRepairAssessment,
@@ -87,7 +89,7 @@ pub(super) fn merge_legacy_targets_into_clusters(
             super::semantic_failure::RawClusterTargetCandidate {
                 raw_path: sanitized_path,
                 role_hint: None,
-                reason: "diagnostic secondary target".to_string(),
+                reason: LEGACY_SECONDARY_TARGET_REASON.to_string(),
             },
         );
     }
@@ -204,6 +206,12 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
 ) {
     let failure_kind = report.failure_kind;
     for cluster in report.failure_clusters.iter_mut() {
+        let legacy_secondary_paths = cluster
+            .proposed_target_candidates
+            .iter()
+            .filter(|candidate| candidate.reason == LEGACY_SECONDARY_TARGET_REASON)
+            .map(|candidate| candidate.raw_path.clone())
+            .collect::<Vec<_>>();
         let mut admitted: Vec<super::task_contract::RecoveryTargetHint> = Vec::new();
         for candidate in cluster.proposed_target_candidates.iter() {
             // recovery_target_hint_for_diagnostic_path is the SSOT — it
@@ -231,8 +239,41 @@ pub(super) fn enrich_failure_clusters_with_admitted_targets(
             failure_kind,
             report.preferred_repair_role,
         );
+        promote_legacy_secondary_implementation_rebinds(
+            &mut admitted,
+            &legacy_secondary_paths,
+            spec_authority,
+            failure_kind,
+            report.preferred_repair_role,
+        );
         cluster.admitted_cluster_targets = admitted;
     }
+}
+
+fn promote_legacy_secondary_implementation_rebinds(
+    admitted: &mut [super::task_contract::RecoveryTargetHint],
+    legacy_secondary_paths: &[String],
+    spec_authority: super::spec_authority::SpecAuthority,
+    failure_kind: super::VerifierDiagnosticFailureKind,
+    preferred_repair_role: super::task_contract::ArtifactRole,
+) {
+    if !matches!(
+        spec_authority,
+        super::spec_authority::SpecAuthority::BehaviorContract
+    ) || !matches!(
+        failure_kind,
+        super::VerifierDiagnosticFailureKind::AssertionMismatch
+    ) || preferred_repair_role != super::task_contract::ArtifactRole::Test
+    {
+        return;
+    }
+    let Some(index) = admitted.iter().position(|hint| {
+        hint.role == super::task_contract::ArtifactRole::Implementation
+            && legacy_secondary_paths.iter().any(|path| path == &hint.path)
+    }) else {
+        return;
+    };
+    admitted[..=index].rotate_right(1);
 }
 
 pub(super) fn diagnostic_target_allowed_by_confidence(

@@ -26,6 +26,9 @@ pub(crate) fn filter_weakening_for_observed_assert_update(
     if !only_expected_assert_update {
         return patterns;
     }
+    if exception_expectation_update_matches(context, before, after) {
+        return Vec::new();
+    }
     if count_assert_lines(after) < count_assert_lines(before) {
         return patterns;
     }
@@ -59,6 +62,34 @@ fn classify_allowed_change_kind(
     }
     test_only_missing_import_symbol_update_matches(context, before, after)
         .then_some(AllowedChangeKind::TestOnlyMissingImportSymbol)
+}
+
+fn exception_expectation_update_matches(
+    context: &super::repair_job::RepairJob,
+    before: &str,
+    after: &str,
+) -> bool {
+    if !expectation_alignment_allowed_by_authority(context) {
+        return false;
+    }
+    if count_test_functions(after) < count_test_functions(before) {
+        return false;
+    }
+    let Some(observed_exception) =
+        observed_exception_type_from_output(&repair_context_diagnostic_text(context))
+    else {
+        return false;
+    };
+    let before_expected = expected_exception_types(before);
+    let after_expected = expected_exception_types(after);
+    if !after_expected
+        .iter()
+        .any(|expected| expected == &observed_exception)
+    {
+        return false;
+    }
+    (!before_expected.is_empty() && before_expected != after_expected)
+        || !changed_assert_lines(before, after).is_empty()
 }
 
 fn expectation_alignment_allowed_by_authority(context: &super::repair_job::RepairJob) -> bool {
@@ -212,6 +243,67 @@ fn observed_pairs_for_repair_context(
     } else {
         pairs
     }
+}
+
+fn observed_exception_type_from_output(output: &str) -> Option<String> {
+    for marker in ["exception:", "E           ", "E   "] {
+        let Some(start) = output.find(marker) else {
+            continue;
+        };
+        let rest = &output[start + marker.len()..];
+        if let Some(name) = leading_exception_identifier(rest) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+fn expected_exception_types(source: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("except ") {
+            push_exception_identifiers_until(rest, ':', &mut types);
+        }
+        let mut rest = trimmed;
+        while let Some(start) = rest.find("pytest.raises(") {
+            let after_marker = &rest[start + "pytest.raises(".len()..];
+            push_exception_identifiers_until(after_marker, ')', &mut types);
+            rest = after_marker;
+        }
+    }
+    types.sort();
+    types.dedup();
+    types
+}
+
+fn push_exception_identifiers_until(input: &str, terminator: char, out: &mut Vec<String>) {
+    let bounded = input.split(terminator).next().unwrap_or(input);
+    for token in bounded.split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        if exception_identifier_is_safe(token) {
+            out.push(token.to_string());
+        }
+    }
+}
+
+fn leading_exception_identifier(input: &str) -> Option<&str> {
+    let token = input
+        .trim_start()
+        .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+        .next()
+        .unwrap_or_default();
+    exception_identifier_is_safe(token).then_some(token)
+}
+
+fn exception_identifier_is_safe(name: &str) -> bool {
+    identifier_is_safe(name) && (name.ends_with("Error") || name.ends_with("Exception"))
+}
+
+fn count_test_functions(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("def test_"))
+        .count()
 }
 
 fn missing_import_name_from_output(output: &str) -> Option<(String, String)> {
@@ -380,6 +472,89 @@ def test_contains_uppercase():
                 WeakeningPattern::AssertionDeleted,
                 WeakeningPattern::LiteralOnlyExpectedChange,
             ],
+            &job,
+            before,
+            after,
+        );
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn generated_test_exception_expectation_repair_preserves_exception_coverage() {
+        let before = r#"
+def test_median_empty():
+    try:
+        median([])
+        assert False, "Expected ZeroDivisionError"
+    except ZeroDivisionError:
+        pass
+"#;
+        let after = r#"
+def test_median_empty():
+    try:
+        median([])
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
+"#;
+        let output = r#"FAILED tests/test_stats.py::test_median_empty exception:ValueError
+E           ValueError: median() arg is an empty sequence"#;
+        let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![WeakeningPattern::AssertionDeleted],
+            &job,
+            before,
+            after,
+        );
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn generated_test_exception_expectation_repair_rejects_test_deletion() {
+        let before = r#"
+def test_median_empty():
+    try:
+        median([])
+        assert False, "Expected ZeroDivisionError"
+    except ZeroDivisionError:
+        pass
+"#;
+        let after = "";
+        let output = r#"FAILED tests/test_stats.py::test_median_empty exception:ValueError
+E           ValueError: median() arg is an empty sequence"#;
+        let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![WeakeningPattern::AssertionDeleted],
+            &job,
+            before,
+            after,
+        );
+
+        assert_eq!(filtered, vec![WeakeningPattern::AssertionDeleted]);
+    }
+
+    #[test]
+    fn generated_test_literal_to_exception_repair_preserves_coverage() {
+        let before = r#"
+def test_median_empty():
+    assert median([]) is None
+"#;
+        let after = r#"
+def test_median_empty():
+    with pytest.raises(ValueError):
+        median([])
+"#;
+        let output = r#"FAILED tests/test_stats.py::test_median_empty exception:ValueError
+>       assert median([]) is None
+E           ValueError: median() arg is an empty sequence"#;
+        let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![WeakeningPattern::AssertionDeleted],
             &job,
             before,
             after,
