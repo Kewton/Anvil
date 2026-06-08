@@ -6,7 +6,7 @@ use super::protocol::{
     requested_paths_from_text,
 };
 use super::summary::{ExitReason, LoopStats};
-use super::task_contract::TaskContract;
+use super::task_contract::{CompletionDecision, TaskContract};
 use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tester;
 use super::verifier_skill::VerifierInputs;
@@ -157,6 +157,54 @@ pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackF
 }
 
 impl Agent {
+    pub(super) fn reconcile_terminal_completion_credit(
+        &mut self,
+        exit_reason: &mut ExitReason,
+        error_text: &mut String,
+        final_prose: &mut String,
+    ) {
+        if !terminal_allows_completion_credit_reconciliation(*exit_reason) {
+            return;
+        }
+        let Some(contract) = super::task_classification::task_contract_authority(self) else {
+            return;
+        };
+        let evidence = self.task_contract_evidence_set_this_turn.clone();
+        let owned_test_artifacts =
+            super::owned_test_projection::owned_test_artifacts_for_verifier(self, &contract);
+        if !completion_credit_reconciliation_allows_done(
+            &contract,
+            &evidence,
+            &owned_test_artifacts,
+            *exit_reason,
+        ) {
+            return;
+        }
+
+        let objective = contract.objective_contract();
+        log_llm_event(
+            "agent.completion_credit.reconciled",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "from_terminal": exit_reason.label(),
+                "task_kind": contract.task_kind.as_str(),
+                "objective_kind": objective.objective_kind.label(),
+                "deliverable_kind": objective.deliverable_kind.label(),
+                "evidence_kind": objective.evidence_kind.label(),
+                "evidence_count": evidence.len(),
+                "owned_test_artifacts_count": owned_test_artifacts.len(),
+            }),
+        );
+        self.prepare_final_verification_job_report_after_success();
+        *exit_reason = ExitReason::Done;
+        error_text.clear();
+        if final_prose.trim().is_empty() {
+            *final_prose =
+                "Completed requested changes and reconciled objective-bound evidence.".to_string();
+        }
+    }
+
     pub(super) fn should_run_auto_test_for_success(&self) -> bool {
         if self.session.mode_state.work_mode == WorkMode::Python {
             return true;
@@ -653,6 +701,30 @@ impl Agent {
     }
 }
 
+pub(super) fn terminal_allows_completion_credit_reconciliation(reason: ExitReason) -> bool {
+    matches!(
+        reason,
+        ExitReason::MissingRepoEdits
+            | ExitReason::MissingVerification
+            | ExitReason::SafeStopVerifierWeak
+            | ExitReason::SafeStopVerifierMissing
+            | ExitReason::RepairSafeStop
+    )
+}
+
+pub(super) fn completion_credit_reconciliation_allows_done(
+    contract: &TaskContract,
+    evidence: &EvidenceSet,
+    owned_test_artifacts: &[String],
+    current_terminal: ExitReason,
+) -> bool {
+    terminal_allows_completion_credit_reconciliation(current_terminal)
+        && matches!(
+            contract.evaluate_with_owned_test_artifacts(evidence, owned_test_artifacts),
+            CompletionDecision::Done
+        )
+}
+
 pub(super) fn recent_successful_bash_commands_since_last_user(
     messages: &[ConversationMessage],
 ) -> Vec<String> {
@@ -1038,6 +1110,87 @@ mod tests {
         let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);
         assert!(satisfied);
         assert!(suppress_success_verifier_for_context(&ctx, satisfied));
+    }
+
+    fn coding_contract_evidence(bound_test_artifacts_count: Option<usize>) -> ES {
+        let mut set = ES::new();
+        set.push(CE::RepoEdit {
+            category: RepoEditCategory::Impl,
+            count: 1,
+            path: Some("src/lib.rs".to_string()),
+        });
+        set.push(CE::RepoEdit {
+            category: RepoEditCategory::Test,
+            count: 1,
+            path: Some("tests/feature_test.rs".to_string()),
+        });
+        set.push(CE::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "cargo test".to_string(),
+            bound_test_artifacts_count,
+        });
+        set
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_promotes_bound_objective_evidence() {
+        let contract =
+            TaskContract::from_request("Implement feature X and add tests for the behavior.");
+        let evidence = coding_contract_evidence(Some(1));
+        let owned = vec!["tests/feature_test.rs".to_string()];
+
+        for terminal in [
+            ExitReason::MissingRepoEdits,
+            ExitReason::MissingVerification,
+            ExitReason::SafeStopVerifierWeak,
+            ExitReason::SafeStopVerifierMissing,
+            ExitReason::RepairSafeStop,
+        ] {
+            assert!(
+                completion_credit_reconciliation_allows_done(
+                    &contract, &evidence, &owned, terminal
+                ),
+                "{terminal:?} should reconcile to done when objective-bound evidence is complete"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_rejects_unbound_or_failed_terminals() {
+        let contract =
+            TaskContract::from_request("Implement feature X and add tests for the behavior.");
+        let unbound = coding_contract_evidence(None);
+        let owned = vec!["tests/feature_test.rs".to_string()];
+
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &unbound,
+                &owned,
+                ExitReason::MissingVerification,
+            ),
+            "unbound verifier success must not be credited as done"
+        );
+
+        let bound = coding_contract_evidence(Some(1));
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &bound,
+                &owned,
+                ExitReason::VerifierFailed,
+            ),
+            "raw verifier failure must not be overridden by accumulated pass evidence"
+        );
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &bound,
+                &owned,
+                ExitReason::TransportError,
+            ),
+            "tool/transport failures are outside completion-credit reconciliation"
+        );
     }
 
     #[test]

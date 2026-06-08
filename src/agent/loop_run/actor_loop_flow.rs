@@ -4267,6 +4267,7 @@ pub(super) fn run_actor_loop(
         agent.config.max_iterations,
         duration_secs,
     );
+    agent.reconcile_terminal_completion_credit(&mut exit_reason, &mut error_text, &mut final_prose);
     if exit_reason == ExitReason::ToolCallFormatError
         && model_capabilities(&super::agent_misc::current_assistant_model(agent))
             .finish_after_edit_format_error

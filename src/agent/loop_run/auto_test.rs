@@ -1342,29 +1342,28 @@ impl VerifierCommand {
         Self::new_allowlisted("pytest", args, owned_test_artifacts.to_vec())
     }
 
-    /// `python3 -m pytest -q -p no:cacheprovider [<owned_test_artifacts>]`
-    /// structured constructor for the stdlib-Python toolchain detected by
-    /// `python_pytest_command`. Toolchain-specific runners (`uv run` etc.)
-    /// still go through Weak in Phase 2.2 because parsing their shell
-    /// shape is out of scope.
+    /// `python3 -m pytest -q -p no:cacheprovider` structured constructor for
+    /// the stdlib-Python toolchain detected by `python_pytest_command`.
+    /// Toolchain-specific runners (`uv run` etc.) still go through Weak in
+    /// Phase 2.2 because parsing their shell shape is out of scope.
     ///
     /// Issue #651 CB-001 defense in depth: empty `owned_test_artifacts`
-    /// is rejected — pytest with no positional path scans the entire
-    /// rootdir, which means the verifier may pass even when zero tests
-    /// from the current task ran.
+    /// is rejected. The verifier intentionally runs the full pytest suite,
+    /// while retaining owned artifacts as binding metadata. This matches the
+    /// Cargo/npm contract: a task-owned test must exist and be in scope, but
+    /// existing regression tests are still part of completion evidence.
     #[allow(dead_code)]
     pub(super) fn from_python3_pytest_stdlib(owned_test_artifacts: &[String]) -> Option<Self> {
         if owned_test_artifacts.is_empty() {
             return None;
         }
-        let mut args = vec![
+        let args = vec![
             "-m".to_string(),
             "pytest".to_string(),
             "-q".to_string(),
             "-p".to_string(),
             "no:cacheprovider".to_string(),
         ];
-        args.extend(owned_test_artifacts.iter().cloned());
         Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
     }
 
@@ -4948,10 +4947,14 @@ dev = [
                 assert_eq!(command.runner(), "python3");
                 assert!(command.args().contains(&"pytest".to_string()));
                 assert!(command.args().contains(&"-q".to_string()));
+                assert_eq!(
+                    command.bound_test_artifacts(),
+                    &["tests/test_x.py".to_string()],
+                    "owned test artifact must be retained as binding metadata"
+                );
                 assert!(
-                    command.args().contains(&"tests/test_x.py".to_string()),
-                    "owned test artifact must be appended to args, got {:?}",
-                    command.args()
+                    !command.args().contains(&"tests/test_x.py".to_string()),
+                    "python verifier should run the full suite instead of filtering to owned tests"
                 );
             }
             other => panic!("expected Runnable, got {other:?}"),
@@ -4978,10 +4981,14 @@ dev = [
             OwnedTestVerifierPlan::Runnable { command, .. } => {
                 assert_eq!(command.runner(), "python3");
                 assert!(command.args().contains(&"pytest".to_string()));
+                assert_eq!(
+                    command.bound_test_artifacts(),
+                    &["tests/test_main.py".to_string()],
+                    "pyproject verifier must keep owned test artifacts as binding metadata"
+                );
                 assert!(
-                    command.args().contains(&"tests/test_main.py".to_string()),
-                    "pyproject verifier must still bind owned test artifacts, got {:?}",
-                    command.args()
+                    !command.args().contains(&"tests/test_main.py".to_string()),
+                    "python verifier should run the full suite instead of filtering to owned tests"
                 );
                 assert!(
                     !command.to_display_string().contains("pip install"),
