@@ -9,6 +9,7 @@ use super::project_profile_projection::{
     apply_profile_contract_inputs, contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
+use super::task_contract_input_projection::ContractRequestInputs;
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
     recovery_target_hint_for_blocking_obligation_diagnostic,
@@ -2652,56 +2653,6 @@ pub(super) fn obligation_report_label(obligation: &ArtifactObligation) -> String
     parts.join(", ")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ContractRequestInputs {
-    asks_for_tests: bool,
-    asks_for_usage_docs: bool,
-    asks_for_setup: bool,
-    asks_for_data_output: bool,
-    asks_for_implementation: bool,
-    project_intent_implies_implementation: bool,
-}
-
-impl ContractRequestInputs {
-    fn collect(
-        scan: &OutputContextScan,
-        request_for_inference: &str,
-        lower: &str,
-        project_intent: &ProjectIntent,
-    ) -> Self {
-        let asks_for_tests = request_asks_for_test_artifact(request_for_inference, lower);
-        let asks_for_usage_docs = request_asks_for_usage_docs(request_for_inference, lower);
-        let asks_for_setup = request_asks_for_setup(request_for_inference, lower);
-        let asks_for_data_output =
-            request_asks_for_data_output_artifact_with_scan(scan, request_for_inference);
-        let asks_for_implementation = request_asks_for_implementation_artifact(
-            request_for_inference,
-            lower,
-            asks_for_tests,
-            asks_for_usage_docs,
-            asks_for_setup,
-        );
-        let project_intent_implies_implementation =
-            project_intent_implies_implementation_artifact(project_intent)
-                && !test_only_without_implementation_signal(
-                    asks_for_tests,
-                    asks_for_usage_docs,
-                    asks_for_setup,
-                    asks_for_data_output,
-                    asks_for_implementation,
-                );
-
-        Self {
-            asks_for_tests,
-            asks_for_usage_docs,
-            asks_for_setup,
-            asks_for_data_output,
-            asks_for_implementation,
-            project_intent_implies_implementation,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArtifactContractParts {
     required: Vec<ArtifactRole>,
@@ -4046,13 +3997,13 @@ fn contains_output_verb(text: &str, stems: &[&str]) -> bool {
 /// Issue #937 (DS3-001): the per-`from_request` output-context scan. Built once;
 /// threaded by `&str` into every surface so the (expensive) mask allocation
 /// happens exactly once per top-level request. Stack-only, never stored.
-struct OutputContextScan {
+pub(super) struct OutputContextScan {
     lower: String,
     lower_masked: String,
 }
 
 impl OutputContextScan {
-    fn new(request: &str) -> Self {
+    pub(super) fn new(request: &str) -> Self {
         let lower = request.to_ascii_lowercase();
         let lower_masked = mask_path_tokens(&lower);
         Self {
@@ -4821,36 +4772,6 @@ pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool
     )
 }
 
-fn project_intent_implies_implementation_artifact(project_intent: &ProjectIntent) -> bool {
-    if !matches!(
-        project_intent.language,
-        Some(ProjectLanguage::Rust | ProjectLanguage::Node | ProjectLanguage::Python)
-    ) || !matches!(
-        project_intent.shape,
-        Some(ProjectShape::Cli | ProjectShape::Library | ProjectShape::Api | ProjectShape::WebApp)
-    ) || !matches!(
-        project_intent.verification,
-        VerificationRequirement::Required { .. }
-    ) {
-        return false;
-    }
-    true
-}
-
-fn test_only_without_implementation_signal(
-    asks_for_tests: bool,
-    asks_for_usage_docs: bool,
-    asks_for_setup: bool,
-    asks_for_data_output: bool,
-    asks_for_implementation: bool,
-) -> bool {
-    asks_for_tests
-        && !asks_for_usage_docs
-        && !asks_for_setup
-        && !asks_for_data_output
-        && !asks_for_implementation
-}
-
 pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool {
     if negated_artifact_list_contains(lower, &["tests", "test files", "test file"]) {
         return true;
@@ -5289,7 +5210,7 @@ fn request_treats_setup_as_document_content(request: &str, lower: &str) -> bool 
 /// output_data.csv, a CSV file?` therefore reaches `output_action=false`
 /// (masked) → no default `output.csv` (R4), while `Generate a CSV file with
 /// columns id and total` keeps `generate` (real verb) → default `output.csv`.
-fn request_asks_for_data_output_artifact_with_scan(
+pub(super) fn request_asks_for_data_output_artifact_with_scan(
     scan: &OutputContextScan,
     request: &str,
 ) -> bool {
