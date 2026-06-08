@@ -14,8 +14,8 @@ use super::repair_job::RepairJob;
 use super::repair_job::sanitize_repair_job_text_with_char_cap;
 use super::task_contract::ArtifactRole;
 use super::task_contract::RecoveryTargetHint;
-use super::verifier_repair_targeting::{
-    extract_path_like_tokens, recovery_target_hint_for_existing_path,
+use super::verifier_failure_artifacts::{
+    VERIFIER_OUTPUT_FAILURE_ARTIFACT_REASON, verifier_output_failure_hints,
 };
 
 const MAX_COMMAND_CHARS: usize = 360;
@@ -130,10 +130,10 @@ impl FailurePacket {
     fn from_repair_job_parts(work_root: Option<&Path>, job: &RepairJob) -> Self {
         let mut candidate_artifacts = Vec::new();
         if let Some(work_root) = work_root {
-            for hint in verifier_output_candidate_artifacts(work_root, job) {
+            for hint in verifier_output_failure_hints(work_root, &job.output_excerpt) {
                 candidate_artifacts.push(CandidateArtifact::from_hint(
                     &hint,
-                    "verifier output names this failure artifact",
+                    VERIFIER_OUTPUT_FAILURE_ARTIFACT_REASON,
                 ));
             }
         }
@@ -304,24 +304,6 @@ fn structured_diagnostic_code_from_failure_kind(failure_kind: &str) -> Option<&'
         "schema_mismatch" | "structured_data_schema_missing" => Some("schema_mismatch"),
         _ => None,
     }
-}
-
-fn verifier_output_candidate_artifacts(
-    work_root: &Path,
-    job: &RepairJob,
-) -> Vec<RecoveryTargetHint> {
-    let mut hints = Vec::new();
-    for raw_path in extract_path_like_tokens(&job.output_excerpt).take(12) {
-        let Some(hint) = recovery_target_hint_for_existing_path(
-            work_root,
-            raw_path,
-            "verifier output names this failure artifact",
-        ) else {
-            continue;
-        };
-        hints.push(hint);
-    }
-    hints
 }
 
 impl ObservedExpectedPair {

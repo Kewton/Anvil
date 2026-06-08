@@ -479,6 +479,8 @@ mod file_excerpt;
 mod failure_packet;
 mod interrupt;
 mod lifecycle;
+mod verifier_evidence_scope;
+mod verifier_failure_artifacts;
 // v0.4.25: model request policy helpers. Keeps transport and focused-edit
 // request sizing decisions out of the actor-loop dispatcher as they are
 // extracted toward a dedicated request boundary.
