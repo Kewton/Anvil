@@ -6,12 +6,17 @@
 
 #![allow(dead_code)]
 
+use std::path::Path;
+
 use sha2::{Digest, Sha256};
 
 use super::repair_job::RepairJob;
 use super::repair_job::sanitize_repair_job_text_with_char_cap;
 use super::task_contract::ArtifactRole;
 use super::task_contract::RecoveryTargetHint;
+use super::verifier_repair_targeting::{
+    extract_path_like_tokens, recovery_target_hint_for_existing_path,
+};
 
 const MAX_COMMAND_CHARS: usize = 360;
 const MAX_SIGNATURE_CHARS: usize = 220;
@@ -115,7 +120,23 @@ pub(super) struct PriorRepairAttempt {
 
 impl FailurePacket {
     pub(super) fn from_repair_job(job: &RepairJob) -> Self {
+        Self::from_repair_job_parts(None, job)
+    }
+
+    pub(super) fn from_repair_job_with_work_root(work_root: &Path, job: &RepairJob) -> Self {
+        Self::from_repair_job_parts(Some(work_root), job)
+    }
+
+    fn from_repair_job_parts(work_root: Option<&Path>, job: &RepairJob) -> Self {
         let mut candidate_artifacts = Vec::new();
+        if let Some(work_root) = work_root {
+            for hint in verifier_output_candidate_artifacts(work_root, job) {
+                candidate_artifacts.push(CandidateArtifact::from_hint(
+                    &hint,
+                    "verifier output names this failure artifact",
+                ));
+            }
+        }
         if let Some(hint) = job.repair_target_hint.as_ref().or(job.target_hint.as_ref()) {
             candidate_artifacts.push(CandidateArtifact::from_hint(
                 hint,
@@ -283,6 +304,24 @@ fn structured_diagnostic_code_from_failure_kind(failure_kind: &str) -> Option<&'
         "schema_mismatch" | "structured_data_schema_missing" => Some("schema_mismatch"),
         _ => None,
     }
+}
+
+fn verifier_output_candidate_artifacts(
+    work_root: &Path,
+    job: &RepairJob,
+) -> Vec<RecoveryTargetHint> {
+    let mut hints = Vec::new();
+    for raw_path in extract_path_like_tokens(&job.output_excerpt).take(12) {
+        let Some(hint) = recovery_target_hint_for_existing_path(
+            work_root,
+            raw_path,
+            "verifier output names this failure artifact",
+        ) else {
+            continue;
+        };
+        hints.push(hint);
+    }
+    hints
 }
 
 impl ObservedExpectedPair {
@@ -633,6 +672,52 @@ assertion `left == right` failed
         assert_eq!(
             packet.timeout_kind,
             Some(FailurePacketTimeoutKind::EnvironmentStall)
+        );
+    }
+
+    #[test]
+    fn failure_packet_includes_verifier_output_named_existing_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(work_root.join("sales.py"), "def summarize(items): pass\n").unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(
+            work_root.join("tests").join("test_sales.py"),
+            "def test_total(): pass\n",
+        )
+        .unwrap();
+        let job = super::super::repair_job::RepairJob {
+            output_excerpt:
+                "FAILED tests/test_sales.py::test_total - AssertionError: expected total"
+                    .to_string(),
+            target_hint: Some(RecoveryTargetHint {
+                role: ArtifactRole::Implementation,
+                path: "sales.py".to_string(),
+                reason: "changed implementation candidate".to_string(),
+            }),
+            changed_file_hints: vec![RecoveryTargetHint {
+                role: ArtifactRole::Implementation,
+                path: "sales.py".to_string(),
+                reason: "changed workspace file".to_string(),
+            }],
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let packet = FailurePacket::from_repair_job_with_work_root(work_root, &job);
+
+        assert!(packet.has_candidate_path("tests/test_sales.py"));
+        assert_eq!(
+            packet.candidate_role_for_path("tests/test_sales.py"),
+            Some(ArtifactRole::Test)
+        );
+        let failure_artifact = packet
+            .candidate_artifacts
+            .iter()
+            .find(|artifact| artifact.path == "tests/test_sales.py")
+            .expect("output-named test artifact candidate");
+        assert_eq!(
+            failure_artifact.reason,
+            "verifier output names this failure artifact"
         );
     }
 

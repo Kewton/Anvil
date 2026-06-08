@@ -578,3 +578,37 @@ The Rust TDD validation passed after these changes, which suggests the added
 scope/candidate plumbing did not regress hard coding tasks. The Python
 feature-improvement case remains open and should be used as the next repair
 convergence fixture.
+
+## Continuation Update: Candidate Completeness And Data False-Done
+
+Additional minimal validation showed two separate issues.
+
+First, making verifier-output artifacts visible in `FailurePacket` and
+`changed_candidates` improves diagnostic input completeness, but it still does
+not make the Python feature-improvement fixture converge. The LLM/repair
+lifecycle continues implementation-target repair even after full-suite evidence
+keeps failing on an existing test artifact. This means the next coding repair
+step should be a typed no-progress target reassessment lifecycle, not another
+candidate-visibility or prompt-only change.
+
+Second, a non-coding CSV task produced a clear false-done:
+
+- requested `data/output.csv`
+- requested columns `id,total`
+- requested rows `1,100` and `2,250`
+- Anvil returned `done`
+- `data/output.csv` contained extra columns and malformed rows
+- an extra root `output.csv` was created
+
+This changes the near-term priority:
+
+1. P0: typed data evidence runner for explicit output path, schema, row count,
+   and requested rows.
+2. P1: no-progress target reassessment for coding repair lifecycle.
+3. P2: broader completion-credit improvements after evidence correctness is
+   reliable.
+
+The architecture principle is unchanged: do not solve this by adding benchmark
+branches. Data correctness should be a generic `EvidenceRunner` capability, and
+repair target switching should be a generic lifecycle transition over typed
+failure observations.
