@@ -6713,18 +6713,21 @@ pub(super) fn objective_evidence_satisfied_for_contract(
     objective_evidence_satisfied(evidence, &contract.objective_contract())
 }
 
+pub(super) fn command_observation_evidence_collected_for_contract(
+    evidence: &EvidenceSet,
+    contract: &TaskContract,
+) -> bool {
+    let objective = contract.objective_contract();
+    objective.evidence_kind == ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        && successful_command_observation_requirements_satisfied(evidence, &objective)
+}
+
 fn objective_evidence_satisfied(evidence: &EvidenceSet, objective: &ObjectiveContract) -> bool {
     match objective.evidence_kind {
         ObjectiveEvidenceKind::TestRun => has_build_test_verifier(evidence),
         ObjectiveEvidenceKind::SafetyBoundaryEvidence => {
-            if objective.required_evidence_commands.is_empty() {
-                has_successful_command_observation(evidence)
-            } else {
-                objective
-                    .required_evidence_commands
-                    .iter()
-                    .all(|command| has_successful_command_observation_for(evidence, command))
-            }
+            successful_command_observation_requirements_satisfied(evidence, objective)
+                && command_observation_deliverable_bound(evidence, objective)
         }
         ObjectiveEvidenceKind::ContentCheck | ObjectiveEvidenceKind::ContentAcceptance => {
             evidence.iter().any(|item| {
@@ -6743,6 +6746,86 @@ fn objective_evidence_satisfied(evidence: &EvidenceSet, objective: &ObjectiveCon
             .iter()
             .any(|item| matches!(item, CompletionEvidence::ReportCompletenessPass { .. })),
         ObjectiveEvidenceKind::FileLayoutCheck => false,
+    }
+}
+
+fn successful_command_observation_requirements_satisfied(
+    evidence: &EvidenceSet,
+    objective: &ObjectiveContract,
+) -> bool {
+    if objective.required_evidence_commands.is_empty() {
+        has_successful_command_observation(evidence)
+    } else {
+        objective
+            .required_evidence_commands
+            .iter()
+            .all(|command| has_successful_command_observation_for(evidence, command))
+    }
+}
+
+fn command_observation_deliverable_bound(
+    evidence: &EvidenceSet,
+    objective: &ObjectiveContract,
+) -> bool {
+    if objective.required_deliverables.is_empty() {
+        return true;
+    }
+    let Some(last_command_index) = last_successful_command_observation_index(evidence, objective)
+    else {
+        return false;
+    };
+    evidence
+        .iter()
+        .enumerate()
+        .skip(last_command_index.saturating_add(1))
+        .any(|(_, item)| {
+            evidence_item_satisfies_observed_deliverable(item, objective.required_deliverables())
+        })
+}
+
+fn last_successful_command_observation_index(
+    evidence: &EvidenceSet,
+    objective: &ObjectiveContract,
+) -> Option<usize> {
+    let mut last_index = None;
+    for (index, item) in evidence.iter().enumerate() {
+        let CompletionEvidence::CommandObservation {
+            command,
+            exit_status: 0,
+            safety_boundary_passed: true,
+        } = item
+        else {
+            continue;
+        };
+        if objective.required_evidence_commands.is_empty()
+            || objective
+                .required_evidence_commands
+                .iter()
+                .any(|required| command_observation_matches_required(command.as_str(), required))
+        {
+            last_index = Some(index);
+        }
+    }
+    last_index
+}
+
+fn evidence_item_satisfies_observed_deliverable(
+    evidence: &CompletionEvidence,
+    required_deliverables: &[ArtifactRole],
+) -> bool {
+    let Some(role) = observed_deliverable_role(evidence) else {
+        return false;
+    };
+    required_deliverables.contains(&role)
+}
+
+fn observed_deliverable_role(evidence: &CompletionEvidence) -> Option<ArtifactRole> {
+    match evidence {
+        CompletionEvidence::RepoEdit { category, .. } => role_from_repo_edit(*category),
+        CompletionEvidence::RequiredSectionsPass { .. }
+        | CompletionEvidence::ReportCompletenessPass { .. } => Some(ArtifactRole::UsageDocs),
+        CompletionEvidence::StructuredDataPass { .. } => Some(ArtifactRole::DataOutput),
+        _ => None,
     }
 }
 
@@ -8387,7 +8470,6 @@ mod tests {
 
         let mut partially_observed = EvidenceSet::new();
         partially_observed.push(command_observation("pwd", 0));
-        partially_observed.push(repo_edit_path(RepoEditCategory::Docs, "ops/observation.md"));
         let partial = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &partially_observed,
@@ -8401,6 +8483,7 @@ mod tests {
 
         let mut observed = partially_observed;
         observed.push(command_observation("ls", 0));
+        observed.push(repo_edit_path(RepoEditCategory::Docs, "ops/observation.md"));
         let complete = plan_artifact_recovery(ArtifactRecoveryInputs {
             contract: &contract,
             evidence: &observed,
@@ -10107,8 +10190,16 @@ Create the README file."#;
         file_only.push(repo_edit_path(RepoEditCategory::Docs, "ops-observation.md"));
         assert_eq!(contract.evaluate(&file_only), CompletionDecision::Verify);
 
-        let mut complete = file_only.clone();
+        let mut stale_artifact = file_only.clone();
+        stale_artifact.push(command_observation("pwd", 0));
+        assert_eq!(
+            contract.evaluate(&stale_artifact),
+            CompletionDecision::Verify
+        );
+
+        let mut complete = EvidenceSet::new();
         complete.push(command_observation("pwd", 0));
+        complete.push(repo_edit_path(RepoEditCategory::Docs, "ops-observation.md"));
         assert_eq!(contract.evaluate(&complete), CompletionDecision::Done);
     }
 
@@ -10159,8 +10250,24 @@ Create the README file."#;
             ArtifactRecoveryAction::RunVerifier
         );
 
-        let mut complete = file_only;
+        let mut stale_artifact = file_only;
+        stale_artifact.push(command_observation("pwd", 0));
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &stale_artifact,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &excerpts,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::RunVerifier
+        );
+
+        let mut complete = EvidenceSet::new();
         complete.push(command_observation("pwd", 0));
+        complete.push(repo_edit_path(RepoEditCategory::Docs, "ops-observation.md"));
         assert_eq!(
             plan_artifact_recovery(ArtifactRecoveryInputs {
                 contract: &contract,

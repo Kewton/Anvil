@@ -100,7 +100,33 @@ fn objective_evidence_action_policy(agent: &Agent) -> Option<EffectiveToolPolicy
         return None;
     }
 
+    if super::task_contract::command_observation_evidence_collected_for_contract(
+        &agent.task_contract_evidence_set_this_turn,
+        &contract,
+    ) && let Some(target) = objective_evidence_artifact_binding_target(agent, &contract)
+    {
+        return Some(EffectiveToolPolicy::evidence_action_artifact_binding(
+            target,
+        ));
+    }
+
     Some(EffectiveToolPolicy::evidence_action_bash_only())
+}
+
+fn objective_evidence_artifact_binding_target(
+    agent: &Agent,
+    contract: &super::task_contract::TaskContract,
+) -> Option<PathBuf> {
+    let objective = contract.objective_contract();
+    for role in objective.required_deliverables() {
+        if let Some(identity) = contract.required_identities_for_role(*role).first() {
+            return Some(agent.work_root.join(&identity.path));
+        }
+    }
+    agent
+        .current_artifact_recovery_target
+        .as_ref()
+        .map(|target| agent.work_root.join(&target.path))
 }
 
 fn objective_required_deliverables_ready(
@@ -505,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn command_observation_evidence_policy_releases_after_observed_command() {
+    fn command_observation_evidence_policy_binds_artifact_after_observed_command() {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         let request =
             "Run pwd and write ops-observation.md containing the exact observed directory.";
@@ -532,6 +558,14 @@ mod tests {
 
         let policy = effective_tool_policy(&agent);
 
-        assert_ne!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
+        assert_eq!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
+        assert_eq!(
+            policy.allowed_tool_names_for_prompt(),
+            Some(&["Read", "Write", "Edit"][..])
+        );
+        let artifact = policy
+            .artifact_directed_policy()
+            .expect("artifact binding policy");
+        assert_eq!(artifact.target, agent.work_root.join("ops-observation.md"));
     }
 }

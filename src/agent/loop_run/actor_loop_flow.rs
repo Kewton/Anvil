@@ -2293,13 +2293,14 @@ fn maybe_handle_pre_reply_command_observation_evidence_action(
     let Some(contract) = args.task_contract else {
         return false;
     };
-    if !task_contract_requires_command_observation_evidence(agent, contract) {
+    let Some(phase) = command_observation_evidence_phase(agent, contract) else {
         return false;
-    }
+    };
     emit_command_observation_evidence_request(
         agent,
         args.last_iter,
-        "A command-observation objective needs an actual Bash command result.",
+        phase.iteration_detail(),
+        phase,
     );
     true
 }
@@ -2829,34 +2830,65 @@ fn maybe_handle_command_observation_evidence_action(
     args: &ActorLoopTaskContractReplyArgs<'_, '_>,
 ) -> Option<ActorLoopTaskContractReplyOutcome> {
     let contract = args.task_contract?;
-    if !task_contract_requires_command_observation_evidence(agent, contract) {
-        return None;
-    }
+    let phase = command_observation_evidence_phase(agent, contract)?;
     emit_command_observation_evidence_request(
         agent,
         args.last_iter,
-        "A command-observation objective needs an actual Bash command result.",
+        phase.iteration_detail(),
+        phase,
     );
     Some(ActorLoopTaskContractReplyOutcome::Continue)
 }
 
-fn task_contract_requires_command_observation_evidence(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandObservationEvidencePhase {
+    CollectCommand,
+    BindArtifact,
+}
+
+impl CommandObservationEvidencePhase {
+    fn iteration_detail(self) -> &'static str {
+        match self {
+            Self::CollectCommand => {
+                "A command-observation objective needs an actual Bash command result."
+            }
+            Self::BindArtifact => {
+                "Command observation exists; update the required artifact with the observed result."
+            }
+        }
+    }
+}
+
+fn command_observation_evidence_phase(
     agent: &Agent,
     contract: &super::task_contract::TaskContract,
-) -> bool {
+) -> Option<CommandObservationEvidencePhase> {
     let objective = contract.objective_contract();
-    objective.evidence_kind == super::task_contract::ObjectiveEvidenceKind::SafetyBoundaryEvidence
-        && objective.requires_evidence()
-        && !super::task_contract::objective_evidence_satisfied_for_contract(
+    if objective.evidence_kind
+        != super::task_contract::ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        || !objective.requires_evidence()
+        || super::task_contract::objective_evidence_satisfied_for_contract(
             &agent.task_contract_evidence_set_this_turn,
             contract,
         )
+    {
+        return None;
+    }
+    if super::task_contract::command_observation_evidence_collected_for_contract(
+        &agent.task_contract_evidence_set_this_turn,
+        contract,
+    ) {
+        Some(CommandObservationEvidencePhase::BindArtifact)
+    } else {
+        Some(CommandObservationEvidencePhase::CollectCommand)
+    }
 }
 
 fn emit_command_observation_evidence_request(
     agent: &mut Agent,
     last_iter: usize,
     detail: &'static str,
+    phase: CommandObservationEvidencePhase,
 ) {
     super::artifact_recovery_flow::clear_artifact_recovery_target(
         agent,
@@ -2875,10 +2907,15 @@ fn emit_command_observation_evidence_request(
         true,
     );
     let active_request = super::workspace_access::active_request_text(agent).unwrap_or_default();
-    let note = format!(
-        "[Command Observation Evidence] The required artifact exists, but the objective still lacks actual command-observation evidence. Use Bash now to execute the local command explicitly requested in the active task, then update the artifact only if the observed output differs. Do not invent command output from the workspace path. Active task: {}",
-        super::task_contract::mask_and_cap_recovery_field(&active_request)
-    );
+    let task = super::task_contract::mask_and_cap_recovery_field(&active_request);
+    let note = match phase {
+        CommandObservationEvidencePhase::CollectCommand => format!(
+            "[Command Observation Evidence] The required artifact exists, but the objective still lacks actual command-observation evidence. Use Bash now to execute the local command explicitly requested in the active task. After all required Bash commands succeed, update the required artifact so its recorded output is based on the observed result. Do not invent command output from the workspace path. Active task: {task}",
+        ),
+        CommandObservationEvidencePhase::BindArtifact => format!(
+            "[Command Observation Artifact Binding] Command observation evidence exists, but the required artifact is not yet bound to that observation. Use Write or Edit on the required artifact now so it records the observed Bash output. Do not call Bash again unless a required command is still missing. Active task: {task}",
+        ),
+    };
     super::message_push::push_system_note(agent, note);
 }
 

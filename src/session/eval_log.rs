@@ -400,6 +400,10 @@ impl EvalRecord {
         let Some(diagnostics) = self.terminal_diagnostics.as_mut() else {
             return;
         };
+        diagnostics.outcome = self.final_outcome.clone();
+        diagnostics.generic_outcome =
+            generic_label_for_legacy_terminal(&self.final_outcome).to_string();
+        diagnostics.classification = "success".to_string();
         set_obligation(
             &mut diagnostics.obligations,
             "repo_edit",
@@ -429,6 +433,27 @@ impl EvalRecord {
                 None,
                 "non-coding artifact evidence was satisfied by the controller completion gate",
             ),
+        );
+        if non_coding_command_observation_tool_observed(
+            self.classified_task_kind.as_deref(),
+            &self.tool_calls,
+        ) {
+            upsert_obligation(
+                &mut diagnostics.obligations,
+                obligation(
+                    "command_observation_evidence",
+                    "satisfied",
+                    None,
+                    "ops command-observation evidence was recorded through a Bash tool call",
+                ),
+            );
+        }
+        set_obligation(
+            &mut diagnostics.obligations,
+            "repair_convergence",
+            "not_applicable",
+            None,
+            "completed objective-bound evidence superseded artifact repair exhaustion",
         );
         refresh_terminal_obligation_indexes(diagnostics);
     }
@@ -1136,6 +1161,9 @@ fn completion_reason_for_eval(
     if verify_command_count > 0 {
         return "verifier_evidence_satisfied".to_string();
     }
+    if non_coding_command_observation_tool_observed(classified_task_kind, tool_calls) {
+        return "command_observation_evidence_satisfied".to_string();
+    }
     let changed_count = changed_file_classes
         .test
         .saturating_add(changed_file_classes.impl_files)
@@ -1160,6 +1188,16 @@ fn non_coding_artifact_tool_observed(
     tool_calls
         .iter()
         .any(|call| matches!(call.name.as_str(), "Write" | "Edit"))
+}
+
+fn non_coding_command_observation_tool_observed(
+    classified_task_kind: Option<&str>,
+    tool_calls: &[ToolCallSummary],
+) -> bool {
+    matches!(
+        classified_task_kind.and_then(normalize_classified_task_kind_for_eval),
+        Some("ops")
+    ) && tool_calls.iter().any(|call| call.name == "Bash")
 }
 
 fn obligation(
@@ -1691,6 +1729,135 @@ mod tests {
             .find(|o| o.id == "verification_evidence")
             .expect("verification evidence obligation");
         assert_eq!(verifier_evidence.status, "not_applicable");
+    }
+
+    #[test]
+    fn terminal_diagnostics_marks_ops_command_observation_evidence() {
+        let tool_calls = vec![
+            ToolCallSummary {
+                name: "Write".to_string(),
+                args_summary: r#"{"path":"ops/observation.md"}"#.to_string(),
+            },
+            ToolCallSummary {
+                name: "Bash".to_string(),
+                args_summary: r#"{"command":"pwd"}"#.to_string(),
+            },
+        ];
+        let mut rec = build_eval_record(
+            "sess-ops-001",
+            12345,
+            "Run pwd and create ops/observation.md with the observed output.",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        rec.classified_task_kind = Some("ops".to_string());
+        rec.refresh_completion_reason();
+        rec.refresh_terminal_diagnostics();
+
+        assert_eq!(
+            rec.completion_reason,
+            "command_observation_evidence_satisfied"
+        );
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"command_observation_evidence".to_string())
+        );
+        let command_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "command_observation_evidence")
+            .expect("command observation evidence obligation");
+        assert_eq!(command_evidence.status, "satisfied");
+    }
+
+    #[test]
+    fn terminal_diagnostics_reconciles_completed_ops_after_artifact_repair_exhaustion() {
+        let tool_calls = vec![
+            ToolCallSummary {
+                name: "Write".to_string(),
+                args_summary: r#"{"path":"ops/observation.md"}"#.to_string(),
+            },
+            ToolCallSummary {
+                name: "Bash".to_string(),
+                args_summary: r#"{"command":"ls -la"}"#.to_string(),
+            },
+        ];
+        let mut rec = build_eval_record(
+            "sess-ops-002",
+            12345,
+            "Run ls and create ops/observation.md with the observed output.",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        rec.classified_task_kind = Some("ops".to_string());
+        rec.mark_artifact_evidence_repair_exhausted();
+        let exhausted = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert_eq!(exhausted.classification, "evidence_repair_exhausted");
+        assert!(
+            exhausted
+                .missing_obligations
+                .contains(&"repair_convergence".to_string())
+        );
+
+        rec.refresh_completion_reason();
+        rec.refresh_terminal_diagnostics();
+
+        assert_eq!(
+            rec.completion_reason,
+            "command_observation_evidence_satisfied"
+        );
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert_eq!(diag.classification, "success");
+        assert_eq!(diag.generic_outcome, "completed");
+        assert!(
+            !diag
+                .missing_obligations
+                .contains(&"repair_convergence".to_string())
+        );
+        let repair_convergence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "repair_convergence")
+            .expect("repair convergence obligation");
+        assert_eq!(repair_convergence.status, "not_applicable");
+        assert_eq!(repair_convergence.failure_domain, None);
+        let command_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "command_observation_evidence")
+            .expect("command observation evidence obligation");
+        assert_eq!(command_evidence.status, "satisfied");
     }
 
     #[test]

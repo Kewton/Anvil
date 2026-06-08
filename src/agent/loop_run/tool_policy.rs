@@ -186,6 +186,18 @@ impl EffectiveToolPolicy {
         }
     }
 
+    pub(super) fn evidence_action_artifact_binding(target: PathBuf) -> Self {
+        Self {
+            allowed_tools: Some(vec!["Read", "Write", "Edit"]),
+            focused_edit: None,
+            artifact_directed: Some(ArtifactDirectedPolicy {
+                target,
+                target_already_read: false,
+            }),
+            reason: EffectiveToolPolicyReason::EvidenceAction,
+        }
+    }
+
     pub(super) fn allowed_tool_names_for_prompt(&self) -> Option<&[&str]> {
         self.allowed_tools.as_deref()
     }
