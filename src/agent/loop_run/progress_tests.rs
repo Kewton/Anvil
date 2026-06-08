@@ -163,11 +163,11 @@ mod inner {
     };
     use super::super::verifier_orchestration::{
         parse_verifier_repair_intent_reply, parse_verifier_repair_intents_reply,
-        task_contract_verifier_target_discovery_note, validate_verifier_repair_intent,
-        validate_verifier_repair_intents, validate_verifier_repair_intents_with_accepted_plan,
-        verifier_diagnostic_messages, verifier_file_excerpt_for_line, verifier_repair_decision,
-        verifier_repair_pass_messages, verifier_repair_policy_for_decision,
-        verifier_repair_policy_for_target_hint,
+        safe_verifier_diagnostic_file_excerpt, task_contract_verifier_target_discovery_note,
+        validate_verifier_repair_intent, validate_verifier_repair_intents,
+        validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_messages,
+        verifier_file_excerpt_for_line, verifier_repair_decision, verifier_repair_pass_messages,
+        verifier_repair_policy_for_decision, verifier_repair_policy_for_target_hint,
     };
     use super::super::verifier_orchestration::{
         verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
@@ -6353,6 +6353,22 @@ E   assert [{'id': 1}] == []\n";
 
         assert!(excerpt.contains("...[truncated]..."));
         assert!(!excerpt.contains("truncated before target line"));
+    }
+
+    #[test]
+    fn verifier_diagnostic_excerpt_preserves_source_control_flow() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        let source = "def password_score(password: str) -> int:\n    if not password:\n        return 0\n    return 1\n";
+        std::fs::write(work_root.join("password_strength.py"), source).unwrap();
+
+        let excerpt =
+            safe_verifier_diagnostic_file_excerpt(work_root, "password_strength.py", None)
+                .expect("diagnostic excerpt");
+
+        assert!(excerpt.contains("password: str"));
+        assert!(excerpt.contains("if not password:\n        return 0"));
+        assert!(!excerpt.contains("password=***"));
     }
 
     // Issue #638 (Phase 2, Task 2.1): deleted `verifier_failure_classifies_indentation_error_as_syntax`

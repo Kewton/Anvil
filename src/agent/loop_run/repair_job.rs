@@ -1419,6 +1419,15 @@ impl RepairJob {
         {
             return Some(target);
         }
+        if let Some(target) = self.current_unexhausted_semantic_target() {
+            return Some(target.clone());
+        }
+        if let Some(target) = self.current_unexhausted_semantic_changed_file_target() {
+            return Some(target.clone());
+        }
+        if let Some(target) = self.current_unexhausted_semantic_observed_target() {
+            return Some(target.clone());
+        }
         self.assessment
             .as_ref()
             .and_then(|assessment| {
@@ -1670,6 +1679,33 @@ impl RepairJob {
         })
     }
 
+    fn current_unexhausted_semantic_changed_file_target(&self) -> Option<&RecoveryTargetHint> {
+        let plan = self.semantic_plan.as_ref()?;
+        self.changed_file_hints.iter().find(|target| {
+            target.role == plan.preferred_repair_role
+                && !self.is_repair_target_exhausted(
+                    &plan.failure_cluster_id,
+                    plan.preferred_repair_role,
+                    &target.path,
+                )
+        })
+    }
+
+    fn current_unexhausted_semantic_observed_target(&self) -> Option<&RecoveryTargetHint> {
+        let plan = self.semantic_plan.as_ref()?;
+        [self.target_hint.as_ref(), self.repair_target_hint.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|target| {
+                target.role == plan.preferred_repair_role
+                    && !self.is_repair_target_exhausted(
+                        &plan.failure_cluster_id,
+                        plan.preferred_repair_role,
+                        &target.path,
+                    )
+            })
+    }
+
     /// True only when the active semantic cluster has at least one admitted
     /// target for its role and all such targets are exhausted.
     pub(super) fn current_semantic_targets_all_exhausted(&self) -> bool {
@@ -1786,7 +1822,7 @@ impl RepairJobDriver<'_> {
 /// - log/report injection: ASCII C0 + DEL → space
 /// - bounded retention: UTF-8 safe `SNAPSHOT_FIELD_BYTE_CAP`-byte cap
 pub(super) fn sanitize_repair_job_text(input: &str) -> String {
-    truncate_for_snapshot(&mask_and_neutralize(input))
+    truncate_for_snapshot(&mask_secrets_headers_and_neutralize(input))
 }
 
 /// Sanitize a `RepairJob` text field for a caller-supplied char bound. Used
@@ -1798,7 +1834,7 @@ pub(super) fn sanitize_repair_job_text(input: &str) -> String {
 /// control-char neutralization) and then truncates to `max_chars` Unicode
 /// chars with a `"..."` suffix when the input exceeds the bound.
 pub(super) fn sanitize_repair_job_text_with_char_cap(input: &str, max_chars: usize) -> String {
-    truncate_chars_with_ellipsis(&mask_and_neutralize(input), max_chars)
+    truncate_chars_with_ellipsis(&mask_secrets_headers_and_neutralize(input), max_chars)
 }
 
 /// Shared SSOT prefix: mask_secrets → mask_header_family → control-char neutralize.
@@ -3773,6 +3809,106 @@ mod tests {
             job.next_action(),
             RepairNextAction::RequestPatch {
                 target_hint: target
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_next_action_prefers_active_semantic_cluster_target() {
+        let test_target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let mut report = semantic_report_fixture(VerifierDiagnosticFailureKind::TestBug, 0.8);
+        report.preferred_repair_role = ArtifactRole::Test;
+        report.failure_clusters[0].admitted_cluster_targets = vec![test_target.clone()];
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::TestBug,
+            spec_authority: SpecAuthority::LlmGeneratedTest,
+            preferred_repair_role: ArtifactRole::Test,
+            repair_hypothesis: "generated test expectation conflicts with objective".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let legacy_impl_target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(legacy_impl_target)),
+            semantic_plan: Some(plan),
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: test_target
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_next_action_uses_semantic_role_changed_file_when_cluster_target_missing() {
+        let test_target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let mut report =
+            semantic_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 0.8);
+        report.preferred_repair_role = ArtifactRole::Test;
+        report.failure_clusters[0].admitted_cluster_targets.clear();
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::LlmGeneratedTest,
+            preferred_repair_role: ArtifactRole::Test,
+            repair_hypothesis: "test artifact should reconcile with objective".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let legacy_impl_target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(legacy_impl_target)),
+            semantic_plan: Some(plan),
+            changed_file_hints: vec![test_target.clone()],
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: test_target
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_next_action_uses_semantic_role_observed_target_before_legacy_assessment() {
+        let test_target = recovery_target(ArtifactRole::Test, "tests/test_main.py");
+        let mut report =
+            semantic_report_fixture(VerifierDiagnosticFailureKind::AssertionMismatch, 0.8);
+        report.preferred_repair_role = ArtifactRole::Test;
+        report.failure_clusters[0].admitted_cluster_targets.clear();
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+        let plan = SemanticRepairPlan {
+            semantic_report: report,
+            failure_cluster_id: cluster_id,
+            semantic_cause: VerifierDiagnosticFailureKind::AssertionMismatch,
+            spec_authority: SpecAuthority::LlmGeneratedTest,
+            preferred_repair_role: ArtifactRole::Test,
+            repair_hypothesis: "verifier failure location is the generated test".to_string(),
+            expected_improvement: None,
+            assessment_generation_at_creation: 0,
+        };
+        let legacy_impl_target = recovery_target(ArtifactRole::Implementation, "app/main.py");
+        let job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(legacy_impl_target)),
+            semantic_plan: Some(plan),
+            target_hint: Some(test_target.clone()),
+            ..RepairJob::new_for_test()
+        };
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: test_target
             }
         );
     }

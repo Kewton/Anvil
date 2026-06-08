@@ -389,17 +389,13 @@ fn observe_evidence_from_bash_outcome(
         // VerifierExitZero today; the match keeps us honest if a
         // future helper returns a different variant.
         agent.evidence_set_this_turn.push(evidence.clone());
-        if agent.current_artifact_recovery_target.is_none() {
-            agent.task_contract_evidence_set_this_turn.push(evidence);
-        }
+        agent.task_contract_evidence_set_this_turn.push(evidence);
         return;
     };
     agent.evidence_set_this_turn.push(evidence.clone());
-    if agent.current_artifact_recovery_target.is_none() {
-        agent
-            .task_contract_evidence_set_this_turn
-            .push(evidence.clone());
-    }
+    agent
+        .task_contract_evidence_set_this_turn
+        .push(evidence.clone());
     crate::logging::log_completion_evidence_observed(
         agent.current_turn_index,
         0, // α-1: iter_index plumbing is α-2 work; emit 0 for now.
@@ -470,7 +466,7 @@ mod tests {
     use crate::agent::loop_run::task_contract::{ArtifactRole, RecoveryTarget, TaskContract};
     use crate::config::Config;
     use crate::session::store::ConversationMessage;
-    use crate::tools::bash::BashExecutionOutcome;
+    use crate::tools::bash::{BashCommandClass, BashExecutionOutcome};
 
     use super::*;
 
@@ -540,6 +536,48 @@ mod tests {
                 )),
             "task contract evidence: {:?}",
             agent.task_contract_evidence_set_this_turn
+        );
+    }
+
+    #[test]
+    fn verifier_exit_zero_reaches_task_contract_with_artifact_target_active() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::UsageDocs,
+            path: "README.md".to_string(),
+            reason: "usage docs still missing".to_string(),
+            attempt: 1,
+        });
+
+        observe_evidence_from_bash_outcome(
+            &mut agent,
+            &BashExecutionOutcome {
+                command: "python3 -m pytest -q".to_string(),
+                exit_code: Some(0),
+                class: BashCommandClass::BuildTest,
+                stdout: "11 passed\n".to_string(),
+                ..BashExecutionOutcome::default()
+            },
+        );
+
+        assert!(
+            agent
+                .task_contract_evidence_set_this_turn
+                .iter()
+                .any(|e| matches!(
+                    e,
+                    CompletionEvidence::VerifierExitZero {
+                        class: BashCommandClass::BuildTest,
+                        command,
+                        ..
+                    } if command == "python3 -m pytest -q"
+                )),
+            "task contract evidence: {:?}",
+            agent.task_contract_evidence_set_this_turn
+        );
+        assert_eq!(
+            agent.session.last_verifier_command.as_deref(),
+            Some("python3 -m pytest -q")
         );
     }
 }

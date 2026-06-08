@@ -58,6 +58,9 @@ pub(super) enum OperatorId {
     PythonCliEntrypoint,
     /// Restore the importable FastAPI `app` (single-shot LLM repair).
     FastApiAppImport,
+    /// Repair a generated test artifact against higher-authority contract
+    /// evidence (single-shot LLM repair).
+    GeneratedTestExpectation,
     /// Add a missing required documentation section (single-shot LLM repair).
     DocsRequiredSection,
     /// Add a missing CSV schema column (single-shot LLM repair).
@@ -73,6 +76,7 @@ impl OperatorId {
             OperatorId::NodeTestRunnerManifest => "node_test_runner_manifest",
             OperatorId::PythonCliEntrypoint => "python_cli_entrypoint",
             OperatorId::FastApiAppImport => "fastapi_app_import",
+            OperatorId::GeneratedTestExpectation => "generated_test_expectation",
             OperatorId::DocsRequiredSection => "docs_required_section",
             OperatorId::CsvSchemaColumn => "csv_schema_column",
         }
@@ -94,6 +98,9 @@ pub(super) enum FailureClass {
     PythonEntrypointMissing,
     /// A FastAPI `app` that cannot be imported.
     FastApiImportMissing,
+    /// A generated test artifact contradicts higher-authority objective,
+    /// behavior, or public-interface evidence.
+    TestArtifactMismatch,
     /// A required documentation section is absent.
     DocsSectionMissing,
     /// A CSV / structured-data schema or column mismatch.
@@ -108,6 +115,7 @@ impl FailureClass {
             FailureClass::NodeTestRunnerUnbound => "node_test_runner_unbound",
             FailureClass::PythonEntrypointMissing => "python_entrypoint_missing",
             FailureClass::FastApiImportMissing => "fastapi_import_missing",
+            FailureClass::TestArtifactMismatch => "test_artifact_mismatch",
             FailureClass::DocsSectionMissing => "docs_section_missing",
             FailureClass::DataSchemaMismatch => "data_schema_mismatch",
         }
@@ -191,6 +199,13 @@ const REGISTRY: &[RepairOperatorDescriptor] = &[
         target_role: ArtifactRole::Implementation,
         kind: OperatorKind::LlmSingleShot,
         summary: "Restore the importable FastAPI app (1 failure / 1 target / 1 patch).",
+    },
+    RepairOperatorDescriptor {
+        id: OperatorId::GeneratedTestExpectation,
+        failure_class: FailureClass::TestArtifactMismatch,
+        target_role: ArtifactRole::Test,
+        kind: OperatorKind::LlmSingleShot,
+        summary: "Repair a generated test artifact against higher-authority contract evidence (1 failure / 1 target / 1 patch).",
     },
     RepairOperatorDescriptor {
         id: OperatorId::DocsRequiredSection,
@@ -330,6 +345,18 @@ impl FailureContext {
 /// matching — good enough to pick the candidate *set*; each operator confirms
 /// precise applicability before editing.
 pub(super) fn classify(ctx: &FailureContext) -> Option<FailureClass> {
+    if ctx.target_role == Some(ArtifactRole::Test)
+        && matches!(
+            ctx.failure_kind,
+            Some(
+                VerifierDiagnosticFailureKind::AssertionMismatch
+                    | VerifierDiagnosticFailureKind::BadTest
+                    | VerifierDiagnosticFailureKind::TestBug
+            )
+        )
+    {
+        return Some(FailureClass::TestArtifactMismatch);
+    }
     classify_from_diagnostic(&ctx.diagnostic, ctx.failure_kind)
 }
 
@@ -394,6 +421,9 @@ pub(super) fn classify_from_diagnostic(
     // Coarse fallback on the semantic failure kind for routing a schema-shaped
     // failure that didn't carry an explicit keyword.
     match failure_kind {
+        Some(VerifierDiagnosticFailureKind::BadTest | VerifierDiagnosticFailureKind::TestBug) => {
+            Some(FailureClass::TestArtifactMismatch)
+        }
         Some(VerifierDiagnosticFailureKind::SchemaMismatch) => {
             Some(FailureClass::DataSchemaMismatch)
         }
@@ -477,7 +507,7 @@ mod tests {
             );
         }
         // The initial operator set named in the issue is all present.
-        assert_eq!(seen.len(), 8);
+        assert_eq!(seen.len(), 9);
     }
 
     #[test]
@@ -590,6 +620,46 @@ mod tests {
         assert_eq!(
             classify_from_diagnostic("totally opaque failure", None),
             None
+        );
+    }
+
+    #[test]
+    fn generated_test_bug_routes_to_test_llm_single_shot() {
+        let class = classify_from_diagnostic(
+            "assertion mismatch",
+            Some(VerifierDiagnosticFailureKind::TestBug),
+        );
+        assert_eq!(class, Some(FailureClass::TestArtifactMismatch));
+
+        let selection = select(class, Some(ArtifactRole::Test));
+        assert!(!selection.operator_missing());
+        assert_eq!(
+            selection.candidates,
+            vec![OperatorId::GeneratedTestExpectation]
+        );
+        assert_eq!(
+            candidates_for(FailureClass::TestArtifactMismatch, Some(ArtifactRole::Test))
+                .iter()
+                .find(|descriptor| descriptor.id == OperatorId::GeneratedTestExpectation)
+                .map(|descriptor| descriptor.kind),
+            Some(OperatorKind::LlmSingleShot)
+        );
+    }
+
+    #[test]
+    fn test_role_assertion_mismatch_routes_to_test_llm_single_shot() {
+        let ctx = FailureContext {
+            failure_kind: Some(VerifierDiagnosticFailureKind::AssertionMismatch),
+            diagnostic: "assertion values differ".to_string(),
+            target_role: Some(ArtifactRole::Test),
+        };
+
+        let class = classify(&ctx);
+        assert_eq!(class, Some(FailureClass::TestArtifactMismatch));
+        let selection = select(class, ctx.target_role);
+        assert_eq!(
+            selection.candidates,
+            vec![OperatorId::GeneratedTestExpectation]
         );
     }
 

@@ -1159,34 +1159,50 @@ fn is_read_only_command(normalized: &str) -> bool {
 }
 
 fn is_build_test_command(normalized: &str) -> bool {
-    [
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        "cargo clippy",
-        "cargo fmt",
-        "npm test",
-        "npm run test",
-        "npm run build",
-        "npm run lint",
-        "pnpm test",
-        "pnpm run test",
-        "pnpm build",
-        "pnpm lint",
-        "yarn test",
-        "yarn build",
-        "yarn lint",
-        "pytest",
-        "python -m pytest",
-        "uv run pytest",
-        "go test",
-        "mvn test",
-        "gradle test",
-        "make test",
-        "make build",
-    ]
-    .iter()
-    .any(|needle| normalized == *needle || normalized.starts_with(needle))
+    is_python_pytest_command(normalized)
+        || [
+            "cargo test",
+            "cargo check",
+            "cargo build",
+            "cargo clippy",
+            "cargo fmt",
+            "npm test",
+            "npm run test",
+            "npm run build",
+            "npm run lint",
+            "pnpm test",
+            "pnpm run test",
+            "pnpm build",
+            "pnpm lint",
+            "yarn test",
+            "yarn build",
+            "yarn lint",
+            "pytest",
+            "python -m pytest",
+            "uv run pytest",
+            "go test",
+            "mvn test",
+            "gradle test",
+            "make test",
+            "make build",
+        ]
+        .iter()
+        .any(|needle| normalized == *needle || normalized.starts_with(needle))
+}
+
+fn is_python_pytest_command(normalized: &str) -> bool {
+    let mut tokens = normalized.split_whitespace();
+    let Some(runner) = tokens.next() else {
+        return false;
+    };
+    if !matches!(runner, "python" | "python3") {
+        return false;
+    }
+    let next = match tokens.next() {
+        Some("-b") => tokens.next(),
+        other => other,
+    };
+    next == Some("-m") && tokens.next() == Some("pytest")
 }
 
 fn command_uses_network(command: &str) -> bool {
@@ -1562,6 +1578,14 @@ mod tests {
     fn classifies_command_policy_groups() {
         assert_eq!(classify_command("pwd"), BashCommandClass::ReadOnly);
         assert_eq!(classify_command("cargo test"), BashCommandClass::BuildTest);
+        assert_eq!(
+            classify_command("python3 -m pytest -q"),
+            BashCommandClass::BuildTest
+        );
+        assert_eq!(
+            classify_command("python3 -B -m pytest tests/test_main.py"),
+            BashCommandClass::BuildTest
+        );
         assert_eq!(
             classify_command("python3 scripts/check.py"),
             BashCommandClass::ScriptRun

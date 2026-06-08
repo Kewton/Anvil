@@ -770,6 +770,50 @@ pub(super) fn recent_successful_bash_commands_since_last_user(
     commands
 }
 
+pub(super) fn recent_bash_verifier_command_hint_since_last_user(
+    messages: &[ConversationMessage],
+) -> Option<String> {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut pending_bash_commands: VecDeque<String> = VecDeque::new();
+    let mut last_hint = None;
+    for message in &messages[start..] {
+        match message.role.as_str() {
+            "assistant" => {
+                pending_bash_commands = message
+                    .tool_calls
+                    .iter()
+                    .filter(|tool_call| tool_call.name == "Bash")
+                    .filter_map(|tool_call| {
+                        tool_call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|command| !command.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect();
+            }
+            "tool" if message.name.as_deref() == Some("Bash") => {
+                let Some(command) = pending_bash_commands.pop_front() else {
+                    continue;
+                };
+                if super::auto_test::AutoTestRunner::plan_from_evidence_command_hint(&command)
+                    .is_some()
+                {
+                    last_hint = Some(command);
+                }
+            }
+            _ => {}
+        }
+    }
+    last_hint
+}
+
 fn bash_tool_result_succeeded(content: &str) -> bool {
     content
         .lines()
@@ -1238,6 +1282,67 @@ mod tests {
         assert_eq!(
             recent_successful_bash_commands_since_last_user(&messages),
             vec!["python3 -m pytest".to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_bash_verifier_command_hint_keeps_latest_current_turn_verifier() {
+        let messages = vec![
+            ConversationMessage::user("old task".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "old".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "cargo test"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+            ConversationMessage::user("fix python tests".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "first".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "python3 -m pytest -q"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "second".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "python3 -m pytest -q tests/test_password_strength.py"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+        ];
+
+        assert_eq!(
+            recent_bash_verifier_command_hint_since_last_user(&messages),
+            Some("python3 -m pytest -q tests/test_password_strength.py".to_string())
+        );
+    }
+
+    #[test]
+    fn recent_bash_verifier_command_hint_rejects_non_verifier_commands() {
+        let messages = vec![
+            ConversationMessage::user("inspect files".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "echo".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "echo ok"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\n".to_string()),
+        ];
+
+        assert_eq!(
+            recent_bash_verifier_command_hint_since_last_user(&messages),
+            None
         );
     }
 

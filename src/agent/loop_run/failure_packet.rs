@@ -474,7 +474,7 @@ fn extract_observed_expected_pairs(output: &str) -> Vec<ObservedExpectedPair> {
     let mut pairs = Vec::new();
     let mut pending_left: Option<String> = None;
     for line in output.lines() {
-        if let Some((observed, expected)) = observed_expected_from_assert_line(line) {
+        for (observed, expected) in observed_expected_pairs_from_assert_line(line) {
             push_pair(
                 &mut pairs,
                 ObservedExpectedPair::new(&observed, &expected, "assert_equal"),
@@ -501,7 +501,27 @@ fn extract_observed_expected_pairs(output: &str) -> Vec<ObservedExpectedPair> {
 }
 
 fn observed_expected_from_assert_line(line: &str) -> Option<(String, String)> {
-    let (_, tail) = line.split_once("assert ")?;
+    observed_expected_pairs_from_assert_line(line)
+        .into_iter()
+        .next()
+}
+
+fn observed_expected_pairs_from_assert_line(line: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut rest = line;
+    while let Some((_, tail)) = rest.split_once("assert ") {
+        if let Some(pair) = observed_expected_from_assert_tail(tail) {
+            pairs.push(pair);
+        }
+        rest = tail;
+        if pairs.len() >= MAX_OBSERVED_EXPECTED_PAIRS {
+            break;
+        }
+    }
+    pairs
+}
+
+fn observed_expected_from_assert_tail(tail: &str) -> Option<(String, String)> {
     let (observed, expected) = tail.split_once("==")?;
     let observed = normalize_observed_expected_token(observed)?;
     let expected = normalize_observed_expected_token(expected)?;
@@ -557,6 +577,32 @@ E       AssertionError: assert 204 == 200
             vec![
                 ObservedExpectedPair::new("201", "200", "assert_equal"),
                 ObservedExpectedPair::new("204", "200", "assert_equal"),
+            ]
+        );
+    }
+
+    #[test]
+    fn failure_packet_extracts_pairs_from_sanitized_flattened_pytest_output() {
+        let output = r#"
+    def test_short_password():
+>       assert password_score("abc") == 0
+E       AssertionError: assert 1 == 0
+E        +  where 1 = password_score('abc')
+
+    def test_length_bonus():
+>       assert password_score("abcdefgh") == 1
+E       AssertionError: assert 2 == 1
+E        +  where 2 = password_score('abcdefgh')
+"#;
+        let flattened =
+            super::super::repair_job::sanitize_repair_job_text_with_char_cap(output, 4000);
+        let pairs = extract_observed_expected_pairs(&flattened);
+
+        assert_eq!(
+            pairs,
+            vec![
+                ObservedExpectedPair::new("1", "0", "assert_equal"),
+                ObservedExpectedPair::new("2", "1", "assert_equal"),
             ]
         );
     }

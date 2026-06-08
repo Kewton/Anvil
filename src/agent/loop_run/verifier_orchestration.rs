@@ -62,8 +62,7 @@ use super::repair_framework_findings::{
 };
 use super::repair_job::{
     RepairJob, RepairTerminalReason, StopReason, mask_code_excerpt_preserving_patch_anchors,
-    mask_secrets_headers_and_neutralize, safe_relative_path_string,
-    verifier_repair_effective_target_hint,
+    safe_relative_path_string, verifier_repair_effective_target_hint,
 };
 use super::repair_patch_validation::{
     ValidatedVerifierRepairEdit, ValidationFailure, VerifierRepairIntent,
@@ -655,11 +654,10 @@ pub(super) fn safe_verifier_diagnostic_file_excerpt(
         target_line,
         VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES,
     );
-    // Issue #638 (Task 1.8 + Codex CB-002): align with the snapshot SSOT
-    // pipeline — mask_secrets → mask_header_family → control-char neutralize.
-    // This redacts Authorization / Cookie / X-API-Key / X-Auth-Token header
-    // values AND keeps C0 + DEL out of the diagnostic prompt payload.
-    let sanitized = mask_secrets_headers_and_neutralize(&lines);
+    // Diagnostic file excerpts are source-code data, not log lines. Preserve
+    // line feeds and tabs so control-flow fragments remain intelligible while
+    // still applying the shared secret/header redaction boundary.
+    let sanitized = mask_code_excerpt_preserving_patch_anchors(&lines);
     Some(truncate(
         &sanitized,
         VERIFIER_DIAGNOSTIC_MAX_FILE_EXCERPT_BYTES,
@@ -2352,8 +2350,11 @@ pub(super) fn select_task_contract_verifier_once(
         super::success::recent_successful_bash_commands_since_last_user(&agent.session.messages);
     let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
         task_contract_verifier_test_binding(agent);
+    let recent_bash_verifier_hint =
+        super::success::recent_bash_verifier_command_hint_since_last_user(&agent.session.messages);
     let evidence_command_hint = super::task_classification::task_contract_authority(agent)
-        .and_then(|contract| contract.evidence_command_hint().map(str::to_string));
+        .and_then(|contract| contract.evidence_command_hint().map(str::to_string))
+        .or(recent_bash_verifier_hint);
     let active_request = super::workspace_access::active_request_text(agent);
     let task_contract_project_unit = super::verifier_driver::select_task_contract_project_unit(
         &agent.work_root,
