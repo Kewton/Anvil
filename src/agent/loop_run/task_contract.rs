@@ -9,6 +9,13 @@ use super::project_profile_projection::{
     apply_profile_contract_inputs, contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
+pub(super) use super::task_contract_recovery_planning::{
+    blocking_obligation_diagnostic_for_role,
+    recovery_target_hint_for_blocking_obligation_diagnostic,
+};
+use super::task_contract_recovery_planning::{
+    order_missing_deliverables_for_recovery, recovery_target_hint_for_missing_with_contract,
+};
 use crate::tools::bash::BashCommandClass;
 
 /// The role an artifact plays in satisfying a task contract.
@@ -2102,16 +2109,6 @@ fn objective_deliverable_stage(
     }
 }
 
-fn order_missing_deliverables_for_recovery(missing: &mut [ArtifactRole]) {
-    missing.sort_by_key(|role| match role {
-        ArtifactRole::Setup => 0,
-        ArtifactRole::Implementation => 1,
-        ArtifactRole::Test => 2,
-        ArtifactRole::DataOutput => 3,
-        ArtifactRole::UsageDocs => 4,
-    });
-}
-
 fn objective_evidence_stage(
     inputs: &ArtifactRecoveryInputs<'_>,
     objective_evidence_satisfied: bool,
@@ -2399,7 +2396,7 @@ fn data_output_structured_evidence_observed(
     })
 }
 
-fn artifact_identity_path_ready_for_verification(
+pub(super) fn artifact_identity_path_ready_for_verification(
     artifacts: &[ArtifactState],
     identity: &ArtifactObligation,
 ) -> bool {
@@ -2513,119 +2510,6 @@ fn artifact_identity_observed_in_evidence(
         })
 }
 
-fn recovery_target_hint_for_missing(
-    artifacts: &[ArtifactState],
-    missing: &[ArtifactRole],
-) -> Option<RecoveryTargetHint> {
-    let role = missing.first().copied()?;
-    if let Some(scaffold_hint) = artifacts
-        .iter()
-        .find(|artifact| {
-            artifact.role == role && artifact.kind == ArtifactStateKind::ScaffoldUnchanged
-        })
-        .and_then(|artifact| {
-            artifact.path.as_ref().map(|path| RecoveryTargetHint {
-                role,
-                path: path.clone(),
-                reason: "bootstrap scaffold artifact for the missing role is still unchanged"
-                    .to_string(),
-            })
-        })
-    {
-        return Some(scaffold_hint);
-    }
-    synthesized_missing_role_target_hint(artifacts, role)
-}
-
-fn recovery_target_hint_for_missing_with_contract(
-    contract: &TaskContract,
-    artifacts: &[ArtifactState],
-    artifact_excerpts: &ArtifactExcerpts,
-    missing: &[ArtifactRole],
-) -> Option<RecoveryTargetHint> {
-    let role = missing.first().copied()?;
-    if let Some(target_hint) = recovery_target_hint_for_blocking_obligation_diagnostic(
-        contract,
-        artifacts,
-        artifact_excerpts,
-        role,
-    ) {
-        return Some(target_hint);
-    }
-    if let Some(identity) = contract.required_identities_for_role(role).first() {
-        return Some(RecoveryTargetHint {
-            role,
-            path: identity.path.clone(),
-            reason: format!(
-                "required deliverable obligation is still missing: {}",
-                obligation_report_label(identity)
-            ),
-        });
-    }
-    recovery_target_hint_for_missing(artifacts, missing)
-}
-
-pub(super) fn recovery_target_hint_for_blocking_obligation_diagnostic(
-    contract: &TaskContract,
-    artifacts: &[ArtifactState],
-    artifact_excerpts: &ArtifactExcerpts,
-    role: ArtifactRole,
-) -> Option<RecoveryTargetHint> {
-    blocking_obligation_diagnostic_for_role(contract, artifacts, artifact_excerpts, role)
-        .map(|diagnostic| diagnostic.target_hint)
-}
-
-pub(super) struct BlockingObligationDiagnostic {
-    pub(super) target_hint: RecoveryTargetHint,
-    pub(super) code: super::verifier::VerifierDiagnosticCode,
-}
-
-pub(super) fn blocking_obligation_diagnostic_for_role(
-    contract: &TaskContract,
-    artifacts: &[ArtifactState],
-    artifact_excerpts: &ArtifactExcerpts,
-    role: ArtifactRole,
-) -> Option<BlockingObligationDiagnostic> {
-    contract
-        .required_identities_for_role(role)
-        .into_iter()
-        .filter_map(|identity| {
-            let path_exists = artifact_identity_path_ready_for_verification(artifacts, identity);
-            let excerpt = artifact_excerpts.get(&identity.role).map(String::as_str);
-            let diagnostic = super::verifier::verifier_diagnostic_for_obligation(
-                contract.task_kind,
-                identity,
-                excerpt,
-                path_exists,
-            )?;
-            if diagnostic.code == super::verifier::VerifierDiagnosticCode::EvidenceMissing
-                && excerpt.is_none()
-                && path_exists
-                && role != ArtifactRole::DataOutput
-            {
-                return None;
-            }
-            let reason = if diagnostic.code == super::verifier::VerifierDiagnosticCode::MissingFile
-            {
-                format!(
-                    "required deliverable obligation is still missing: {}",
-                    obligation_report_label(identity)
-                )
-            } else {
-                diagnostic.reason()
-            };
-            Some(BlockingObligationDiagnostic {
-                target_hint: RecoveryTargetHint {
-                    role,
-                    path: identity.path.clone(),
-                    reason,
-                },
-                code: diagnostic.code,
-            })
-        })
-        .next()
-}
-
 /// Issue #918 (P1): display cap (chars) for a single section/schema label.
 /// Applied ONLY to the display projection here — NOT to the stored
 /// `required_sections` (which `required_sections_present` substring-matches; a
@@ -2711,7 +2595,7 @@ fn join_masked_labels(values: &[String]) -> String {
         .join("|")
 }
 
-fn obligation_report_label(obligation: &ArtifactObligation) -> String {
+pub(super) fn obligation_report_label(obligation: &ArtifactObligation) -> String {
     let mut parts = vec![format!(
         "role={}, kind={}, path={}",
         obligation.role.label(),
@@ -2766,70 +2650,6 @@ fn obligation_report_label(obligation: &ArtifactObligation) -> String {
         parts.push(format!("schema_sections={}", join_masked_labels(sections)));
     }
     parts.join(", ")
-}
-
-fn synthesized_missing_role_target_hint(
-    artifacts: &[ArtifactState],
-    role: ArtifactRole,
-) -> Option<RecoveryTargetHint> {
-    let path = match role {
-        ArtifactRole::Test => synthesized_test_target_path(artifacts)?,
-        ArtifactRole::UsageDocs => "README.md".to_string(),
-        ArtifactRole::DataOutput => "output.csv".to_string(),
-        // Issue #920 (Tier A, cascade-free default): roles with no conventional
-        // synthesizable path (Implementation / Setup today, and any future role)
-        // produce no hint — there is nothing deterministic to create for them.
-        _ => return None,
-    };
-    Some(RecoveryTargetHint {
-        role,
-        path,
-        reason: "no existing artifact for the missing role; create a conventional artifact path"
-            .to_string(),
-    })
-}
-
-fn synthesized_test_target_path(artifacts: &[ArtifactState]) -> Option<String> {
-    let impl_path = artifacts
-        .iter()
-        .find(|artifact| {
-            artifact.role == ArtifactRole::Implementation
-                && matches!(
-                    artifact.kind,
-                    ArtifactStateKind::ExistsButUnverified
-                        | ArtifactStateKind::ChangedThisTurn
-                        | ArtifactStateKind::Verified
-                )
-        })
-        .and_then(|artifact| artifact.path.as_deref());
-    let Some(path) = impl_path else {
-        return Some("tests/test_main.py".to_string());
-    };
-    let stem = sanitized_file_stem(path).unwrap_or("main");
-    if path.ends_with(".rs") {
-        Some(format!("tests/{stem}.rs"))
-    } else if path.ends_with(".ts") || path.ends_with(".tsx") {
-        Some(format!("tests/{stem}.test.ts"))
-    } else if path.ends_with(".js") || path.ends_with(".jsx") {
-        Some(format!("tests/{stem}.test.js"))
-    } else {
-        Some(format!("tests/test_{stem}.py"))
-    }
-}
-
-fn sanitized_file_stem(path: &str) -> Option<&str> {
-    let file_name = path.rsplit('/').next()?.rsplit('\\').next()?;
-    let stem = file_name
-        .rsplit_once('.')
-        .map_or(file_name, |(stem, _)| stem);
-    if stem.is_empty()
-        || !stem
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return None;
-    }
-    Some(stem)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

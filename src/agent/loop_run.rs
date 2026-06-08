@@ -1230,6 +1230,7 @@ mod project_profile;
 mod project_profile_projection;
 mod summary;
 mod task_contract;
+mod task_contract_recovery_planning;
 #[cfg(test)]
 mod task_kind_confirm_e2e_tests;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
