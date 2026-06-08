@@ -2867,14 +2867,14 @@ fn command_observation_evidence_phase(
     if objective.evidence_kind
         != super::task_contract::ObjectiveEvidenceKind::SafetyBoundaryEvidence
         || !objective.requires_evidence()
-        || super::task_contract::objective_evidence_satisfied_for_contract(
+        || super::objective_evidence::objective_evidence_satisfied_for_contract(
             &agent.task_contract_evidence_set_this_turn,
             contract,
         )
     {
         return None;
     }
-    if super::task_contract::command_observation_evidence_collected_for_contract(
+    if super::objective_evidence::command_observation_evidence_collected_for_contract(
         &agent.task_contract_evidence_set_this_turn,
         contract,
     ) {

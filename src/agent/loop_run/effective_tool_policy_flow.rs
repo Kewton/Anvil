@@ -91,7 +91,7 @@ fn objective_evidence_action_policy(agent: &Agent) -> Option<EffectiveToolPolicy
     if objective.evidence_kind
         != super::task_contract::ObjectiveEvidenceKind::SafetyBoundaryEvidence
         || !objective.requires_evidence()
-        || super::task_contract::objective_evidence_satisfied_for_contract(
+        || super::objective_evidence::objective_evidence_satisfied_for_contract(
             &agent.task_contract_evidence_set_this_turn,
             &contract,
         )
@@ -100,7 +100,7 @@ fn objective_evidence_action_policy(agent: &Agent) -> Option<EffectiveToolPolicy
         return None;
     }
 
-    if super::task_contract::command_observation_evidence_collected_for_contract(
+    if super::objective_evidence::command_observation_evidence_collected_for_contract(
         &agent.task_contract_evidence_set_this_turn,
         &contract,
     ) && let Some(target) = objective_evidence_artifact_binding_target(agent, &contract)
@@ -561,11 +561,12 @@ mod tests {
         assert_eq!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
         assert_eq!(
             policy.allowed_tool_names_for_prompt(),
-            Some(&["Read", "Write", "Edit"][..])
+            Some(&["Write", "Edit"][..])
         );
         let artifact = policy
             .artifact_directed_policy()
             .expect("artifact binding policy");
         assert_eq!(artifact.target, agent.work_root.join("ops-observation.md"));
+        assert!(artifact.target_already_read);
     }
 }

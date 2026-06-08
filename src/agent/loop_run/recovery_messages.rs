@@ -173,13 +173,13 @@ pub(super) fn artifact_directed_recovery_message_body(
 ) -> String {
     let target_display = super::task_contract::mask_and_cap_recovery_field(path);
     let reason_display = super::task_contract::mask_and_cap_recovery_field(reason);
-    let read_guidance = if target_already_read {
+    let read_clause = if target_already_read {
         " The target has already been read in this session, so do not call Read again."
     } else {
-        ""
+        " Read may inspect workspace files needed to produce the target."
     };
     format!(
-        "[Artifact Directed Recovery] Missing role: {role_label}. Target file: {target_display}. Reason: {reason_display}. Allowed tools for this turn are {allowed}. Write/Edit must stay on that exact target path; Read may inspect workspace files needed to produce the target.{read_guidance} Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
+        "[Artifact Directed Recovery] Missing role: {role_label}. Target file: {target_display}. Reason: {reason_display}. Allowed tools for this turn are {allowed}. Write/Edit must stay on that exact target path;{read_clause} Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
     )
 }
 

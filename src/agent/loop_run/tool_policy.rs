@@ -188,11 +188,11 @@ impl EffectiveToolPolicy {
 
     pub(super) fn evidence_action_artifact_binding(target: PathBuf) -> Self {
         Self {
-            allowed_tools: Some(vec!["Read", "Write", "Edit"]),
+            allowed_tools: Some(vec!["Write", "Edit"]),
             focused_edit: None,
             artifact_directed: Some(ArtifactDirectedPolicy {
                 target,
-                target_already_read: false,
+                target_already_read: true,
             }),
             reason: EffectiveToolPolicyReason::EvidenceAction,
         }

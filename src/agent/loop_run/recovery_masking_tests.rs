@@ -164,7 +164,7 @@ fn artifact_directed_recovery_message_body_masks_and_is_byte_stable() {
             true
         ),
         format!(
-            "[Artifact Directed Recovery] Missing role: implementation. Target file: {p}. Reason: {reason}. Allowed tools for this turn are Read, Write, Edit. Write/Edit must stay on that exact target path; Read may inspect workspace files needed to produce the target. The target has already been read in this session, so do not call Read again. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
+            "[Artifact Directed Recovery] Missing role: implementation. Target file: {p}. Reason: {reason}. Allowed tools for this turn are Read, Write, Edit. Write/Edit must stay on that exact target path; The target has already been read in this session, so do not call Read again. Do not call Bash, Glob, Grep, or switch files. Use Write if a small scaffold file should be replaced; otherwise use a compact Edit."
         )
     );
 }
