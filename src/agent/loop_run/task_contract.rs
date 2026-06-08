@@ -9,6 +9,16 @@ use super::project_profile_projection::{
     apply_profile_contract_inputs, contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
+use super::task_contract_controller_packet::ControllerStatePacket;
+pub(super) use super::task_contract_controller_packet::{
+    RequestInferenceView, model_visible_request_text,
+};
+#[cfg(test)]
+pub(super) use super::task_contract_display::MAX_SECTION_LABEL_LEN;
+pub(super) use super::task_contract_display::{
+    MAX_ACCEPTANCE_CRITERIA, mask_and_cap_recovery_field, obligation_report_label,
+};
+use super::task_contract_display::{join_masked_labels, mask_and_cap_label, mask_obligation_value};
 use super::task_contract_input_projection::ContractRequestInputs;
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
@@ -607,7 +617,7 @@ impl DeliverableObligation {
         }
     }
 
-    fn readme(path: impl Into<String>, required_sections: Vec<String>) -> Self {
+    pub(super) fn readme(path: impl Into<String>, required_sections: Vec<String>) -> Self {
         let path = validated_obligation_path(path.into());
         Self {
             role: ArtifactRole::UsageDocs,
@@ -650,7 +660,7 @@ impl DeliverableObligation {
         }
     }
 
-    fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
+    pub(super) fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
         Self::structured_record_with_expected_rows(path, columns, Vec::new())
     }
 
@@ -828,151 +838,6 @@ impl ProjectIntent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ControllerStatePacket {
-    required_artifacts: Vec<ArtifactObligation>,
-    evidence_command: Option<String>,
-}
-
-impl ControllerStatePacket {
-    fn from_value(value: &serde_json::Value) -> Self {
-        let required_artifacts = value
-            .get("required_artifacts")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(controller_artifact_obligation)
-            .collect::<Vec<_>>();
-        let evidence_command = value
-            .get("evidence_command")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-            .map(str::to_string);
-        Self {
-            required_artifacts,
-            evidence_command,
-        }
-    }
-
-    fn inferred_task_kind(&self) -> Option<TaskKind> {
-        if self.required_artifacts.is_empty() {
-            return None;
-        }
-        if self
-            .required_artifacts
-            .iter()
-            .any(|artifact| artifact.role == ArtifactRole::DataOutput)
-        {
-            Some(TaskKind::Data)
-        } else if self
-            .required_artifacts
-            .iter()
-            .all(|artifact| artifact.role == ArtifactRole::UsageDocs)
-        {
-            Some(TaskKind::Docs)
-        } else {
-            Some(TaskKind::Coding)
-        }
-    }
-
-    fn extend_contract_parts(
-        &self,
-        required: &mut Vec<ArtifactRole>,
-        required_artifact_identities: &mut Vec<ArtifactObligation>,
-    ) {
-        for identity in &self.required_artifacts {
-            if !required.contains(&identity.role) {
-                required.push(identity.role);
-            }
-            push_or_merge_artifact_obligation(required_artifact_identities, identity.clone());
-        }
-    }
-}
-
-/// Single parsed view of a raw request used by controller/state code.
-///
-/// The controller packet is structural state. Natural-language inference,
-/// WorkMode classification, and model-visible prompt history must use
-/// `visible_text`, not the raw request, so schema keys cannot leak into task or
-/// tool policy decisions.
-#[derive(Debug, Clone)]
-pub(super) struct RequestInferenceView {
-    visible_text: String,
-    controller_state: Option<ControllerStatePacket>,
-    controller_packet_at_start: bool,
-}
-
-impl RequestInferenceView {
-    pub(super) fn from_raw(raw: &str) -> Self {
-        let parsed_packet = controller_state_packet_value_and_range(raw);
-        let (controller_state, visible_text) = match parsed_packet {
-            Some((value, range)) => (
-                Some(ControllerStatePacket::from_value(&value)),
-                model_visible_request_text_from_packet_range(raw, range),
-            ),
-            None => (None, model_visible_request_text_without_packet(raw)),
-        };
-        let controller_packet_at_start = raw.trim_start().starts_with("STATE_CONTROL_PACKET");
-        Self {
-            visible_text,
-            controller_state,
-            controller_packet_at_start,
-        }
-    }
-
-    pub(super) fn visible_text(&self) -> &str {
-        &self.visible_text
-    }
-
-    pub(super) fn into_visible_text(self) -> String {
-        self.visible_text
-    }
-
-    pub(super) fn is_controller_owned_turn(&self) -> bool {
-        self.controller_packet_at_start
-    }
-}
-
-fn controller_state_packet_value_and_range(
-    raw: &str,
-) -> Option<(serde_json::Value, std::ops::Range<usize>)> {
-    let marker_start = raw.find("STATE_CONTROL_PACKET")?;
-    let json_start = marker_start + raw[marker_start..].find('{')?;
-    let tail = &raw[json_start..];
-    let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
-    let value = stream.next()?.ok()?;
-    let json_end = json_start + stream.byte_offset();
-    Some((value, marker_start..json_end))
-}
-
-pub(super) fn model_visible_request_text(raw: &str) -> String {
-    RequestInferenceView::from_raw(raw).into_visible_text()
-}
-
-fn model_visible_request_text_without_packet(raw: &str) -> String {
-    if let Some(marker_start) = raw.find("STATE_CONTROL_PACKET") {
-        return raw[..marker_start].trim_end().to_string();
-    }
-    raw.trim().to_string()
-}
-
-fn model_visible_request_text_from_packet_range(
-    raw: &str,
-    range: std::ops::Range<usize>,
-) -> String {
-    let before = raw[..range.start].trim_end();
-    let after = raw[range.end..].trim_start_matches(|ch: char| {
-        ch.is_whitespace() || matches!(ch, '.' | '。' | ',' | '、' | ';' | '；')
-    });
-    match (before.is_empty(), after.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => before.to_string(),
-        (true, false) => after.to_string(),
-        (false, false) => format!("{before} {after}"),
-    }
-}
-
 pub(super) fn objective_contract_prompt_message(contract: &TaskContract) -> Option<String> {
     if contract.required_artifact_identities.is_empty() && contract.evidence_command_hint.is_none()
     {
@@ -1078,110 +943,6 @@ fn objective_contract_obligation_prompt_line(obligation: &ArtifactObligation) ->
     }
 
     parts.join("; ")
-}
-
-fn controller_artifact_obligation(value: &serde_json::Value) -> Option<ArtifactObligation> {
-    let path = value
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())?;
-    let role = value
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .and_then(controller_artifact_role_from_label)
-        .or_else(|| {
-            let category =
-                super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
-            role_from_repo_edit(category)
-        })?;
-    let data_fields = controller_schema_labels(
-        value,
-        &["columns", "json_fields", "fields", "schema_fields"],
-    );
-    let required_sections =
-        controller_schema_labels(value, &["required_sections", "sections", "schema_sections"]);
-    let obligation = match role {
-        ArtifactRole::DataOutput if !data_fields.is_empty() => {
-            ArtifactObligation::structured_record(path, data_fields)
-        }
-        ArtifactRole::UsageDocs if !required_sections.is_empty() => {
-            ArtifactObligation::readme(path, required_sections)
-        }
-        _ => ArtifactObligation::file(role, path),
-    };
-    Some(obligation)
-}
-
-fn controller_artifact_role_from_label(raw: &str) -> Option<ArtifactRole> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "source" | "implementation" | "impl" | "code" => Some(ArtifactRole::Implementation),
-        "test" | "tests" | "verifier" => Some(ArtifactRole::Test),
-        "manifest" | "setup" | "config" | "package_manifest" => Some(ArtifactRole::Setup),
-        "document" | "docs" | "usage_docs" | "runbook" | "research_notes" | "prose" => {
-            Some(ArtifactRole::UsageDocs)
-        }
-        "output_file" | "data_output" | "data" | "json" | "csv" => Some(ArtifactRole::DataOutput),
-        _ => None,
-    }
-}
-
-const MAX_CONTROLLER_SCHEMA_LABELS: usize = 32;
-
-fn controller_schema_labels(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
-    for key in keys {
-        let labels = controller_schema_labels_from_value(value.get(*key));
-        if !labels.is_empty() {
-            return labels;
-        }
-    }
-    if let Some(schema) = value.get("schema") {
-        for key in keys {
-            let labels = controller_schema_labels_from_value(schema.get(*key));
-            if !labels.is_empty() {
-                return labels;
-            }
-        }
-    }
-    Vec::new()
-}
-
-fn controller_schema_labels_from_value(value: Option<&serde_json::Value>) -> Vec<String> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    let raw = match value {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>(),
-        serde_json::Value::String(s) => s.split([',', '|']).map(str::to_string).collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    let mut labels = Vec::new();
-    for label in raw.into_iter().filter_map(controller_schema_label) {
-        if !labels.contains(&label) {
-            labels.push(label);
-        }
-        if labels.len() >= MAX_CONTROLLER_SCHEMA_LABELS {
-            break;
-        }
-    }
-    labels
-}
-
-fn controller_schema_label(raw: String) -> Option<String> {
-    let normalized = raw
-        .trim()
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    Some(mask_and_cap_label(&normalized))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2511,148 +2272,6 @@ fn artifact_identity_observed_in_evidence(
         })
 }
 
-/// Issue #918 (P1): display cap (chars) for a single section/schema label.
-/// Applied ONLY to the display projection here — NOT to the stored
-/// `required_sections` (which `required_sections_present` substring-matches; a
-/// truncated stored value would make completion permanently false-negative).
-const MAX_SECTION_LABEL_LEN: usize = 256;
-/// Issue #918 (P1): display cap (count) on acceptance criteria. Applied only at
-/// this projection — never to the stored `acceptance_criteria` field, which is
-/// also read by repair_packet expected-evidence and is `PartialEq`-compared.
-const MAX_ACCEPTANCE_CRITERIA: usize = 32;
-
-/// Per-value `mask_secrets` for a free-text obligation field.
-///
-/// Issue #918 (P1): masks each value BEFORE it is assembled into the label, so
-/// the `role=/kind=/path=` structure (and the exact-string goldens) survive and
-/// secrets in any LLM-derived field cannot leak. This is the SOLE defense on the
-/// prompt path (the label is rendered into the LLM request body via recovery
-/// messages, which is not a serde `Value` and does not pass through
-/// `mask_payload_inplace`); persisted/logged copies additionally pass through
-/// `mask_payload_inplace` as the final defense line.
-fn mask_obligation_value(value: &str) -> String {
-    crate::session::feedback::mask_secrets(value)
-}
-
-/// Mask then char-boundary-cap a section/schema label for display.
-fn mask_and_cap_label(value: &str) -> String {
-    let masked = mask_obligation_value(value);
-    if masked.chars().count() <= MAX_SECTION_LABEL_LEN {
-        masked
-    } else {
-        masked.chars().take(MAX_SECTION_LABEL_LEN).collect()
-    }
-}
-
-/// Issue #918 (P1) follow-up (PR #930 review): SSOT mask+cap for any
-/// obligation/hint-derived free-text rendered into a **recovery prompt**.
-///
-/// Recovery notes (verifier-repair / artifact-directed) render `RecoveryTargetHint`
-/// path/reason — which can carry LLM/request-derived text — directly into the LLM
-/// request body, a path that does NOT pass through `mask_payload_inplace`. This is
-/// the same masking + length cap [`obligation_report_label`] applies, exposed so
-/// the recovery-note builders reuse it instead of emitting raw values.
-///
-/// # Issue #931 — recovery-prompt masking convention (SSOT)
-///
-/// This doc comment is the canonical statement of the masking convention for
-/// every recovery/repair model-facing prompt. **The ONLY sanctioned way to put
-/// an LLM/request-derived path or reason into a recovery/repair prompt or onto
-/// the LLM wire is one of these three render-point masks:**
-///
-/// 1. [`mask_and_cap_recovery_field`] (this fn, `loop_run`) — `mask_secrets` +
-///    `MAX_SECTION_LABEL_LEN`=256 char cap. Use for free-text / reason / path
-///    rendered into a `loop_run` recovery note (the `format!`/`push_system_note`
-///    prompt path that bypasses `mask_payload_inplace`).
-/// 2. [`crate::agent::recovery::mask_recovery_path`] (`recovery.rs`) —
-///    `mask_secrets` + a SEPARATE local `CAP`=256 char cap. Used INTERNALLY by
-///    the 14 `recovery.rs` note builders so no caller can bypass it.
-/// 3. [`crate::session::feedback::mask_secrets`] — for the `json!` LLM-wire
-///    path-identity fields ONLY (NO length cap): the model must act on the exact
-///    workspace-relative path, and `mask_secrets` is a no-op on ordinary paths,
-///    so an ordinary path stays byte-exact while a secret-shaped path is redacted.
-///
-/// The mask must be applied **at the render point — inside the function that
-/// builds the prompt string** — so the masking shape is identical across all
-/// three chokes (Choke A `recovery.rs`, Choke B `loop_run`, Choke C
-/// `tool_policy.rs`/`json!` wire) and no new or future renderer can bypass it.
-///
-/// **Cap note (DR1-003):** the `CAP`=256 in [`crate::agent::recovery::mask_recovery_path`]
-/// and `MAX_SECTION_LABEL_LEN`=256 used here are SEPARATE constants whose equality
-/// is a *convention*, not a mechanical share. The shared SSOT is `mask_secrets`
-/// itself, not the cap value — if one cap changes, verify the other deliberately.
-///
-/// A source-scan `#[cfg(test)]` guard (Issue #931 Phase E) enforces this
-/// convention structurally for new renderers.
-pub(super) fn mask_and_cap_recovery_field(value: &str) -> String {
-    mask_and_cap_label(value)
-}
-
-fn join_masked_labels(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|v| mask_and_cap_label(v))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-pub(super) fn obligation_report_label(obligation: &ArtifactObligation) -> String {
-    let mut parts = vec![format!(
-        "role={}, kind={}, path={}",
-        obligation.role.label(),
-        obligation.kind.label(),
-        mask_obligation_value(&obligation.path)
-    )];
-    if !obligation.required_sections.is_empty() {
-        parts.push(format!(
-            "required_sections={}",
-            join_masked_labels(&obligation.required_sections)
-        ));
-    }
-    if !obligation.acceptance_criteria.is_empty() {
-        // Count-cap the criteria list AND per-value mask+length-cap each entry at
-        // the display projection (never the stored field). PR #930 review (Medium):
-        // each criterion now also gets the MAX_SECTION_LABEL_LEN char cap via
-        // `mask_and_cap_label`, not just `mask_secrets`.
-        let shown = obligation
-            .acceptance_criteria
-            .iter()
-            .take(MAX_ACCEPTANCE_CRITERIA)
-            .map(|c| mask_and_cap_label(c))
-            .collect::<Vec<_>>()
-            .join("|");
-        parts.push(format!("acceptance_criteria={shown}"));
-    }
-    if let Some(DeliverableSchema::JsonFields(fields)) = obligation.schema.as_ref()
-        && !fields.is_empty()
-    {
-        parts.push(format!("schema_fields={}", join_masked_labels(fields)));
-    }
-    if let Some(DeliverableSchema::StructuredRecord(schema)) = obligation.schema.as_ref()
-        && !schema.columns.is_empty()
-    {
-        parts.push(format!(
-            "schema_columns={}",
-            join_masked_labels(&schema.columns)
-        ));
-        if !schema.expected_rows.is_empty() {
-            let rows = schema
-                .expected_rows
-                .iter()
-                .map(|row| join_masked_labels(row))
-                .collect::<Vec<_>>()
-                .join(";");
-            parts.push(format!("schema_rows={rows}"));
-        }
-    }
-    if let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
-        && !sections.is_empty()
-    {
-        parts.push(format!("schema_sections={}", join_masked_labels(sections)));
-    }
-    parts.join(", ")
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArtifactContractParts {
     required: Vec<ArtifactRole>,
@@ -2890,7 +2509,7 @@ impl TaskContract {
         let evidence_command_hint = request_view
             .controller_state
             .as_ref()
-            .and_then(|state| state.evidence_command.clone());
+            .and_then(|state| state.evidence_command().map(str::to_string));
         let lower = request_for_inference.to_ascii_lowercase();
         // Issue #937 (DS3-001): the output-context mask is allocated exactly ONCE
         // per request and threaded by reference into every output-context surface
@@ -5360,7 +4979,7 @@ fn inferred_artifact_obligations_from_project_intent(
     obligations
 }
 
-fn push_or_merge_artifact_obligation(
+pub(super) fn push_or_merge_artifact_obligation(
     obligations: &mut Vec<ArtifactObligation>,
     incoming: ArtifactObligation,
 ) {

@@ -1234,6 +1234,8 @@ mod project_profile;
 mod project_profile_projection;
 mod summary;
 mod task_contract;
+mod task_contract_controller_packet;
+mod task_contract_display;
 mod task_contract_input_projection;
 mod task_contract_recovery_planning;
 #[cfg(test)]
