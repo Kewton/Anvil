@@ -48,6 +48,7 @@ pub(super) struct ProjectProfileContractInputs {
     pub(super) forbids_implementation: bool,
     pub(super) forbids_tests: bool,
     pub(super) forbids_setup: bool,
+    pub(super) forbids_usage_docs: bool,
     pub(super) confidence: f32,
 }
 
@@ -84,6 +85,7 @@ pub(super) fn contract_inputs_from_confirmation(
         forbids_implementation: forbids_implementation_artifact(profile),
         forbids_tests: forbids_test_artifacts(profile),
         forbids_setup: forbids_setup_artifact(profile),
+        forbids_usage_docs: forbids_usage_docs_artifact(profile),
         confidence: profile.confidence,
     })
 }
@@ -180,6 +182,19 @@ fn objective_deliverable_kind_from_profile(
 fn objective_evidence_kind_from_profile(
     profile: &ProjectProfileConfirmation,
 ) -> Option<ObjectiveEvidenceKind> {
+    if matches!(profile.deliverable_kind, Some(ProfileDeliverableKind::Data))
+        && matches!(
+            profile.evidence_kind,
+            None | Some(
+                ProfileEvidenceKind::ContentCheck
+                    | ProfileEvidenceKind::SchemaCheck
+                    | ProfileEvidenceKind::None
+                    | ProfileEvidenceKind::Unknown
+            )
+        )
+    {
+        return Some(ObjectiveEvidenceKind::SchemaCheck);
+    }
     match profile.evidence_kind? {
         ProfileEvidenceKind::TestRun => Some(ObjectiveEvidenceKind::TestRun),
         ProfileEvidenceKind::ContentCheck => Some(ObjectiveEvidenceKind::ContentCheck),
@@ -303,6 +318,13 @@ fn forbids_setup_artifact(profile: &ProjectProfileConfirmation) -> bool {
                         | ProfileDeliverableKind::ResearchReport
                 )
             ))
+}
+
+fn forbids_usage_docs_artifact(profile: &ProjectProfileConfirmation) -> bool {
+    profile
+        .forbidden_artifacts
+        .iter()
+        .any(|artifact| matches!(artifact, ForbiddenArtifact::Docs))
 }
 
 fn artifact_obligations(
@@ -601,6 +623,33 @@ npm test
             project_profile_adoption_decision(Some(&profile), &first_pass),
             ProjectProfileAdoptionDecision::Adopt
         );
+    }
+
+    #[test]
+    fn data_profile_content_check_projects_schema_check_evidence() {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"data",
+                "primary_artifacts":["summary.csv"],
+                "forbidden_artifacts":["docs"],
+                "evidence_kind":"content_check",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"structured output"
+            }"#,
+        )
+        .expect("profile");
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+
+        assert_eq!(inputs.task_kind, Some(TaskKind::Data));
+        assert_eq!(
+            inputs.evidence_kind,
+            Some(ObjectiveEvidenceKind::SchemaCheck)
+        );
+        assert!(inputs.forbids_usage_docs);
     }
 
     #[test]

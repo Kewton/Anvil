@@ -479,6 +479,7 @@ pub(super) struct TaskDeliverable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StructuredRecordSchema {
     pub(super) columns: Vec<String>,
+    pub(super) expected_rows: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,8 +613,19 @@ impl DeliverableObligation {
     }
 
     fn structured_record(path: impl Into<String>, columns: Vec<String>) -> Self {
+        Self::structured_record_with_expected_rows(path, columns, Vec::new())
+    }
+
+    fn structured_record_with_expected_rows(
+        path: impl Into<String>,
+        columns: Vec<String>,
+        expected_rows: Vec<Vec<String>>,
+    ) -> Self {
         let path = validated_obligation_path(path.into());
-        let schema = StructuredRecordSchema { columns };
+        let schema = StructuredRecordSchema {
+            columns,
+            expected_rows,
+        };
         Self {
             role: ArtifactRole::DataOutput,
             kind: DeliverableKind::StructuredRecord,
@@ -628,7 +640,20 @@ impl DeliverableObligation {
                     "structured output includes columns: {}",
                     schema.columns.join(", ")
                 )]
-            },
+            }
+            .into_iter()
+            .chain((!schema.expected_rows.is_empty()).then(|| {
+                format!(
+                    "structured output includes expected rows: {}",
+                    schema
+                        .expected_rows
+                        .iter()
+                        .map(|row| row.join(","))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }))
+            .collect(),
             structured_record_schema: Some(schema),
         }
     }
@@ -963,6 +988,15 @@ fn objective_contract_obligation_prompt_line(obligation: &ArtifactObligation) ->
                 ));
             } else {
                 parts.push(format!("include required columns: {columns}"));
+            }
+            if !schema.expected_rows.is_empty() {
+                let rows = schema
+                    .expected_rows
+                    .iter()
+                    .map(|row| join_masked_labels(row))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                parts.push(format!("include exactly these data rows: {rows}"));
             }
         }
         Some(DeliverableSchema::RequiredSections(sections)) if !sections.is_empty() => {
@@ -1787,12 +1821,15 @@ fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, exce
         return super::verifier::assess_structured_data(None, excerpt, &[]).is_accepted();
     }
     schema_identities.iter().all(|identity| {
-        let columns = identity
-            .structured_record_schema
-            .as_ref()
-            .map(|schema| schema.columns.as_slice())
-            .unwrap_or(&[]);
-        super::verifier::structured_data_schema_obligation_pass(&identity.path, excerpt, columns)
+        let Some(schema) = identity.structured_record_schema.as_ref() else {
+            return true;
+        };
+        super::verifier::structured_data_schema_obligation_pass_with_rows(
+            &identity.path,
+            excerpt,
+            &schema.columns,
+            &schema.expected_rows,
+        )
     })
 }
 
@@ -1943,6 +1980,10 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
         }
     }
 
+    if let Some(action) = unexpected_data_output_artifact_action(&inputs) {
+        return action;
+    }
+
     let existing_unverified_used = inputs.artifacts.iter().any(|artifact| {
         objective.required_deliverables().contains(&artifact.role)
             && artifact.kind == ArtifactStateKind::ExistsButUnverified
@@ -2050,6 +2091,45 @@ fn objective_evidence_stage(
     ObjectiveEvidenceStage::SatisfiedOrNotRequired {
         runner: default_runner,
     }
+}
+
+fn unexpected_data_output_artifact_action(
+    inputs: &ArtifactRecoveryInputs<'_>,
+) -> Option<ArtifactRecoveryAction> {
+    let required_outputs = inputs
+        .contract
+        .required_identities_for_role(ArtifactRole::DataOutput);
+    if required_outputs.is_empty() {
+        return None;
+    }
+    let unexpected = inputs.artifacts.iter().find(|artifact| {
+        artifact.role == ArtifactRole::DataOutput
+            && matches!(
+                artifact.kind,
+                ArtifactStateKind::ExistsButUnverified
+                    | ArtifactStateKind::ChangedThisTurn
+                    | ArtifactStateKind::Verified
+            )
+            && artifact.path.as_deref().is_some_and(|path| {
+                !required_outputs
+                    .iter()
+                    .any(|identity| normalized_artifact_path_eq(path, &identity.path))
+            })
+    })?;
+    let required = required_outputs.first()?;
+    let unexpected_path = unexpected.path.as_deref().unwrap_or("<unknown>");
+    Some(ArtifactRecoveryAction::Continue {
+        missing: vec![ArtifactRole::DataOutput],
+        target_hint: Some(RecoveryTargetHint {
+            role: ArtifactRole::DataOutput,
+            path: required.path.clone(),
+            reason: format!(
+                "unexpected data output artifact observed outside required path: {}; required data output path is {}",
+                mask_and_cap_recovery_field(unexpected_path),
+                mask_and_cap_recovery_field(&required.path),
+            ),
+        }),
+    })
 }
 
 fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRole) -> bool {
@@ -2165,16 +2245,20 @@ fn command_observation_usage_docs_behavior_satisfied(contract: &TaskContract) ->
 }
 
 fn data_output_identity_excerpt_satisfies(identity: &ArtifactObligation, excerpt: &str) -> bool {
-    let columns = identity
-        .structured_record_schema
-        .as_ref()
-        .map(|schema| schema.columns.as_slice())
-        .unwrap_or(&[]);
-    if columns.is_empty() {
+    let Some(schema) = identity.structured_record_schema.as_ref() else {
+        return super::verifier::assess_structured_data(Some(&identity.path), excerpt, &[])
+            .is_accepted();
+    };
+    if schema.columns.is_empty() && schema.expected_rows.is_empty() {
         return super::verifier::assess_structured_data(Some(&identity.path), excerpt, &[])
             .is_accepted();
     }
-    super::verifier::structured_data_schema_obligation_pass(&identity.path, excerpt, columns)
+    super::verifier::structured_data_schema_obligation_pass_with_rows(
+        &identity.path,
+        excerpt,
+        &schema.columns,
+        &schema.expected_rows,
+    )
 }
 
 fn data_output_structured_evidence_observed(
@@ -2191,6 +2275,9 @@ fn data_output_structured_evidence_observed(
                     .structured_record_schema
                     .as_ref()
                     .is_none_or(|schema| {
+                        if !schema.expected_rows.is_empty() {
+                            return false;
+                        }
                         schema
                             .columns
                             .iter()
@@ -2298,6 +2385,9 @@ fn artifact_identity_observed_in_evidence(
                         .structured_record_schema
                         .as_ref()
                         .is_none_or(|schema| {
+                            if !schema.expected_rows.is_empty() {
+                                return false;
+                            }
                             schema
                                 .columns
                                 .iter()
@@ -2549,6 +2639,15 @@ fn obligation_report_label(obligation: &ArtifactObligation) -> String {
             "schema_columns={}",
             join_masked_labels(&schema.columns)
         ));
+        if !schema.expected_rows.is_empty() {
+            let rows = schema
+                .expected_rows
+                .iter()
+                .map(|row| join_masked_labels(row))
+                .collect::<Vec<_>>()
+                .join(";");
+            parts.push(format!("schema_rows={rows}"));
+        }
     }
     if let Some(DeliverableSchema::RequiredSections(sections)) = obligation.schema.as_ref()
         && !sections.is_empty()
@@ -2766,6 +2865,9 @@ impl TaskContract {
         let profile_forbids_setup = project_profile_inputs
             .as_ref()
             .is_some_and(|inputs| inputs.forbids_setup);
+        let profile_forbids_usage_docs = project_profile_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.forbids_usage_docs);
 
         if task_kind == TaskKind::Coding
             && (asks_for_implementation || project_intent_implies_implementation)
@@ -2776,7 +2878,7 @@ impl TaskContract {
         if asks_for_tests && !profile_forbids_tests {
             required.push(ArtifactRole::Test);
         }
-        if asks_for_usage_docs {
+        if asks_for_usage_docs && !profile_forbids_usage_docs {
             required.push(ArtifactRole::UsageDocs);
         }
         // Issue #919 (Decision #5(a)): Authoring requires the UsageDocs role even
@@ -2784,7 +2886,7 @@ impl TaskContract {
         // the explicit `summary.md`/`README.md` obligation survive the
         // `required_artifact_identities.retain(|id| required.contains(&id.role))`
         // below — without it the obligation is dropped exactly as it is today.
-        if task_kind == TaskKind::Authoring {
+        if task_kind == TaskKind::Authoring && !profile_forbids_usage_docs {
             required.push(ArtifactRole::UsageDocs);
         }
         let setup_required = matches!(intent, TaskIntent::Install)
@@ -2834,6 +2936,12 @@ impl TaskContract {
             if identity.role == ArtifactRole::DataOutput
                 && !data_path_has_output_context_with_scan(&scan, &identity.path)
             {
+                continue;
+            }
+            if profile_obligation_shadowed_by_prior_identity(
+                &required_artifact_identities,
+                &identity,
+            ) {
                 continue;
             }
             if !required.contains(&identity.role) {
@@ -5370,6 +5478,16 @@ fn inferred_obligation_shadowed_by_explicit_identity(
         .any(|identity| identity.role == incoming.role && identity.path != incoming.path)
 }
 
+fn profile_obligation_shadowed_by_prior_identity(
+    existing: &[ArtifactObligation],
+    incoming: &ArtifactObligation,
+) -> bool {
+    incoming.role == ArtifactRole::DataOutput
+        && existing
+            .iter()
+            .any(|identity| identity.role == incoming.role && identity.path != incoming.path)
+}
+
 fn should_merge_artifact_obligations(
     existing: &ArtifactObligation,
     incoming: &ArtifactObligation,
@@ -5467,9 +5585,12 @@ fn inferred_data_obligations_from_request_with_scan(
             "output.csv".to_string()
         }
     });
-    vec![ArtifactObligation::structured_record(
+    let columns = extract_required_columns_from_request(request);
+    let expected_rows = extract_expected_rows_from_request(request, &columns);
+    vec![ArtifactObligation::structured_record_with_expected_rows(
         path,
-        extract_required_columns_from_request(request),
+        columns,
+        expected_rows,
     )]
 }
 
@@ -5492,11 +5613,24 @@ fn extract_required_columns_from_request(request: &str) -> Vec<String> {
         let lower = token.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "column" | "columns" | "with" | "and" | "or" | "as" | "the" | "a" | "an"
+            "column"
+                | "columns"
+                | "with"
+                | "and"
+                | "or"
+                | "as"
+                | "the"
+                | "a"
+                | "an"
+                | "exactly"
+                | "only"
         ) {
             continue;
         }
-        if matches!(lower.as_str(), "from" | "for" | "in" | "into") {
+        if matches!(
+            lower.as_str(),
+            "from" | "for" | "in" | "into" | "row" | "rows" | "record" | "records"
+        ) {
             break;
         }
         if columns.iter().any(|existing| existing == token) {
@@ -5505,6 +5639,68 @@ fn extract_required_columns_from_request(request: &str) -> Vec<String> {
         columns.push(token.to_string());
     }
     columns
+}
+
+const EXPECTED_STRUCTURED_ROWS_MAX: usize = 8;
+const EXPECTED_STRUCTURED_ROW_CELLS_MAX: usize = 12;
+
+fn extract_expected_rows_from_request(request: &str, columns: &[String]) -> Vec<Vec<String>> {
+    if columns.is_empty() || columns.len() > EXPECTED_STRUCTURED_ROW_CELLS_MAX {
+        return Vec::new();
+    }
+    let lower = request.to_ascii_lowercase();
+    let Some(after_marker) = data_rows_marker_end(&lower) else {
+        return Vec::new();
+    };
+    let tail = &request[after_marker..];
+    let window = tail
+        .split(['.', '\n'])
+        .next()
+        .unwrap_or(tail)
+        .replace(['`', '"', '\'', '[', ']', '(', ')'], " ")
+        .replace(';', "\n");
+    let mut rows = Vec::new();
+    for segment in window
+        .split('\n')
+        .flat_map(|part| part.split(" and "))
+        .take(EXPECTED_STRUCTURED_ROWS_MAX * 2)
+    {
+        let cells = segment
+            .split(',')
+            .map(clean_expected_row_cell)
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        if cells.len() == columns.len() && !rows.iter().any(|existing| existing == &cells) {
+            rows.push(cells);
+            if rows.len() >= EXPECTED_STRUCTURED_ROWS_MAX {
+                break;
+            }
+        }
+    }
+    rows
+}
+
+fn data_rows_marker_end(lower: &str) -> Option<usize> {
+    ["records", "record", "rows", "row"]
+        .iter()
+        .filter_map(|marker| {
+            lower.find(marker).and_then(|index| {
+                let before = lower[..index].chars().next_back();
+                let after = lower[index + marker.len()..].chars().next();
+                (!before.is_some_and(is_ascii_word_char) && !after.is_some_and(is_ascii_word_char))
+                    .then_some(index + marker.len())
+            })
+        })
+        .min()
+}
+
+fn clean_expected_row_cell(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ':' | '=' | '-' | '>' | '[' | ']' | '(' | ')')
+        })
+        .trim()
+        .to_string()
 }
 
 pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<ArtifactObligation> {
@@ -6284,14 +6480,18 @@ fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
         let before = haystack[..idx]
             .chars()
             .next_back()
-            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+            .is_none_or(|ch| !is_ascii_word_char(ch));
         let after_idx = idx + needle.len();
         let after = haystack[after_idx..]
             .chars()
             .next()
-            .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+            .is_none_or(|ch| !is_ascii_word_char(ch));
         before && after
     })
+}
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
 }
 
 fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
@@ -10108,6 +10308,166 @@ Create the README file."#;
                 owned_test_artifacts: &[],
             }),
             ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn data_task_blocks_extra_columns_when_rows_are_explicitly_requested() {
+        let contract = TaskContract::from_request(
+            "Generate data/output.csv with exactly columns id,total and exactly rows 1,100 and 2,250.",
+        );
+        let obligation =
+            required_obligation(&contract, ArtifactRole::DataOutput, "data/output.csv");
+        let schema = obligation
+            .structured_record_schema
+            .as_ref()
+            .expect("data output carries structured schema");
+        assert_eq!(schema.columns, vec!["id".to_string(), "total".to_string()]);
+        assert_eq!(
+            schema.expected_rows,
+            vec![
+                vec!["1".to_string(), "100".to_string()],
+                vec!["2".to_string(), "250".to_string()]
+            ]
+        );
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "data/output.csv"));
+        let repair_state = VerifierRepairState::None;
+        let artifacts = [ArtifactState::exists(
+            ArtifactRole::DataOutput,
+            "data/output.csv",
+        )];
+        let extra_column_rows = build_excerpts(&[(
+            ArtifactRole::DataOutput,
+            "id,total,extra\n1,100,ignored\n2,250,ignored\n",
+        )]);
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &extra_column_rows,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(ref target),
+                } if missing == &vec![ArtifactRole::DataOutput]
+                    && target.path == "data/output.csv"
+                    && target.reason.contains("expected rows")
+            ),
+            "explicit data rows must block extra-column output, got {action:?}"
+        );
+
+        let exact_rows = build_excerpts(&[(ArtifactRole::DataOutput, "id,total\n1,100\n2,250\n")]);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &exact_rows,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn data_task_blocks_unexpected_output_path_when_output_path_is_explicit() {
+        let contract = TaskContract::from_request(
+            "Generate data/output.csv with exactly columns id,total and exactly rows 1,100 and 2,250.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "data/output.csv"));
+        evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
+        let repair_state = VerifierRepairState::None;
+        let artifacts = [
+            ArtifactState::exists(ArtifactRole::DataOutput, "data/output.csv"),
+            ArtifactState::changed_at(ArtifactRole::DataOutput, "output.csv"),
+        ];
+        let exact_rows = build_excerpts(&[(ArtifactRole::DataOutput, "id,total\n1,100\n2,250\n")]);
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &exact_rows,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(ref target),
+                } if missing == &vec![ArtifactRole::DataOutput]
+                    && target.path == "data/output.csv"
+                    && target.reason.contains("unexpected data output artifact")
+                    && target.reason.contains("output.csv")
+            ),
+            "unexpected extra DataOutput path must block done, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn data_profile_path_drift_does_not_add_second_output_obligation() {
+        let request = "Create data/output.csv only. It must have exactly columns id,total and exactly rows 1,100 and 2,250. Do not create source code, tests, package.json, Cargo.toml, README, or any other files.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"docs",
+                "shape":"documentation",
+                "deliverable_kind":"data",
+                "primary_artifacts":["output.csv"],
+                "forbidden_artifacts":["source_code","tests","setup","docs"],
+                "evidence_kind":"none",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"sidecar collapsed the requested nested output path"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "README/docs were explicitly forbidden, required={:?}",
+            contract.required_artifacts
+        );
+        let data_outputs = contract.required_identities_for_role(ArtifactRole::DataOutput);
+        assert_eq!(
+            data_outputs.len(),
+            1,
+            "required identities={data_outputs:?}"
+        );
+        assert_eq!(data_outputs[0].path, "data/output.csv");
+        assert_eq!(
+            data_outputs[0]
+                .structured_record_schema
+                .as_ref()
+                .map(|schema| schema.expected_rows.as_slice()),
+            Some(
+                [
+                    vec!["1".to_string(), "100".to_string()],
+                    vec!["2".to_string(), "250".to_string()]
+                ]
+                .as_slice()
+            )
         );
     }
 

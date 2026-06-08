@@ -249,3 +249,69 @@ adding projection helpers to the contract file.
 4. Repeat with Rust TDD crate-name binding failures.
 5. Add data/research/ops LLM validations where evidence scope is checked by
    typed schema/source/command observations rather than coding-first tests.
+
+## Continuation: Typed Data Rows And Forbidden Docs
+
+Date: 2026-06-08
+
+### Hypothesis
+
+The v0.6.8 data false-done was not just weak prompting. The controller needed
+typed completion authority for:
+
+- exact structured rows, not only file existence or column names
+- request-owned data output paths over sidecar `primary_artifacts` drift
+- forbidden non-goals such as README/docs, not only source/test/setup non-goals
+
+### Minimal Implementation
+
+- Extended structured data obligations with bounded `expected_rows`.
+- Routed data completion and diagnostic checks through row-aware schema
+  validation for CSV/TSV evidence.
+- Blocked unexpected `DataOutput` artifacts outside explicit required paths.
+- Prevented ProjectProfile path drift from adding a second DataOutput when the
+  request already contains an explicit data output path.
+- Added `docs` to typed `forbidden_artifacts`, and suppress UsageDocs when the
+  sidecar marks docs/README as forbidden.
+- Normalized data profile evidence to `schema_check` when the sidecar returns
+  `content_check`, `none`, or omits evidence.
+
+### Actual Local LLM Validation
+
+Command shape:
+
+```bash
+anvildev -m qwen3.6:27b-coding-nvfp4 --sidecar-model qwen3.5:9b -y --fresh-session --no-footer --deterministic-fallback full-template --max-iterations 12 --chat-timeout-secs 180 -p "Create data/output.csv only. It must have exactly columns id,total and exactly rows 1,100 and 2,250. Do not create source code, tests, package.json, Cargo.toml, README, or any other files."
+```
+
+Before the final fixes, the same prompt produced:
+
+- `README.md`
+- `data/output.csv`
+- sometimes root `output.csv`
+- terminal `done`
+
+After the fixes:
+
+- generated only `data/output.csv`
+- content was exactly:
+  `id,total`, `1,100`, `2,250`
+- terminal `done` at iteration 1
+- Objective Contract log showed `objective kind: data` and
+  `evidence spec: schema_check`
+
+### Architecture Insight
+
+The effective fix was not stronger prose. The sidecar LLM had enough semantic
+signal to identify non-goals once the typed schema could represent them. The
+controller then had to project those typed signals into ObjectiveContract and
+artifact recovery. This supports the current direction:
+
+- LLM performs semantic classification.
+- Controller accepts typed contract fields only.
+- Completion authority is based on deliverable/evidence schemas.
+- Prompt rules remain secondary guidance, not the source of truth.
+
+The remaining risk is that `TaskContract` still owns too many projection and
+validation helpers. Future additions should move data/document/research/ops
+evidence schemas into narrower modules before adding more helper branches here.

@@ -824,9 +824,13 @@ fn verifier_diagnostic_for_obligation_parts(
                 "structured data schema obligation has no parse evidence",
             ));
         };
-        if let Some(diagnostic) =
-            data_schema_obligation_diagnostic(task_kind, &obligation.path, excerpt, &schema.columns)
-        {
+        if let Some(diagnostic) = data_schema_obligation_diagnostic_with_rows(
+            task_kind,
+            &obligation.path,
+            excerpt,
+            &schema.columns,
+            &schema.expected_rows,
+        ) {
             return Some(diagnostic);
         }
     }
@@ -973,11 +977,22 @@ fn data_artifact_diagnostic(
     None
 }
 
+#[cfg(test)]
 fn data_schema_obligation_diagnostic(
     task_kind: TaskKind,
     path: &str,
     excerpt: &str,
     required_columns: &[String],
+) -> Option<VerifierDiagnostic> {
+    data_schema_obligation_diagnostic_with_rows(task_kind, path, excerpt, required_columns, &[])
+}
+
+fn data_schema_obligation_diagnostic_with_rows(
+    task_kind: TaskKind,
+    path: &str,
+    excerpt: &str,
+    required_columns: &[String],
+    expected_rows: &[Vec<String>],
 ) -> Option<VerifierDiagnostic> {
     if required_columns.is_empty() {
         return data_artifact_diagnostic(task_kind, path, excerpt, required_columns);
@@ -1015,28 +1030,47 @@ fn data_schema_obligation_diagnostic(
         .filter(|column| !observed.iter().any(|seen| seen == *column))
         .cloned()
         .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return None;
+    if !missing.is_empty() {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            format!(
+                "structured data is missing required columns: {}; observed columns: {}; add all required columns",
+                display_schema_columns(&missing),
+                display_schema_columns(&observed)
+            ),
+        ));
     }
-    Some(VerifierDiagnostic::new(
-        task_kind,
-        VerifierDiagnosticCode::SchemaMismatch,
-        ArtifactRole::DataOutput,
-        Some(path),
-        format!(
-            "structured data is missing required columns: {}; observed columns: {}; add all required columns",
-            display_schema_columns(&missing),
-            display_schema_columns(&observed)
-        ),
-    ))
+    if let Some(message) =
+        structured_data_expected_rows_diagnostic(path, excerpt, required_columns, expected_rows)
+    {
+        return Some(VerifierDiagnostic::new(
+            task_kind,
+            VerifierDiagnosticCode::SchemaMismatch,
+            ArtifactRole::DataOutput,
+            Some(path),
+            message,
+        ));
+    }
+    None
 }
 
-pub(super) fn structured_data_schema_obligation_pass(
+pub(super) fn structured_data_schema_obligation_pass_with_rows(
     path: &str,
     excerpt: &str,
     required_columns: &[String],
+    expected_rows: &[Vec<String>],
 ) -> bool {
-    data_schema_obligation_diagnostic(TaskKind::Data, path, excerpt, required_columns).is_none()
+    data_schema_obligation_diagnostic_with_rows(
+        TaskKind::Data,
+        path,
+        excerpt,
+        required_columns,
+        expected_rows,
+    )
+    .is_none()
 }
 
 fn json_object_exact_columns_diagnostic(
@@ -1060,6 +1094,101 @@ fn json_object_exact_columns_diagnostic(
             display_schema_columns(&observed)
         )
     })
+}
+
+fn structured_data_expected_rows_diagnostic(
+    path: &str,
+    excerpt: &str,
+    required_columns: &[String],
+    expected_rows: &[Vec<String>],
+) -> Option<String> {
+    if expected_rows.is_empty() {
+        return None;
+    }
+    let Some(delimiter) = delimited_data_delimiter(path) else {
+        return Some("structured data expected rows require CSV or TSV parse evidence".to_string());
+    };
+    let Some((observed_columns, observed_rows)) = delimited_table(excerpt, delimiter) else {
+        return Some("structured data expected rows have no parse-ready records".to_string());
+    };
+    if observed_columns != required_columns {
+        return Some(format!(
+            "structured data columns must match exactly for expected rows: expected {}; observed {}",
+            display_schema_columns(required_columns),
+            display_schema_columns(&observed_columns)
+        ));
+    }
+    if observed_rows
+        .iter()
+        .any(|row| row.len() != required_columns.len())
+    {
+        return Some(format!(
+            "structured data expected rows require {} cells per row",
+            required_columns.len()
+        ));
+    }
+    let expected = normalized_row_set(expected_rows);
+    let observed = normalized_row_set(&observed_rows);
+    (expected != observed).then(|| {
+        format!(
+            "structured data expected rows do not match: expected rows {}; observed rows {}",
+            display_schema_rows(expected_rows),
+            display_schema_rows(&observed_rows)
+        )
+    })
+}
+
+fn delimited_data_delimiter(path: &str) -> Option<char> {
+    match path_extension_lower(path).as_deref() {
+        Some("csv") => Some(','),
+        Some("tsv") => Some('\t'),
+        _ => None,
+    }
+}
+
+fn delimited_table(excerpt: &str, delimiter: char) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+    let mut lines = excerpt.lines().filter(|line| !line.trim().is_empty());
+    let header = lines
+        .next()?
+        .split(delimiter)
+        .map(clean_data_column)
+        .collect::<Vec<_>>();
+    if header.is_empty() {
+        return None;
+    }
+    let rows = lines
+        .map(|line| {
+            line.split(delimiter)
+                .map(clean_data_column)
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
+        .collect::<Vec<_>>();
+    Some((header, rows))
+}
+
+fn normalized_row_set(rows: &[Vec<String>]) -> Vec<String> {
+    let mut normalized = rows
+        .iter()
+        .map(|row| row.join("\u{1f}"))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized
+}
+
+fn display_schema_rows(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return "(none)".to_string();
+    }
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| crate::session::feedback::mask_secrets(cell))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn display_schema_columns(columns: &[String]) -> String {

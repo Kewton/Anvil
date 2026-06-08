@@ -220,6 +220,7 @@ pub(super) enum ForbiddenArtifact {
     SourceCode,
     Tests,
     Setup,
+    Docs,
     Unknown,
 }
 
@@ -240,7 +241,7 @@ pub(super) fn build_project_profile_confirm_prompt(
             "Allowed language values: rust, node, python, docs, unknown.\n",
             "Allowed shape values: cli, library, api, web_app, documentation, unknown.\n",
             "Allowed deliverable_kind values: code, document, data, research_report, command_observation, none, unknown.\n",
-            "Allowed forbidden_artifacts values: source_code, tests, setup. Use [] when none.\n",
+            "Allowed forbidden_artifacts values: source_code, tests, setup, docs. Use [] when none.\n",
             "Allowed evidence_kind values: test_run, content_check, schema_check, command_observation, source_fetch, none, unknown.\n",
             "confidence must be a number from 0.0 to 1.0, not a word.\n",
             "All enum values must be quoted JSON strings. primary_artifacts must be an array of path strings, not objects.\n",
@@ -249,7 +250,7 @@ pub(super) fn build_project_profile_confirm_prompt(
             "primary_artifacts must contain only output deliverables the agent should create or modify; never include files the user asks to read, inspect, summarize, or use as input.\n",
             "When both input and output files are mentioned, list only the output file(s) in primary_artifacts.\n",
             "Use preferred_runner only when evidence should be produced by a command, otherwise null.\n",
-            "If the user forbids source code or tests, put that in forbidden_artifacts.\n",
+            "If the user forbids source code, tests, setup files, README, docs, or documentation, put the corresponding value in forbidden_artifacts.\n",
             "If setup is a document section rather than environment work, set needs_environment_setup=false.\n",
             "Do not write prose outside JSON.\n\n",
             "First pass: language={:?}, shape={:?}\n",
@@ -549,6 +550,7 @@ fn parse_forbidden_artifact(value: &str) -> Option<ForbiddenArtifact> {
         "source_code" | "code" | "implementation" => Some(ForbiddenArtifact::SourceCode),
         "tests" | "test" => Some(ForbiddenArtifact::Tests),
         "setup" | "environment_setup" => Some(ForbiddenArtifact::Setup),
+        "docs" | "doc" | "document" | "documentation" | "readme" => Some(ForbiddenArtifact::Docs),
         "unknown" => Some(ForbiddenArtifact::Unknown),
         _ => None,
     }
@@ -779,7 +781,7 @@ mod tests {
     #[test]
     fn llm_profile_confirmation_parser_captures_non_goals_and_document_setup() {
         let parsed = parse_project_profile_confirmation(
-            r#"{"language":"docs","shape":"documentation","deliverable_kind":"document","primary_artifacts":["README.md","../escape.md"],"forbidden_artifacts":["source_code","tests"],"evidence_kind":"content_check","needs_environment_setup":false,"confidence":0.91}"#,
+            r#"{"language":"docs","shape":"documentation","deliverable_kind":"document","primary_artifacts":["README.md","../escape.md"],"forbidden_artifacts":["source_code","tests","docs"],"evidence_kind":"content_check","needs_environment_setup":false,"confidence":0.91}"#,
         )
         .expect("parse profile");
 
@@ -790,7 +792,11 @@ mod tests {
         assert_eq!(parsed.primary_artifacts, vec!["README.md"]);
         assert_eq!(
             parsed.forbidden_artifacts,
-            vec![ForbiddenArtifact::SourceCode, ForbiddenArtifact::Tests]
+            vec![
+                ForbiddenArtifact::SourceCode,
+                ForbiddenArtifact::Tests,
+                ForbiddenArtifact::Docs
+            ]
         );
         assert_eq!(
             parsed.evidence_kind,
