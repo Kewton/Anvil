@@ -252,3 +252,76 @@ pub(super) fn request_matches_authoring_keyword(scan: &OutputContextScan, reques
 pub(super) fn prose_output_shaped(intent: TaskIntent, keyword: bool) -> bool {
     matches!(intent, TaskIntent::Explain) || keyword
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_governing_cue_is_input_reference_is_directional() {
+        assert!(nearest_governing_cue_is_input_reference(
+            "compare findings in "
+        ));
+        assert!(nearest_governing_cue_is_input_reference("review "));
+        assert!(nearest_governing_cue_is_input_reference(
+            "summarize the notes in "
+        ));
+        assert!(!nearest_governing_cue_is_input_reference(
+            "review            and rewrite "
+        ));
+        assert!(!nearest_governing_cue_is_input_reference(
+            "compare           and proofread "
+        ));
+        assert!(!nearest_governing_cue_is_input_reference("and write "));
+        assert!(!nearest_governing_cue_is_input_reference(
+            "rewrite the intro in "
+        ));
+        assert!(!nearest_governing_cue_is_input_reference(""));
+        assert!(!nearest_governing_cue_is_input_reference("the design "));
+    }
+
+    #[test]
+    fn report_path_in_output_context_jp_output_marker_n2() {
+        assert!(report_path_in_output_context(
+            "選択肢を比較して結果を findings.md に出力する",
+            "findings.md"
+        ));
+    }
+
+    #[test]
+    fn report_path_in_output_context_directional_unit_pins() {
+        assert!(!report_path_in_output_context(
+            "Compare findings in generated_report.md and summary.md",
+            "generated_report.md"
+        ));
+        assert!(report_path_in_output_context(
+            "Investigate the notes in source_report.md and produce findings.md",
+            "findings.md"
+        ));
+        assert!(!report_path_in_output_context(
+            "Investigate the notes in source_report.md and produce findings.md",
+            "source_report.md"
+        ));
+        assert!(report_path_in_output_context(
+            "Produce the summary in report.md",
+            "report.md"
+        ));
+        assert!(!report_path_in_output_context(
+            "Compare report.md and summary.md",
+            "report.md"
+        ));
+    }
+
+    #[test]
+    fn research_report_artifact_intended_masked_mode2() {
+        assert!(research_report_artifact_intended(
+            "Research local LLM options and draft a report",
+            &"Research local LLM options and draft a report".to_ascii_lowercase()
+        ));
+        let req = "Compare findings in draft_report.md and notes.md";
+        assert!(!research_report_artifact_intended(
+            req,
+            &req.to_ascii_lowercase()
+        ));
+    }
+}

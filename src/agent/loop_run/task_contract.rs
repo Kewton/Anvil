@@ -17,11 +17,6 @@ pub(super) use super::task_contract_artifact_intent::{
     request_names_explicit_output_docs, research_report_artifact_intended_with_scan,
     research_report_path_from_request_with_scan,
 };
-#[cfg(test)]
-use super::task_contract_artifact_intent::{
-    nearest_governing_cue_is_input_reference, report_path_in_output_context,
-    research_report_artifact_intended,
-};
 use super::task_contract_artifact_predicates::{
     artifact_identity_satisfied_for_verification, behavior_coverage_enabled,
     required_role_satisfied_by_evidence, role_deliverable_content_satisfied,
@@ -7894,37 +7889,6 @@ Create the README file."#;
         }
     }
 
-    /// Issue #937 (Codex High round 2): the directional nearest-cue function in
-    /// isolation. The before-window text is masked (path tokens already blanked).
-    #[test]
-    fn nearest_governing_cue_is_input_reference_is_directional() {
-        // Pure input reference → consumed.
-        assert!(nearest_governing_cue_is_input_reference(
-            "compare findings in "
-        ));
-        assert!(nearest_governing_cue_is_input_reference("review "));
-        assert!(nearest_governing_cue_is_input_reference(
-            "summarize the notes in "
-        ));
-        // Nearest cue is an authoring verb (even with an earlier input verb in
-        // range) → produced/edited in place, NOT consumed. The masked path is a
-        // run of spaces between the two verbs.
-        assert!(!nearest_governing_cue_is_input_reference(
-            "review            and rewrite "
-        ));
-        assert!(!nearest_governing_cue_is_input_reference(
-            "compare           and proofread "
-        ));
-        // Output verb nearest → not input reference.
-        assert!(!nearest_governing_cue_is_input_reference("and write "));
-        // Neutral (no cue) → not an input reference (in-place authoring default).
-        assert!(!nearest_governing_cue_is_input_reference(
-            "rewrite the intro in "
-        ));
-        assert!(!nearest_governing_cue_is_input_reference(""));
-        assert!(!nearest_governing_cue_is_input_reference("the design "));
-    }
-
     // ----- Issue #919: Accept-tier authority (Decision #4 / DR3-002) -----
 
     #[test]
@@ -8161,48 +8125,6 @@ Create the README file."#;
     // mode-1 directional unit pins).
     // ===================================================================
 
-    /// N2 (genuine JP research output): an explicit JP output verb directed at a
-    /// path keeps the obligation. `report_path_in_output_context` returns true via
-    /// the whole-request JP marker `出力` in the neutral-preposition fallback.
-    #[test]
-    fn report_path_in_output_context_jp_output_marker_n2() {
-        assert!(report_path_in_output_context(
-            "選択肢を比較して結果を findings.md に出力する",
-            "findings.md"
-        ));
-    }
-
-    /// Mode-1 directional: a filename-internal output-verb substring no longer
-    /// fabricates output context for a neutral input reference.
-    #[test]
-    fn report_path_in_output_context_directional_unit_pins() {
-        // Filename pollution (generated_report.md) read in a comparison → false.
-        assert!(!report_path_in_output_context(
-            "Compare findings in generated_report.md and summary.md",
-            "generated_report.md"
-        ));
-        // Multi-path attribution: produce attaches to findings.md only.
-        assert!(report_path_in_output_context(
-            "Investigate the notes in source_report.md and produce findings.md",
-            "findings.md"
-        ));
-        assert!(!report_path_in_output_context(
-            "Investigate the notes in source_report.md and produce findings.md",
-            "source_report.md"
-        ));
-        // Directional before-window: an output verb in the before-window of a
-        // neutral preposition counts (genuine EN output).
-        assert!(report_path_in_output_context(
-            "Produce the summary in report.md",
-            "report.md"
-        ));
-        // A bare output-looking name with no directed verb stays false.
-        assert!(!report_path_in_output_context(
-            "Compare report.md and summary.md",
-            "report.md"
-        ));
-    }
-
     /// N7 (authoring EN): `Translate README.ja.md and write README.md` →
     /// `README.ja.md` is a clear source (pruned), `README.md` is the lone output.
     #[test]
@@ -8315,24 +8237,6 @@ Create the README file."#;
         assert!(request_explicitly_requests_standalone_data_artifact(
             "Generate a CSV file with columns id and total",
             &"Generate a CSV file with columns id and total".to_ascii_lowercase()
-        ));
-    }
-
-    /// Mode-2 (no-path): `research_report_artifact_intended` over masked text.
-    /// A filename-internal `draft`+`report` (draft_report.md) no longer fires;
-    /// a genuine no-path `draft a report` still does.
-    #[test]
-    fn research_report_artifact_intended_masked_mode2() {
-        // No-path genuine output → true.
-        assert!(research_report_artifact_intended(
-            "Research local LLM options and draft a report",
-            &"Research local LLM options and draft a report".to_ascii_lowercase()
-        ));
-        // Filename-only draft+report (no other output verb/noun) → false.
-        let req = "Compare findings in draft_report.md and notes.md";
-        assert!(!research_report_artifact_intended(
-            req,
-            &req.to_ascii_lowercase()
         ));
     }
 }
