@@ -1757,11 +1757,16 @@ impl AutoTestRunner {
                 // explicit owned test paths. Missing dependencies then surface
                 // as normal verifier failures instead of collapsing the task
                 // into VerifierWeak.
-                let command = if display_command.contains("unittest") {
-                    VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
-                } else {
-                    VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
-                };
+                let command =
+                    if super::verifier_command_policy::canonical_project_unit_evidence_command(
+                        Some(&display_command),
+                    )
+                    .is_some()
+                    {
+                        VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
+                    } else {
+                        VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
+                    };
                 if let Some(command) = command {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }

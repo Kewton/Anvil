@@ -275,6 +275,9 @@ fn objective_deliverable_kind_from_profile(
 fn objective_evidence_kind_from_profile(
     profile: &ProjectProfileConfirmation,
 ) -> Option<ObjectiveEvidenceKind> {
+    if profile_declares_code_with_test_runner(profile) {
+        return Some(ObjectiveEvidenceKind::TestRun);
+    }
     if matches!(profile.deliverable_kind, Some(ProfileDeliverableKind::Data))
         && matches!(
             profile.evidence_kind,
@@ -327,6 +330,12 @@ fn required_artifact_role(profile: &ProjectProfileConfirmation) -> Option<Artifa
 fn verification_requirement(
     profile: &ProjectProfileConfirmation,
 ) -> Option<VerificationRequirement> {
+    if profile_declares_code_with_test_runner(profile) {
+        return Some(VerificationRequirement::Required {
+            preferred_runner: preferred_runner_from_profile(profile)
+                .or_else(|| profile.language.and_then(preferred_runner_for_language)),
+        });
+    }
     match profile.evidence_kind? {
         ProfileEvidenceKind::TestRun => Some(VerificationRequirement::Required {
             preferred_runner: preferred_runner_from_profile(profile)
@@ -349,6 +358,11 @@ fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option
     super::verifier_command_policy::admitted_profile_preferred_runner(
         profile.preferred_runner.as_deref(),
     )
+}
+
+fn profile_declares_code_with_test_runner(profile: &ProjectProfileConfirmation) -> bool {
+    matches!(profile.deliverable_kind, Some(ProfileDeliverableKind::Code))
+        && preferred_runner_from_profile(profile).is_some()
 }
 
 fn forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool {
@@ -713,6 +727,46 @@ npm test
                 .required_artifacts
                 .contains(&ArtifactRole::UsageDocs),
             "profile adoption should remove forbidden docs drift"
+        );
+    }
+
+    #[test]
+    fn source_profile_with_test_runner_normalizes_command_observation_to_test_run() {
+        let request = "Create math_utils.py and tests/test_math_utils.py only. Use Python unittest and verify with python -m unittest discover -s tests.";
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["setup","docs"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":"python -m unittest discover -s tests",
+                "confidence":1.0,
+                "reason":"Python code with a verifier command"
+            }"#,
+        )
+        .expect("profile");
+
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+        assert_eq!(inputs.evidence_kind, Some(ObjectiveEvidenceKind::TestRun));
+        assert_eq!(
+            inputs.verification,
+            Some(VerificationRequirement::Required {
+                preferred_runner: Some("python -m unittest discover -s tests")
+            })
+        );
+
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract.objective_contract().evidence_kind,
+            ObjectiveEvidenceKind::TestRun
+        );
+        assert_eq!(
+            contract.evidence_command_hint(),
+            Some("python -m unittest discover -s tests")
         );
     }
 

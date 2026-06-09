@@ -359,9 +359,28 @@ fn has_rust_verifier(work_root: &Path, facts: &WorkspaceFacts) -> bool {
         })
 }
 
-fn has_python_verifier(facts: &WorkspaceFacts) -> bool {
-    facts.files.iter().any(|path| {
-        facts.edited_files.contains(path) && is_test_file(Path::new(path)) && path.ends_with(".py")
+fn python_verifier_command(work_root: &Path, facts: &WorkspaceFacts) -> Option<&'static str> {
+    let mut has_python_test = false;
+    for path in facts.files.iter().filter(|path| {
+        facts.edited_files.contains(*path) && is_test_file(Path::new(path)) && path.ends_with(".py")
+    }) {
+        has_python_test = true;
+        if python_test_uses_unittest(work_root, path) {
+            return Some("python3 -m unittest discover -s tests");
+        }
+    }
+    has_python_test.then_some("python3 -B -m pytest -p no:cacheprovider")
+}
+
+fn python_test_uses_unittest(work_root: &Path, relative_path: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(work_root.join(relative_path)) else {
+        return false;
+    };
+    content.lines().take(120).any(|line| {
+        let line = line.trim_start();
+        line.starts_with("import unittest")
+            || line.starts_with("from unittest")
+            || line.contains("unittest.TestCase")
     })
 }
 
@@ -459,9 +478,9 @@ fn verifier_candidates(
             timeout_class: ProjectUnitTimeoutClass::ShortUnitTest,
         });
     }
-    if has_python_verifier(facts) {
+    if let Some(command_preview) = python_verifier_command(work_root, facts) {
         out.push(ProjectUnitVerifierCandidate {
-            command_preview: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+            command_preview: command_preview.to_string(),
             source: "python_tests",
             timeout_class: ProjectUnitTimeoutClass::ShortUnitTest,
         });
@@ -1029,6 +1048,36 @@ mod tests {
             Some("python -m unittest discover -s tests"),
         )
         .expect("unit");
+
+        assert_eq!(unit.verifier_candidates.len(), 1);
+        assert_eq!(unit.verifier_candidates[0].source, "python_tests");
+        assert_eq!(
+            unit.verifier_candidates[0].command_preview,
+            "python3 -m unittest discover -s tests"
+        );
+    }
+
+    #[test]
+    fn python_unittest_artifact_selects_stdlib_unittest_verifier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("math_utils.py"),
+            "def clamp(value, minimum, maximum):\n    return max(minimum, min(maximum, value))\n",
+        )
+        .expect("impl");
+        std::fs::write(
+            dir.path().join("tests/test_math_utils.py"),
+            "import unittest\n\nfrom math_utils import clamp\n\nclass ClampTests(unittest.TestCase):\n    def test_clamps_low(self):\n        self.assertEqual(clamp(-1, 0, 5), 0)\n",
+        )
+        .expect("test");
+
+        let request = "Create math_utils.py and tests/test_math_utils.py.";
+        let scope = scope(dir.path(), request);
+        let edited = edited(&["math_utils.py", "tests/test_math_utils.py"]);
+
+        let unit = probe_project_unit_for_request(dir.path(), request, &scope, &edited)
+            .expect("project unit");
 
         assert_eq!(unit.verifier_candidates.len(), 1);
         assert_eq!(unit.verifier_candidates[0].source, "python_tests");
