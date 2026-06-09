@@ -322,19 +322,45 @@ pub(super) fn verifier_repair_stale_assertion_test_target(
     if selected_path.is_some_and(|path| path != previous_target.path) {
         return None;
     }
-    let failure_target = context.target_hint.as_ref()?;
-    if failure_target.role != super::task_contract::ArtifactRole::Test
-        || failure_target.path == previous_target.path
-    {
+    let failure_target = context
+        .target_hint
+        .as_ref()
+        .filter(|hint| hint.role == super::task_contract::ArtifactRole::Test)
+        .cloned()
+        .or_else(|| verifier_output_test_failure_target(context, admission))?;
+    if failure_target.path == previous_target.path {
         return None;
     }
     let promoted = super::task_contract::RecoveryTargetHint {
         reason: "same assertion failure remained after a non-test repair; inspect generated test setup or expectations".to_string(),
-        ..failure_target.clone()
+        ..failure_target
     };
     // Issue #647 (§5.1 stage 2): Owned admission gate. Path 5 of the
     // 6 source categories: stale-assertion test re-target.
     admit_repair_target_hint(promoted, admission)
+}
+
+fn verifier_output_test_failure_target(
+    context: &super::repair_job::RepairJob,
+    admission: &RepairTargetAdmissionContext<'_>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    let packet = super::failure_packet::FailurePacket::from_repair_job_with_work_root(
+        admission.work_root,
+        context,
+    );
+    if packet.observed_expected_pairs.is_empty() {
+        return None;
+    }
+    packet
+        .candidate_artifacts
+        .into_iter()
+        .find(|candidate| candidate.role == super::task_contract::ArtifactRole::Test)
+        .map(|candidate| super::task_contract::RecoveryTargetHint {
+            role: candidate.role,
+            path: candidate.path,
+            reason: "same assertion failure remained after a non-test repair; verifier output names this test artifact".to_string(),
+        })
+        .and_then(|hint| admit_repair_target_hint(hint, admission))
 }
 
 pub(super) fn python_missing_external_dependency_name(
@@ -990,6 +1016,58 @@ mod tests {
 
         assert_eq!(promoted.path, "tests/test_main.py");
         assert_eq!(impl_hint.path, "app/main.py");
+    }
+
+    #[test]
+    fn verifier_repair_stale_assertion_uses_verifier_output_test_candidate_when_target_hint_missing()
+     {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(
+            work_root.join("app/main.py"),
+            "def longest_word(text): pass\n",
+        )
+        .unwrap();
+        let test_path = work_root.join("tests/test_text_rank.py");
+        std::fs::write(
+            &test_path,
+            "def test_returns_first_longest_when_tied(): pass\n",
+        )
+        .unwrap();
+        let scope = super::super::task_workspace_scope::TaskWorkspaceScope::detect(work_root, "");
+        let admission = RepairTargetAdmissionContext::owned_for_test(work_root, &scope);
+        let impl_hint = super::super::task_contract::RecoveryTargetHint {
+            role: super::super::task_contract::ArtifactRole::Implementation,
+            path: "app/main.py".to_string(),
+            reason: "previous target".to_string(),
+        };
+        let output = format!(
+            "FAIL: test_returns_first_longest_when_tied\n  File \"{}\", line 19\nAssertionError: 'green' != 'blue'",
+            test_path.display()
+        );
+        let context = super::super::repair_job::RepairJob {
+            output_excerpt: output,
+            repair_target_hint: Some(impl_hint),
+            target_hint: None,
+            rerun_outcome: Some(super::super::VerifierRepairRerunOutcome::SameFailureRemaining),
+            ..super::super::repair_job::RepairJob::new_for_test()
+        };
+
+        let promoted = verifier_repair_stale_assertion_test_target(
+            &context,
+            Some("app/main.py"),
+            super::super::VerifierFailureType::AssertionFailure,
+            &admission,
+        )
+        .unwrap();
+
+        assert_eq!(promoted.path, "tests/test_text_rank.py");
+        assert_eq!(
+            promoted.reason,
+            "same assertion failure remained after a non-test repair; inspect generated test setup or expectations"
+        );
     }
 
     #[test]

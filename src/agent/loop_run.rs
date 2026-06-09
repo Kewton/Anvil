@@ -1238,6 +1238,7 @@ mod task_contract_artifact_contract;
 mod task_contract_artifact_predicates;
 mod task_contract_completion_policy;
 mod task_contract_controller_packet;
+mod task_contract_data_output_context;
 mod task_contract_deliverable_projection;
 mod task_contract_display;
 mod task_contract_evidence_stage;
