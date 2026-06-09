@@ -8,8 +8,8 @@ use super::completion_evidence::classify_repo_edit_path;
 use super::contract_request_signals::negated_artifact_list_contains;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableKind, DeliverableSchema, ProjectIntent,
-    ProjectLanguage, ProjectShape, request_asks_for_data_output_artifact_with_scan,
-    request_negates_test_artifacts, role_from_repo_edit,
+    ProjectLanguage, ProjectShape, TaskKind, request_asks_for_data_output_artifact_with_scan,
+    request_asks_for_ops_task, request_negates_test_artifacts, role_from_repo_edit,
 };
 use super::task_contract_data_output_context::{
     data_path_has_output_context_with_scan, explicit_path_with_data_extension_with_scan,
@@ -204,6 +204,141 @@ pub(super) fn required_ops_sections_from_request(request: &str) -> Vec<String> {
         sections.push(OpsSection::Checklist.label().to_string());
     }
     sections
+}
+
+/// Issue #923 (P6): the OpsRunbook obligation bridge. Without this, an Ops
+/// request produces only a `TaskDeliverable` (no obligation), so the production
+/// obligation diagnostic never runs `ops_runbook_pass` and loosening the
+/// predicate would be a no-op (Codex DR3-001).
+///
+/// Only genuine runbook/deploy/operation requests get an obligation. A pure
+/// setup/install request reaches `TaskKind::Ops` via `asks_for_setup` (not the
+/// ops keywords), so gating on `request_asks_for_ops_task` leaves setup-only
+/// completion to the Setup evidence / SetupBootstrap path (DR3-003). Path falls
+/// back to a literal `runbook.md` (validated in the ctor, DR4-001).
+pub(super) fn inferred_ops_obligations_from_request(
+    request: &str,
+    lower: &str,
+    task_kind: TaskKind,
+) -> Vec<ArtifactObligation> {
+    if task_kind != TaskKind::Ops {
+        return Vec::new();
+    }
+    let required_sections = required_ops_sections_from_request(request);
+    if request_asks_for_ops_task(request, lower) {
+        return vec![ArtifactObligation::ops_runbook(
+            default_ops_runbook_path_from_request(request),
+            required_sections,
+        )];
+    }
+    explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .filter(|identity| identity.role == ArtifactRole::UsageDocs)
+        .map(|identity| {
+            ArtifactObligation::command_output(
+                identity.path,
+                required_sections.clone(),
+                required_command_observations_from_request(request),
+            )
+        })
+        .collect()
+}
+
+fn required_command_observations_from_request(request: &str) -> Vec<String> {
+    let mut commands = backtick_command_observations_from_request(request);
+    if commands.is_empty() {
+        commands.extend(run_clause_command_observations_from_request(request));
+    }
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn backtick_command_observations_from_request(request: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut in_backtick = false;
+    let mut start = 0usize;
+    for (idx, ch) in request.char_indices() {
+        if ch != '`' {
+            continue;
+        }
+        if in_backtick {
+            if let Some(command) = normalize_required_command_observation(&request[start..idx]) {
+                commands.push(command);
+            }
+            in_backtick = false;
+        } else {
+            in_backtick = true;
+            start = idx + ch.len_utf8();
+        }
+    }
+    commands
+}
+
+fn run_clause_command_observations_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let Some(run_idx) = lower.find("run ") else {
+        return Vec::new();
+    };
+    let after_start = run_idx + "run ".len();
+    let after = &request[after_start..];
+    let after_lower = &lower[after_start..];
+    let end = [", then", " then ", ". ", "\n"]
+        .into_iter()
+        .filter_map(|marker| after_lower.find(marker))
+        .min()
+        .unwrap_or(after.len());
+    after[..end]
+        .split([',', ';'])
+        .flat_map(|chunk| chunk.split(" and "))
+        .filter_map(normalize_required_command_observation)
+        .collect()
+}
+
+fn normalize_required_command_observation(raw: &str) -> Option<String> {
+    let command = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ':' | '.'));
+    if command.is_empty()
+        || command.len() > 80
+        || command.chars().any(|ch| {
+            matches!(
+                ch,
+                '|' | '&' | ';' | '<' | '>' | '$' | '(' | ')' | '\n' | '\r'
+            )
+        })
+    {
+        return None;
+    }
+    let first = command.split_whitespace().next().unwrap_or_default();
+    if first.is_empty()
+        || !first
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/'))
+    {
+        return None;
+    }
+    if matches!(
+        first.to_ascii_lowercase().as_str(),
+        "create" | "write" | "edit" | "add" | "make" | "produce" | "document"
+    ) {
+        return None;
+    }
+    Some(command.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Issue #923 (CB-002 / DR4-001): honor an explicit markdown path the user named
+/// (e.g. `deployment-runbook.md`) so the obligation matches the artifact the
+/// agent will actually write, instead of always demanding a literal `runbook.md`.
+/// Explicit paths come from `explicit_artifact_obligations_from_request` (already
+/// `validated_obligation_path`-sanitized); the fallback is the literal
+/// `runbook.md`. Mirrors `default_docs_path_from_request`.
+pub(super) fn default_ops_runbook_path_from_request(request: &str) -> String {
+    explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .find(|identity| identity.role == ArtifactRole::UsageDocs)
+        .map(|identity| identity.path)
+        .unwrap_or_else(|| "runbook.md".to_string())
 }
 
 fn push_section_if(sections: &mut Vec<String>, condition: bool, section: &str) {
