@@ -28,8 +28,9 @@ pub(super) use super::task_contract_controller_packet::{
     RequestInferenceView, model_visible_request_text,
 };
 pub(super) use super::task_contract_core::{
-    ArtifactState, ArtifactStateKind, CompletionDecision, RecoveryTarget, RecoveryTargetHint,
-    SafeStopReason,
+    ArtifactObligation, ArtifactState, ArtifactStateKind, CompletionDecision,
+    DeliverableObligation, ProjectIntent, RecoveryTarget, RecoveryTargetHint, SafeStopReason,
+    TaskClassification,
 };
 #[cfg(test)]
 use super::task_contract_data_output_context::{
@@ -83,36 +84,6 @@ use crate::tools::bash::BashCommandClass;
 struct TaskKindInference {
     kind: TaskKind,
     matched: bool,
-}
-
-/// Issue #917 (P0.5): per-turn classification head, projected from
-/// [`TaskContract`] via [`TaskContract::classification`]. The P0.5 frozen shape
-/// is `{ task_kind, confidence }`; `needs_confirm()` is *derived* (no
-/// independent bool) so `confidence` is the single source of truth (DR1-004).
-/// `#[non_exhaustive]` keeps the P1 additions (coding sub-profile / behavior
-/// flags) additive (DR1-003).
-// Issue #926: production consumers wired — the per-turn authority accessor
-// (`task_classification.rs`) and the TaskKind confirm path
-// (`classify_confirm_flow::maybe_invoke_task_kind_confirm`) read this; the
-// transient `#[allow(dead_code)]` has been removed.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[non_exhaustive]
-pub(super) struct TaskClassification {
-    pub(super) task_kind: TaskKind,
-    /// 0.0..=1.0. P0.5 is a 2-value approximation (matched → 1.0, no-match →
-    /// 0.0); the f32 type leaves room for additive refinement toward
-    /// `ModeClassification.confidence`'s continuous scale.
-    pub(super) confidence: f32,
-}
-
-impl TaskClassification {
-    /// "Unknown" signal (D1/D5): a no-keyword-match request (`confidence` below
-    /// the confirm threshold) routes to the confirm path instead of silently
-    /// staying `Coding`. Reuses the WorkMode confirm threshold (DR2-001 path:
-    /// `crate::modes::plan_act`, not `super::super::modes`).
-    pub(super) fn needs_confirm(&self) -> bool {
-        self.confidence < crate::modes::plan_act::WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
-    }
 }
 
 #[allow(dead_code)] // Issue #947: read-only ObjectiveContract projection.
@@ -232,20 +203,6 @@ fn objective_evidence_kind_requires_command_evidence(evidence_kind: ObjectiveEvi
         ObjectiveEvidenceKind::TestRun | ObjectiveEvidenceKind::SafetyBoundaryEvidence
     )
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DeliverableObligation {
-    pub(super) role: ArtifactRole,
-    pub(super) kind: DeliverableKind,
-    pub(super) path: String,
-    pub(super) format: Option<DeliverableFormat>,
-    pub(super) schema: Option<DeliverableSchema>,
-    pub(super) required_sections: Vec<String>,
-    pub(super) acceptance_criteria: Vec<String>,
-    pub(super) structured_record_schema: Option<StructuredRecordSchema>,
-}
-
-pub(super) type ArtifactObligation = DeliverableObligation;
 
 impl DeliverableObligation {
     pub(super) fn file(role: ArtifactRole, path: impl Into<String>) -> Self {
@@ -413,15 +370,6 @@ impl DeliverableObligation {
             structured_record_schema: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ProjectIntent {
-    pub(super) intent: TaskIntent,
-    pub(super) language: Option<ProjectLanguage>,
-    pub(super) shape: Option<ProjectShape>,
-    pub(super) verification: VerificationRequirement,
-    pub(super) confidence: f32,
 }
 
 impl ProjectIntent {

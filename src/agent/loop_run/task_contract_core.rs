@@ -5,7 +5,56 @@
 //! It deliberately does not infer requests, inspect evidence, or decide
 //! terminal state.
 
-use super::task_contract_taxonomy::ArtifactRole;
+use super::task_contract_taxonomy::{
+    ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, ProjectLanguage,
+    ProjectShape, StructuredRecordSchema, TaskIntent, TaskKind, VerificationRequirement,
+};
+
+/// Issue #917 (P0.5): per-turn classification head, projected from
+/// `TaskContract` via `TaskContract::classification`. The P0.5 frozen shape is
+/// `{ task_kind, confidence }`; `needs_confirm()` is derived (no independent
+/// bool) so `confidence` is the single source of truth (DR1-004).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub(super) struct TaskClassification {
+    pub(super) task_kind: TaskKind,
+    /// 0.0..=1.0. P0.5 is a 2-value approximation (matched -> 1.0, no-match ->
+    /// 0.0); the f32 type leaves room for additive refinement toward
+    /// `ModeClassification.confidence`'s continuous scale.
+    pub(super) confidence: f32,
+}
+
+impl TaskClassification {
+    /// "Unknown" signal (D1/D5): a no-keyword-match request (`confidence` below
+    /// the confirm threshold) routes to the confirm path instead of silently
+    /// staying `Coding`.
+    pub(super) fn needs_confirm(&self) -> bool {
+        self.confidence < crate::modes::plan_act::WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DeliverableObligation {
+    pub(super) role: ArtifactRole,
+    pub(super) kind: DeliverableKind,
+    pub(super) path: String,
+    pub(super) format: Option<DeliverableFormat>,
+    pub(super) schema: Option<DeliverableSchema>,
+    pub(super) required_sections: Vec<String>,
+    pub(super) acceptance_criteria: Vec<String>,
+    pub(super) structured_record_schema: Option<StructuredRecordSchema>,
+}
+
+pub(super) type ArtifactObligation = DeliverableObligation;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ProjectIntent {
+    pub(super) intent: TaskIntent,
+    pub(super) language: Option<ProjectLanguage>,
+    pub(super) shape: Option<ProjectShape>,
+    pub(super) verification: VerificationRequirement,
+    pub(super) confidence: f32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CompletionDecision {
