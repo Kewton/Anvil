@@ -27,7 +27,9 @@ use super::repair_brief::AllowedChangeKind;
 use super::repair_packet::{
     CorrectionKind, DeliverableFailureDomain, RepairPacket, obligation_id_for_parts,
 };
-use super::repair_target_decision::{RepairTargetAuthority, RepairTargetDecision};
+use super::repair_target_decision::{
+    RepairTargetAuthority, RepairTargetDecision, audit_repair_target_candidates,
+};
 use super::semantic_failure::{FailureClusterKey, SemanticFailureReport};
 use super::spec_authority::{RepairRole, SpecAuthority, WeakeningPattern};
 use super::task_contract::{ArtifactRole, DeliverableKind, RecoveryTargetHint, TaskContract};
@@ -112,6 +114,18 @@ impl RepairTargetAttemptBucket {
             | Self::Duplicate
             | Self::NoProgress
             | Self::Worsened => 2,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsafe { .. } => "unsafe",
+            Self::Malformed => "malformed",
+            Self::Noop => "noop",
+            Self::Duplicate => "duplicate",
+            Self::ImprovedStillFailing => "improved_still_failing",
+            Self::NoProgress => "no_progress",
+            Self::Worsened => "worsened",
         }
     }
 }
@@ -301,6 +315,23 @@ pub(super) struct RepairJob {
     /// target / role is not retried after no progress. Turn-local; carried over
     /// across reruns alongside `exhausted_attempts` (not serialized).
     pub(super) no_progress_policy: NoProgressRecoveryPolicy,
+}
+
+fn current_repair_target_hint_matching_role(
+    candidates: &[(Option<RecoveryTargetHint>, RepairTargetAuthority)],
+    role: Option<ArtifactRole>,
+) -> Option<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
+    let role = role?;
+    candidates
+        .iter()
+        .find(|(hint, _)| hint.as_ref().is_some_and(|hint| hint.role == role))
+        .cloned()
+}
+
+fn current_repair_target_hint_legacy_order(
+    candidates: &[(Option<RecoveryTargetHint>, RepairTargetAuthority)],
+) -> Option<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
+    candidates.iter().find(|(hint, _)| hint.is_some()).cloned()
 }
 
 /// Legacy verifier-repair projection retained for tests that pin the old
@@ -1481,39 +1512,25 @@ impl RepairJob {
                 .single_candidate_target_role()
                 .or(selection.target_role)
         };
-        let (target_hint, authority) = self
-            .current_repair_target_hint_matching_role(preferred_role)
-            .or_else(|| self.current_repair_target_hint_legacy_order())
-            .unwrap_or((None, RepairTargetAuthority::None));
+        let candidates = self.current_repair_target_candidates();
+        let (target_hint, authority) =
+            current_repair_target_hint_matching_role(&candidates, preferred_role)
+                .or_else(|| current_repair_target_hint_legacy_order(&candidates))
+                .unwrap_or((None, RepairTargetAuthority::None));
         let target_role = target_hint
             .as_ref()
             .map(|hint| hint.role)
             .or(preferred_role);
+        let candidate_audit =
+            audit_repair_target_candidates(&candidates, target_hint.as_ref(), preferred_role);
         RepairTargetDecision::new(
             selection.failure_class,
             target_role,
             target_hint,
             authority,
             selection.candidates,
+            candidate_audit,
         )
-    }
-
-    fn current_repair_target_hint_matching_role(
-        &self,
-        role: Option<ArtifactRole>,
-    ) -> Option<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
-        let role = role?;
-        self.current_repair_target_candidates()
-            .into_iter()
-            .find(|(hint, _)| hint.as_ref().is_some_and(|hint| hint.role == role))
-    }
-
-    fn current_repair_target_hint_legacy_order(
-        &self,
-    ) -> Option<(Option<RecoveryTargetHint>, RepairTargetAuthority)> {
-        self.current_repair_target_candidates()
-            .into_iter()
-            .find(|(hint, _)| hint.is_some())
     }
 
     fn current_repair_target_candidates(
@@ -3226,6 +3243,10 @@ pub(super) const SAFE_STOP_OBLIGATION_TARGET_MAX: usize = 8;
 /// Maximum number of invalid proposal summaries retained in terminal diagnostics.
 pub(super) const SAFE_STOP_INVALID_PROPOSAL_MAX: usize = 8;
 
+/// Maximum number of repair target attempt history entries retained in
+/// terminal diagnostics.
+pub(super) const SAFE_STOP_TARGET_HISTORY_MAX: usize = 8;
+
 /// Issue #654 — per-turn dedup key. Each variant maps 1:1 to a `stop_reason`
 /// label that appears in the `agent.safe_stop.report` event payload.
 ///
@@ -3292,6 +3313,9 @@ impl DiagnosticTargetMissingReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExhaustedAttemptsSummary {
     pub(super) total: usize,
+    /// Contract component currently blocking repair, expressed as the closed
+    /// `ArtifactRole` label vocabulary.
+    pub(super) blocked_component: Option<&'static str>,
     /// `Vec<(cluster_key_16hex, Vec<role_label>)>` — preserves insertion
     /// order, deduplicates within a cluster, and caps at
     /// `SAFE_STOP_PER_CLUSTER_MAX` × `SAFE_STOP_PER_CLUSTER_ROLE_MAX`.
@@ -3304,6 +3328,17 @@ pub(super) struct ExhaustedAttemptsSummary {
     pub(super) invalid_proposal_reasons: Vec<InvalidRepairProposalSummary>,
     /// Obligation-targeted corrections that reached an exhaustion condition.
     pub(super) exhausted_corrections: Vec<ExhaustedCorrectionSummary>,
+    /// Bounded history of admitted repair target attempts.
+    pub(super) target_history: Vec<RepairTargetHistorySummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RepairTargetHistorySummary {
+    pub(super) cluster: String,
+    pub(super) role: ArtifactRole,
+    pub(super) path: String,
+    pub(super) bucket: &'static str,
+    pub(super) exhausted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3374,8 +3409,11 @@ impl ExhaustedAttemptsSummary {
             })
             .collect::<Vec<_>>();
         let exhausted_corrections = exhausted_corrections_for_job(job);
+        let blocked_component = blocked_component_for_job(job);
+        let target_history = repair_target_history_for_job(job);
         Self {
             total,
+            blocked_component,
             per_cluster,
             last_repair_hypothesis,
             unfulfilled_obligations: unfulfilled_obligations
@@ -3385,8 +3423,42 @@ impl ExhaustedAttemptsSummary {
                 .collect(),
             invalid_proposal_reasons,
             exhausted_corrections,
+            target_history,
         }
     }
+}
+
+fn blocked_component_for_job(job: &RepairJob) -> Option<&'static str> {
+    job.current_repair_target_decision()
+        .target_role
+        .map(ArtifactRole::label)
+        .or_else(|| {
+            job.repair_target_attempt_outcomes
+                .last()
+                .map(|attempt| attempt.role.label())
+        })
+}
+
+fn repair_target_history_for_job(job: &RepairJob) -> Vec<RepairTargetHistorySummary> {
+    let start = job
+        .repair_target_attempt_outcomes
+        .len()
+        .saturating_sub(SAFE_STOP_TARGET_HISTORY_MAX);
+    job.repair_target_attempt_outcomes
+        .iter()
+        .skip(start)
+        .map(|attempt| RepairTargetHistorySummary {
+            cluster: attempt.cluster.as_str().to_string(),
+            role: attempt.role,
+            path: sanitize_repair_job_text_with_char_cap(&attempt.path, SAFE_STOP_PATH_CHAR_CAP),
+            bucket: attempt.bucket.as_str(),
+            exhausted: job.is_repair_target_exhausted(
+                &attempt.cluster,
+                attempt.role,
+                &attempt.path,
+            ),
+        })
+        .collect()
 }
 
 fn exhausted_corrections_for_job(job: &RepairJob) -> Vec<ExhaustedCorrectionSummary> {
@@ -7744,6 +7816,20 @@ mod tests {
                 .operator_candidates
                 .contains(&super::super::repair_operator::OperatorId::GeneratedTestExpectation)
         );
+        assert!(decision.candidate_audit.iter().any(|entry| {
+            entry.authority
+                == super::super::repair_target_decision::RepairTargetAuthority::CorrectionJob
+                && entry.role == Some(super::super::task_contract::ArtifactRole::Implementation)
+                && entry.status
+                    == super::super::repair_target_decision::RepairTargetCandidateStatus::RejectedRoleMismatch
+        }));
+        assert!(decision.candidate_audit.iter().any(|entry| {
+            entry.authority
+                == super::super::repair_target_decision::RepairTargetAuthority::SemanticCluster
+                && entry.role == Some(super::super::task_contract::ArtifactRole::Test)
+                && entry.status
+                    == super::super::repair_target_decision::RepairTargetCandidateStatus::Selected
+        }));
         assert!(matches!(
             job.next_action(),
             RepairNextAction::RequestPatch { target_hint }
@@ -9389,6 +9475,35 @@ mod tests {
             summary.invalid_proposal_reasons[0].correction_kind,
             Some(super::super::repair_packet::CorrectionKind::SectionAddition)
         );
+    }
+
+    #[test]
+    fn exhausted_attempts_summary_includes_blocked_component_and_target_history() {
+        let mut job = RepairJob::new_for_test();
+        job.repair_target_hint = Some(recovery_target(ArtifactRole::UsageDocs, "README.md"));
+        let cluster = make_cluster_key("target-history");
+        job.repair_target_attempt_outcomes
+            .push(RepairTargetAttemptOutcome {
+                cluster: cluster.clone(),
+                role: ArtifactRole::UsageDocs,
+                path: "README.md".to_string(),
+                bucket: RepairTargetAttemptBucket::NoProgress,
+            });
+        job.exhausted_repair_targets.push(ExhaustedRepairTarget {
+            cluster,
+            role: ArtifactRole::UsageDocs,
+            path: "README.md".to_string(),
+            bucket: RepairTargetAttemptBucket::NoProgress,
+        });
+
+        let summary = ExhaustedAttemptsSummary::from_repair_job(&job, None, &[]);
+
+        assert_eq!(summary.blocked_component, Some("usage_docs"));
+        assert_eq!(summary.target_history.len(), 1);
+        assert_eq!(summary.target_history[0].role, ArtifactRole::UsageDocs);
+        assert_eq!(summary.target_history[0].path, "README.md");
+        assert_eq!(summary.target_history[0].bucket, "no_progress");
+        assert!(summary.target_history[0].exhausted);
     }
 
     #[test]

@@ -37,6 +37,90 @@ impl RepairTargetAuthority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RepairTargetCandidateStatus {
+    Selected,
+    RejectedLowerAuthority,
+    RejectedRoleMismatch,
+    Unavailable,
+}
+
+impl RepairTargetCandidateStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::RejectedLowerAuthority => "rejected_lower_authority",
+            Self::RejectedRoleMismatch => "rejected_role_mismatch",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepairTargetCandidateAudit {
+    pub(super) authority: RepairTargetAuthority,
+    pub(super) role: Option<ArtifactRole>,
+    pub(super) path: Option<String>,
+    pub(super) status: RepairTargetCandidateStatus,
+}
+
+impl RepairTargetCandidateAudit {
+    pub(super) fn new(
+        authority: RepairTargetAuthority,
+        hint: Option<&RecoveryTargetHint>,
+        status: RepairTargetCandidateStatus,
+    ) -> Self {
+        Self {
+            authority,
+            role: hint.map(|hint| hint.role),
+            path: hint.map(|hint| hint.path.clone()),
+            status,
+        }
+    }
+
+    fn to_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "authority": self.authority.as_str(),
+            "role": self.role.map(ArtifactRole::label),
+            "path": self.path.as_deref(),
+            "status": self.status.as_str(),
+        })
+    }
+}
+
+pub(super) fn audit_repair_target_candidates(
+    candidates: &[(Option<RecoveryTargetHint>, RepairTargetAuthority)],
+    selected: Option<&RecoveryTargetHint>,
+    preferred_role: Option<ArtifactRole>,
+) -> Vec<RepairTargetCandidateAudit> {
+    candidates
+        .iter()
+        .map(|(hint, authority)| {
+            let status = repair_target_candidate_status(hint.as_ref(), selected, preferred_role);
+            RepairTargetCandidateAudit::new(*authority, hint.as_ref(), status)
+        })
+        .collect()
+}
+
+fn repair_target_candidate_status(
+    candidate: Option<&RecoveryTargetHint>,
+    selected: Option<&RecoveryTargetHint>,
+    preferred_role: Option<ArtifactRole>,
+) -> RepairTargetCandidateStatus {
+    let Some(candidate) = candidate else {
+        return RepairTargetCandidateStatus::Unavailable;
+    };
+    if selected
+        .is_some_and(|selected| selected.role == candidate.role && selected.path == candidate.path)
+    {
+        return RepairTargetCandidateStatus::Selected;
+    }
+    if preferred_role.is_some_and(|role| candidate.role != role) {
+        return RepairTargetCandidateStatus::RejectedRoleMismatch;
+    }
+    RepairTargetCandidateStatus::RejectedLowerAuthority
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairTargetDecision {
     pub(super) failure_class: Option<FailureClass>,
@@ -44,6 +128,53 @@ pub(super) struct RepairTargetDecision {
     pub(super) target_hint: Option<RecoveryTargetHint>,
     pub(super) authority: RepairTargetAuthority,
     pub(super) operator_candidates: Vec<OperatorId>,
+    pub(super) candidate_audit: Vec<RepairTargetCandidateAudit>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hint(role: ArtifactRole, path: &str) -> RecoveryTargetHint {
+        RecoveryTargetHint {
+            role,
+            path: path.to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn audit_marks_selected_role_mismatch_lower_authority_and_unavailable() {
+        let selected = hint(ArtifactRole::Test, "tests/test_app.py");
+        let candidates = vec![
+            (
+                Some(hint(ArtifactRole::Implementation, "app.py")),
+                RepairTargetAuthority::CorrectionJob,
+            ),
+            (
+                Some(selected.clone()),
+                RepairTargetAuthority::SemanticCluster,
+            ),
+            (
+                Some(hint(ArtifactRole::Test, "tests/old_test.py")),
+                RepairTargetAuthority::AssessmentHint,
+            ),
+            (None, RepairTargetAuthority::RepairJobHint),
+        ];
+
+        let audit =
+            audit_repair_target_candidates(&candidates, Some(&selected), Some(ArtifactRole::Test));
+
+        assert_eq!(
+            audit.iter().map(|entry| entry.status).collect::<Vec<_>>(),
+            vec![
+                RepairTargetCandidateStatus::RejectedRoleMismatch,
+                RepairTargetCandidateStatus::Selected,
+                RepairTargetCandidateStatus::RejectedLowerAuthority,
+                RepairTargetCandidateStatus::Unavailable,
+            ]
+        );
+    }
 }
 
 impl RepairTargetDecision {
@@ -53,6 +184,7 @@ impl RepairTargetDecision {
         target_hint: Option<RecoveryTargetHint>,
         authority: RepairTargetAuthority,
         operator_candidates: Vec<OperatorId>,
+        candidate_audit: Vec<RepairTargetCandidateAudit>,
     ) -> Self {
         Self {
             failure_class,
@@ -60,6 +192,7 @@ impl RepairTargetDecision {
             target_hint,
             authority,
             operator_candidates,
+            candidate_audit,
         }
     }
 
@@ -76,6 +209,10 @@ impl RepairTargetDecision {
             "operator_candidates": self.operator_candidates
                 .iter()
                 .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            "candidate_audit": self.candidate_audit
+                .iter()
+                .map(RepairTargetCandidateAudit::to_json_value)
                 .collect::<Vec<_>>(),
         })
     }

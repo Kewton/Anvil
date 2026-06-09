@@ -2673,11 +2673,13 @@ mod tests {
             actual_actions: (0..8).map(|_| big.clone()).collect(),
             exhausted_attempts_summary: Some(ExhaustedAttemptsSummary {
                 total: 3,
+                blocked_component: None,
                 per_cluster: vec![(big.clone(), vec!["implementation", "test"])],
                 last_repair_hypothesis: Some(big.clone()),
                 unfulfilled_obligations: Vec::new(),
                 invalid_proposal_reasons: Vec::new(),
                 exhausted_corrections: Vec::new(),
+                target_history: Vec::new(),
             }),
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
@@ -3187,6 +3189,7 @@ mod tests {
             actual_actions: (0..8).map(|_| big.clone()).collect(),
             exhausted_attempts_summary: Some(ExhaustedAttemptsSummary {
                 total: 3,
+                blocked_component: None,
                 per_cluster: (0..3)
                     .map(|_| (big.clone(), vec!["implementation", "test"]))
                     .collect(),
@@ -3194,6 +3197,7 @@ mod tests {
                 unfulfilled_obligations: Vec::new(),
                 invalid_proposal_reasons: Vec::new(),
                 exhausted_corrections: Vec::new(),
+                target_history: Vec::new(),
             }),
             diagnostic_target_missing_reason: Some(
                 DiagnosticTargetMissingReason::AssessmentMissing,
@@ -3278,6 +3282,7 @@ mod tests {
             actual_actions: vec![],
             exhausted_attempts_summary: Some(ExhaustedAttemptsSummary {
                 total: 2,
+                blocked_component: None,
                 per_cluster: vec![(
                     "a1b2c3d4e5f60718".to_string(),
                     vec!["implementation", "test"],
@@ -3286,6 +3291,7 @@ mod tests {
                 unfulfilled_obligations: Vec::new(),
                 invalid_proposal_reasons: Vec::new(),
                 exhausted_corrections: Vec::new(),
+                target_history: Vec::new(),
             }),
             diagnostic_target_missing_reason: None,
             no_progress_reason: None,

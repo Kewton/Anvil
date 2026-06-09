@@ -129,6 +129,7 @@ fn render_safe_stop_payload(report: &SafeStopReport, truncated: bool) -> serde_j
     let exhausted = report.exhausted_attempts_summary.as_ref().map(|s| {
         serde_json::json!({
             "total": s.total,
+            "blocked_component": s.blocked_component,
             "per_cluster": s.per_cluster.iter().map(|(k, roles)| {
                 serde_json::json!([k, roles])
             }).collect::<Vec<_>>(),
@@ -161,6 +162,15 @@ fn render_safe_stop_payload(report: &SafeStopReport, truncated: bool) -> serde_j
                     "failure_domain": entry.failure_domain.map(|domain| domain.as_str()),
                     "correction_kind": entry.correction_kind.map(|kind| kind.as_str()),
                     "reason": entry.reason.map(|reason| reason.as_str()),
+                })
+            }).collect::<Vec<_>>(),
+            "target_history": s.target_history.iter().map(|entry| {
+                serde_json::json!({
+                    "cluster": entry.cluster,
+                    "role": entry.role.label(),
+                    "path": entry.path,
+                    "bucket": entry.bucket,
+                    "exhausted": entry.exhausted,
                 })
             }).collect::<Vec<_>>(),
         })
