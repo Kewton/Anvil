@@ -48,6 +48,9 @@ pub(super) use super::task_contract_data_output_context::{
     request_mentions_protected_data_artifact_path,
 };
 #[cfg(test)]
+use super::task_contract_deliverable_lifecycle::ObjectiveLifecycleStage;
+use super::task_contract_deliverable_lifecycle::objective_deliverable_stage;
+#[cfg(test)]
 use super::task_contract_deliverable_projection::deliverable_kind_for_role;
 use super::task_contract_deliverable_projection::{
     default_deliverable_path, deliverables_from_contract_parts,
@@ -76,12 +79,10 @@ pub(super) use super::task_contract_path_context::{
     DATA_SHAPE_NOUNS, OUTPUT_VERB_STEMS_ASCII, OutputContextScan, contains_any,
     contains_output_verb, validated_obligation_path,
 };
+use super::task_contract_recovery_planning::recovery_target_hint_for_missing_with_contract;
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
     recovery_target_hint_for_blocking_obligation_diagnostic,
-};
-use super::task_contract_recovery_planning::{
-    order_missing_deliverables_for_recovery, recovery_target_hint_for_missing_with_contract,
 };
 pub(super) use super::task_contract_request_inference::{
     SETUP_MARKER_NEEDLES_ASCII, SETUP_MARKER_NEEDLES_JP, infer_intent, infer_project_language,
@@ -595,30 +596,6 @@ pub(super) use super::task_contract_recovery_model::{
     ArtifactExcerpts, ArtifactRecoveryAction, ArtifactRecoveryInputs, MAX_ARTIFACT_EXCERPT_BYTES,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ObjectiveLifecycleStage {
-    MissingDeliverable {
-        missing: Vec<ArtifactRole>,
-        target_hint: Option<RecoveryTargetHint>,
-    },
-    DeliverablesSatisfied,
-}
-
-impl ObjectiveLifecycleStage {
-    fn into_recovery_action(self) -> Option<ArtifactRecoveryAction> {
-        match self {
-            ObjectiveLifecycleStage::MissingDeliverable {
-                missing,
-                target_hint,
-            } => Some(ArtifactRecoveryAction::Continue {
-                missing,
-                target_hint,
-            }),
-            ObjectiveLifecycleStage::DeliverablesSatisfied => None,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Issue #636: behavior coverage judgement (private to task_contract).
 // ---------------------------------------------------------------------------
@@ -828,42 +805,6 @@ fn forbidden_artifact_action(
     })
 }
 
-fn objective_deliverable_stage(
-    inputs: &ArtifactRecoveryInputs<'_>,
-    observed: &[ArtifactRole],
-) -> ObjectiveLifecycleStage {
-    let objective = inputs.contract.objective_contract();
-    let mut missing = Vec::new();
-    for role in objective.required_deliverables() {
-        if required_role_satisfied(
-            inputs.contract,
-            inputs.evidence,
-            inputs.artifacts,
-            inputs.artifact_excerpts,
-            observed,
-            *role,
-        ) {
-            continue;
-        }
-        missing.push(*role);
-    }
-    order_missing_deliverables_for_recovery(&mut missing);
-
-    if missing.is_empty() {
-        return ObjectiveLifecycleStage::DeliverablesSatisfied;
-    }
-
-    ObjectiveLifecycleStage::MissingDeliverable {
-        target_hint: recovery_target_hint_for_missing_with_contract(
-            inputs.contract,
-            inputs.artifacts,
-            inputs.artifact_excerpts,
-            &missing,
-        ),
-        missing,
-    }
-}
-
 fn unexpected_data_output_artifact_action(
     inputs: &ArtifactRecoveryInputs<'_>,
 ) -> Option<ArtifactRecoveryAction> {
@@ -915,7 +856,7 @@ fn artifact_ready_for_verification(artifacts: &[ArtifactState], role: ArtifactRo
     })
 }
 
-fn required_role_satisfied(
+pub(super) fn required_role_satisfied(
     contract: &TaskContract,
     evidence: &EvidenceSet,
     artifacts: &[ArtifactState],
