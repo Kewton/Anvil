@@ -591,67 +591,9 @@ enum EvaluateMode<'a> {
 // unchanged.
 pub(super) use super::repair_job::VerifierRepairState;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ArtifactRecoveryAction {
-    Continue {
-        missing: Vec<ArtifactRole>,
-        target_hint: Option<RecoveryTargetHint>,
-    },
-    RunVerifier,
-    RepairArtifact {
-        target_hint: Option<RecoveryTargetHint>,
-    },
-    Done,
-    /// Issue #651: mirror of `CompletionDecision::SafeStop` for the
-    /// recovery planner side. Carries the same `SafeStopReason` so the
-    /// caller can emit reason-specific log keys without re-deriving the
-    /// classification.
-    SafeStop {
-        reason: SafeStopReason,
-    },
-}
-
-/// Issue #636: bounded `ArtifactRole -> excerpt` sidecar carried alongside
-/// the existing artifact / evidence inputs into `plan_artifact_recovery`.
-/// `KISS / DR1-004`: kept as a `HashMap` type alias instead of a wrapper
-/// struct. The `bounded_post_edit_excerpt` SSOT in `turn.rs` is responsible
-/// for sizing each value at or below [`MAX_ARTIFACT_EXCERPT_BYTES`] before
-/// insertion. No `pub use` is added at the loop_run facade (DR3-001).
-pub(super) type ArtifactExcerpts = std::collections::HashMap<ArtifactRole, String>;
-
-/// Issue #636: upper byte cap for any single post-edit excerpt collected
-/// by `bounded_post_edit_excerpt`. 8 KiB is intentionally smaller than
-/// `required_behavior::MAX_REQUEST_SCAN_BYTES` (64 KiB) so per-turn excerpt
-/// memory stays bounded even when many artifact roles fire. Used as the
-/// SSOT by `turn.rs::bounded_post_edit_excerpt`; not re-exported via the
-/// `loop_run` facade (DR3-001).
-pub(super) const MAX_ARTIFACT_EXCERPT_BYTES: usize = 8 * 1024;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ArtifactRecoveryInputs<'a> {
-    pub(super) contract: &'a TaskContract,
-    pub(super) evidence: &'a EvidenceSet,
-    pub(super) artifacts: &'a [ArtifactState],
-    pub(super) repair_state: &'a VerifierRepairState,
-    /// Issue #636: bounded post-edit excerpt per observed role.
-    /// `&ArtifactExcerpts::new()` (empty) is the back-compat sentinel that
-    /// disables behavior-coverage gating.
-    pub(super) artifact_excerpts: &'a ArtifactExcerpts,
-    /// Issue #646 (A1/B2): when `true`, the planner MUST suppress
-    /// `RunVerifier` so the model does not enter an infinite NoVerifier
-    /// retry loop before an in-scope edit lands. Driven by the
-    /// `MissingVerifierJob` first-class state on `Agent`. `false` is the
-    /// back-compat default for tests / call sites that have no awareness
-    /// of the missing-verifier track.
-    pub(super) missing_verifier_suppress_retry: bool,
-    /// Issue #651 Phase 5: SSOT slice of "test artifact paths the
-    /// current task owns and that the structured verifier can bind to".
-    /// Threaded through to `TaskContract::evaluate_with_owned_test_artifacts`
-    /// so the SafeStop gate fires on `test_execution_required &&
-    /// owned_test_artifacts.is_empty()`. `&[]` is the back-compat default
-    /// (existing tests / planner sites that have no ownership view).
-    pub(super) owned_test_artifacts: &'a [String],
-}
+pub(super) use super::task_contract_recovery_model::{
+    ArtifactExcerpts, ArtifactRecoveryAction, ArtifactRecoveryInputs, MAX_ARTIFACT_EXCERPT_BYTES,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ObjectiveLifecycleStage {
@@ -1033,23 +975,6 @@ pub(super) fn artifact_identity_path_ready_for_verification(
                     | ArtifactStateKind::Verified
             )
     })
-}
-
-impl From<CompletionDecision> for ArtifactRecoveryAction {
-    fn from(decision: CompletionDecision) -> Self {
-        match decision {
-            CompletionDecision::Continue { missing } => ArtifactRecoveryAction::Continue {
-                missing,
-                target_hint: None,
-            },
-            CompletionDecision::Verify => ArtifactRecoveryAction::RunVerifier,
-            CompletionDecision::Done => ArtifactRecoveryAction::Done,
-            // Issue #651: `_ =>` fallback is intentionally forbidden so that
-            // a future `SafeStopReason` variant lights up compile errors at
-            // every match site.
-            CompletionDecision::SafeStop { reason } => ArtifactRecoveryAction::SafeStop { reason },
-        }
-    }
 }
 
 impl TaskContract {

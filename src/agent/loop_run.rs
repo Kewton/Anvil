@@ -1254,6 +1254,7 @@ mod task_contract_evidence_stage;
 mod task_contract_input_projection;
 mod task_contract_obligation_planning;
 mod task_contract_path_context;
+mod task_contract_recovery_model;
 mod task_contract_recovery_planning;
 mod task_contract_request_inference;
 #[cfg(test)]
