@@ -138,6 +138,11 @@ fn append_contract_runtime_messages(
     {
         messages.push(message);
     }
+    if let Some(message) =
+        super::test_expectation_audit::test_expectation_audit_message_for_execution(&execution)
+    {
+        messages.push(message);
+    }
 }
 
 fn model_visible_session_messages(

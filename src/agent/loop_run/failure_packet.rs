@@ -480,6 +480,12 @@ fn extract_observed_expected_pairs(output: &str) -> Vec<ObservedExpectedPair> {
                 ObservedExpectedPair::new(&observed, &expected, "assert_equal"),
             );
         }
+        if let Some((observed, expected)) = observed_expected_from_unittest_assertion_line(line) {
+            push_pair(
+                &mut pairs,
+                ObservedExpectedPair::new(&observed, &expected, "unittest_assert_equal"),
+            );
+        }
 
         let trimmed = line.trim();
         if let Some(left) = trimmed.strip_prefix("left:") {
@@ -519,6 +525,14 @@ fn observed_expected_pairs_from_assert_line(line: &str) -> Vec<(String, String)>
         }
     }
     pairs
+}
+
+fn observed_expected_from_unittest_assertion_line(line: &str) -> Option<(String, String)> {
+    let tail = line.trim().strip_prefix("AssertionError:")?.trim();
+    let (observed, expected) = tail.split_once(" != ")?;
+    let observed = normalize_observed_expected_token(observed)?;
+    let expected = normalize_observed_expected_token(expected)?;
+    (observed != expected).then_some((observed, expected))
 }
 
 fn observed_expected_from_assert_tail(tail: &str) -> Option<(String, String)> {
@@ -625,6 +639,31 @@ assertion `left == right` failed
         assert_eq!(
             pairs,
             vec![ObservedExpectedPair::new("1", "2", "left_right")]
+        );
+    }
+
+    #[test]
+    fn failure_packet_extracts_unittest_assert_equal_pairs() {
+        let output = r#"
+FAIL: test_multiple_words (test_text_rank.TestLongestWord)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "tests/test_text_rank.py", line 24, in test_multiple_words
+    self.assertEqual(text_rank.longest_word("hello world foo"), "world")
+AssertionError: 'hello' != 'world'
+- hello
++ world
+"#;
+
+        let pairs = extract_observed_expected_pairs(output);
+
+        assert_eq!(
+            pairs,
+            vec![ObservedExpectedPair::new(
+                "hello",
+                "world",
+                "unittest_assert_equal"
+            )]
         );
     }
 

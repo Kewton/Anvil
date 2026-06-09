@@ -1236,6 +1236,7 @@ mod summary;
 mod task_contract;
 mod task_contract_artifact_contract;
 mod task_contract_artifact_predicates;
+mod task_contract_completion_policy;
 mod task_contract_controller_packet;
 mod task_contract_deliverable_projection;
 mod task_contract_display;
@@ -1245,6 +1246,7 @@ mod task_contract_obligation_planning;
 mod task_contract_recovery_planning;
 #[cfg(test)]
 mod task_kind_confirm_e2e_tests;
+mod test_expectation_audit;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
 // Private module, not re-exported (DR3-001) — the 18 former `from_request`
 // sites and `run_turn` consume it via `super::task_classification::*`.
