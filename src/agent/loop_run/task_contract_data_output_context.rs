@@ -1,10 +1,10 @@
 //! Data-output direction and explicit data artifact path inference.
 //!
 //! This module keeps DataOutput-specific output-context judgement out of
-//! `task_contract.rs` while reusing that file's shared `OutputContextScan` and
-//! cue vocabulary. It should not grow task-specific filename branches.
+//! `task_contract.rs` while reusing shared `OutputContextScan` and cue
+//! vocabulary. It should not grow task-specific filename branches.
 
-use super::task_contract::{
+use super::task_contract_path_context::{
     DATA_INPUT_EXTRA, INPUT_VERBS_ASCII, JP_OUTPUT_MARKERS, OUTPUT_AFTER_ASCII, OUTPUT_PREP_ASCII,
     OUTPUT_VERB_STEMS_ASCII, OutputContextScan, bounded_context_after, bounded_context_before,
     contains_any, contains_ascii_token, contains_output_verb, normalize_explicit_artifact_path,

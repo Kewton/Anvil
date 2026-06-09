@@ -60,6 +60,17 @@ use super::task_contract_input_projection::ContractRequestInputs;
 #[cfg(test)]
 pub(super) use super::task_contract_obligation_planning::default_readme_required_sections;
 pub(super) use super::task_contract_obligation_planning::push_or_merge_artifact_obligation;
+pub(super) use super::task_contract_path_context::{
+    AUTHORING_KEYWORD_NEEDLES_ASCII, DATA_SHAPE_NOUNS, DOCS_OUTPUT_AFTER_JP,
+    INPUT_REFERENCE_VERBS_ASCII, INPUT_VERBS_ASCII, OUTPUT_AFTER_ASCII, OUTPUT_PREP_ASCII,
+    OUTPUT_VERB_STEMS_ASCII, OutputContextScan, RESEARCH_OUTPUT_AFTER_JP, bounded_context_after,
+    bounded_context_before, contains_any, contains_ascii_token, contains_output_verb,
+    is_ascii_word_char, normalize_explicit_user_artifact_path,
+};
+#[cfg(test)]
+pub(super) use super::task_contract_path_context::{
+    mask_path_tokens, normalize_explicit_artifact_path, path_token_is_maskable,
+};
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
     recovery_target_hint_for_blocking_obligation_diagnostic,
@@ -1796,211 +1807,9 @@ fn normalize_explicit_section_label(raw: &str) -> Option<String> {
     Some(normalized)
 }
 
-// ============================================================================
-// === Issue #937: output-context detection SSOT ===
-//
-// Output-context judgement (does a request create a UsageDocs/DataOutput
-// obligation?) used to be pure substring matching over the WHOLE request,
-// filenames included, so a filename token (`draft_report.md`, `output_data.csv`)
-// fabricated false obligations. This block consolidates the shared primitives:
-//
-//   1. `split_path_tokens`  — the single tokenizer SSOT (path-char split + byte
-//      offsets). `mask_path_tokens` and the path extractors share it so the
-//      split boundary cannot drift (DS1-006).
-//   2. `mask_path_tokens`   — blank recognized-extension path tokens to EQUAL
-//      length spaces (index-preserving), so verb/noun scans run over a
-//      filename-stripped string without a filename leaking a false cue.
-//   3. cue-vocabulary `const`s — per-domain cue sets stay parameterized; only
-//      the vocabulary + boundary matcher + masking are shared. Each surface
-//      keeps its OWN aggregation (any/every) and polarity (ADD/DROP).
-//   4. `OutputContextScan { lower, lower_masked }` — built once per
-//      `from_request` and threaded by `&str` (DS3-001, no O(N²) re-masking).
-//
-// The masked string is a TRANSIENT local: never stored on the contract, logged,
-// or persisted (§5 Security). Obligation paths still go through
-// `normalize_explicit_user_artifact_path` / `validated_obligation_path`.
-// ============================================================================
-
-/// Issue #937 (DS1-006): the single tokenizer SSOT. Splits on any character that
-/// is NOT a path-construction char (`[alnum _ - . / \]`) and yields each token's
-/// byte offset in `s`. Both `mask_path_tokens` and the path extractors share
-/// this so the split boundary can never drift between mask and extraction.
-fn split_path_tokens(s: &str) -> impl Iterator<Item = (usize, &str)> {
-    s.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\')))
-        .scan(0usize, move |cursor, token| {
-            // Reconstruct the byte offset: tokens come back in order, and the
-            // delimiters between them are single non-path chars. `find` from the
-            // cursor recovers the precise start (tokens may repeat).
-            let start = if token.is_empty() {
-                *cursor
-            } else {
-                // SAFETY of indices: token is a sub-slice produced by split, so a
-                // forward `find` from the cursor lands on this exact occurrence.
-                let rel = s[*cursor..].find(token).map(|r| *cursor + r);
-                let start = rel.unwrap_or(*cursor);
-                *cursor = start + token.len();
-                start
-            };
-            Some((start, token))
-        })
-}
-
-/// Issue #937 (DS1-005 案A): is `token` a recognized artifact path? Mask + extraction
-/// share this exact predicate so the "what is a path" set cannot drift. A token
-/// counts when it normalizes to an explicit artifact path (recognized-extension
-/// allowlist, identical to `normalize_explicit_artifact_path`) OR contains a
-/// path separator. The trailing-`.` run is trimmed before the extension test so a
-/// sentence-final `output_data.csv.` still recognizes (M6).
-fn path_token_is_maskable(token: &str) -> bool {
-    let trimmed = token.trim_end_matches('.');
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return true;
-    }
-    normalize_explicit_artifact_path(trimmed).is_some()
-}
-
-/// Issue #937 (DS1-005 / 判断#1): blank every recognized path token to an
-/// EQUAL-LENGTH run of spaces, preserving every byte index so callers can locate
-/// occurrences via the original `lower` and read context windows on the masked
-/// copy. Non-path tokens (real verbs/nouns, `v1.2.3`, `3.14`, `e.g`, JP) are kept
-/// verbatim — only authentic path tokens are erased (no over-masking). The
-/// masked string is judgement-only and never persisted.
-fn mask_path_tokens(lower: &str) -> String {
-    // Collect the byte spans of maskable path tokens; every such span is
-    // ASCII-only (alnum/_-./\\), so blanking each byte to a space is index- and
-    // UTF-8-stable. No `unsafe`: rebuild the string byte-wise, substituting
-    // spaces inside a span and copying every other byte verbatim.
-    let spans: Vec<(usize, usize)> = split_path_tokens(lower)
-        .filter(|(_, token)| path_token_is_maskable(token))
-        .map(|(start, token)| (start, start + token.len()))
-        .collect();
-    if spans.is_empty() {
-        return lower.to_string();
-    }
-    let bytes = lower.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut span_iter = spans.iter().peekable();
-    for (idx, &b) in bytes.iter().enumerate() {
-        while span_iter.peek().is_some_and(|(_, end)| idx >= *end) {
-            span_iter.next();
-        }
-        let in_span = span_iter
-            .peek()
-            .is_some_and(|(start, end)| idx >= *start && idx < *end);
-        out.push(if in_span { b' ' } else { b });
-    }
-    // SAFETY-free: spans cover ASCII path chars only, so the length and all
-    // char boundaries are preserved; the result is valid UTF-8.
-    String::from_utf8(out).unwrap_or_else(|_| lower.to_string())
-}
-
-// --- shared cue vocabulary (SSOT) -----------------------------------------
-// ASCII verb STEMS only; the matcher (`contains_output_verb`) absorbs an
-// optional trailing plural `s`. JP markers are substring (no word boundary).
-pub(super) const OUTPUT_VERB_STEMS_ASCII: &[&str] = &[
-    "write", "produce", "generate", "create", "export", "save", "output", "compile", "draft",
-    "prepare", "emit",
-];
-pub(super) const OUTPUT_PREP_ASCII: &[&str] = &["to", "into"];
-pub(super) const OUTPUT_AFTER_ASCII: &[&str] = &[" output", " deliverable", " artifact"];
-pub(super) const INPUT_VERBS_ASCII: &[&str] =
-    &["input", "source", "from", "read", "reads", "load", "loads"];
-/// Shared JP output markers (substring). **bare `書` is intentionally excluded**
-/// (DS1-003): it lives only in research's `RESEARCH_OUTPUT_AFTER_JP` so `文書`
-/// (document) never fabricates a data output cue.
-pub(super) const JP_OUTPUT_MARKERS: &[&str] = &["生成", "出力", "作成", "書き出", "まとめ"];
-/// `mentions_output_shape` noun part only (DS1-002/004); verbs are NOT replaced.
-pub(super) const DATA_SHAPE_NOUNS: &[&str] = &["schema", "column", "columns", "出力", "列"];
-/// research-only **directional after-window** JP output markers (DS1-001). Bare
-/// `書` is isolated here (DS1-003) and substring-covers `書き出`/`書いて`. Issue
-/// #937 CB-001: this is the directional after-window set — it is **no longer
-/// byte-identical** to the pre-#937 `:2654` whole-request set `[作成,出力,書き出,
-/// まとめ,書いて]`, by design. The whole-request JP scan (which leaked a later
-/// `出力`/`作成` backward onto an earlier neutral input path) was removed from
-/// `report_path_in_output_context_with_scan`; its `作成` capability was folded
-/// into this after-window so the full original JP output vocabulary is preserved
-/// directionally (the rest — `出力`/`まとめ`/`書き出`/`書いて` — was already here).
-const RESEARCH_OUTPUT_AFTER_JP: &[&str] = &["まとめ", "出力", "書", "作成"];
-/// data-only extra input cues, appended to `INPUT_VERBS_ASCII`.
-pub(super) const DATA_INPUT_EXTRA: &[&str] = &["sample", "example", "fixture", "ingest"];
-/// docs-only output after-window JP markers (判断#5, polarity-preserving).
-const DOCS_OUTPUT_AFTER_JP: &[&str] = &["に書いて", "に出力", "として保存"];
-/// Issue #937 (Codex High): shared input-reference (reading/comparison) verbs.
-/// A docs/report path governed by one of these in its (masked) before-window is
-/// being CONSUMED — read or compared — not produced, so it is obligation-free
-/// for the Research AND Authoring entry points (`Compare findings in
-/// draft_report.md`, `Review draft_report.md`). `read`/`reads` already live in
-/// `INPUT_VERBS_ASCII`; this set adds the reading/comparison verbs that the
-/// authoring gate previously ignored. Word-boundary matched over masked text.
-const INPUT_REFERENCE_VERBS_ASCII: &[&str] = &[
-    "compare",
-    "compares",
-    "compared",
-    "comparing",
-    "review",
-    "reviews",
-    "reviewed",
-    "reviewing",
-    "summarize",
-    "summarise",
-    "summarizes",
-    "summarises",
-    "analyze",
-    "analyse",
-    "analyzes",
-    "analyses",
-];
-/// Issue #919 / #937 (Codex High): ASCII authoring-verb needles (SSOT). Used by
-/// `request_matches_authoring_keyword` (substring over masked text) and by the
-/// directional nearest-cue scan (`docs_path_is_input_reference_with_scan`, token
-/// `starts_with`) so an authoring verb like `rewrite`/`proofread` that governs a
-/// neutral in-place docs target overrides an earlier `review`/`compare` cue.
-const AUTHORING_KEYWORD_NEEDLES_ASCII: &[&str] = &[
-    "translate",
-    "translation",
-    "rewrite",
-    "reword",
-    "paraphrase",
-    "proofread",
-    "copyedit",
-    "draft",
-];
-
-/// Issue #937 (DS1-002): match an ASCII output verb STEM at a word boundary,
-/// absorbing an optional trailing plural `s` (so `generates`/`writes` match the
-/// `generate`/`write` stem). Runs over filename-stripped text supplied by caller.
-pub(super) fn contains_output_verb(text: &str, stems: &[&str]) -> bool {
-    stems.iter().any(|stem| {
-        contains_ascii_token(text, stem) || {
-            let mut plural = String::with_capacity(stem.len() + 1);
-            plural.push_str(stem);
-            plural.push('s');
-            contains_ascii_token(text, &plural)
-        }
-    })
-}
-
-/// Issue #937 (DS3-001): the per-`from_request` output-context scan. Built once;
-/// threaded by `&str` into every surface so the (expensive) mask allocation
-/// happens exactly once per top-level request. Stack-only, never stored.
-pub(super) struct OutputContextScan {
-    pub(super) lower: String,
-    pub(super) lower_masked: String,
-}
-
-impl OutputContextScan {
-    pub(super) fn new(request: &str) -> Self {
-        let lower = request.to_ascii_lowercase();
-        let lower_masked = mask_path_tokens(&lower);
-        Self {
-            lower,
-            lower_masked,
-        }
-    }
-}
+// Generic path masking, explicit artifact path normalization, bounded context,
+// and ASCII token matching live in `task_contract_path_context`. This file keeps
+// the domain-specific obligation and request-intent aggregation logic.
 
 /// Issue #922 (P5 / DD4 / PR-003): a research request *intends a written report
 /// artifact* (vs. a genuine answer-only Q&A) when EITHER (a) a doc-like path is
@@ -3715,13 +3524,6 @@ fn docs_path_file_name_looks_like_source(path: &str) -> bool {
     )
 }
 
-pub(super) fn normalize_explicit_user_artifact_path(token: &str) -> Option<String> {
-    let path = normalize_explicit_artifact_path(token)?;
-    crate::util::workspace_paths::WorkspacePolicy::default()
-        .admits_artifact_display_path(&path)
-        .then_some(path)
-}
-
 /// Issue #918 (P1): hard cap (bytes) on a stored obligation path.
 pub(super) const MAX_OBLIGATION_PATH_BYTES: usize = 4096;
 
@@ -3782,105 +3584,6 @@ fn truncate_obligation_path(mut path: String) -> String {
     }
     path.truncate(end);
     path
-}
-
-pub(super) fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
-    let trimmed = token.trim_matches(|ch: char| {
-        ch.is_ascii_whitespace()
-            || matches!(
-                ch,
-                '`' | '\''
-                    | '"'
-                    | ','
-                    | '.'
-                    | ':'
-                    | ';'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '<'
-                    | '>'
-                    | '、'
-                    | '。'
-                    | '，'
-                    | '．'
-            )
-    });
-    if !trimmed.contains('.') {
-        return None;
-    }
-    let path = trimmed.replace('\\', "/");
-    if matches!(
-        path.to_ascii_lowercase().as_str(),
-        "node.js" | "next.js" | "vue.js"
-    ) {
-        return None;
-    }
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.starts_with("./.")
-        || path.contains("://")
-        || path.bytes().any(|b| b.is_ascii_control())
-    {
-        return None;
-    }
-    let segments = path.split('/').collect::<Vec<_>>();
-    if segments.iter().any(|segment| {
-        segment.is_empty()
-            || *segment == "."
-            || *segment == ".."
-            || !segment
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-    }) {
-        return None;
-    }
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|ext| ext.to_str())?
-        .to_ascii_lowercase();
-    let recognized = matches!(
-        ext.as_str(),
-        "py" | "rs"
-            | "ts"
-            | "tsx"
-            | "js"
-            | "jsx"
-            | "csv"
-            | "tsv"
-            | "jsonl"
-            | "md"
-            | "mdx"
-            | "txt"
-            | "rst"
-            | "toml"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "lock"
-            | "ndjson"
-            | "parquet"
-    );
-    recognized.then_some(path)
-}
-
-pub(super) fn bounded_context_before(text: &str, end: usize, max_bytes: usize) -> &str {
-    let mut start = end.saturating_sub(max_bytes);
-    while start < end && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..end]
-}
-
-pub(super) fn bounded_context_after(text: &str, start: usize, max_bytes: usize) -> &str {
-    let mut end = (start + max_bytes).min(text.len());
-    while end > start && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[start..end]
 }
 
 pub(super) fn normalized_artifact_path_eq(actual: &str, expected: &str) -> bool {
@@ -4069,29 +3772,6 @@ fn done_gate_safe_stop_reason(
         return SafeStopReason::VerifierWeak;
     }
     SafeStopReason::VerifierMissing
-}
-
-pub(super) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-pub(super) fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
-    haystack.match_indices(needle).any(|(idx, _)| {
-        let before = haystack[..idx]
-            .chars()
-            .next_back()
-            .is_none_or(|ch| !is_ascii_word_char(ch));
-        let after_idx = idx + needle.len();
-        let after = haystack[after_idx..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !is_ascii_word_char(ch));
-        before && after
-    })
-}
-
-fn is_ascii_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric()
 }
 
 fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
