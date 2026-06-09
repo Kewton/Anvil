@@ -38,10 +38,6 @@ pub(super) use super::task_contract_core::{
     DeliverableObligation, ProjectIntent, RecoveryTarget, RecoveryTargetHint, SafeStopReason,
     TaskClassification,
 };
-#[cfg(test)]
-use super::task_contract_data_output_context::{
-    data_path_has_output_context, request_explicitly_requests_standalone_data_artifact,
-};
 pub(super) use super::task_contract_data_output_context::{
     data_path_has_output_context_with_scan, explicit_path_with_data_extension,
     explicit_path_with_data_extension_with_scan,
@@ -67,8 +63,6 @@ use super::task_contract_input_projection::ContractRequestInputs;
 use super::task_contract_obligation_planning::default_ops_runbook_path_from_request;
 #[cfg(test)]
 pub(super) use super::task_contract_obligation_planning::default_readme_required_sections;
-#[cfg(test)]
-use super::task_contract_obligation_planning::docs_path_is_clearly_source_input;
 pub(super) use super::task_contract_obligation_planning::{
     explicit_artifact_obligations_from_request,
     explicit_artifact_obligations_from_request_with_scan,
@@ -80,11 +74,6 @@ pub(super) use super::task_contract_obligation_planning::{
 pub(super) use super::task_contract_path_context::{
     DATA_SHAPE_NOUNS, OUTPUT_VERB_STEMS_ASCII, OutputContextScan, contains_any,
     contains_output_verb, validated_obligation_path,
-};
-#[cfg(test)]
-pub(super) use super::task_contract_path_context::{
-    MAX_OBLIGATION_PATH_BYTES, contains_ascii_token, mask_path_tokens,
-    normalize_explicit_artifact_path, path_token_is_maskable,
 };
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
@@ -2126,6 +2115,7 @@ fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::task_contract_path_context::MAX_OBLIGATION_PATH_BYTES;
     use super::*;
 
     // ---- Issue #920 (P3): ArtifactRole round-trip / totality / append-only ----
@@ -2628,7 +2618,7 @@ mod tests {
         let long = format!("dir/{}.txt", "a".repeat(8000));
         let got = super::validated_obligation_path(long);
         assert!(
-            got.len() <= super::MAX_OBLIGATION_PATH_BYTES,
+            got.len() <= MAX_OBLIGATION_PATH_BYTES,
             "path must be capped to MAX_OBLIGATION_PATH_BYTES"
         );
     }
@@ -7977,266 +7967,5 @@ Create the README file."#;
             all_evidence.push(CompletionEvidence::ReportCompletenessPass { path: Some(p) });
         }
         assert_eq!(contract.evaluate(&all_evidence), CompletionDecision::Done);
-    }
-
-    // ===================================================================
-    // Issue #937: output-context SSOT primitive unit pins (M1-M7)
-    // ===================================================================
-
-    /// M1: equal-length / index-preserving masking (all cases).
-    #[test]
-    fn mask_path_tokens_preserves_length_m1() {
-        for s in [
-            "compare findings in draft_report.md and summary.md",
-            "idとtotalの列を持つoutput.csvを生成してください",
-            "what columns are in output_data.csv, a csv file?",
-            "generate data/results.jsonl with columns id from input.jsonl",
-            "v1.2.3 and 3.14 and e.g and i.e are not paths",
-            "",
-            "no paths here at all",
-        ] {
-            assert_eq!(
-                mask_path_tokens(s).len(),
-                s.len(),
-                "mask must be byte-length preserving: {s:?}"
-            );
-        }
-    }
-
-    /// M2: JP / non-ASCII content survives verbatim (never masked).
-    #[test]
-    fn mask_path_tokens_keeps_japanese_verbatim_m2() {
-        let masked = mask_path_tokens("idとtotalの列を持つoutput.csvを生成してください");
-        assert!(masked.contains("生成"), "JP verb must survive: {masked:?}");
-        assert!(masked.contains('列'), "JP noun must survive: {masked:?}");
-        // The path token IS blanked.
-        assert!(
-            !masked.contains("output.csv"),
-            "path must be blanked: {masked:?}"
-        );
-    }
-
-    /// M3: multiple path tokens are all blanked in one pass.
-    #[test]
-    fn mask_path_tokens_blanks_all_paths_m3() {
-        let masked = mask_path_tokens("a report.md and b data.csv");
-        assert!(
-            !masked.contains("report.md"),
-            "first path blanked: {masked:?}"
-        );
-        assert!(
-            !masked.contains("data.csv"),
-            "second path blanked: {masked:?}"
-        );
-        // Non-path words stay.
-        assert!(masked.contains(" and "), "connective stays: {masked:?}");
-    }
-
-    /// M4: a filename-internal verb is blanked with the path; a standalone verb
-    /// (not inside a recognized path) stays.
-    #[test]
-    fn mask_path_tokens_filename_internal_vs_standalone_m4() {
-        let masked = mask_path_tokens("draft a report into draft_report.md now");
-        // The standalone `draft` (a real word) survives.
-        assert!(
-            contains_ascii_token(&masked, "draft"),
-            "standalone draft must survive: {masked:?}"
-        );
-        // The filename `draft_report.md` is fully blanked.
-        assert!(
-            !masked.contains("draft_report.md"),
-            "filename blanked: {masked:?}"
-        );
-    }
-
-    /// M5: only recognized-extension / separator path tokens are masked; numeric
-    /// version / abbreviation tokens are NOT.
-    #[test]
-    fn mask_path_tokens_recognized_extension_only_m5() {
-        let masked = mask_path_tokens("v1.2.3 release, see e.g output_data.csv and readme.ja.md");
-        assert!(masked.contains("v1.2.3"), "version verbatim: {masked:?}");
-        assert!(masked.contains("e.g"), "abbreviation verbatim: {masked:?}");
-        assert!(
-            !masked.contains("output_data.csv"),
-            "csv path blanked: {masked:?}"
-        );
-        assert!(
-            !masked.contains("readme.ja.md"),
-            "md path blanked: {masked:?}"
-        );
-        // separator path masks too.
-        let with_sep = mask_path_tokens("write data/results.jsonl now");
-        assert!(
-            !with_sep.contains("data/results.jsonl"),
-            "separator path blanked: {with_sep:?}"
-        );
-    }
-
-    /// M6: a sentence-final trailing-dot path still masks.
-    #[test]
-    fn mask_path_tokens_trailing_dot_edge_m6() {
-        let masked = mask_path_tokens("summarize the trends in output_data.csv.");
-        assert!(
-            !masked.contains("output_data.csv"),
-            "trailing-dot path blanked: {masked:?}"
-        );
-        assert_eq!(
-            masked.len(),
-            "summarize the trends in output_data.csv.".len()
-        );
-    }
-
-    /// M7: the mask allowlist MUST byte-match `normalize_explicit_artifact_path`'s
-    /// recognized-extension set. `path_token_is_maskable` defers to that exact
-    /// predicate, so every recognized extension masks and any non-recognized one
-    /// does not. If the two diverge (a new extension added to one only), this pin
-    /// fails (DS2-005).
-    #[test]
-    fn mask_path_tokens_allowlist_equals_normalize_m7() {
-        let recognized = [
-            "py", "rs", "ts", "tsx", "js", "jsx", "csv", "tsv", "jsonl", "md", "mdx", "txt", "rst",
-            "toml", "json", "yaml", "yml", "lock", "ndjson", "parquet",
-        ];
-        for ext in recognized {
-            let token = format!("file.{ext}");
-            assert!(
-                normalize_explicit_artifact_path(&token).is_some(),
-                "normalize must accept recognized .{ext}"
-            );
-            assert!(
-                path_token_is_maskable(&token),
-                "mask allowlist must accept recognized .{ext}"
-            );
-        }
-        // A non-recognized extension is masked by NEITHER.
-        for token in ["file.exe", "file.bin", "file.markdown", "3.14", "e.g"] {
-            assert_eq!(
-                normalize_explicit_artifact_path(token).is_some(),
-                path_token_is_maskable(token),
-                "mask allowlist must agree with normalize for {token:?}"
-            );
-        }
-        // A separator path is maskable even though normalize may reject extension.
-        assert!(path_token_is_maskable("dir/sub/file.csv"));
-    }
-
-    // ===================================================================
-    // Issue #937: directional / docs surface in-module pins (N2/N7/N8 +
-    // mode-1 directional unit pins).
-    // ===================================================================
-
-    /// N7 (authoring EN): `Translate README.ja.md and write README.md` →
-    /// `README.ja.md` is a clear source (pruned), `README.md` is the lone output.
-    #[test]
-    fn docs_source_discriminator_en_n7() {
-        let req = "Translate README.ja.md and write README.md";
-        assert!(
-            docs_path_is_clearly_source_input(req, "README.ja.md"),
-            "language-stamped translation source must be a clear source"
-        );
-        assert!(
-            !docs_path_is_clearly_source_input(req, "README.md"),
-            "the written output README.md must not be classified as source"
-        );
-    }
-
-    /// N8 (authoring JP): `README.ja.mdを翻訳してREADME.mdに書いてください` →
-    /// `README.ja.md` is the translation source (pruned via `翻訳`), `README.md`
-    /// is the lone output (kept via the `に書いて` DOCS_OUTPUT_AFTER_JP marker).
-    #[test]
-    fn docs_source_discriminator_jp_n8() {
-        let req = "README.ja.mdを翻訳してREADME.mdに書いてください";
-        assert!(
-            docs_path_is_clearly_source_input(req, "README.ja.md"),
-            "JP translation source must be a clear source"
-        );
-        assert!(
-            !docs_path_is_clearly_source_input(req, "README.md"),
-            "the `に書いて` output target README.md must not be classified as source"
-        );
-        // End-to-end: the contract keeps exactly README.md as the UsageDocs id.
-        let contract = TaskContract::from_request(req);
-        let docs: Vec<&str> = contract
-            .required_artifact_identities
-            .iter()
-            .filter(|o| o.role == ArtifactRole::UsageDocs)
-            .map(|o| o.path.as_str())
-            .collect();
-        assert_eq!(
-            docs,
-            vec!["README.md"],
-            "JP translation must prune the source and keep only README.md"
-        );
-    }
-
-    /// Data mode-1 demotion: `data_path_has_output_context` no longer treats an
-    /// output-looking stem as a standalone output; a directed verb/JP marker
-    /// does, and the auxiliary stem still protects against a downstream input.
-    #[test]
-    fn data_path_has_output_context_demotion_unit_pins() {
-        // Input reference, output-looking stem → false (demotion).
-        assert!(!data_path_has_output_context(
-            "Summarize the trends in output_data.csv",
-            "output_data.csv"
-        ));
-        // Directed EN verb in before-window → true.
-        assert!(data_path_has_output_context(
-            "Generate output.csv with columns id and score",
-            "output.csv"
-        ));
-        // JP after-window marker → true (#921).
-        assert!(data_path_has_output_context(
-            "idとtotalの列を持つoutput.csvを生成してください",
-            "output.csv"
-        ));
-        // Auxiliary stem guard: output stem + downstream `from ... input` → true.
-        assert!(data_path_has_output_context(
-            "Generate report output.csv from the input data.",
-            "output.csv"
-        ));
-        // input.jsonl filename is dropped as input.
-        assert!(!data_path_has_output_context(
-            "Generate data/results.jsonl from input.jsonl",
-            "input.jsonl"
-        ));
-    }
-
-    #[test]
-    fn data_path_direction_uses_nearest_governing_cue() {
-        let request = "Read orders.csv and create team_summary.json only.";
-        assert!(
-            !data_path_has_output_context(request, "orders.csv"),
-            "the read-governed CSV is an input"
-        );
-        assert!(
-            data_path_has_output_context(request, "team_summary.json"),
-            "the create-governed JSON is an output"
-        );
-
-        let contract = TaskContract::from_request(
-            "Read orders.csv and create team_summary.json only. The JSON must contain row_count, total_items, and items_by_team.",
-        );
-        let data_outputs: Vec<&str> = contract
-            .required_artifact_identities
-            .iter()
-            .filter(|identity| identity.role == ArtifactRole::DataOutput)
-            .map(|identity| identity.path.as_str())
-            .collect();
-        assert_eq!(data_outputs, vec!["team_summary.json"]);
-    }
-
-    /// Fifth-surface gate: the masked `output_action` closes R4 while keeping N4.
-    #[test]
-    fn standalone_data_artifact_masked_output_action_pins() {
-        // R4: filename `output` is masked; no real output verb → false.
-        assert!(!request_explicitly_requests_standalone_data_artifact(
-            "What columns are in output_data.csv, a CSV file?",
-            &"What columns are in output_data.csv, a CSV file?".to_ascii_lowercase()
-        ));
-        // N4: real `generate` verb survives masking → true.
-        assert!(request_explicitly_requests_standalone_data_artifact(
-            "Generate a CSV file with columns id and total",
-            &"Generate a CSV file with columns id and total".to_ascii_lowercase()
-        ));
     }
 }

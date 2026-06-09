@@ -234,3 +234,69 @@ fn data_path_file_stem(path: &str) -> Option<String> {
         .and_then(|stem| stem.to_str())?;
     Some(file_name.to_ascii_lowercase())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::task_contract::{ArtifactRole, TaskContract};
+    use super::*;
+
+    #[test]
+    fn data_path_has_output_context_demotion_unit_pins() {
+        assert!(!data_path_has_output_context(
+            "Summarize the trends in output_data.csv",
+            "output_data.csv"
+        ));
+        assert!(data_path_has_output_context(
+            "Generate output.csv with columns id and score",
+            "output.csv"
+        ));
+        assert!(data_path_has_output_context(
+            "idとtotalの列を持つoutput.csvを生成してください",
+            "output.csv"
+        ));
+        assert!(data_path_has_output_context(
+            "Generate report output.csv from the input data.",
+            "output.csv"
+        ));
+        assert!(!data_path_has_output_context(
+            "Generate data/results.jsonl from input.jsonl",
+            "input.jsonl"
+        ));
+    }
+
+    #[test]
+    fn standalone_data_artifact_masked_output_action_pins() {
+        assert!(!request_explicitly_requests_standalone_data_artifact(
+            "What columns are in output_data.csv, a CSV file?",
+            &"What columns are in output_data.csv, a CSV file?".to_ascii_lowercase()
+        ));
+        assert!(request_explicitly_requests_standalone_data_artifact(
+            "Generate a CSV file with columns id and total",
+            &"Generate a CSV file with columns id and total".to_ascii_lowercase()
+        ));
+    }
+
+    #[test]
+    fn data_path_direction_uses_nearest_governing_cue() {
+        let request = "Read orders.csv and create team_summary.json only.";
+        assert!(
+            !data_path_has_output_context(request, "orders.csv"),
+            "the read-governed CSV is an input"
+        );
+        assert!(
+            data_path_has_output_context(request, "team_summary.json"),
+            "the create-governed JSON is an output"
+        );
+
+        let contract = TaskContract::from_request(
+            "Read orders.csv and create team_summary.json only. The JSON must contain row_count, total_items, and items_by_team.",
+        );
+        let data_outputs: Vec<&str> = contract
+            .required_artifact_identities
+            .iter()
+            .filter(|identity| identity.role == ArtifactRole::DataOutput)
+            .map(|identity| identity.path.as_str())
+            .collect();
+        assert_eq!(data_outputs, vec!["team_summary.json"]);
+    }
+}

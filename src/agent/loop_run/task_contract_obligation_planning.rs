@@ -847,3 +847,47 @@ fn should_merge_artifact_obligations(
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::task_contract::TaskContract;
+    use super::*;
+
+    #[test]
+    fn docs_source_discriminator_en_n7() {
+        let req = "Translate README.ja.md and write README.md";
+        assert!(
+            docs_path_is_clearly_source_input(req, "README.ja.md"),
+            "language-stamped translation source must be a clear source"
+        );
+        assert!(
+            !docs_path_is_clearly_source_input(req, "README.md"),
+            "the written output README.md must not be classified as source"
+        );
+    }
+
+    #[test]
+    fn docs_source_discriminator_jp_n8() {
+        let req = "README.ja.mdを翻訳してREADME.mdに書いてください";
+        assert!(
+            docs_path_is_clearly_source_input(req, "README.ja.md"),
+            "JP translation source must be a clear source"
+        );
+        assert!(
+            !docs_path_is_clearly_source_input(req, "README.md"),
+            "the `に書いて` output target README.md must not be classified as source"
+        );
+        let contract = TaskContract::from_request(req);
+        let docs: Vec<&str> = contract
+            .required_artifact_identities
+            .iter()
+            .filter(|o| o.role == ArtifactRole::UsageDocs)
+            .map(|o| o.path.as_str())
+            .collect();
+        assert_eq!(
+            docs,
+            vec!["README.md"],
+            "JP translation must prune the source and keep only README.md"
+        );
+    }
+}

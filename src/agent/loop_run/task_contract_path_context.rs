@@ -365,3 +365,125 @@ pub(super) fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
 pub(super) fn is_ascii_word_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_path_tokens_preserves_length_m1() {
+        for s in [
+            "compare findings in draft_report.md and summary.md",
+            "idとtotalの列を持つoutput.csvを生成してください",
+            "what columns are in output_data.csv, a csv file?",
+            "generate data/results.jsonl with columns id from input.jsonl",
+            "v1.2.3 and 3.14 and e.g and i.e are not paths",
+            "",
+            "no paths here at all",
+        ] {
+            assert_eq!(
+                mask_path_tokens(s).len(),
+                s.len(),
+                "mask must be byte-length preserving: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_path_tokens_keeps_japanese_verbatim_m2() {
+        let masked = mask_path_tokens("idとtotalの列を持つoutput.csvを生成してください");
+        assert!(masked.contains("生成"), "JP verb must survive: {masked:?}");
+        assert!(masked.contains('列'), "JP noun must survive: {masked:?}");
+        assert!(
+            !masked.contains("output.csv"),
+            "path must be blanked: {masked:?}"
+        );
+    }
+
+    #[test]
+    fn mask_path_tokens_blanks_all_paths_m3() {
+        let masked = mask_path_tokens("a report.md and b data.csv");
+        assert!(
+            !masked.contains("report.md"),
+            "first path blanked: {masked:?}"
+        );
+        assert!(
+            !masked.contains("data.csv"),
+            "second path blanked: {masked:?}"
+        );
+        assert!(masked.contains(" and "), "connective stays: {masked:?}");
+    }
+
+    #[test]
+    fn mask_path_tokens_filename_internal_vs_standalone_m4() {
+        let masked = mask_path_tokens("draft a report into draft_report.md now");
+        assert!(
+            contains_ascii_token(&masked, "draft"),
+            "standalone draft must survive: {masked:?}"
+        );
+        assert!(
+            !masked.contains("draft_report.md"),
+            "filename blanked: {masked:?}"
+        );
+    }
+
+    #[test]
+    fn mask_path_tokens_recognized_extension_only_m5() {
+        let masked = mask_path_tokens("v1.2.3 release, see e.g output_data.csv and readme.ja.md");
+        assert!(masked.contains("v1.2.3"), "version verbatim: {masked:?}");
+        assert!(masked.contains("e.g"), "abbreviation verbatim: {masked:?}");
+        assert!(
+            !masked.contains("output_data.csv"),
+            "csv path blanked: {masked:?}"
+        );
+        assert!(
+            !masked.contains("readme.ja.md"),
+            "md path blanked: {masked:?}"
+        );
+        let with_sep = mask_path_tokens("write data/results.jsonl now");
+        assert!(
+            !with_sep.contains("data/results.jsonl"),
+            "separator path blanked: {with_sep:?}"
+        );
+    }
+
+    #[test]
+    fn mask_path_tokens_trailing_dot_edge_m6() {
+        let masked = mask_path_tokens("summarize the trends in output_data.csv.");
+        assert!(
+            !masked.contains("output_data.csv"),
+            "trailing-dot path blanked: {masked:?}"
+        );
+        assert_eq!(
+            masked.len(),
+            "summarize the trends in output_data.csv.".len()
+        );
+    }
+
+    #[test]
+    fn mask_path_tokens_allowlist_equals_normalize_m7() {
+        let recognized = [
+            "py", "rs", "ts", "tsx", "js", "jsx", "csv", "tsv", "jsonl", "md", "mdx", "txt", "rst",
+            "toml", "json", "yaml", "yml", "lock", "ndjson", "parquet",
+        ];
+        for ext in recognized {
+            let token = format!("file.{ext}");
+            assert!(
+                normalize_explicit_artifact_path(&token).is_some(),
+                "normalize must accept recognized .{ext}"
+            );
+            assert!(
+                path_token_is_maskable(&token),
+                "mask allowlist must accept recognized .{ext}"
+            );
+        }
+        for token in ["file.exe", "file.bin", "file.markdown", "3.14", "e.g"] {
+            assert_eq!(
+                normalize_explicit_artifact_path(token).is_some(),
+                path_token_is_maskable(token),
+                "mask allowlist must agree with normalize for {token:?}"
+            );
+        }
+        assert!(path_token_is_maskable("dir/sub/file.csv"));
+    }
+}
