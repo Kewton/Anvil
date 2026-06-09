@@ -3375,23 +3375,7 @@ pub(super) fn run_actor_loop(
     let mut last_known_root = agent.work_root.clone();
     let task_contract = super::prepare_actor_loop_state::prepare_actor_loop_turn_state(agent);
 
-    let mut tool_calls_made_this_turn = 0usize;
-    let mut repo_edit_calls_made_this_turn = 0usize;
-    let mut empty_retries = 0usize;
-    let mut no_tool_retries = 0usize;
-    let mut repo_change_retries = 0usize;
-    let mut verifier_repair_retries = 0usize;
-    let mut focused_policy_retries = 0usize;
-    let mut contract_completion_retries = 0usize;
-    let mut contract_completion_role_retries =
-        HashMap::<super::task_contract::ArtifactRole, usize>::new();
-    let mut contract_verification_retries = 0usize;
-    let mut contract_verifier_repair_edit_count: Option<usize> = None;
-    let mut task_contract_verifier_passed_in_loop = false;
-    let mut task_contract_verify_commands_collected = Vec::<String>::new();
-    let mut python_test_retries = 0usize;
-    let mut node_runner_retries = 0usize;
-    let mut plan_progress_retries = 0usize;
+    let mut loop_state = super::loop_state::LoopState::new();
     let mut plan_exploration_only_turns = 0usize;
     let mut plan_exploration_counts = HashMap::<PlanExplorationKey, usize>::new();
     let mut plan_write_signature_counts = HashMap::<String, usize>::new();
@@ -3444,15 +3428,16 @@ pub(super) fn run_actor_loop(
                     before_snapshot: &before_snapshot,
                     accumulated: &accumulated,
                     task_contract: task_contract.as_ref(),
-                    repo_edit_calls_made_this_turn: &mut repo_edit_calls_made_this_turn,
-                    contract_verification_retries: &mut contract_verification_retries,
-                    contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
-                    repo_change_retries: &mut repo_change_retries,
-                    verifier_repair_retries: &mut verifier_repair_retries,
-                    task_contract_verify_commands_collected:
-                        &mut task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop:
-                        &mut task_contract_verifier_passed_in_loop,
+                    repo_edit_calls_made_this_turn: &mut loop_state.repo_edit_calls_made_this_turn,
+                    contract_verification_retries: &mut loop_state.contract_verification_retries,
+                    contract_verifier_repair_edit_count: &mut loop_state
+                        .contract_verifier_repair_edit_count,
+                    repo_change_retries: &mut loop_state.repo_change_retries,
+                    verifier_repair_retries: &mut loop_state.verifier_repair_retries,
+                    task_contract_verify_commands_collected: &mut loop_state
+                        .task_contract_verify_commands_collected,
+                    task_contract_verifier_passed_in_loop: &mut loop_state
+                        .task_contract_verifier_passed_in_loop,
                     framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
                     action_expectation,
                     stream_output,
@@ -3507,8 +3492,9 @@ pub(super) fn run_actor_loop(
                     reply_tool_calls,
                     task_contract: task_contract.as_ref(),
                     tool_call_summaries: &mut tool_call_summaries,
-                    focused_policy_retries: &mut focused_policy_retries,
-                    contract_completion_role_retries: &mut contract_completion_role_retries,
+                    focused_policy_retries: &mut loop_state.focused_policy_retries,
+                    contract_completion_role_retries: &mut loop_state
+                        .contract_completion_role_retries,
                     missing_verifier_setup_turn,
                     recovery_dispatch_gate,
                     recovery_owner,
@@ -3557,17 +3543,13 @@ pub(super) fn run_actor_loop(
             };
             let plan_exploration_budget =
                 lifecycle::plan_stage_exploration_budget(current_plan_stage);
-            tool_calls_made_this_turn += prepared_tool_calls.len();
-            repo_edit_calls_made_this_turn += prepared_tool_calls
+            let repo_edit_calls_before_tool = loop_state.repo_edit_calls_made_this_turn;
+            loop_state.tool_calls_made_this_turn += prepared_tool_calls.len();
+            loop_state.repo_edit_calls_made_this_turn += prepared_tool_calls
                 .iter()
                 .filter(|tool_call| recovery::tool_call_counts_as_repo_edit(&tool_call.name))
                 .count();
-            empty_retries = 0;
-            no_tool_retries = 0;
-            focused_policy_retries = 0;
-            if repo_edit_calls_made_this_turn > 0 {
-                repo_change_retries = 0;
-            }
+            loop_state.reset_after_executed_tool_call(repo_edit_calls_before_tool);
 
             agent.session.messages.push(ConversationMessage::assistant(
                 reply_content,
@@ -3632,7 +3614,7 @@ pub(super) fn run_actor_loop(
                 }
                 let block_restart_discovery = recovery::should_block_restart_discovery(
                     &tool_name,
-                    restart_convergence_mode && repo_edit_calls_made_this_turn == 0,
+                    restart_convergence_mode && loop_state.repo_edit_calls_made_this_turn == 0,
                 );
                 let repeated_plan_exploration =
                     if agent.session.mode_state.mode == ExecutionMode::Plan {
@@ -4004,7 +3986,7 @@ pub(super) fn run_actor_loop(
                     plan_file_edit_calls_this_turn,
                     plan_exploration_calls_this_turn,
                     plan_missing_before_turn,
-                    plan_progress_retries: &mut plan_progress_retries,
+                    plan_progress_retries: &mut loop_state.plan_progress_retries,
                     plan_exploration_only_turns: &mut plan_exploration_only_turns,
                 },
             ) {
@@ -4031,10 +4013,10 @@ pub(super) fn run_actor_loop(
                     recovery_dispatch_gate,
                     emitted_bash_loop_note,
                     bash_only_tool_turn,
-                    repo_edit_calls_made_this_turn,
-                    tool_calls_made_this_turn,
+                    repo_edit_calls_made_this_turn: loop_state.repo_edit_calls_made_this_turn,
+                    tool_calls_made_this_turn: loop_state.tool_calls_made_this_turn,
                     logged_act_first_repo_edit,
-                    repo_change_retries: &mut repo_change_retries,
+                    repo_change_retries: &mut loop_state.repo_change_retries,
                 },
             ) {
                 ActorLoopPostToolFallbackOutcome::Proceed => {}
@@ -4052,10 +4034,11 @@ pub(super) fn run_actor_loop(
                 agent,
                 ActorLoopPostToolCleanupArgs {
                     task_contract: task_contract.as_ref(),
-                    contract_verifier_repair_edit_count,
-                    repo_edit_calls_made_this_turn,
-                    contract_completion_retries,
-                    tool_calls_made_this_turn,
+                    contract_verifier_repair_edit_count: loop_state
+                        .contract_verifier_repair_edit_count,
+                    repo_edit_calls_made_this_turn: loop_state.repo_edit_calls_made_this_turn,
+                    contract_completion_retries: loop_state.contract_completion_retries,
+                    tool_calls_made_this_turn: loop_state.tool_calls_made_this_turn,
                     interrupt_flag: &interrupt_flag,
                 },
             ) {
@@ -4103,8 +4086,8 @@ pub(super) fn run_actor_loop(
                 super::task_contract_recovery::task_contract_recovery_action(
                     agent,
                     contract,
-                    contract_verifier_repair_edit_count,
-                    repo_edit_calls_made_this_turn,
+                    loop_state.contract_verifier_repair_edit_count,
+                    loop_state.repo_edit_calls_made_this_turn,
                 )
             })
         };
@@ -4117,18 +4100,20 @@ pub(super) fn run_actor_loop(
                 task_contract_action: task_contract_action.as_ref(),
                 final_reply: &final_reply,
                 current_reply_tool_call_count,
-                repo_edit_calls_made_this_turn,
+                repo_edit_calls_made_this_turn: loop_state.repo_edit_calls_made_this_turn,
                 last_iter,
-                contract_completion_retries: &mut contract_completion_retries,
-                contract_completion_role_retries: &mut contract_completion_role_retries,
-                contract_verification_retries: &mut contract_verification_retries,
-                contract_verifier_repair_edit_count: &mut contract_verifier_repair_edit_count,
-                repo_change_retries: &mut repo_change_retries,
-                verifier_repair_retries: &mut verifier_repair_retries,
-                task_contract_verify_commands_collected:
-                    &mut task_contract_verify_commands_collected,
-                task_contract_verifier_passed_in_loop: &mut task_contract_verifier_passed_in_loop,
-                no_tool_retries: &mut no_tool_retries,
+                contract_completion_retries: &mut loop_state.contract_completion_retries,
+                contract_completion_role_retries: &mut loop_state.contract_completion_role_retries,
+                contract_verification_retries: &mut loop_state.contract_verification_retries,
+                contract_verifier_repair_edit_count: &mut loop_state
+                    .contract_verifier_repair_edit_count,
+                repo_change_retries: &mut loop_state.repo_change_retries,
+                verifier_repair_retries: &mut loop_state.verifier_repair_retries,
+                task_contract_verify_commands_collected: &mut loop_state
+                    .task_contract_verify_commands_collected,
+                task_contract_verifier_passed_in_loop: &mut loop_state
+                    .task_contract_verifier_passed_in_loop,
+                no_tool_retries: &mut loop_state.no_tool_retries,
                 contract_deterministic_fallback_materialized:
                     &mut contract_deterministic_fallback_materialized,
             },
@@ -4159,11 +4144,11 @@ pub(super) fn run_actor_loop(
                 requires_action,
                 recovery_dispatch_gate,
                 final_reply: &final_reply,
-                tool_calls_made_this_turn,
-                repo_change_retries: &mut repo_change_retries,
-                plan_progress_retries: &mut plan_progress_retries,
-                empty_retries: &mut empty_retries,
-                no_tool_retries: &mut no_tool_retries,
+                tool_calls_made_this_turn: loop_state.tool_calls_made_this_turn,
+                repo_change_retries: &mut loop_state.repo_change_retries,
+                plan_progress_retries: &mut loop_state.plan_progress_retries,
+                empty_retries: &mut loop_state.empty_retries,
+                no_tool_retries: &mut loop_state.no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             },
         ) {
@@ -4193,14 +4178,14 @@ pub(super) fn run_actor_loop(
                 action_expectation,
                 requires_action,
                 recovery_dispatch_gate,
-                repo_edit_calls_made_this_turn,
+                repo_edit_calls_made_this_turn: loop_state.repo_edit_calls_made_this_turn,
                 final_reply: &final_reply,
                 task_contract_action: task_contract_action.as_ref(),
                 interrupt_flag: &interrupt_flag,
-                repo_change_retries: &mut repo_change_retries,
-                python_test_retries: &mut python_test_retries,
-                node_runner_retries: &mut node_runner_retries,
-                no_tool_retries: &mut no_tool_retries,
+                repo_change_retries: &mut loop_state.repo_change_retries,
+                python_test_retries: &mut loop_state.python_test_retries,
+                node_runner_retries: &mut loop_state.node_runner_retries,
+                no_tool_retries: &mut loop_state.no_tool_retries,
                 framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
             },
         ) {
@@ -4225,7 +4210,7 @@ pub(super) fn run_actor_loop(
                 last_iter,
                 final_reply: &final_reply,
                 task_contract_action: task_contract_action.as_ref(),
-                plan_progress_retries: &mut plan_progress_retries,
+                plan_progress_retries: &mut loop_state.plan_progress_retries,
             },
         ) {
             ActorLoopCompletionOutcome::Continue => continue,
@@ -4258,7 +4243,7 @@ pub(super) fn run_actor_loop(
     // untouched so consumers do not mistake a successful investigation
     // for a "no progress" failure (design 5.5 last-write-wins).
     if should_record_no_repo_progress(
-        repo_edit_calls_made_this_turn,
+        loop_state.repo_edit_calls_made_this_turn,
         final_verif.made_any_progress(),
         agent.session.eligible_feedback_recorded_this_turn,
     ) {
@@ -4291,12 +4276,12 @@ pub(super) fn run_actor_loop(
     // (S5-002 — `agent.last_iter` field does NOT exist; only the local
     // mutable `last_iter` in the actor loop exists). For
     // `tool_calls_this_turn` the SSOT is the local
-    // `tool_calls_made_this_turn` counter. Populate happens here, after
+    // `loop_state.tool_calls_made_this_turn` counter. Populate happens here, after
     // the loop exits but before any post-loop hook reads the values
     // (Reminder / CaseRecord / AntiPattern / photon evaluate all run
     // below this line).
     agent.session.iter_count_this_turn = last_iter.min(agent.config.max_iterations);
-    agent.session.tool_calls_this_turn = tool_calls_made_this_turn;
+    agent.session.tool_calls_this_turn = loop_state.tool_calls_made_this_turn;
     let mut stats = build_stats(
         accumulated,
         final_verif.clone(),
@@ -4320,12 +4305,13 @@ pub(super) fn run_actor_loop(
         exit_reason = ExitReason::Done;
         error_text.clear();
     }
-    let mut verify_commands_collected = task_contract_verify_commands_collected;
+    let mut verify_commands_collected =
+        std::mem::take(&mut loop_state.task_contract_verify_commands_collected);
     verify_commands_collected.extend(agent.run_post_loop_success_verifier(
         &final_verif,
         &stats,
-        repo_edit_calls_made_this_turn,
-        task_contract_verifier_passed_in_loop,
+        loop_state.repo_edit_calls_made_this_turn,
+        loop_state.task_contract_verifier_passed_in_loop,
         &mut exit_reason,
         &mut error_text,
     ));

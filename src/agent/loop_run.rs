@@ -405,6 +405,7 @@ mod read_target_helpers;
 // `tool_result_failed`, `quality_confirm_cache_key` free fns +
 // `RetrievalInjection` struct + `WrittenScaffoldArtifacts` type alias.
 // `pub(super)` limited / no facade re-export (DR3-001).
+mod loop_state;
 mod turn_helpers;
 mod turn_state;
 // Assistant-reply retry state types extracted from `turn.rs` (parent
