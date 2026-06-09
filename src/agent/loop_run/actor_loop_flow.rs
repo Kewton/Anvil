@@ -3425,7 +3425,7 @@ pub(super) fn run_actor_loop(
         // Issue #660 (Phase C / DD-4): emit `agent.active_job.selected`
         // at the head of every iteration when the selection differs from
         // the previous emission. Per-turn diff-based dedup state lives
-        // on `agent.last_active_job_selection`, reset at
+        // on `agent.turn_state.last_active_job_selection`, reset at
         // `handle_user_message` entry adjacent to
         // `safe_stop_report_emitted`. The helper itself is the only emit
         // site; raw verifier commands / raw paths are redacted by the

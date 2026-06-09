@@ -47,32 +47,10 @@ pub(super) fn handle_user_message(
     agent.turn_edited_relative_paths.clear();
     agent.turn_pre_tool_file_hashes.clear();
     agent.missing_verifier_job = None;
-    // Issue #654: per-turn dedup marker reset (DR1-006 / DR2-005). The
-    // `agent.safe_stop.report` event is emitted at most once per
-    // StopReason per turn; clearing here lets a new user turn re-emit
-    // the same StopReason if the stop condition recurs.
-    agent.safe_stop_report_emitted.clear();
-    // Issue #660 (Phase C / DD-4 / DR1-007): per-turn diff-based dedup
-    // state for the `agent.active_job.selected` event. Reset adjacent to
-    // `safe_stop_report_emitted.clear()` so all per-turn dedup state
-    // restarts together at turn boundary (locality eases review when
-    // adding new per-turn caps). Forces the first selection of the new
-    // turn to emit (None → Some triggers emit), so each turn starts the
-    // observation series fresh.
-    agent.last_active_job_selection = None;
-    // Issue #666: per-turn fire-once dedup for the four new
-    // `agent.{artifact_completion,verification,repair,memory}.report`
-    // events. Reset adjacent to `safe_stop_report_emitted.clear()` and
-    // `last_active_job_selection = None` so all per-turn dedup state
-    // restarts together at turn boundary (locality, CLAUDE.md per-turn
-    // rule). NOT serialized.
-    agent.job_report_dedup_keys.clear();
-    // Issue #665 (Phase 6 / S5-006 / S7-002): per-turn diff-based dedup
-    // state for `agent.behavior_contract.projected` event. Reset adjacent
-    // to `last_active_job_selection = None` so all per-turn dedup state
-    // restarts together at turn boundary. Forces the first consumed
-    // projection in the new turn to emit.
-    agent.last_behavior_contract_projection_event = None;
+    // WP8: reset grouped per-turn event-dedup state through a single owner.
+    // The fields remain turn-local and non-serialized, but future reset-only
+    // carriers can move into `TurnState` without growing this function.
+    agent.turn_state.reset_dedup_state();
     // Issue #667 (DR1-004 / per-turn rule): clear the PAM advisory
     // decision carrier. `is_some()` is the "decided this turn" predicate;
     // the 2 production chokepoints set this exactly once (DR1-005).

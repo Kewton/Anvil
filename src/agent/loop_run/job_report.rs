@@ -661,8 +661,8 @@ impl super::Agent {
             VerificationReport::EVENT_NAME,
             self.current_turn_index as u64
         );
-        self.job_report_dedup_keys.remove(&key);
-        self.safe_stop_report_emitted.clear();
+        self.turn_state.job_report_dedup_keys.remove(&key);
+        self.turn_state.safe_stop_report_emitted.clear();
     }
 
     /// Read the SafeStopLinkage from per-turn dedup state.
@@ -678,7 +678,7 @@ impl super::Agent {
     /// turn precedes repair exhaustion.
     fn snapshot_safe_stop_linkage(&self) -> SafeStopLinkage {
         use super::repair_job::StopReason;
-        if self.safe_stop_report_emitted.is_empty() {
+        if self.turn_state.safe_stop_report_emitted.is_empty() {
             return SafeStopLinkage::default();
         }
         // Fixed priority order — first hit wins. NOTE: must be updated if a
@@ -693,7 +693,7 @@ impl super::Agent {
         ];
         let reason = PRIORITY
             .iter()
-            .find(|r| self.safe_stop_report_emitted.contains(*r))
+            .find(|r| self.turn_state.safe_stop_report_emitted.contains(*r))
             .map(|r| r.as_str().to_string());
         SafeStopLinkage {
             reason,
@@ -717,7 +717,7 @@ impl super::Agent {
         report: R,
     ) -> Option<serde_json::Value> {
         let key = format!("{}::{}", R::EVENT_NAME, report.dedup_key());
-        if !self.job_report_dedup_keys.insert(key) {
+        if !self.turn_state.job_report_dedup_keys.insert(key) {
             return None;
         }
         let mut envelope = build_envelope(&report);

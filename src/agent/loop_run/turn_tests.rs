@@ -2717,7 +2717,7 @@ mod tests {
         use crate::config::Config;
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        assert!(agent.last_active_job_selection.is_none());
+        assert!(agent.turn_state.last_active_job_selection.is_none());
         let emitted =
             super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
         assert!(
@@ -2725,7 +2725,7 @@ mod tests {
             "first call after turn reset must emit (None -> Some transition)"
         );
         assert!(
-            agent.last_active_job_selection.is_some(),
+            agent.turn_state.last_active_job_selection.is_some(),
             "emit must update the dedup state to Some(...) so the next \
              identical call is deduped"
         );
@@ -2790,10 +2790,10 @@ mod tests {
 
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);
-        assert!(agent.last_active_job_selection.is_some());
+        assert!(agent.turn_state.last_active_job_selection.is_some());
 
         // Simulate per-turn reset (same lines as handle_user_message head).
-        agent.last_active_job_selection = None;
+        agent.turn_state.last_active_job_selection = None;
 
         let after_reset =
             super::super::active_job_emit::emit_active_job_selected_if_changed(&mut agent, 0);

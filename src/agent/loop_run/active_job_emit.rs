@@ -31,7 +31,7 @@ use crate::modes::plan_act::ExecutionMode;
 
 pub(super) fn emit_active_job_selected_if_changed(agent: &mut Agent, iteration_seq: u32) -> bool {
     let selection = current_active_job_selection(agent);
-    if agent.last_active_job_selection.as_ref() == Some(&selection) {
+    if agent.turn_state.last_active_job_selection.as_ref() == Some(&selection) {
         return false;
     }
     let payload = build_active_job_selected_payload(
@@ -45,7 +45,7 @@ pub(super) fn emit_active_job_selected_if_changed(agent: &mut Agent, iteration_s
             .unwrap_or(0),
     );
     log_llm_event("agent.active_job.selected", payload);
-    agent.last_active_job_selection = Some(selection);
+    agent.turn_state.last_active_job_selection = Some(selection);
     true
 }
 
@@ -54,7 +54,7 @@ pub(super) fn emit_active_job_selected_if_changed(agent: &mut Agent, iteration_s
 /// dedup. Only emits when:
 /// - `projection` is `Some(...)` (i.e. consumed by a prompt site), AND
 /// - the payload-shaped key differs from
-///   `agent.last_behavior_contract_projection_event`.
+///   `agent.turn_state.last_behavior_contract_projection_event`.
 ///
 /// **Per-turn rule** (DR1-007): `last_behavior_contract_projection_event`
 /// is reset to `None` at the head of every `handle_user_message`, so the
@@ -76,7 +76,12 @@ pub(super) fn emit_behavior_contract_projected_if_changed(
         return false;
     };
     let key = BehaviorProjectionEventKey::from_projection(proj, consumer);
-    if agent.last_behavior_contract_projection_event.as_ref() == Some(&key) {
+    if agent
+        .turn_state
+        .last_behavior_contract_projection_event
+        .as_ref()
+        == Some(&key)
+    {
         return false;
     }
     let session_id = agent.session_store.session_id().to_string();
@@ -84,7 +89,7 @@ pub(super) fn emit_behavior_contract_projected_if_changed(
     let payload =
         behavior_contract_projected_payload(&key, proj.confidence, &session_id, turn_index);
     log_llm_event("agent.behavior_contract.projected", payload);
-    agent.last_behavior_contract_projection_event = Some(key);
+    agent.turn_state.last_behavior_contract_projection_event = Some(key);
     true
 }
 

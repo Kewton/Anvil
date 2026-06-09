@@ -337,6 +337,7 @@ fn final_verifier_success_report_supersedes_same_turn_repair_exhausted_snapshot(
     let (mut agent, _td) = build_live_agent(&session_id);
 
     agent
+        .turn_state
         .safe_stop_report_emitted
         .insert(StopReason::RepairExhausted);
     agent.session.last_verifier_invocation = Some(VerifierInvocationRecord {
@@ -422,9 +423,11 @@ fn snapshot_safe_stop_linkage_is_deterministic_for_multiple_reasons() {
     // higher-priority reason (ArtifactCompletionFailed comes before
     // RepairExhausted in the priority list).
     agent
+        .turn_state
         .safe_stop_report_emitted
         .insert(StopReason::RepairExhausted);
     agent
+        .turn_state
         .safe_stop_report_emitted
         .insert(StopReason::ArtifactCompletionFailed);
 

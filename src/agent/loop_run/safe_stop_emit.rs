@@ -148,7 +148,11 @@ pub(super) fn record_safe_stop_report(
     ctx: super::repair_job::SafeStopContext<'_>,
 ) {
     let stop_reason = input.stop_reason();
-    if agent.safe_stop_report_emitted.contains(&stop_reason) {
+    if agent
+        .turn_state
+        .safe_stop_report_emitted
+        .contains(&stop_reason)
+    {
         return;
     }
     // Issue #666 (CB-001 fix): emit per-turn job reports BEFORE the
@@ -168,7 +172,10 @@ pub(super) fn record_safe_stop_report(
     let report = super::repair_job::SafeStopReport::build_from(input, ctx);
     let payload = build_safe_stop_payload(&report);
     log_llm_event("agent.safe_stop.report", payload);
-    agent.safe_stop_report_emitted.insert(stop_reason);
+    agent
+        .turn_state
+        .safe_stop_report_emitted
+        .insert(stop_reason);
 }
 
 /// Issue #654 (E.3) — `verifier_failed_safe_stop` emit shell. Builds a
@@ -198,6 +205,7 @@ pub(super) fn emit_safe_stop_report_for_artifact_completion_failed(
     expected_target_path: Option<String>,
 ) {
     if agent
+        .turn_state
         .safe_stop_report_emitted
         .contains(&super::repair_job::StopReason::ArtifactCompletionFailed)
     {

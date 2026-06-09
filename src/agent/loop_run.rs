@@ -406,6 +406,7 @@ mod read_target_helpers;
 // `RetrievalInjection` struct + `WrittenScaffoldArtifacts` type alias.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod turn_helpers;
+mod turn_state;
 // Assistant-reply retry state types extracted from `turn.rs` (parent
 // #680). Hosts `AssistantReplyRetryState` (per-attempt accumulator +
 // `new(chat_retries, message_count)` constructor) and
@@ -886,7 +887,7 @@ impl Agent {
     pub(in crate::agent::loop_run) fn last_active_job_selection_clone(
         &self,
     ) -> Option<active_job_arbiter::ActiveJobSelection> {
-        self.last_active_job_selection.clone()
+        self.turn_state.last_active_job_selection.clone()
     }
 
     /// Issue #667 iteration-2 test-only seam: simulate the turn-boundary
@@ -1701,7 +1702,7 @@ pub(crate) fn emit_safe_stop_report_artifact_completion_failed_for_test(
 /// the reset path (re-emit after `handle_user_message`-style clear).
 #[cfg(test)]
 pub(crate) fn clear_safe_stop_report_dedup_for_test(agent: &mut Agent) {
-    agent.safe_stop_report_emitted.clear();
+    agent.turn_state.safe_stop_report_emitted.clear();
 }
 
 /// Issue #659 (Phase 4 / Task 4.1) test seam: simulate "agent successfully
@@ -2313,6 +2314,10 @@ pub struct Agent {
     /// projection_recovery_target()` at the same call sites — there is no
     /// divergent independent assignment outside of `set_artifact_recovery_target_from_hint`.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
+    /// Turn-local reset-only carriers grouped behind one owner. WP8 starts
+    /// with event dedup state; additional reset-only fields can move here in
+    /// small, auditable batches.
+    pub(in crate::agent::loop_run) turn_state: turn_state::TurnState,
     /// Issue #950: turn-local controller strategy ledger for delegated
     /// local-LLM persistence. Static labels only; no commands, paths, tool
     /// args, or approval details. Reset at every user turn and actor-loop
@@ -2422,44 +2427,6 @@ pub struct Agent {
     /// artifacts cannot auto-promote themselves (Issue #646 §修正方針 2
     /// `Owned` rules).
     turn_edited_relative_paths: std::collections::HashSet<String>,
-    /// Issue #654 (DR1-006): per-turn dedup marker for the `agent.safe_stop.report`
-    /// event. `HashSet<StopReason>` provides type-safe membership tests
-    /// (typo detection at compile time). Reset at the head of every
-    /// `handle_user_message` so a new turn can re-emit the same StopReason.
-    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
-    /// persistence schemas are unchanged by Issue #654.
-    pub(in crate::agent::loop_run) safe_stop_report_emitted:
-        std::collections::HashSet<repair_job::StopReason>,
-    /// Issue #660 (Phase C / DD-4): per-turn diff-based dedup state for the
-    /// `agent.active_job.selected` structured log event. Holds the
-    /// `ActiveJobSelection` most recently passed to
-    /// `emit_active_job_selected_if_changed`; the helper re-emits only when
-    /// the new selection differs. Reset at the head of every
-    /// `handle_user_message` adjacent to `safe_stop_report_emitted.clear()`
-    /// (per DR1-007 — per-turn reset group locality).
-    ///
-    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
-    /// persistence schemas are unchanged by Issue #660 (in-memory only,
-    /// same pattern as `safe_stop_report_emitted` and `artifact_ledger`).
-    pub(in crate::agent::loop_run) last_active_job_selection:
-        Option<active_job_arbiter::ActiveJobSelection>,
-    /// Issue #665 (Phase 6 / S5-006 / S7-002): per-turn diff-based dedup state
-    /// for the `agent.behavior_contract.projected` structured log event. Holds
-    /// the **payload-shaped key** (NOT the raw `BehaviorContractProjection`)
-    /// most recently emitted. The emit helper re-emits only when the new key
-    /// differs from this one. Reset at the head of every `handle_user_message`
-    /// adjacent to `last_active_job_selection.take()`.
-    ///
-    /// **Why payload-shaped, not raw projection (S5-006)**: dedup state must
-    /// not retain attacker-controlled `label` / `excerpt` content across turns.
-    /// `BehaviorProjectionEventKey` contains only the `schema_version` /
-    /// `consumer` / `confidence_bucket` / `fields_used` metadata, which is
-    /// what the emitted event payload actually keys on.
-    ///
-    /// NOT serialized — in-memory only, same pattern as
-    /// `last_active_job_selection`.
-    pub(in crate::agent::loop_run) last_behavior_contract_projection_event:
-        Option<required_behavior::BehaviorProjectionEventKey>,
     /// Issue #659 (Phase 2): per-turn SSOT for artifact observations
     /// (Existing / Scaffold / RepoEdit) + verifier observations bound by
     /// path. Adapter-period contract: `turn_edited_relative_paths` remains
@@ -2473,17 +2440,6 @@ pub struct Agent {
     /// ledger lives only on `Agent`, never on `SessionSnapshot`.
     pub(in crate::agent::loop_run) artifact_ledger:
         crate::agent::loop_run::artifact_ledger::ArtifactLedger,
-    /// Issue #666: per-turn fire-once dedup keys for the four new
-    /// `agent.{artifact_completion,verification,repair,memory}.report`
-    /// events. Single namespaced HashSet — keys are
-    /// `"{event_name}::{report_dedup_key}"`. Reset at the head of every
-    /// `handle_user_message` adjacent to `safe_stop_report_emitted.clear()`
-    /// (CLAUDE.md per-turn rule).
-    ///
-    /// NOT serialized — same pattern as `safe_stop_report_emitted` and
-    /// `last_active_job_selection`. `SessionSnapshot` / `CaseRecord` /
-    /// `EvalTurnRecord` persistence schemas remain unchanged by Issue #666.
-    pub(in crate::agent::loop_run) job_report_dedup_keys: std::collections::HashSet<String>,
     /// Issue #661 Task 2.6 (DR1-004): per-turn dedup state for the
     /// `agent.verifier.invoked` structured log event. Holds the 8-byte digest
     /// of the most recent emit's canonical-JSON payload (`mask_payload_inplace`
@@ -2835,6 +2791,7 @@ impl Agent {
             evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
+            turn_state: turn_state::TurnState::new(),
             controller_policy_ledger: controller_policy::ControllerPolicyLedger::default(),
             artifact_completion_job: None,
             artifact_completion_exhausted_this_turn: false,
@@ -2848,11 +2805,7 @@ impl Agent {
             missing_verifier_job: None,
             turn_pre_tool_file_hashes: std::collections::HashMap::new(),
             turn_edited_relative_paths: std::collections::HashSet::new(),
-            safe_stop_report_emitted: std::collections::HashSet::new(),
-            last_active_job_selection: None,
-            last_behavior_contract_projection_event: None,
             artifact_ledger: artifact_ledger::ArtifactLedger::new(),
-            job_report_dedup_keys: std::collections::HashSet::new(),
             // Issue #661 Task 2.6: per-turn dedup state for
             // `agent.verifier.invoked` + `agent.verifier.external_import_rejected`.
             // Reset at handle_user_message head; producers land in iteration-3.
@@ -2892,6 +2845,7 @@ impl Agent {
     ) -> pam_advisory::PamAdvisoryInputs {
         // Priority (1): active-job arbiter selected kind.
         let role_hint_from_active = self
+            .turn_state
             .last_active_job_selection
             .as_ref()
             .and_then(|sel| sel.selected.as_ref())
@@ -2950,7 +2904,7 @@ impl Agent {
             return None;
         }
         let inputs = self.pam_advisory_inputs();
-        let active_ref = self.last_active_job_selection.as_ref();
+        let active_ref = self.turn_state.last_active_job_selection.as_ref();
         let outcome = pam_advisory::evaluate_pam_advisory(
             resp,
             blocked_ids,
