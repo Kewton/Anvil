@@ -162,6 +162,63 @@ pub(super) fn artifact_directed_recovery_message(
     ))
 }
 
+pub(super) fn artifact_directed_tool_policy_packet_message(
+    effective_tool_policy: &EffectiveToolPolicy,
+) -> Option<String> {
+    let policy = effective_tool_policy.artifact_directed_policy()?;
+    let context = policy.job_context.as_ref()?;
+    let allowed = effective_tool_policy
+        .allowed_tool_names_for_prompt()
+        .map(|tools| tools.join(", "))
+        .unwrap_or_else(|| "Read, Write, Edit".to_string());
+    Some(artifact_directed_tool_policy_packet_body(
+        context.role.label(),
+        &context.target_path,
+        &allowed,
+        &artifact_write_actions_label(&context.allowed_write_actions),
+        artifact_read_scope_label(&context.allowed_read_scope).as_str(),
+        policy.target_already_read,
+    ))
+}
+
+pub(super) fn artifact_directed_tool_policy_packet_body(
+    role_label: &str,
+    target_path: &str,
+    allowed_tools: &str,
+    write_actions: &str,
+    read_scope: &str,
+    target_already_read: bool,
+) -> String {
+    let role = super::task_contract::mask_and_cap_recovery_field(role_label);
+    let target = super::task_contract::mask_and_cap_recovery_field(target_path);
+    let allowed = super::task_contract::mask_and_cap_recovery_field(allowed_tools);
+    let write = super::task_contract::mask_and_cap_recovery_field(write_actions);
+    let read = super::task_contract::mask_and_cap_recovery_field(read_scope);
+    format!(
+        "[Controller Tool Policy Packet]\npolicy=artifact_directed_recovery\nrole={role}\ntarget_path={target}\nallowed_tools={allowed}\nwrite_actions={write}\nread_scope={read}\ntarget_already_read={target_already_read}"
+    )
+}
+
+fn artifact_write_actions_label(
+    actions: &super::artifact_completion_job::AllowedWriteActions,
+) -> String {
+    let (create, modify, target_only) = (
+        actions.allow_create(),
+        actions.allow_modify(),
+        actions.target_only(),
+    );
+    format!("create={create},modify={modify},target_only={target_only}")
+}
+
+fn artifact_read_scope_label(scope: &super::artifact_completion_job::AllowedReadScope) -> String {
+    match scope {
+        super::artifact_completion_job::AllowedReadScope::TargetOnly => "target_only".to_string(),
+        super::artifact_completion_job::AllowedReadScope::TargetAndDeps(deps) => {
+            format!("target_and_deps:{}", deps.len())
+        }
+    }
+}
+
 /// Issue #931 (Choke B): pure render-point helper for the artifact-directed
 /// recovery message. Masks `path` INTERNALLY via the recovery-field SSOT.
 pub(super) fn artifact_directed_recovery_message_body(

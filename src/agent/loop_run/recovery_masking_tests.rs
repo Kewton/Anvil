@@ -170,6 +170,33 @@ fn artifact_directed_recovery_message_body_masks_and_is_byte_stable() {
 }
 
 #[test]
+fn artifact_directed_tool_policy_packet_body_masks_and_is_byte_stable() {
+    use super::recovery_messages::artifact_directed_tool_policy_packet_body;
+    let masked = artifact_directed_tool_policy_packet_body(
+        "test",
+        &secret_path(),
+        "Read, Write",
+        "create=true,modify=false,target_only=true",
+        "target_only",
+        false,
+    );
+    assert_masked("artifact_directed_tool_policy_packet_body", &masked);
+
+    let body = artifact_directed_tool_policy_packet_body(
+        "test",
+        "tests/test_math_utils.py",
+        "Read, Write",
+        "create=true,modify=false,target_only=true",
+        "target_only",
+        false,
+    );
+    assert_eq!(
+        body,
+        "[Controller Tool Policy Packet]\npolicy=artifact_directed_recovery\nrole=test\ntarget_path=tests/test_math_utils.py\nallowed_tools=Read, Write\nwrite_actions=create=true,modify=false,target_only=true\nread_scope=target_only\ntarget_already_read=false"
+    );
+}
+
+#[test]
 fn verifier_repair_request_patch_message_body_masks_all_arms_and_is_byte_stable() {
     use super::recovery_messages::verifier_repair_request_patch_message_body;
     // Enumerated mask: every (is_file, already_read) arm masks the secret path.

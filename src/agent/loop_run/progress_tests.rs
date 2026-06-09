@@ -10114,6 +10114,7 @@ export default function App() {
     #[test]
     fn artifact_directed_from_job_records_artifact_directed_recovery_reason() {
         use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        use super::super::recovery_messages::artifact_directed_tool_policy_packet_message;
         use super::super::task_contract::ArtifactRole;
         let temp = tempdir().unwrap();
         let target = temp.path().join("tests/test_x.py");
@@ -10151,6 +10152,11 @@ export default function App() {
             context.allowed_read_scope,
             AllowedReadScope::TargetOnly
         ));
+        let packet = artifact_directed_tool_policy_packet_message(&policy)
+            .expect("artifact-directed recovery should render a typed tool-policy packet");
+        assert!(packet.contains("policy=artifact_directed_recovery"));
+        assert!(packet.contains("role=test"));
+        assert!(packet.contains("target_path=tests/test_x.py"));
     }
 
     #[test]

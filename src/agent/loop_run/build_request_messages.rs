@@ -341,6 +341,11 @@ fn append_common_request_messages(
     {
         messages.push(ConversationMessage::system(note));
     }
+    if let Some(note) = super::recovery_messages::artifact_directed_tool_policy_packet_message(
+        effective_tool_policy,
+    ) {
+        messages.push(ConversationMessage::system(note));
+    }
     if let Some(note) = super::recovery_messages::artifact_directed_policy_violation_message(
         agent,
         effective_tool_policy,

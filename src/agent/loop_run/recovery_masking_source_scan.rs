@@ -80,6 +80,7 @@ const ALLOWLIST: &[AllowlistedRenderer] = &[
     rndr("recovery_messages.rs", "focused_edit_no_tool_note_for_target_body"),
     rndr("recovery_messages.rs", "focused_edit_no_tool_note_for_policy_arm"),
     rndr("recovery_messages.rs", "artifact_directed_recovery_message_body"),
+    rndr("recovery_messages.rs", "artifact_directed_tool_policy_packet_body"),
     rndr("recovery_messages.rs", "verifier_repair_request_patch_message_body"),
     rndr("recovery_messages.rs", "deterministic_ui_recovery_continuation_note_body"),
     // Choke B — focused_edit_recovery.rs already-pure helpers (mask internally).
