@@ -5,6 +5,12 @@
 //! semantic interpretation belongs in LLM-produced candidates plus deterministic
 //! admission.
 
+use super::task_contract::{
+    ProjectLanguage, ProjectShape, TaskIntent, VerificationRequirement, request_asks_for_code_work,
+    request_asks_for_setup, request_asks_for_test_artifact,
+};
+use super::task_contract_path_context::contains_any;
+
 /// Issue #664 (CB-002): English setup-marker substring set. Each marker is
 /// matched with a **token boundary** check (`contains_setup_token_ascii`)
 /// plus a **negation-prefix guard** (`negation_prefix_within_window`) so
@@ -247,4 +253,110 @@ pub(super) fn request_contains_jp_setup_marker_unnegated(request: &str, needle: 
             .any(|suffix| window.contains(suffix));
         !negated
     })
+}
+
+pub(super) fn infer_intent(request: &str, lower: &str) -> TaskIntent {
+    if request_asks_for_setup(request, lower) && !request_asks_for_code_work(request, lower) {
+        return TaskIntent::Install;
+    }
+    if contains_any(
+        lower,
+        &[
+            "explain",
+            "summarize",
+            "tell me",
+            "analyze",
+            "review",
+            "説明",
+            "要約",
+            "教えて",
+            "調査",
+        ],
+    ) && !request_asks_for_code_work(request, lower)
+    {
+        return TaskIntent::Explain;
+    }
+    if contains_any(lower, &["fix", "repair", "bug", "修正", "直して"]) {
+        return TaskIntent::Fix;
+    }
+    if contains_any(
+        lower,
+        &[
+            "update", "modify", "edit", "refactor", "変更", "更新", "編集",
+        ],
+    ) {
+        return TaskIntent::Modify;
+    }
+    TaskIntent::Build
+}
+
+pub(super) fn infer_project_language(request: &str, lower: &str) -> ProjectLanguage {
+    super::project_profile::infer_language(request, lower)
+}
+
+pub(super) fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
+    super::project_profile::infer_shape(request, lower)
+}
+
+pub(super) fn infer_verification_requirement(
+    request: &str,
+    lower: &str,
+    language: ProjectLanguage,
+    shape: ProjectShape,
+) -> VerificationRequirement {
+    if matches!(infer_intent(request, lower), TaskIntent::Explain) {
+        return VerificationRequirement::NotRequired;
+    }
+    if request_asks_for_test_artifact(request, lower)
+        || contains_any(lower, &["verify", "validate", "check"])
+        || contains_any(request, &["検証", "動作確認", "確認"])
+    {
+        return VerificationRequirement::Required {
+            preferred_runner: preferred_runner_for_language(language),
+        };
+    }
+    if matches!(
+        shape,
+        ProjectShape::Cli | ProjectShape::Library | ProjectShape::Api | ProjectShape::WebApp
+    ) {
+        return VerificationRequirement::Required {
+            preferred_runner: preferred_runner_for_language(language),
+        };
+    }
+    if matches!(shape, ProjectShape::Documentation) || request_asks_for_setup(request, lower) {
+        VerificationRequirement::ArtifactOnly
+    } else {
+        VerificationRequirement::NotRequired
+    }
+}
+
+pub(super) fn preferred_runner_for_language(language: ProjectLanguage) -> Option<&'static str> {
+    match language {
+        ProjectLanguage::Rust => Some("cargo test"),
+        ProjectLanguage::Node => Some("npm test"),
+        ProjectLanguage::Python => Some("pytest"),
+        ProjectLanguage::Docs | ProjectLanguage::Unknown => None,
+    }
+}
+
+pub(super) fn project_intent_confidence(
+    intent: TaskIntent,
+    language: ProjectLanguage,
+    shape: ProjectShape,
+    verification: VerificationRequirement,
+) -> f32 {
+    let mut confidence: f32 = 0.35;
+    if !matches!(intent, TaskIntent::Build) {
+        confidence += 0.15;
+    }
+    if !matches!(language, ProjectLanguage::Unknown) {
+        confidence += 0.20;
+    }
+    if !matches!(shape, ProjectShape::Unknown) {
+        confidence += 0.20;
+    }
+    if !matches!(verification, VerificationRequirement::NotRequired) {
+        confidence += 0.10;
+    }
+    confidence.min(1.0)
 }

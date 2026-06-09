@@ -80,7 +80,9 @@ use super::task_contract_recovery_planning::{
     order_missing_deliverables_for_recovery, recovery_target_hint_for_missing_with_contract,
 };
 pub(super) use super::task_contract_request_inference::{
-    SETUP_MARKER_NEEDLES_ASCII, SETUP_MARKER_NEEDLES_JP, lower_contains_setup_token_unnegated,
+    SETUP_MARKER_NEEDLES_ASCII, SETUP_MARKER_NEEDLES_JP, infer_intent, infer_project_language,
+    infer_project_shape, infer_verification_requirement, lower_contains_setup_token_unnegated,
+    preferred_runner_for_language, project_intent_confidence,
     request_contains_jp_setup_marker_unnegated,
 };
 pub(super) use super::task_contract_taxonomy::{
@@ -2312,112 +2314,6 @@ fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
             "手順",
         ],
     )
-}
-
-fn infer_intent(request: &str, lower: &str) -> TaskIntent {
-    if request_asks_for_setup(request, lower) && !request_asks_for_code_work(request, lower) {
-        return TaskIntent::Install;
-    }
-    if contains_any(
-        lower,
-        &[
-            "explain",
-            "summarize",
-            "tell me",
-            "analyze",
-            "review",
-            "説明",
-            "要約",
-            "教えて",
-            "調査",
-        ],
-    ) && !request_asks_for_code_work(request, lower)
-    {
-        return TaskIntent::Explain;
-    }
-    if contains_any(lower, &["fix", "repair", "bug", "修正", "直して"]) {
-        return TaskIntent::Fix;
-    }
-    if contains_any(
-        lower,
-        &[
-            "update", "modify", "edit", "refactor", "変更", "更新", "編集",
-        ],
-    ) {
-        return TaskIntent::Modify;
-    }
-    TaskIntent::Build
-}
-
-fn infer_project_language(request: &str, lower: &str) -> ProjectLanguage {
-    super::project_profile::infer_language(request, lower)
-}
-
-fn infer_project_shape(request: &str, lower: &str) -> ProjectShape {
-    super::project_profile::infer_shape(request, lower)
-}
-
-fn infer_verification_requirement(
-    request: &str,
-    lower: &str,
-    language: ProjectLanguage,
-    shape: ProjectShape,
-) -> VerificationRequirement {
-    if matches!(infer_intent(request, lower), TaskIntent::Explain) {
-        return VerificationRequirement::NotRequired;
-    }
-    if request_asks_for_test_artifact(request, lower)
-        || contains_any(lower, &["verify", "validate", "check"])
-        || contains_any(request, &["検証", "動作確認", "確認"])
-    {
-        return VerificationRequirement::Required {
-            preferred_runner: preferred_runner_for_language(language),
-        };
-    }
-    if matches!(
-        shape,
-        ProjectShape::Cli | ProjectShape::Library | ProjectShape::Api | ProjectShape::WebApp
-    ) {
-        return VerificationRequirement::Required {
-            preferred_runner: preferred_runner_for_language(language),
-        };
-    }
-    if matches!(shape, ProjectShape::Documentation) || request_asks_for_setup(request, lower) {
-        VerificationRequirement::ArtifactOnly
-    } else {
-        VerificationRequirement::NotRequired
-    }
-}
-
-pub(super) fn preferred_runner_for_language(language: ProjectLanguage) -> Option<&'static str> {
-    match language {
-        ProjectLanguage::Rust => Some("cargo test"),
-        ProjectLanguage::Node => Some("npm test"),
-        ProjectLanguage::Python => Some("pytest"),
-        ProjectLanguage::Docs | ProjectLanguage::Unknown => None,
-    }
-}
-
-fn project_intent_confidence(
-    intent: TaskIntent,
-    language: ProjectLanguage,
-    shape: ProjectShape,
-    verification: VerificationRequirement,
-) -> f32 {
-    let mut confidence: f32 = 0.35;
-    if !matches!(intent, TaskIntent::Build) {
-        confidence += 0.15;
-    }
-    if !matches!(language, ProjectLanguage::Unknown) {
-        confidence += 0.20;
-    }
-    if !matches!(shape, ProjectShape::Unknown) {
-        confidence += 0.20;
-    }
-    if !matches!(verification, VerificationRequirement::NotRequired) {
-        confidence += 0.10;
-    }
-    confidence.min(1.0)
 }
 
 /// Returns `true` when the request asks for any code-work signal
