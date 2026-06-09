@@ -1,0 +1,79 @@
+//! Recovery target alignment helpers.
+//!
+//! This module keeps request/runtime-aware target-path normalization out of the
+//! artifact target installer. It does not install jobs or mutate `Agent`.
+
+use super::task_contract::{ArtifactRole, RecoveryTargetHint};
+use super::verifier_orchestration::{
+    synthesized_missing_test_target_path_for_request, test_target_path_compatible_with_request,
+};
+
+pub(super) fn align_recovery_target_hint_to_request(
+    request: Option<&str>,
+    mut hint: RecoveryTargetHint,
+) -> RecoveryTargetHint {
+    if hint.role != ArtifactRole::Test {
+        return hint;
+    }
+    let Some(request) = request else {
+        return hint;
+    };
+    let Some((target_path, stack_label)) =
+        synthesized_missing_test_target_path_for_request(request)
+    else {
+        return hint;
+    };
+    if hint.path == target_path || test_target_path_compatible_with_request(&hint.path, request) {
+        return hint;
+    }
+    hint.path = target_path.to_string();
+    hint.reason =
+        format!("synthesized test artifact aligned with requested {stack_label} project family");
+    hint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hint(role: ArtifactRole, path: &str) -> RecoveryTargetHint {
+        RecoveryTargetHint {
+            role,
+            path: path.to_string(),
+            reason: "missing target".to_string(),
+        }
+    }
+
+    #[test]
+    fn non_test_target_is_not_aligned() {
+        let aligned = align_recovery_target_hint_to_request(
+            Some("Create app.py and tests/test_app.py"),
+            hint(ArtifactRole::Implementation, "main.py"),
+        );
+
+        assert_eq!(aligned.path, "main.py");
+        assert_eq!(aligned.reason, "missing target");
+    }
+
+    #[test]
+    fn python_test_target_aligns_to_existing_requested_family_default() {
+        let aligned = align_recovery_target_hint_to_request(
+            Some("Create math_utils.py and tests/test_math_utils.py with Python unittest tests."),
+            hint(ArtifactRole::Test, "tests/cli.rs"),
+        );
+
+        assert_eq!(aligned.path, "tests/test_main.py");
+        assert!(aligned.reason.contains("python"));
+    }
+
+    #[test]
+    fn compatible_test_target_is_preserved() {
+        let aligned = align_recovery_target_hint_to_request(
+            Some("Create src/lib.rs and tests/lib.rs. Verify with cargo test."),
+            hint(ArtifactRole::Test, "tests/lib.rs"),
+        );
+
+        assert_eq!(aligned.path, "tests/lib.rs");
+        assert_eq!(aligned.reason, "missing target");
+    }
+}

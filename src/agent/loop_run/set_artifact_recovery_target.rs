@@ -13,10 +13,7 @@
 //! - `set_artifact_recovery_target_from_hint` — the SSOT atomic
 //!   installer. Orders: align → install/refresh job → commit
 //!   projection or atomic-clear on validation failure.
-//! - `synthesized_missing_implementation_target_path` (private) —
-//!   per-role synthesised target derivation.
-//! - `align_recovery_target_hint_to_request` (private) — Test-role
-//!   path alignment to the requested stack family.
+//!   Test-role path alignment is delegated to `artifact_target_alignment`.
 //!
 //! Originally `impl Agent` methods; converted to free functions taking
 //! `&mut Agent` / `&Agent`, matching `actor_loop_flow` / `reply_retry`
@@ -25,12 +22,9 @@
 
 use super::Agent;
 use super::task_contract::{
-    ArtifactRecoveryAction, ArtifactRole, CompletionDecision, RecoveryTarget, RecoveryTargetHint,
+    ArtifactRecoveryAction, CompletionDecision, RecoveryTarget, RecoveryTargetHint,
 };
-use super::verifier_orchestration::{
-    JobInstallOutcome, synthesized_missing_test_target_path_for_request,
-    test_target_path_compatible_with_request,
-};
+use super::verifier_orchestration::JobInstallOutcome;
 use crate::logging::log_llm_event;
 
 pub(super) fn set_artifact_recovery_target_for_decision(
@@ -55,36 +49,16 @@ pub(super) fn set_artifact_recovery_target_for_action(
     set_artifact_recovery_target_from_hint(agent, hint, attempt)
 }
 
-fn align_recovery_target_hint_to_request(
-    agent: &Agent,
-    mut hint: RecoveryTargetHint,
-) -> RecoveryTargetHint {
-    if hint.role != ArtifactRole::Test {
-        return hint;
-    }
-    let Some(request) = super::workspace_access::active_request_text(agent) else {
-        return hint;
-    };
-    let Some((target_path, stack_label)) =
-        synthesized_missing_test_target_path_for_request(&request)
-    else {
-        return hint;
-    };
-    if hint.path == target_path || test_target_path_compatible_with_request(&hint.path, &request) {
-        return hint;
-    }
-    hint.path = target_path.to_string();
-    hint.reason =
-        format!("synthesized test artifact aligned with requested {stack_label} project family");
-    hint
-}
-
 pub(super) fn set_artifact_recovery_target_from_hint(
     agent: &mut Agent,
     hint: RecoveryTargetHint,
     attempt: usize,
 ) -> Option<RecoveryTargetHint> {
-    let hint = align_recovery_target_hint_to_request(agent, hint);
+    let request = super::workspace_access::active_request_text(agent);
+    let hint = super::artifact_target_alignment::align_recovery_target_hint_to_request(
+        request.as_deref(),
+        hint,
+    );
     // Issue #652 PR-001: the `ArtifactCompletionJob` is the SSOT for
     // target + role-specific retry budget. We must NOT update
     // `current_artifact_recovery_target` before the job has been

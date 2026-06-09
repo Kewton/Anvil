@@ -185,12 +185,13 @@ mod working_memory_messages;
 // `artifact_recovery_target_path` as free fns over `&mut Agent` /
 // `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
 mod artifact_recovery_flow;
+mod artifact_target_alignment;
 // Artifact-recovery target installer (projection-write half)
 // extracted from `turn.rs` (parent #680). Hosts
 // `set_artifact_recovery_target_for_decision`,
 // `set_artifact_recovery_target_for_action`,
-// `set_artifact_recovery_target_from_hint`, and 2 private alignment /
-// synthesis helpers. Free fns over `&mut Agent` / `&Agent`.
+// `set_artifact_recovery_target_from_hint`. Free fns over `&mut Agent` /
+// `&Agent`.
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod set_artifact_recovery_target;
 // Per-turn artifact-ledger state management (parent #680). Hosts the
