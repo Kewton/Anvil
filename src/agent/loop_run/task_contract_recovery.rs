@@ -53,7 +53,7 @@ pub(super) fn task_contract_recovery_action(
     let artifacts =
         super::artifact_state_projection::task_contract_artifact_states(agent, contract);
     if let Some(action) = satisfied_artifact_job_action(agent, contract, &artifacts) {
-        return action;
+        return finalize_recovery_action(agent, contract, action);
     }
 
     let verifier_repair_ready_to_verify = agent.task_contract_verifier_repair_pending
@@ -67,7 +67,11 @@ pub(super) fn task_contract_recovery_action(
                 )
             }));
     if verifier_repair_ready_to_verify {
-        return super::task_contract::ArtifactRecoveryAction::RunVerifier;
+        return finalize_recovery_action(
+            agent,
+            contract,
+            super::task_contract::ArtifactRecoveryAction::RunVerifier,
+        );
     }
     let repair_state =
         task_contract_repair_state(agent, repair_edit_count, repo_edit_calls_made_this_turn);
@@ -98,7 +102,7 @@ pub(super) fn task_contract_recovery_action(
     ) && let Some(fresh_action) =
         super::deliverable_freshness::stale_supporting_deliverable_action(contract, &artifacts)
     {
-        return fresh_action;
+        return finalize_recovery_action(agent, contract, fresh_action);
     }
     if let Some(probe_action) = super::completion_probe_gate::completion_probe_override(
         agent,
@@ -106,8 +110,17 @@ pub(super) fn task_contract_recovery_action(
         &action,
         &owned_test_artifacts,
     ) {
-        return probe_action;
+        return finalize_recovery_action(agent, contract, probe_action);
     }
+    finalize_recovery_action(agent, contract, action)
+}
+
+fn finalize_recovery_action(
+    agent: &Agent,
+    contract: &super::task_contract::TaskContract,
+    action: super::task_contract::ArtifactRecoveryAction,
+) -> super::task_contract::ArtifactRecoveryAction {
+    super::post_tool_reconciliation::emit_post_tool_reconciliation(agent, contract, &action);
     action
 }
 

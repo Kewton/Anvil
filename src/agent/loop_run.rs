@@ -207,6 +207,7 @@ mod artifact_ledger_state;
 // over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
 // re-export (DR3-001).
 mod artifact_state_projection;
+mod post_tool_reconciliation;
 // `agent.safe_stop.report` emit cluster extracted from `turn.rs` (parent
 // #680). Hosts the Issue #654 emit lifecycle: per-StopReason dedup +
 // emit-4-job-reports + SafeStopReport build + bounded payload render +
