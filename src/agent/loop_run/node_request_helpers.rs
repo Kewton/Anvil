@@ -15,27 +15,49 @@ use std::path::Path;
 use super::Agent;
 use super::evidence_binding::{BindingFailureCheck, BindingState, evaluate_binding};
 use super::node_runner_manifest::{NodeManifestCompletion, complete_node_test_runner_manifest};
+use super::task_contract::{ArtifactRole, DeliverableFormat, TaskContract};
 
 /// True when the active request targets a Node/JS/TS coding stack and the
-/// task contract requires test execution. Reuses the request-family
-/// classifier (`synthesized_missing_test_target_path_for_request`) so the
-/// stack gate stays consistent with the rest of the verifier orchestration.
+/// task contract requires test execution.
+///
+/// The stack gate reads only sealed contract facts. Raw request text is still
+/// allowed upstream while constructing the contract, but this post-seal recovery
+/// decision must not reinterpret the user prompt independently.
 pub(super) fn active_node_request_requires_tests(agent: &Agent) -> bool {
-    let Some(request) = super::workspace_access::active_request_text(agent) else {
-        return false;
-    };
-    if !request_targets_node_stack(&request) {
-        return false;
-    }
-    super::task_classification::task_contract_authority(agent)
-        .is_some_and(|contract| contract.completion_policy.test_execution_required())
+    super::task_classification::task_contract_authority(agent).is_some_and(|contract| {
+        task_contract_targets_node_stack(&contract)
+            && contract.completion_policy.test_execution_required()
+    })
 }
 
-fn request_targets_node_stack(request: &str) -> bool {
-    matches!(
-        super::verifier_orchestration::synthesized_missing_test_target_path_for_request(request),
-        Some((_, "javascript" | "typescript"))
-    )
+fn task_contract_targets_node_stack(contract: &TaskContract) -> bool {
+    contract
+        .required_artifact_identities
+        .iter()
+        .any(|identity| {
+            node_stack_artifact_identity(identity.role, identity.format.as_ref(), &identity.path)
+        })
+}
+
+fn node_stack_artifact_identity(
+    role: ArtifactRole,
+    format: Option<&DeliverableFormat>,
+    path: &str,
+) -> bool {
+    match role {
+        ArtifactRole::Implementation | ArtifactRole::Test => matches!(
+            format,
+            Some(DeliverableFormat::JavaScriptSource | DeliverableFormat::TypeScriptSource)
+        ),
+        ArtifactRole::Setup => artifact_file_name_eq(path, "package.json"),
+        ArtifactRole::UsageDocs | ArtifactRole::DataOutput => false,
+    }
+}
+
+fn artifact_file_name_eq(path: &str, expected: &str) -> bool {
+    path.rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
 
 /// True when a Node test artifact already exists in the workspace (top-level
@@ -130,6 +152,66 @@ mod tests {
     use super::super::evidence_binding::{BindingFailureCheck, BindingRecovery, BindingState};
     use super::super::node_runner_manifest::NodeManifestAction;
     use super::*;
+
+    #[test]
+    fn node_stack_detection_uses_package_manifest_contract_fact() {
+        let contract = TaskContract::from_request(
+            "Create a Node CLI. Include package.json, implementation, tests, and README.md.",
+        );
+
+        assert!(task_contract_targets_node_stack(&contract));
+        assert!(contract.completion_policy.test_execution_required());
+    }
+
+    #[test]
+    fn node_stack_detection_uses_js_and_ts_artifact_formats() {
+        let js_contract =
+            TaskContract::from_request("Create src/index.js with tests/index.test.js.");
+        let ts_contract =
+            TaskContract::from_request("Create src/index.ts with tests/index.test.ts.");
+
+        assert!(task_contract_targets_node_stack(&js_contract));
+        assert!(task_contract_targets_node_stack(&ts_contract));
+    }
+
+    #[test]
+    fn node_stack_detection_rejects_standalone_data_json_contract() {
+        let contract = TaskContract::from_request(
+            "Create summary.json only with fields total_count and status.",
+        );
+
+        assert!(!task_contract_targets_node_stack(&contract));
+        assert!(
+            contract
+                .required_artifact_identities
+                .iter()
+                .any(|identity| identity.role == ArtifactRole::DataOutput)
+        );
+    }
+
+    #[test]
+    fn node_stack_artifact_identity_rejects_non_node_roles_and_paths() {
+        assert!(node_stack_artifact_identity(
+            ArtifactRole::Setup,
+            Some(&DeliverableFormat::Json),
+            "frontend/package.json",
+        ));
+        assert!(!node_stack_artifact_identity(
+            ArtifactRole::Setup,
+            Some(&DeliverableFormat::Toml),
+            "Cargo.toml",
+        ));
+        assert!(!node_stack_artifact_identity(
+            ArtifactRole::DataOutput,
+            Some(&DeliverableFormat::Json),
+            "output.json",
+        ));
+        assert!(!node_stack_artifact_identity(
+            ArtifactRole::UsageDocs,
+            Some(&DeliverableFormat::Markdown),
+            "README.md",
+        ));
+    }
 
     #[test]
     fn node_test_filename_predicate_matches_common_shapes() {
