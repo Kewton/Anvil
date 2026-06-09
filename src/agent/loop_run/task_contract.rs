@@ -60,16 +60,20 @@ use super::task_contract_evidence_stage::{ObjectiveEvidenceRunner, ObjectiveEvid
 use super::task_contract_input_projection::ContractRequestInputs;
 #[cfg(test)]
 pub(super) use super::task_contract_obligation_planning::default_readme_required_sections;
+#[cfg(test)]
+use super::task_contract_obligation_planning::docs_path_is_clearly_source_input;
 pub(super) use super::task_contract_obligation_planning::{
-    inferred_data_obligations_from_request_with_scan, push_or_merge_artifact_obligation,
-    required_doc_sections_from_request, required_ops_sections_from_request,
-    required_research_sections_from_request,
+    explicit_artifact_obligations_from_request,
+    explicit_artifact_obligations_from_request_with_scan,
+    inferred_data_obligations_from_request_with_scan, inferred_docs_obligations_from_request,
+    push_or_merge_artifact_obligation, required_doc_sections_from_request,
+    required_ops_sections_from_request, required_research_sections_from_request,
 };
 pub(super) use super::task_contract_path_context::{
-    AUTHORING_KEYWORD_NEEDLES_ASCII, DATA_SHAPE_NOUNS, DOCS_OUTPUT_AFTER_JP,
-    INPUT_REFERENCE_VERBS_ASCII, INPUT_VERBS_ASCII, OUTPUT_AFTER_ASCII, OUTPUT_PREP_ASCII,
-    OUTPUT_VERB_STEMS_ASCII, OutputContextScan, RESEARCH_OUTPUT_AFTER_JP, bounded_context_after,
-    bounded_context_before, contains_any, contains_ascii_token, contains_output_verb,
+    AUTHORING_KEYWORD_NEEDLES_ASCII, DATA_SHAPE_NOUNS, INPUT_REFERENCE_VERBS_ASCII,
+    INPUT_VERBS_ASCII, OUTPUT_AFTER_ASCII, OUTPUT_PREP_ASCII, OUTPUT_VERB_STEMS_ASCII,
+    OutputContextScan, RESEARCH_OUTPUT_AFTER_JP, bounded_context_after, bounded_context_before,
+    contains_any, contains_ascii_token, contains_output_verb,
     normalize_explicit_user_artifact_path, validated_obligation_path,
 };
 #[cfg(test)]
@@ -2197,24 +2201,6 @@ pub(super) fn request_asks_for_data_output_artifact_with_scan(
     request_explicitly_requests_standalone_data_artifact_with_scan(scan, request)
 }
 
-pub(super) fn inferred_docs_obligations_from_request(
-    request: &str,
-    lower: &str,
-    required_artifacts: &[ArtifactRole],
-) -> Vec<ArtifactObligation> {
-    if !required_artifacts.contains(&ArtifactRole::UsageDocs)
-        || !lower.contains("readme")
-        || !lower.contains("section")
-    {
-        return Vec::new();
-    }
-    let sections = required_doc_sections_from_request(request);
-    if sections.is_empty() {
-        return Vec::new();
-    }
-    vec![ArtifactObligation::readme("README.md", sections)]
-}
-
 /// Issue #923 (P6): the OpsRunbook obligation bridge. Without this, an Ops
 /// request produces only a `TaskDeliverable` (no obligation), so the production
 /// obligation diagnostic never runs `ops_runbook_pass` and loosening the
@@ -2348,175 +2334,6 @@ fn default_ops_runbook_path_from_request(request: &str) -> String {
         .find(|identity| identity.role == ArtifactRole::UsageDocs)
         .map(|identity| identity.path)
         .unwrap_or_else(|| "runbook.md".to_string())
-}
-
-pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<ArtifactObligation> {
-    let scan = OutputContextScan::new(request);
-    explicit_artifact_obligations_from_request_with_scan(&scan, request)
-}
-
-/// Issue #937 (DS3-001): scan-threaded variant. The DataOutput identity gate
-/// reuses the single mask for `data_path_has_output_context` per path candidate.
-pub(super) fn explicit_artifact_obligations_from_request_with_scan(
-    scan: &OutputContextScan,
-    request: &str,
-) -> Vec<ArtifactObligation> {
-    let mut obligations = Vec::new();
-    for token in request.split(|ch: char| {
-        !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\'))
-    }) {
-        let Some(path) = normalize_explicit_user_artifact_path(token) else {
-            continue;
-        };
-        let category =
-            super::completion_evidence::classify_repo_edit_path(std::path::Path::new(&path));
-        let Some(role) = role_from_repo_edit(category) else {
-            continue;
-        };
-        if role == ArtifactRole::DataOutput && !data_path_has_output_context_with_scan(scan, &path)
-        {
-            continue;
-        }
-        if !obligations
-            .iter()
-            .any(|existing: &ArtifactObligation| existing.role == role && existing.path == path)
-        {
-            obligations.push(ArtifactObligation::file(role, path));
-        }
-    }
-    // Issue #919 (CB2-001): mirror the `DataOutput` source/output discriminator
-    // for `UsageDocs` paths so a translation/authoring *source* (input) is not
-    // modeled as a required deliverable. Unlike the unconditional `DataOutput`
-    // filter, this is scoped so it can never leave an authoring request with
-    // zero deliverables: a docs path is dropped from `required` only when it
-    // carries a clear *source/input* cue AND a *distinct* docs path that is not
-    // itself a source/input (a real output) is also present. In-place authoring
-    // (`rewrite docs/intro.md ...`) keeps its single path; true multi-output
-    // (`write intro.md and faq.md`) keeps both (neither is a source).
-    retain_docs_outputs_when_distinct_source(scan, &mut obligations);
-    obligations.sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
-    obligations
-}
-
-/// Issue #919 (CB2-001): remove `UsageDocs` obligations that are clearly a
-/// *source/input* of an authoring/translation request, but only when a distinct
-/// `UsageDocs` *output* obligation also survives — guaranteeing the request is
-/// never left with zero docs deliverables (fail-open to "everything required").
-///
-/// "Source/input" is keyed on the SAME before/after preposition+verb cues the
-/// `DataOutput` discriminator (`data_path_has_output_context`) already uses,
-/// extended minimally with translation cues (`translate` / `翻訳`) and a
-/// language-stamped filename hint (`README.ja.md`). It deliberately does NOT
-/// invent new output heuristics: an output is simply "any docs path that is not
-/// classified as a source/input".
-fn retain_docs_outputs_when_distinct_source(
-    scan: &OutputContextScan,
-    obligations: &mut Vec<ArtifactObligation>,
-) {
-    let docs_sources: Vec<String> = obligations
-        .iter()
-        .filter(|o| o.role == ArtifactRole::UsageDocs)
-        .filter(|o| docs_path_is_clearly_source_input_with_scan(scan, &o.path))
-        .map(|o| o.path.clone())
-        .collect();
-    if docs_sources.is_empty() {
-        return;
-    }
-    // A distinct output exists iff some UsageDocs obligation is NOT a source.
-    let has_distinct_output = obligations
-        .iter()
-        .any(|o| o.role == ArtifactRole::UsageDocs && !docs_sources.contains(&o.path));
-    if !has_distinct_output {
-        return;
-    }
-    obligations.retain(|o| !(o.role == ArtifactRole::UsageDocs && docs_sources.contains(&o.path)));
-}
-
-/// Issue #919 (CB2-001): true iff `path` (a recognized docs path) is referenced
-/// in `request` with a clear source/input cue and never with an output cue —
-/// mirroring the `input_context && !output` branch of
-/// [`data_path_has_output_context`], extended for translation/authoring.
-#[cfg(test)]
-fn docs_path_is_clearly_source_input(request: &str, path: &str) -> bool {
-    let scan = OutputContextScan::new(request);
-    docs_path_is_clearly_source_input_with_scan(&scan, path)
-}
-
-/// Issue #937 (判断#5, DS3-001): the docs/authoring source discriminator, hardened
-/// for masking + word-boundary + a JP output marker. Polarity is PRESERVED:
-/// `true` = DROP as source, requiring `saw_occurrence && every(source) &&
-/// !any(output)`. The before/after windows run on the **masked** text so an
-/// adjacent path cannot supply a false cue; ASCII verbs are word-boundary
-/// matched; the new `DOCS_OUTPUT_AFTER_JP` after-window (`に書いて`/`に出力`/
-/// `として保存`) lets `...README.mdに書いてください` count `README.md` as an
-/// OUTPUT (so it is kept, not pruned as source) — required to keep the polarity
-/// correct (N8).
-fn docs_path_is_clearly_source_input_with_scan(scan: &OutputContextScan, path: &str) -> bool {
-    let lower = scan.lower.as_str();
-    let masked = scan.lower_masked.as_str();
-    let path_lower = path.to_ascii_lowercase();
-    let filename_source = docs_path_file_name_looks_like_source(path);
-    let mut saw_occurrence = false;
-    let mut every_occurrence_is_source = true;
-    for (idx, _) in lower.match_indices(&path_lower) {
-        saw_occurrence = true;
-        let before = bounded_context_before(masked, idx, 48);
-        let after_idx = idx + path_lower.len();
-        let after = bounded_context_after(masked, after_idx, 32);
-        // Output cues take precedence: a written/saved/into position makes this a
-        // deliverable, not a source. ASCII output verbs/preps (boundary) +
-        // `OUTPUT_AFTER_ASCII` nouns + JP output markers (judgement #5).
-        let output_context = contains_output_verb(before, OUTPUT_VERB_STEMS_ASCII)
-            || OUTPUT_PREP_ASCII
-                .iter()
-                .any(|prep| contains_ascii_token(before, prep))
-            || contains_any(after, OUTPUT_AFTER_ASCII)
-            || contains_any(after, DOCS_OUTPUT_AFTER_JP);
-        let input_context = INPUT_VERBS_ASCII
-            .iter()
-            .any(|cue| contains_ascii_token(before, cue))
-            || contains_ascii_token(before, "original")
-            || contains_ascii_token(before, "translate")
-            || contains_ascii_token(before, "translates")
-            || contains_ascii_token(before, "translating")
-            || contains_any(before, &["translation of", "翻訳", "英訳"])
-            || contains_any(
-                after,
-                &[" as input", " input", " 翻訳", " を英訳", " を翻訳"],
-            );
-        let occurrence_is_source = (filename_source || input_context) && !output_context;
-        if !occurrence_is_source {
-            every_occurrence_is_source = false;
-        }
-    }
-    saw_occurrence && every_occurrence_is_source
-}
-
-/// Issue #919 (CB2-001): a docs filename that itself signals a translation
-/// *source* via a language stamp (`README.ja.md`, `intro.fr.mdx`) — i.e. a
-/// non-English language tag immediately before the extension. The English tag
-/// (`.en.`) is treated as a likely *output* (translation target), so it is not
-/// a source hint.
-fn docs_path_file_name_looks_like_source(path: &str) -> bool {
-    let Some(stem) = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::to_ascii_lowercase)
-    else {
-        return false;
-    };
-    // The file_stem of `README.ja.md` is `README.ja`; its inner extension is the
-    // language tag.
-    let Some(lang) = std::path::Path::new(&stem)
-        .extension()
-        .and_then(|ext| ext.to_str())
-    else {
-        return false;
-    };
-    matches!(
-        lang,
-        "ja" | "fr" | "de" | "es" | "it" | "pt" | "zh" | "ko" | "ru" | "nl"
-    )
 }
 
 pub(super) fn normalized_artifact_path_eq(actual: &str, expected: &str) -> bool {
@@ -5014,6 +4831,32 @@ mod tests {
         assert_eq!(
             contract.evaluate_with_owned_test_artifacts(&evidence, &[]),
             CompletionDecision::Done
+        );
+    }
+
+    #[test]
+    fn explicit_non_readme_docs_does_not_synthesize_negated_readme_obligation() {
+        let contract = TaskContract::from_request(
+            "Produce a documentation file named guide.md only. It must contain markdown sections Overview and Usage. Do not create README or source code.",
+        );
+
+        assert!(
+            contract
+                .required_artifact_identities
+                .iter()
+                .any(|obligation| obligation.role == ArtifactRole::UsageDocs
+                    && obligation.path == "guide.md"),
+            "explicit guide.md obligation should be retained: {:?}",
+            contract.required_artifact_identities
+        );
+        assert!(
+            !contract
+                .required_artifact_identities
+                .iter()
+                .any(|obligation| obligation.role == ArtifactRole::UsageDocs
+                    && obligation.path == "README.md"),
+            "README/docs were explicitly forbidden, required={:?}",
+            contract.required_artifact_identities
         );
     }
 
