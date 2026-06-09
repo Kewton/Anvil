@@ -7,13 +7,17 @@
 
 use std::path::{Path, PathBuf};
 
-use super::task_contract::ArtifactRole;
+use super::task_contract::{
+    ArtifactRole, DeliverableFormat, DeliverableSchema, StructuredRecordSchema,
+};
 use super::worker_contract::{
-    ExecutionDeliverable, RuntimeProfile, TaskExecutionContract, WorkerKind,
+    ExecutionDeliverable, ExecutionEvidence, PublicContract, RuntimeProfile, TaskExecutionContract,
+    WorkerKind,
 };
 use crate::session::store::ConversationMessage;
 
 const MAX_PHASES_IN_MESSAGE: usize = 7;
+const MAX_DECLARED_ITEMS_IN_MESSAGE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContractGenerationPhaseKind {
@@ -72,6 +76,8 @@ pub(super) struct ContractBoundGenerationPlan {
     phases: Vec<ContractGenerationPhase>,
     alignment_predicate: &'static str,
     runtime_profile: RuntimeProfile,
+    declared_artifacts: String,
+    declared_expectations: String,
 }
 
 impl ContractBoundGenerationPlan {
@@ -122,6 +128,8 @@ impl ContractBoundGenerationPlan {
             phases,
             alignment_predicate,
             runtime_profile: execution.runtime_profile,
+            declared_artifacts: declared_artifacts_summary(&execution.deliverables),
+            declared_expectations: declared_expectations_summary(execution),
         })
     }
 
@@ -150,10 +158,12 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; phases={}. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; declared_artifacts={}; declared_expectations={}; phases={}. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
+            self.declared_artifacts,
+            self.declared_expectations,
             phase_text
         )
     }
@@ -302,6 +312,172 @@ fn phase_target_label(phase: &ContractGenerationPhase) -> String {
     format!("{role}@{path}")
 }
 
+fn declared_artifacts_summary(deliverables: &[ExecutionDeliverable]) -> String {
+    if deliverables.is_empty() {
+        return "none".to_string();
+    }
+    deliverables
+        .iter()
+        .take(MAX_DECLARED_ITEMS_IN_MESSAGE)
+        .map(declared_artifact_summary)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn declared_artifact_summary(deliverable: &ExecutionDeliverable) -> String {
+    let mut details = Vec::new();
+    if let Some(kind) = deliverable.kind {
+        details.push(format!("kind={}", kind.label()));
+    }
+    if let Some(format) = deliverable.format.as_ref() {
+        details.push(format!("format={}", deliverable_format_label(format)));
+    }
+    if let Some(schema) = deliverable.schema.as_ref() {
+        details.push(deliverable_schema_summary(schema));
+    } else if !deliverable.required_sections.is_empty() {
+        details.push(format!(
+            "sections={}",
+            compact_value_list(deliverable.required_sections.iter().map(String::as_str))
+        ));
+    }
+    if !deliverable.acceptance_criteria.is_empty() {
+        details.push(format!(
+            "criteria={}",
+            compact_value_list(deliverable.acceptance_criteria.iter().map(String::as_str))
+        ));
+    }
+
+    let role = deliverable.role.label();
+    let path = deliverable
+        .path
+        .as_deref()
+        .map(display_path)
+        .unwrap_or_else(|| "declared".to_string());
+    if details.is_empty() {
+        format!("{role}@{path}")
+    } else {
+        format!("{role}@{path}({})", details.join(";"))
+    }
+}
+
+fn declared_expectations_summary(execution: &TaskExecutionContract) -> String {
+    [
+        public_contract_summary(&execution.public_contract)
+            .map(|summary| format!("public_contract={summary}")),
+        Some(evidence_summary(&execution.evidence)),
+        allowed_files_summary(&execution.constraints.allowed_files)
+            .map(|summary| format!("allowed_files={summary}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(";")
+}
+
+fn public_contract_summary(public_contract: &PublicContract) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(goal) = public_contract.goal() {
+        parts.push(format!(
+            "goal={}",
+            super::task_contract::mask_and_cap_recovery_field(goal)
+        ));
+    }
+    if !public_contract.signatures().is_empty() {
+        parts.push(format!(
+            "signatures={}",
+            compact_value_list(public_contract.signatures().iter().map(String::as_str))
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(","))
+}
+
+fn evidence_summary(evidence: &ExecutionEvidence) -> String {
+    let required = if evidence.required {
+        "required"
+    } else {
+        "optional"
+    };
+    let mut out = format!("evidence={}({required})", evidence.kind.label());
+    if let Some(command) = evidence.command.as_deref() {
+        out.push_str(&format!(
+            ",command={}",
+            super::task_contract::mask_and_cap_recovery_field(command)
+        ));
+    }
+    out
+}
+
+fn allowed_files_summary(paths: &[PathBuf]) -> Option<String> {
+    (!paths.is_empty())
+        .then(|| compact_value_list(paths.iter().map(|path| path.to_string_lossy().into_owned())))
+}
+
+fn deliverable_format_label(format: &DeliverableFormat) -> &'static str {
+    match format {
+        DeliverableFormat::RustSource => "rust_source",
+        DeliverableFormat::JavaScriptSource => "javascript_source",
+        DeliverableFormat::TypeScriptSource => "typescript_source",
+        DeliverableFormat::Markdown => "markdown",
+        DeliverableFormat::Toml => "toml",
+        DeliverableFormat::Json => "json",
+        DeliverableFormat::Csv => "csv",
+        DeliverableFormat::Tsv => "tsv",
+        DeliverableFormat::JsonLines => "json_lines",
+        DeliverableFormat::Text => "text",
+    }
+}
+
+fn deliverable_schema_summary(schema: &DeliverableSchema) -> String {
+    match schema {
+        DeliverableSchema::StructuredRecord(record_schema) => {
+            structured_record_schema_summary(record_schema)
+        }
+        DeliverableSchema::JsonFields(fields) => {
+            format!(
+                "schema=json_fields:{}",
+                compact_value_list(fields.iter().map(String::as_str))
+            )
+        }
+        DeliverableSchema::RequiredSections(sections) => format!(
+            "schema=required_sections:{}",
+            compact_value_list(sections.iter().map(String::as_str))
+        ),
+    }
+}
+
+fn structured_record_schema_summary(schema: &StructuredRecordSchema) -> String {
+    let mut parts = vec![format!(
+        "columns={}",
+        compact_value_list(schema.columns.iter().map(String::as_str))
+    )];
+    if !schema.expected_rows.is_empty() {
+        parts.push(format!(
+            "expected_rows={}",
+            compact_value_list(schema.expected_rows.iter().map(|row| row.join("|")))
+        ));
+    }
+    format!("schema=structured_record:{}", parts.join(";"))
+}
+
+fn compact_value_list<I, S>(values: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out = values
+        .into_iter()
+        .take(MAX_DECLARED_ITEMS_IN_MESSAGE)
+        .map(|value| super::task_contract::mask_and_cap_recovery_field(value.as_ref()))
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    out.dedup();
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out.join("|")
+    }
+}
+
 fn display_path(path: &Path) -> String {
     super::task_contract::mask_and_cap_recovery_field(&path.to_string_lossy())
 }
@@ -383,6 +559,60 @@ mod tests {
                 && phase.worker_kind == WorkerKind::Data
         }));
         assert!(!plan.policy_message().contains("cargo"));
+    }
+
+    #[test]
+    fn generation_packet_includes_admitted_rust_manifest_and_artifact_formats() {
+        let contract = TaskContract::from_request(
+            "Create a Rust library. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::Rust)
+            .with_evidence_command("cargo test");
+        let plan = ContractBoundGenerationPlan::from_execution_contract(&execution)
+            .expect("rust contract should produce a generation plan");
+        let message = plan.policy_message();
+
+        assert!(message.contains("declared_artifacts="));
+        assert!(message.contains("setup@Cargo.toml(kind=file;format=toml)"));
+        assert!(message.contains("implementation@src/lib.rs(kind=file;format=rust_source)"));
+        assert!(message.contains("test@tests/lib.rs(kind=file;format=rust_source)"));
+        assert!(message.contains("evidence=test_run(required),command=cargo test"));
+    }
+
+    #[test]
+    fn generation_packet_includes_data_schema_without_coding_branches() {
+        let contract = TaskContract::from_request(
+            "Generate data/output.csv with exactly columns id,total and exactly rows 1,100 and 2,250.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract);
+        let plan = ContractBoundGenerationPlan::from_execution_contract(&execution)
+            .expect("data contract should produce a generation plan");
+        let message = plan.policy_message();
+
+        assert!(message.contains("data_output@data/output.csv"));
+        assert!(
+            message.contains("schema=structured_record:columns=id|total;expected_rows=1|100|2|250"),
+            "{message}"
+        );
+        assert!(!message.contains("module_exports_cli_shape"));
+    }
+
+    #[test]
+    fn generation_packet_includes_required_document_sections() {
+        let contract = TaskContract::from_request(
+            "Create README.md with sections Overview, Usage, Validation.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract);
+        let plan = ContractBoundGenerationPlan::from_execution_contract(&execution)
+            .expect("docs contract should produce a generation plan");
+        let message = plan.policy_message();
+
+        assert!(message.contains("usage_docs@README.md"));
+        assert!(
+            message.contains("schema=required_sections:overview|usage"),
+            "{message}"
+        );
     }
 
     #[test]

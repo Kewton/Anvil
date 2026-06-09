@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use super::scaffold_pipeline::ScaffoldFramework;
 use super::task_contract::{
-    ArtifactRole, ObjectiveContract, ObjectiveDeliverableKind, ObjectiveEvidenceKind,
-    ObjectiveKind, RecoveryTargetHint, TaskContract, TaskKind,
+    ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, ObjectiveContract,
+    ObjectiveDeliverableKind, ObjectiveEvidenceKind, ObjectiveKind, RecoveryTargetHint,
+    TaskContract, TaskKind,
 };
 
 pub(super) const MAX_CONTEXT_PACK_ENTRIES: usize = 8;
@@ -1304,6 +1305,11 @@ impl ScaffoldProfile {
 pub(super) struct ExecutionDeliverable {
     pub(super) role: ArtifactRole,
     pub(super) path: Option<PathBuf>,
+    pub(super) kind: Option<DeliverableKind>,
+    pub(super) format: Option<DeliverableFormat>,
+    pub(super) schema: Option<DeliverableSchema>,
+    pub(super) required_sections: Vec<String>,
+    pub(super) acceptance_criteria: Vec<String>,
 }
 
 const MAX_PUBLIC_CONTRACT_SIGNATURES: usize = 6;
@@ -1718,6 +1724,11 @@ fn execution_deliverables_for_contract(
             .map(|obligation| ExecutionDeliverable {
                 role: obligation.role,
                 path: Some(PathBuf::from(obligation.path.as_str())),
+                kind: Some(obligation.kind),
+                format: obligation.format.clone(),
+                schema: obligation.schema.clone(),
+                required_sections: obligation.required_sections.clone(),
+                acceptance_criteria: obligation.acceptance_criteria.clone(),
             })
             .collect();
     }
@@ -1727,6 +1738,11 @@ fn execution_deliverables_for_contract(
         .map(|role| ExecutionDeliverable {
             role: *role,
             path: None,
+            kind: None,
+            format: None,
+            schema: None,
+            required_sections: Vec::new(),
+            acceptance_criteria: Vec::new(),
         })
         .collect()
 }
@@ -2523,6 +2539,11 @@ mod tests {
         let rust = vec![ExecutionDeliverable {
             role: ArtifactRole::Implementation,
             path: Some(PathBuf::from("src/lib.rs")),
+            kind: None,
+            format: None,
+            schema: None,
+            required_sections: Vec::new(),
+            acceptance_criteria: Vec::new(),
         }];
         assert_eq!(
             runtime_profile_for_deliverables(&rust),
@@ -2532,6 +2553,11 @@ mod tests {
         let docs = vec![ExecutionDeliverable {
             role: ArtifactRole::UsageDocs,
             path: Some(PathBuf::from("README.md")),
+            kind: None,
+            format: None,
+            schema: None,
+            required_sections: Vec::new(),
+            acceptance_criteria: Vec::new(),
         }];
         assert_eq!(
             runtime_profile_for_deliverables(&docs),
