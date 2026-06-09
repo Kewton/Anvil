@@ -11,7 +11,8 @@ use super::project_profile::ProjectProfileConfirmation;
 use super::project_profile_projection::{
     ProjectProfileContractInputs, contract_inputs_from_confirmation,
 };
-use super::task_contract::TaskKind;
+use super::task_contract::{TaskContract, TaskKind};
+use super::task_contract_semantic_candidate::{CandidateContractDisagreement, SemanticCandidate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContractAdmissionRejectionReason {
@@ -126,10 +127,111 @@ pub(super) fn admit_task_kind(inputs: ContractAdmissionInput<'_>) -> TaskKindAdm
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SemanticCandidateAdmissionStatus {
+    Admitted,
+    Rejected,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SemanticCandidateAdmissionReason {
+    ShadowOnly,
+    ExplicitFactConflict,
+    LowerConfidenceThanContract,
+    MissingArtifactIdentity,
+    AmbiguousObjective,
+    UnsafePath,
+    UnsupportedRuntime,
+}
+
+impl SemanticCandidateAdmissionReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ShadowOnly => "shadow_only",
+            Self::ExplicitFactConflict => "explicit_fact_conflict",
+            Self::LowerConfidenceThanContract => "lower_confidence_than_contract",
+            Self::MissingArtifactIdentity => "missing_artifact_identity",
+            Self::AmbiguousObjective => "ambiguous_objective",
+            Self::UnsafePath => "unsafe_path",
+            Self::UnsupportedRuntime => "unsupported_runtime",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SemanticCandidateAdmissionDecision {
+    pub(super) status: SemanticCandidateAdmissionStatus,
+    pub(super) reasons: Vec<SemanticCandidateAdmissionReason>,
+    pub(super) disagreements: Vec<CandidateContractDisagreement>,
+}
+
+impl SemanticCandidateAdmissionDecision {
+    pub(super) fn is_authoritative(&self) -> bool {
+        matches!(self.status, SemanticCandidateAdmissionStatus::Admitted)
+    }
+
+    pub(super) fn reason_labels(&self) -> Vec<&'static str> {
+        self.reasons.iter().map(|reason| reason.label()).collect()
+    }
+
+    pub(super) fn log_lines(&self) -> Vec<String> {
+        let reasons = self.reason_labels().join(",");
+        let mut lines = vec![format!(
+            "semantic_candidate_admission status={:?} reasons={}",
+            self.status, reasons
+        )];
+        lines.extend(self.disagreements.iter().map(|disagreement| {
+            format!(
+                "semantic_candidate_disagreement field={} candidate={} contract={}",
+                disagreement.field, disagreement.candidate, disagreement.contract
+            )
+        }));
+        lines
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SemanticCandidateAdmissionInput<'a> {
+    pub(super) candidate: &'a SemanticCandidate,
+    pub(super) contract: &'a TaskContract,
+    pub(super) allow_equivalent_current_behavior: bool,
+}
+
+pub(super) fn admit_semantic_candidate(
+    inputs: SemanticCandidateAdmissionInput<'_>,
+) -> SemanticCandidateAdmissionDecision {
+    let disagreements = inputs
+        .candidate
+        .disagreements_with_contract(inputs.contract);
+    if !disagreements.is_empty() {
+        return SemanticCandidateAdmissionDecision {
+            status: SemanticCandidateAdmissionStatus::Rejected,
+            reasons: vec![SemanticCandidateAdmissionReason::ExplicitFactConflict],
+            disagreements,
+        };
+    }
+
+    if inputs.allow_equivalent_current_behavior {
+        return SemanticCandidateAdmissionDecision {
+            status: SemanticCandidateAdmissionStatus::Admitted,
+            reasons: Vec::new(),
+            disagreements,
+        };
+    }
+
+    SemanticCandidateAdmissionDecision {
+        status: SemanticCandidateAdmissionStatus::Ignored,
+        reasons: vec![SemanticCandidateAdmissionReason::ShadowOnly],
+        disagreements,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::project_profile::{ProfileDeliverableKind, ProjectProfileConfirmation};
     use super::super::task_contract::TaskKind;
+    use super::super::task_contract_semantic_candidate::SemanticCandidate;
     use super::*;
 
     fn profile(confidence: f32) -> ProjectProfileConfirmation {
@@ -188,5 +290,66 @@ mod tests {
         assert_eq!(decision.task_kind, TaskKind::Docs);
         assert_eq!(decision.source, TaskKindAdmissionSource::ProjectProfile);
         assert_eq!(decision.classification_confidence, 0.95);
+    }
+
+    #[test]
+    fn semantic_candidate_shadow_mode_keeps_equivalent_candidate_non_authoritative() {
+        let contract = TaskContract::from_request("Generate output.csv with columns id and total.");
+        let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+        let decision = admit_semantic_candidate(SemanticCandidateAdmissionInput {
+            candidate: &candidate,
+            contract: &contract,
+            allow_equivalent_current_behavior: false,
+        });
+
+        assert_eq!(decision.status, SemanticCandidateAdmissionStatus::Ignored);
+        assert!(!decision.is_authoritative());
+        assert_eq!(decision.reason_labels(), vec!["shadow_only"]);
+        assert!(decision.disagreements.is_empty());
+    }
+
+    #[test]
+    fn semantic_candidate_conflict_is_rejected_and_logged() {
+        let contract = TaskContract::from_request("Generate output.csv with columns id and total.");
+        let mut candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+        candidate.objective_kind = super::super::task_contract::ObjectiveKind::Coding;
+
+        let decision = admit_semantic_candidate(SemanticCandidateAdmissionInput {
+            candidate: &candidate,
+            contract: &contract,
+            allow_equivalent_current_behavior: true,
+        });
+
+        assert_eq!(decision.status, SemanticCandidateAdmissionStatus::Rejected);
+        assert!(!decision.is_authoritative());
+        assert_eq!(decision.reason_labels(), vec!["explicit_fact_conflict"]);
+        assert_eq!(decision.disagreements.len(), 1);
+        assert!(
+            decision
+                .log_lines()
+                .iter()
+                .any(|line| line.contains("semantic_candidate_disagreement"))
+        );
+    }
+
+    #[test]
+    fn equivalent_semantic_candidate_can_be_admitted_without_mutating_contract() {
+        let contract = TaskContract::from_request(
+            "Create a Rust CLI. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+        let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+        let decision = admit_semantic_candidate(SemanticCandidateAdmissionInput {
+            candidate: &candidate,
+            contract: &contract,
+            allow_equivalent_current_behavior: true,
+        });
+
+        assert_eq!(decision.status, SemanticCandidateAdmissionStatus::Admitted);
+        assert!(decision.is_authoritative());
+        assert!(decision.reasons.is_empty());
+        assert!(decision.disagreements.is_empty());
+        assert_eq!(contract.task_kind, TaskKind::Coding);
     }
 }

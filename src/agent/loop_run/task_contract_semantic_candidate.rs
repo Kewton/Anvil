@@ -149,75 +149,6 @@ pub(super) struct CandidateContractDisagreement {
     pub(super) contract: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AdmissionOutcome {
-    ShadowOnly,
-    Accepted,
-    Rejected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AdmissionRejectionReason {
-    ShadowOnly,
-    ExplicitUserFactConflict,
-    LowerConfidenceThanContract,
-    MissingArtifactIdentity,
-    AmbiguousObjective,
-    UnsafePath,
-    UnsupportedRuntime,
-}
-
-impl AdmissionRejectionReason {
-    fn label(self) -> &'static str {
-        match self {
-            Self::ShadowOnly => "shadow_only",
-            Self::ExplicitUserFactConflict => "explicit_user_fact_conflict",
-            Self::LowerConfidenceThanContract => "lower_confidence_than_contract",
-            Self::MissingArtifactIdentity => "missing_artifact_identity",
-            Self::AmbiguousObjective => "ambiguous_objective",
-            Self::UnsafePath => "unsafe_path",
-            Self::UnsupportedRuntime => "unsupported_runtime",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct AdmissionDecision {
-    pub(super) outcome: AdmissionOutcome,
-    pub(super) rejection_reasons: Vec<AdmissionRejectionReason>,
-    pub(super) disagreements: Vec<CandidateContractDisagreement>,
-}
-
-impl AdmissionDecision {
-    pub(super) fn shadow_only(candidate: &SemanticCandidate, contract: &TaskContract) -> Self {
-        Self {
-            outcome: AdmissionOutcome::ShadowOnly,
-            rejection_reasons: vec![AdmissionRejectionReason::ShadowOnly],
-            disagreements: candidate.disagreements_with_contract(contract),
-        }
-    }
-
-    pub(super) fn log_lines(&self) -> Vec<String> {
-        let reasons = self
-            .rejection_reasons
-            .iter()
-            .map(|reason| reason.label())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut lines = vec![format!(
-            "semantic_candidate outcome={:?} reasons={}",
-            self.outcome, reasons
-        )];
-        lines.extend(self.disagreements.iter().map(|disagreement| {
-            format!(
-                "semantic_candidate_disagreement field={} candidate={} contract={}",
-                disagreement.field, disagreement.candidate, disagreement.contract
-            )
-        }));
-        lines
-    }
-}
-
 fn schema_expectations_from_obligations(
     obligations: &[ArtifactObligation],
 ) -> Vec<SemanticExpectation> {
@@ -318,13 +249,22 @@ mod tests {
 
     #[test]
     fn shadow_admission_logs_candidate_contract_disagreement() {
+        use super::super::task_contract_admission::{
+            SemanticCandidateAdmissionInput, SemanticCandidateAdmissionStatus,
+            admit_semantic_candidate,
+        };
+
         let contract = TaskContract::from_request("Generate output.csv with columns id and total.");
         let mut candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
         candidate.objective_kind = ObjectiveKind::Coding;
 
-        let decision = AdmissionDecision::shadow_only(&candidate, &contract);
+        let decision = admit_semantic_candidate(SemanticCandidateAdmissionInput {
+            candidate: &candidate,
+            contract: &contract,
+            allow_equivalent_current_behavior: false,
+        });
 
-        assert_eq!(decision.outcome, AdmissionOutcome::ShadowOnly);
+        assert_eq!(decision.status, SemanticCandidateAdmissionStatus::Rejected);
         assert_eq!(decision.disagreements.len(), 1);
         assert_eq!(decision.disagreements[0].field, "objective_kind");
         assert!(

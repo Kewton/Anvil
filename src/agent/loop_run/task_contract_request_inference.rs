@@ -10,7 +10,8 @@ use super::contract_request_signals::{
     contains_implementation_file_hint, negated_artifact_list_contains,
 };
 use super::task_contract::{
-    ProjectLanguage, ProjectShape, TaskIntent, VerificationRequirement, request_asks_for_setup,
+    ArtifactRole, ProjectLanguage, ProjectShape, TaskIntent, VerificationRequirement,
+    request_asks_for_setup,
 };
 use super::task_contract_path_context::{contains_any, contains_ascii_token};
 
@@ -686,6 +687,30 @@ pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool
     )
 }
 
+pub(super) fn request_negates_usage_docs_artifacts(request: &str, lower: &str) -> bool {
+    if negated_artifact_list_contains(lower, &["docs", "documentation", "manual"]) {
+        return true;
+    }
+    contains_any(
+        lower,
+        &[
+            "no docs",
+            "no documentation",
+            "without docs",
+            "without documentation",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "ドキュメント不要",
+            "ドキュメントなし",
+            "ドキュメント無し",
+            "ドキュメントを作成しない",
+            "ドキュメントを追加しない",
+        ],
+    )
+}
+
 pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &str) -> bool {
     contains_any(
         lower,
@@ -733,4 +758,30 @@ pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &st
             "実装しない",
         ],
     )
+}
+
+pub(super) fn request_forbidden_artifact_roles(request: &str, lower: &str) -> Vec<ArtifactRole> {
+    let mut roles = Vec::new();
+    push_role_if(
+        &mut roles,
+        request_negates_implementation_artifacts(request, lower),
+        ArtifactRole::Implementation,
+    );
+    push_role_if(
+        &mut roles,
+        request_negates_test_artifacts(request, lower),
+        ArtifactRole::Test,
+    );
+    push_role_if(
+        &mut roles,
+        request_negates_usage_docs_artifacts(request, lower),
+        ArtifactRole::UsageDocs,
+    );
+    roles
+}
+
+fn push_role_if(roles: &mut Vec<ArtifactRole>, condition: bool, role: ArtifactRole) {
+    if condition && !roles.contains(&role) {
+        roles.push(role);
+    }
 }

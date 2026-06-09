@@ -5,7 +5,9 @@ use super::contract_request_signals::{
     contains_callable_signature_hint, contains_dotted_callable_change_action,
 };
 use super::project_profile::ProjectProfileConfirmation;
-use super::project_profile_projection::apply_profile_contract_inputs;
+use super::project_profile_projection::{
+    ProjectProfileContractInputs, apply_profile_contract_inputs,
+};
 use super::required_behavior::{self, RequiredBehaviorContract};
 use super::task_contract_admission::{
     ContractAdmissionInput, admit_project_profile_contract_inputs, admit_task_kind,
@@ -45,10 +47,10 @@ pub(super) use super::task_contract_data_output_context::{
     request_explicitly_requests_standalone_data_artifact_with_scan,
     request_mentions_protected_data_artifact_path,
 };
-use super::task_contract_deliverable_projection::deliverables_from_contract_parts;
 #[cfg(test)]
+use super::task_contract_deliverable_projection::deliverable_kind_for_role;
 use super::task_contract_deliverable_projection::{
-    default_deliverable_path, deliverable_kind_for_role,
+    default_deliverable_path, deliverables_from_contract_parts,
 };
 #[cfg(test)]
 pub(super) use super::task_contract_display::MAX_SECTION_LABEL_LEN;
@@ -87,8 +89,9 @@ pub(super) use super::task_contract_request_inference::{
     preferred_runner_for_language, project_intent_confidence, request_asks_for_code_work,
     request_asks_for_data_task, request_asks_for_implementation_artifact,
     request_asks_for_ops_task, request_asks_for_research_task, request_asks_for_test_artifact,
-    request_contains_jp_setup_marker_unnegated, request_has_explicit_coding_subject,
-    request_negates_test_artifacts,
+    request_contains_jp_setup_marker_unnegated, request_forbidden_artifact_roles,
+    request_has_explicit_coding_subject, request_negates_test_artifacts,
+    request_negates_usage_docs_artifacts,
 };
 pub(super) use super::task_contract_taxonomy::{
     ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, DeliverableSpec,
@@ -537,6 +540,7 @@ pub(super) struct TaskContract {
     pub(super) required_artifacts: Vec<ArtifactRole>,
     pub(super) required_artifact_identities: Vec<ArtifactObligation>,
     pub(super) optional_artifacts: Vec<ArtifactRole>,
+    pub(super) forbidden_artifacts: Vec<ArtifactRole>,
     pub(super) verification_required: bool,
     pub(super) completion_policy: CompletionPolicy,
     // Issue #635: deterministic behavior schema. Built once in
@@ -764,6 +768,10 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
     let objective_evidence_satisfied =
         super::objective_evidence::objective_evidence_satisfied(inputs.evidence, &objective);
 
+    if let Some(action) = forbidden_artifact_action(&inputs) {
+        return action;
+    }
+
     if let Some(action) = objective_deliverable_stage(&inputs, &observed).into_recovery_action() {
         return action;
     }
@@ -842,6 +850,40 @@ pub(super) fn plan_artifact_recovery(inputs: ArtifactRecoveryInputs<'_>) -> Arti
         .contract
         .evaluate_with_owned_test_artifacts(inputs.evidence, inputs.owned_test_artifacts)
         .into()
+}
+
+fn forbidden_artifact_action(
+    inputs: &ArtifactRecoveryInputs<'_>,
+) -> Option<ArtifactRecoveryAction> {
+    if inputs.contract.forbidden_artifacts.is_empty() {
+        return None;
+    }
+    let forbidden = inputs.artifacts.iter().find(|artifact| {
+        inputs.contract.forbidden_artifacts.contains(&artifact.role)
+            && matches!(
+                artifact.kind,
+                ArtifactStateKind::ExistsButUnverified
+                    | ArtifactStateKind::ChangedThisTurn
+                    | ArtifactStateKind::Verified
+            )
+    })?;
+    let path = forbidden.path.clone().unwrap_or_else(|| {
+        default_deliverable_path(forbidden.role)
+            .unwrap_or("<unknown>")
+            .to_string()
+    });
+    Some(ArtifactRecoveryAction::Continue {
+        missing: vec![forbidden.role],
+        target_hint: Some(RecoveryTargetHint {
+            role: forbidden.role,
+            path: path.clone(),
+            reason: format!(
+                "forbidden artifact observed for role {} at {}",
+                forbidden.role.label(),
+                mask_and_cap_recovery_field(&path),
+            ),
+        }),
+    })
 }
 
 fn objective_deliverable_stage(
@@ -1137,6 +1179,11 @@ impl TaskContract {
             project_intent.verification_required() || evidence_command_hint.is_some(),
             &required_behavior,
         );
+        let forbidden_artifacts = forbidden_artifacts_from_contract_inputs(
+            request_for_inference,
+            &lower,
+            project_profile_inputs.as_ref(),
+        );
         Self {
             task_kind,
             intent,
@@ -1144,6 +1191,7 @@ impl TaskContract {
             required_artifacts: required,
             required_artifact_identities,
             optional_artifacts: optional,
+            forbidden_artifacts,
             verification_required: completion_policy.verification_required(),
             completion_policy,
             required_behavior,
@@ -1756,6 +1804,9 @@ fn request_asks_for_authoring_task(
 }
 
 pub(super) fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
+    if request_negates_usage_docs_artifacts(request, lower) {
+        return false;
+    }
     contains_any(
         lower,
         &[
@@ -1770,6 +1821,37 @@ pub(super) fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
         request,
         &["使用方法", "使い方", "README", "ドキュメント", "手順"],
     )
+}
+
+fn forbidden_artifacts_from_contract_inputs(
+    request: &str,
+    lower: &str,
+    project_profile_inputs: Option<&ProjectProfileContractInputs>,
+) -> Vec<ArtifactRole> {
+    let mut roles = request_forbidden_artifact_roles(request, lower);
+    if let Some(inputs) = project_profile_inputs {
+        push_artifact_role_if(
+            &mut roles,
+            inputs.forbids_implementation,
+            ArtifactRole::Implementation,
+        );
+        push_artifact_role_if(&mut roles, inputs.forbids_tests, ArtifactRole::Test);
+        push_artifact_role_if(&mut roles, inputs.forbids_setup, ArtifactRole::Setup);
+        push_artifact_role_if(
+            &mut roles,
+            inputs.forbids_usage_docs,
+            ArtifactRole::UsageDocs,
+        );
+    }
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
+fn push_artifact_role_if(roles: &mut Vec<ArtifactRole>, condition: bool, role: ArtifactRole) {
+    if condition && !roles.contains(&role) {
+        roles.push(role);
+    }
 }
 
 pub(super) fn request_asks_for_setup(request: &str, lower: &str) -> bool {
@@ -6096,6 +6178,76 @@ Create the README file."#;
                     && target.reason.contains("output.csv")
             ),
             "unexpected extra DataOutput path must block done, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_no_docs_records_forbidden_usage_docs_without_requiring_docs() {
+        let contract = TaskContract::from_request(
+            "Create password_strength.py and tests/test_password_strength.py. Implement score_password(password). Use Python unittest and run the tests. Do not add documentation files.",
+        );
+
+        assert!(
+            contract
+                .forbidden_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "forbidden_artifacts={:?}",
+            contract.forbidden_artifacts
+        );
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "UsageDocs must not become required from a negated docs instruction: {:?}",
+            contract.required_artifacts
+        );
+    }
+
+    #[test]
+    fn forbidden_usage_docs_observation_blocks_done_even_with_passing_tests() {
+        let contract = TaskContract::from_request(
+            "Create password_strength.py and tests/test_password_strength.py. Implement score_password(password). Use Python unittest and run the tests. Do not add documentation files.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(
+            RepoEditCategory::Impl,
+            "password_strength.py",
+        ));
+        evidence.push(repo_edit_path(
+            RepoEditCategory::Test,
+            "tests/test_password_strength.py",
+        ));
+        evidence.push(repo_edit_path(RepoEditCategory::Docs, "README.md"));
+        evidence.push(build_test_bound(1));
+        let repair_state = VerifierRepairState::None;
+        let artifacts = [
+            ArtifactState::exists(ArtifactRole::Implementation, "password_strength.py"),
+            ArtifactState::exists(ArtifactRole::Test, "tests/test_password_strength.py"),
+            ArtifactState::changed_at(ArtifactRole::UsageDocs, "README.md"),
+        ];
+        let owned_tests = vec!["tests/test_password_strength.py".to_string()];
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &owned_tests,
+        });
+
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(ref target),
+                } if missing == &vec![ArtifactRole::UsageDocs]
+                    && target.path == "README.md"
+                    && target.reason.contains("forbidden artifact observed")
+            ),
+            "forbidden README must block done, got {action:?}"
         );
     }
 

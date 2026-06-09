@@ -4,7 +4,9 @@ use crate::util::file_classify::{is_setup_file, is_test_file};
 
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::summary::LoopStats;
-use super::task_contract::CompletionPolicy;
+use super::task_contract::{
+    ArtifactRole, CompletionPolicy, CompletionProjectIntent, TaskContract, TaskKind,
+};
 
 /// Issue #607: judgment context extracted from the active request text.
 /// Bundled in a struct (instead of two bool params) so future flags
@@ -22,6 +24,7 @@ pub(super) enum ProtocolKind {
     TypeScriptUi,
     Python,
     Docs,
+    Data,
     AnswerOnly,
     GenericCode,
 }
@@ -35,6 +38,7 @@ impl ProtocolKind {
             ProtocolKind::Python => "python",
             ProtocolKind::TypeScriptUi => "typescript_ui",
             ProtocolKind::Docs => "docs",
+            ProtocolKind::Data => "data",
             ProtocolKind::AnswerOnly => "answer_only",
             ProtocolKind::GenericCode => "generic_code",
         }
@@ -95,6 +99,7 @@ impl ProtocolKind {
             ) => true,
             (ProtocolKind::Docs, CompletionEvidence::RequiredSectionsPass { .. }) => true,
             (ProtocolKind::Docs, CompletionEvidence::ReportCompletenessPass { .. }) => true,
+            (ProtocolKind::Data, CompletionEvidence::StructuredDataPass { .. }) => true,
             _ => false,
         }
     }
@@ -190,6 +195,7 @@ impl ProtocolKind {
                                     | CompletionEvidence::ReportCompletenessPass { .. }
                             )))
             }
+            ProtocolKind::Data => matches!(evidence, CompletionEvidence::StructuredDataPass { .. }),
             ProtocolKind::AnswerOnly => {
                 matches!(
                     evidence,
@@ -338,6 +344,14 @@ impl ProtocolKind {
                     missing.push("repo_edit_docs_or_deliverable_pass");
                 }
             }
+            ProtocolKind::Data => {
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::StructuredDataPass { .. }))
+                {
+                    missing.push("structured_data_pass");
+                }
+            }
         }
         missing
     }
@@ -386,6 +400,18 @@ impl ExecutionProtocol {
             WorkMode::Auto | WorkMode::GenericCode | WorkMode::Unknown => ProtocolKind::GenericCode,
         };
         Self { kind }
+    }
+
+    pub(super) fn from_work_mode_with_contract(
+        mode: WorkMode,
+        contract: Option<&TaskContract>,
+    ) -> Self {
+        if let Some(contract) = contract {
+            return Self {
+                kind: protocol_kind_from_contract(mode, contract),
+            };
+        }
+        Self::from_work_mode(mode)
     }
 
     #[allow(dead_code)] // Issue #466: 一時的に call site が VerifierSkill 経由になり
@@ -446,6 +472,7 @@ impl ExecutionProtocol {
                 &evidence,
                 "docs protocol requires a documentation artifact",
             ),
+            ProtocolKind::Data => Some("data protocol requires structured data validation".into()),
             ProtocolKind::Python => {
                 if let Some(issue) = requested_path_issue(&evidence) {
                     return Some(issue);
@@ -501,6 +528,9 @@ impl ExecutionProtocol {
             ProtocolKind::Docs => relevant_docs_suffix(stats, &[".md", ".mdx", ".txt", ".rst"])
                 .map(|reason| (true, Some(reason)))
                 .unwrap_or((false, None)),
+            ProtocolKind::Data => relevant_suffix(stats, &[".csv", ".json", ".jsonl", ".tsv"])
+                .map(|reason| (true, Some(reason)))
+                .unwrap_or((false, None)),
             ProtocolKind::Python => {
                 if stats.changed_impl_count > 0 {
                     (true, Some("impl_file_category"))
@@ -540,6 +570,29 @@ impl ExecutionProtocol {
             deterministic_only,
             total_changed: stats.total_changed,
         }
+    }
+}
+
+fn protocol_kind_from_contract(mode: WorkMode, contract: &TaskContract) -> ProtocolKind {
+    if contract.completion_policy.project_intent == CompletionProjectIntent::AnswerOnly {
+        return ProtocolKind::AnswerOnly;
+    }
+    match contract.task_kind {
+        TaskKind::Coding => match mode {
+            WorkMode::TypeScriptUi => ProtocolKind::TypeScriptUi,
+            WorkMode::Python => ProtocolKind::Python,
+            _ => ProtocolKind::GenericCode,
+        },
+        TaskKind::Docs | TaskKind::Authoring => ProtocolKind::Docs,
+        TaskKind::Research
+            if contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs) =>
+        {
+            ProtocolKind::Docs
+        }
+        TaskKind::Data => ProtocolKind::Data,
+        TaskKind::Ops | TaskKind::Research => ProtocolKind::GenericCode,
     }
 }
 
@@ -1037,6 +1090,56 @@ mod tests {
             vec!["src/app/page.tsx".to_string(), "README.md".to_string()]
         );
         assert!(requested_paths_from_text("../secret.py /tmp/x.py https://x/y.py").is_empty());
+    }
+
+    #[test]
+    fn coding_contract_prevents_docs_protocol_from_negated_docs_text() {
+        let request = "Create password_strength.py and tests/test_password_strength.py. Use Python unittest and run the tests. Do not add documentation files.";
+        let contract = TaskContract::from_request(request);
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Docs, Some(&contract)).kind(),
+            ProtocolKind::GenericCode
+        );
+    }
+
+    #[test]
+    fn coding_contract_keeps_specific_code_protocol_when_work_mode_is_specific() {
+        let contract = TaskContract::from_request(
+            "Create calculator.py and tests/test_calculator.py. Use Python unittest.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Python, Some(&contract))
+                .kind(),
+            ProtocolKind::Python
+        );
+    }
+
+    #[test]
+    fn data_contract_prevents_docs_protocol_from_negated_docs_text() {
+        let request = "Create output.csv with columns id,name and rows 1,Ada and 2,Linus. Do not add documentation files.";
+        let contract = TaskContract::from_request(request);
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Docs, Some(&contract)).kind(),
+            ProtocolKind::Data
+        );
+    }
+
+    #[test]
+    fn docs_contract_keeps_docs_protocol() {
+        let contract =
+            TaskContract::from_request("Create README.md with Overview and Usage sections.");
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Docs, Some(&contract)).kind(),
+            ProtocolKind::Docs
+        );
     }
 
     // ----------------------------- Issue #606 T-1.4 -----------------------

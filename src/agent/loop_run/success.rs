@@ -6,7 +6,7 @@ use super::protocol::{
     requested_paths_from_text,
 };
 use super::summary::{ExitReason, LoopStats};
-use super::task_contract::{CompletionDecision, TaskContract};
+use super::task_contract::{ArtifactExcerpts, ArtifactRole, CompletionDecision, TaskContract};
 use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tester;
 use super::verifier_skill::VerifierInputs;
@@ -311,8 +311,12 @@ impl Agent {
         // Issue #607: build the request context once and reuse it across the
         // satisfaction / missing-shapes / post-loop verifier-demand sinks.
         let ctx = self.current_request_context();
+        let contract_authority = super::task_classification::task_contract_authority(self);
         let should_dispatch_success_verifier = if exit_reason.is_success() {
-            let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
+            let protocol = ExecutionProtocol::from_work_mode_with_contract(
+                self.session.mode_state.work_mode,
+                contract_authority.as_deref(),
+            );
             let deterministic_recovery_recorded =
                 self.session.last_feedback.as_ref().is_some_and(|frame| {
                     frame.primary_error.as_deref() == Some(DETERMINISTIC_CONTENT_FALLBACK_TAG)
@@ -325,8 +329,15 @@ impl Agent {
             // TypeScriptUi / GenericCode protocols when the user only asked
             // to install dependencies.
             let kind = protocol.kind();
-            let evidence_satisfied =
-                kind.evidence_set_satisfies_with_context(&self.evidence_set_this_turn, &ctx);
+            let evidence_satisfied = kind
+                .evidence_set_satisfies_with_context(&self.evidence_set_this_turn, &ctx)
+                || contract_authority.as_deref().is_some_and(|contract| {
+                    contract_artifact_acceptance_satisfies_protocol(
+                        contract,
+                        &self.task_contract_excerpts,
+                        kind,
+                    )
+                });
             let success_context = ProtocolSuccessContext {
                 stats,
                 deterministic_recovery_recorded,
@@ -379,8 +390,11 @@ impl Agent {
         // OR-fold, which fired for any accepted evidence (RepoEdit only,
         // BuildTest only, etc.) and over-suppressed legitimate verifier
         // runs. See `env_setup_only_evidence_satisfies` doc for details.
-        let protocol_kind =
-            ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode).kind();
+        let protocol_kind = ExecutionProtocol::from_work_mode_with_contract(
+            self.session.mode_state.work_mode,
+            contract_authority.as_deref(),
+        )
+        .kind();
         let env_setup_only_satisfied =
             env_setup_only_evidence_satisfies(&self.evidence_set_this_turn, protocol_kind, &ctx);
         let suppress_success_verifier =
@@ -394,8 +408,9 @@ impl Agent {
         // `select_success_verifier(false, false, true) == Tester` and the
         // `TesterDelegated` fallback re-calls the raw demand. Non-prose contracts
         // are unaffected (all three inputs computed exactly as today).
-        let prose_verifier_free = super::task_classification::task_contract_authority(self)
-            .is_some_and(|c| post_loop_verifier_free_for_prose(&c));
+        let prose_verifier_free = contract_authority
+            .as_deref()
+            .is_some_and(post_loop_verifier_free_for_prose);
 
         let tester_candidate_some = if !prose_verifier_free
             && should_dispatch_success_verifier
@@ -698,6 +713,23 @@ impl Agent {
         }
 
         verify_commands_collected
+    }
+}
+
+pub(super) fn contract_artifact_acceptance_satisfies_protocol(
+    contract: &TaskContract,
+    excerpts: &ArtifactExcerpts,
+    kind: ProtocolKind,
+) -> bool {
+    match kind {
+        ProtocolKind::Data => {
+            super::task_contract_artifact_predicates::role_deliverable_content_satisfied(
+                contract,
+                excerpts,
+                ArtifactRole::DataOutput,
+            )
+        }
+        _ => false,
     }
 }
 
@@ -1174,6 +1206,42 @@ mod tests {
             bound_test_artifacts_count,
         });
         set
+    }
+
+    #[test]
+    fn data_protocol_acceptance_uses_schema_aware_artifact_excerpt() {
+        let contract = TaskContract::from_request(
+            "Create output.csv with exactly columns id,name and exactly rows 1,Ada and 2,Linus.",
+        );
+        let mut excerpts = ArtifactExcerpts::default();
+        excerpts.insert(
+            ArtifactRole::DataOutput,
+            "id,name\n1,Ada\n2,Linus\n".to_string(),
+        );
+
+        assert!(contract_artifact_acceptance_satisfies_protocol(
+            &contract,
+            &excerpts,
+            ProtocolKind::Data
+        ));
+    }
+
+    #[test]
+    fn data_protocol_acceptance_rejects_extra_columns_when_rows_are_exact() {
+        let contract = TaskContract::from_request(
+            "Create output.csv with exactly columns id,name and exactly rows 1,Ada and 2,Linus.",
+        );
+        let mut excerpts = ArtifactExcerpts::default();
+        excerpts.insert(
+            ArtifactRole::DataOutput,
+            "id,name,these\n1,Ada,\n2,Linus,\n".to_string(),
+        );
+
+        assert!(!contract_artifact_acceptance_satisfies_protocol(
+            &contract,
+            &excerpts,
+            ProtocolKind::Data
+        ));
     }
 
     #[test]

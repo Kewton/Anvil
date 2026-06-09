@@ -1309,6 +1309,7 @@ mod tests {
             required_artifacts,
             required_artifact_identities: vec![],
             optional_artifacts: vec![],
+            forbidden_artifacts: vec![],
             verification_required: true,
             completion_policy,
             required_behavior,
