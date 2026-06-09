@@ -275,7 +275,7 @@ fn objective_deliverable_kind_from_profile(
 fn objective_evidence_kind_from_profile(
     profile: &ProjectProfileConfirmation,
 ) -> Option<ObjectiveEvidenceKind> {
-    if profile_declares_code_with_test_runner(profile) {
+    if profile_declares_code_command_observation_as_test_run(profile) {
         return Some(ObjectiveEvidenceKind::TestRun);
     }
     if matches!(profile.deliverable_kind, Some(ProfileDeliverableKind::Data))
@@ -330,10 +330,9 @@ fn required_artifact_role(profile: &ProjectProfileConfirmation) -> Option<Artifa
 fn verification_requirement(
     profile: &ProjectProfileConfirmation,
 ) -> Option<VerificationRequirement> {
-    if profile_declares_code_with_test_runner(profile) {
+    if profile_declares_code_command_observation_as_test_run(profile) {
         return Some(VerificationRequirement::Required {
-            preferred_runner: preferred_runner_from_profile(profile)
-                .or_else(|| profile.language.and_then(preferred_runner_for_language)),
+            preferred_runner: preferred_runner_from_profile(profile),
         });
     }
     match profile.evidence_kind? {
@@ -360,9 +359,16 @@ fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option
     )
 }
 
-fn profile_declares_code_with_test_runner(profile: &ProjectProfileConfirmation) -> bool {
+fn profile_declares_code_command_observation_as_test_run(
+    profile: &ProjectProfileConfirmation,
+) -> bool {
     matches!(profile.deliverable_kind, Some(ProfileDeliverableKind::Code))
-        && preferred_runner_from_profile(profile).is_some()
+        && matches!(
+            profile.evidence_kind,
+            Some(ProfileEvidenceKind::CommandObservation)
+        )
+        && (preferred_runner_from_profile(profile).is_some()
+            || profile_declares_primary_artifact_for_role(profile, ArtifactRole::Test))
 }
 
 fn forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool {
@@ -768,6 +774,44 @@ npm test
             contract.evidence_command_hint(),
             Some("python -m unittest discover -s tests")
         );
+    }
+
+    #[test]
+    fn source_profile_with_test_artifact_normalizes_command_observation_to_test_run_without_runner()
+    {
+        let request = "Create math_utils.py and tests/test_math_utils.py only. Use Python unittest and verify with python -m unittest discover -s tests.";
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["setup","docs"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"Python code with tests but no preferred runner"
+            }"#,
+        )
+        .expect("profile");
+
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+        assert_eq!(inputs.evidence_kind, Some(ObjectiveEvidenceKind::TestRun));
+        assert_eq!(
+            inputs.verification,
+            Some(VerificationRequirement::Required {
+                preferred_runner: None
+            })
+        );
+
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract.objective_contract().evidence_kind,
+            ObjectiveEvidenceKind::TestRun
+        );
+        assert_eq!(contract.evidence_command_hint(), None);
     }
 
     #[test]

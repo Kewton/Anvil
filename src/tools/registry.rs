@@ -392,7 +392,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Read",
-            "Read a text file or list a directory. Absolute paths are preferred.",
+            "Read a text file or list a directory. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -405,7 +405,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Write",
-            "Create or overwrite a file. Absolute paths are preferred.",
+            "Create or overwrite a file. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -417,7 +417,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Edit",
-            "Replace exact text in an existing file. Absolute paths are preferred.",
+            "Replace exact text in an existing file. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -870,13 +870,33 @@ pub fn truncate_output(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolContext, ToolRegistry, canonicalize_with_missing_tail, enforce_plan_stage_scope,
-        resolve_plan_mode_write_target,
+        ToolContext, ToolRegistry, canonicalize_with_missing_tail, default_tool_specs,
+        enforce_plan_stage_scope, resolve_plan_mode_write_target,
     };
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
     use crate::util::workspace_paths::WorkspacePolicy;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn file_tool_descriptions_prefer_repository_relative_paths() {
+        let specs = default_tool_specs();
+        for tool_name in ["Read", "Write", "Edit"] {
+            let description = specs
+                .iter()
+                .find(|spec| spec.function.name == tool_name)
+                .map(|spec| spec.function.description.as_str())
+                .expect("tool spec");
+            assert!(
+                description.contains("repository-relative paths"),
+                "{tool_name} description should reinforce repository-relative paths: {description}"
+            );
+            assert!(
+                !description.contains("Absolute paths are preferred"),
+                "{tool_name} description must not contradict the system prompt: {description}"
+            );
+        }
+    }
 
     #[test]
     fn plan_mode_write_target_accepts_same_filename_alias() {

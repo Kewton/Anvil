@@ -9,9 +9,9 @@
 //!    sanitiser (e.g. XML-fallback recovery for tool calls emitted as
 //!    free-text).
 //! 2. For `Read` / `Write` / `Edit`, the `path` argument is resolved
-//!    against `work_root` via `resolve_user_path`; the resolved path
-//!    is written back to the arguments object so downstream tools see
-//!    a workspace-confined absolute path.
+//!    against `work_root` via `resolve_user_path`; the model-visible
+//!    argument is written back as a workspace-relative path so later
+//!    turns do not learn absolute project paths from history.
 //! 3. For `Read` specifically: when the active
 //!    `EffectiveToolPolicy::focused_edit_policy()` declares a focused
 //!    target and the resolved path is a directory that contains it,
@@ -28,6 +28,7 @@ use super::tool_history::focused_read_target_for_directory;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
 use crate::safety::path_guard::resolve_user_path;
+use std::path::Path;
 
 pub(super) fn prepare_tool_call(agent: &Agent, mut tool_call: ToolCall) -> ToolCall {
     tool_call.arguments = normalize_tool_call_arguments(&tool_call.name, tool_call.arguments);
@@ -49,8 +50,46 @@ pub(super) fn prepare_tool_call(agent: &Agent, mut tool_call: ToolCall) -> ToolC
         };
         arguments.insert(
             "path".to_string(),
-            serde_json::Value::String(resolved.display().to_string()),
+            serde_json::Value::String(model_visible_tool_path(&agent.work_root, &resolved)),
         );
     }
     tool_call
+}
+
+fn model_visible_tool_path(work_root: &Path, resolved: &Path) -> String {
+    let canonical_root =
+        std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    resolved
+        .strip_prefix(&canonical_root)
+        .or_else(|_| resolved.strip_prefix(work_root))
+        .map(|relative| relative.to_string_lossy().to_string())
+        .unwrap_or_else(|_| resolved.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_visible_tool_path;
+
+    #[test]
+    fn model_visible_tool_path_strips_workspace_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work_root = temp.path();
+        let resolved = work_root.join("tests/test_math_utils.py");
+
+        assert_eq!(
+            model_visible_tool_path(work_root, &resolved),
+            "tests/test_math_utils.py"
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_path_falls_back_for_external_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let external = std::path::Path::new("/outside/file.txt");
+
+        assert_eq!(
+            model_visible_tool_path(temp.path(), external),
+            external.display().to_string()
+        );
+    }
 }
