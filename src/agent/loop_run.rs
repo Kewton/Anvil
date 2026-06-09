@@ -1248,6 +1248,8 @@ mod task_contract_obligation_planning;
 mod task_contract_path_context;
 mod task_contract_recovery_planning;
 mod task_contract_request_inference;
+#[cfg(test)]
+mod task_contract_request_inference_tests;
 mod task_contract_taxonomy;
 #[cfg(test)]
 mod task_kind_confirm_e2e_tests;
