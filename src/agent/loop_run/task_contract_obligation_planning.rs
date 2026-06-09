@@ -5,9 +5,11 @@
 
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableKind, DeliverableSchema, ProjectIntent,
-    ProjectLanguage, ProjectShape, request_negates_test_artifacts,
+    ProjectLanguage, ProjectShape, request_asks_for_data_output_artifact_with_scan,
+    request_negates_test_artifacts,
 };
-use super::task_contract_path_context::contains_any;
+use super::task_contract_data_output_context::explicit_path_with_data_extension_with_scan;
+use super::task_contract_path_context::{OutputContextScan, contains_any, is_ascii_word_char};
 
 pub(super) fn default_readme_required_sections() -> Vec<String> {
     ["setup", "usage", "test"]
@@ -179,6 +181,167 @@ fn push_section_if(sections: &mut Vec<String>, condition: bool, section: &str) {
     if condition && !sections.iter().any(|existing| existing == section) {
         sections.push(section.to_string());
     }
+}
+
+/// Issue #937 (DS3-001): scan-threaded variant called from `from_request`.
+pub(super) fn inferred_data_obligations_from_request_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> Vec<ArtifactObligation> {
+    if !request_asks_for_data_output_artifact_with_scan(scan, request) {
+        return Vec::new();
+    }
+    let lower = scan.lower.as_str();
+    let explicit_output = explicit_path_with_data_extension_with_scan(scan, request);
+    let path = explicit_output.unwrap_or_else(|| {
+        if lower.contains("tsv") {
+            "output.tsv".to_string()
+        } else if lower.contains("jsonl") || lower.contains("ndjson") {
+            "output.jsonl".to_string()
+        } else {
+            "output.csv".to_string()
+        }
+    });
+    let columns = extract_required_columns_from_request(request);
+    let expected_rows = extract_expected_rows_from_request(request, &columns);
+    vec![ArtifactObligation::structured_record_with_expected_rows(
+        path,
+        columns,
+        expected_rows,
+    )]
+}
+
+fn extract_required_columns_from_request(request: &str) -> Vec<String> {
+    let Some(start) = request.to_ascii_lowercase().find("column") else {
+        return Vec::new();
+    };
+    let tail = &request[start..];
+    let window = tail
+        .split(['.', '\n', ';'])
+        .next()
+        .unwrap_or(tail)
+        .replace(['`', '"', '\''], " ");
+    let mut columns = Vec::new();
+    let tokens = window
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        let lower = token.to_ascii_lowercase();
+        if structured_row_count_token_before_row_marker(&tokens, index) {
+            break;
+        }
+        if matches!(
+            lower.as_str(),
+            "column"
+                | "columns"
+                | "with"
+                | "and"
+                | "or"
+                | "as"
+                | "the"
+                | "a"
+                | "an"
+                | "exactly"
+                | "only"
+        ) {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "from" | "for" | "in" | "into" | "row" | "rows" | "record" | "records"
+        ) {
+            break;
+        }
+        if columns.iter().any(|existing| existing == token) {
+            continue;
+        }
+        columns.push((*token).to_string());
+    }
+    columns
+}
+
+fn structured_row_count_token_before_row_marker(tokens: &[&str], index: usize) -> bool {
+    if !structured_count_token(tokens[index]) {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(index + 1)
+        .take(3)
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| matches!(token.as_str(), "row" | "rows" | "record" | "records"))
+}
+
+fn structured_count_token(token: &str) -> bool {
+    token.chars().all(|ch| ch.is_ascii_digit())
+        || matches!(
+            token.to_ascii_lowercase().as_str(),
+            "one" | "two" | "three" | "four" | "five" | "six" | "seven" | "eight" | "nine" | "ten"
+        )
+}
+
+const EXPECTED_STRUCTURED_ROWS_MAX: usize = 8;
+const EXPECTED_STRUCTURED_ROW_CELLS_MAX: usize = 12;
+
+fn extract_expected_rows_from_request(request: &str, columns: &[String]) -> Vec<Vec<String>> {
+    if columns.is_empty() || columns.len() > EXPECTED_STRUCTURED_ROW_CELLS_MAX {
+        return Vec::new();
+    }
+    let lower = request.to_ascii_lowercase();
+    let Some(after_marker) = data_rows_marker_end(&lower) else {
+        return Vec::new();
+    };
+    let tail = &request[after_marker..];
+    let window = tail
+        .split(['.', '\n'])
+        .next()
+        .unwrap_or(tail)
+        .replace(['`', '"', '\'', '[', ']', '(', ')'], " ")
+        .replace(';', "\n");
+    let mut rows = Vec::new();
+    for segment in window
+        .split('\n')
+        .flat_map(|part| part.split(" and "))
+        .take(EXPECTED_STRUCTURED_ROWS_MAX * 2)
+    {
+        let cells = segment
+            .split(',')
+            .map(clean_expected_row_cell)
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        if cells.len() == columns.len() && !rows.iter().any(|existing| existing == &cells) {
+            rows.push(cells);
+            if rows.len() >= EXPECTED_STRUCTURED_ROWS_MAX {
+                break;
+            }
+        }
+    }
+    rows
+}
+
+fn data_rows_marker_end(lower: &str) -> Option<usize> {
+    ["records", "record", "rows", "row"]
+        .iter()
+        .filter_map(|marker| {
+            lower.find(marker).and_then(|index| {
+                let before = lower[..index].chars().next_back();
+                let after = lower[index + marker.len()..].chars().next();
+                (!before.is_some_and(is_ascii_word_char) && !after.is_some_and(is_ascii_word_char))
+                    .then_some(index + marker.len())
+            })
+        })
+        .min()
+}
+
+fn clean_expected_row_cell(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, ':' | '=' | '-' | '>' | '[' | ']' | '(' | ')')
+        })
+        .trim()
+        .to_string()
 }
 
 pub(super) fn inferred_artifact_obligations_from_project_intent(
