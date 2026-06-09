@@ -65,11 +65,12 @@ pub(super) use super::task_contract_path_context::{
     INPUT_REFERENCE_VERBS_ASCII, INPUT_VERBS_ASCII, OUTPUT_AFTER_ASCII, OUTPUT_PREP_ASCII,
     OUTPUT_VERB_STEMS_ASCII, OutputContextScan, RESEARCH_OUTPUT_AFTER_JP, bounded_context_after,
     bounded_context_before, contains_any, contains_ascii_token, contains_output_verb,
-    is_ascii_word_char, normalize_explicit_user_artifact_path,
+    is_ascii_word_char, normalize_explicit_user_artifact_path, validated_obligation_path,
 };
 #[cfg(test)]
 pub(super) use super::task_contract_path_context::{
-    mask_path_tokens, normalize_explicit_artifact_path, path_token_is_maskable,
+    MAX_OBLIGATION_PATH_BYTES, mask_path_tokens, normalize_explicit_artifact_path,
+    path_token_is_maskable,
 };
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
@@ -3522,68 +3523,6 @@ fn docs_path_file_name_looks_like_source(path: &str) -> bool {
         lang,
         "ja" | "fr" | "de" | "es" | "it" | "pt" | "zh" | "ko" | "ru" | "nl"
     )
-}
-
-/// Issue #918 (P1): hard cap (bytes) on a stored obligation path.
-pub(super) const MAX_OBLIGATION_PATH_BYTES: usize = 4096;
-
-/// Issue #918 (P1): SSOT path validator that every `DeliverableObligation`
-/// constructor routes its `path` through, so a raw unvalidated traversal /
-/// oversized path can never be stored.
-///
-/// The validation *predicate* is [`normalize_explicit_user_artifact_path`]
-/// (normalize + `WorkspacePolicy` admit) — the SAME predicate parse-time
-/// admission uses, so the two cannot diverge. They differ only in their
-/// *failure action*: parse-time rejects (returns `None`); construction here is
-/// infallible and falls back to a sanitized, non-traversing display string.
-///
-/// The obligation path is a display + string-comparison label only — it is
-/// never resolved against the filesystem (the Write/Edit tool registry enforces
-/// work_root containment independently), so the fallback's job is to keep it a
-/// safe display string (no traversal, no control chars, masked, length-capped),
-/// not to gate FS access. Valid builder paths pass the predicate and are stored
-/// verbatim, so existing obligation goldens / equality fixtures are unchanged.
-fn validated_obligation_path(raw: String) -> String {
-    match normalize_explicit_user_artifact_path(&raw) {
-        Some(normalized) => truncate_obligation_path(normalized),
-        None => sanitize_rejected_obligation_path(&raw),
-    }
-}
-
-/// Fail-closed sanitizer for a path that did not pass the validation predicate.
-/// Strips traversal (`..`/`.`/leading-`/`), neutralizes control characters,
-/// masks secrets, and caps length — guaranteeing a workspace-relative-looking
-/// display string that can never traverse or break a log line / recovery prompt.
-fn sanitize_rejected_obligation_path(raw: &str) -> String {
-    let normalized_sep = raw.replace('\\', "/");
-    let mut out = String::new();
-    for segment in normalized_sep.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push('/');
-        }
-        for ch in segment.chars() {
-            out.push(if ch.is_control() { '_' } else { ch });
-        }
-    }
-    // mask BEFORE truncation so a length cap can never split an unmasked secret.
-    let masked = crate::session::feedback::mask_secrets(&out);
-    truncate_obligation_path(masked)
-}
-
-/// Char-boundary-safe truncation to [`MAX_OBLIGATION_PATH_BYTES`].
-fn truncate_obligation_path(mut path: String) -> String {
-    if path.len() <= MAX_OBLIGATION_PATH_BYTES {
-        return path;
-    }
-    let mut end = MAX_OBLIGATION_PATH_BYTES;
-    while end > 0 && !path.is_char_boundary(end) {
-        end -= 1;
-    }
-    path.truncate(end);
-    path
 }
 
 pub(super) fn normalized_artifact_path_eq(actual: &str, expected: &str) -> bool {

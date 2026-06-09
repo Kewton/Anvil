@@ -192,6 +192,58 @@ pub(super) fn normalize_explicit_user_artifact_path(token: &str) -> Option<Strin
         .then_some(path)
 }
 
+/// Issue #918 (P1): hard cap (bytes) on a stored obligation path.
+pub(super) const MAX_OBLIGATION_PATH_BYTES: usize = 4096;
+
+/// Issue #918 (P1): SSOT path validator that every artifact obligation
+/// constructor routes its `path` through, so a raw unvalidated traversal /
+/// oversized path can never be stored.
+///
+/// The validation *predicate* is [`normalize_explicit_user_artifact_path`]
+/// (normalize + `WorkspacePolicy` admit). It differs from parse-time admission
+/// only in failure action: parse-time rejects; construction is infallible and
+/// falls back to a sanitized, non-traversing display string.
+pub(super) fn validated_obligation_path(raw: String) -> String {
+    match normalize_explicit_user_artifact_path(&raw) {
+        Some(normalized) => truncate_obligation_path(normalized),
+        None => sanitize_rejected_obligation_path(&raw),
+    }
+}
+
+/// Fail-closed sanitizer for a path that did not pass the validation predicate.
+/// Strips traversal (`..`/`.`/leading-`/`), neutralizes control characters,
+/// masks secrets, and caps length.
+fn sanitize_rejected_obligation_path(raw: &str) -> String {
+    let normalized_sep = raw.replace('\\', "/");
+    let mut out = String::new();
+    for segment in normalized_sep.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('/');
+        }
+        for ch in segment.chars() {
+            out.push(if ch.is_control() { '_' } else { ch });
+        }
+    }
+    let masked = crate::session::feedback::mask_secrets(&out);
+    truncate_obligation_path(masked)
+}
+
+/// Char-boundary-safe truncation to [`MAX_OBLIGATION_PATH_BYTES`].
+fn truncate_obligation_path(mut path: String) -> String {
+    if path.len() <= MAX_OBLIGATION_PATH_BYTES {
+        return path;
+    }
+    let mut end = MAX_OBLIGATION_PATH_BYTES;
+    while end > 0 && !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    path.truncate(end);
+    path
+}
+
 pub(super) fn normalize_explicit_artifact_path(token: &str) -> Option<String> {
     let trimmed = token.trim_matches(|ch: char| {
         ch.is_ascii_whitespace()
