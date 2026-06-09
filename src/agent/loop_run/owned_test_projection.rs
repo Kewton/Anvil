@@ -51,10 +51,15 @@ pub(super) fn owned_test_artifacts_for_verifier(
     let ledger = agent
         .artifact_ledger
         .owned_test_artifacts(super::task_contract::ArtifactRole::Test);
+    let verifier_candidates = verifier_candidate_tests_from_contract_or_ledger(
+        &agent.work_root,
+        contract,
+        ledger.as_slice(),
+    );
     let preflight_report = super::generated_test_guard::preflight_owned_test_artifacts_for_verifier(
         &agent.work_root,
         contract,
-        &ledger,
+        &verifier_candidates,
     );
     if !preflight_report.rejected.is_empty() {
         emit_generated_test_preflight_rejections(agent, &preflight_report.rejected);
@@ -64,6 +69,24 @@ pub(super) fn owned_test_artifacts_for_verifier(
         emit_owned_test_artifacts_projection_divergence(agent, &legacy, &ledger);
     }
     guarded
+}
+
+fn verifier_candidate_tests_from_contract_or_ledger(
+    work_root: &std::path::Path,
+    contract: &super::task_contract::TaskContract,
+    ledger: &[String],
+) -> Vec<String> {
+    let explicit_existing = contract
+        .required_artifact_identities
+        .iter()
+        .filter(|identity| identity.role == super::task_contract::ArtifactRole::Test)
+        .filter(|identity| work_root.join(&identity.path).is_file())
+        .map(|identity| identity.path.clone())
+        .collect::<Vec<_>>();
+    if !explicit_existing.is_empty() {
+        return explicit_existing;
+    }
+    ledger.to_vec()
 }
 
 /// Issue #659 (Task 3.3): masked observability emit when the legacy

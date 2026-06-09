@@ -162,7 +162,7 @@ fn source_deliverable_has_unforbidden_mixed_objective_roles(
         .any(|role| {
             matches!(role, ArtifactRole::UsageDocs | ArtifactRole::DataOutput)
                 && !first_pass.forbidden_artifacts.contains(role)
-                && !profile_forbids_role(profile, *role)
+                && !profile_effectively_forbids_role(profile, *role)
         })
 }
 
@@ -177,6 +177,26 @@ fn profile_forbids_role(profile: &ProjectProfileConfirmation, role: ArtifactRole
             (ForbiddenArtifact::Docs, ArtifactRole::UsageDocs) => true,
             _ => false,
         })
+}
+
+fn profile_effectively_forbids_role(
+    profile: &ProjectProfileConfirmation,
+    role: ArtifactRole,
+) -> bool {
+    profile_forbids_role(profile, role)
+        && !profile_declares_primary_artifact_for_role(profile, role)
+}
+
+fn profile_declares_primary_artifact_for_role(
+    profile: &ProjectProfileConfirmation,
+    role: ArtifactRole,
+) -> bool {
+    let fallback_role = required_artifact_role(profile);
+    profile.primary_artifacts.iter().any(|path| {
+        let category =
+            super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
+        role_from_repo_edit(category).or(fallback_role) == Some(role)
+    })
 }
 
 fn profile_conflicts_with_first_pass_objective(
@@ -334,10 +354,7 @@ fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option
 }
 
 fn forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::SourceCode))
+    profile_effectively_forbids_role(profile, ArtifactRole::Implementation)
         || matches!(
             profile.deliverable_kind,
             Some(
@@ -351,10 +368,7 @@ fn forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool
 }
 
 fn forbids_test_artifacts(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::Tests))
+    profile_effectively_forbids_role(profile, ArtifactRole::Test)
         || matches!(
             profile.evidence_kind,
             Some(
@@ -368,10 +382,7 @@ fn forbids_test_artifacts(profile: &ProjectProfileConfirmation) -> bool {
 }
 
 fn forbids_setup_artifact(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::Setup))
+    profile_effectively_forbids_role(profile, ArtifactRole::Setup)
         || (matches!(
             profile.deliverable_kind,
             Some(
@@ -392,10 +403,7 @@ fn forbids_setup_artifact(profile: &ProjectProfileConfirmation) -> bool {
 }
 
 fn forbids_usage_docs_artifact(profile: &ProjectProfileConfirmation) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|artifact| matches!(artifact, ForbiddenArtifact::Docs))
+    profile_effectively_forbids_role(profile, ArtifactRole::UsageDocs)
 }
 
 fn artifact_obligations(
@@ -410,7 +418,7 @@ fn artifact_obligations(
         .iter()
         .filter_map(|path| {
             let role = artifact_role_for_profile_path(path, fallback_role);
-            (!profile_forbids_role(profile, role))
+            (!profile_effectively_forbids_role(profile, role))
                 .then(|| ArtifactObligation::file(role, path.as_str()))
         })
         .collect()
@@ -698,6 +706,53 @@ npm test
                 .required_artifacts
                 .contains(&ArtifactRole::UsageDocs),
             "profile adoption should remove forbidden docs drift"
+        );
+    }
+
+    #[test]
+    fn code_profile_primary_source_overrides_self_contradictory_forbidden_source() {
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest. Do not create README, package.json, Cargo.toml, or setup files.";
+        let first_pass = TaskContract::from_request(request);
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["source_code","setup","docs"],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"misclassified source_code as forbidden while requesting source output"
+            }"#,
+        )
+        .expect("profile");
+
+        assert_eq!(
+            project_profile_adoption_decision(Some(&profile), &first_pass),
+            ProjectProfileAdoptionDecision::Adopt
+        );
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert!(
+            contract
+                .required_identities_for_role(ArtifactRole::Implementation)
+                .iter()
+                .any(|identity| identity.path == "math_utils.py"),
+            "positive primary source artifact should remain required"
+        );
+        assert!(
+            !contract
+                .forbidden_artifacts
+                .contains(&ArtifactRole::Implementation),
+            "self-contradictory source_code forbidden entry should not forbid the declared source deliverable"
+        );
+        assert!(
+            contract
+                .forbidden_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "uncontradicted docs forbidden entry should still remove docs drift"
         );
     }
 

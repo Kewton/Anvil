@@ -90,13 +90,10 @@ pub(super) fn set_artifact_recovery_target_from_hint_with_contract(
     contract: Option<&TaskContract>,
 ) -> Option<RecoveryTargetHint> {
     let request = super::workspace_access::active_request_text(agent);
-    let fallback_contract = if contract.is_none() {
-        super::task_classification::task_contract_authority(agent)
-    } else {
-        None
-    };
-    let contract = contract.or_else(|| fallback_contract.as_deref());
-    let hint = if let Some(contract) = contract {
+    let authority_contract = super::task_classification::task_contract_authority(agent);
+    let contract_for_alignment =
+        alignment_contract_for_hint(contract, authority_contract.as_deref(), hint.role);
+    let hint = if let Some(contract) = contract_for_alignment {
         super::artifact_target_alignment::align_recovery_target_hint_to_request(
             request.as_deref(),
             &contract.required_artifact_identities,
@@ -164,13 +161,37 @@ pub(super) fn set_artifact_recovery_target_from_hint_with_contract(
     }
 }
 
+fn alignment_contract_for_hint<'a>(
+    provided: Option<&'a TaskContract>,
+    authority: Option<&'a TaskContract>,
+    role: super::task_contract::ArtifactRole,
+) -> Option<&'a TaskContract> {
+    authority
+        .filter(|contract| contract_has_identity_for_role(contract, role))
+        .or_else(|| provided.filter(|contract| contract_has_identity_for_role(contract, role)))
+        .or(provided)
+        .or(authority)
+}
+
+fn contract_has_identity_for_role(
+    contract: &TaskContract,
+    role: super::task_contract::ArtifactRole,
+) -> bool {
+    contract
+        .required_artifact_identities
+        .iter()
+        .any(|identity| identity.role == role)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
     use crate::agent::loop_run::task_contract::{ArtifactRole, TaskContract};
     use crate::config::Config;
     use crate::session::store::ConversationMessage;
+    use std::rc::Rc;
 
     #[test]
     fn installer_uses_contract_identity_before_request_family_default() {
@@ -209,6 +230,56 @@ mod tests {
             .as_ref()
             .expect("target projection should be installed");
         assert_eq!(target.path, "tests/test_math_utils.py");
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact completion job should be installed");
+        assert_eq!(job.target_path(), "tests/test_math_utils.py");
+    }
+
+    #[test]
+    fn installer_prefers_per_turn_authority_over_stale_provided_contract() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python test identity"}"#,
+        )
+        .expect("profile");
+        let authority =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(authority))
+            .expect("unset contract cell");
+        let stale_contract = TaskContract::from_request("Create a Rust CLI and add tests");
+
+        let installed = set_artifact_recovery_target_from_hint_with_contract(
+            &mut agent,
+            RecoveryTargetHint {
+                role: ArtifactRole::Test,
+                path: "tests/cli.rs".to_string(),
+                reason: "synthesized test artifact aligned with requested rust project family"
+                    .to_string(),
+            },
+            1,
+            Some(&stale_contract),
+        )
+        .expect("authority identity should produce an installable target");
+
+        assert_eq!(installed.path, "tests/test_math_utils.py");
+        assert_eq!(
+            installed.reason,
+            "contract required test artifact identity is still missing"
+        );
         let job = agent
             .artifact_completion_job
             .as_ref()
