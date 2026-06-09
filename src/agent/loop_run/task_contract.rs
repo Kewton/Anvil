@@ -5,10 +5,11 @@ use super::contract_request_signals::{
     contains_callable_signature_hint, contains_dotted_callable_change_action,
 };
 use super::project_profile::ProjectProfileConfirmation;
-use super::project_profile_projection::{
-    adopt_contract_task_kind, apply_profile_contract_inputs, contract_inputs_from_confirmation,
-};
+use super::project_profile_projection::apply_profile_contract_inputs;
 use super::required_behavior::{self, RequiredBehaviorContract};
+use super::task_contract_admission::{
+    ContractAdmissionInput, admit_project_profile_contract_inputs, admit_task_kind,
+};
 use super::task_contract_artifact_contract::{
     ArtifactContractBuildInputs, ArtifactContractParts, build_artifact_contract_parts,
 };
@@ -1057,7 +1058,8 @@ impl TaskContract {
         // judgement-only, never stored.
         let scan = OutputContextScan::new(request_for_inference);
         let mut project_intent = ProjectIntent::from_request(request_for_inference);
-        let project_profile_inputs = contract_inputs_from_confirmation(project_profile);
+        let project_profile_admission = admit_project_profile_contract_inputs(project_profile);
+        let project_profile_inputs = project_profile_admission.profile_inputs;
         if let Some(inputs) = &project_profile_inputs {
             apply_profile_contract_inputs(&mut project_intent, inputs);
         }
@@ -1081,13 +1083,15 @@ impl TaskContract {
         // #917 2-value confidence applies (matched → 1.0 / no-match → 0.0; only
         // the no-keyword-match fallthrough lands below the confirm threshold and
         // triggers `needs_confirm()`).
-        let (task_kind, classification_confidence) = adopt_contract_task_kind(
+        let task_kind_admission = admit_task_kind(ContractAdmissionInput {
             forced_kind,
             controller_task_kind,
-            project_profile_inputs.as_ref(),
+            profile_inputs: project_profile_inputs.as_ref(),
             inferred_kind,
             inferred_matched,
-        );
+        });
+        let task_kind = task_kind_admission.task_kind;
+        let classification_confidence = task_kind_admission.classification_confidence;
         // Issue #919 (Decision #5(a)): Authoring contracts never carry the
         // Explain intent. Trigger B may have classified `intent = Explain` (e.g.
         // `summarize`); override it to `Build` so the contract acquires a

@@ -1234,6 +1234,7 @@ mod project_profile;
 mod project_profile_projection;
 mod summary;
 mod task_contract;
+mod task_contract_admission;
 mod task_contract_artifact_contract;
 mod task_contract_artifact_intent;
 mod task_contract_artifact_predicates;
