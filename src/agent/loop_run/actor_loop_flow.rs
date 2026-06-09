@@ -57,6 +57,7 @@ use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, Recover
 use super::controller_policy::ControllerRecoveryStrategy;
 use super::interrupt::{InterruptFlag, InterruptMonitor};
 use super::lifecycle;
+use super::loop_phase::{LoopPhase, LoopPhaseTransition, emit_loop_phase};
 use super::path_helpers::normalize_exploration_path;
 use super::plan_sections::{
     join_sections_for_progress, plan_section_body_for_progress, plan_sections_with_content,
@@ -3374,6 +3375,15 @@ pub(super) fn run_actor_loop(
     let mut accumulated: Vec<RepoVerification> = Vec::new();
     let mut last_known_root = agent.work_root.clone();
     let task_contract = super::prepare_actor_loop_state::prepare_actor_loop_turn_state(agent);
+    emit_loop_phase(
+        agent,
+        LoopPhase::ContractAdmitted,
+        LoopPhaseTransition::Exit,
+        0,
+        serde_json::json!({
+            "contract_present": task_contract.is_some(),
+        }),
+    );
 
     let mut loop_state = super::loop_state::LoopState::new();
     let mut plan_exploration_only_turns = 0usize;
@@ -3420,6 +3430,15 @@ pub(super) fn run_actor_loop(
         // semantics agree (previously the per-turn index was passed,
         // which collapsed all same-turn re-emits to a single value).
         super::active_job_emit::emit_active_job_selected_if_changed(agent, iter_count as u32);
+        emit_loop_phase(
+            agent,
+            LoopPhase::ModelRequestPrepared,
+            LoopPhaseTransition::Enter,
+            last_iter,
+            serde_json::json!({
+                "contract_present": task_contract.is_some(),
+            }),
+        );
 
         let (reply, recovery_dispatch_gate, missing_verifier_setup_turn, recovery_owner) =
             match drive_actor_loop_pre_reply_phase(
@@ -3471,6 +3490,19 @@ pub(super) fn run_actor_loop(
                     recovery_owner,
                 ),
             };
+        emit_loop_phase(
+            agent,
+            LoopPhase::ModelRequestPrepared,
+            LoopPhaseTransition::Exit,
+            last_iter,
+            serde_json::json!({
+                "missing_verifier_setup_turn": missing_verifier_setup_turn,
+                "recovery_job_kind": recovery_owner
+                    .recovery_job_kind()
+                    .map(|kind| kind.as_str())
+                    .unwrap_or("None"),
+            }),
+        );
 
         // Boundary 2: right after the Ollama response completes. This is
         // the AC-10 checkpoint — mid-flight cancel is out of scope.
@@ -3485,6 +3517,15 @@ pub(super) fn run_actor_loop(
             ..
         } = reply;
 
+        emit_loop_phase(
+            agent,
+            LoopPhase::GenerationPrepared,
+            LoopPhaseTransition::Enter,
+            last_iter,
+            serde_json::json!({
+                "reply_tool_call_count": reply_tool_calls.len(),
+            }),
+        );
         let (current_reply_tool_call_count, prepared_tool_calls, effective_tool_policy) =
             match drive_actor_loop_tool_preparation_phase(
                 agent,
@@ -3525,8 +3566,27 @@ pub(super) fn run_actor_loop(
                     effective_tool_policy,
                 ),
             };
+        emit_loop_phase(
+            agent,
+            LoopPhase::GenerationPrepared,
+            LoopPhaseTransition::Exit,
+            last_iter,
+            serde_json::json!({
+                "current_reply_tool_call_count": current_reply_tool_call_count,
+                "prepared_tool_call_count": prepared_tool_calls.len(),
+            }),
+        );
 
         if !prepared_tool_calls.is_empty() {
+            emit_loop_phase(
+                agent,
+                LoopPhase::ToolExecution,
+                LoopPhaseTransition::Enter,
+                last_iter,
+                serde_json::json!({
+                    "prepared_tool_call_count": prepared_tool_calls.len(),
+                }),
+            );
             let mut plan_file_edit_calls_this_turn = 0usize;
             let mut plan_exploration_calls_this_turn = 0usize;
             let mut plan_ready_after_tool = false;
@@ -3978,6 +4038,16 @@ pub(super) fn run_actor_loop(
                     break;
                 }
             }
+            emit_loop_phase(
+                agent,
+                LoopPhase::ToolExecution,
+                LoopPhaseTransition::Exit,
+                last_iter,
+                serde_json::json!({
+                    "repo_edit_calls_made_this_turn": loop_state.repo_edit_calls_made_this_turn,
+                    "tool_calls_made_this_turn": loop_state.tool_calls_made_this_turn,
+                }),
+            );
             match handle_actor_loop_plan_tool_followup(
                 agent,
                 ActorLoopPlanToolFollowupArgs {
@@ -4091,6 +4161,16 @@ pub(super) fn run_actor_loop(
                 )
             })
         };
+        emit_loop_phase(
+            agent,
+            LoopPhase::ArtifactEvidenceReconciliation,
+            LoopPhaseTransition::Enter,
+            last_iter,
+            serde_json::json!({
+                "has_task_contract_action": task_contract_action.is_some(),
+                "repo_edit_calls_made_this_turn": loop_state.repo_edit_calls_made_this_turn,
+            }),
+        );
         match handle_actor_loop_task_contract_reply(
             agent,
             ActorLoopTaskContractReplyArgs {
@@ -4136,6 +4216,16 @@ pub(super) fn run_actor_loop(
                 break 'outer;
             }
         }
+        emit_loop_phase(
+            agent,
+            LoopPhase::ArtifactEvidenceReconciliation,
+            LoopPhaseTransition::Exit,
+            last_iter,
+            serde_json::json!({
+                "task_contract_verifier_passed_in_loop": loop_state
+                    .task_contract_verifier_passed_in_loop,
+            }),
+        );
         match handle_actor_loop_no_tool_reply(
             agent,
             ActorLoopNoToolReplyArgs {
@@ -4171,6 +4261,16 @@ pub(super) fn run_actor_loop(
             }
         }
 
+        emit_loop_phase(
+            agent,
+            LoopPhase::VerifierRepairDispatch,
+            LoopPhaseTransition::Enter,
+            last_iter,
+            serde_json::json!({
+                "has_task_contract_action": task_contract_action.is_some(),
+                "repo_edit_calls_made_this_turn": loop_state.repo_edit_calls_made_this_turn,
+            }),
+        );
         if let Some(outcome) = handle_post_reply_recovery(
             agent,
             PostReplyRecoveryArgs {
@@ -4203,6 +4303,16 @@ pub(super) fn run_actor_loop(
                 }
             }
         }
+        emit_loop_phase(
+            agent,
+            LoopPhase::VerifierRepairDispatch,
+            LoopPhaseTransition::Exit,
+            last_iter,
+            serde_json::json!({
+                "repo_change_retries": loop_state.repo_change_retries,
+                "no_tool_retries": loop_state.no_tool_retries,
+            }),
+        );
 
         match handle_actor_loop_completion(
             agent,
@@ -4305,6 +4415,16 @@ pub(super) fn run_actor_loop(
         exit_reason = ExitReason::Done;
         error_text.clear();
     }
+    emit_loop_phase(
+        agent,
+        LoopPhase::DoneOrSafeStop,
+        LoopPhaseTransition::Enter,
+        last_iter.min(agent.config.max_iterations),
+        serde_json::json!({
+            "exit_reason": exit_reason.label(),
+            "total_changed": stats.total_changed,
+        }),
+    );
     let mut verify_commands_collected =
         std::mem::take(&mut loop_state.task_contract_verify_commands_collected);
     verify_commands_collected.extend(agent.run_post_loop_success_verifier(
@@ -4557,6 +4677,17 @@ pub(super) fn run_actor_loop(
     // pinned at the same boundary that the summary publishes.
     super::artifact_ledger_state::assert_dual_source_alignment_at_turn_end(agent);
     super::artifact_ledger_state::record_turn_end_artifact_ledger_summary(agent);
+
+    emit_loop_phase(
+        agent,
+        LoopPhase::DoneOrSafeStop,
+        LoopPhaseTransition::Exit,
+        stats.iter_used,
+        serde_json::json!({
+            "exit_reason": exit_reason.label(),
+            "total_changed": stats.total_changed,
+        }),
+    );
 
     log_llm_event(
         "agent.milestone.turn_completed",
