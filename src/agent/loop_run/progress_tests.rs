@@ -167,7 +167,8 @@ mod inner {
         validate_verifier_repair_intent, validate_verifier_repair_intents,
         validate_verifier_repair_intents_with_accepted_plan, verifier_diagnostic_messages,
         verifier_file_excerpt_for_line, verifier_repair_decision, verifier_repair_pass_messages,
-        verifier_repair_policy_for_decision, verifier_repair_policy_for_target_hint,
+        verifier_repair_pass_messages_with_runtime_capability, verifier_repair_policy_for_decision,
+        verifier_repair_policy_for_target_hint,
     };
     use super::super::verifier_orchestration::{
         verifier_repair_intent_fingerprint, verifier_repair_intents_fingerprint,
@@ -1286,6 +1287,45 @@ mod inner {
         assert!(payload.contains("previous_repair_error"));
         assert!(payload.contains("SyntaxError"));
         assert!(!payload.contains("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn verifier_repair_pass_prompt_carries_runtime_capability_payload_as_context() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::create_dir_all(work_root.join("app")).unwrap();
+        std::fs::write(work_root.join("app/main.py"), "print('hello')\n").unwrap();
+        let context = verifier_context_for("app/main.py");
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let messages = verifier_repair_pass_messages_with_runtime_capability(
+            work_root,
+            &context,
+            &target,
+            "fix app",
+            None,
+            Some(serde_json::json!({
+                "task_kind": "coding",
+                "process_exec_allowed": true,
+                "authority": "context_only",
+            })),
+        )
+        .unwrap();
+        let payload = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(payload.contains("\"runtime_capability\""));
+        assert!(payload.contains("\"authority\":\"context_only\""));
+        assert!(payload.contains("\"process_exec_allowed\":true"));
     }
 
     #[test]

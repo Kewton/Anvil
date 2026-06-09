@@ -813,12 +813,31 @@ pub(super) fn verifier_diagnostic_messages(
     verifier_diagnostic_prompt_messages(payload)
 }
 
+#[cfg(test)]
 pub(super) fn verifier_repair_pass_messages(
     work_root: &Path,
     context: &RepairJob,
     target_hint: &RecoveryTargetHint,
     active_request: &str,
     behavior_projection: Option<&super::required_behavior::BehaviorContractProjection>,
+) -> Result<Vec<ConversationMessage>, String> {
+    verifier_repair_pass_messages_with_runtime_capability(
+        work_root,
+        context,
+        target_hint,
+        active_request,
+        behavior_projection,
+        None,
+    )
+}
+
+pub(super) fn verifier_repair_pass_messages_with_runtime_capability(
+    work_root: &Path,
+    context: &RepairJob,
+    target_hint: &RecoveryTargetHint,
+    active_request: &str,
+    behavior_projection: Option<&super::required_behavior::BehaviorContractProjection>,
+    runtime_capability: Option<serde_json::Value>,
 ) -> Result<Vec<ConversationMessage>, String> {
     let target_line = verifier_repair_context_line_for_path(context, &target_hint.path);
     let target_excerpt =
@@ -933,6 +952,7 @@ pub(super) fn verifier_repair_pass_messages(
         "target_excerpt": target_excerpt,
         "related_excerpts": related,
         "behavior_contract": behavior_contract,
+        "runtime_capability": runtime_capability,
     });
     let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     Ok(vec![

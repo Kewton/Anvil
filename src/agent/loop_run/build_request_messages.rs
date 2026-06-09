@@ -43,6 +43,7 @@ use super::turn_helpers::RetrievalInjection;
 use super::worker_contract::TaskExecutionContract;
 use crate::agent::prompting;
 use crate::agent::recovery;
+use crate::logging::log_llm_event;
 use crate::modes::plan_act::ExecutionMode;
 use crate::session::store::ConversationMessage;
 use crate::system_prompt::build_system_prompt;
@@ -100,7 +101,7 @@ pub(super) fn build_request_messages(
         messages.push(ConversationMessage::system(note));
     }
     if let Some(contract) = super::task_classification::task_contract_authority(agent) {
-        append_contract_runtime_messages(&contract, &mut messages);
+        append_contract_runtime_messages(agent, &contract, &mut messages);
     }
     if focused_edit_target.is_none() {
         append_general_request_context_messages(agent, &mut messages);
@@ -122,15 +123,30 @@ pub(super) fn build_request_messages(
 }
 
 fn append_contract_runtime_messages(
+    agent: &Agent,
     contract: &super::task_contract::TaskContract,
     messages: &mut Vec<ConversationMessage>,
 ) {
     let execution = TaskExecutionContract::from_task_contract(contract);
-    if let Some(message) =
-        super::runtime_capability::runtime_capability_message_for_execution(&execution)
-    {
-        messages.push(message);
-    }
+    let capability_context =
+        super::runtime_capability::RuntimeCapabilityContext::from_work_root(&agent.work_root);
+    log_llm_event(
+        "agent.runtime_capability.context",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "packet": super::runtime_capability::runtime_capability_payload_for_execution(
+                &execution,
+                &capability_context,
+            ),
+            "authority": "context_only",
+        }),
+    );
+    messages.push(
+        super::runtime_capability::runtime_capability_message_for_execution_with_context(
+            &execution,
+            &capability_context,
+        ),
+    );
     if let Some(message) =
         super::contract_bound_generation::contract_bound_generation_message_for_execution(
             &execution,

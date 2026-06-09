@@ -38,7 +38,8 @@ use super::verifier_orchestration::{
     emit_patch_proposal_legacy_validation_comparison_event,
     emit_patch_proposal_shadow_validation_event,
     validate_verifier_repair_intents_with_accepted_plan, verifier_repair_intent_limits,
-    verifier_repair_pass_messages, verifier_repair_pass_request_error_message,
+    verifier_repair_pass_messages_with_runtime_capability,
+    verifier_repair_pass_request_error_message,
 };
 use super::verifier_repair_shadow::legacy_repair_brief_input_from_assessment;
 use crate::logging::log_llm_event;
@@ -215,12 +216,21 @@ pub(super) fn prepare_verifier_repair_pass(
             ),
         });
     }
-    let messages = match verifier_repair_pass_messages(
+    let execution =
+        super::worker_contract::TaskExecutionContract::from_task_contract(task_contract.as_ref());
+    let capability_context =
+        super::runtime_capability::RuntimeCapabilityContext::from_work_root(&agent.work_root);
+    let runtime_capability = super::runtime_capability::runtime_capability_payload_for_execution(
+        &execution,
+        &capability_context,
+    );
+    let messages = match verifier_repair_pass_messages_with_runtime_capability(
         &agent.work_root,
         &context,
         target_hint,
         &active_request,
         behavior_projection.as_ref(),
+        Some(runtime_capability),
     ) {
         Ok(messages) => messages,
         Err(err) => {
