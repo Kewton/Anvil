@@ -61,6 +61,36 @@ pub(super) enum TaskContractVerifierSelection {
     Missing,
 }
 
+impl TaskContractVerifierSelection {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::StructuredRunnable { .. } => "structured_runnable",
+            Self::StructuredWeak { .. } => "structured_weak",
+            Self::StructuredMissing { .. } => "structured_missing",
+            Self::LegacyRunnable { .. } => "legacy_runnable",
+            Self::Missing => "missing",
+        }
+    }
+
+    pub(super) fn owned_test_artifacts_count(&self) -> Option<usize> {
+        match self {
+            Self::StructuredRunnable {
+                bound_test_artifacts_count,
+                ..
+            } => Some(*bound_test_artifacts_count),
+            Self::StructuredWeak {
+                owned_test_artifacts_count,
+                ..
+            }
+            | Self::StructuredMissing {
+                owned_test_artifacts_count,
+                ..
+            } => Some(*owned_test_artifacts_count),
+            Self::LegacyRunnable { .. } | Self::Missing => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct StructuredVerifierInvocationReport {
     pub(super) snapshot: Option<VerifierInvokedSnapshot>,
@@ -175,16 +205,6 @@ pub(super) fn select_task_contract_verifier(
     evidence_command_hint: Option<&str>,
     project_unit: Option<&ProjectUnit>,
 ) -> TaskContractVerifierSelection {
-    if let Some(plan) =
-        evidence_command_hint.and_then(AutoTestRunner::plan_from_evidence_command_hint)
-    {
-        let command_for_log = crate::session::feedback::mask_secrets(&plan.command);
-        return TaskContractVerifierSelection::LegacyRunnable {
-            plan,
-            command_for_log,
-        };
-    }
-
     if test_execution_required && workspace_scope.is_some() {
         let owned_plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
             work_root,
@@ -194,6 +214,16 @@ pub(super) fn select_task_contract_verifier(
             project_unit,
         );
         return structured_selection_from_owned_plan(owned_plan, owned_test_artifacts.len());
+    }
+
+    if let Some(plan) =
+        evidence_command_hint.and_then(AutoTestRunner::plan_from_evidence_command_hint)
+    {
+        let command_for_log = crate::session::feedback::mask_secrets(&plan.command);
+        return TaskContractVerifierSelection::LegacyRunnable {
+            plan,
+            command_for_log,
+        };
     }
 
     let Some(plan) = AutoTestRunner::detect_with_project_unit(
@@ -607,16 +637,76 @@ mod tests {
     }
 
     #[test]
-    fn verifier_selection_uses_evidence_command_hint_without_owned_tests() {
+    fn verifier_selection_does_not_use_unbound_hint_when_tests_required_without_owned_tests() {
         let dir = tempdir().unwrap();
         let scope = TaskWorkspaceScope::detect(dir.path(), "run tests");
+        assert_eq!(
+            select_task_contract_verifier(
+                dir.path(),
+                &[],
+                &[],
+                &[],
+                true,
+                Some(&scope),
+                Some("cargo test --manifest-path Cargo.toml"),
+                None,
+            ),
+            TaskContractVerifierSelection::StructuredMissing {
+                outcome: TaskContractVerifierOutcome::SafeStop {
+                    reason: SafeStopReason::VerifierMissing
+                },
+                owned_test_artifacts_count: 0
+            }
+        );
+    }
+
+    #[test]
+    fn verifier_selection_prefers_structured_owned_tests_over_unbound_hint() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/lib.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+        let scope = TaskWorkspaceScope::detect(dir.path(), "run cargo tests");
+        let selection = select_task_contract_verifier(
+            dir.path(),
+            &["tests/lib.rs".to_string(), "Cargo.toml".to_string()],
+            &[],
+            &["tests/lib.rs".to_string()],
+            true,
+            Some(&scope),
+            Some("cargo test --manifest-path Cargo.toml"),
+            None,
+        );
+
+        let TaskContractVerifierSelection::StructuredRunnable {
+            command,
+            bound_test_artifacts_count,
+            ..
+        } = &selection
+        else {
+            panic!("expected structured owned-test verifier, got {selection:?}");
+        };
+        assert_eq!(command.runner(), "cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+        assert_eq!(*bound_test_artifacts_count, 1);
+        assert_eq!(selection.label(), "structured_runnable");
+        assert_eq!(selection.owned_test_artifacts_count(), Some(1));
+    }
+
+    #[test]
+    fn verifier_selection_still_uses_evidence_hint_when_tests_are_not_required() {
+        let dir = tempdir().unwrap();
         let selection = select_task_contract_verifier(
             dir.path(),
             &[],
             &[],
             &[],
-            true,
-            Some(&scope),
+            false,
+            None,
             Some("cargo test --manifest-path Cargo.toml"),
             None,
         );

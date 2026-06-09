@@ -2386,19 +2386,35 @@ pub(super) fn select_task_contract_verifier_once(
             }),
         );
     }
-    (
-        super::verifier_driver::select_task_contract_verifier(
-            &agent.work_root,
-            changed_files,
-            &recent_successful_bash_commands,
-            &owned_test_artifacts,
-            test_execution_required,
-            workspace_scope_opt.as_ref(),
-            evidence_command_hint.as_deref(),
-            task_contract_project_unit.as_ref(),
-        ),
-        workspace_scope_opt,
-    )
+    let selection = super::verifier_driver::select_task_contract_verifier(
+        &agent.work_root,
+        changed_files,
+        &recent_successful_bash_commands,
+        &owned_test_artifacts,
+        test_execution_required,
+        workspace_scope_opt.as_ref(),
+        evidence_command_hint.as_deref(),
+        task_contract_project_unit.as_ref(),
+    );
+    log_llm_event(
+        "agent.task_contract.verifier.selection",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "selection": selection.label(),
+            "owned_test_artifacts_count": selection.owned_test_artifacts_count(),
+            "test_execution_required": test_execution_required,
+            "evidence_command_hint_present": evidence_command_hint.is_some(),
+            "evidence_command_hint_deferred_to_structured": evidence_command_hint.is_some()
+                && matches!(
+                    selection,
+                    super::verifier_driver::TaskContractVerifierSelection::StructuredRunnable { .. }
+                        | super::verifier_driver::TaskContractVerifierSelection::StructuredWeak { .. }
+                        | super::verifier_driver::TaskContractVerifierSelection::StructuredMissing { .. }
+                ),
+        }),
+    );
+    (selection, workspace_scope_opt)
 }
 
 pub(super) fn handle_legacy_task_contract_verifier_selection(
