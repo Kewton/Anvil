@@ -16,12 +16,13 @@ use super::worker_contract::{
 };
 use crate::session::store::ConversationMessage;
 
-const MAX_PHASES_IN_MESSAGE: usize = 7;
+const MAX_PHASES_IN_MESSAGE: usize = 9;
 const MAX_DECLARED_ITEMS_IN_MESSAGE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContractGenerationPhaseKind {
     ContractAlignment,
+    InterfaceOrSchemaExpectation,
     Setup,
     PrimaryDeliverable,
     SupportingDeliverable,
@@ -34,6 +35,7 @@ impl ContractGenerationPhaseKind {
     fn label(self) -> &'static str {
         match self {
             Self::ContractAlignment => "contract_alignment",
+            Self::InterfaceOrSchemaExpectation => "interface_schema_expectation",
             Self::Setup => "setup",
             Self::PrimaryDeliverable => "primary_deliverable",
             Self::SupportingDeliverable => "supporting_deliverable",
@@ -94,6 +96,15 @@ impl ContractBoundGenerationPlan {
             None,
             alignment_predicate,
         )];
+        if needs_expectation_phase(execution) {
+            phases.push(ContractGenerationPhase::new(
+                ContractGenerationPhaseKind::InterfaceOrSchemaExpectation,
+                WorkerKind::primary_for_task_kind(execution.objective_kind.to_task_kind()),
+                None,
+                None,
+                "declared_interface_schema_and_runtime_expectations_are_explicit_before_writes",
+            ));
+        }
 
         for deliverable in generation_ordered_deliverables(&execution.deliverables) {
             phases.push(phase_for_deliverable(execution, deliverable));
@@ -158,7 +169,7 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; declared_artifacts={}; declared_expectations={}; phases={}. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
@@ -184,6 +195,15 @@ fn generation_ordered_deliverables(
     append_primary_deliverables(deliverables, &mut ordered);
     append_deliverables_with_role(deliverables, ArtifactRole::Test, &mut ordered);
     ordered
+}
+
+fn needs_expectation_phase(execution: &TaskExecutionContract) -> bool {
+    execution.runtime_profile != RuntimeProfile::Unspecified
+        || !execution.public_contract.is_empty()
+        || execution
+            .deliverables
+            .iter()
+            .any(|deliverable| deliverable.schema.is_some())
 }
 
 fn append_deliverables_with_role<'a>(
@@ -503,6 +523,10 @@ mod tests {
             ContractGenerationPhaseKind::ContractAlignment
         );
         assert_eq!(
+            plan.phases()[1].kind,
+            ContractGenerationPhaseKind::InterfaceOrSchemaExpectation
+        );
+        assert_eq!(
             plan.phases()[0].completion_predicate,
             "source_api_and_test_expectations_agree"
         );
@@ -526,6 +550,10 @@ mod tests {
         assert!(
             plan.policy_message()
                 .contains("test_artifact_targets_the_declared_public_contract")
+        );
+        assert!(
+            plan.policy_message()
+                .contains("interface_schema_expectation")
         );
         assert!(
             plan.policy_message()
@@ -554,6 +582,10 @@ mod tests {
             plan.phases()[0].completion_predicate,
             "output_path_schema_and_rows_agree"
         );
+        assert!(plan.phases().iter().any(|phase| {
+            phase.kind == ContractGenerationPhaseKind::InterfaceOrSchemaExpectation
+                && phase.worker_kind == WorkerKind::Data
+        }));
         assert!(plan.phases().iter().any(|phase| {
             phase.target_role == Some(ArtifactRole::DataOutput)
                 && phase.worker_kind == WorkerKind::Data
@@ -616,10 +648,53 @@ mod tests {
     }
 
     #[test]
+    fn expectation_phase_precedes_manifest_implementation_and_tests() {
+        let contract = TaskContract::from_request(
+            "Create a Rust library. Include Cargo.toml, implementation, tests, and README.md.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::Rust)
+            .with_evidence_command("cargo test");
+        let plan = ContractBoundGenerationPlan::from_execution_contract(&execution)
+            .expect("rust contract should produce a generation plan");
+        let phases = plan.phases();
+
+        let expectation_idx = phase_index(
+            phases,
+            ContractGenerationPhaseKind::InterfaceOrSchemaExpectation,
+        )
+        .expect("expectation phase should be present");
+        let setup_idx = role_phase_index(phases, ArtifactRole::Setup).expect("setup phase");
+        let implementation_idx =
+            role_phase_index(phases, ArtifactRole::Implementation).expect("implementation phase");
+        let test_idx = role_phase_index(phases, ArtifactRole::Test).expect("test phase");
+
+        assert!(expectation_idx < setup_idx);
+        assert!(setup_idx < implementation_idx);
+        assert!(implementation_idx < test_idx);
+        assert!(plan.policy_message().contains(
+            "declared_interface_schema_and_runtime_expectations_are_explicit_before_writes"
+        ));
+    }
+
+    #[test]
     fn answer_only_contract_does_not_add_generation_protocol() {
         let contract = TaskContract::from_request("Explain what this repository does.");
         let execution = TaskExecutionContract::from_task_contract(&contract);
 
         assert!(ContractBoundGenerationPlan::from_execution_contract(&execution).is_none());
+    }
+
+    fn phase_index(
+        phases: &[ContractGenerationPhase],
+        kind: ContractGenerationPhaseKind,
+    ) -> Option<usize> {
+        phases.iter().position(|phase| phase.kind == kind)
+    }
+
+    fn role_phase_index(phases: &[ContractGenerationPhase], role: ArtifactRole) -> Option<usize> {
+        phases
+            .iter()
+            .position(|phase| phase.target_role == Some(role))
     }
 }
