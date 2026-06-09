@@ -82,8 +82,9 @@ use super::task_contract_recovery_planning::{
 pub(super) use super::task_contract_request_inference::{
     SETUP_MARKER_NEEDLES_ASCII, SETUP_MARKER_NEEDLES_JP, infer_intent, infer_project_language,
     infer_project_shape, infer_verification_requirement, lower_contains_setup_token_unnegated,
-    preferred_runner_for_language, project_intent_confidence,
-    request_contains_jp_setup_marker_unnegated,
+    mentions_stack_as_build_target, preferred_runner_for_language, project_intent_confidence,
+    request_asks_for_data_task, request_asks_for_ops_task, request_asks_for_research_task,
+    request_contains_jp_setup_marker_unnegated, request_has_explicit_coding_subject,
 };
 pub(super) use super::task_contract_taxonomy::{
     ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, DeliverableSpec,
@@ -2084,58 +2085,6 @@ fn push_section_if(sections: &mut Vec<String>, condition: bool, section: &str) {
     }
 }
 
-fn request_asks_for_data_task(request: &str, lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "csv",
-            "jsonl",
-            "dataset",
-            "spreadsheet",
-            "data",
-            "etl",
-            "transform",
-            "clean data",
-            "summary.csv",
-        ],
-    ) || contains_any(request, &["データ", "CSV", "集計", "整形"])
-}
-
-fn request_has_explicit_coding_subject(request: &str, lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "api",
-            "backend",
-            "frontend",
-            "cli",
-            "library",
-            "module",
-            "script",
-            "service",
-            "component",
-            "rust",
-            "python",
-            "node",
-        ],
-    ) || contains_any(
-        request,
-        &[
-            "API",
-            "バックエンド",
-            "フロントエンド",
-            "CLI",
-            "ライブラリ",
-            "モジュール",
-            "スクリプト",
-            "Rust",
-            "Python",
-        ],
-    ) || mentions_stack_as_build_target(request, lower)
-        || contains_implementation_file_hint(lower)
-        || contains_callable_signature_hint(lower)
-}
-
 /// Issue #919 (Decision #1): does the request name an explicit user-provided
 /// output docs artifact path (`UsageDocs`-role obligation with a recognized
 /// docs extension `.md`/`.txt`/`.rst`/`.mdx`)? This is the §2.6 load-bearing
@@ -2270,50 +2219,6 @@ fn request_asks_for_authoring_task(
     let prose_output_shaped = matches!(intent, TaskIntent::Explain) || keyword;
     let trigger_b = explicit_output && prose_output_shaped;
     trigger_a || trigger_b
-}
-
-fn request_asks_for_research_task(request: &str, lower: &str, intent: TaskIntent) -> bool {
-    matches!(intent, TaskIntent::Explain)
-        || contains_any(
-            lower,
-            &[
-                "research",
-                "investigate",
-                "compare",
-                "summarize",
-                "analysis",
-                "analyze",
-                "report",
-            ],
-        )
-        || contains_any(request, &["調査", "比較", "分析", "レポート"])
-}
-
-fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "deploy",
-            "deployment",
-            "rollback",
-            "runbook",
-            "incident",
-            "monitoring",
-            "checklist",
-            "release",
-            "operation",
-        ],
-    ) || contains_any(
-        request,
-        &[
-            "デプロイ",
-            "ロールバック",
-            "運用",
-            "監視",
-            "リリース",
-            "手順",
-        ],
-    )
 }
 
 /// Returns `true` when the request asks for any code-work signal
@@ -3367,32 +3272,6 @@ fn done_gate_safe_stop_reason(
         return SafeStopReason::VerifierWeak;
     }
     SafeStopReason::VerifierMissing
-}
-
-fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "with fastapi",
-            "using fastapi",
-            "fastapi app",
-            "fastapi api",
-            "with flask",
-            "using flask",
-            "flask app",
-            "with django",
-            "using django",
-            "django app",
-            "rust library",
-            "rust crate",
-            "rust package",
-            "cargo project",
-        ],
-    ) || contains_any(
-        request,
-        &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
-    ) || (request.contains("Rust")
-        && contains_any(request, &["ライブラリ", "クレート", "パッケージ"]))
 }
 
 /// Issue #920: intentional 1:1 decision point — every role has a distinct,

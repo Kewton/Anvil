@@ -5,6 +5,9 @@
 //! semantic interpretation belongs in LLM-produced candidates plus deterministic
 //! admission.
 
+use super::contract_request_signals::{
+    contains_callable_signature_hint, contains_implementation_file_hint,
+};
 use super::task_contract::{
     ProjectLanguage, ProjectShape, TaskIntent, VerificationRequirement, request_asks_for_code_work,
     request_asks_for_setup, request_asks_for_test_artifact,
@@ -359,4 +362,130 @@ pub(super) fn project_intent_confidence(
         confidence += 0.10;
     }
     confidence.min(1.0)
+}
+
+pub(super) fn request_asks_for_data_task(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "csv",
+            "jsonl",
+            "dataset",
+            "spreadsheet",
+            "data",
+            "etl",
+            "transform",
+            "clean data",
+            "summary.csv",
+        ],
+    ) || contains_any(request, &["データ", "CSV", "集計", "整形"])
+}
+
+pub(super) fn request_has_explicit_coding_subject(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "api",
+            "backend",
+            "frontend",
+            "cli",
+            "library",
+            "module",
+            "script",
+            "service",
+            "component",
+            "rust",
+            "python",
+            "node",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "API",
+            "バックエンド",
+            "フロントエンド",
+            "CLI",
+            "ライブラリ",
+            "モジュール",
+            "スクリプト",
+            "Rust",
+            "Python",
+        ],
+    ) || mentions_stack_as_build_target(request, lower)
+        || contains_implementation_file_hint(lower)
+        || contains_callable_signature_hint(lower)
+}
+
+pub(super) fn request_asks_for_research_task(
+    request: &str,
+    lower: &str,
+    intent: TaskIntent,
+) -> bool {
+    matches!(intent, TaskIntent::Explain)
+        || contains_any(
+            lower,
+            &[
+                "research",
+                "investigate",
+                "compare",
+                "summarize",
+                "analysis",
+                "analyze",
+                "report",
+            ],
+        )
+        || contains_any(request, &["調査", "比較", "分析", "レポート"])
+}
+
+pub(super) fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "deploy",
+            "deployment",
+            "rollback",
+            "runbook",
+            "incident",
+            "monitoring",
+            "checklist",
+            "release",
+            "operation",
+        ],
+    ) || contains_any(
+        request,
+        &[
+            "デプロイ",
+            "ロールバック",
+            "運用",
+            "監視",
+            "リリース",
+            "手順",
+        ],
+    )
+}
+
+pub(super) fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "with fastapi",
+            "using fastapi",
+            "fastapi app",
+            "fastapi api",
+            "with flask",
+            "using flask",
+            "flask app",
+            "with django",
+            "using django",
+            "django app",
+            "rust library",
+            "rust crate",
+            "rust package",
+            "cargo project",
+        ],
+    ) || contains_any(
+        request,
+        &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
+    ) || (request.contains("Rust")
+        && contains_any(request, &["ライブラリ", "クレート", "パッケージ"]))
 }
