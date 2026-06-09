@@ -2115,7 +2115,6 @@ fn suggested_next_action(role: ArtifactRole, request: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::task_contract_path_context::MAX_OBLIGATION_PATH_BYTES;
     use super::*;
 
     // ---- Issue #920 (P3): ArtifactRole round-trip / totality / append-only ----
@@ -2557,69 +2556,6 @@ mod tests {
         assert!(
             !docs_only.test_execution_required(),
             "DocsOnly Coding must not require test execution"
-        );
-    }
-
-    // Issue #918 (P1) Task 4: validated_obligation_path SSOT.
-    #[test]
-    fn validated_obligation_path_keeps_builder_corpus_verbatim() {
-        // DR3-007: every path the default-obligation builders pass must take the
-        // Some/verbatim branch so obligation goldens / .contains(&ctor) equality
-        // never drift. If a future builder path falls to the sanitized fallback,
-        // this fails CI instead of silently changing stored path identity.
-        for p in [
-            "Cargo.toml",
-            "src/main.rs",
-            "tests/cli.rs",
-            "README.md",
-            "package.json",
-            "src/index.js",
-            "tests/index.test.js",
-            "main.py",
-            "tests/test_main.py",
-            "output.csv",
-            "output.tsv",
-            "output.jsonl",
-        ] {
-            assert_eq!(
-                super::validated_obligation_path(p.to_string()),
-                p,
-                "builder path {p} must be stored verbatim (predicate Some branch)"
-            );
-        }
-    }
-
-    #[test]
-    fn validated_obligation_path_sanitizes_traversal_and_control() {
-        for raw in [
-            "../../etc/passwd",
-            "..\\..\\windows\\system32",
-            "/etc/shadow",
-            "./../secret.key",
-        ] {
-            let got = super::validated_obligation_path(raw.to_string());
-            assert!(
-                !got.contains(".."),
-                "{raw:?} -> {got:?} must not contain a traversal segment"
-            );
-            assert!(
-                !got.starts_with('/'),
-                "{raw:?} -> {got:?} must not be absolute"
-            );
-        }
-        // Control characters (newline used for log-line / prompt spoofing) are
-        // neutralized so a rejected path can't break a recovery message.
-        let spoof = super::validated_obligation_path("a\nb\rc.txt".to_string());
-        assert!(!spoof.contains('\n') && !spoof.contains('\r'));
-    }
-
-    #[test]
-    fn validated_obligation_path_caps_length() {
-        let long = format!("dir/{}.txt", "a".repeat(8000));
-        let got = super::validated_obligation_path(long);
-        assert!(
-            got.len() <= MAX_OBLIGATION_PATH_BYTES,
-            "path must be capped to MAX_OBLIGATION_PATH_BYTES"
         );
     }
 

@@ -371,6 +371,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validated_obligation_path_keeps_builder_corpus_verbatim() {
+        for p in [
+            "Cargo.toml",
+            "src/main.rs",
+            "tests/cli.rs",
+            "README.md",
+            "package.json",
+            "src/index.js",
+            "tests/index.test.js",
+            "main.py",
+            "tests/test_main.py",
+            "output.csv",
+            "output.tsv",
+            "output.jsonl",
+        ] {
+            assert_eq!(
+                validated_obligation_path(p.to_string()),
+                p,
+                "builder path {p} must be stored verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_obligation_path_sanitizes_traversal_and_control() {
+        for raw in [
+            "../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "/etc/shadow",
+            "./../secret.key",
+        ] {
+            let got = validated_obligation_path(raw.to_string());
+            assert!(
+                !got.contains(".."),
+                "{raw:?} -> {got:?} must not contain a traversal segment"
+            );
+            assert!(
+                !got.starts_with('/'),
+                "{raw:?} -> {got:?} must not be absolute"
+            );
+        }
+        let spoof = validated_obligation_path("a\nb\rc.txt".to_string());
+        assert!(!spoof.contains('\n') && !spoof.contains('\r'));
+    }
+
+    #[test]
+    fn validated_obligation_path_caps_length() {
+        let long = format!("dir/{}.txt", "a".repeat(8000));
+        let got = validated_obligation_path(long);
+        assert!(
+            got.len() <= MAX_OBLIGATION_PATH_BYTES,
+            "path must be capped to MAX_OBLIGATION_PATH_BYTES"
+        );
+    }
+
+    #[test]
     fn mask_path_tokens_preserves_length_m1() {
         for s in [
             "compare findings in draft_report.md and summary.md",
