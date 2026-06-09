@@ -5,14 +5,180 @@
 
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableKind, DeliverableSchema, ProjectIntent,
-    ProjectLanguage, ProjectShape,
+    ProjectLanguage, ProjectShape, request_negates_test_artifacts,
 };
+use super::task_contract_path_context::contains_any;
 
 pub(super) fn default_readme_required_sections() -> Vec<String> {
     ["setup", "usage", "test"]
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+pub(super) fn required_doc_sections_from_request(request: &str) -> Vec<String> {
+    if let Some(sections) = explicit_required_sections_list_from_request(request) {
+        return sections;
+    }
+    let lower = request.to_ascii_lowercase();
+    let mut sections = Vec::new();
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["overview", "summary"]) || contains_any(request, &["概要", "要約"]),
+        "overview",
+    );
+    let mentions_setup = contains_any(&lower, &["setup", "getting started"])
+        || contains_any(request, &["セットアップ", "導入"]);
+    let mentions_installation = contains_any(&lower, &["install", "installation"])
+        || contains_any(request, &["インストール"]);
+    push_section_if(
+        &mut sections,
+        mentions_setup || mentions_installation,
+        if mentions_setup {
+            "setup"
+        } else {
+            "installation"
+        },
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["usage", "how to use", "examples", "example"])
+            || contains_any(request, &["使用方法", "使い方", "利用方法", "例"]),
+        "usage",
+    );
+    let test_artifacts_negated = request_negates_test_artifacts(request, &lower);
+    let explicit_testing_section = contains_any(
+        &lower,
+        &[
+            "test method",
+            "testing section",
+            "testing sections",
+            "tests section",
+            "tests sections",
+        ],
+    ) || contains_any(request, &["テスト方法"]);
+    push_section_if(
+        &mut sections,
+        explicit_testing_section
+            || (!test_artifacts_negated
+                && (contains_any(&lower, &["testing", "tests"])
+                    || contains_any(request, &["テスト", "検証"]))),
+        "testing",
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["api", "endpoint", "reference", "configuration"])
+            || contains_any(request, &["API", "エンドポイント", "設定"]),
+        "reference",
+    );
+    if sections.is_empty() {
+        sections.push("overview".to_string());
+    }
+    sections
+}
+
+fn explicit_required_sections_list_from_request(request: &str) -> Option<Vec<String>> {
+    let lower = request.to_ascii_lowercase();
+    let marker = ["sections:", "sections："]
+        .into_iter()
+        .find_map(|marker| lower.find(marker).map(|idx| (idx, marker.len())))?;
+    let after = &request[marker.0 + marker.1..];
+    let end = after
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '.' | '\n' | '\r').then_some(idx))
+        .unwrap_or(after.len());
+    let list = &after[..end];
+    let sections = list
+        .split([',', ';', '、', '，'])
+        .filter_map(normalize_explicit_section_label)
+        .take(12)
+        .collect::<Vec<_>>();
+    (!sections.is_empty()).then_some(sections)
+}
+
+fn normalize_explicit_section_label(raw: &str) -> Option<String> {
+    let mut label = raw
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '[' | ']' | '(' | ')' | ':'));
+    for prefix in ["and ", "or "] {
+        if label
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        {
+            label = label[prefix.len()..].trim();
+        }
+    }
+    let normalized = label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if normalized.len() < 2
+        || normalized.len() > 80
+        || normalized.contains("do not")
+        || normalized.contains("source code")
+        || normalized.contains("package.json")
+        || normalized.contains("cargo.toml")
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+pub(super) fn required_research_sections_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut sections = vec!["findings".to_string(), "sources".to_string()];
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["recommend", "compare", "tradeoff"])
+            || contains_any(request, &["比較", "推奨", "トレードオフ"]),
+        "recommendation",
+    );
+    sections
+}
+
+/// Issue #923 (P6): the explicit-override carrier for Ops runbooks. Emits only
+/// canonical `OpsSection` labels, so the values are safe to store on the
+/// obligation and surface in diagnostics / repair packets.
+pub(super) fn required_ops_sections_from_request(request: &str) -> Vec<String> {
+    let lower = request.to_ascii_lowercase();
+    let mut sections = Vec::new();
+    use super::verifier::OpsSection;
+    push_section_if(
+        &mut sections,
+        contains_any(
+            &lower,
+            &["runbook", "procedure", "checklist", "deploy", "deployment"],
+        ) || contains_any(request, &["手順", "チェックリスト", "デプロイ"]),
+        OpsSection::Checklist.label(),
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["validate", "validation", "verify"])
+            || contains_any(request, &["確認", "検証"]),
+        OpsSection::Validation.label(),
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["rollback", "restore", "roll back", "revert"])
+            || contains_any(request, &["ロールバック", "切り戻し"]),
+        OpsSection::Rollback.label(),
+    );
+    push_section_if(
+        &mut sections,
+        contains_any(&lower, &["risk", "impact"]) || contains_any(request, &["リスク", "注意"]),
+        OpsSection::Risk.label(),
+    );
+    if sections.is_empty() {
+        sections.push(OpsSection::Checklist.label().to_string());
+    }
+    sections
+}
+
+fn push_section_if(sections: &mut Vec<String>, condition: bool, section: &str) {
+    if condition && !sections.iter().any(|existing| existing == section) {
+        sections.push(section.to_string());
+    }
 }
 
 pub(super) fn inferred_artifact_obligations_from_project_intent(
