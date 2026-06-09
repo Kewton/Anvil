@@ -1367,6 +1367,25 @@ impl VerifierCommand {
         Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
     }
 
+    /// `python3 -m unittest discover -s tests` structured constructor for
+    /// explicit stdlib-unittest requests. Like the pytest stdlib constructor,
+    /// it runs the discovered suite while retaining owned test artifacts as
+    /// binding metadata.
+    #[allow(dead_code)]
+    pub(super) fn from_python3_unittest_discover(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        let args = vec![
+            "-m".to_string(),
+            "unittest".to_string(),
+            "discover".to_string(),
+            "-s".to_string(),
+            "tests".to_string(),
+        ];
+        Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
+    }
+
     /// Full `npm test` structured constructor.
     ///
     /// Issue #865: package-script verification should accept `npm test` as
@@ -1738,9 +1757,12 @@ impl AutoTestRunner {
                 // explicit owned test paths. Missing dependencies then surface
                 // as normal verifier failures instead of collapsing the task
                 // into VerifierWeak.
-                if let Some(command) =
+                let command = if display_command.contains("unittest") {
+                    VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
+                } else {
                     VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
-                {
+                };
+                if let Some(command) = command {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }
                 OwnedTestVerifierPlan::Weak {
@@ -5170,6 +5192,59 @@ dev = [
                 assert_eq!(command.bound_test_artifacts(), owned.as_slice());
             }
             other => panic!("expected project-unit filtered python verifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_unit_unittest_preview_builds_structured_unittest_verifier() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+
+        let owned = vec!["tests/test_math_utils.py".to_string()];
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: vec![super::super::project_probe::ProjectUnitVerifierCandidate {
+                command_preview: "python3 -m unittest discover -s tests".to_string(),
+                source: "python_tests",
+                timeout_class: super::super::project_probe::ProjectUnitTimeoutClass::ShortUnitTest,
+            }],
+            observed_stacks: vec!["python"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::High,
+        };
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &[
+                "math_utils.py".to_string(),
+                "tests/test_math_utils.py".to_string(),
+            ],
+            &[],
+            &owned,
+            Some(&project_unit),
+        );
+
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert_eq!(
+                    command.args(),
+                    vec![
+                        "-m".to_string(),
+                        "unittest".to_string(),
+                        "discover".to_string(),
+                        "-s".to_string(),
+                        "tests".to_string(),
+                    ]
+                    .as_slice()
+                );
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected structured unittest verifier, got {other:?}"),
         }
     }
 

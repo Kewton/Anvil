@@ -218,6 +218,7 @@ pub(super) fn probe_project_unit_for_request(
     }
     let mut unit = build_project_unit(work_root, &facts)?;
     constrain_project_unit_to_request(request, &mut unit)?;
+    apply_request_verifier_preference(request, &mut unit);
     Some(unit)
 }
 
@@ -463,6 +464,17 @@ fn verifier_candidates(
         });
     }
     out
+}
+
+fn apply_request_verifier_preference(request: &str, unit: &mut ProjectUnit) {
+    if !request.to_ascii_lowercase().contains("unittest") {
+        return;
+    }
+    for candidate in &mut unit.verifier_candidates {
+        if candidate.source == "python_tests" {
+            candidate.command_preview = "python3 -m unittest discover -s tests".to_string();
+        }
+    }
 }
 
 fn constrain_project_unit_to_request(request: &str, unit: &mut ProjectUnit) -> Option<()> {
@@ -974,6 +986,36 @@ mod tests {
             probe_project_unit_for_request(dir.path(), request, &scope, &edited).expect("unit");
         assert_eq!(unit.verifier_candidates.len(), 1);
         assert_eq!(unit.verifier_candidates[0].source, "package_json_scripts");
+    }
+
+    #[test]
+    fn python_unittest_request_prefers_unittest_project_unit_verifier() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("math_utils.py"),
+            "def clamp(v, lo, hi): return v",
+        )
+        .expect("impl");
+        std::fs::write(
+            dir.path().join("tests/test_math_utils.py"),
+            "import unittest\n\nclass TestClamp(unittest.TestCase):\n    def test_smoke(self):\n        self.assertTrue(True)\n",
+        )
+        .expect("test");
+
+        let request = "Create math_utils.py and tests/test_math_utils.py. Use Python unittest and verify with python -m unittest discover -s tests.";
+        let scope = scope(dir.path(), request);
+        let edited = edited(&["math_utils.py", "tests/test_math_utils.py"]);
+
+        let unit =
+            probe_project_unit_for_request(dir.path(), request, &scope, &edited).expect("unit");
+
+        assert_eq!(unit.verifier_candidates.len(), 1);
+        assert_eq!(unit.verifier_candidates[0].source, "python_tests");
+        assert_eq!(
+            unit.verifier_candidates[0].command_preview,
+            "python3 -m unittest discover -s tests"
+        );
     }
 
     #[test]
