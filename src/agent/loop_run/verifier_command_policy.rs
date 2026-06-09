@@ -5,6 +5,23 @@
 //! decides whether an already-proposed command shape is safe enough to admit as
 //! a verifier hint.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PythonProjectUnitVerifierFlavor {
+    PytestStdlib,
+    UnittestDiscover,
+}
+
+pub(super) fn python_project_unit_verifier_flavor(
+    command: Option<&str>,
+) -> PythonProjectUnitVerifierFlavor {
+    match canonical_project_unit_evidence_command(command) {
+        Some("python3 -m unittest discover -s tests") => {
+            PythonProjectUnitVerifierFlavor::UnittestDiscover
+        }
+        _ => PythonProjectUnitVerifierFlavor::PytestStdlib,
+    }
+}
+
 pub(super) fn admitted_profile_preferred_runner(runner: Option<&str>) -> Option<&'static str> {
     match runner?.trim().to_ascii_lowercase().as_str() {
         "cargo test" => Some("cargo test"),
@@ -81,6 +98,18 @@ mod tests {
         assert_eq!(
             canonical_project_unit_evidence_command(Some("python -m unittest discover -s tests")),
             Some("python3 -m unittest discover -s tests")
+        );
+    }
+
+    #[test]
+    fn python_project_unit_verifier_flavor_is_explicit() {
+        assert_eq!(
+            python_project_unit_verifier_flavor(Some("python -m unittest discover -s tests")),
+            PythonProjectUnitVerifierFlavor::UnittestDiscover
+        );
+        assert_eq!(
+            python_project_unit_verifier_flavor(Some("python3 -B -m pytest -p no:cacheprovider")),
+            PythonProjectUnitVerifierFlavor::PytestStdlib
         );
     }
 

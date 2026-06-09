@@ -12,6 +12,7 @@ use crate::util::workspace_paths::is_ignored_workspace_display_path;
 use super::completion_evidence::is_completion_verifier_command;
 use super::project_probe::ProjectUnit;
 use super::task_workspace_scope::TaskWorkspaceScope;
+use super::verifier_command_policy::PythonProjectUnitVerifierFlavor;
 
 /// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
 /// `AutoTestResult.output`. Issue #459 / DR2-009 keeps this private to the
@@ -1758,14 +1759,15 @@ impl AutoTestRunner {
                 // as normal verifier failures instead of collapsing the task
                 // into VerifierWeak.
                 let command =
-                    if super::verifier_command_policy::canonical_project_unit_evidence_command(
-                        Some(&display_command),
-                    )
-                    .is_some()
-                    {
-                        VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
-                    } else {
-                        VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
+                    match super::verifier_command_policy::python_project_unit_verifier_flavor(Some(
+                        &display_command,
+                    )) {
+                        PythonProjectUnitVerifierFlavor::UnittestDiscover => {
+                            VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
+                        }
+                        PythonProjectUnitVerifierFlavor::PytestStdlib => {
+                            VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
+                        }
                     };
                 if let Some(command) = command {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
