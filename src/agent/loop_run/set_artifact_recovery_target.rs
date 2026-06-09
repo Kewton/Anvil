@@ -161,6 +161,59 @@ pub(super) fn set_artifact_recovery_target_from_hint_with_contract(
     }
 }
 
+pub(super) fn realign_current_artifact_recovery_target_to_contract(agent: &mut Agent) -> bool {
+    let Some(contract) =
+        super::task_classification::task_contract_authority(agent).map(|rc| (*rc).clone())
+    else {
+        return false;
+    };
+    realign_current_artifact_recovery_target_with_contract(agent, &contract)
+}
+
+pub(super) fn realign_current_artifact_recovery_target_with_contract(
+    agent: &mut Agent,
+    contract: &TaskContract,
+) -> bool {
+    let Some(current) = active_artifact_recovery_target_projection(agent) else {
+        return false;
+    };
+    let identities = contract.required_identities_for_role(current.role);
+    let Some(identity) = identities.first() else {
+        return false;
+    };
+    if identity.path == current.path {
+        if agent.current_artifact_recovery_target.is_none() {
+            agent.current_artifact_recovery_target = Some(current);
+            return true;
+        }
+        return false;
+    }
+    let hint = RecoveryTargetHint {
+        role: current.role,
+        path: identity.path.clone(),
+        reason: format!(
+            "required deliverable obligation is still missing: {}",
+            super::task_contract::obligation_report_label(identity)
+        ),
+    };
+    set_artifact_recovery_target_from_hint_with_contract(
+        agent,
+        hint,
+        current.attempt,
+        Some(contract),
+    )
+    .is_some()
+}
+
+fn active_artifact_recovery_target_projection(agent: &Agent) -> Option<RecoveryTarget> {
+    agent.current_artifact_recovery_target.clone().or_else(|| {
+        agent
+            .artifact_completion_job
+            .as_ref()
+            .map(|job| job.projection_recovery_target())
+    })
+}
+
 fn alignment_contract_for_hint<'a>(
     provided: Option<&'a TaskContract>,
     authority: Option<&'a TaskContract>,
@@ -284,6 +337,112 @@ mod tests {
             .artifact_completion_job
             .as_ref()
             .expect("artifact completion job should be installed");
+        assert_eq!(job.target_path(), "tests/test_math_utils.py");
+    }
+
+    #[test]
+    fn current_target_realigns_to_per_turn_contract_identity_before_retry_note() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        let profile = parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python test identity"}"#,
+        )
+        .expect("profile");
+        let authority =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(authority))
+            .expect("unset contract cell");
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Test,
+            path: "tests/cli.rs".to_string(),
+            reason: "synthesized test artifact aligned with requested rust project family"
+                .to_string(),
+            attempt: 2,
+        });
+
+        assert!(realign_current_artifact_recovery_target_to_contract(
+            &mut agent
+        ));
+
+        let target = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("target");
+        assert_eq!(target.path, "tests/test_math_utils.py");
+        assert_eq!(
+            target.reason,
+            "required deliverable obligation is still missing: role=test, kind=file, path=tests/test_math_utils.py"
+        );
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact completion job should be refreshed");
+        assert_eq!(job.target_path(), "tests/test_math_utils.py");
+    }
+
+    #[test]
+    fn stale_job_without_current_target_realigns_to_contract_identity_before_policy() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        let stale = set_artifact_recovery_target_from_hint(
+            &mut agent,
+            RecoveryTargetHint {
+                role: ArtifactRole::Test,
+                path: "tests/cli.rs".to_string(),
+                reason: "synthesized test artifact aligned with requested rust project family"
+                    .to_string(),
+            },
+            4,
+        )
+        .expect("stale test target should install");
+        assert_eq!(stale.path, "tests/cli.rs");
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python test identity"}"#,
+        )
+        .expect("profile");
+        let authority =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(authority))
+            .expect("unset contract cell");
+        agent.current_artifact_recovery_target = None;
+
+        assert!(realign_current_artifact_recovery_target_to_contract(
+            &mut agent
+        ));
+
+        let target = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("projection should be restored from job and realigned");
+        assert_eq!(target.path, "tests/test_math_utils.py");
+        assert_eq!(target.attempt, 0);
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact completion job should be reinstalled");
         assert_eq!(job.target_path(), "tests/test_math_utils.py");
     }
 

@@ -1488,7 +1488,9 @@ fn sync_post_tool_contract_recovery_target(
     if agent.session.mode_state.mode == super::ExecutionMode::Plan {
         return None;
     }
-    let contract = args.task_contract?;
+    let authority_contract =
+        super::task_classification::task_contract_authority(agent).map(|rc| (*rc).clone());
+    let contract = authority_contract.as_ref().or(args.task_contract)?;
     let action = super::task_contract_recovery::task_contract_recovery_action(
         agent,
         contract,
@@ -2051,6 +2053,18 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
     args: ActorLoopToolPreparationArgs<'_, '_>,
 ) -> ActorLoopToolPreparationOutcome {
     let current_reply_tool_call_count = args.reply_tool_calls.len();
+    let authority_contract =
+        super::task_classification::task_contract_authority(agent).map(|rc| (*rc).clone());
+    let task_contract = authority_contract.as_ref().or(args.task_contract);
+    if let Some(contract) = task_contract {
+        super::set_artifact_recovery_target::realign_current_artifact_recovery_target_with_contract(
+            agent, contract,
+        );
+    } else {
+        super::set_artifact_recovery_target::realign_current_artifact_recovery_target_to_contract(
+            agent,
+        );
+    }
     let mut prepared_tool_calls = args
         .reply_tool_calls
         .into_iter()
@@ -2058,7 +2072,8 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
         .collect::<Vec<_>>();
     record_actor_loop_tool_call_summaries(&prepared_tool_calls, args.tool_call_summaries);
 
-    let effective_tool_policy = super::effective_tool_policy_flow::effective_tool_policy(agent);
+    let effective_tool_policy =
+        super::effective_tool_policy_flow::prepare_effective_tool_policy(agent);
     if effective_tool_policy
         .allowed_tool_names_for_prompt()
         .is_some()
@@ -2094,7 +2109,7 @@ pub(super) fn drive_actor_loop_tool_preparation_phase(
                     ActorLoopRejectedToolBatchArgs {
                         err,
                         effective_tool_policy: &effective_tool_policy,
-                        task_contract: args.task_contract,
+                        task_contract,
                         contract_completion_role_retries: args.contract_completion_role_retries,
                         focused_policy_retries: args.focused_policy_retries,
                         missing_verifier_setup_turn: args.missing_verifier_setup_turn,
@@ -2172,13 +2187,16 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
     agent: &mut Agent,
     args: &ActorLoopPreReplyArgs<'_, '_>,
 ) -> ActorLoopPreReplyControlState {
+    let authority_contract =
+        super::task_classification::task_contract_authority(agent).map(|rc| (*rc).clone());
+    let task_contract = authority_contract.as_ref().or(args.task_contract);
     let pre_model_task_contract_action = if agent.session.mode_state.mode
         == super::ExecutionMode::Plan
         || (agent.task_contract_verifier_repair_pending && agent.repair_job.is_some())
     {
         None
     } else {
-        args.task_contract.map(|contract| {
+        task_contract.map(|contract| {
             super::task_contract_recovery::task_contract_recovery_action(
                 agent,
                 contract,
@@ -2201,7 +2219,7 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
     );
     sync_pre_model_task_contract_recovery_target(
         agent,
-        args.task_contract,
+        task_contract,
         pre_model_task_contract_action.as_ref(),
     );
     let recovery_owner = RecoveryOwner::from_control_action(
@@ -4126,10 +4144,14 @@ pub(super) fn run_actor_loop(
             }
             continue;
         }
+        let task_contract_authority =
+            super::task_classification::task_contract_authority(agent).map(|rc| (*rc).clone());
+        let task_contract_for_iteration =
+            task_contract_authority.as_ref().or(task_contract.as_ref());
         let task_contract_action = if agent.session.mode_state.mode == ExecutionMode::Plan {
             None
         } else {
-            task_contract.as_ref().map(|contract| {
+            task_contract_for_iteration.map(|contract| {
                 super::task_contract_recovery::task_contract_recovery_action(
                     agent,
                     contract,
@@ -4153,7 +4175,7 @@ pub(super) fn run_actor_loop(
             ActorLoopTaskContractReplyArgs {
                 before_snapshot: &before_snapshot,
                 accumulated: &accumulated,
-                task_contract: task_contract.as_ref(),
+                task_contract: task_contract_for_iteration,
                 task_contract_action: task_contract_action.as_ref(),
                 final_reply: &final_reply,
                 current_reply_tool_call_count,
@@ -5691,6 +5713,184 @@ mod tests {
             .expect("artifact target sync must also install the completion job");
         assert_eq!(job.role(), expected_target.0);
         assert_eq!(job.target_path(), expected_target.1);
+    }
+
+    #[test]
+    fn post_tool_cleanup_prefers_authority_contract_over_stale_local_contract() {
+        use super::super::artifact_ledger::LedgerAdmissionContext;
+        use super::super::commands::test_agent_with_config;
+        use super::super::project_profile::parse_project_profile_confirmation;
+        use super::super::task_contract::{ArtifactRole, TaskContract};
+        use crate::config::Config;
+        use crate::session::store::ConversationMessage;
+        use std::rc::Rc;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python test identity"}"#,
+        )
+        .expect("profile");
+        let authority =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(authority))
+            .expect("unset contract cell");
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        std::fs::write(agent.work_root.join("math_utils.py"), "def clamp(): pass\n").unwrap();
+        assert!(
+            agent
+                .artifact_ledger
+                .record_repo_edit_event(
+                    &LedgerAdmissionContext::new(&agent.work_root, &scope),
+                    "math_utils.py".to_string(),
+                    ArtifactRole::Implementation,
+                    true,
+                )
+                .is_some()
+        );
+        let stale_local_contract = TaskContract::from_request("Create a Rust CLI with tests");
+        let interrupt = InterruptFlag::new_preset(false);
+
+        let outcome = handle_actor_loop_post_tool_cleanup(
+            &mut agent,
+            ActorLoopPostToolCleanupArgs {
+                task_contract: Some(&stale_local_contract),
+                contract_verifier_repair_edit_count: None,
+                repo_edit_calls_made_this_turn: 1,
+                contract_completion_retries: 0,
+                tool_calls_made_this_turn: 1,
+                interrupt_flag: &interrupt,
+            },
+        );
+
+        assert!(matches!(outcome, ActorLoopPostToolCleanupOutcome::Continue));
+        let target = agent
+            .current_artifact_recovery_target
+            .as_ref()
+            .expect("post-tool cleanup should install missing test target");
+        assert_eq!(target.role, ArtifactRole::Test);
+        assert_eq!(target.path, "tests/test_math_utils.py");
+        let job = agent
+            .artifact_completion_job
+            .as_ref()
+            .expect("artifact completion job should follow authority target");
+        assert_eq!(job.target_path(), "tests/test_math_utils.py");
+    }
+
+    #[test]
+    fn tool_preparation_prefers_authority_contract_over_stale_local_contract() {
+        use super::super::commands::test_agent_with_config;
+        use super::super::project_profile::parse_project_profile_confirmation;
+        use super::super::task_contract::{
+            ArtifactRole, RecoveryTarget, RecoveryTargetHint, TaskContract,
+        };
+        use crate::config::Config;
+        use crate::ollama::xml_fallback::ToolCall;
+        use crate::session::store::ConversationMessage;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python test identity"}"#,
+        )
+        .expect("profile");
+        let authority =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(authority))
+            .expect("unset contract cell");
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent.artifact_completion_job = Some(
+            super::super::artifact_completion_job::ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/cli.rs".to_string(),
+                    reason: "stale rust target".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("stale artifact completion job"),
+        );
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Test,
+            path: "tests/cli.rs".to_string(),
+            reason: "stale rust target".to_string(),
+            attempt: 2,
+        });
+        let stale_local_contract = TaskContract::from_request("Create a Rust CLI with tests");
+        let mut summaries = Vec::new();
+        let mut focused_retries = 0usize;
+        let mut role_retries = HashMap::new();
+
+        let outcome = drive_actor_loop_tool_preparation_phase(
+            &mut agent,
+            ActorLoopToolPreparationArgs {
+                reply_tool_calls: vec![ToolCall {
+                    id: "call_test".to_string(),
+                    name: "Write".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "tests/test_math_utils.py",
+                        "content": "import unittest\n",
+                    }),
+                }],
+                task_contract: Some(&stale_local_contract),
+                tool_call_summaries: &mut summaries,
+                focused_policy_retries: &mut focused_retries,
+                contract_completion_role_retries: &mut role_retries,
+                missing_verifier_setup_turn: false,
+                recovery_dispatch_gate: RecoveryDispatchGate::from_owner(
+                    RecoveryOwner::ArtifactCompletion,
+                ),
+                recovery_owner: RecoveryOwner::ArtifactCompletion,
+                last_iter: 2,
+            },
+        );
+
+        let ActorLoopToolPreparationOutcome::Prepared {
+            effective_tool_policy,
+            ..
+        } = outcome
+        else {
+            panic!("expected prepared tool calls");
+        };
+        let artifact_policy = effective_tool_policy
+            .artifact_directed_policy()
+            .expect("artifact policy");
+        assert!(artifact_policy.target.ends_with("tests/test_math_utils.py"));
+        assert_eq!(
+            agent
+                .artifact_completion_job
+                .as_ref()
+                .expect("job")
+                .target_path(),
+            "tests/test_math_utils.py"
+        );
     }
 
     #[test]

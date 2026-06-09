@@ -26,6 +26,7 @@
 //! be filtered safely under cargo's parallel test execution (DR3-003).
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use serde_json::Value;
@@ -45,7 +46,7 @@ use crate::agent::loop_run::{
 use crate::config::Config;
 use crate::model_registry::RuntimeModels;
 use crate::ollama::client::OllamaClient;
-use crate::session::store::{SessionSnapshot, SessionStore};
+use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 
 // ---------------------------------------------------------------------------
 // Shared logger setup (DR3-003) — one TempDir for all tests so OnceLock-backed
@@ -515,6 +516,63 @@ mod verifier_missing {
         assert!(
             !owned.iter().any(|p| p == "src/lib.rs"),
             "non-test paths must be excluded by classify_ownership / is_test_file gate; got {owned:?}",
+        );
+    }
+
+    #[test]
+    fn from_missing_verifier_contract_bounds_owned_tests_to_explicit_identity() {
+        // Real local-LLM regression: after a profile-confirmed Python TDD task,
+        // a stale ambient Rust-family test path (`tests/cli.rs`) was still
+        // reported as the owned verifier artifact even though the objective
+        // contract required `tests/test_math_utils.py`.
+        let _ = shared_log_path();
+        let session_id = unique_session_id("vm-contract-bound");
+        let server = mockito::Server::new();
+        let (mut agent, dir) = build_live_agent(&session_id, &server.url());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python TDD target"}"#,
+        )
+        .expect("profile");
+        let contract =
+            super::super::task_contract::TaskContract::from_request_with_kind_and_project_profile(
+                request,
+                None,
+                Some(&profile),
+            );
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(contract))
+            .expect("unset task contract");
+
+        let stale = seed_owned_test_artifact(&mut agent, &dir, "cli.rs");
+        let expected = seed_owned_test_artifact(&mut agent, &dir, "test_math_utils.py");
+
+        emit_safe_stop_report_verifier_missing_for_test(&mut agent);
+
+        let events = safe_stop_events_for(&session_id);
+        assert_eq!(events.len(), 1, "expected exactly one safe_stop event");
+        let payload = events[0].get("payload").expect("payload");
+        let owned: Vec<String> = payload
+            .get("owned_test_artifacts")
+            .and_then(|v| v.as_array())
+            .expect("owned_test_artifacts must be an array")
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert_eq!(
+            owned,
+            vec![expected],
+            "contract test identity must exclude stale verifier-owned path {stale:?}",
         );
     }
 }

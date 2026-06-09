@@ -18,7 +18,8 @@
 //! - `emit_repair_safe_stop_report` — shared helper for the
 //!   repair-job-driven emit paths (E.2 / E.3 / E.4).
 //! - `collect_owned_test_artifacts` — Task D.6 Owned-validated test
-//!   artifact collector (≤ 8 paths, classify_ownership gated).
+//!   artifact collector (≤ 8 paths, classify_ownership gated, then
+//!   contract-bound when explicit test identities exist).
 //!
 //! Originally `impl Agent` methods; converted to free functions taking
 //! `&mut Agent` / `&Agent`, matching the `actor_loop_flow` /
@@ -418,5 +419,15 @@ fn collect_owned_test_artifacts(agent: &Agent) -> Vec<String> {
     }
     out.sort();
     out.truncate(8);
-    out
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
+        return out;
+    };
+    let mut bound = super::owned_test_projection::contract_bound_owned_test_artifacts(
+        &agent.work_root,
+        &contract,
+        &out,
+    );
+    bound.sort();
+    bound.truncate(8);
+    bound
 }

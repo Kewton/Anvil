@@ -496,6 +496,51 @@ class ClampTests(unittest.TestCase):
     assert_eq!(owned, vec!["tests/test_math_utils.py".to_string()]);
 }
 
+#[test]
+fn owned_test_artifacts_for_verifier_drops_stale_fallback_when_contract_test_identity_missing() {
+    let session_id = unique_session_id("verifier-contract-test-missing");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+    std::fs::write(
+        work_root.join("Cargo.toml"),
+        "[package]\nname = \"ambient-rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work_root.join("tests/cli.rs"),
+        r#"#[test]
+fn stale_family_default() {
+    assert!(true);
+}
+"#,
+    )
+    .unwrap();
+    let scope = single_root_scope();
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/cli.rs",
+        ArtifactRole::Test,
+        &scope,
+    );
+
+    let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+    let profile = super::project_profile::parse_project_profile_confirmation(
+        r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":[],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":"python -m unittest discover -s tests","confidence":0.96,"reason":"Python TDD task with explicit source and test files"}"#,
+    )
+    .expect("profile");
+    let contract =
+        TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+    let owned =
+        super::owned_test_projection::owned_test_artifacts_for_verifier(&mut agent, &contract);
+
+    assert!(
+        owned.is_empty(),
+        "stale fallback tests must not satisfy an explicit missing contract test identity: {owned:?}",
+    );
+}
+
 /// Issue #659 (Task 3.3): compile-time contract for the public(super)
 /// helper signature. Phase 3 must NOT change the function's argument
 /// shape (`&mut self`, `&TaskContract`) or its return type (`Vec<String>`).

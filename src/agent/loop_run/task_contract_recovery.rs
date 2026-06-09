@@ -556,6 +556,91 @@ mod tests {
     }
 
     #[test]
+    fn post_tool_recovery_ignores_stale_owned_test_when_contract_test_identity_is_missing() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum): return minimum when value is below minimum, maximum when value is above maximum, otherwise value. Use Python unittest and verify with python -m unittest discover -s tests. Do not create README, package.json, Cargo.toml, or setup files.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        std::fs::write(
+            agent.work_root.join("Cargo.toml"),
+            "[package]\nname = \"ambient-rust-manifest\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("math_utils.py"),
+            "def clamp(value, minimum, maximum):\n    return max(minimum, min(value, maximum))\n",
+        )
+        .unwrap();
+        std::fs::write(agent.work_root.join("tests/cli.rs"), "# stale rust test\n").unwrap();
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["setup","docs"],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"explicit Python code and unittest files"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        for (path, role, category) in [
+            (
+                "math_utils.py",
+                ArtifactRole::Implementation,
+                RepoEditCategory::Impl,
+            ),
+            ("tests/cli.rs", ArtifactRole::Test, RepoEditCategory::Test),
+        ] {
+            agent.turn_edited_relative_paths.insert(path.to_string());
+            agent
+                .task_contract_evidence_set_this_turn
+                .push(CompletionEvidence::RepoEdit {
+                    category,
+                    count: 1,
+                    path: Some(path.to_string()),
+                });
+            let recorded = agent.artifact_ledger.record_repo_edit_event(
+                &LedgerAdmissionContext::new(&agent.work_root, &scope),
+                path.to_string(),
+                role,
+                true,
+            );
+            assert!(recorded.is_some(), "repo edit must be recorded: {path}");
+        }
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 2);
+        let ArtifactRecoveryAction::Continue {
+            missing,
+            target_hint: Some(target_hint),
+        } = action
+        else {
+            panic!("expected missing contract test recovery action, got {action:?}");
+        };
+        assert_eq!(missing, vec![ArtifactRole::Test]);
+        assert_eq!(target_hint.role, ArtifactRole::Test);
+        assert_eq!(target_hint.path, "tests/test_math_utils.py");
+        assert_eq!(
+            target_hint.reason,
+            "required deliverable obligation is still missing: role=test, kind=file, path=tests/test_math_utils.py"
+        );
+    }
+
+    #[test]
     fn docs_artifact_satisfied_without_verification_returns_done() {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
         let request = concat!(

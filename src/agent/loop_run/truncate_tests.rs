@@ -10,6 +10,7 @@
 
 // Additional explicit imports needed by test bodies via qualified `super::X`.
 use super::verifier_orchestration::{
+    missing_verifier_setup_hint_for_request,
     synthesized_missing_implementation_target_path_for_request,
     synthesized_missing_test_target_path_for_request, task_contract_no_verifier_note,
     test_target_path_compatible_with_request,
@@ -384,6 +385,20 @@ mod inner {
                 "FastAPIでAPIを作成し、pytestで確認してください。"
             ),
             Some(("tests/test_main.py", "python"))
+        );
+    }
+
+    #[test]
+    fn forbidden_cargo_manifest_does_not_make_python_tdd_request_rust_family() {
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest and verify with python -m unittest discover -s tests. Do not create README, package.json, Cargo.toml, or setup files.";
+
+        assert_eq!(
+            super::synthesized_missing_test_target_path_for_request(request),
+            Some(("tests/test_main.py", "python"))
+        );
+        assert_eq!(
+            super::missing_verifier_setup_hint_for_request(request),
+            None
         );
     }
 

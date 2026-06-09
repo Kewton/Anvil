@@ -51,11 +51,8 @@ pub(super) fn owned_test_artifacts_for_verifier(
     let ledger = agent
         .artifact_ledger
         .owned_test_artifacts(super::task_contract::ArtifactRole::Test);
-    let verifier_candidates = verifier_candidate_tests_from_contract_or_ledger(
-        &agent.work_root,
-        contract,
-        ledger.as_slice(),
-    );
+    let verifier_candidates =
+        contract_bound_owned_test_artifacts(&agent.work_root, contract, ledger.as_slice());
     let preflight_report = super::generated_test_guard::preflight_owned_test_artifacts_for_verifier(
         &agent.work_root,
         contract,
@@ -71,22 +68,25 @@ pub(super) fn owned_test_artifacts_for_verifier(
     guarded
 }
 
-fn verifier_candidate_tests_from_contract_or_ledger(
+pub(super) fn contract_bound_owned_test_artifacts(
     work_root: &std::path::Path,
     contract: &super::task_contract::TaskContract,
-    ledger: &[String],
+    fallback: &[String],
 ) -> Vec<String> {
-    let explicit_existing = contract
+    let explicit_identities = contract
         .required_artifact_identities
         .iter()
-        .filter(|identity| identity.role == super::task_contract::ArtifactRole::Test)
+        .filter(|identity| identity.role == super::task_contract::ArtifactRole::Test);
+    let mut has_explicit_identity = false;
+    let explicit_existing = explicit_identities
+        .inspect(|_| has_explicit_identity = true)
         .filter(|identity| work_root.join(&identity.path).is_file())
         .map(|identity| identity.path.clone())
         .collect::<Vec<_>>();
-    if !explicit_existing.is_empty() {
+    if has_explicit_identity {
         return explicit_existing;
     }
-    ledger.to_vec()
+    fallback.to_vec()
 }
 
 /// Issue #659 (Task 3.3): masked observability emit when the legacy

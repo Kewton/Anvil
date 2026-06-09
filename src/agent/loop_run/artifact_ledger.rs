@@ -924,9 +924,10 @@ mod projection {
         out
     }
 
-    /// Per-required-role completion view. Minimal implementation: a role is
-    /// "completed" when at least one ledger event for that role has
-    /// `ownership == Owned`. Full arbitration is Issue #663 scope.
+    /// Per-required-role completion view. A role with explicit contract
+    /// identities is completed only when every required identity path has an
+    /// owned ledger event. Roles without identities keep the legacy role-level
+    /// completion rule.
     ///
     /// CB-002 fail-closed: when the ledger has overflowed, every role is
     /// reported as `false`. A turn cannot claim completion from a partial
@@ -938,11 +939,24 @@ mod projection {
         let mut out: BTreeMap<ArtifactRole, bool> = BTreeMap::new();
         let overflowed = ledger.overflowed;
         for role in &contract.required_artifacts {
+            let identities = contract.required_identities_for_role(*role);
             let completed = !overflowed
-                && ledger
-                    .events
-                    .iter()
-                    .any(|e| e.role == *role && matches!(e.ownership, ArtifactOwnership::Owned));
+                && if identities.is_empty() {
+                    ledger.events.iter().any(|event| {
+                        event.role == *role && matches!(event.ownership, ArtifactOwnership::Owned)
+                    })
+                } else {
+                    identities.iter().all(|identity| {
+                        ledger.events.iter().any(|event| {
+                            event.role == identity.role
+                                && matches!(event.ownership, ArtifactOwnership::Owned)
+                                && super::super::task_contract::normalized_artifact_path_eq(
+                                    &event.path,
+                                    &identity.path,
+                                )
+                        })
+                    })
+                };
             out.insert(*role, completed);
         }
         out
@@ -2040,6 +2054,45 @@ mod tests {
         assert!(p.is_satisfied(ArtifactRole::Test));
         assert!(!p.is_satisfied(ArtifactRole::Implementation));
         assert!(!p.overflowed());
+    }
+
+    #[test]
+    fn required_artifacts_projection_requires_explicit_identity_path_when_declared() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/cli.rs"), "stale rust test\n").unwrap();
+        let scope = single_root_scope();
+        let mut ledger = ArtifactLedger::new();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/cli.rs".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        let contract = TaskContract::from_request(
+            "Create math_utils.py and tests/test_math_utils.py only. Use Python unittest.",
+        );
+
+        let stale_projection = ledger.required_artifacts_completed_projection(&contract);
+
+        assert!(
+            !stale_projection.is_satisfied(ArtifactRole::Test),
+            "owned stale test role path must not satisfy explicit test identity"
+        );
+
+        std::fs::write(
+            dir.path().join("tests/test_math_utils.py"),
+            "import unittest\n",
+        )
+        .unwrap();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/test_math_utils.py".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        let satisfied_projection = ledger.required_artifacts_completed_projection(&contract);
+        assert!(satisfied_projection.is_satisfied(ArtifactRole::Test));
     }
 
     #[test]

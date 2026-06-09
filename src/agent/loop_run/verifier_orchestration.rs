@@ -2038,6 +2038,27 @@ pub(super) fn request_matches_family(
     lower_contains_any(lower, lower_patterns) || request_contains_any(request, request_patterns)
 }
 
+fn rust_family_signal_is_only_forbidden_cargo_artifact(lower: &str) -> bool {
+    if lower.contains("rust") || lower.contains("cargo test") {
+        return false;
+    }
+    let Some(cargo_idx) = lower.find("cargo.toml") else {
+        return false;
+    };
+    let start = cargo_idx.saturating_sub(96);
+    let prefix = &lower[start..cargo_idx];
+    [
+        "do not create",
+        "do not add",
+        "don't create",
+        "without",
+        "no ",
+        "not create",
+    ]
+    .iter()
+    .any(|pattern| prefix.contains(pattern))
+}
+
 pub(super) fn synthesized_missing_implementation_target_path_for_request(
     role: ArtifactRole,
     request: &str,
@@ -2053,6 +2074,9 @@ pub(super) fn synthesized_missing_implementation_target_path_for_request(
         PYTHON_REQUEST_JA_PATTERNS,
     ) {
         return Some("main.py".to_string());
+    }
+    if rust_family_signal_is_only_forbidden_cargo_artifact(&lower) {
+        return None;
     }
     if request_matches_family(
         &lower,
@@ -2077,6 +2101,16 @@ pub(super) fn synthesized_missing_test_target_path_for_request(
     request: &str,
 ) -> Option<(&'static str, &'static str)> {
     let lower = request.to_ascii_lowercase();
+    if rust_family_signal_is_only_forbidden_cargo_artifact(&lower)
+        && request_matches_family(
+            &lower,
+            request,
+            PYTHON_TEST_REQUEST_PATTERNS,
+            PYTHON_REQUEST_JA_PATTERNS,
+        )
+    {
+        return Some(("tests/test_main.py", "python"));
+    }
     if request_matches_family(&lower, request, RUST_REQUEST_PATTERNS, &["Rustで"]) {
         if request_matches_family(
             &lower,
@@ -2120,6 +2154,9 @@ pub(super) fn test_target_path_compatible_with_request(path: &str, request: &str
 
 pub(super) fn missing_verifier_setup_hint_for_request(request: &str) -> Option<&'static str> {
     let lower = request.to_ascii_lowercase();
+    if rust_family_signal_is_only_forbidden_cargo_artifact(&lower) {
+        return None;
+    }
     if request_matches_family(
         &lower,
         request,

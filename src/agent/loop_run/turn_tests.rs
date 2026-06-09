@@ -3875,6 +3875,87 @@ mod tests {
     }
 
     #[test]
+    fn artifact_recovery_job_preempts_forced_small_edit_target() {
+        use super::super::artifact_completion_job::ArtifactCompletionJob;
+        use super::super::commands::test_agent_with_config;
+        use super::super::task_contract::{ArtifactRole, RecoveryTarget, RecoveryTargetHint};
+        use crate::config::Config;
+        use crate::ollama::xml_fallback::ToolCall;
+        use crate::session::store::ConversationMessage;
+        use serde_json::json;
+
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        std::fs::write(
+            agent.work_root.join("tests/cli.rs"),
+            "# stale read target\n",
+        )
+        .unwrap();
+
+        let scope = super::workspace_access::current_workspace_scope(&agent);
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Test,
+            path: "tests/test_math_utils.py".to_string(),
+            reason: "contract test artifact is still missing".to_string(),
+        };
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(&agent.work_root, &scope, target_hint.clone(), false, false)
+                .expect("test artifact job fixture"),
+        );
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Test,
+            path: target_hint.path.clone(),
+            reason: target_hint.reason.clone(),
+            attempt: 1,
+        });
+
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user("create Python tests".to_string()));
+        agent.session.messages.push(ConversationMessage::system(
+            "Previous tool call was cut off by the model length limit: \
+             tool call parser failed: truncated tool call (generate response \
+             hit length limit). tool_call_format_attempt=1"
+                .to_string(),
+        ));
+        agent.session.messages.push(ConversationMessage::assistant(
+            String::new(),
+            vec![ToolCall {
+                id: "read-stale".to_string(),
+                name: "Read".to_string(),
+                arguments: json!({"path": "tests/cli.rs"}),
+            }],
+        ));
+
+        assert!(
+            super::super::forced_small_edit::forced_small_edit_recovery_target(&agent).is_some(),
+            "fixture invariant: forced-small-edit target must be selectable"
+        );
+
+        let selection = super::super::active_job_emit::current_active_job_selection(&agent);
+        let kind = selection.selected.as_ref().map(|candidate| candidate.kind);
+        assert_eq!(
+            kind,
+            Some(super::super::active_job_arbiter::ActiveJobKind::ArtifactRecovery),
+            "artifact completion job must preempt stale read-derived forced-small-edit target"
+        );
+        let policy = super::super::effective_tool_policy_flow::effective_tool_policy(&agent);
+        assert_eq!(
+            policy.reason(),
+            super::EffectiveToolPolicyReason::ArtifactDirectedRecovery
+        );
+        let target = &policy
+            .artifact_directed_policy()
+            .expect("artifact policy")
+            .target;
+        assert!(
+            target.ends_with("tests/test_math_utils.py"),
+            "artifact policy must target contract test identity, got {target:?}"
+        );
+    }
+
+    #[test]
     fn issue660_phase_d_no_active_job_allows_generic_fallback_path_to_run() {
         // Negative regression guard: when no selectable active job is in
         // flight, `effective_tool_policy()` projects to `Unrestricted` and

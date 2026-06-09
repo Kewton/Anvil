@@ -251,11 +251,10 @@ impl RecoveryDispatchGate {
 /// are pre-arbitration gates and do NOT appear here.
 ///
 /// Issue #664 (AD1 / AD6 / 判断 5): `SetupBootstrap` is added as the
-/// 6th selectable variant with priority rank = 4 (between ArtifactRecovery
-/// and FocusedEditRecovery). The legacy variants below are renumbered
-/// (FocusedEditRecovery 4→5, LocalLlmSmallEditAfterRead 5→6); the
-/// **relative order** of the 5 legacy variants is preserved so the #660
-/// pairwise priority tests are unchanged.
+/// 6th selectable variant with priority rank = 4 (between ForcedSmallEditRecovery
+/// and FocusedEditRecovery). ArtifactRecovery intentionally ranks above
+/// ForcedSmallEditRecovery because a role-scoped ObjectiveContract target must
+/// own the turn while an artifact-completion job is active.
 ///
 /// `#[non_exhaustive]`: additive variants can be added without breaking
 /// in-crate matches (DR1-008 / DR1-003).
@@ -264,10 +263,10 @@ impl RecoveryDispatchGate {
 pub(super) enum ActiveJobKind {
     /// Priority 1: verifier-repair (highest selectable priority).
     VerifierRepair,
-    /// Priority 2: forced small-edit recovery (diagnostic target known).
-    ForcedSmallEditRecovery,
-    /// Priority 3: artifact-recovery (missing required artifact role).
+    /// Priority 2: artifact-recovery (missing required artifact role).
     ArtifactRecovery,
+    /// Priority 3: forced small-edit recovery (diagnostic target known).
+    ForcedSmallEditRecovery,
     /// Issue #664: Priority 4: setup bootstrap (environment provisioning).
     SetupBootstrap,
     /// Priority 5: focused-edit recovery (heuristic last-read target).
@@ -283,8 +282,8 @@ impl ActiveJobKind {
     fn priority_rank(self) -> u8 {
         match self {
             ActiveJobKind::VerifierRepair => 1,
-            ActiveJobKind::ForcedSmallEditRecovery => 2,
-            ActiveJobKind::ArtifactRecovery => 3,
+            ActiveJobKind::ArtifactRecovery => 2,
+            ActiveJobKind::ForcedSmallEditRecovery => 3,
             ActiveJobKind::SetupBootstrap => 4,
             ActiveJobKind::FocusedEditRecovery => 5,
             ActiveJobKind::LocalLlmSmallEditAfterRead => 6,
@@ -976,10 +975,10 @@ mod tests {
     }
 
     #[test]
-    fn priority_forced_small_edit_beats_artifact_recovery() {
+    fn priority_artifact_recovery_beats_forced_small_edit() {
         pairwise_priority_check(
-            ActiveJobKind::ForcedSmallEditRecovery,
             ActiveJobKind::ArtifactRecovery,
+            ActiveJobKind::ForcedSmallEditRecovery,
         );
     }
 
@@ -1347,16 +1346,16 @@ mod tests {
         assert!(DesiredAction::SetupBash.target_path().is_none());
     }
 
-    /// 判断 5 (a): the 5 legacy variants' **relative order** is preserved
-    /// after SetupBootstrap is inserted at rank 4. Rank numbers shift
-    /// (FocusedEditRecovery 4→5, LocalLlmSmallEditAfterRead 5→6) but the
-    /// comparison ordering is unchanged.
+    /// 判断 5 (a): the selectable variants keep the controller ordering:
+    /// verifier repair, contract artifact completion, focused/truncated
+    /// small-edit recovery, setup bootstrap, generic focused edit, then
+    /// local-LLM fallback.
     #[test]
     fn other_active_job_kinds_priority_rank_preserved() {
         let ordered = [
             ActiveJobKind::VerifierRepair,
-            ActiveJobKind::ForcedSmallEditRecovery,
             ActiveJobKind::ArtifactRecovery,
+            ActiveJobKind::ForcedSmallEditRecovery,
             ActiveJobKind::FocusedEditRecovery,
             ActiveJobKind::LocalLlmSmallEditAfterRead,
         ];
@@ -1370,12 +1369,12 @@ mod tests {
         }
     }
 
-    /// 判断 5 (b): SetupBootstrap sits strictly between ArtifactRecovery
+    /// 判断 5 (b): SetupBootstrap sits strictly between ForcedSmallEditRecovery
     /// and FocusedEditRecovery.
     #[test]
     fn setup_bootstrap_priority_rank_between_artifact_recovery_and_focused_edit() {
         let setup = ActiveJobKind::SetupBootstrap.priority_rank();
-        assert!(ActiveJobKind::ArtifactRecovery.priority_rank() < setup);
+        assert!(ActiveJobKind::ForcedSmallEditRecovery.priority_rank() < setup);
         assert!(setup < ActiveJobKind::FocusedEditRecovery.priority_rank());
     }
 

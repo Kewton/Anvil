@@ -3,7 +3,10 @@
 //!
 //! Hosts the `EffectiveToolPolicy` decision pipeline:
 //!
-//! - `effective_tool_policy` (pub(super) entry point) — pre-arbitration
+//! - `prepare_effective_tool_policy` (pub(super) mutable entry point) —
+//!   realigns turn-local artifact recovery projection with the authoritative
+//!   contract before policy selection.
+//! - `effective_tool_policy` (pub(super) read-only entry point) — pre-arbitration
 //!   gates (AnswerOnly / Plan mode) + the arbiter-based shell over
 //!   `build_arbiter_candidates` + `select_active_job` + `project_policy`.
 //! - `build_arbiter_candidates` (pub(super)) — composes the priority-1
@@ -37,6 +40,13 @@ use super::tool_history::focused_edit_target_already_read;
 use super::tool_policy::{EffectiveToolPolicy, EffectiveToolPolicyReason};
 use super::verifier_orchestration::verifier_repair_policy_for_target_hint;
 use crate::modes::plan_act::{ExecutionMode, WorkMode};
+
+pub(super) fn prepare_effective_tool_policy(agent: &mut Agent) -> EffectiveToolPolicy {
+    super::set_artifact_recovery_target::realign_current_artifact_recovery_target_to_contract(
+        agent,
+    );
+    effective_tool_policy(agent)
+}
 
 pub(super) fn effective_tool_policy(agent: &Agent) -> EffectiveToolPolicy {
     if let Some(policy) = objective_evidence_action_policy(agent) {
@@ -160,18 +170,9 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
 
     let mut candidates: Vec<JobCandidate> = Vec::new();
 
-    // Priority 2: ForcedSmallEditRecovery.
-    if let Some(target) = super::forced_small_edit::forced_small_edit_recovery_target(agent) {
-        push_focused_edit_candidate(
-            agent,
-            &mut candidates,
-            target,
-            ActiveJobKind::ForcedSmallEditRecovery,
-            EffectiveToolPolicyReason::FocusedEditRecovery,
-        );
-    }
-
-    // Priority 3: ArtifactRecovery.
+    // Priority 2: ArtifactRecovery. When a role-scoped artifact-completion
+    // job is active, the ObjectiveContract target must own the turn; a
+    // read/truncation-derived focused edit target is only advisory.
     if let (Some(target), Some(job)) = (
         super::artifact_recovery_flow::artifact_recovery_target_path(agent),
         agent.artifact_completion_job.as_ref(),
@@ -199,6 +200,17 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
             policy,
             budget: Budget::Unbounded,
         });
+    }
+
+    // Priority 3: ForcedSmallEditRecovery.
+    if let Some(target) = super::forced_small_edit::forced_small_edit_recovery_target(agent) {
+        push_focused_edit_candidate(
+            agent,
+            &mut candidates,
+            target,
+            ActiveJobKind::ForcedSmallEditRecovery,
+            EffectiveToolPolicyReason::FocusedEditRecovery,
+        );
     }
 
     // Issue #664 (Priority 4 / AD22): SetupBootstrap candidate.
@@ -438,11 +450,14 @@ fn focused_edit_policy_for_target(
 mod tests {
     use std::rc::Rc;
 
+    use crate::agent::loop_run::artifact_completion_job::ArtifactCompletionJob;
     use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
     use crate::agent::loop_run::commands::test_agent_with_config;
     use crate::agent::loop_run::completion_evidence::CompletionEvidence;
     use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
-    use crate::agent::loop_run::task_contract::{ArtifactRole, TaskContract};
+    use crate::agent::loop_run::task_contract::{
+        ArtifactRole, RecoveryTarget, RecoveryTargetHint, TaskContract,
+    };
     use crate::agent::loop_run::tool_policy::EffectiveToolPolicyReason;
     use crate::config::Config;
     use crate::session::store::ConversationMessage;
@@ -490,6 +505,25 @@ mod tests {
         contract
     }
 
+    fn python_tdd_contract(request: &str) -> TaskContract {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["docs","setup"],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":false,
+                "preferred_runner":"python -m unittest discover -s tests",
+                "confidence":1.0,
+                "reason":"explicit Python TDD request"
+            }"#,
+        )
+        .expect("profile");
+        TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile))
+    }
+
     #[test]
     fn command_observation_evidence_policy_waits_for_deliverable() {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
@@ -501,6 +535,69 @@ mod tests {
         let policy = effective_tool_policy(&agent);
 
         assert_ne!(policy.reason(), EffectiveToolPolicyReason::EvidenceAction);
+    }
+
+    #[test]
+    fn prepared_policy_realigns_stale_artifact_job_to_contract_identity() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        let contract = seed_active_contract(&mut agent, request, python_tdd_contract(request));
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        std::fs::write(agent.work_root.join("tests/cli.rs"), "stale rust test\n").unwrap();
+        agent.artifact_completion_job = Some(
+            ArtifactCompletionJob::new(
+                &agent.work_root,
+                &scope,
+                RecoveryTargetHint {
+                    role: ArtifactRole::Test,
+                    path: "tests/cli.rs".to_string(),
+                    reason: "stale request-derived fallback".to_string(),
+                },
+                true,
+                false,
+            )
+            .expect("stale artifact completion job"),
+        );
+        agent.current_artifact_recovery_target = Some(RecoveryTarget {
+            role: ArtifactRole::Test,
+            path: "tests/cli.rs".to_string(),
+            reason: "stale request-derived fallback".to_string(),
+            attempt: 2,
+        });
+
+        let policy = prepare_effective_tool_policy(&mut agent);
+
+        assert_eq!(
+            contract.required_identities_for_role(ArtifactRole::Test)[0].path,
+            "tests/test_math_utils.py"
+        );
+        assert_eq!(
+            policy.reason(),
+            EffectiveToolPolicyReason::ArtifactDirectedRecovery
+        );
+        let artifact = policy
+            .artifact_directed_policy()
+            .expect("artifact-directed policy");
+        assert!(artifact.target.ends_with("tests/test_math_utils.py"));
+        let context = artifact.job_context.as_ref().expect("job context");
+        assert_eq!(context.target_path, "tests/test_math_utils.py");
+        assert_eq!(
+            agent
+                .current_artifact_recovery_target
+                .as_ref()
+                .expect("current target")
+                .path,
+            "tests/test_math_utils.py"
+        );
+        assert_eq!(
+            agent
+                .artifact_completion_job
+                .as_ref()
+                .expect("job")
+                .target_path(),
+            "tests/test_math_utils.py"
+        );
     }
 
     #[test]

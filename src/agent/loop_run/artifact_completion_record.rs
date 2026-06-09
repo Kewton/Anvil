@@ -29,6 +29,9 @@ use super::Agent;
 use crate::agent::recovery;
 
 pub(super) fn push_artifact_directed_recovery_note(agent: &mut Agent, attempt: usize) -> bool {
+    super::set_artifact_recovery_target::realign_current_artifact_recovery_target_to_contract(
+        agent,
+    );
     if super::recovery_targets::focused_edit_recovery_target(agent).is_some() {
         return false;
     }
