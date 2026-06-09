@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+use super::task_contract::ArtifactRole;
 use super::task_workspace_scope::TaskWorkspaceScope;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::safety::path_guard::resolve_user_path;
@@ -23,6 +24,31 @@ pub(super) struct FocusedEditPolicy {
 pub(super) struct ArtifactDirectedPolicy {
     pub(super) target: PathBuf,
     pub(super) target_already_read: bool,
+    pub(super) job_context: Option<ArtifactDirectedPolicyContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ArtifactDirectedPolicyContext {
+    pub(super) role: ArtifactRole,
+    pub(super) target_path: String,
+    pub(super) allowed_write_actions: AllowedWriteActions,
+    pub(super) allowed_read_scope: AllowedReadScope,
+}
+
+impl ArtifactDirectedPolicyContext {
+    fn from_job(
+        role: ArtifactRole,
+        target_path: impl Into<String>,
+        allowed_write_actions: &AllowedWriteActions,
+        allowed_read_scope: &AllowedReadScope,
+    ) -> Self {
+        Self {
+            role,
+            target_path: target_path.into(),
+            allowed_write_actions: allowed_write_actions.clone(),
+            allowed_read_scope: allowed_read_scope.clone(),
+        }
+    }
 }
 
 /// Issue #664 (AD1 / AD6 / DC1-002): `#[non_exhaustive]` enables additive
@@ -106,6 +132,7 @@ impl EffectiveToolPolicy {
             artifact_directed: Some(ArtifactDirectedPolicy {
                 target,
                 target_already_read,
+                job_context: None,
             }),
             reason: EffectiveToolPolicyReason::ArtifactDirectedRecovery,
         }
@@ -117,6 +144,8 @@ impl EffectiveToolPolicy {
     pub(super) fn artifact_directed_from_job(
         target: PathBuf,
         target_already_read: bool,
+        role: ArtifactRole,
+        target_path: impl Into<String>,
         allowed_write_actions: &AllowedWriteActions,
         allowed_read_scope: &AllowedReadScope,
     ) -> Self {
@@ -140,6 +169,12 @@ impl EffectiveToolPolicy {
             artifact_directed: Some(ArtifactDirectedPolicy {
                 target,
                 target_already_read,
+                job_context: Some(ArtifactDirectedPolicyContext::from_job(
+                    role,
+                    target_path,
+                    allowed_write_actions,
+                    allowed_read_scope,
+                )),
             }),
             reason: EffectiveToolPolicyReason::ArtifactDirectedRecovery,
         }
@@ -193,6 +228,7 @@ impl EffectiveToolPolicy {
             artifact_directed: Some(ArtifactDirectedPolicy {
                 target,
                 target_already_read: true,
+                job_context: None,
             }),
             reason: EffectiveToolPolicyReason::EvidenceAction,
         }

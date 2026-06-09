@@ -181,6 +181,8 @@ pub(super) fn build_arbiter_candidates(agent: &Agent) -> Vec<JobCandidate> {
         let policy = EffectiveToolPolicy::artifact_directed_from_job(
             target.clone(),
             target_already_read,
+            job.role(),
+            job.target_path(),
             job.allowed_write_actions(),
             job.allowed_read_scope(),
         );

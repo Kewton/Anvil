@@ -128,6 +128,8 @@ pub(super) fn artifact_directed_policy_for_test(agent: &Agent) -> Option<Effecti
     Some(EffectiveToolPolicy::artifact_directed_from_job(
         target,
         target_already_read,
+        job.role(),
+        job.target_path(),
         job.allowed_write_actions(),
         job.allowed_read_scope(),
     ))

@@ -10025,14 +10025,18 @@ export default function App() {
     #[test]
     fn artifact_directed_from_job_target_create_only_grants_write_only() {
         use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        use super::super::task_contract::ArtifactRole;
         let temp = tempdir().unwrap();
         let work_root = temp.path();
         let target = work_root.join("tests/test_new.py"); // missing leaf
+        let target_path = "tests/test_new.py";
         let write_actions = AllowedWriteActions::target_create_only();
         let read_scope = AllowedReadScope::TargetOnly;
         let policy = EffectiveToolPolicy::artifact_directed_from_job(
             target,
             /*target_already_read=*/ false,
+            ArtifactRole::Test,
+            target_path,
             &write_actions,
             &read_scope,
         );
@@ -10053,16 +10057,20 @@ export default function App() {
     #[test]
     fn artifact_directed_from_job_target_modify_only_grants_write_and_edit() {
         use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        use super::super::task_contract::ArtifactRole;
         let temp = tempdir().unwrap();
         let work_root = temp.path();
         std::fs::create_dir_all(work_root.join("tests")).unwrap();
         let target = work_root.join("tests/test_existing.py");
+        let target_path = "tests/test_existing.py";
         std::fs::write(&target, "def test_x(): pass\n").unwrap();
         let write_actions = AllowedWriteActions::target_modify_only();
         let read_scope = AllowedReadScope::TargetOnly;
         let policy = EffectiveToolPolicy::artifact_directed_from_job(
             target,
             /*target_already_read=*/ false,
+            ArtifactRole::Test,
+            target_path,
             &write_actions,
             &read_scope,
         );
@@ -10077,16 +10085,20 @@ export default function App() {
     #[test]
     fn artifact_directed_from_job_target_already_read_suppresses_read() {
         use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        use super::super::task_contract::ArtifactRole;
         let temp = tempdir().unwrap();
         let work_root = temp.path();
         std::fs::create_dir_all(work_root.join("tests")).unwrap();
         let target = work_root.join("tests/test_existing.py");
+        let target_path = "tests/test_existing.py";
         std::fs::write(&target, "def test_x(): pass\n").unwrap();
         let write_actions = AllowedWriteActions::target_modify_only();
         let read_scope = AllowedReadScope::TargetOnly;
         let policy = EffectiveToolPolicy::artifact_directed_from_job(
             target,
             /*target_already_read=*/ true,
+            ArtifactRole::Test,
+            target_path,
             &write_actions,
             &read_scope,
         );
@@ -10102,11 +10114,15 @@ export default function App() {
     #[test]
     fn artifact_directed_from_job_records_artifact_directed_recovery_reason() {
         use super::super::artifact_completion_job::{AllowedReadScope, AllowedWriteActions};
+        use super::super::task_contract::ArtifactRole;
         let temp = tempdir().unwrap();
         let target = temp.path().join("tests/test_x.py");
+        let target_path = "tests/test_x.py";
         let policy = EffectiveToolPolicy::artifact_directed_from_job(
             target.clone(),
             false,
+            ArtifactRole::Test,
+            target_path,
             &AllowedWriteActions::target_create_only(),
             &AllowedReadScope::TargetOnly,
         );
@@ -10124,6 +10140,17 @@ export default function App() {
                 .map(|p| p.target.as_path()),
             Some(target.as_path())
         );
+        let context = policy
+            .artifact_directed_policy()
+            .and_then(|p| p.job_context.as_ref())
+            .expect("artifact-directed recovery should preserve job projection context");
+        assert_eq!(context.role, ArtifactRole::Test);
+        assert_eq!(context.target_path, target_path);
+        assert!(context.allowed_write_actions.allow_create());
+        assert!(matches!(
+            context.allowed_read_scope,
+            AllowedReadScope::TargetOnly
+        ));
     }
 
     #[test]
