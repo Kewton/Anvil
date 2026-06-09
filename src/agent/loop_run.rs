@@ -98,6 +98,7 @@ mod case_record_flow;
 mod classify_confirm_flow;
 mod completion_probe_gate;
 mod contract_bound_generation;
+mod contract_generation_expectations;
 mod deliverable_freshness;
 mod runtime_capability;
 // Tester invocation flow extracted from `turn.rs` (parent #680). Hosts

@@ -7,18 +7,16 @@
 
 use std::path::{Path, PathBuf};
 
-use super::task_contract::{
-    ArtifactRole, DeliverableFormat, DeliverableSchema, StructuredRecordSchema,
+use super::contract_generation_expectations::{
+    declared_artifacts_summary, declared_expectations_summary,
 };
+use super::task_contract::ArtifactRole;
 use super::worker_contract::{
-    ExecutionDeliverable, ExecutionEvidence, PublicContract, RuntimeProfile, TaskExecutionContract,
-    WorkerKind,
+    ExecutionDeliverable, RuntimeProfile, TaskExecutionContract, WorkerKind,
 };
 use crate::session::store::ConversationMessage;
 
 const MAX_PHASES_IN_MESSAGE: usize = 9;
-const MAX_DECLARED_ITEMS_IN_MESSAGE: usize = 8;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContractGenerationPhaseKind {
     ContractAlignment,
@@ -330,172 +328,6 @@ fn phase_target_label(phase: &ContractGenerationPhase) -> String {
         .map(display_path)
         .unwrap_or_else(|| "declared".to_string());
     format!("{role}@{path}")
-}
-
-fn declared_artifacts_summary(deliverables: &[ExecutionDeliverable]) -> String {
-    if deliverables.is_empty() {
-        return "none".to_string();
-    }
-    deliverables
-        .iter()
-        .take(MAX_DECLARED_ITEMS_IN_MESSAGE)
-        .map(declared_artifact_summary)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn declared_artifact_summary(deliverable: &ExecutionDeliverable) -> String {
-    let mut details = Vec::new();
-    if let Some(kind) = deliverable.kind {
-        details.push(format!("kind={}", kind.label()));
-    }
-    if let Some(format) = deliverable.format.as_ref() {
-        details.push(format!("format={}", deliverable_format_label(format)));
-    }
-    if let Some(schema) = deliverable.schema.as_ref() {
-        details.push(deliverable_schema_summary(schema));
-    } else if !deliverable.required_sections.is_empty() {
-        details.push(format!(
-            "sections={}",
-            compact_value_list(deliverable.required_sections.iter().map(String::as_str))
-        ));
-    }
-    if !deliverable.acceptance_criteria.is_empty() {
-        details.push(format!(
-            "criteria={}",
-            compact_value_list(deliverable.acceptance_criteria.iter().map(String::as_str))
-        ));
-    }
-
-    let role = deliverable.role.label();
-    let path = deliverable
-        .path
-        .as_deref()
-        .map(display_path)
-        .unwrap_or_else(|| "declared".to_string());
-    if details.is_empty() {
-        format!("{role}@{path}")
-    } else {
-        format!("{role}@{path}({})", details.join(";"))
-    }
-}
-
-fn declared_expectations_summary(execution: &TaskExecutionContract) -> String {
-    [
-        public_contract_summary(&execution.public_contract)
-            .map(|summary| format!("public_contract={summary}")),
-        Some(evidence_summary(&execution.evidence)),
-        allowed_files_summary(&execution.constraints.allowed_files)
-            .map(|summary| format!("allowed_files={summary}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(";")
-}
-
-fn public_contract_summary(public_contract: &PublicContract) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(goal) = public_contract.goal() {
-        parts.push(format!(
-            "goal={}",
-            super::task_contract::mask_and_cap_recovery_field(goal)
-        ));
-    }
-    if !public_contract.signatures().is_empty() {
-        parts.push(format!(
-            "signatures={}",
-            compact_value_list(public_contract.signatures().iter().map(String::as_str))
-        ));
-    }
-    (!parts.is_empty()).then(|| parts.join(","))
-}
-
-fn evidence_summary(evidence: &ExecutionEvidence) -> String {
-    let required = if evidence.required {
-        "required"
-    } else {
-        "optional"
-    };
-    let mut out = format!("evidence={}({required})", evidence.kind.label());
-    if let Some(command) = evidence.command.as_deref() {
-        out.push_str(&format!(
-            ",command={}",
-            super::task_contract::mask_and_cap_recovery_field(command)
-        ));
-    }
-    out
-}
-
-fn allowed_files_summary(paths: &[PathBuf]) -> Option<String> {
-    (!paths.is_empty())
-        .then(|| compact_value_list(paths.iter().map(|path| path.to_string_lossy().into_owned())))
-}
-
-fn deliverable_format_label(format: &DeliverableFormat) -> &'static str {
-    match format {
-        DeliverableFormat::RustSource => "rust_source",
-        DeliverableFormat::JavaScriptSource => "javascript_source",
-        DeliverableFormat::TypeScriptSource => "typescript_source",
-        DeliverableFormat::Markdown => "markdown",
-        DeliverableFormat::Toml => "toml",
-        DeliverableFormat::Json => "json",
-        DeliverableFormat::Csv => "csv",
-        DeliverableFormat::Tsv => "tsv",
-        DeliverableFormat::JsonLines => "json_lines",
-        DeliverableFormat::Text => "text",
-    }
-}
-
-fn deliverable_schema_summary(schema: &DeliverableSchema) -> String {
-    match schema {
-        DeliverableSchema::StructuredRecord(record_schema) => {
-            structured_record_schema_summary(record_schema)
-        }
-        DeliverableSchema::JsonFields(fields) => {
-            format!(
-                "schema=json_fields:{}",
-                compact_value_list(fields.iter().map(String::as_str))
-            )
-        }
-        DeliverableSchema::RequiredSections(sections) => format!(
-            "schema=required_sections:{}",
-            compact_value_list(sections.iter().map(String::as_str))
-        ),
-    }
-}
-
-fn structured_record_schema_summary(schema: &StructuredRecordSchema) -> String {
-    let mut parts = vec![format!(
-        "columns={}",
-        compact_value_list(schema.columns.iter().map(String::as_str))
-    )];
-    if !schema.expected_rows.is_empty() {
-        parts.push(format!(
-            "expected_rows={}",
-            compact_value_list(schema.expected_rows.iter().map(|row| row.join("|")))
-        ));
-    }
-    format!("schema=structured_record:{}", parts.join(";"))
-}
-
-fn compact_value_list<I, S>(values: I) -> String
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut out = values
-        .into_iter()
-        .take(MAX_DECLARED_ITEMS_IN_MESSAGE)
-        .map(|value| super::task_contract::mask_and_cap_recovery_field(value.as_ref()))
-        .filter(|value| !value.trim().is_empty())
-        .collect::<Vec<_>>();
-    out.dedup();
-    if out.is_empty() {
-        "none".to_string()
-    } else {
-        out.join("|")
-    }
 }
 
 fn display_path(path: &Path) -> String {
