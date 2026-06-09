@@ -1236,7 +1236,9 @@ mod summary;
 mod task_contract;
 mod task_contract_controller_packet;
 mod task_contract_display;
+mod task_contract_evidence_stage;
 mod task_contract_input_projection;
+mod task_contract_obligation_planning;
 mod task_contract_recovery_planning;
 #[cfg(test)]
 mod task_kind_confirm_e2e_tests;

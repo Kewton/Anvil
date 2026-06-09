@@ -151,6 +151,23 @@ fn command_observation_deliverable_bound(
         .any(|(_, item)| {
             evidence_item_satisfies_observed_deliverable(item, objective.required_deliverables())
         })
+        || command_observation_validates_prior_deliverable(evidence, objective, last_command_index)
+}
+
+fn command_observation_validates_prior_deliverable(
+    evidence: &EvidenceSet,
+    objective: &ObjectiveContract,
+    command_index: usize,
+) -> bool {
+    if !objective
+        .required_deliverables()
+        .contains(&ArtifactRole::DataOutput)
+    {
+        return false;
+    }
+    evidence.iter().take(command_index).any(|item| {
+        evidence_item_satisfies_observed_deliverable(item, objective.required_deliverables())
+    })
 }
 
 fn last_successful_command_observation_index(
@@ -201,6 +218,7 @@ fn observed_deliverable_role(evidence: &CompletionEvidence) -> Option<ArtifactRo
 
 #[cfg(test)]
 mod tests {
+    use super::super::completion_evidence::RepoEditCategory;
     use super::super::task_contract::{ObjectiveDeliverableKind, ObjectiveKind, TaskKind};
     use super::*;
 
@@ -243,5 +261,73 @@ mod tests {
         assert!(successful_command_observation_requirements_satisfied(
             &evidence, &objective
         ));
+    }
+
+    #[test]
+    fn safety_boundary_data_output_can_be_validated_by_later_command() {
+        let objective = ObjectiveContract {
+            task_kind: TaskKind::Data,
+            objective_kind: ObjectiveKind::Data,
+            deliverable_kind: ObjectiveDeliverableKind::OutputFile,
+            evidence_kind: ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+            required_deliverables: vec![ArtifactRole::DataOutput],
+            evidence_required: true,
+            required_evidence_commands: Vec::new(),
+        };
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Data,
+            count: 1,
+            path: Some("summary.json".to_string()),
+        });
+        evidence.push(CompletionEvidence::CommandObservation {
+            command: "python3 -c 'validate summary.json'".to_string(),
+            exit_status: 0,
+            safety_boundary_passed: true,
+        });
+
+        assert!(objective_evidence_satisfied(&evidence, &objective));
+    }
+
+    #[test]
+    fn safety_boundary_ops_document_still_requires_artifact_after_command() {
+        let objective = ObjectiveContract {
+            task_kind: TaskKind::Ops,
+            objective_kind: ObjectiveKind::Ops,
+            deliverable_kind: ObjectiveDeliverableKind::DocumentSections,
+            evidence_kind: ObjectiveEvidenceKind::SafetyBoundaryEvidence,
+            required_deliverables: vec![ArtifactRole::UsageDocs],
+            evidence_required: true,
+            required_evidence_commands: Vec::new(),
+        };
+
+        let mut stale_document = EvidenceSet::new();
+        stale_document.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Docs,
+            count: 1,
+            path: Some("ops-observation.md".to_string()),
+        });
+        stale_document.push(CompletionEvidence::CommandObservation {
+            command: "pwd".to_string(),
+            exit_status: 0,
+            safety_boundary_passed: true,
+        });
+
+        assert!(!objective_evidence_satisfied(&stale_document, &objective));
+
+        let mut bound_document = EvidenceSet::new();
+        bound_document.push(CompletionEvidence::CommandObservation {
+            command: "pwd".to_string(),
+            exit_status: 0,
+            safety_boundary_passed: true,
+        });
+        bound_document.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Docs,
+            count: 1,
+            path: Some("ops-observation.md".to_string()),
+        });
+
+        assert!(objective_evidence_satisfied(&bound_document, &objective));
     }
 }

@@ -19,7 +19,18 @@ pub(super) use super::task_contract_display::{
     MAX_ACCEPTANCE_CRITERIA, mask_and_cap_recovery_field, obligation_report_label,
 };
 use super::task_contract_display::{join_masked_labels, mask_and_cap_label, mask_obligation_value};
+use super::task_contract_evidence_stage::objective_evidence_stage;
+#[cfg(test)]
+use super::task_contract_evidence_stage::{ObjectiveEvidenceRunner, ObjectiveEvidenceStage};
 use super::task_contract_input_projection::ContractRequestInputs;
+#[cfg(test)]
+pub(super) use super::task_contract_obligation_planning::default_readme_required_sections;
+pub(super) use super::task_contract_obligation_planning::push_or_merge_artifact_obligation;
+use super::task_contract_obligation_planning::{
+    inferred_artifact_obligations_from_project_intent,
+    inferred_obligation_shadowed_by_explicit_identity,
+    profile_obligation_shadowed_by_prior_identity,
+};
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
     recovery_target_hint_for_blocking_obligation_diagnostic,
@@ -706,7 +717,7 @@ impl DeliverableObligation {
         }
     }
 
-    fn json_field(
+    pub(super) fn json_field(
         role: ArtifactRole,
         path: impl Into<String>,
         field: impl Into<String>,
@@ -1441,69 +1452,6 @@ impl ObjectiveLifecycleStage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ObjectiveEvidenceStage {
-    MissingEvidence { runner: ObjectiveEvidenceRunner },
-    SatisfiedOrNotRequired { runner: ObjectiveEvidenceRunner },
-}
-
-impl ObjectiveEvidenceStage {
-    fn into_recovery_action(
-        self,
-        missing_verifier_suppress_retry: bool,
-    ) -> Option<ArtifactRecoveryAction> {
-        match self {
-            ObjectiveEvidenceStage::MissingEvidence { runner } => {
-                runner.missing_recovery_action(missing_verifier_suppress_retry)
-            }
-            ObjectiveEvidenceStage::SatisfiedOrNotRequired { .. } => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ObjectiveEvidenceRunner {
-    Command(EvidenceSpec),
-    ArtifactAcceptance(EvidenceSpec),
-    NotRequired,
-}
-
-impl ObjectiveEvidenceRunner {
-    fn for_objective(objective: &ObjectiveContract) -> Self {
-        if objective.requires_evidence() {
-            Self::Command(objective.evidence_kind)
-        } else if objective.has_required_deliverables() {
-            Self::ArtifactAcceptance(objective.evidence_kind)
-        } else {
-            Self::NotRequired
-        }
-    }
-
-    fn command(evidence_kind: EvidenceSpec) -> Self {
-        Self::Command(evidence_kind)
-    }
-
-    fn missing_recovery_action(
-        self,
-        missing_verifier_suppress_retry: bool,
-    ) -> Option<ArtifactRecoveryAction> {
-        match self {
-            ObjectiveEvidenceRunner::Command(_) => {
-                // Once a MissingVerifierJob is in flight and no in-scope edit
-                // has landed, ask for repair instead of re-triggering the same
-                // missing-evidence loop.
-                if missing_verifier_suppress_retry {
-                    Some(ArtifactRecoveryAction::RepairArtifact { target_hint: None })
-                } else {
-                    Some(ArtifactRecoveryAction::RunVerifier)
-                }
-            }
-            ObjectiveEvidenceRunner::ArtifactAcceptance(_)
-            | ObjectiveEvidenceRunner::NotRequired => None,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Issue #636: behavior coverage judgement (private to task_contract).
 // ---------------------------------------------------------------------------
@@ -1868,37 +1816,6 @@ fn objective_deliverable_stage(
             &missing,
         ),
         missing,
-    }
-}
-
-fn objective_evidence_stage(
-    inputs: &ArtifactRecoveryInputs<'_>,
-    objective_evidence_satisfied: bool,
-    existing_unverified_used: bool,
-    code_or_test_required: bool,
-) -> ObjectiveEvidenceStage {
-    let objective = inputs.contract.objective_contract();
-    let default_runner = ObjectiveEvidenceRunner::for_objective(&objective);
-    if objective_evidence_satisfied {
-        return ObjectiveEvidenceStage::SatisfiedOrNotRequired {
-            runner: default_runner,
-        };
-    }
-
-    if objective.requires_evidence() {
-        return ObjectiveEvidenceStage::MissingEvidence {
-            runner: default_runner,
-        };
-    }
-
-    if existing_unverified_used && code_or_test_required {
-        return ObjectiveEvidenceStage::MissingEvidence {
-            runner: ObjectiveEvidenceRunner::command(objective.evidence_kind),
-        };
-    }
-
-    ObjectiveEvidenceStage::SatisfiedOrNotRequired {
-        runner: default_runner,
     }
 }
 
@@ -4870,185 +4787,6 @@ pub(super) fn request_asks_for_data_output_artifact_with_scan(
         return false;
     }
     request_explicitly_requests_standalone_data_artifact_with_scan(scan, request)
-}
-
-fn default_readme_required_sections() -> Vec<String> {
-    ["setup", "usage", "test"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-fn inferred_artifact_obligations_from_project_intent(
-    project_intent: &ProjectIntent,
-    required_artifacts: &[ArtifactRole],
-) -> Vec<ArtifactObligation> {
-    if !required_artifacts.contains(&ArtifactRole::Implementation) {
-        return Vec::new();
-    }
-    let shape = project_intent.shape.unwrap_or(ProjectShape::Unknown);
-    if !matches!(shape, ProjectShape::Cli | ProjectShape::Library) {
-        return Vec::new();
-    }
-    let mut obligations = Vec::new();
-    match project_intent.language.unwrap_or(ProjectLanguage::Unknown) {
-        ProjectLanguage::Rust => {
-            obligations.push(ArtifactObligation::file(ArtifactRole::Setup, "Cargo.toml"));
-            if matches!(shape, ProjectShape::Cli) {
-                obligations.push(ArtifactObligation::file(
-                    ArtifactRole::Implementation,
-                    "src/main.rs",
-                ));
-                if required_artifacts.contains(&ArtifactRole::Test) {
-                    obligations.push(ArtifactObligation::file(ArtifactRole::Test, "tests/cli.rs"));
-                }
-                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
-                    obligations.push(ArtifactObligation::readme(
-                        "README.md",
-                        default_readme_required_sections(),
-                    ));
-                }
-            } else if matches!(shape, ProjectShape::Library) {
-                obligations.push(ArtifactObligation::file(
-                    ArtifactRole::Implementation,
-                    "src/lib.rs",
-                ));
-                if required_artifacts.contains(&ArtifactRole::Test) {
-                    obligations.push(ArtifactObligation::file(ArtifactRole::Test, "tests/lib.rs"));
-                }
-                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
-                    obligations.push(ArtifactObligation::readme(
-                        "README.md",
-                        default_readme_required_sections(),
-                    ));
-                }
-            }
-        }
-        ProjectLanguage::Node => {
-            obligations.push(ArtifactObligation::file(
-                ArtifactRole::Setup,
-                "package.json",
-            ));
-            if matches!(shape, ProjectShape::Cli) {
-                obligations.push(ArtifactObligation::json_field(
-                    ArtifactRole::Setup,
-                    "package.json",
-                    "bin",
-                    "package.json declares a bin entry for the CLI",
-                ));
-                obligations.push(ArtifactObligation::file(
-                    ArtifactRole::Implementation,
-                    "src/index.js",
-                ));
-                if required_artifacts.contains(&ArtifactRole::Test) {
-                    obligations.push(ArtifactObligation::file(
-                        ArtifactRole::Test,
-                        "tests/index.test.js",
-                    ));
-                }
-                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
-                    obligations.push(ArtifactObligation::readme(
-                        "README.md",
-                        default_readme_required_sections(),
-                    ));
-                }
-            }
-        }
-        ProjectLanguage::Python => {
-            if matches!(shape, ProjectShape::Cli) {
-                obligations.push(ArtifactObligation::file(
-                    ArtifactRole::Implementation,
-                    "main.py",
-                ));
-                if required_artifacts.contains(&ArtifactRole::Test) {
-                    obligations.push(ArtifactObligation::file(
-                        ArtifactRole::Test,
-                        "tests/test_main.py",
-                    ));
-                }
-                if required_artifacts.contains(&ArtifactRole::UsageDocs) {
-                    obligations.push(ArtifactObligation::readme(
-                        "README.md",
-                        default_readme_required_sections(),
-                    ));
-                }
-            }
-        }
-        ProjectLanguage::Docs | ProjectLanguage::Unknown => {}
-    }
-    obligations
-}
-
-pub(super) fn push_or_merge_artifact_obligation(
-    obligations: &mut Vec<ArtifactObligation>,
-    incoming: ArtifactObligation,
-) {
-    let Some(existing) = obligations
-        .iter_mut()
-        .find(|existing| should_merge_artifact_obligations(existing, &incoming))
-    else {
-        obligations.push(incoming);
-        return;
-    };
-    if existing.kind == DeliverableKind::File && incoming.kind != DeliverableKind::File {
-        existing.kind = incoming.kind;
-    }
-    if existing.required_sections.is_empty() && !incoming.required_sections.is_empty() {
-        existing.required_sections = incoming.required_sections;
-    }
-    if existing.acceptance_criteria.is_empty() && !incoming.acceptance_criteria.is_empty() {
-        existing.acceptance_criteria = incoming.acceptance_criteria;
-    }
-    if existing.structured_record_schema.is_none() {
-        existing.structured_record_schema = incoming.structured_record_schema;
-    }
-    if existing.schema.is_none() {
-        existing.schema = incoming.schema;
-    }
-}
-
-fn inferred_obligation_shadowed_by_explicit_identity(
-    existing: &[ArtifactObligation],
-    incoming: &ArtifactObligation,
-) -> bool {
-    matches!(
-        incoming.role,
-        ArtifactRole::Implementation | ArtifactRole::Test
-    ) && existing
-        .iter()
-        .any(|identity| identity.role == incoming.role && identity.path != incoming.path)
-}
-
-fn profile_obligation_shadowed_by_prior_identity(
-    existing: &[ArtifactObligation],
-    incoming: &ArtifactObligation,
-) -> bool {
-    incoming.role == ArtifactRole::DataOutput
-        && existing
-            .iter()
-            .any(|identity| identity.role == incoming.role && identity.path != incoming.path)
-}
-
-fn should_merge_artifact_obligations(
-    existing: &ArtifactObligation,
-    incoming: &ArtifactObligation,
-) -> bool {
-    if existing.role != incoming.role || existing.path != incoming.path {
-        return false;
-    }
-    if existing.role == ArtifactRole::Setup
-        && existing.path == "package.json"
-        && (matches!(
-            existing.schema.as_ref(),
-            Some(DeliverableSchema::JsonFields(_))
-        ) || matches!(
-            incoming.schema.as_ref(),
-            Some(DeliverableSchema::JsonFields(_))
-        ))
-    {
-        return false;
-    }
-    true
 }
 
 fn inferred_docs_obligations_from_request(
