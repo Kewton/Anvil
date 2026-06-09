@@ -1263,6 +1263,7 @@ mod task_contract_taxonomy;
 #[cfg(test)]
 mod task_kind_confirm_e2e_tests;
 mod test_expectation_audit;
+mod verifier_command_policy;
 // Issue #917 (P0.5): per-turn single classification authority accessor.
 // Private module, not re-exported (DR3-001) — the 18 former `from_request`
 // sites and `run_turn` consume it via `super::task_classification::*`.

@@ -346,15 +346,9 @@ fn verification_requirement(
 }
 
 fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option<&'static str> {
-    let runner = profile.preferred_runner.as_deref()?.trim();
-    match runner {
-        "cargo test" => Some("cargo test"),
-        "npm test" => Some("npm test"),
-        "pytest" => Some("pytest"),
-        "python -m unittest discover -s tests" => Some("python -m unittest discover -s tests"),
-        "python3 -m unittest discover -s tests" => Some("python3 -m unittest discover -s tests"),
-        _ => None,
-    }
+    super::verifier_command_policy::admitted_profile_preferred_runner(
+        profile.preferred_runner.as_deref(),
+    )
 }
 
 fn forbids_implementation_artifact(profile: &ProjectProfileConfirmation) -> bool {

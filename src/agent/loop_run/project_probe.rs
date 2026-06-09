@@ -477,7 +477,10 @@ fn verifier_candidates(
 }
 
 fn apply_evidence_command_preference(evidence_command_hint: Option<&str>, unit: &mut ProjectUnit) {
-    let Some(command_preview) = canonical_project_unit_evidence_command(evidence_command_hint)
+    let Some(command_preview) =
+        super::verifier_command_policy::canonical_project_unit_evidence_command(
+            evidence_command_hint,
+        )
     else {
         return;
     };
@@ -485,15 +488,6 @@ fn apply_evidence_command_preference(evidence_command_hint: Option<&str>, unit: 
         if candidate.source == "python_tests" {
             candidate.command_preview = command_preview.to_string();
         }
-    }
-}
-
-fn canonical_project_unit_evidence_command(command: Option<&str>) -> Option<&'static str> {
-    match command?.trim().to_ascii_lowercase().as_str() {
-        "python -m unittest discover -s tests" | "python3 -m unittest discover -s tests" => {
-            Some("python3 -m unittest discover -s tests")
-        }
-        _ => None,
     }
 }
 

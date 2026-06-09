@@ -1565,7 +1565,7 @@ impl AutoTestRunner {
         if !is_completion_verifier_command(command) {
             return None;
         }
-        if !is_evidence_command_hint_allowed(command) {
+        if !super::verifier_command_policy::is_evidence_command_hint_allowed(command) {
             return None;
         }
         Some(AutoTestPlan {
@@ -3158,26 +3158,6 @@ fn contains_blocked_shell_fragment(lower: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
-}
-
-fn is_evidence_command_hint_allowed(command: &str) -> bool {
-    let lower = command.trim().to_ascii_lowercase();
-    [
-        "cargo test",
-        "cargo build",
-        "cargo check",
-        "cargo clippy",
-        "npm test",
-        "npm run test",
-        "npm run build",
-        "python -m pytest",
-        "python3 -m pytest",
-        "python -m unittest discover -s tests",
-        "python3 -m unittest discover -s tests",
-        "pytest",
-    ]
-    .iter()
-    .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix} ")))
 }
 
 fn is_project_level_verifier_command(lower: &str) -> bool {
