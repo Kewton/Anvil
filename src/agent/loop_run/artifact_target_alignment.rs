@@ -3,7 +3,9 @@
 //! This module keeps request/runtime-aware target-path normalization out of the
 //! artifact target installer. It does not install jobs or mutate `Agent`.
 
-use super::task_contract::{ArtifactRole, RecoveryTargetHint};
+use super::task_contract::{
+    ArtifactRole, RecoveryTargetHint, explicit_artifact_obligations_from_request,
+};
 use super::verifier_orchestration::{
     synthesized_missing_test_target_path_for_request, test_target_path_compatible_with_request,
 };
@@ -18,6 +20,16 @@ pub(super) fn align_recovery_target_hint_to_request(
     let Some(request) = request else {
         return hint;
     };
+    if let Some(explicit_path) = explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .find(|identity| identity.role == ArtifactRole::Test)
+        .map(|identity| identity.path)
+        && hint.path != explicit_path
+    {
+        hint.path = explicit_path;
+        hint.reason = "explicit requested test artifact identity is still missing".to_string();
+        return hint;
+    }
     let Some((target_path, stack_label)) =
         synthesized_missing_test_target_path_for_request(request)
     else {
@@ -56,9 +68,23 @@ mod tests {
     }
 
     #[test]
-    fn python_test_target_aligns_to_existing_requested_family_default() {
+    fn explicit_test_identity_precedes_synthesized_family_default() {
         let aligned = align_recovery_target_hint_to_request(
             Some("Create math_utils.py and tests/test_math_utils.py with Python unittest tests."),
+            hint(ArtifactRole::Test, "tests/cli.rs"),
+        );
+
+        assert_eq!(aligned.path, "tests/test_math_utils.py");
+        assert_eq!(
+            aligned.reason,
+            "explicit requested test artifact identity is still missing"
+        );
+    }
+
+    #[test]
+    fn incompatible_test_target_uses_synthesized_default_without_explicit_identity() {
+        let aligned = align_recovery_target_hint_to_request(
+            Some("Create a Python module with unittest tests."),
             hint(ArtifactRole::Test, "tests/cli.rs"),
         );
 
