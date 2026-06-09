@@ -54,8 +54,7 @@ pub(super) fn handle_user_message(
     // Issue #667 (DR1-004 / per-turn rule): clear the PAM advisory
     // decision carrier. `is_some()` is the "decided this turn" predicate;
     // the 2 production chokepoints set this exactly once (DR1-005).
-    agent.last_pam_decision_this_turn = None;
-    agent.last_pam_unused_reason_this_turn = None;
+    agent.turn_state.reset_pam_state();
     // Issue #994 (parent #988, Issue F): clear the per-turn contract conflict
     // job carrier. `is_some()` is the "arbitrated this turn" predicate; the
     // production hook sets it exactly once at the repair_exhausted chokepoint

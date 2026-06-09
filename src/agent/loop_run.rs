@@ -882,7 +882,7 @@ impl Agent {
     pub(in crate::agent::loop_run) fn last_pam_decision_this_turn(
         &self,
     ) -> Option<&pam_advisory::PamAdvisoryDecision> {
-        self.last_pam_decision_this_turn.as_ref()
+        self.turn_state.pam_decision()
     }
 
     /// Issue #667 test-only accessor: deep clone of the active job selection
@@ -899,8 +899,7 @@ impl Agent {
     /// constructing a full request lifecycle. `#[cfg(test)]` keeps this out
     /// of release binaries.
     pub(in crate::agent::loop_run) fn reset_last_pam_decision_for_test(&mut self) {
-        self.last_pam_decision_this_turn = None;
-        self.last_pam_unused_reason_this_turn = None;
+        self.turn_state.reset_pam_state();
     }
 }
 
@@ -2527,20 +2526,6 @@ pub struct Agent {
     /// is the authority for any persisted ownership / completion data).
     pub(in crate::agent::loop_run) owned_test_verifier_missing_observed_carryover:
         Option<task_contract::RequestCarryoverKey>,
-    /// Issue #667 (DR1-004): per-turn PAM advisory decision carrier. `is_some()`
-    /// is synonymous with "adapter has produced a decision this turn"; the
-    /// old design's separate `pam_advisory_decided_this_turn: bool` flag is
-    /// intentionally absent (SRP violation + double-write footgun).
-    ///
-    /// Reset to `None` at the head of every `handle_user_message` adjacent
-    /// to `last_active_job_selection = None`. NOT serialized — in-memory
-    /// only (same per-turn pattern as `last_active_job_selection` and
-    /// `last_behavior_contract_projection_event`).
-    pub(in crate::agent::loop_run) last_pam_decision_this_turn:
-        Option<pam_advisory::PamAdvisoryDecision>,
-    /// Issue #867: per-turn reason PAM advisory was not used. Eval logging
-    /// consumes this only when `last_pam_decision_this_turn` is `None`.
-    pub(in crate::agent::loop_run) last_pam_unused_reason_this_turn: Option<String>,
     /// Issue #994 (parent #988, Issue F): per-turn carrier for the
     /// `ContractConflictJob` arbitrated at the `repair_exhausted` chokepoint.
     /// `is_some()` drives the `agent.contract_arbitration.report` emit in
@@ -2821,9 +2806,6 @@ impl Agent {
             owned_test_verifier_missing_observed_this_turn: false,
             // Issue #664 iteration-4 (CB3-001): request-bound carryover.
             owned_test_verifier_missing_observed_carryover: None,
-            // Issue #667: PAM advisory per-turn carrier.
-            last_pam_decision_this_turn: None,
-            last_pam_unused_reason_this_turn: None,
             last_contract_conflict_job_this_turn: None,
         }
     }
@@ -2902,7 +2884,7 @@ impl Agent {
             self.record_pam_unused_reason("pam_disabled");
             return None;
         }
-        if self.last_pam_decision_this_turn.is_some() {
+        if self.turn_state.pam_decision().is_some() {
             self.record_pam_unused_reason("already_decided_this_turn");
             return None;
         }
@@ -2918,17 +2900,13 @@ impl Agent {
                 shadow: shadow_input,
             },
         );
-        self.last_pam_decision_this_turn = Some(outcome.decision.clone());
-        self.last_pam_unused_reason_this_turn = None;
+        self.turn_state
+            .record_pam_decision(outcome.decision.clone());
         Some(outcome)
     }
 
     pub(in crate::agent::loop_run) fn record_pam_unused_reason(&mut self, reason: &str) {
-        if self.last_pam_decision_this_turn.is_none()
-            && self.last_pam_unused_reason_this_turn.is_none()
-        {
-            self.last_pam_unused_reason_this_turn = Some(reason.to_string());
-        }
+        self.turn_state.record_pam_unused_reason(reason);
     }
 }
 

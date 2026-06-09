@@ -4610,16 +4610,14 @@ pub(super) fn run_actor_loop(
         record.recovery_strategy_count = agent.controller_policy_ledger.distinct_strategy_count();
         record.recovery_strategies = agent.controller_policy_ledger.strategy_labels();
         record.pam_eval = agent
-            .last_pam_decision_this_turn
-            .as_ref()
+            .turn_state
+            .pam_decision()
             .map(|decision| decision.to_eval_summary())
             .or_else(|| {
                 agent
-                    .last_pam_unused_reason_this_turn
-                    .as_ref()
-                    .map(|reason| {
-                        crate::session::eval_log::PamEvalSummary::skipped(reason.as_str())
-                    })
+                    .turn_state
+                    .pam_unused_reason()
+                    .map(crate::session::eval_log::PamEvalSummary::skipped)
             });
         // Issue #925 (P8): surface the agent's CLASSIFIED task_kind for R5.
         // DR3-002: cross the agent→session boundary as a plain String (never the

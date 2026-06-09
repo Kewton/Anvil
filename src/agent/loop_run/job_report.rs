@@ -589,17 +589,14 @@ impl super::Agent {
                 self.last_photon_context_pack_status,
                 PhotonContextPackStatus::NoTurn
             )
-            || self.last_pam_decision_this_turn.is_some();
+            || self.turn_state.pam_decision().is_some();
         if mr_observable {
             // Issue #667 (C.1): project the per-turn decision into the
             // `pam_decision` field. The envelope traverses
             // `record_job_report` → `log_llm_event` →
             // `mask_payload_inplace` as the final defence (Security
             // Invariants), so the adapter does NOT re-sanitize here.
-            let pam_decision = self
-                .last_pam_decision_this_turn
-                .as_ref()
-                .map(|d| d.to_json_value());
+            let pam_decision = self.turn_state.pam_decision().map(|d| d.to_json_value());
             let mr = MemoryReport {
                 turn_index,
                 pam_decision,

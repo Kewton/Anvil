@@ -10,6 +10,8 @@ pub(super) struct TurnState {
     pub(super) job_report_dedup_keys: std::collections::HashSet<String>,
     pub(super) last_behavior_contract_projection_event:
         Option<super::required_behavior::BehaviorProjectionEventKey>,
+    pub(super) last_pam_decision_this_turn: Option<super::pam_advisory::PamAdvisoryDecision>,
+    pub(super) last_pam_unused_reason_this_turn: Option<String>,
 }
 
 impl TurnState {
@@ -19,6 +21,8 @@ impl TurnState {
             last_active_job_selection: None,
             job_report_dedup_keys: std::collections::HashSet::new(),
             last_behavior_contract_projection_event: None,
+            last_pam_decision_this_turn: None,
+            last_pam_unused_reason_this_turn: None,
         }
     }
 
@@ -27,6 +31,35 @@ impl TurnState {
         self.last_active_job_selection = None;
         self.job_report_dedup_keys.clear();
         self.last_behavior_contract_projection_event = None;
+    }
+
+    pub(super) fn reset_pam_state(&mut self) {
+        self.last_pam_decision_this_turn = None;
+        self.last_pam_unused_reason_this_turn = None;
+    }
+
+    pub(super) fn pam_decision(&self) -> Option<&super::pam_advisory::PamAdvisoryDecision> {
+        self.last_pam_decision_this_turn.as_ref()
+    }
+
+    pub(super) fn pam_unused_reason(&self) -> Option<&str> {
+        self.last_pam_unused_reason_this_turn.as_deref()
+    }
+
+    pub(super) fn record_pam_decision(
+        &mut self,
+        decision: super::pam_advisory::PamAdvisoryDecision,
+    ) {
+        self.last_pam_decision_this_turn = Some(decision);
+        self.last_pam_unused_reason_this_turn = None;
+    }
+
+    pub(super) fn record_pam_unused_reason(&mut self, reason: &str) {
+        if self.last_pam_decision_this_turn.is_none()
+            && self.last_pam_unused_reason_this_turn.is_none()
+        {
+            self.last_pam_unused_reason_this_turn = Some(reason.to_string());
+        }
     }
 
     #[cfg(test)]
@@ -74,5 +107,30 @@ mod tests {
         assert!(!state.dedup_state_is_empty());
         state.reset_dedup_state();
         assert!(state.dedup_state_is_empty());
+    }
+
+    #[test]
+    fn turn_state_reset_clears_pam_state() {
+        let mut state = state_with_pam_unused_reason();
+        state.reset_pam_state();
+
+        assert!(state.pam_decision().is_none());
+        assert!(state.pam_unused_reason().is_none());
+    }
+
+    #[test]
+    fn pam_unused_reason_is_single_assignment_until_decision() {
+        let mut state = TurnState::new();
+        state.record_pam_unused_reason("first");
+        state.record_pam_unused_reason("second");
+
+        assert_eq!(state.pam_unused_reason(), Some("first"));
+    }
+
+    fn state_with_pam_unused_reason() -> TurnState {
+        let mut state = TurnState::new();
+        state.record_pam_unused_reason("pam_disabled");
+        assert_eq!(state.pam_unused_reason(), Some("pam_disabled"));
+        state
     }
 }
