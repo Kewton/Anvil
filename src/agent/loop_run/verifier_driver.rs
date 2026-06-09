@@ -299,14 +299,16 @@ pub(super) fn select_task_contract_project_unit(
     active_request: Option<&str>,
     workspace_scope: Option<&TaskWorkspaceScope>,
     edited_files: &HashSet<String>,
+    evidence_command_hint: Option<&str>,
 ) -> Option<ProjectUnit> {
     let scope = workspace_scope?;
     match active_request {
-        Some(request) => super::project_probe::probe_project_unit_for_request(
+        Some(request) => super::project_probe::probe_project_unit_for_request_with_evidence_hint(
             work_root,
             request,
             scope,
             edited_files,
+            evidence_command_hint,
         ),
         None => super::project_probe::probe_project_unit(work_root, scope, edited_files),
     }
@@ -606,7 +608,8 @@ mod tests {
                 Path::new("/tmp/nonexistent"),
                 Some("add tests"),
                 None,
-                &edited_files
+                &edited_files,
+                None
             ),
             None
         );

@@ -2433,6 +2433,7 @@ pub(super) fn select_task_contract_verifier_once(
         active_request.as_deref(),
         workspace_scope_opt.as_ref(),
         &agent.turn_edited_relative_paths,
+        evidence_command_hint.as_deref(),
     );
     if let Some(project_unit) = task_contract_project_unit.as_ref() {
         log_llm_event(

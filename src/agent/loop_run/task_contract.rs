@@ -1089,7 +1089,7 @@ impl TaskContract {
             .controller_state
             .as_ref()
             .and_then(ControllerStatePacket::inferred_task_kind);
-        let evidence_command_hint = request_view
+        let controller_evidence_command_hint = request_view
             .controller_state
             .as_ref()
             .and_then(|state| state.evidence_command().map(str::to_string));
@@ -1102,6 +1102,11 @@ impl TaskContract {
         let mut project_intent = ProjectIntent::from_request(request_for_inference);
         let project_profile_admission = admit_project_profile_contract_inputs(project_profile);
         let project_profile_inputs = project_profile_admission.profile_inputs;
+        let evidence_command_hint = controller_evidence_command_hint.or_else(|| {
+            project_profile_inputs
+                .as_ref()
+                .and_then(|inputs| inputs.preferred_runner.map(str::to_string))
+        });
         if let Some(inputs) = &project_profile_inputs {
             apply_profile_contract_inputs(&mut project_intent, inputs);
         }

@@ -205,6 +205,16 @@ pub(super) fn probe_project_unit_for_request(
     scope: &TaskWorkspaceScope,
     edited_files: &HashSet<String>,
 ) -> Option<ProjectUnit> {
+    probe_project_unit_for_request_with_evidence_hint(work_root, request, scope, edited_files, None)
+}
+
+pub(super) fn probe_project_unit_for_request_with_evidence_hint(
+    work_root: &Path,
+    request: &str,
+    scope: &TaskWorkspaceScope,
+    edited_files: &HashSet<String>,
+    evidence_command_hint: Option<&str>,
+) -> Option<ProjectUnit> {
     let facts = WorkspaceFacts {
         files: collect_scoped_files(work_root, scope),
         edited_files: edited_files.clone(),
@@ -218,7 +228,7 @@ pub(super) fn probe_project_unit_for_request(
     }
     let mut unit = build_project_unit(work_root, &facts)?;
     constrain_project_unit_to_request(request, &mut unit)?;
-    apply_request_verifier_preference(request, &mut unit);
+    apply_evidence_command_preference(evidence_command_hint, &mut unit);
     Some(unit)
 }
 
@@ -466,14 +476,24 @@ fn verifier_candidates(
     out
 }
 
-fn apply_request_verifier_preference(request: &str, unit: &mut ProjectUnit) {
-    if !request.to_ascii_lowercase().contains("unittest") {
+fn apply_evidence_command_preference(evidence_command_hint: Option<&str>, unit: &mut ProjectUnit) {
+    let Some(command_preview) = canonical_project_unit_evidence_command(evidence_command_hint)
+    else {
         return;
-    }
+    };
     for candidate in &mut unit.verifier_candidates {
         if candidate.source == "python_tests" {
-            candidate.command_preview = "python3 -m unittest discover -s tests".to_string();
+            candidate.command_preview = command_preview.to_string();
         }
+    }
+}
+
+fn canonical_project_unit_evidence_command(command: Option<&str>) -> Option<&'static str> {
+    match command?.trim().to_ascii_lowercase().as_str() {
+        "python -m unittest discover -s tests" | "python3 -m unittest discover -s tests" => {
+            Some("python3 -m unittest discover -s tests")
+        }
+        _ => None,
     }
 }
 
@@ -989,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn python_unittest_request_prefers_unittest_project_unit_verifier() {
+    fn evidence_command_hint_prefers_unittest_project_unit_verifier() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
         std::fs::write(
@@ -1003,12 +1023,18 @@ mod tests {
         )
         .expect("test");
 
-        let request = "Create math_utils.py and tests/test_math_utils.py. Use Python unittest and verify with python -m unittest discover -s tests.";
+        let request = "Create math_utils.py and tests/test_math_utils.py.";
         let scope = scope(dir.path(), request);
         let edited = edited(&["math_utils.py", "tests/test_math_utils.py"]);
 
-        let unit =
-            probe_project_unit_for_request(dir.path(), request, &scope, &edited).expect("unit");
+        let unit = probe_project_unit_for_request_with_evidence_hint(
+            dir.path(),
+            request,
+            &scope,
+            &edited,
+            Some("python -m unittest discover -s tests"),
+        )
+        .expect("unit");
 
         assert_eq!(unit.verifier_candidates.len(), 1);
         assert_eq!(unit.verifier_candidates[0].source, "python_tests");

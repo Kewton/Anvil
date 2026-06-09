@@ -250,6 +250,7 @@ pub(super) fn build_project_profile_confirm_prompt(
             "primary_artifacts must contain only output deliverables the agent should create or modify; never include files the user asks to read, inspect, summarize, or use as input.\n",
             "When both input and output files are mentioned, list only the output file(s) in primary_artifacts.\n",
             "Use preferred_runner only when evidence should be produced by a command, otherwise null.\n",
+            "If the user explicitly specifies the verifier command to run, put that command string in preferred_runner.\n",
             "If the user forbids source code, tests, setup files, README, docs, or documentation, put the corresponding value in forbidden_artifacts.\n",
             "If setup is a document section rather than environment work, set needs_environment_setup=false.\n",
             "Do not write prose outside JSON.\n\n",

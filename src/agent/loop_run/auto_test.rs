@@ -3172,6 +3172,8 @@ fn is_evidence_command_hint_allowed(command: &str) -> bool {
         "npm run build",
         "python -m pytest",
         "python3 -m pytest",
+        "python -m unittest discover -s tests",
+        "python3 -m unittest discover -s tests",
         "pytest",
     ]
     .iter()
@@ -4421,6 +4423,17 @@ mod tests {
         .expect("safe cargo test hint");
 
         assert_eq!(plan.command, "cargo test --manifest-path Cargo.toml");
+        assert_eq!(plan.reason, "controller evidence command");
+    }
+
+    #[test]
+    fn evidence_command_hint_accepts_stdlib_unittest_verifier() {
+        let plan = AutoTestRunner::plan_from_evidence_command_hint(
+            "python3 -m unittest discover -s tests",
+        )
+        .expect("safe unittest hint");
+
+        assert_eq!(plan.command, "python3 -m unittest discover -s tests");
         assert_eq!(plan.reason, "controller evidence command");
     }
 

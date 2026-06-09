@@ -43,6 +43,7 @@ pub(super) struct ProjectProfileContractInputs {
     pub(super) shape: Option<ProjectShape>,
     pub(super) verification: Option<VerificationRequirement>,
     pub(super) evidence_kind: Option<ObjectiveEvidenceKind>,
+    pub(super) preferred_runner: Option<&'static str>,
     pub(super) required_role: Option<ArtifactRole>,
     pub(super) artifact_obligations: Vec<ArtifactObligation>,
     pub(super) forbids_implementation: bool,
@@ -102,6 +103,7 @@ pub(super) fn contract_inputs_from_confirmation(
         shape: profile.shape,
         verification: verification_requirement(profile),
         evidence_kind: objective_evidence_kind_from_profile(profile),
+        preferred_runner: preferred_runner_from_profile(profile),
         required_role,
         artifact_obligations: artifact_obligations(profile, required_role),
         forbids_implementation: forbids_implementation_artifact(profile),
@@ -349,6 +351,8 @@ fn preferred_runner_from_profile(profile: &ProjectProfileConfirmation) -> Option
         "cargo test" => Some("cargo test"),
         "npm test" => Some("npm test"),
         "pytest" => Some("pytest"),
+        "python -m unittest discover -s tests" => Some("python -m unittest discover -s tests"),
+        "python3 -m unittest discover -s tests" => Some("python3 -m unittest discover -s tests"),
         _ => None,
     }
 }
@@ -692,8 +696,17 @@ npm test
             project_profile_adoption_decision(Some(&profile), &first_pass),
             ProjectProfileAdoptionDecision::Adopt
         );
+        let inputs = contract_inputs_from_confirmation(Some(&profile)).expect("inputs");
+        assert_eq!(
+            inputs.preferred_runner,
+            Some("python -m unittest discover -s tests")
+        );
         let contract =
             TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract.evidence_command_hint(),
+            Some("python -m unittest discover -s tests")
+        );
         assert_eq!(
             contract
                 .required_identities_for_role(ArtifactRole::Test)
