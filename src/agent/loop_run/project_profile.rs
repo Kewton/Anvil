@@ -251,6 +251,8 @@ pub(super) fn build_project_profile_confirm_prompt(
             "When both input and output files are mentioned, list only the output file(s) in primary_artifacts.\n",
             "Use preferred_runner only when evidence should be produced by a command, otherwise null.\n",
             "If the user explicitly specifies the verifier command to run, put that command string in preferred_runner.\n",
+            "For document deliverables, use evidence_kind=content_check unless the user explicitly asks to run or record a command observation.\n",
+            "Do not use command_observation merely because a document can be read back after writing.\n",
             "If the user forbids source code, tests, setup files, README, docs, or documentation, put the corresponding value in forbidden_artifacts.\n",
             "If setup is a document section rather than environment work, set needs_environment_setup=false.\n",
             "Do not write prose outside JSON.\n\n",
@@ -764,6 +766,8 @@ mod tests {
         assert!(prompt.contains("array of path strings"));
         assert!(prompt.contains("first pass is only a low-priority hint"));
         assert!(prompt.contains("user request, ignore the first pass"));
+        assert!(prompt.contains("document deliverables, use evidence_kind=content_check"));
+        assert!(prompt.contains("Do not use command_observation merely because"));
     }
 
     #[test]
