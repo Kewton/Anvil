@@ -150,7 +150,7 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; phases={}. A deliverable phase is complete only after its target role/path satisfies its predicate. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; phases={}. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
@@ -354,6 +354,14 @@ mod tests {
         assert!(
             plan.policy_message()
                 .contains("Do not final-answer between required deliverable phases")
+        );
+        assert!(
+            plan.policy_message()
+                .contains("do not invent tie-breaks, ordering, error modes")
+        );
+        assert!(
+            plan.policy_message()
+                .contains("prefer one coherent whole-file update")
         );
     }
 

@@ -5,10 +5,12 @@ use super::contract_request_signals::{
 };
 use super::project_profile::ProjectProfileConfirmation;
 use super::project_profile_projection::{
-    ProfileForbiddenRoles, ProjectProfileContractInputs, adopt_contract_task_kind,
-    apply_profile_contract_inputs, contract_inputs_from_confirmation,
+    adopt_contract_task_kind, apply_profile_contract_inputs, contract_inputs_from_confirmation,
 };
 use super::required_behavior::{self, RequiredBehaviorContract};
+use super::task_contract_artifact_contract::{
+    ArtifactContractBuildInputs, ArtifactContractParts, build_artifact_contract_parts,
+};
 use super::task_contract_artifact_predicates::{
     artifact_identity_satisfied_for_verification, behavior_coverage_enabled,
     required_role_satisfied_by_evidence, role_deliverable_content_satisfied,
@@ -21,6 +23,11 @@ use super::task_contract_artifact_predicates::{
 use super::task_contract_controller_packet::ControllerStatePacket;
 pub(super) use super::task_contract_controller_packet::{
     RequestInferenceView, model_visible_request_text,
+};
+use super::task_contract_deliverable_projection::deliverables_from_contract_parts;
+#[cfg(test)]
+use super::task_contract_deliverable_projection::{
+    default_deliverable_path, deliverable_kind_for_role,
 };
 #[cfg(test)]
 pub(super) use super::task_contract_display::MAX_SECTION_LABEL_LEN;
@@ -35,11 +42,6 @@ use super::task_contract_input_projection::ContractRequestInputs;
 #[cfg(test)]
 pub(super) use super::task_contract_obligation_planning::default_readme_required_sections;
 pub(super) use super::task_contract_obligation_planning::push_or_merge_artifact_obligation;
-use super::task_contract_obligation_planning::{
-    inferred_artifact_obligations_from_project_intent,
-    inferred_obligation_shadowed_by_explicit_identity,
-    profile_obligation_shadowed_by_prior_identity,
-};
 pub(super) use super::task_contract_recovery_planning::{
     blocking_obligation_diagnostic_for_role,
     recovery_target_hint_for_blocking_obligation_diagnostic,
@@ -661,7 +663,7 @@ impl DeliverableObligation {
     /// `ResearchNotes` kind and a `RequiredSections` schema so the research
     /// acceptance predicate (`assess_research_report`) — not the docs surface
     /// gate — drives verification. `path` is admitted via `validated_obligation_path`.
-    fn research_report(path: impl Into<String>, required_sections: Vec<String>) -> Self {
+    pub(super) fn research_report(path: impl Into<String>, required_sections: Vec<String>) -> Self {
         let path = validated_obligation_path(path.into());
         Self {
             role: ArtifactRole::UsageDocs,
@@ -1781,186 +1783,6 @@ pub(super) fn artifact_identity_path_ready_for_verification(
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtifactContractParts {
-    required: Vec<ArtifactRole>,
-    optional: Vec<ArtifactRole>,
-    required_artifact_identities: Vec<ArtifactObligation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ArtifactRoleSeed {
-    required: Vec<ArtifactRole>,
-    optional: Vec<ArtifactRole>,
-    research_report_intended: bool,
-}
-
-struct ArtifactContractBuildInputs<'a> {
-    scan: &'a OutputContextScan,
-    request: &'a str,
-    lower: &'a str,
-    task_kind: TaskKind,
-    intent: TaskIntent,
-    request_inputs: ContractRequestInputs,
-    project_intent: &'a ProjectIntent,
-    profile_inputs: Option<&'a ProjectProfileContractInputs>,
-    controller_state: Option<&'a ControllerStatePacket>,
-}
-
-fn build_artifact_contract_parts(inputs: ArtifactContractBuildInputs<'_>) -> ArtifactContractParts {
-    let mut role_seed = seed_artifact_roles(&inputs);
-    let mut required_artifact_identities = build_required_artifact_identities(
-        &inputs,
-        &mut role_seed.required,
-        role_seed.research_report_intended,
-    );
-    role_seed.required.sort();
-    role_seed.required.dedup();
-    required_artifact_identities
-        .sort_by(|a, b| (a.role, a.path.as_str()).cmp(&(b.role, b.path.as_str())));
-
-    ArtifactContractParts {
-        required: role_seed.required,
-        optional: role_seed.optional,
-        required_artifact_identities,
-    }
-}
-
-fn seed_artifact_roles(inputs: &ArtifactContractBuildInputs<'_>) -> ArtifactRoleSeed {
-    let mut required = Vec::new();
-    let mut optional = Vec::new();
-    let profile_forbids = ProfileForbiddenRoles::from_inputs(inputs.profile_inputs);
-
-    if inputs.task_kind == TaskKind::Coding
-        && (inputs.request_inputs.asks_for_implementation
-            || inputs.request_inputs.project_intent_implies_implementation)
-        && !profile_forbids.implementation
-    {
-        required.push(ArtifactRole::Implementation);
-    }
-    if inputs.request_inputs.asks_for_tests && !profile_forbids.tests {
-        required.push(ArtifactRole::Test);
-    }
-    if inputs.request_inputs.asks_for_usage_docs && !profile_forbids.usage_docs {
-        required.push(ArtifactRole::UsageDocs);
-    }
-    if inputs.task_kind == TaskKind::Authoring && !profile_forbids.usage_docs {
-        required.push(ArtifactRole::UsageDocs);
-    }
-    let setup_required = matches!(inputs.intent, TaskIntent::Install)
-        && !request_asks_for_code_work(inputs.request, inputs.lower);
-    if inputs.request_inputs.asks_for_setup && !profile_forbids.setup {
-        if setup_required {
-            required.push(ArtifactRole::Setup);
-        } else {
-            optional.push(ArtifactRole::Setup);
-        }
-    }
-    if inputs.request_inputs.asks_for_data_output {
-        required.push(ArtifactRole::DataOutput);
-    }
-    if let Some(role) = inputs
-        .profile_inputs
-        .and_then(|inputs| inputs.required_role)
-    {
-        required.push(role);
-    }
-
-    let research_report_intended = inputs.task_kind == TaskKind::Research
-        && research_report_artifact_intended_with_scan(inputs.scan, inputs.request);
-    if research_report_intended {
-        required.push(ArtifactRole::UsageDocs);
-    }
-
-    optional.sort();
-    optional.dedup();
-
-    ArtifactRoleSeed {
-        required,
-        optional,
-        research_report_intended,
-    }
-}
-
-fn build_required_artifact_identities(
-    inputs: &ArtifactContractBuildInputs<'_>,
-    required: &mut Vec<ArtifactRole>,
-    research_report_intended: bool,
-) -> Vec<ArtifactObligation> {
-    let mut required_artifact_identities =
-        explicit_artifact_obligations_from_request_with_scan(inputs.scan, inputs.request);
-    if let Some(controller_state) = inputs.controller_state {
-        controller_state.extend_contract_parts(required, &mut required_artifact_identities);
-    }
-    for identity in inputs
-        .profile_inputs
-        .into_iter()
-        .flat_map(|inputs| inputs.artifact_obligations.iter())
-        .cloned()
-    {
-        if identity.role == ArtifactRole::DataOutput
-            && !data_path_has_output_context_with_scan(inputs.scan, &identity.path)
-        {
-            continue;
-        }
-        if profile_obligation_shadowed_by_prior_identity(&required_artifact_identities, &identity) {
-            continue;
-        }
-        if !required.contains(&identity.role) {
-            required.push(identity.role);
-        }
-        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-    }
-    if inputs.request_inputs.asks_for_data_output
-        && required_artifact_identities
-            .iter()
-            .any(|identity| identity.role == ArtifactRole::DataOutput)
-    {
-        required.push(ArtifactRole::DataOutput);
-    }
-    required_artifact_identities.retain(|identity| required.contains(&identity.role));
-    for identity in
-        inferred_artifact_obligations_from_project_intent(inputs.project_intent, required)
-    {
-        if inferred_obligation_shadowed_by_explicit_identity(
-            &required_artifact_identities,
-            &identity,
-        ) {
-            continue;
-        }
-        if !required.contains(&identity.role) {
-            required.push(identity.role);
-        }
-        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-    }
-    for identity in inferred_docs_obligations_from_request(inputs.request, inputs.lower, required) {
-        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-    }
-    if research_report_intended {
-        let sections = required_research_sections_from_request(inputs.request);
-        let path = research_report_path_from_request_with_scan(inputs.scan, inputs.request);
-        push_or_merge_artifact_obligation(
-            &mut required_artifact_identities,
-            ArtifactObligation::research_report(path, sections),
-        );
-    }
-    for identity in inferred_data_obligations_from_request_with_scan(inputs.scan, inputs.request) {
-        if !required.contains(&identity.role) {
-            required.push(identity.role);
-        }
-        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-    }
-    for identity in
-        inferred_ops_obligations_from_request(inputs.request, inputs.lower, inputs.task_kind)
-    {
-        if !required.contains(&identity.role) {
-            required.push(identity.role);
-        }
-        push_or_merge_artifact_obligation(&mut required_artifact_identities, identity);
-    }
-    required_artifact_identities
-}
-
 impl From<CompletionDecision> for ArtifactRecoveryAction {
     fn from(decision: CompletionDecision) -> Self {
         match decision {
@@ -2670,156 +2492,7 @@ fn infer_task_kind(
     }
 }
 
-fn deliverables_from_contract_parts(
-    request: &str,
-    task_kind: TaskKind,
-    required_artifacts: &[ArtifactRole],
-    required_artifact_identities: &[ArtifactObligation],
-    optional_artifacts: &[ArtifactRole],
-) -> Vec<TaskDeliverable> {
-    let mut deliverables = Vec::new();
-    for role in required_artifacts {
-        deliverables.push(deliverable_for_role(
-            request,
-            *role,
-            required_artifact_identities,
-            false,
-        ));
-    }
-    for role in optional_artifacts {
-        deliverables.push(deliverable_for_role(
-            request,
-            *role,
-            required_artifact_identities,
-            true,
-        ));
-    }
-    if deliverables.is_empty() {
-        deliverables.push(generic_task_deliverable(request, task_kind));
-    }
-    deliverables
-}
-
-fn deliverable_for_role(
-    request: &str,
-    role: ArtifactRole,
-    required_artifact_identities: &[ArtifactObligation],
-    optional: bool,
-) -> TaskDeliverable {
-    // Issue #923: an OpsRunbook obligation rides on the `UsageDocs` role (no
-    // dedicated role until #920) but is a runbook deliverable, not docs. Surface
-    // it with its `OpsRunbook` kind and carry its canonical `required_sections`
-    // so the deliverable view matches the obligation (DR3-002).
-    if let Some(identity) = required_artifact_identities
-        .iter()
-        .find(|identity| identity.role == role && identity.kind == DeliverableKind::OpsRunbook)
-    {
-        return TaskDeliverable {
-            kind: DeliverableKind::OpsRunbook,
-            role: Some(role),
-            path: Some(identity.path.clone()),
-            required_sections: identity.required_sections.clone(),
-        };
-    }
-    if let Some(identity) = required_artifact_identities
-        .iter()
-        .find(|identity| identity.role == role && !identity.required_sections.is_empty())
-    {
-        return TaskDeliverable {
-            kind: deliverable_kind_for_role(role),
-            role: Some(role),
-            path: Some(identity.path.clone()),
-            required_sections: identity.required_sections.clone(),
-        };
-    }
-    let path = required_artifact_identities
-        .iter()
-        .find(|identity| identity.role == role)
-        .map(|identity| identity.path.clone())
-        .or_else(|| default_deliverable_path(role).map(str::to_string));
-    TaskDeliverable {
-        kind: deliverable_kind_for_role(role),
-        role: Some(role),
-        path,
-        required_sections: if role == ArtifactRole::UsageDocs && !optional {
-            required_doc_sections_from_request(request)
-        } else {
-            Vec::new()
-        },
-    }
-}
-
-fn generic_task_deliverable(request: &str, task_kind: TaskKind) -> TaskDeliverable {
-    match task_kind {
-        TaskKind::Docs => TaskDeliverable {
-            kind: DeliverableKind::UsageDocs,
-            role: Some(ArtifactRole::UsageDocs),
-            path: Some(default_docs_path_from_request(request)),
-            required_sections: required_doc_sections_from_request(request),
-        },
-        TaskKind::Data => TaskDeliverable {
-            kind: DeliverableKind::Data,
-            role: None,
-            path: explicit_path_with_data_extension(request),
-            required_sections: Vec::new(),
-        },
-        TaskKind::Research => TaskDeliverable {
-            kind: DeliverableKind::ResearchNotes,
-            role: None,
-            path: None,
-            required_sections: required_research_sections_from_request(request),
-        },
-        TaskKind::Ops => TaskDeliverable {
-            kind: DeliverableKind::OpsRunbook,
-            role: None,
-            path: None,
-            required_sections: required_ops_sections_from_request(request),
-        },
-        TaskKind::Coding => TaskDeliverable {
-            kind: DeliverableKind::Code,
-            role: Some(ArtifactRole::Implementation),
-            path: None,
-            required_sections: Vec::new(),
-        },
-        // Issue #919 (Decision #3 site #7): reuse the Docs deliverable shape but
-        // with **empty `required_sections`** so the docs section gate is not
-        // imposed — Authoring completion is accept-tier only (present + non-empty
-        // + min length + softened user-named sections).
-        TaskKind::Authoring => TaskDeliverable {
-            kind: DeliverableKind::UsageDocs,
-            role: Some(ArtifactRole::UsageDocs),
-            path: Some(default_docs_path_from_request(request)),
-            required_sections: Vec::new(),
-        },
-    }
-}
-
-/// Issue #920: intentional 1:1 decision point — there is no sensible default
-/// `DeliverableKind` for an unknown role, so this match stays exhaustive (no
-/// `_ =>`). Adding a role MUST compile-error here to force an explicit kind.
-fn deliverable_kind_for_role(role: ArtifactRole) -> DeliverableKind {
-    match role {
-        ArtifactRole::Implementation => DeliverableKind::Code,
-        ArtifactRole::Test => DeliverableKind::Tests,
-        ArtifactRole::UsageDocs => DeliverableKind::UsageDocs,
-        ArtifactRole::Setup => DeliverableKind::Setup,
-        ArtifactRole::DataOutput => DeliverableKind::Data,
-    }
-}
-
-fn default_deliverable_path(role: ArtifactRole) -> Option<&'static str> {
-    match role {
-        ArtifactRole::UsageDocs => Some("README.md"),
-        ArtifactRole::DataOutput => Some("output.csv"),
-        // Issue #920 (Tier A, cascade-free default): roles without a canonical
-        // default artifact path (Implementation / Test / Setup today, and any
-        // future role) have no deterministic default path. A new role inherits
-        // `None` here and only needs a dedicated arm if it gains a convention.
-        _ => None,
-    }
-}
-
-fn default_docs_path_from_request(request: &str) -> String {
+pub(super) fn default_docs_path_from_request(request: &str) -> String {
     explicit_artifact_obligations_from_request(request)
         .into_iter()
         .find(|identity| identity.role == ArtifactRole::UsageDocs)
@@ -2827,7 +2500,7 @@ fn default_docs_path_from_request(request: &str) -> String {
         .unwrap_or_else(|| "README.md".to_string())
 }
 
-fn required_doc_sections_from_request(request: &str) -> Vec<String> {
+pub(super) fn required_doc_sections_from_request(request: &str) -> Vec<String> {
     if let Some(sections) = explicit_required_sections_list_from_request(request) {
         return sections;
     }
@@ -3161,7 +2834,10 @@ fn research_report_artifact_intended(request: &str, lower: &str) -> bool {
 /// `output_verb && report_noun` co-occurrence can no longer be satisfied by a
 /// file NAME. A genuine no-path request (`Research ... and draft a report`,
 /// where `draft`/`report` are real words) is unmasked and still fires.
-fn research_report_artifact_intended_with_scan(scan: &OutputContextScan, request: &str) -> bool {
+pub(super) fn research_report_artifact_intended_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> bool {
     // Issue #922 (PR2-001): an explicit "do not edit / read-only" instruction
     // must never be turned into a file-edit report obligation, even if the
     // request also asks for a "report". Fail closed → stays answer-only, and the
@@ -3323,7 +2999,10 @@ fn research_report_output_path_from_request_with_scan(
 /// Issue #922 (P5 / DD3 / DR4-001): the report artifact path for a research
 /// obligation — the output-context path if present, else the `report.md`
 /// default. Never stores a raw/unadmitted path.
-fn research_report_path_from_request_with_scan(scan: &OutputContextScan, request: &str) -> String {
+pub(super) fn research_report_path_from_request_with_scan(
+    scan: &OutputContextScan,
+    request: &str,
+) -> String {
     research_report_output_path_from_request_with_scan(scan, request)
         .unwrap_or_else(|| "report.md".to_string())
 }
@@ -3342,7 +3021,7 @@ pub(super) fn report_intended_research(request: &str) -> bool {
             .contains(&ArtifactRole::UsageDocs)
 }
 
-fn required_research_sections_from_request(request: &str) -> Vec<String> {
+pub(super) fn required_research_sections_from_request(request: &str) -> Vec<String> {
     let lower = request.to_ascii_lowercase();
     let mut sections = vec!["findings".to_string(), "sources".to_string()];
     push_section_if(
@@ -3360,7 +3039,7 @@ fn required_research_sections_from_request(request: &str) -> Vec<String> {
 /// repair packets. `push_section_if` dedups; the four fixed calls cap the result
 /// at four labels (DR4-003). The empty fallback is `checklist` (the core), which
 /// is harmless because the core is mandatory regardless.
-fn required_ops_sections_from_request(request: &str) -> Vec<String> {
+pub(super) fn required_ops_sections_from_request(request: &str) -> Vec<String> {
     let lower = request.to_ascii_lowercase();
     let mut sections = Vec::new();
     use super::verifier::OpsSection;
@@ -3633,7 +3312,7 @@ fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
     )
 }
 
-fn explicit_path_with_data_extension(request: &str) -> Option<String> {
+pub(super) fn explicit_path_with_data_extension(request: &str) -> Option<String> {
     let scan = OutputContextScan::new(request);
     explicit_path_with_data_extension_with_scan(&scan, request)
 }
@@ -4381,7 +4060,7 @@ pub(super) fn request_asks_for_data_output_artifact_with_scan(
     request_explicitly_requests_standalone_data_artifact_with_scan(scan, request)
 }
 
-fn inferred_docs_obligations_from_request(
+pub(super) fn inferred_docs_obligations_from_request(
     request: &str,
     lower: &str,
     required_artifacts: &[ArtifactRole],
@@ -4409,7 +4088,7 @@ fn inferred_docs_obligations_from_request(
 /// ops keywords), so gating on `request_asks_for_ops_task` leaves setup-only
 /// completion to the Setup evidence / SetupBootstrap path (DR3-003). Path falls
 /// back to a literal `runbook.md` (validated in the ctor, DR4-001).
-fn inferred_ops_obligations_from_request(
+pub(super) fn inferred_ops_obligations_from_request(
     request: &str,
     lower: &str,
     task_kind: TaskKind,
@@ -4535,7 +4214,7 @@ fn default_ops_runbook_path_from_request(request: &str) -> String {
 }
 
 /// Issue #937 (DS3-001): scan-threaded variant called from `from_request`.
-fn inferred_data_obligations_from_request_with_scan(
+pub(super) fn inferred_data_obligations_from_request_with_scan(
     scan: &OutputContextScan,
     request: &str,
 ) -> Vec<ArtifactObligation> {
@@ -4702,7 +4381,7 @@ pub(super) fn explicit_artifact_obligations_from_request(request: &str) -> Vec<A
 
 /// Issue #937 (DS3-001): scan-threaded variant. The DataOutput identity gate
 /// reuses the single mask for `data_path_has_output_context` per path candidate.
-fn explicit_artifact_obligations_from_request_with_scan(
+pub(super) fn explicit_artifact_obligations_from_request_with_scan(
     scan: &OutputContextScan,
     request: &str,
 ) -> Vec<ArtifactObligation> {
@@ -5082,7 +4761,7 @@ fn data_path_has_output_context(request: &str, path: &str) -> bool {
 /// fabricates a DataOutput obligation, while `...output.csvを生成してください`
 /// stays an obligation via the JP `生成` after-window marker (#921). The
 /// `input.jsonl` input-filename drop is preserved.
-fn data_path_has_output_context_with_scan(scan: &OutputContextScan, path: &str) -> bool {
+pub(super) fn data_path_has_output_context_with_scan(scan: &OutputContextScan, path: &str) -> bool {
     let masked = scan.lower_masked.as_str();
     let lower = scan.lower.as_str();
     let path_lower = path.to_ascii_lowercase();
