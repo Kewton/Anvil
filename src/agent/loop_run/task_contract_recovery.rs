@@ -120,8 +120,63 @@ fn finalize_recovery_action(
     contract: &super::task_contract::TaskContract,
     action: super::task_contract::ArtifactRecoveryAction,
 ) -> super::task_contract::ArtifactRecoveryAction {
+    let action = align_recovery_action_with_contract(contract, action);
     super::post_tool_reconciliation::emit_post_tool_reconciliation(agent, contract, &action);
     action
+}
+
+fn align_recovery_action_with_contract(
+    contract: &super::task_contract::TaskContract,
+    action: super::task_contract::ArtifactRecoveryAction,
+) -> super::task_contract::ArtifactRecoveryAction {
+    match action {
+        super::task_contract::ArtifactRecoveryAction::Continue {
+            missing,
+            target_hint,
+        } => {
+            let role = target_hint
+                .as_ref()
+                .map(|hint| hint.role)
+                .or_else(|| missing.first().copied());
+            super::task_contract::ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint: align_target_hint_with_contract(contract, role, target_hint),
+            }
+        }
+        super::task_contract::ArtifactRecoveryAction::RepairArtifact { target_hint } => {
+            let role = target_hint.as_ref().map(|hint| hint.role);
+            super::task_contract::ArtifactRecoveryAction::RepairArtifact {
+                target_hint: align_target_hint_with_contract(contract, role, target_hint),
+            }
+        }
+        other => other,
+    }
+}
+
+fn align_target_hint_with_contract(
+    contract: &super::task_contract::TaskContract,
+    role: Option<super::task_contract::ArtifactRole>,
+    target_hint: Option<super::task_contract::RecoveryTargetHint>,
+) -> Option<super::task_contract::RecoveryTargetHint> {
+    let role = role?;
+    let identities = contract.required_identities_for_role(role);
+    let Some(identity) = identities.first() else {
+        return target_hint;
+    };
+    if target_hint
+        .as_ref()
+        .is_some_and(|hint| hint.role == role && hint.path == identity.path)
+    {
+        return target_hint;
+    }
+    Some(super::task_contract::RecoveryTargetHint {
+        role,
+        path: identity.path.clone(),
+        reason: format!(
+            "required deliverable obligation is still missing: {}",
+            super::task_contract::obligation_report_label(identity)
+        ),
+    })
 }
 
 pub(super) fn record_obligation_diagnostic_attempt_for_action(
@@ -308,6 +363,7 @@ mod tests {
     use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
     use crate::agent::loop_run::commands::test_agent_with_config;
     use crate::agent::loop_run::completion_evidence::{CompletionEvidence, RepoEditCategory};
+    use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
     use crate::agent::loop_run::task_contract::{
         ArtifactRecoveryAction, ArtifactRole, RecoveryTargetHint, TaskContract, TaskKind,
     };
@@ -413,6 +469,89 @@ mod tests {
                 } if missing == &vec![ArtifactRole::Test] && path == "tests/index.test.js"
             ),
             "preflight-rejected tests must stay in Test repair instead of completion-probe RunVerifier: {action:?}"
+        );
+    }
+
+    #[test]
+    fn post_tool_recovery_action_keeps_profile_test_identity_over_rust_family_hint() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum): return minimum when value is below minimum, maximum when value is above maximum, otherwise value. Use Python unittest and verify with python -m unittest discover -s tests. Do not create README, package.json, Cargo.toml, or setup files.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        std::fs::write(
+            agent.work_root.join("Cargo.toml"),
+            "[package]\nname = \"ambient-rust-manifest\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("math_utils.py"),
+            "def clamp(value, minimum, maximum):\n    return max(minimum, min(value, maximum))\n",
+        )
+        .unwrap();
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["setup","docs"],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"explicit Python code and unittest files"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract
+                .required_identities_for_role(ArtifactRole::Test)
+                .first()
+                .map(|identity| identity.path.as_str()),
+            Some("tests/test_math_utils.py")
+        );
+
+        let scope = super::super::workspace_access::current_workspace_scope(&agent);
+        agent
+            .turn_edited_relative_paths
+            .insert("math_utils.py".to_string());
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::RepoEdit {
+                category: RepoEditCategory::Impl,
+                count: 1,
+                path: Some("math_utils.py".to_string()),
+            });
+        let recorded = agent.artifact_ledger.record_repo_edit_event(
+            &LedgerAdmissionContext::new(&agent.work_root, &scope),
+            "math_utils.py".to_string(),
+            ArtifactRole::Implementation,
+            true,
+        );
+        assert!(recorded.is_some(), "implementation edit must be recorded");
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 1);
+        let ArtifactRecoveryAction::Continue {
+            missing,
+            target_hint: Some(target_hint),
+        } = action
+        else {
+            panic!("expected missing test recovery action, got {action:?}");
+        };
+        assert_eq!(missing, vec![ArtifactRole::Test]);
+        assert_eq!(target_hint.role, ArtifactRole::Test);
+        assert_eq!(target_hint.path, "tests/test_math_utils.py");
+        assert_eq!(
+            target_hint.reason,
+            "required deliverable obligation is still missing: role=test, kind=file, path=tests/test_math_utils.py"
         );
     }
 

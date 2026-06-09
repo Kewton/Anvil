@@ -12,7 +12,7 @@ use super::project_profile::{
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, ObjectiveDeliverableKind, ObjectiveEvidenceKind,
     ProjectIntent, ProjectLanguage, ProjectShape, TaskContract, TaskKind, VerificationRequirement,
-    preferred_runner_for_language,
+    preferred_runner_for_language, role_from_repo_edit,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +151,34 @@ fn source_deliverable_has_mixed_objective_roles(required: &[ArtifactRole]) -> bo
         .any(|role| matches!(role, ArtifactRole::UsageDocs | ArtifactRole::DataOutput))
 }
 
+fn source_deliverable_has_unforbidden_mixed_objective_roles(
+    profile: &ProjectProfileConfirmation,
+    first_pass: &TaskContract,
+) -> bool {
+    first_pass
+        .objective_contract()
+        .required_deliverables
+        .iter()
+        .any(|role| {
+            matches!(role, ArtifactRole::UsageDocs | ArtifactRole::DataOutput)
+                && !first_pass.forbidden_artifacts.contains(role)
+                && !profile_forbids_role(profile, *role)
+        })
+}
+
+fn profile_forbids_role(profile: &ProjectProfileConfirmation, role: ArtifactRole) -> bool {
+    profile
+        .forbidden_artifacts
+        .iter()
+        .any(|forbidden| match (forbidden, role) {
+            (ForbiddenArtifact::SourceCode, ArtifactRole::Implementation) => true,
+            (ForbiddenArtifact::Tests, ArtifactRole::Test) => true,
+            (ForbiddenArtifact::Setup, ArtifactRole::Setup) => true,
+            (ForbiddenArtifact::Docs, ArtifactRole::UsageDocs) => true,
+            _ => false,
+        })
+}
+
 fn profile_conflicts_with_first_pass_objective(
     profile: &ProjectProfileConfirmation,
     first_pass: &TaskContract,
@@ -163,13 +191,14 @@ fn profile_conflicts_with_first_pass_objective(
         return false;
     }
     if profile_deliverable == ObjectiveDeliverableKind::SourceFiles {
-        if source_deliverable_has_mixed_objective_roles(&objective.required_deliverables) {
+        if source_deliverable_has_unforbidden_mixed_objective_roles(profile, first_pass) {
             return true;
         }
-        return !matches!(
-            objective.deliverable_kind,
-            ObjectiveDeliverableKind::SourceFiles
-        );
+        return !first_pass_has_source_compatible_roles(first_pass)
+            && !matches!(
+                objective.deliverable_kind,
+                ObjectiveDeliverableKind::SourceFiles
+            );
     }
 
     if profile_deliverable != ObjectiveDeliverableKind::SourceFiles
@@ -186,6 +215,10 @@ fn profile_conflicts_with_first_pass_objective(
 }
 
 fn first_pass_requires_code_setup_or_test(first_pass: &TaskContract) -> bool {
+    first_pass_has_source_compatible_roles(first_pass)
+}
+
+fn first_pass_has_source_compatible_roles(first_pass: &TaskContract) -> bool {
     first_pass.required_artifacts.iter().any(|role| {
         matches!(
             role,
@@ -369,14 +402,23 @@ fn artifact_obligations(
     profile: &ProjectProfileConfirmation,
     required_role: Option<ArtifactRole>,
 ) -> Vec<ArtifactObligation> {
-    let Some(role) = required_role else {
+    let Some(fallback_role) = required_role else {
         return Vec::new();
     };
     profile
         .primary_artifacts
         .iter()
-        .map(|path| ArtifactObligation::file(role, path.as_str()))
+        .filter_map(|path| {
+            let role = artifact_role_for_profile_path(path, fallback_role);
+            (!profile_forbids_role(profile, role))
+                .then(|| ArtifactObligation::file(role, path.as_str()))
+        })
         .collect()
+}
+
+fn artifact_role_for_profile_path(path: &str, fallback_role: ArtifactRole) -> ArtifactRole {
+    let category = super::completion_evidence::classify_repo_edit_path(std::path::Path::new(path));
+    role_from_repo_edit(category).unwrap_or(fallback_role)
 }
 
 #[cfg(test)]
@@ -601,6 +643,101 @@ npm test
         assert_eq!(
             project_profile_adoption_decision(Some(&profile), &first_pass),
             ProjectProfileAdoptionDecision::RejectContradictoryObjective
+        );
+    }
+
+    #[test]
+    fn source_profile_can_resolve_forbidden_docs_drift_for_python_tdd() {
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum): return minimum when value is below minimum, maximum when value is above maximum, otherwise value. Use Python unittest and verify with python -m unittest discover -s tests. Do not create README, package.json, Cargo.toml, or setup files.";
+        let first_pass = TaskContract::from_request(request);
+        assert!(
+            first_pass
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "fixture should exercise first-pass docs drift: {:?}",
+            first_pass.required_artifacts
+        );
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["setup","docs"],
+                "evidence_kind":"test_run",
+                "needs_environment_setup":false,
+                "preferred_runner":"python -m unittest discover -s tests",
+                "confidence":1.0,
+                "reason":"explicit Python code and unittest files"
+            }"#,
+        )
+        .expect("profile");
+        assert!(
+            profile
+                .forbidden_artifacts
+                .iter()
+                .any(|artifact| matches!(artifact, ForbiddenArtifact::Docs)),
+            "docs drift is recoverable only when the profile also forbids docs"
+        );
+
+        assert_eq!(
+            project_profile_adoption_decision(Some(&profile), &first_pass),
+            ProjectProfileAdoptionDecision::Adopt
+        );
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract
+                .required_identities_for_role(ArtifactRole::Test)
+                .first()
+                .map(|identity| identity.path.as_str()),
+            Some("tests/test_math_utils.py")
+        );
+        assert!(
+            !contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "profile adoption should remove forbidden docs drift"
+        );
+    }
+
+    #[test]
+    fn source_profile_projects_primary_paths_to_typed_artifact_roles() {
+        let request = "Create math_utils.py and tests/test_math_utils.py only. Use Python unittest and verify with python -m unittest discover -s tests. Do not create README or setup files.";
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"python",
+                "shape":"library",
+                "deliverable_kind":"code",
+                "primary_artifacts":["math_utils.py","tests/test_math_utils.py"],
+                "forbidden_artifacts":["setup","docs"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":1.0,
+                "reason":"explicit Python files"
+            }"#,
+        )
+        .expect("profile");
+
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+        assert_eq!(
+            contract
+                .required_identities_for_role(ArtifactRole::Implementation)
+                .iter()
+                .map(|identity| identity.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["math_utils.py"]
+        );
+        assert_eq!(
+            contract
+                .required_identities_for_role(ArtifactRole::Test)
+                .iter()
+                .map(|identity| identity.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tests/test_math_utils.py"]
         );
     }
 

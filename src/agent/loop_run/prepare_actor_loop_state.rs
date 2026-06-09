@@ -141,10 +141,11 @@ pub(super) fn prepare_actor_loop_turn_state(agent: &mut Agent) -> Option<TaskCon
             super::task_contract::ArtifactRecoveryAction::Continue { .. }
                 | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. }
         ) {
-            super::set_artifact_recovery_target::set_artifact_recovery_target_for_action(
+            super::set_artifact_recovery_target::set_artifact_recovery_target_for_action_with_contract(
                 agent,
                 &initial_action,
                 0,
+                Some(contract),
             );
         }
     }

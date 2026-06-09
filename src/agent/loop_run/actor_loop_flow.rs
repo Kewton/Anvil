@@ -1504,10 +1504,11 @@ fn sync_post_tool_contract_recovery_target(
     match action {
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
         | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. } => {
-            super::set_artifact_recovery_target::set_artifact_recovery_target_for_action(
+            super::set_artifact_recovery_target::set_artifact_recovery_target_for_action_with_contract(
                 agent,
                 &action,
                 args.contract_completion_retries.saturating_add(1),
+                Some(contract),
             );
         }
         super::task_contract::ArtifactRecoveryAction::RunVerifier => {
@@ -2198,7 +2199,11 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
             task_contract_action: pre_model_task_contract_action.clone(),
         },
     );
-    sync_pre_model_task_contract_recovery_target(agent, pre_model_task_contract_action.as_ref());
+    sync_pre_model_task_contract_recovery_target(
+        agent,
+        args.task_contract,
+        pre_model_task_contract_action.as_ref(),
+    );
     let recovery_owner = RecoveryOwner::from_control_action(
         &loop_control_action,
         pre_model_task_contract_action.as_ref(),
@@ -2216,6 +2221,7 @@ pub(super) fn build_actor_loop_pre_reply_control_state(
 
 fn sync_pre_model_task_contract_recovery_target(
     agent: &mut Agent,
+    contract: Option<&super::task_contract::TaskContract>,
     action: Option<&super::task_contract::ArtifactRecoveryAction>,
 ) {
     let Some(
@@ -2230,8 +2236,8 @@ fn sync_pre_model_task_contract_recovery_target(
         .as_ref()
         .map(|target| target.attempt.saturating_add(1))
         .unwrap_or(1);
-    super::set_artifact_recovery_target::set_artifact_recovery_target_for_action(
-        agent, action, attempt,
+    super::set_artifact_recovery_target::set_artifact_recovery_target_for_action_with_contract(
+        agent, action, attempt, contract,
     );
 }
 
@@ -2474,10 +2480,11 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         .clone()
         .or_else(|| super::task_contract_recovery::task_contract_recovery_target(agent, &decision))
         .and_then(|hint| {
-            super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint(
+            super::set_artifact_recovery_target::set_artifact_recovery_target_from_hint_with_contract(
                 agent,
                 hint,
                 (*args.contract_completion_retries).saturating_add(1),
+                Some(args.contract),
             )
         });
     if task_contract_continue_requires_tool_recovery(
@@ -2512,10 +2519,11 @@ pub(super) fn handle_actor_loop_task_contract_continue_action(
         agent
             .controller_policy_ledger
             .record(ControllerRecoveryStrategy::DeterministicFallback);
-        super::set_artifact_recovery_target::set_artifact_recovery_target_for_decision(
+        super::set_artifact_recovery_target::set_artifact_recovery_target_for_decision_with_contract(
             agent,
             &decision,
             (*args.contract_completion_retries).saturating_add(1),
+            Some(args.contract),
         );
         let scaffold_note = "[Task Contract] Deterministic fallback created framework scaffold files only. Treat them as bootstrap, edit them to satisfy the user's specific request, then update tests and docs before final response.";
         super::message_push::push_system_note(agent, scaffold_note.to_string());

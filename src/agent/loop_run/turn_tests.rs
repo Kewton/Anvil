@@ -2494,8 +2494,8 @@ mod tests {
         // CB2-001 follow-up: confirm the clearing also flows through
         // `set_artifact_recovery_target_from_hint`, since that is the
         // production entry point used by both
-        // `set_artifact_recovery_target_for_decision` and
-        // `set_artifact_recovery_target_for_action`. A Test job is
+        // `set_artifact_recovery_target_for_decision_with_contract` and
+        // `set_artifact_recovery_target_for_action_with_contract`. A Test job is
         // installed via the public entry, then the same entry is
         // called with a non-Test hint. The Test job must be gone.
         use crate::agent::loop_run::commands::test_agent_with_config;
