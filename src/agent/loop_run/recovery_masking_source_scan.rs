@@ -108,7 +108,10 @@ const ALLOWLIST: &[AllowlistedRenderer] = &[
         "verifier_diagnostic_payload.rs",
         "exhausted_repair_targets_payload",
     ),
-    rndr("verifier_orchestration.rs", "verifier_repair_pass_messages"),
+    rndr(
+        "verifier_orchestration.rs",
+        "verifier_repair_pass_messages_with_runtime_capability",
+    ),
     rndr("verifier_orchestration.rs", "verifier_repair_repeated_failure_invariant"),
 ];
 

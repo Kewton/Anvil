@@ -85,8 +85,7 @@ fn repeated_active_attempt<'a>(
     rejected_attempts
         .iter()
         .rev()
-        .filter(|attempt| attempt_matches_active_key(&attempt.key, active_key))
-        .next()
+        .find(|attempt| attempt_matches_active_key(&attempt.key, active_key))
 }
 
 fn attempt_matches_active_key(

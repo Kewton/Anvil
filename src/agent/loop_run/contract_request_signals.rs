@@ -112,8 +112,7 @@ fn dotted_identifier_start_before_paren(before_paren: &str) -> Option<usize> {
 fn last_ascii_word(prefix: &str) -> Option<&str> {
     prefix
         .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .next_back()
+        .rfind(|word| !word.is_empty())
 }
 
 fn lower_contains_file_suffix(lower: &str, suffix: &str) -> bool {

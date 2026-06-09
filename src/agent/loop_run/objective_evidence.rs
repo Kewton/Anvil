@@ -113,7 +113,7 @@ fn observed_command_heads(command: &str) -> Vec<&str> {
         .flat_map(|line| line.split("&&"))
         .flat_map(|segment| segment.split("||"))
         .filter_map(|segment| {
-            let head = segment.trim_start().split_whitespace().next()?;
+            let head = segment.split_whitespace().next()?;
             (!head.is_empty()).then_some(head)
         })
         .collect()

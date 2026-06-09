@@ -253,14 +253,15 @@ fn repair_failure_clusters_tail_fields(raw: &str) -> Option<serde_json::Value> {
             }
             b'{' => brace_depth = brace_depth.saturating_add(1),
             b'}' => brace_depth = brace_depth.saturating_sub(1),
-            b',' if bracket_depth == 1 && brace_depth == 0 => {
-                if starts_with_report_field_tail(&raw[index + 1..]) {
-                    let mut repaired = String::with_capacity(raw.len() + 1);
-                    repaired.push_str(&raw[..index]);
-                    repaired.push(']');
-                    repaired.push_str(&raw[index..]);
-                    return serde_json::from_str(&repaired).ok();
-                }
+            b',' if bracket_depth == 1
+                && brace_depth == 0
+                && starts_with_report_field_tail(&raw[index + 1..]) =>
+            {
+                let mut repaired = String::with_capacity(raw.len() + 1);
+                repaired.push_str(&raw[..index]);
+                repaired.push(']');
+                repaired.push_str(&raw[index..]);
+                return serde_json::from_str(&repaired).ok();
             }
             _ => {}
         }

@@ -71,6 +71,7 @@ pub(super) fn emit_loop_phase(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_loop_phase_payload(
     session_id: &str,
     turn_index: usize,

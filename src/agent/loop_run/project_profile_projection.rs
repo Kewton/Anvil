@@ -169,16 +169,15 @@ fn source_deliverable_has_unforbidden_mixed_objective_roles(
 }
 
 fn profile_forbids_role(profile: &ProjectProfileConfirmation, role: ArtifactRole) -> bool {
-    profile
-        .forbidden_artifacts
-        .iter()
-        .any(|forbidden| match (forbidden, role) {
-            (ForbiddenArtifact::SourceCode, ArtifactRole::Implementation) => true,
-            (ForbiddenArtifact::Tests, ArtifactRole::Test) => true,
-            (ForbiddenArtifact::Setup, ArtifactRole::Setup) => true,
-            (ForbiddenArtifact::Docs, ArtifactRole::UsageDocs) => true,
-            _ => false,
-        })
+    profile.forbidden_artifacts.iter().any(|forbidden| {
+        matches!(
+            (forbidden, role),
+            (ForbiddenArtifact::SourceCode, ArtifactRole::Implementation)
+                | (ForbiddenArtifact::Tests, ArtifactRole::Test)
+                | (ForbiddenArtifact::Setup, ArtifactRole::Setup)
+                | (ForbiddenArtifact::Docs, ArtifactRole::UsageDocs)
+        )
+    })
 }
 
 fn profile_effectively_forbids_role(

@@ -934,7 +934,7 @@ fn domain_term_matches_excerpt(term: &str, lower_excerpt: &str) -> bool {
 }
 
 fn domain_term_tail(term: &str) -> Option<&str> {
-    term.rsplit(|ch| matches!(ch, '.' | '/' | '-' | '_'))
+    term.rsplit(['.', '/', '-', '_'])
         .find(|part| !part.is_empty())
 }
 
@@ -1584,7 +1584,7 @@ fn extract_first_behavior_goal_sentence(
     normalized: &str,
     predicate: impl Fn(&str) -> bool,
 ) -> Option<BoundedLabelWithExcerpt> {
-    for sentence in split_into_sentences(&normalized) {
+    for sentence in split_into_sentences(normalized) {
         let trimmed = sentence.trim();
         if trimmed.is_empty() || looks_like_negation(trimmed) {
             continue;

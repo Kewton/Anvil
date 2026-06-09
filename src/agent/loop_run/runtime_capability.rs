@@ -391,7 +391,7 @@ fn dependency_constraints(
 }
 
 fn is_known_manifest_path(path: &str) -> bool {
-    KNOWN_MANIFEST_PATHS.iter().any(|known| path == *known)
+    KNOWN_MANIFEST_PATHS.contains(&path)
 }
 
 fn push_unique(out: &mut Vec<String>, value: String) {

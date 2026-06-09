@@ -131,6 +131,47 @@ pub(super) struct RepairTargetDecision {
     pub(super) candidate_audit: Vec<RepairTargetCandidateAudit>,
 }
 
+impl RepairTargetDecision {
+    pub(super) fn new(
+        failure_class: Option<FailureClass>,
+        target_role: Option<ArtifactRole>,
+        target_hint: Option<RecoveryTargetHint>,
+        authority: RepairTargetAuthority,
+        operator_candidates: Vec<OperatorId>,
+        candidate_audit: Vec<RepairTargetCandidateAudit>,
+    ) -> Self {
+        Self {
+            failure_class,
+            target_role,
+            target_hint,
+            authority,
+            operator_candidates,
+            candidate_audit,
+        }
+    }
+
+    pub(super) fn target_hint(&self) -> Option<RecoveryTargetHint> {
+        self.target_hint.clone()
+    }
+
+    pub(super) fn to_json_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "failure_class": self.failure_class.map(FailureClass::as_str),
+            "target_role": self.target_role.map(ArtifactRole::label),
+            "target_path": self.target_hint.as_ref().map(|hint| hint.path.as_str()),
+            "authority": self.authority.as_str(),
+            "operator_candidates": self.operator_candidates
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            "candidate_audit": self.candidate_audit
+                .iter()
+                .map(RepairTargetCandidateAudit::to_json_value)
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,46 +215,5 @@ mod tests {
                 RepairTargetCandidateStatus::Unavailable,
             ]
         );
-    }
-}
-
-impl RepairTargetDecision {
-    pub(super) fn new(
-        failure_class: Option<FailureClass>,
-        target_role: Option<ArtifactRole>,
-        target_hint: Option<RecoveryTargetHint>,
-        authority: RepairTargetAuthority,
-        operator_candidates: Vec<OperatorId>,
-        candidate_audit: Vec<RepairTargetCandidateAudit>,
-    ) -> Self {
-        Self {
-            failure_class,
-            target_role,
-            target_hint,
-            authority,
-            operator_candidates,
-            candidate_audit,
-        }
-    }
-
-    pub(super) fn target_hint(&self) -> Option<RecoveryTargetHint> {
-        self.target_hint.clone()
-    }
-
-    pub(super) fn to_json_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "failure_class": self.failure_class.map(FailureClass::as_str),
-            "target_role": self.target_role.map(ArtifactRole::label),
-            "target_path": self.target_hint.as_ref().map(|hint| hint.path.as_str()),
-            "authority": self.authority.as_str(),
-            "operator_candidates": self.operator_candidates
-                .iter()
-                .map(|id| id.as_str())
-                .collect::<Vec<_>>(),
-            "candidate_audit": self.candidate_audit
-                .iter()
-                .map(RepairTargetCandidateAudit::to_json_value)
-                .collect::<Vec<_>>(),
-        })
     }
 }

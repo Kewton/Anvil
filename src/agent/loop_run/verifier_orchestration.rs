@@ -2582,9 +2582,7 @@ fn maybe_recover_unbound_verifier_binding(
         .unwrap_or(TaskKind::Coding);
     let plan =
         super::evidence_binding::evidence_binding_plan_after_scaffold(task_kind, &agent.work_root);
-    let Some(recovery_job_kind) = plan.recovery_job_kind() else {
-        return None;
-    };
+    let recovery_job_kind = plan.recovery_job_kind()?;
     let failed_checks: Vec<_> = plan.failed_checks().collect();
     log_llm_event(
         "agent.evidence_binding.failed",

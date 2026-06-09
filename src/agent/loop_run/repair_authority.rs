@@ -155,13 +155,13 @@ fn validate_dependency_or_config_target(brief: &RepairBrief) -> Result<(), Repai
 fn validate_generated_test_expectation_authority(
     brief: &RepairBrief,
 ) -> Result<(), RepairPlanRejection> {
-    if brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation {
-        if matches!(
+    if brief.allowed_change_kind == AllowedChangeKind::FixGeneratedTestExpectation
+        && matches!(
             brief.source_of_truth,
             SourceOfTruth::Unknown | SourceOfTruth::Ambiguous | SourceOfTruth::LlmGeneratedTest
-        ) {
-            return Err(RepairPlanRejection::TestExpectationWithoutAuthority);
-        }
+        )
+    {
+        return Err(RepairPlanRejection::TestExpectationWithoutAuthority);
     }
 
     Ok(())
