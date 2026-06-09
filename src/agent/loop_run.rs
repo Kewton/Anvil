@@ -407,6 +407,7 @@ mod read_target_helpers;
 // `pub(super)` limited / no facade re-export (DR3-001).
 mod loop_phase;
 mod loop_state;
+mod model_request_phase;
 mod turn_helpers;
 mod turn_state;
 // Assistant-reply retry state types extracted from `turn.rs` (parent

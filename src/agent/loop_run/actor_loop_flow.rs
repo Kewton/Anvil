@@ -3430,33 +3430,15 @@ pub(super) fn run_actor_loop(
         // semantics agree (previously the per-turn index was passed,
         // which collapsed all same-turn re-emits to a single value).
         super::active_job_emit::emit_active_job_selected_if_changed(agent, iter_count as u32);
-        emit_loop_phase(
-            agent,
-            LoopPhase::ModelRequestPrepared,
-            LoopPhaseTransition::Enter,
-            last_iter,
-            serde_json::json!({
-                "contract_present": task_contract.is_some(),
-            }),
-        );
 
         let (reply, recovery_dispatch_gate, missing_verifier_setup_turn, recovery_owner) =
-            match drive_actor_loop_pre_reply_phase(
+            match super::model_request_phase::run_model_request_phase(
                 agent,
-                ActorLoopPreReplyArgs {
+                super::model_request_phase::ModelRequestPhaseArgs {
                     before_snapshot: &before_snapshot,
                     accumulated: &accumulated,
                     task_contract: task_contract.as_ref(),
-                    repo_edit_calls_made_this_turn: &mut loop_state.repo_edit_calls_made_this_turn,
-                    contract_verification_retries: &mut loop_state.contract_verification_retries,
-                    contract_verifier_repair_edit_count: &mut loop_state
-                        .contract_verifier_repair_edit_count,
-                    repo_change_retries: &mut loop_state.repo_change_retries,
-                    verifier_repair_retries: &mut loop_state.verifier_repair_retries,
-                    task_contract_verify_commands_collected: &mut loop_state
-                        .task_contract_verify_commands_collected,
-                    task_contract_verifier_passed_in_loop: &mut loop_state
-                        .task_contract_verifier_passed_in_loop,
+                    loop_state: &mut loop_state,
                     framework_app_fallback_materialized: &mut framework_app_fallback_materialized,
                     action_expectation,
                     stream_output,
@@ -3490,19 +3472,6 @@ pub(super) fn run_actor_loop(
                     recovery_owner,
                 ),
             };
-        emit_loop_phase(
-            agent,
-            LoopPhase::ModelRequestPrepared,
-            LoopPhaseTransition::Exit,
-            last_iter,
-            serde_json::json!({
-                "missing_verifier_setup_turn": missing_verifier_setup_turn,
-                "recovery_job_kind": recovery_owner
-                    .recovery_job_kind()
-                    .map(|kind| kind.as_str())
-                    .unwrap_or("None"),
-            }),
-        );
 
         // Boundary 2: right after the Ollama response completes. This is
         // the AC-10 checkpoint — mid-flight cancel is out of scope.
