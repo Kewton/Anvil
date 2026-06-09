@@ -1,7 +1,8 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
+use super::contract_request_signals::contains_implementation_file_hint;
+#[cfg(test)]
 use super::contract_request_signals::{
     contains_callable_signature_hint, contains_dotted_callable_change_action,
-    contains_implementation_file_hint, negated_artifact_list_contains,
 };
 use super::project_profile::ProjectProfileConfirmation;
 use super::project_profile_projection::{
@@ -82,9 +83,11 @@ use super::task_contract_recovery_planning::{
 pub(super) use super::task_contract_request_inference::{
     SETUP_MARKER_NEEDLES_ASCII, SETUP_MARKER_NEEDLES_JP, infer_intent, infer_project_language,
     infer_project_shape, infer_verification_requirement, lower_contains_setup_token_unnegated,
-    mentions_stack_as_build_target, preferred_runner_for_language, project_intent_confidence,
-    request_asks_for_data_task, request_asks_for_ops_task, request_asks_for_research_task,
+    preferred_runner_for_language, project_intent_confidence, request_asks_for_code_work,
+    request_asks_for_data_task, request_asks_for_implementation_artifact,
+    request_asks_for_ops_task, request_asks_for_research_task, request_asks_for_test_artifact,
     request_contains_jp_setup_marker_unnegated, request_has_explicit_coding_subject,
+    request_negates_test_artifacts,
 };
 pub(super) use super::task_contract_taxonomy::{
     ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, DeliverableSpec,
@@ -2219,251 +2222,6 @@ fn request_asks_for_authoring_task(
     let prose_output_shaped = matches!(intent, TaskIntent::Explain) || keyword;
     let trigger_b = explicit_output && prose_output_shaped;
     trigger_a || trigger_b
-}
-
-/// Returns `true` when the request asks for any code-work signal
-/// (production / edit action over a recognizable code subject) **without**
-/// regard to support-artifact context.
-///
-/// This is the canonical input to [`infer_intent`]'s `Install` rule:
-///
-/// ```text
-/// Install ⇔ asks_for_setup && !request_asks_for_code_work
-/// ```
-///
-/// Equivalent to calling
-/// [`request_asks_for_implementation_artifact`] with all three support
-/// flags forced to `false`. Exposed at `pub(super)` so the behavior
-/// schema extractor (`required_behavior::extract_required_artifacts`)
-/// can use the *same* rule when deciding whether Setup is required —
-/// keeping the two paths in lockstep (CB-004).
-pub(super) fn request_asks_for_code_work(request: &str, lower: &str) -> bool {
-    request_asks_for_implementation_artifact(request, lower, false, false, false)
-}
-
-pub(super) fn request_asks_for_implementation_artifact(
-    request: &str,
-    lower: &str,
-    asks_for_tests: bool,
-    asks_for_usage_docs: bool,
-    asks_for_setup: bool,
-) -> bool {
-    // Issue #922 (PR2-001 / remediation): an explicit "do not edit / read-only"
-    // instruction negates implementation artifacts too (you cannot create code
-    // if no file may change). Reusing the WorkMode-classifier SSOT keeps the two
-    // axes consistent (the classifier already routes such requests to
-    // AnswerOnly), so a research request like "produce a report … but do not
-    // edit any files" classifies as Research, not Coding, and then stays
-    // answer-only with no obligation.
-    if request_negates_implementation_artifacts(request, lower)
-        || crate::modes::plan_act::request_has_explicit_no_edit(request)
-    {
-        return false;
-    }
-    let support_artifact_requested = asks_for_tests || asks_for_usage_docs || asks_for_setup;
-    let production_action = contains_any(
-        lower,
-        &[
-            "create",
-            "build",
-            "develop",
-            "implement",
-            "scaffold",
-            "fix",
-            "refactor",
-        ],
-    ) || contains_dotted_callable_change_action(lower)
-        || contains_any(request, &["作成", "開発", "実装", "修正", "構築"]);
-    let edit_action = production_action
-        || contains_any(lower, &["write", "add", "update", "modify", "edit"])
-        || contains_any(request, &["追加", "追記", "更新", "変更", "編集"]);
-    let code_subject = contains_any(
-        lower,
-        &[
-            "crud",
-            "endpoint",
-            "server",
-            "backend",
-            "frontend",
-            "web app",
-            "browser app",
-            "cli",
-            "component",
-            "service",
-            "module",
-            "library",
-            "crate",
-            "package",
-            "tool",
-            "program",
-            "command",
-        ],
-    ) || contains_ascii_token(lower, "api")
-        || contains_any(
-            request,
-            &[
-                "エンドポイント",
-                "サーバ",
-                "バックエンド",
-                "フロントエンド",
-                "アプリ",
-                "機能",
-                "ライブラリ",
-                "クレート",
-                "パッケージ",
-                "ツール",
-                "コマンド",
-            ],
-        )
-        || mentions_stack_as_build_target(request, lower)
-        || contains_implementation_file_hint(lower)
-        || contains_callable_signature_hint(lower);
-
-    if support_artifact_requested {
-        production_action && code_subject
-    } else {
-        edit_action
-    }
-}
-
-pub(super) fn request_asks_for_test_artifact(request: &str, lower: &str) -> bool {
-    if request_negates_test_artifacts(request, lower) {
-        return false;
-    }
-    contains_any(
-        lower,
-        &[
-            "npm test",
-            "cargo test",
-            "node --test",
-            "test code",
-            "unit test",
-            "unit tests",
-            "integration test",
-            "integration tests",
-            "tests",
-            "test file",
-            "add test",
-            "write test",
-            "implement test",
-            "create test",
-            "pytest",
-            "unittest",
-            "spec",
-        ],
-    ) || contains_any(
-        request,
-        &[
-            "テストコード",
-            "テストを実装",
-            "テストも実装",
-            "テストを追加",
-            "テストも追加",
-            "テストを書く",
-            "テストを作成",
-            "テスト作成",
-        ],
-    )
-}
-
-pub(super) fn request_negates_test_artifacts(request: &str, lower: &str) -> bool {
-    if negated_artifact_list_contains(lower, &["tests", "test files", "test file"]) {
-        return true;
-    }
-    contains_any(
-        lower,
-        &[
-            "do not create code or tests",
-            "do not create tests or code",
-            "do not create source code or tests",
-            "do not create tests or source code",
-            "do not create source code, tests",
-            "do not write code or tests",
-            "do not write source code or tests",
-            "do not add code or tests",
-            "do not add source code or tests",
-            "do not implement code or tests",
-            "do not implement source code or tests",
-            "do not create tests",
-            "do not add tests",
-            "do not write tests",
-            "do not implement tests",
-            "don't create tests",
-            "don't add tests",
-            "don't write tests",
-            "no tests",
-            "no test files",
-            "without tests",
-            "skip tests",
-            "avoid tests",
-            "tests are not required",
-            "tests not required",
-            "test files are not required",
-        ],
-    ) || contains_any(
-        request,
-        &[
-            "テスト不要",
-            "テストは不要",
-            "テストなし",
-            "テスト無し",
-            "テストを作成しない",
-            "テストは作成しない",
-            "テストを追加しない",
-            "テストは追加しない",
-            "テストを書かない",
-            "テストは禁止",
-        ],
-    )
-}
-
-pub(super) fn request_negates_implementation_artifacts(request: &str, lower: &str) -> bool {
-    contains_any(
-        lower,
-        &[
-            "do not create code or tests",
-            "do not create tests or code",
-            "do not create code",
-            "do not create source code",
-            "do not add code",
-            "do not add source code",
-            "do not write code",
-            "do not write source code",
-            "do not implement code",
-            "do not change code",
-            "do not modify code",
-            "don't create code",
-            "don't create source code",
-            "don't add code",
-            "don't write code",
-            "don't write source code",
-            "don't implement code",
-            "no code",
-            "no source code",
-            "no code changes",
-            "without code",
-            "without source code",
-            "without code changes",
-            "code changes are not required",
-            "code changes not required",
-        ],
-    ) || contains_any(
-        request,
-        &[
-            "コード不要",
-            "コードは不要",
-            "コードなし",
-            "コード無し",
-            "コードを作成しない",
-            "コードは作成しない",
-            "コードを追加しない",
-            "コードは追加しない",
-            "コードを書かない",
-            "コード変更なし",
-            "コード変更は不要",
-            "実装しない",
-        ],
-    )
 }
 
 pub(super) fn request_asks_for_usage_docs(request: &str, lower: &str) -> bool {
