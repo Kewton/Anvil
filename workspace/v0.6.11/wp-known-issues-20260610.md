@@ -51,3 +51,14 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - FastAPI failed 2/2 with `repair_exhausted` around 422 response mismatches, indicating API request-schema repair is still weak.
 - Research and ops tasks stopped at `missing_repo_edits` without creating artifacts, showing non-coding admission can still inherit edit-obligation pressure incorrectly.
 - Rust NDJSON failed because generated tests imported `merge_ndjson_lines` from the wrong root path; Rust source/test binding drift remains.
+
+## WP11: 50-Run Improvement Claim
+
+- WP11 reached 38/50 pass and 35/50 high-quality in the focused matrix. This is a strong success-rate signal, but not a clean unconditional improvement claim because false-done and false-missing remain.
+- PAM was attempted for 25 rows, but Photon context/evaluate failed and no memory was injected. PAM effectiveness was not actually measured.
+- Python sales recovered strongly at 8/8, and Node JSON/CSV remained stable at 10/10 combined.
+- TOML was externally valid 6/6, but only 4/6 high-quality because internal terminal states still reported verifier-missing or repair-exhausted. Evidence binding remains misaligned with real artifact success.
+- Data CSV failed 0/2 with `done` despite schema/content mismatch. Typed schema evidence is needed for data tasks.
+- Research and ops failed 0/2 each with `missing_repo_edits`; non-coding objective admission still carries coding/edit-obligation leakage.
+- FastAPI failed 5/6 with `repair_exhausted` around 422 request/response mismatches. Generic API schema reconciliation remains a high-priority repair gap.
+- Python markdown had one externally passing row with `repair_exhausted`; terminal/evidence alignment remains incomplete even when artifacts pass local checks.
