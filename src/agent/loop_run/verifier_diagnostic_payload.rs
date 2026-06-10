@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use super::api_contract_expectation::api_contract_payload_value_from_request;
 use super::failure_packet::FailurePacket;
 use super::repair_authority::AuthorityEvidence;
 use super::repair_framework_findings::{
@@ -40,6 +41,8 @@ pub(super) fn build_verifier_diagnostic_payload(
         input.active_request,
         input.behavior_projection.is_some(),
     );
+    let api_contract =
+        api_contract_payload_value_from_request(input.active_request, &context.output_excerpt);
     let payload = serde_json::json!({
         "task_summary": compact_verifier_failure_text(input.active_request, 500),
         "command": context.command,
@@ -64,6 +67,7 @@ pub(super) fn build_verifier_diagnostic_payload(
         "safe_file_excerpts": safe_file_excerpts_payload(input.diagnostic_excerpts),
         "framework_findings": framework_findings_payload(input.framework_findings),
         "behavior_contract": behavior_contract,
+        "api_contract": api_contract,
     });
     serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
 }

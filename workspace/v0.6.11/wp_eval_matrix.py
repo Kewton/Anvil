@@ -384,6 +384,10 @@ def grade_node_csv(root: Path) -> tuple[bool, bool, bool, str]:
     return grade_node_test(root, "tests/csv_to_json.test.js")
 
 
+def grade_node_notes_api(root: Path) -> tuple[bool, bool, bool, str]:
+    return grade_node_test(root, "tests/notes_api.test.js")
+
+
 def grade_fastapi(root: Path) -> tuple[bool, bool, bool, str]:
     if not (root / "app.py").exists():
         return False, False, False, "app.py missing"
@@ -459,6 +463,14 @@ CASES: dict[str, Case] = {
         setup_empty,
         grade_fastapi,
         ("app.py", "tests/"),
+    ),
+    "node_notes_api": Case(
+        "node_notes_api",
+        "coding",
+        "Create src/notes_api.js and tests/notes_api.test.js for a small HTTP-style notes API module. Model GET /notes with getNotes() returning an empty list. Model POST /notes with createNote(requestJson) accepting a JSON object with title and body and returning the created note with id=1, title, and body. Use node:test and verify with node --test tests/notes_api.test.js. Do not install packages or create README files.",
+        setup_empty,
+        grade_node_notes_api,
+        ("package.json", "src/", "tests/"),
     ),
     "python_markdown": Case(
         "python_markdown",

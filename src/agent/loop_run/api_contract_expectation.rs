@@ -78,6 +78,129 @@ impl ApiContractExpectation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApiContractObservationKind {
+    RequestSchemaMismatch,
+    StatusMismatch,
+    ResponseShapeMismatch,
+    ApiContractMismatch,
+}
+
+impl ApiContractObservationKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::RequestSchemaMismatch => "request_schema_mismatch",
+            Self::StatusMismatch => "status_mismatch",
+            Self::ResponseShapeMismatch => "response_shape_mismatch",
+            Self::ApiContractMismatch => "api_contract_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApiRequestBindingIssue {
+    JsonBodyFieldsNotBound,
+}
+
+impl ApiRequestBindingIssue {
+    fn label(self) -> &'static str {
+        match self {
+            Self::JsonBodyFieldsNotBound => "json_body_fields_not_bound",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApiExpectedStatusPolicy {
+    Unspecified,
+    Explicit(u16),
+}
+
+impl ApiExpectedStatusPolicy {
+    fn summary(self) -> String {
+        match self {
+            Self::Unspecified => "status_policy=unspecified".to_string(),
+            Self::Explicit(status) => format!("status_policy=explicit:{status}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ApiStatusObservation {
+    pub(super) policy: ApiExpectedStatusPolicy,
+    pub(super) expected_from_diagnostic: Option<u16>,
+    pub(super) observed_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ApiContractObservation {
+    pub(super) kind: ApiContractObservationKind,
+    pub(super) method: HttpMethod,
+    pub(super) path: String,
+    pub(super) request_json_fields: Vec<String>,
+    pub(super) request_binding_issue: Option<ApiRequestBindingIssue>,
+    pub(super) status: Option<ApiStatusObservation>,
+}
+
+impl ApiContractObservation {
+    fn summary(&self) -> String {
+        let mut parts = vec![
+            format!("method={}", self.method.label()),
+            format!("path={}", mask(&self.path)),
+        ];
+        if !self.request_json_fields.is_empty() {
+            parts.push(format!(
+                "request_json_body_fields={}",
+                self.request_json_fields
+                    .iter()
+                    .map(|field| mask(field))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ));
+        }
+        if let Some(issue) = self.request_binding_issue {
+            parts.push(format!("request_binding_issue={}", issue.label()));
+        }
+        if let Some(status) = &self.status {
+            parts.push(status.policy.summary());
+            if let Some(expected) = status.expected_from_diagnostic {
+                parts.push(format!("diagnostic_expected_status={expected}"));
+            }
+            if let Some(observed) = status.observed_status {
+                parts.push(format!("observed_status={observed}"));
+            }
+        }
+        parts.join(",")
+    }
+
+    fn repair_hint(&self) -> Option<String> {
+        match self.kind {
+            ApiContractObservationKind::RequestSchemaMismatch
+                if self.request_binding_issue
+                    == Some(ApiRequestBindingIssue::JsonBodyFieldsNotBound) =>
+            {
+                Some(
+                    "bind_declared_fields_from_json_request_body_object_not_query_or_form_params"
+                        .to_string(),
+                )
+            }
+            ApiContractObservationKind::StatusMismatch => {
+                match self.status.as_ref().map(|status| status.policy) {
+                    Some(ApiExpectedStatusPolicy::Unspecified) => Some(
+                        "do_not_invent_exact_http_status_when_expected_status_unspecified"
+                            .to_string(),
+                    ),
+                    Some(ApiExpectedStatusPolicy::Explicit(status)) => {
+                        Some(format!("honor_explicit_http_status_{status}"))
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 pub(super) fn extract_api_contract_expectations(request: &str) -> Vec<ApiContractExpectation> {
     let lower = request.to_ascii_lowercase();
     let mut occurrences = method_path_occurrences(&lower);
@@ -126,31 +249,131 @@ pub(super) fn api_contract_delta_summary(
     diagnostic: &str,
 ) -> Option<String> {
     let expected = api_contract_summary(expectations)?;
+    let observation = observe_api_contract_mismatch(expectations, diagnostic)?;
+    let hint = observation
+        .repair_hint()
+        .map(|hint| format!("; repair_hint={hint}"))
+        .unwrap_or_default();
+    Some(format!(
+        "kind={}; expected={expected}; observed={}{hint}",
+        observation.kind.label(),
+        observation.summary(),
+    ))
+}
+
+pub(super) fn api_contract_payload_value_from_request(
+    request: &str,
+    diagnostic: &str,
+) -> serde_json::Value {
+    let expectations = extract_api_contract_expectations(request);
+    api_contract_payload_value(&expectations, diagnostic)
+}
+
+pub(super) fn api_contract_payload_value(
+    expectations: &[ApiContractExpectation],
+    diagnostic: &str,
+) -> serde_json::Value {
+    let Some(expectations_summary) = api_contract_summary(expectations) else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "expectations": expectations_summary,
+        "observation": api_contract_delta_summary(expectations, diagnostic),
+    })
+}
+
+pub(super) fn observe_api_contract_mismatch(
+    expectations: &[ApiContractExpectation],
+    diagnostic: &str,
+) -> Option<ApiContractObservation> {
     let lower = diagnostic.to_ascii_lowercase();
-    let kind = if lower.contains("422") || lower.contains("unprocessable entity") {
-        "request_schema_mismatch"
-    } else if lower.contains("status") || lower.contains("status_code") {
-        "status_mismatch"
-    } else if lower.contains("response") || lower.contains("json") {
-        "response_shape_mismatch"
+    let kind = api_observation_kind(&lower);
+    let expectation = select_api_observation_expectation(expectations, kind)?;
+    let request_binding_issue = (kind == ApiContractObservationKind::RequestSchemaMismatch
+        && !expectation.request_json_fields.is_empty())
+    .then_some(ApiRequestBindingIssue::JsonBodyFieldsNotBound);
+    let status = observe_api_status(expectations, diagnostic, kind);
+    Some(ApiContractObservation {
+        kind,
+        method: expectation.method,
+        path: expectation.path.clone(),
+        request_json_fields: expectation.request_json_fields.clone(),
+        request_binding_issue,
+        status,
+    })
+}
+
+fn api_observation_kind(lower_diagnostic: &str) -> ApiContractObservationKind {
+    if lower_diagnostic.contains("422") || lower_diagnostic.contains("unprocessable entity") {
+        ApiContractObservationKind::RequestSchemaMismatch
+    } else if lower_diagnostic.contains("status") || lower_diagnostic.contains("status_code") {
+        ApiContractObservationKind::StatusMismatch
+    } else if lower_diagnostic.contains("response") || lower_diagnostic.contains("json") {
+        ApiContractObservationKind::ResponseShapeMismatch
     } else {
-        "api_contract_mismatch"
-    };
-    let status_unspecified = expectations
-        .iter()
-        .all(|expectation| expectation.expected_status.is_none());
-    let hint = if kind == "request_schema_mismatch"
-        && expectations
+        ApiContractObservationKind::ApiContractMismatch
+    }
+}
+
+fn select_api_observation_expectation(
+    expectations: &[ApiContractExpectation],
+    kind: ApiContractObservationKind,
+) -> Option<&ApiContractExpectation> {
+    match kind {
+        ApiContractObservationKind::RequestSchemaMismatch => expectations
             .iter()
-            .any(|expectation| !expectation.request_json_fields.is_empty())
+            .find(|expectation| !expectation.request_json_fields.is_empty())
+            .or_else(|| expectations.first()),
+        ApiContractObservationKind::StatusMismatch => expectations
+            .iter()
+            .find(|expectation| expectation.expected_status.is_some())
+            .or_else(|| expectations.first()),
+        ApiContractObservationKind::ResponseShapeMismatch => expectations
+            .iter()
+            .find(|expectation| !expectation.response_fields.is_empty())
+            .or_else(|| expectations.first()),
+        ApiContractObservationKind::ApiContractMismatch => expectations.first(),
+    }
+}
+
+fn observe_api_status(
+    expectations: &[ApiContractExpectation],
+    diagnostic: &str,
+    kind: ApiContractObservationKind,
+) -> Option<ApiStatusObservation> {
+    let codes = status_codes_from_text(diagnostic);
+    if kind != ApiContractObservationKind::StatusMismatch && !codes.contains(&422) {
+        return None;
+    }
+    let policy = expectations
+        .iter()
+        .find_map(|expectation| expectation.expected_status)
+        .map(ApiExpectedStatusPolicy::Explicit)
+        .unwrap_or(ApiExpectedStatusPolicy::Unspecified);
+    Some(ApiStatusObservation {
+        policy,
+        expected_from_diagnostic: codes.first().copied(),
+        observed_status: codes
+            .get(1)
+            .copied()
+            .or_else(|| codes.contains(&422).then_some(422)),
+    })
+}
+
+fn status_codes_from_text(text: &str) -> Vec<u16> {
+    let mut codes = Vec::new();
+    for token in text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() == 3)
     {
-        "; repair_hint=bind_declared_fields_from_json_request_body_object_not_query_or_form_params"
-    } else if kind == "status_mismatch" && status_unspecified {
-        "; repair_hint=do_not_invent_exact_http_status_when_expected_status_unspecified"
-    } else {
-        ""
-    };
-    Some(format!("kind={kind}; expected={expected}{hint}"))
+        if let Ok(status) = token.parse::<u16>()
+            && (100..=599).contains(&status)
+            && !codes.contains(&status)
+        {
+            codes.push(status);
+        }
+    }
+    codes
 }
 
 pub(super) fn api_contract_artifact_directed_context(
@@ -444,6 +667,94 @@ mod tests {
     }
 
     #[test]
+    fn observes_post_body_field_binding_issue() {
+        let expectations = extract_api_contract_expectations(
+            "POST /notes accepting JSON with title and body returning id.",
+        );
+        let observation = observe_api_contract_mismatch(
+            &expectations,
+            "AssertionError: POST /notes returned 422 Unprocessable Entity",
+        )
+        .expect("api observation");
+
+        assert_eq!(
+            observation.kind,
+            ApiContractObservationKind::RequestSchemaMismatch
+        );
+        assert_eq!(observation.method, HttpMethod::Post);
+        assert_eq!(observation.path, "/notes");
+        assert_eq!(observation.request_json_fields, vec!["title", "body"]);
+        assert_eq!(
+            observation.request_binding_issue,
+            Some(ApiRequestBindingIssue::JsonBodyFieldsNotBound)
+        );
+        assert_eq!(
+            observation
+                .status
+                .as_ref()
+                .and_then(|status| status.observed_status),
+            Some(422)
+        );
+    }
+
+    #[test]
+    fn observes_unspecified_status_without_forcing_exact_created_status() {
+        let expectations = extract_api_contract_expectations(
+            "POST /notes accepting JSON with title and body returning the created note with id.",
+        );
+        let observation = observe_api_contract_mismatch(
+            &expectations,
+            "AssertionError: expected status 201 but got 200",
+        )
+        .expect("api observation");
+
+        assert_eq!(observation.kind, ApiContractObservationKind::StatusMismatch);
+        let status = observation.status.as_ref().expect("status observation");
+        assert_eq!(status.policy, ApiExpectedStatusPolicy::Unspecified);
+        assert_eq!(status.expected_from_diagnostic, Some(201));
+        assert_eq!(status.observed_status, Some(200));
+        assert_eq!(
+            observation.repair_hint().as_deref(),
+            Some("do_not_invent_exact_http_status_when_expected_status_unspecified")
+        );
+    }
+
+    #[test]
+    fn observes_explicit_status_policy_when_declared() {
+        let expectations = extract_api_contract_expectations(
+            "POST /items accepting JSON with name and price returns status 201 with id.",
+        );
+        let observation = observe_api_contract_mismatch(
+            &expectations,
+            "AssertionError: expected status 201 but got 200",
+        )
+        .expect("api observation");
+
+        assert_eq!(observation.kind, ApiContractObservationKind::StatusMismatch);
+        assert_eq!(
+            observation.status.as_ref().map(|status| status.policy),
+            Some(ApiExpectedStatusPolicy::Explicit(201))
+        );
+        assert_eq!(
+            observation.repair_hint().as_deref(),
+            Some("honor_explicit_http_status_201")
+        );
+    }
+
+    #[test]
+    fn payload_value_from_request_carries_typed_observation() {
+        let payload = api_contract_payload_value_from_request(
+            "Implement POST /notes accepting JSON with title and body returning id.",
+            "AssertionError: POST /notes returned 422 Unprocessable Entity",
+        );
+
+        assert_eq!(
+            payload["observation"].as_str().unwrap_or_default(),
+            "kind=request_schema_mismatch; expected=method=POST,path=/notes,request_body=json,request_binding=json_body_object,request_json_body_fields=title|body,expected_status=unspecified,response_fields=id; observed=method=POST,path=/notes,request_json_body_fields=title|body,request_binding_issue=json_body_fields_not_bound,status_policy=unspecified,diagnostic_expected_status=422,observed_status=422; repair_hint=bind_declared_fields_from_json_request_body_object_not_query_or_form_params"
+        );
+    }
+
+    #[test]
     fn emits_status_drift_delta_when_status_was_not_declared() {
         let expectations = extract_api_contract_expectations(
             "POST /notes accepting JSON with title and body returning the created note with id.",
@@ -458,6 +769,10 @@ mod tests {
         assert!(delta.contains("expected_status=unspecified"), "{delta}");
         assert!(
             delta.contains("do_not_invent_exact_http_status_when_expected_status_unspecified"),
+            "{delta}"
+        );
+        assert!(
+            delta.contains("observed=method=POST,path=/notes"),
             "{delta}"
         );
     }

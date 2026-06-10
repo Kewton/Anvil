@@ -1329,6 +1329,46 @@ mod inner {
     }
 
     #[test]
+    fn verifier_repair_pass_prompt_carries_api_contract_observation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(
+            work_root.join("app.py"),
+            "from fastapi import FastAPI\napp = FastAPI()\n@app.post('/notes')\ndef create_note(title: str, body: str):\n    return {'id': 1, 'title': title, 'body': body}\n",
+        )
+        .unwrap();
+        let mut context = verifier_context_for("app.py");
+        context.output_excerpt =
+            "FAILED tests/test_app.py::test_post_note - assert 422 == 200".to_string();
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let messages = verifier_repair_pass_messages(
+            work_root,
+            &context,
+            &target,
+            "Implement POST /notes accepting JSON with title and body returning id.",
+            None,
+        )
+        .unwrap();
+        let payload = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(payload.contains("\"api_contract\""));
+        assert!(payload.contains("request_schema_mismatch"));
+        assert!(payload.contains("request_binding_issue=json_body_fields_not_bound"));
+        assert!(payload.contains("bind declared JSON body fields"));
+    }
+
+    #[test]
     fn verifier_repair_pass_prompt_surfaces_observed_expected_pairs_as_hard_boundary() {
         let temp = tempdir().unwrap();
         let work_root = temp.path();
@@ -3925,6 +3965,47 @@ class TestItems:\n\
             prompt.contains("pytest_unittest_lifecycle_mismatch"),
             "pytest lifecycle mismatch must be surfaced as a structured finding: {prompt}"
         );
+    }
+
+    #[test]
+    fn verifier_diagnostic_payload_includes_api_contract_observation() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        std::fs::write(
+            work_root.join("app.py"),
+            "from fastapi import FastAPI\napp = FastAPI()\n@app.post('/notes')\ndef create_note(title: str, body: str):\n    return {'id': 1, 'title': title, 'body': body}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(work_root.join("tests")).unwrap();
+        std::fs::write(
+            work_root.join("tests").join("test_app.py"),
+            "def test_post_note(): pass\n",
+        )
+        .unwrap();
+        let context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            "FAILED tests/test_app.py::test_post_note - assert 422 == 200\n",
+            &["app.py".to_string(), "tests/test_app.py".to_string()],
+            1,
+            None,
+        );
+
+        let messages = verifier_diagnostic_messages(
+            &work_root,
+            &context,
+            "Implement POST /notes accepting JSON with title and body returning id.",
+            None,
+        );
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(prompt.contains("\"api_contract\""));
+        assert!(prompt.contains("request_schema_mismatch"));
+        assert!(prompt.contains("request_binding_issue=json_body_fields_not_bound"));
     }
 
     #[test]
