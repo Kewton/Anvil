@@ -34,3 +34,10 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 
 - No new behavior regression was observed in docs, Python, or hard Node smoke.
 - `run_actor_loop` remains large. WP8 only moved phase-event construction and prepared-tool counter mutation; future slices should keep extracting local transition/data builders instead of adding semantic task branches.
+
+## WP9: TurnState Ownership
+
+- The CLI rejects `--resume` with `--oneshot` / `-p`; two-turn smoke used the same state directory and workdir without `--fresh-session` to continue the latest session.
+- Docs -> coding continued session passed, but coding -> data continued session failed: the data-only prompt was admitted into a coding/test-evidence path, wrote `tests/test_main.py`, and stopped at `safe_stop_verifier_missing` without creating `output.csv`.
+- This is not caused by verifier event dedup storage. It indicates remaining semantic/session contamination where current-turn ObjectiveContract construction can still inherit stale coding/evidence pressure from prior turns or existing project artifacts.
+- Fixing the coding -> data failure should happen at objective contract admission / deliverable obligation construction, not by adding another path-specific reset field or CSV string rule.

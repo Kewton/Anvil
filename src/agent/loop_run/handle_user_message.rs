@@ -60,13 +60,6 @@ pub(super) fn handle_user_message(
     // production hook sets it exactly once at the repair_exhausted chokepoint
     // (per-turn rule, co-located reset group).
     agent.last_contract_conflict_job_this_turn = None;
-    // Issue #661 Task 2.6 (DR1-004 / DR1-010): per-turn dedup state for
-    // `agent.verifier.invoked` (digest of canonical-JSON payload) and
-    // per-turn cap for `agent.verifier.external_import_rejected`. Reset
-    // adjacent to `last_active_job_selection = None` so the per-turn
-    // reset group stays co-located. Producers land in iteration-3.
-    agent.last_verifier_invoked_payload_digest = None;
-    agent.external_import_rejected_emitted_this_turn = false;
     // Issue #459: Tester Skill per-turn cap counter (DR1-004). Mirror of
     // the reminder cap above; reset so a fresh user turn can fire the
     // Tester once even if the previous turn already did.

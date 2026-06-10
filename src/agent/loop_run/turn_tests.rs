@@ -2804,14 +2804,9 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Issue #661 Task 2.6: Agent per-turn dedup state initialisation +
-    // reset contract (DR1-004 / DR1-010 / DR2-005). The two fields live on
-    // Agent only (NOT SessionSnapshot), are initialised to neutral values
-    // by `Agent::new`, and must be reset to those neutral values at the
-    // head of every `handle_user_message`. Iteration-3 wires the producers
-    // (`agent.verifier.invoked` emit + `external_import_rejected` cap); the
-    // contract enforced here is "fields exist, start clean, reset on turn
-    // boundary".
+    // Issue #661 / WP9: verifier event dedup state is turn-local. The fields
+    // live on `TurnState` only (NOT SessionSnapshot), start clean via
+    // `Agent::new`, and reset through `TurnState::reset_dedup_state`.
     // ----------------------------------------------------------------
 
     #[test]
@@ -2821,11 +2816,14 @@ mod tests {
 
         let (agent, _temp) = test_agent_with_config(Config::default());
         assert!(
-            agent.last_verifier_invoked_payload_digest.is_none(),
+            agent
+                .turn_state
+                .last_verifier_invoked_payload_digest
+                .is_none(),
             "fresh Agent must start with last_verifier_invoked_payload_digest = None"
         );
         assert!(
-            !agent.external_import_rejected_emitted_this_turn,
+            !agent.turn_state.external_import_rejected_emitted,
             "fresh Agent must start with external_import_rejected_emitted_this_turn = false"
         );
     }
@@ -2841,19 +2839,21 @@ mod tests {
         let (mut agent, _temp) = test_agent_with_config(Config::default());
 
         // Populate the dedup state as if a previous turn already emitted.
-        agent.last_verifier_invoked_payload_digest = Some([0xAB; 8]);
-        agent.external_import_rejected_emitted_this_turn = true;
+        agent.turn_state.last_verifier_invoked_payload_digest = Some([0xAB; 8]);
+        agent.turn_state.external_import_rejected_emitted = true;
 
-        // Apply the same reset block `handle_user_message` head runs.
-        agent.last_verifier_invoked_payload_digest = None;
-        agent.external_import_rejected_emitted_this_turn = false;
+        // Apply the same TurnState reset `handle_user_message` head runs.
+        agent.turn_state.reset_dedup_state();
 
         assert!(
-            agent.last_verifier_invoked_payload_digest.is_none(),
+            agent
+                .turn_state
+                .last_verifier_invoked_payload_digest
+                .is_none(),
             "handle_user_message head reset must clear last_verifier_invoked_payload_digest"
         );
         assert!(
-            !agent.external_import_rejected_emitted_this_turn,
+            !agent.turn_state.external_import_rejected_emitted,
             "handle_user_message head reset must clear external_import_rejected_emitted_this_turn"
         );
     }
@@ -4444,7 +4444,12 @@ mod tests {
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        assert!(agent.last_verifier_invoked_payload_digest.is_none());
+        assert!(
+            agent
+                .turn_state
+                .last_verifier_invoked_payload_digest
+                .is_none()
+        );
         let snapshot = make_verifier_invoked_snapshot_cargo(&["tests/test_a.rs"]);
         let emitted = super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
             &mut agent, &snapshot,
@@ -4453,7 +4458,12 @@ mod tests {
             emitted,
             "first emit of the turn must return true (None -> Some transition)"
         );
-        assert!(agent.last_verifier_invoked_payload_digest.is_some());
+        assert!(
+            agent
+                .turn_state
+                .last_verifier_invoked_payload_digest
+                .is_some()
+        );
     }
 
     #[test]
@@ -4467,7 +4477,7 @@ mod tests {
                 &mut agent, &snapshot
             )
         );
-        let digest_after_first = agent.last_verifier_invoked_payload_digest;
+        let digest_after_first = agent.turn_state.last_verifier_invoked_payload_digest;
         let again = super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
             &mut agent, &snapshot,
         );
@@ -4476,7 +4486,7 @@ mod tests {
             "identical snapshot in the same turn must be deduped (returns false)"
         );
         assert_eq!(
-            agent.last_verifier_invoked_payload_digest, digest_after_first,
+            agent.turn_state.last_verifier_invoked_payload_digest, digest_after_first,
             "dedup must not rotate the stored digest"
         );
     }
@@ -4493,7 +4503,7 @@ mod tests {
                 &mut agent, &snap_a
             )
         );
-        let digest_a = agent.last_verifier_invoked_payload_digest;
+        let digest_a = agent.turn_state.last_verifier_invoked_payload_digest;
         assert!(
             super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
                 &mut agent, &snap_b
@@ -4501,14 +4511,14 @@ mod tests {
             "different bound_artifacts must re-emit"
         );
         assert_ne!(
-            digest_a, agent.last_verifier_invoked_payload_digest,
+            digest_a, agent.turn_state.last_verifier_invoked_payload_digest,
             "different snapshot must rotate the stored digest"
         );
     }
 
     #[test]
     fn issue661_emit_agent_verifier_invoked_per_turn_reset_re_emits_same_snapshot() {
-        // Mirrors `handle_user_message` head reset: `last_verifier_invoked_payload_digest = None;`.
+        // Mirrors `handle_user_message` head reset through `TurnState::reset_dedup_state`.
         // Same snapshot in the new turn must emit again (per-turn rule).
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
@@ -4520,7 +4530,7 @@ mod tests {
             )
         );
         // Simulate per-turn reset.
-        agent.last_verifier_invoked_payload_digest = None;
+        agent.turn_state.reset_dedup_state();
         assert!(
             super::super::emit_verifier_events::emit_agent_verifier_invoked_if_new(
                 &mut agent, &snapshot
@@ -4559,6 +4569,7 @@ mod tests {
         // make without an emit capture seam is determinism: re-running
         // the same input via the same path yields the same stored value.
         let stored = agent
+            .turn_state
             .last_verifier_invoked_payload_digest
             .expect("digest stored after emit");
         assert_eq!(
@@ -4581,7 +4592,7 @@ mod tests {
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
-        assert!(!agent.external_import_rejected_emitted_this_turn);
+        assert!(!agent.turn_state.external_import_rejected_emitted);
         let emitted = super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_pythonpath_rejected",
@@ -4590,7 +4601,7 @@ mod tests {
             false,
         );
         assert!(emitted, "first emit of the turn must return true");
-        assert!(agent.external_import_rejected_emitted_this_turn);
+        assert!(agent.turn_state.external_import_rejected_emitted);
     }
 
     #[test]
@@ -4622,9 +4633,9 @@ mod tests {
 
     #[test]
     fn issue661_emit_external_import_rejected_per_turn_reset_re_emits() {
-        // Mirrors `handle_user_message` head reset:
-        // `external_import_rejected_emitted_this_turn = false;`. After
-        // reset the next emit must return true.
+        // Mirrors `handle_user_message` head reset through
+        // `TurnState::reset_dedup_state`. After reset the next emit must
+        // return true.
         use super::super::commands::test_agent_with_config;
         use crate::config::Config;
         let (mut agent, _temp) = test_agent_with_config(Config::default());
@@ -4635,7 +4646,7 @@ mod tests {
             1,
             false,
         ));
-        agent.external_import_rejected_emitted_this_turn = false;
+        agent.turn_state.reset_dedup_state();
         let again = super::super::emit_verifier_events::emit_agent_verifier_external_import_rejected_if_first(&mut agent,
             "python3",
             "external_pythonpath_rejected",

@@ -1053,7 +1053,7 @@ fn path_is_known_safe_external(p: &Path, work_root_canon: &Path) -> bool {
 /// pre-spawn `agent.verifier.invoked` event の構造化 snapshot。`turn.rs`
 /// facade と `verifier_skill::execute_with_invocation_observer` が
 /// `run_structured` 直前にこの snapshot を構築し、emit ownership は
-/// `Agent::last_verifier_invoked_payload_digest` を持つ caller に閉じる
+/// `TurnState::last_verifier_invoked_payload_digest` を持つ caller に閉じる
 /// (DR1-005 emit ownership facade plumbing)。
 ///
 /// 型レベル invariant:

@@ -10,6 +10,8 @@ pub(super) struct TurnState {
     pub(super) job_report_dedup_keys: std::collections::HashSet<String>,
     pub(super) last_behavior_contract_projection_event:
         Option<super::required_behavior::BehaviorProjectionEventKey>,
+    pub(super) last_verifier_invoked_payload_digest: Option<[u8; 8]>,
+    pub(super) external_import_rejected_emitted: bool,
     pub(super) last_pam_decision_this_turn: Option<super::pam_advisory::PamAdvisoryDecision>,
     pub(super) last_pam_unused_reason_this_turn: Option<String>,
 }
@@ -21,6 +23,8 @@ impl TurnState {
             last_active_job_selection: None,
             job_report_dedup_keys: std::collections::HashSet::new(),
             last_behavior_contract_projection_event: None,
+            last_verifier_invoked_payload_digest: None,
+            external_import_rejected_emitted: false,
             last_pam_decision_this_turn: None,
             last_pam_unused_reason_this_turn: None,
         }
@@ -31,6 +35,8 @@ impl TurnState {
         self.last_active_job_selection = None;
         self.job_report_dedup_keys.clear();
         self.last_behavior_contract_projection_event = None;
+        self.last_verifier_invoked_payload_digest = None;
+        self.external_import_rejected_emitted = false;
     }
 
     pub(super) fn reset_pam_state(&mut self) {
@@ -68,6 +74,8 @@ impl TurnState {
             && self.last_active_job_selection.is_none()
             && self.job_report_dedup_keys.is_empty()
             && self.last_behavior_contract_projection_event.is_none()
+            && self.last_verifier_invoked_payload_digest.is_none()
+            && !self.external_import_rejected_emitted
     }
 }
 
@@ -103,6 +111,8 @@ mod tests {
                 fields_used: vec!["behavior_goal"],
             },
         );
+        state.last_verifier_invoked_payload_digest = Some([0xAB; 8]);
+        state.external_import_rejected_emitted = true;
 
         assert!(!state.dedup_state_is_empty());
         state.reset_dedup_state();

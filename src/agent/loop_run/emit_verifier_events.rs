@@ -3,8 +3,8 @@
 //! Hosts the two `agent.verifier.*` event emitters previously sitting on
 //! `impl Agent`. Both apply `mask_payload_inplace` as the final defence
 //! line and respect per-turn dedup / single-shot caps via
-//! `Agent.last_verifier_invoked_payload_digest` and
-//! `Agent.external_import_rejected_emitted_this_turn`.
+//! `TurnState::last_verifier_invoked_payload_digest` and
+//! `TurnState::external_import_rejected_emitted`.
 //!
 //! Entry points (pub(super)):
 //! - `emit_agent_verifier_invoked_if_new` — pre-spawn
@@ -56,10 +56,10 @@ pub(super) fn emit_agent_verifier_invoked_if_new(
     // dedup key matches the post-mask representation log consumers see.
     mask_payload_inplace(&mut payload);
     let digest = compute_payload_digest(&payload);
-    if agent.last_verifier_invoked_payload_digest == Some(digest) {
+    if agent.turn_state.last_verifier_invoked_payload_digest == Some(digest) {
         return false;
     }
-    agent.last_verifier_invoked_payload_digest = Some(digest);
+    agent.turn_state.last_verifier_invoked_payload_digest = Some(digest);
     // log_llm_event masks again — idempotent for already-masked
     // payloads (final defence line invariant).
     log_llm_event("agent.verifier.invoked", payload);
@@ -68,7 +68,7 @@ pub(super) fn emit_agent_verifier_invoked_if_new(
 
 /// Issue #661 iteration-5 Task 7.3: emit
 /// `agent.verifier.external_import_rejected` event subject to per-turn
-/// cap (`external_import_rejected_emitted_this_turn`). Caller passes the
+/// cap (`TurnState::external_import_rejected_emitted`). Caller passes the
 /// already-hashed module hashes + their static source labels so raw paths
 /// never reach the payload (DR4-005).
 ///
@@ -84,10 +84,10 @@ pub(super) fn emit_agent_verifier_external_import_rejected_if_first(
     detected_count: usize,
     detected_truncated: bool,
 ) -> bool {
-    if agent.external_import_rejected_emitted_this_turn {
+    if agent.turn_state.external_import_rejected_emitted {
         return false;
     }
-    agent.external_import_rejected_emitted_this_turn = true;
+    agent.turn_state.external_import_rejected_emitted = true;
     let mut payload = build_agent_verifier_external_import_rejected_payload(
         agent.session_store.session_id(),
         agent.current_turn_index,
