@@ -55,6 +55,70 @@ pub(super) struct EvidenceObservation {
     pub(super) diagnostic_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EvidenceShadowTerminalClass {
+    Success,
+    MissingEvidence,
+    EvidenceFailed,
+    NotObserved,
+}
+
+impl EvidenceShadowTerminalClass {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            EvidenceShadowTerminalClass::Success => "success",
+            EvidenceShadowTerminalClass::MissingEvidence => "missing_evidence",
+            EvidenceShadowTerminalClass::EvidenceFailed => "evidence_failed",
+            EvidenceShadowTerminalClass::NotObserved => "not_observed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EvidenceShadowTerminalProjection {
+    pub(super) class: EvidenceShadowTerminalClass,
+    pub(super) satisfied_evidence_ids: Vec<String>,
+    pub(super) missing_evidence_ids: Vec<String>,
+    pub(super) failed_evidence_ids: Vec<String>,
+}
+
+pub(super) fn shadow_project_evidence_observations(
+    observations: &[EvidenceObservation],
+) -> EvidenceShadowTerminalProjection {
+    let mut satisfied = Vec::new();
+    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    for observation in observations {
+        let id = observation.kind.label().to_string();
+        match observation.status {
+            EvidenceObservationStatus::Passed => push_unique(&mut satisfied, id),
+            EvidenceObservationStatus::Missing => push_unique(&mut missing, id),
+            EvidenceObservationStatus::Failed => push_unique(&mut failed, id),
+        }
+    }
+    let class = if !failed.is_empty() {
+        EvidenceShadowTerminalClass::EvidenceFailed
+    } else if !missing.is_empty() {
+        EvidenceShadowTerminalClass::MissingEvidence
+    } else if !satisfied.is_empty() {
+        EvidenceShadowTerminalClass::Success
+    } else {
+        EvidenceShadowTerminalClass::NotObserved
+    };
+    EvidenceShadowTerminalProjection {
+        class,
+        satisfied_evidence_ids: satisfied,
+        missing_evidence_ids: missing,
+        failed_evidence_ids: failed,
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
 impl EvidenceObservation {
     pub(super) fn passed(
         kind: ObjectiveEvidenceKind,
@@ -420,5 +484,78 @@ mod tests {
             observation.diagnostic_summary.as_deref(),
             Some("command_observation exit_status=2 safety_boundary_passed=true")
         );
+    }
+
+    #[test]
+    fn shadow_projection_marks_success_from_passed_observation() {
+        let observations = vec![EvidenceObservation::passed(
+            ObjectiveEvidenceKind::TestRun,
+            Some(EvidenceRunnerKind::CodingBuildTest),
+            EvidenceObservationSource::Verifier,
+        )];
+
+        let projection = shadow_project_evidence_observations(&observations);
+
+        assert_eq!(projection.class, EvidenceShadowTerminalClass::Success);
+        assert_eq!(projection.class.as_str(), "success");
+        assert_eq!(projection.satisfied_evidence_ids, vec!["test_run"]);
+        assert!(projection.missing_evidence_ids.is_empty());
+        assert!(projection.failed_evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn shadow_projection_marks_missing_without_failure() {
+        let observations = vec![EvidenceObservation::missing(
+            ObjectiveEvidenceKind::ContentAcceptance,
+            None,
+            EvidenceObservationSource::CompletionEvidence,
+            "content evidence absent",
+        )];
+
+        let projection = shadow_project_evidence_observations(&observations);
+
+        assert_eq!(
+            projection.class,
+            EvidenceShadowTerminalClass::MissingEvidence
+        );
+        assert_eq!(projection.missing_evidence_ids, vec!["content_acceptance"]);
+        assert!(projection.failed_evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn shadow_projection_prefers_failed_over_missing() {
+        let observations = vec![
+            EvidenceObservation::missing(
+                ObjectiveEvidenceKind::SchemaCheck,
+                Some(EvidenceRunnerKind::DataSchemaCheck),
+                EvidenceObservationSource::EvidenceRunner,
+                "schema not observed",
+            ),
+            EvidenceObservation::failed(
+                ObjectiveEvidenceKind::TestRun,
+                Some(EvidenceRunnerKind::CodingBuildTest),
+                EvidenceObservationSource::Verifier,
+                "test failed",
+            ),
+        ];
+
+        let projection = shadow_project_evidence_observations(&observations);
+
+        assert_eq!(
+            projection.class,
+            EvidenceShadowTerminalClass::EvidenceFailed
+        );
+        assert_eq!(projection.missing_evidence_ids, vec!["schema_check"]);
+        assert_eq!(projection.failed_evidence_ids, vec!["test_run"]);
+    }
+
+    #[test]
+    fn shadow_projection_marks_not_observed_for_empty_input() {
+        let projection = shadow_project_evidence_observations(&[]);
+
+        assert_eq!(projection.class, EvidenceShadowTerminalClass::NotObserved);
+        assert!(projection.satisfied_evidence_ids.is_empty());
+        assert!(projection.missing_evidence_ids.is_empty());
+        assert!(projection.failed_evidence_ids.is_empty());
     }
 }

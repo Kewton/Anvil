@@ -4635,6 +4635,7 @@ pub(super) fn run_actor_loop(
         record.refresh_evaluation_taxonomy();
         record.refresh_completion_reason();
         record.refresh_terminal_diagnostics();
+        record.refresh_shadow_terminal_projection();
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }

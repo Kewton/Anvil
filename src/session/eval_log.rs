@@ -83,6 +83,12 @@ pub struct EvalRecord {
     /// intentionally unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_diagnostics: Option<TerminalDiagnosticsSummary>,
+    /// RWP-1: shadow projection derived from typed terminal obligations.
+    ///
+    /// This is diagnostic-only. It intentionally does not change
+    /// `final_outcome`, `completion_reason`, or `evaluation_taxonomy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_terminal_projection: Option<ShadowTerminalProjectionSummary>,
     /// Issue #950: distinct controller recovery strategies attempted during
     /// delegated local-LLM persistence. Labels are static controller-owned
     /// strings, never raw commands, paths, tool args, or approval details.
@@ -389,6 +395,19 @@ pub struct TerminalObligationDiagnostic {
     pub detail: String,
 }
 
+/// RWP-1 diagnostic-only terminal projection from typed obligations.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShadowTerminalProjectionSummary {
+    pub class: String,
+    pub current_terminal_class: String,
+    pub conflict: bool,
+    pub satisfied_evidence_ids: Vec<String>,
+    pub missing_evidence_ids: Vec<String>,
+    pub failed_evidence_ids: Vec<String>,
+    pub source: String,
+    pub reason: String,
+}
+
 /// Issue #904: bounded taxonomy for offline quality reports.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EvaluationTaxonomySummary {
@@ -492,6 +511,13 @@ impl EvalRecord {
             "completed objective-bound evidence superseded artifact repair exhaustion",
         );
         refresh_terminal_obligation_indexes(diagnostics);
+        self.refresh_shadow_terminal_projection();
+    }
+
+    pub fn refresh_shadow_terminal_projection(&mut self) {
+        self.shadow_terminal_projection = self.terminal_diagnostics.as_ref().map(|diagnostics| {
+            build_shadow_terminal_projection(&self.final_outcome, diagnostics)
+        });
     }
 
     pub fn mark_artifact_evidence_repair_exhausted(&mut self) {
@@ -702,6 +728,9 @@ pub fn build_eval_record_with_terminal_context(
         verify_commands.len(),
         last_failure_signature,
     ));
+    let shadow_terminal_projection = terminal_diagnostics
+        .as_ref()
+        .map(|diagnostics| build_shadow_terminal_projection(final_outcome, diagnostics));
     let completion_reason = truncate_bytes(
         &completion_reason_for_eval(
             final_outcome,
@@ -749,6 +778,7 @@ pub fn build_eval_record_with_terminal_context(
         photon_canary: 0,
         auto_promote,
         terminal_diagnostics,
+        shadow_terminal_projection,
         recovery_strategy_count: 0,
         recovery_strategies: Vec::new(),
         evaluation_taxonomy,
@@ -1000,6 +1030,104 @@ pub fn build_terminal_diagnostics_with_context(
         verifier_status: verifier_status.to_string(),
         last_failure_signature,
         obligations,
+    }
+}
+
+fn build_shadow_terminal_projection(
+    final_outcome: &str,
+    diagnostics: &TerminalDiagnosticsSummary,
+) -> ShadowTerminalProjectionSummary {
+    let mut satisfied = Vec::new();
+    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    for item in diagnostics
+        .obligations
+        .iter()
+        .filter(|item| is_evidence_obligation(&item.id))
+    {
+        match item.status.as_str() {
+            "satisfied" => push_unique_string(&mut satisfied, item.id.clone()),
+            "unsatisfied" if is_failure_domain(item.failure_domain.as_deref()) => {
+                push_unique_string(&mut failed, item.id.clone())
+            }
+            "unsatisfied" => push_unique_string(&mut missing, item.id.clone()),
+            _ => {}
+        }
+    }
+
+    let class = if !failed.is_empty() {
+        "evidence_failed"
+    } else if !missing.is_empty() {
+        "missing_evidence"
+    } else if diagnostics
+        .obligations
+        .iter()
+        .any(|item| item.id == "repair_convergence" && item.status == "unsatisfied")
+    {
+        "evidence_repair_exhausted"
+    } else if diagnostics
+        .obligations
+        .iter()
+        .any(|item| item.id == "repo_edit" && item.status == "unsatisfied")
+    {
+        "missing_deliverable"
+    } else if !satisfied.is_empty() || diagnostics.classification == "success" {
+        "success"
+    } else {
+        "not_observed"
+    };
+    let current_terminal_class = if final_outcome == "done" {
+        "success"
+    } else {
+        diagnostics.generic_outcome.as_str()
+    };
+    let conflict = (current_terminal_class == "success") != (class == "success");
+    ShadowTerminalProjectionSummary {
+        class: class.to_string(),
+        current_terminal_class: current_terminal_class.to_string(),
+        conflict,
+        satisfied_evidence_ids: satisfied,
+        missing_evidence_ids: missing,
+        failed_evidence_ids: failed,
+        source: "terminal_diagnostics".to_string(),
+        reason: shadow_terminal_reason(class, conflict).to_string(),
+    }
+}
+
+fn is_evidence_obligation(id: &str) -> bool {
+    id.contains("evidence") || id == "artifact_evidence" || id == "command_observation_evidence"
+}
+
+fn is_failure_domain(domain: Option<&str>) -> bool {
+    matches!(
+        domain,
+        Some("verification_failure") | Some("evidence_failure")
+    )
+}
+
+fn shadow_terminal_reason(class: &str, conflict: bool) -> &'static str {
+    match (class, conflict) {
+        ("success", true) => "shadow evidence indicates success while current terminal is non-success",
+        ("success", false) => "typed evidence obligations indicate success",
+        ("missing_evidence", true) => {
+            "shadow evidence indicates missing evidence while current terminal is success"
+        }
+        ("missing_evidence", false) => "typed evidence obligations indicate missing evidence",
+        ("evidence_failed", true) => {
+            "shadow evidence indicates failed evidence while current terminal is success"
+        }
+        ("evidence_failed", false) => "typed evidence obligations indicate failed evidence",
+        ("evidence_repair_exhausted", _) => {
+            "typed repair-convergence obligation is unsatisfied"
+        }
+        ("missing_deliverable", _) => "typed deliverable obligation is unsatisfied",
+        _ => "typed evidence obligations were not observed",
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
     }
 }
 
@@ -1380,6 +1508,18 @@ mod tests {
                 },
                 1,
             )),
+            shadow_terminal_projection: Some(build_shadow_terminal_projection(
+                "done",
+                &build_terminal_diagnostics(
+                    "done",
+                    &ChangedFileClasses {
+                        test: 1,
+                        impl_files: 2,
+                        setup: 0,
+                    },
+                    1,
+                ),
+            )),
             recovery_strategy_count: 0,
             recovery_strategies: Vec::new(),
             evaluation_taxonomy: build_evaluation_taxonomy(
@@ -1443,6 +1583,12 @@ mod tests {
         assert_eq!(rec.final_outcome, "done");
         assert_eq!(rec.completion_reason, "verifier_evidence_satisfied");
         assert_eq!(
+            rec.shadow_terminal_projection
+                .as_ref()
+                .map(|projection| projection.class.as_str()),
+            Some("success")
+        );
+        assert_eq!(
             rec.terminal_diagnostics
                 .as_ref()
                 .map(|d| d.classification.as_str()),
@@ -1460,6 +1606,80 @@ mod tests {
         assert_eq!(
             rec.evaluation_taxonomy.outcome_agreement,
             "external_postcheck_unavailable"
+        );
+    }
+
+    #[test]
+    fn shadow_terminal_projection_marks_failed_evidence_conflict_on_done() {
+        let mut diagnostics = build_terminal_diagnostics(
+            "done",
+            &ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            0,
+        );
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "schema_evidence",
+                "unsatisfied",
+                Some("verification_failure"),
+                "schema mismatch was observed",
+            ),
+        );
+        refresh_terminal_obligation_indexes(&mut diagnostics);
+
+        let projection = build_shadow_terminal_projection("done", &diagnostics);
+
+        assert_eq!(projection.class, "evidence_failed");
+        assert!(projection.conflict);
+        assert_eq!(projection.failed_evidence_ids, vec!["schema_evidence"]);
+    }
+
+    #[test]
+    fn shadow_terminal_projection_marks_missing_evidence() {
+        let diagnostics = build_terminal_diagnostics(
+            "safe_stop_verifier_missing",
+            &ChangedFileClasses {
+                test: 1,
+                impl_files: 1,
+                setup: 0,
+            },
+            0,
+        );
+
+        let projection =
+            build_shadow_terminal_projection("safe_stop_verifier_missing", &diagnostics);
+
+        assert_eq!(projection.class, "missing_evidence");
+        assert!(!projection.conflict);
+        assert_eq!(
+            projection.missing_evidence_ids,
+            vec!["verification_evidence"]
+        );
+    }
+
+    #[test]
+    fn shadow_terminal_projection_marks_success_without_conflict() {
+        let diagnostics = build_terminal_diagnostics(
+            "done",
+            &ChangedFileClasses {
+                test: 1,
+                impl_files: 1,
+                setup: 0,
+            },
+            1,
+        );
+
+        let projection = build_shadow_terminal_projection("done", &diagnostics);
+
+        assert_eq!(projection.class, "success");
+        assert!(!projection.conflict);
+        assert_eq!(
+            projection.satisfied_evidence_ids,
+            vec!["verification_evidence"]
         );
     }
 
