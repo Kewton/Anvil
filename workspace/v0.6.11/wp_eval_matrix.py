@@ -44,6 +44,10 @@ RESULT_FIELDS = [
     "pam_availability",
     "pam_injected_count",
     "pam_unused_reason",
+    "shadow_terminal_class",
+    "shadow_terminal_conflict",
+    "shadow_missing_evidence",
+    "shadow_failed_evidence",
     "notes",
 ]
 
@@ -612,6 +616,17 @@ def pam_availability_from_eval(variant: str, record: dict[str, object]) -> tuple
     return ("disabled", injected_count, unused_reason)
 
 
+def shadow_terminal_from_eval(record: dict[str, object]) -> tuple[str, str, str, str]:
+    shadow = record.get("shadow_terminal_projection")
+    if not isinstance(shadow, dict):
+        return ("unknown", "false", "", "")
+    cls = str(shadow.get("class") or "unknown")
+    conflict = bool_s(bool(shadow.get("conflict")))
+    missing = ",".join(str(item) for item in (shadow.get("missing_evidence_ids") or []))
+    failed = ",".join(str(item) for item in (shadow.get("failed_evidence_ids") or []))
+    return (cls, conflict, missing, failed)
+
+
 def run_one(
     *,
     suite: str,
@@ -728,6 +743,9 @@ def run_one(
     pam_availability, pam_injected_count, pam_unused_reason = pam_availability_from_eval(
         variant, eval_record
     )
+    shadow_class, shadow_conflict, shadow_missing, shadow_failed = shadow_terminal_from_eval(
+        eval_record
+    )
 
     return {
         "suite": suite,
@@ -751,6 +769,10 @@ def run_one(
         "pam_availability": pam_availability,
         "pam_injected_count": pam_injected_count,
         "pam_unused_reason": pam_unused_reason,
+        "shadow_terminal_class": shadow_class,
+        "shadow_terminal_conflict": shadow_conflict,
+        "shadow_missing_evidence": shadow_missing,
+        "shadow_failed_evidence": shadow_failed,
         "notes": notes,
     }
 
@@ -771,6 +793,7 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, object]:
             bucket["hq"] += 1
     by_variant: dict[str, dict[str, int]] = {}
     by_pam_availability: dict[str, dict[str, int]] = {}
+    by_shadow_terminal: dict[str, dict[str, int]] = {}
     for row in rows:
         variant = row["variant"]
         bucket = by_variant.setdefault(variant, {"total": 0, "pass": 0, "hq": 0})
@@ -789,6 +812,15 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, object]:
             avail_bucket["pass"] += 1
         if row["high_quality"] == "true":
             avail_bucket["hq"] += 1
+        shadow_key = row.get("shadow_terminal_class") or "unknown"
+        shadow_bucket = by_shadow_terminal.setdefault(
+            shadow_key, {"total": 0, "pass": 0, "hq": 0}
+        )
+        shadow_bucket["total"] += 1
+        if row["pass"] == "true":
+            shadow_bucket["pass"] += 1
+        if row["high_quality"] == "true":
+            shadow_bucket["hq"] += 1
     return {
         "total": total,
         "pass": count("pass"),
@@ -798,9 +830,11 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, object]:
         "false_missing": count("false_missing"),
         "repair_exhausted": count("repair_exhausted"),
         "max_iterations": count("max_iterations"),
+        "shadow_conflict": count("shadow_terminal_conflict"),
         "by_case": by_case,
         "by_variant": by_variant,
         "by_pam_availability": by_pam_availability,
+        "by_shadow_terminal": by_shadow_terminal,
     }
 
 
@@ -819,6 +853,7 @@ def write_summary(run_dir: Path, rows: list[dict[str, str]]) -> None:
         f"- false_missing: {summary['false_missing']}",
         f"- repair_exhausted: {summary['repair_exhausted']}",
         f"- max_iterations: {summary['max_iterations']}",
+        f"- shadow_conflict: {summary['shadow_conflict']}",
         "",
         "## By Variant",
         "",
@@ -837,6 +872,17 @@ def write_summary(run_dir: Path, rows: list[dict[str, str]]) -> None:
         ]
     )
     for key, bucket in sorted(summary["by_pam_availability"].items()):
+        lines.append(f"| {key} | {bucket['pass']} | {bucket['hq']} | {bucket['total']} |")
+    lines.extend(
+        [
+            "",
+            "## By Shadow Terminal",
+            "",
+            "| shadow_terminal_class | pass | high_quality | total |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for key, bucket in sorted(summary["by_shadow_terminal"].items()):
         lines.append(f"| {key} | {bucket['pass']} | {bucket['hq']} | {bucket['total']} |")
     lines.extend(["", "## By Case", "", "| case | pass | high_quality | total |", "| --- | ---: | ---: | ---: |"])
     for case_id, bucket in sorted(summary["by_case"].items()):

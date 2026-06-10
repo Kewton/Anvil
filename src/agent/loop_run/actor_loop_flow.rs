@@ -4632,10 +4632,10 @@ pub(super) fn run_actor_loop(
         if artifact_completion_exhausted_by_evidence_failure(agent) {
             record.mark_artifact_evidence_repair_exhausted();
         }
-        record.refresh_evaluation_taxonomy();
         record.refresh_completion_reason();
         record.refresh_terminal_diagnostics();
         record.refresh_shadow_terminal_projection();
+        record.refresh_evaluation_taxonomy();
         record.photon_canary = agent.config.photon_canary;
         write_eval_record(&record);
     }

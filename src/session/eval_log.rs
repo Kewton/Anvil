@@ -425,6 +425,7 @@ impl EvalRecord {
             &self.final_outcome,
             &self.changed_file_classes,
             self.terminal_diagnostics.as_ref(),
+            self.shadow_terminal_projection.as_ref(),
             self.classified_task_kind.as_deref(),
             self.pam_eval.as_ref(),
         );
@@ -754,6 +755,7 @@ pub fn build_eval_record_with_terminal_context(
         final_outcome,
         &changed_file_classes,
         terminal_diagnostics.as_ref(),
+        shadow_terminal_projection.as_ref(),
         None,
         None,
     );
@@ -1169,22 +1171,38 @@ fn build_evaluation_taxonomy(
     final_outcome: &str,
     changed_file_classes: &ChangedFileClasses,
     terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
+    shadow_terminal_projection: Option<&ShadowTerminalProjectionSummary>,
     classified_task_kind: Option<&str>,
     pam_eval: Option<&PamEvalSummary>,
 ) -> EvaluationTaxonomySummary {
     let failure_authority =
         failure_authority_for_eval(final_outcome, changed_file_classes, terminal_diagnostics);
+    let shadow_conflict = shadow_terminal_projection
+        .map(|projection| projection.conflict)
+        .unwrap_or(false);
+    let anvil_terminal_class = if shadow_conflict {
+        shadow_terminal_projection
+            .map(|projection| format!("shadow_{}", projection.class))
+            .unwrap_or_else(|| "shadow_conflict".to_string())
+    } else if final_outcome == "done" {
+        "success".to_string()
+    } else {
+        "non_success".to_string()
+    };
+    let failure_authority = if shadow_conflict && final_outcome == "done" {
+        shadow_terminal_projection
+            .map(|projection| projection.class.as_str())
+            .unwrap_or(failure_authority)
+    } else {
+        failure_authority
+    };
     EvaluationTaxonomySummary {
         pam_variant: pam_variant_for_eval(pam_eval).to_string(),
         task_kind: classified_task_kind
             .and_then(normalize_classified_task_kind_for_eval)
             .unwrap_or_else(|| infer_eval_task_kind(task))
             .to_string(),
-        anvil_terminal_class: if final_outcome == "done" {
-            "success".to_string()
-        } else {
-            "non_success".to_string()
-        },
+        anvil_terminal_class,
         outcome_agreement: "external_postcheck_unavailable".to_string(),
         failure_authority: failure_authority.to_string(),
     }
@@ -1539,6 +1557,18 @@ mod tests {
                     },
                     1,
                 )),
+                Some(&build_shadow_terminal_projection(
+                    "done",
+                    &build_terminal_diagnostics(
+                        "done",
+                        &ChangedFileClasses {
+                            test: 1,
+                            impl_files: 2,
+                            setup: 0,
+                        },
+                        1,
+                    ),
+                )),
                 None,
                 None,
             ),
@@ -1681,6 +1711,58 @@ mod tests {
             projection.satisfied_evidence_ids,
             vec!["verification_evidence"]
         );
+    }
+
+    #[test]
+    fn evaluation_taxonomy_adopts_shadow_conflict_for_done() {
+        let mut rec = build_eval_record(
+            "sess-shadow-conflict",
+            12345,
+            "Read input/orders.csv and create output/order-summary.csv",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        let diagnostics = rec.terminal_diagnostics.as_mut().expect("diagnostics");
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "schema_evidence",
+                "unsatisfied",
+                Some("verification_failure"),
+                "schema mismatch was observed",
+            ),
+        );
+        refresh_terminal_obligation_indexes(diagnostics);
+        rec.refresh_shadow_terminal_projection();
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.final_outcome, "done");
+        assert_eq!(
+            rec.shadow_terminal_projection
+                .as_ref()
+                .map(|projection| projection.conflict),
+            Some(true)
+        );
+        assert_eq!(
+            rec.evaluation_taxonomy.anvil_terminal_class,
+            "shadow_evidence_failed"
+        );
+        assert_eq!(rec.evaluation_taxonomy.failure_authority, "evidence_failed");
     }
 
     #[test]
