@@ -29,3 +29,8 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - A verification-only coding request with existing source/test artifacts still stops at `missing_repo_edits` because the WP6 fresh-edit guard cannot distinguish "verify existing artifacts" from "build/modify/fix source". This should be addressed by a typed verification-only objective or a more precise edit-obligation predicate.
 - A Python repair smoke successfully fixed the implementation, but then stopped at `repair_safe_stop: verifier_unavailable`; manual `PYTHONPATH=. pytest -q tests/test_calculator.py` passed. The remaining issue is verifier rerun binding/import environment, not target selection.
 - `tool_failure` is part of the delta vocabulary, but live tool-failure recovery paths are not fully migrated to emit it through `RepairTargetDecision` yet.
+
+## WP8: Actor Loop Phase Refactor
+
+- No new behavior regression was observed in docs, Python, or hard Node smoke.
+- `run_actor_loop` remains large. WP8 only moved phase-event construction and prepared-tool counter mutation; future slices should keep extracting local transition/data builders instead of adding semantic task branches.

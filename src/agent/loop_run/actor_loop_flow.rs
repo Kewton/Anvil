@@ -57,7 +57,10 @@ use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, Recover
 use super::controller_policy::ControllerRecoveryStrategy;
 use super::interrupt::{InterruptFlag, InterruptMonitor};
 use super::lifecycle;
-use super::loop_phase::{LoopPhase, LoopPhaseTransition, emit_loop_phase};
+use super::loop_phase::{
+    LoopPhase, LoopPhaseTransition, contract_admitted_exit_event, emit_loop_phase,
+    generation_prepared_enter_event, generation_prepared_exit_event, tool_execution_enter_event,
+};
 use super::path_helpers::normalize_exploration_path;
 use super::plan_sections::{
     join_sections_for_progress, plan_section_body_for_progress, plan_sections_with_content,
@@ -3401,15 +3404,7 @@ pub(super) fn run_actor_loop(
     let mut accumulated: Vec<RepoVerification> = Vec::new();
     let mut last_known_root = agent.work_root.clone();
     let task_contract = super::prepare_actor_loop_state::prepare_actor_loop_turn_state(agent);
-    emit_loop_phase(
-        agent,
-        LoopPhase::ContractAdmitted,
-        LoopPhaseTransition::Exit,
-        0,
-        serde_json::json!({
-            "contract_present": task_contract.is_some(),
-        }),
-    );
+    contract_admitted_exit_event(task_contract.is_some()).emit(agent);
 
     let mut loop_state = super::loop_state::LoopState::new();
     let mut plan_exploration_only_turns = 0usize;
@@ -3512,15 +3507,7 @@ pub(super) fn run_actor_loop(
             ..
         } = reply;
 
-        emit_loop_phase(
-            agent,
-            LoopPhase::GenerationPrepared,
-            LoopPhaseTransition::Enter,
-            last_iter,
-            serde_json::json!({
-                "reply_tool_call_count": reply_tool_calls.len(),
-            }),
-        );
+        generation_prepared_enter_event(last_iter, reply_tool_calls.len()).emit(agent);
         let (current_reply_tool_call_count, prepared_tool_calls, effective_tool_policy) =
             match drive_actor_loop_tool_preparation_phase(
                 agent,
@@ -3561,27 +3548,15 @@ pub(super) fn run_actor_loop(
                     effective_tool_policy,
                 ),
             };
-        emit_loop_phase(
-            agent,
-            LoopPhase::GenerationPrepared,
-            LoopPhaseTransition::Exit,
+        generation_prepared_exit_event(
             last_iter,
-            serde_json::json!({
-                "current_reply_tool_call_count": current_reply_tool_call_count,
-                "prepared_tool_call_count": prepared_tool_calls.len(),
-            }),
-        );
+            current_reply_tool_call_count,
+            prepared_tool_calls.len(),
+        )
+        .emit(agent);
 
         if !prepared_tool_calls.is_empty() {
-            emit_loop_phase(
-                agent,
-                LoopPhase::ToolExecution,
-                LoopPhaseTransition::Enter,
-                last_iter,
-                serde_json::json!({
-                    "prepared_tool_call_count": prepared_tool_calls.len(),
-                }),
-            );
+            tool_execution_enter_event(last_iter, prepared_tool_calls.len()).emit(agent);
             let mut plan_file_edit_calls_this_turn = 0usize;
             let mut plan_exploration_calls_this_turn = 0usize;
             let mut plan_ready_after_tool = false;
@@ -3598,13 +3573,11 @@ pub(super) fn run_actor_loop(
             };
             let plan_exploration_budget =
                 lifecycle::plan_stage_exploration_budget(current_plan_stage);
-            let repo_edit_calls_before_tool = loop_state.repo_edit_calls_made_this_turn;
-            loop_state.tool_calls_made_this_turn += prepared_tool_calls.len();
-            loop_state.repo_edit_calls_made_this_turn += prepared_tool_calls
+            let repo_edit_call_count = prepared_tool_calls
                 .iter()
                 .filter(|tool_call| recovery::tool_call_counts_as_repo_edit(&tool_call.name))
                 .count();
-            loop_state.reset_after_executed_tool_call(repo_edit_calls_before_tool);
+            loop_state.record_prepared_tool_batch(prepared_tool_calls.len(), repo_edit_call_count);
 
             agent.session.messages.push(ConversationMessage::assistant(
                 reply_content,

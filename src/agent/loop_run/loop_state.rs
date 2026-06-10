@@ -55,6 +55,21 @@ impl LoopState {
             self.repo_change_retries = 0;
         }
     }
+
+    pub(super) fn record_prepared_tool_batch(
+        &mut self,
+        tool_call_count: usize,
+        repo_edit_call_count: usize,
+    ) {
+        let repo_edit_calls_before_tool = self.repo_edit_calls_made_this_turn;
+        self.tool_calls_made_this_turn = self
+            .tool_calls_made_this_turn
+            .saturating_add(tool_call_count);
+        self.repo_edit_calls_made_this_turn = self
+            .repo_edit_calls_made_this_turn
+            .saturating_add(repo_edit_call_count);
+        self.reset_after_executed_tool_call(repo_edit_calls_before_tool);
+    }
 }
 
 impl Default for LoopState {
@@ -85,6 +100,31 @@ mod tests {
 
         state.repo_change_retries = 2;
         state.reset_after_executed_tool_call(1);
+        assert_eq!(state.repo_change_retries, 2);
+    }
+
+    #[test]
+    fn record_prepared_tool_batch_owns_tool_and_repo_edit_counters() {
+        let mut state = LoopState::new();
+        state.empty_retries = 1;
+        state.no_tool_retries = 1;
+        state.focused_policy_retries = 1;
+        state.repo_change_retries = 1;
+
+        state.record_prepared_tool_batch(3, 1);
+
+        assert_eq!(state.tool_calls_made_this_turn, 3);
+        assert_eq!(state.repo_edit_calls_made_this_turn, 1);
+        assert_eq!(state.empty_retries, 0);
+        assert_eq!(state.no_tool_retries, 0);
+        assert_eq!(state.focused_policy_retries, 0);
+        assert_eq!(state.repo_change_retries, 0);
+
+        state.repo_change_retries = 2;
+        state.record_prepared_tool_batch(2, 0);
+
+        assert_eq!(state.tool_calls_made_this_turn, 5);
+        assert_eq!(state.repo_edit_calls_made_this_turn, 1);
         assert_eq!(state.repo_change_retries, 2);
     }
 }

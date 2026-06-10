@@ -71,6 +71,115 @@ pub(super) fn emit_loop_phase(
     );
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct LoopPhaseEvent {
+    phase: LoopPhase,
+    transition: LoopPhaseTransition,
+    iter_count: usize,
+    detail: serde_json::Value,
+}
+
+impl LoopPhaseEvent {
+    fn new(
+        phase: LoopPhase,
+        transition: LoopPhaseTransition,
+        iter_count: usize,
+        detail: serde_json::Value,
+    ) -> Self {
+        Self {
+            phase,
+            transition,
+            iter_count,
+            detail,
+        }
+    }
+
+    pub(super) fn emit(self, agent: &Agent) {
+        emit_loop_phase(
+            agent,
+            self.phase,
+            self.transition,
+            self.iter_count,
+            self.detail,
+        );
+    }
+
+    #[cfg(test)]
+    fn payload_for_test(
+        &self,
+        session_id: &str,
+        turn_index: usize,
+        mode: ExecutionMode,
+        task_profile: TaskProfile,
+    ) -> serde_json::Value {
+        build_loop_phase_payload(
+            session_id,
+            turn_index,
+            self.iter_count,
+            mode,
+            task_profile,
+            self.phase,
+            self.transition,
+            self.detail.clone(),
+        )
+    }
+}
+
+pub(super) fn contract_admitted_exit_event(contract_present: bool) -> LoopPhaseEvent {
+    LoopPhaseEvent::new(
+        LoopPhase::ContractAdmitted,
+        LoopPhaseTransition::Exit,
+        0,
+        serde_json::json!({
+            "contract_present": contract_present,
+        }),
+    )
+}
+
+pub(super) fn generation_prepared_enter_event(
+    iter_count: usize,
+    reply_tool_call_count: usize,
+) -> LoopPhaseEvent {
+    LoopPhaseEvent::new(
+        LoopPhase::GenerationPrepared,
+        LoopPhaseTransition::Enter,
+        iter_count,
+        serde_json::json!({
+            "reply_tool_call_count": reply_tool_call_count,
+        }),
+    )
+}
+
+pub(super) fn generation_prepared_exit_event(
+    iter_count: usize,
+    current_reply_tool_call_count: usize,
+    prepared_tool_call_count: usize,
+) -> LoopPhaseEvent {
+    LoopPhaseEvent::new(
+        LoopPhase::GenerationPrepared,
+        LoopPhaseTransition::Exit,
+        iter_count,
+        serde_json::json!({
+            "current_reply_tool_call_count": current_reply_tool_call_count,
+            "prepared_tool_call_count": prepared_tool_call_count,
+        }),
+    )
+}
+
+pub(super) fn tool_execution_enter_event(
+    iter_count: usize,
+    prepared_tool_call_count: usize,
+) -> LoopPhaseEvent {
+    LoopPhaseEvent::new(
+        LoopPhase::ToolExecution,
+        LoopPhaseTransition::Enter,
+        iter_count,
+        serde_json::json!({
+            "prepared_tool_call_count": prepared_tool_call_count,
+        }),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_loop_phase_payload(
     session_id: &str,
@@ -154,5 +263,41 @@ mod tests {
         assert_eq!(payload["phase"], "tool_execution");
         assert_eq!(payload["transition"], "enter");
         assert_eq!(payload["detail"]["tool_count"], 2);
+    }
+
+    #[test]
+    fn actor_loop_phase_event_builders_pin_snapshot_payloads() {
+        let contract = contract_admitted_exit_event(true).payload_for_test(
+            "session-1",
+            2,
+            ExecutionMode::Act,
+            TaskProfile::Generic,
+        );
+        assert_eq!(contract["phase"], "contract_admitted");
+        assert_eq!(contract["transition"], "exit");
+        assert_eq!(contract["iteration_seq"], 0);
+        assert_eq!(contract["detail"]["contract_present"], true);
+
+        let generation = generation_prepared_exit_event(4, 3, 2).payload_for_test(
+            "session-1",
+            2,
+            ExecutionMode::Act,
+            TaskProfile::Generic,
+        );
+        assert_eq!(generation["phase"], "generation_prepared");
+        assert_eq!(generation["transition"], "exit");
+        assert_eq!(generation["iteration_seq"], 4);
+        assert_eq!(generation["detail"]["current_reply_tool_call_count"], 3);
+        assert_eq!(generation["detail"]["prepared_tool_call_count"], 2);
+
+        let tool = tool_execution_enter_event(5, 1).payload_for_test(
+            "session-1",
+            2,
+            ExecutionMode::Act,
+            TaskProfile::Generic,
+        );
+        assert_eq!(tool["phase"], "tool_execution");
+        assert_eq!(tool["transition"], "enter");
+        assert_eq!(tool["detail"]["prepared_tool_call_count"], 1);
     }
 }
