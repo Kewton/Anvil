@@ -1,0 +1,79 @@
+{
+  "by_case": {
+    "data_csv": {
+      "hq": 0,
+      "pass": 0,
+      "total": 1
+    },
+    "docs_runbook": {
+      "hq": 2,
+      "pass": 2,
+      "total": 2
+    },
+    "fastapi_notes": {
+      "hq": 0,
+      "pass": 0,
+      "total": 2
+    },
+    "node_csv": {
+      "hq": 2,
+      "pass": 2,
+      "total": 2
+    },
+    "node_json": {
+      "hq": 2,
+      "pass": 2,
+      "total": 2
+    },
+    "ops_health": {
+      "hq": 0,
+      "pass": 0,
+      "total": 1
+    },
+    "python_markdown": {
+      "hq": 1,
+      "pass": 1,
+      "total": 1
+    },
+    "python_sales": {
+      "hq": 3,
+      "pass": 3,
+      "total": 3
+    },
+    "research_cache": {
+      "hq": 0,
+      "pass": 0,
+      "total": 1
+    },
+    "rust_ndjson": {
+      "hq": 0,
+      "pass": 0,
+      "total": 1
+    },
+    "rust_word": {
+      "hq": 2,
+      "pass": 2,
+      "total": 2
+    },
+    "toml_merge": {
+      "hq": 2,
+      "pass": 2,
+      "total": 2
+    }
+  },
+  "by_variant": {
+    "no_pam": {
+      "hq": 14,
+      "pass": 14,
+      "total": 20
+    }
+  },
+  "false_done": 1,
+  "false_missing": 2,
+  "high_quality": 14,
+  "max_iterations": 0,
+  "pass": 14,
+  "repair_exhausted": 2,
+  "total": 20,
+  "verification_pass": 15
+}

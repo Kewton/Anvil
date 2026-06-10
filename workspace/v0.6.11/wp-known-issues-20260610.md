@@ -41,3 +41,13 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - Docs -> coding continued session passed, but coding -> data continued session failed: the data-only prompt was admitted into a coding/test-evidence path, wrote `tests/test_main.py`, and stopped at `safe_stop_verifier_missing` without creating `output.csv`.
 - This is not caused by verifier event dedup storage. It indicates remaining semantic/session contamination where current-turn ObjectiveContract construction can still inherit stale coding/evidence pressure from prior turns or existing project artifacts.
 - Fixing the coding -> data failure should happen at objective contract admission / deliverable obligation construction, not by adding another path-specific reset field or CSV string rule.
+
+## WP10: 20-Run Regression Guard
+
+- WP10 reached 14/20 pass and 14/20 high-quality, but the strict regression guard is not fully passed because false terminal alignment remains.
+- Python sales recovered in this sample at 3/3, but this is a 20-run guard, not yet a 50-run improvement claim.
+- Data CSV produced an artifact and exited `done`, but the file included an extra `same` column. This is a false-done style content acceptance issue.
+- TOML passed the external deterministic grader 2/2, but both runs exited `safe_stop_verifier_missing`; internal evidence binding still disagrees with real artifact/evidence completion.
+- FastAPI failed 2/2 with `repair_exhausted` around 422 response mismatches, indicating API request-schema repair is still weak.
+- Research and ops tasks stopped at `missing_repo_edits` without creating artifacts, showing non-coding admission can still inherit edit-obligation pressure incorrectly.
+- Rust NDJSON failed because generated tests imported `merge_ndjson_lines` from the wrong root path; Rust source/test binding drift remains.
