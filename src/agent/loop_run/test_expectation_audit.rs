@@ -42,7 +42,7 @@ impl TestExpectationAudit {
 
     fn policy_message(&self) -> String {
         format!(
-            "[Test Expectation Audit] worker={}; source={}; test={}; before writing or repairing tests, classify each assertion expectation as explicit_user_request, declared_public_contract, existing_required_behavior, language_runtime_fact, or unsupported_assumption. Keep exact product expectations only when supported by explicit_user_request, declared_public_contract, or existing_required_behavior. Use language_runtime_fact only for mechanics, not to turn incidental implementation behavior into product assertions. For underspecified dimensions such as tie-breaking, ordering, rounding, randomness, filesystem order, or locale, use non-ambiguous fixtures or property assertions instead of exact literals. Preserve existing required behavior and keep tests aligned with the source API.",
+            "[Test Expectation Audit] worker={}; source={}; test={}; before writing or repairing tests, classify each assertion expectation as explicit_user_request, declared_public_contract, existing_required_behavior, language_runtime_fact, or unsupported_assumption. Keep exact product expectations only when supported by explicit_user_request, declared_public_contract, or existing_required_behavior. Use language_runtime_fact only for mechanics, not to turn incidental implementation behavior into product assertions. For HTTP APIs, do not invent exact status-code assertions when the contract status is unspecified; success/non-error is enough unless the user declared a status. For underspecified dimensions such as tie-breaking, ordering, rounding, randomness, filesystem order, or locale, use non-ambiguous fixtures or property assertions instead of exact literals. Preserve existing required behavior and keep tests aligned with the source API.",
             WorkerKind::TestAuthor.label(),
             self.source_path,
             self.test_path
@@ -79,6 +79,7 @@ mod tests {
                 .contains("incidental implementation behavior")
         );
         assert!(message.content.contains("tie-breaking"));
+        assert!(message.content.contains("do not invent exact status-code"));
         assert!(message.content.contains("property assertions"));
         assert!(message.content.contains("test_author"));
     }

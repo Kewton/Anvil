@@ -1,3 +1,4 @@
+use super::api_contract_expectation::{ApiContractExpectation, extract_api_contract_expectations};
 use super::authoring_style::AuthoringStyleDecision;
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::contract_request_signals::contains_implementation_file_hint;
@@ -624,6 +625,7 @@ pub(super) struct TaskContract {
     pub(super) evidence_command_hint: Option<String>,
     pub(super) authoring_style_decision: AuthoringStyleDecision,
     pub(super) objective_evidence_kind_override: Option<ObjectiveEvidenceKind>,
+    pub(super) api_contract_expectations: Vec<ApiContractExpectation>,
 }
 
 /// Issue #651: dispatch tag for [`TaskContract::evaluate_inner`]. The
@@ -1145,6 +1147,7 @@ impl TaskContract {
             objective_evidence_kind_override: project_profile_inputs
                 .as_ref()
                 .and_then(|inputs| inputs.evidence_kind),
+            api_contract_expectations: extract_api_contract_expectations(request_for_inference),
         }
     }
 
@@ -3315,6 +3318,21 @@ mod tests {
                 .contains(&ArtifactRole::UsageDocs)
         );
         assert!(contract.verification_required);
+    }
+
+    #[test]
+    fn http_api_contract_records_typed_endpoint_expectation() {
+        let contract = TaskContract::from_request(
+            "Create app.py and tests/test_app.py for an HTTP notes API. Implement POST /notes accepting JSON with title and body, returning the created note with id=1.",
+        );
+
+        assert_eq!(contract.api_contract_expectations.len(), 1);
+        let expectation = &contract.api_contract_expectations[0];
+        assert_eq!(expectation.method.label(), "POST");
+        assert_eq!(expectation.path, "/notes");
+        assert_eq!(expectation.request_json_fields, vec!["title", "body"]);
+        assert_eq!(expectation.response_fields, vec!["id", "title", "body"]);
+        assert_eq!(expectation.expected_status, None);
     }
 
     #[test]

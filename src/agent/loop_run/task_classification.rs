@@ -192,6 +192,7 @@ fn emit_semantic_candidate_shadow(agent: &Agent, contract: &TaskContract) {
             "evidence_kind": candidate.evidence_kind.label(),
             "deliverable_candidate_count": candidate.deliverable_candidates.len(),
             "artifact_identity_count": candidate.artifact_identities.len(),
+            "api_expectation_count": candidate.api_expectations.len(),
             "schema_expectation_count": candidate.schema_expectations.len(),
             "authoring_style": candidate.authoring_style.style.label(),
             "style_authority": candidate.authoring_style.authority.label(),

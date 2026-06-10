@@ -85,3 +85,12 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - `docs_to_coding` externally passed but reported `repair_safe_stop`, so terminal projection can still disagree with externally valid artifacts/evidence.
 - The first setup turn in `coding_to_data` asked for `package.json` plus `src/add.js`, but the contract only required `src/add.js`; this is acceptable for stale-context setup but should not be used as coding completeness evidence.
 - Real LLM validation still requires unsandboxed localhost Ollama access.
+
+## WP-E: API Contract Expectation
+
+- Typed API expectations are now extracted and projected into generation, artifact-directed recovery, semantic shadow logs, and repair deltas without FastAPI-specific matching.
+- Real LLM validation improved the focused mixed smoke from 3/6 to 4/6 high-quality. FastAPI moved from 0/3 to 1/3, while Node, Python, and docs regressions remained green.
+- JSON body binding improved materially: after first-write artifact-directed context was connected, 3/3 FastAPI rows generated body-object style implementations in `wp-e-api-contract-smoke5-20260610`.
+- The remaining FastAPI failures are still convergence problems: one row ignored the JSON body binding even with typed context present, and another row invented exact `201` status despite `expected_status=unspecified`.
+- Repair diagnosis can identify the right hypothesis, but bounded repair proposals may still be rejected as malformed or ambiguous before convergence.
+- Future work should add evidence-side API contract observation and repair binding, not framework-specific string rules.

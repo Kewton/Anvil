@@ -1319,6 +1319,7 @@ mod tests {
             authoring_style_decision:
                 super::super::authoring_style::AuthoringStyleDecision::unspecified(),
             objective_evidence_kind_override: None,
+            api_contract_expectations: Vec::new(),
         };
         ledger.required_artifacts_completed_projection(&contract)
     }

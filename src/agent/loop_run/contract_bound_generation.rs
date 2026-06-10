@@ -178,7 +178,7 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; authoring_style_decision={}; authoring_style_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; authoring_style_decision={}; authoring_style_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query or form parameters. If api_contracts has expected_status=unspecified, tests must not assert an exact HTTP status invented from words like created; assert response success only when needed. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
@@ -530,6 +530,40 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("module_exports_cli_shape"));
+    }
+
+    #[test]
+    fn generation_packet_includes_generic_json_body_binding_policy_for_api_contracts() {
+        let contract = TaskContract::from_request(
+            "Create app.py and tests/test_app.py for an API. Implement POST /notes accepting JSON with title and body, returning the created note with id=1.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::Python)
+            .with_evidence_command("pytest");
+        let plan = ContractBoundGenerationPlan::from_execution_contract(&execution)
+            .expect("api coding contract should produce a generation plan");
+        let message = plan.policy_message();
+
+        assert!(message.contains("api_contracts="), "{message}");
+        assert!(message.contains("request_body=json"), "{message}");
+        assert!(
+            message.contains("request_binding=json_body_object"),
+            "{message}"
+        );
+        assert!(message.contains("expected_status=unspecified"), "{message}");
+        assert!(
+            message
+                .contains("implement request_json_body_fields as JSON request-body object fields"),
+            "{message}"
+        );
+        assert!(
+            message.contains("not query or form parameters"),
+            "{message}"
+        );
+        assert!(
+            message.contains("tests must not assert an exact HTTP status"),
+            "{message}"
+        );
     }
 
     #[test]

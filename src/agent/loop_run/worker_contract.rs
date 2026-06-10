@@ -9,6 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use super::api_contract_expectation::{
+    ApiContractExpectation, api_contract_delta_summary, api_contract_summary,
+};
 use super::authoring_style::AuthoringStyleDecision;
 use super::repair_target_decision::RepairTargetDeltaKind;
 use super::scaffold_pipeline::ScaffoldFramework;
@@ -874,6 +877,7 @@ pub(super) struct DiagnosticRepairWorkerRequest {
     allowed_change_kind: String,
     evidence_command: String,
     ledger_facts: String,
+    api_contract_delta: String,
     diagnostic: String,
     output_contract: &'static str,
 }
@@ -907,6 +911,10 @@ impl DiagnosticRepairWorkerRequest {
         &self.ledger_facts
     }
 
+    pub(super) fn api_contract_delta(&self) -> &str {
+        &self.api_contract_delta
+    }
+
     pub(super) fn diagnostic(&self) -> &str {
         &self.diagnostic
     }
@@ -922,8 +930,10 @@ impl DiagnosticRepairWorkerRequest {
         let evidence_command =
             super::task_contract::mask_and_cap_recovery_field(&self.evidence_command);
         let ledger_facts = super::task_contract::mask_and_cap_recovery_field(&self.ledger_facts);
+        let api_contract_delta =
+            super::task_contract::mask_and_cap_recovery_field(&self.api_contract_delta);
         format!(
-            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. repair_delta={repair_delta}; ledger_facts={ledger_facts}; failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Treat repair_delta and ledger_facts as primary control data; treat Diagnostic as auxiliary failure text. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
+            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. repair_delta={repair_delta}; ledger_facts={ledger_facts}; api_contract_delta={api_contract_delta}; failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Treat repair_delta, ledger_facts, and api_contract_delta as primary control data; treat Diagnostic as auxiliary failure text. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
             repair_delta = self.repair_delta_kind.as_str(),
             failure_kind = self.failure_kind.label(),
             target_role = self.target_role.label(),
@@ -1068,6 +1078,9 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
         allowed_change_kind.trim().to_string()
     };
     let repair_delta_kind = diagnostic_repair_delta_kind(failure_kind, target_role);
+    let api_contract_delta =
+        api_contract_delta_summary(&contract.api_contract_expectations, diagnostic)
+            .unwrap_or_else(|| "none".to_string());
     let ledger_facts = format!(
         "target_path_present={}; evidence_command_present={}; diagnostic_failure_kind={}",
         !target_hint.path.trim().is_empty(),
@@ -1096,6 +1109,11 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
         ),
     ));
     context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Repair,
+        "api_contract_delta",
+        api_contract_delta.as_str(),
+    ));
+    context_pack.push(ContextPackEntry::new(
         ContextPackKind::Evidence,
         "evidence_command",
         evidence_command.as_str(),
@@ -1115,6 +1133,7 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
         allowed_change_kind,
         evidence_command,
         ledger_facts,
+        api_contract_delta,
         diagnostic: diagnostic.to_string(),
         output_contract: "single_bounded_repair_tool_action_for_the_declared_target_and_failure",
     }
@@ -1486,6 +1505,7 @@ pub(super) struct TaskExecutionContract {
     pub(super) deliverables: Vec<ExecutionDeliverable>,
     pub(super) scaffold_profile: ScaffoldProfile,
     pub(super) public_contract: PublicContract,
+    pub(super) api_contract_expectations: Vec<ApiContractExpectation>,
     pub(super) evidence: ExecutionEvidence,
     pub(super) authoring_style_decision: AuthoringStyleDecision,
     pub(super) constraints: ExecutionConstraints,
@@ -1516,6 +1536,7 @@ impl TaskExecutionContract {
             deliverables,
             scaffold_profile: ScaffoldProfile::None,
             public_contract,
+            api_contract_expectations: contract.api_contract_expectations.clone(),
             evidence: ExecutionEvidence {
                 kind: objective.evidence_kind,
                 required: objective.evidence_required,
@@ -1662,6 +1683,13 @@ impl TaskExecutionContract {
             context_pack.push(ContextPackEntry::new(
                 ContextPackKind::Contract,
                 "public_contract",
+                summary,
+            ));
+        }
+        if let Some(summary) = api_contract_summary(&self.api_contract_expectations) {
+            context_pack.push(ContextPackEntry::new(
+                ContextPackKind::Contract,
+                "api_contract",
                 summary,
             ));
         }
@@ -2257,6 +2285,52 @@ mod tests {
         assert_eq!(
             style_request.repair_delta_kind(),
             RepairTargetDeltaKind::StyleMismatch
+        );
+    }
+
+    #[test]
+    fn diagnostic_repair_worker_request_carries_api_contract_delta_for_422() {
+        let contract = TaskContract::from_request(
+            "Create app.py and tests/test_app.py for an HTTP notes API. Implement POST /notes accepting JSON with title and body, returning the created note with id=1.",
+        );
+        let target_hint = RecoveryTargetHint {
+            role: ArtifactRole::Implementation,
+            path: "app.py".to_string(),
+            reason: "POST /notes returned 422".to_string(),
+        };
+        let request = diagnostic_repair_worker_request_for_evidence_failed(
+            &contract,
+            "AssertionError: POST /notes expected 200 but got 422 Unprocessable Entity",
+            &target_hint,
+            "implementation",
+            Some("python -m pytest tests/test_app.py"),
+        );
+
+        assert!(
+            request
+                .api_contract_delta()
+                .contains("kind=request_schema_mismatch"),
+            "{}",
+            request.api_contract_delta()
+        );
+        assert!(
+            request
+                .api_contract_delta()
+                .contains("request_json_body_fields=title|body"),
+            "{}",
+            request.api_contract_delta()
+        );
+        assert!(
+            request.api_contract_delta().contains(
+                "bind_declared_fields_from_json_request_body_object_not_query_or_form_params"
+            ),
+            "{}",
+            request.api_contract_delta()
+        );
+        assert!(
+            request
+                .policy_message("exactly one bounded implementation edit")
+                .contains("api_contract_delta=kind=request_schema_mismatch"),
         );
     }
 

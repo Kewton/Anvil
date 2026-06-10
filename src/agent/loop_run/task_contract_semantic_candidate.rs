@@ -90,6 +90,7 @@ impl SemanticCandidate {
         let objective = contract.objective_contract();
         let artifact_identities = contract.required_artifact_identities.clone();
         let schema_expectations = schema_expectations_from_obligations(&artifact_identities);
+        let api_expectations = api_expectations_from_contract(contract);
         Self {
             origin: SemanticCandidateOrigin::DeterministicShadow,
             objective_kind: objective.objective_kind,
@@ -105,7 +106,7 @@ impl SemanticCandidate {
                 shape: None,
                 runtime_expectations: Vec::new(),
             },
-            api_expectations: Vec::new(),
+            api_expectations,
             schema_expectations,
             authoring_style: contract.authoring_style_decision,
             compatibility_risks: compatibility_risks_from_contract(contract),
@@ -177,6 +178,21 @@ pub(super) struct CandidateContractDisagreement {
     pub(super) field: &'static str,
     pub(super) candidate: String,
     pub(super) contract: String,
+}
+
+fn api_expectations_from_contract(contract: &TaskContract) -> Vec<SemanticExpectation> {
+    contract
+        .api_contract_expectations
+        .iter()
+        .map(|expectation| SemanticExpectation {
+            name: format!(
+                "{} {}",
+                expectation.method.label(),
+                super::task_contract::mask_and_cap_recovery_field(&expectation.path)
+            ),
+            value: expectation.summary(),
+        })
+        .collect()
 }
 
 fn schema_expectations_from_obligations(
@@ -277,6 +293,24 @@ mod tests {
                 .schema_expectations
                 .iter()
                 .any(|expectation| expectation.value.contains("id|total"))
+        );
+    }
+
+    #[test]
+    fn api_candidate_carries_http_contract_expectation() {
+        let contract = TaskContract::from_request(
+            "Create an HTTP API with POST /notes accepting JSON with title and body returning id.",
+        );
+        let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+        assert_eq!(candidate.api_expectations.len(), 1);
+        assert_eq!(candidate.api_expectations[0].name, "POST /notes");
+        assert!(
+            candidate.api_expectations[0]
+                .value
+                .contains("request_json_body_fields=title|body"),
+            "{:?}",
+            candidate.api_expectations[0]
         );
     }
 

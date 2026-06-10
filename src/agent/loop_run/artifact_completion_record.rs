@@ -38,10 +38,24 @@ pub(super) fn push_artifact_directed_recovery_note(agent: &mut Agent, attempt: u
     let Some(target) = agent.current_artifact_recovery_target.as_ref() else {
         return false;
     };
-    let note =
+    let mut note =
         recovery::artifact_directed_recovery_note(target.role.label(), &target.path, attempt);
+    if let Some(contract) = super::task_classification::task_contract_authority(agent)
+        && let Some(api_context) = artifact_directed_api_contract_context(contract.as_ref())
+    {
+        note.push(' ');
+        note.push_str(&api_context);
+    }
     super::message_push::push_system_note(agent, note);
     true
+}
+
+fn artifact_directed_api_contract_context(
+    contract: &super::task_contract::TaskContract,
+) -> Option<String> {
+    super::api_contract_expectation::api_contract_artifact_directed_context(
+        &contract.api_contract_expectations,
+    )
 }
 
 /// Issue #652: record an attempt against the active
@@ -153,5 +167,38 @@ fn record_artifact_completion_outcome(
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::task_contract::TaskContract;
+    use super::*;
+
+    #[test]
+    fn artifact_directed_api_context_projects_typed_json_body_contract() {
+        let contract = TaskContract::from_request(
+            "Create app.py and tests/test_app.py for an HTTP API. Implement POST /notes accepting JSON with title and body, returning the created note with id=1.",
+        );
+        let context = artifact_directed_api_contract_context(&contract).expect("api context");
+
+        assert!(context.contains("api_contracts=method=POST,path=/notes"));
+        assert!(context.contains("request_body=json"));
+        assert!(context.contains("request_binding=json_body_object"));
+        assert!(
+            context.contains("JSON request-body object fields"),
+            "{context}"
+        );
+        assert!(
+            context.contains("not query or form parameters"),
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn artifact_directed_api_context_is_absent_without_http_contract() {
+        let contract = TaskContract::from_request("Create README.md with Usage and Validation.");
+
+        assert!(artifact_directed_api_contract_context(&contract).is_none());
     }
 }

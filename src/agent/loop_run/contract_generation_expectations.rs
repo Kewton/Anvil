@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::api_contract_expectation::{ApiContractExpectation, api_contract_summary};
 use super::task_contract::{
     ArtifactRole, DeliverableFormat, DeliverableSchema, StructuredRecordSchema,
 };
@@ -19,6 +20,7 @@ const MAX_EXPECTATION_ITEMS: usize = 8;
 pub(super) struct ContractGenerationExpectations {
     source_api: Option<String>,
     test_api: Option<String>,
+    api_contracts: Option<String>,
     schemas: Vec<String>,
     manifests: Vec<String>,
     evidence: String,
@@ -29,6 +31,7 @@ impl ContractGenerationExpectations {
     pub(super) fn from_execution(execution: &TaskExecutionContract) -> Self {
         let source_api = source_api_expectation(execution);
         let test_api = test_api_expectation(execution);
+        let api_contracts = api_contract_expectations(&execution.api_contract_expectations);
         let schemas = schema_expectations(&execution.deliverables);
         let manifests = manifest_expectations(&execution.deliverables);
         let evidence = evidence_summary(&execution.evidence);
@@ -36,6 +39,7 @@ impl ContractGenerationExpectations {
         Self {
             source_api,
             test_api,
+            api_contracts,
             schemas,
             manifests,
             evidence,
@@ -51,6 +55,9 @@ impl ContractGenerationExpectations {
             self.test_api
                 .as_ref()
                 .map(|summary| format!("test_api={summary}")),
+            self.api_contracts
+                .as_ref()
+                .map(|summary| format!("api_contracts={summary}")),
             (!self.schemas.is_empty()).then(|| format!("schemas={}", self.schemas.join(","))),
             (!self.manifests.is_empty()).then(|| format!("manifests={}", self.manifests.join(","))),
             Some(self.evidence.clone()),
@@ -78,6 +85,10 @@ pub(super) fn declared_artifacts_summary(deliverables: &[ExecutionDeliverable]) 
 
 pub(super) fn declared_expectations_summary(execution: &TaskExecutionContract) -> String {
     ContractGenerationExpectations::from_execution(execution).summary()
+}
+
+fn api_contract_expectations(expectations: &[ApiContractExpectation]) -> Option<String> {
+    api_contract_summary(expectations)
 }
 
 fn source_api_expectation(execution: &TaskExecutionContract) -> Option<String> {
@@ -358,6 +369,38 @@ mod tests {
         assert!(!summary.contains("test_api="), "{summary}");
         assert!(summary.contains("schemas="), "{summary}");
         assert!(summary.contains("columns=id|total"), "{summary}");
+    }
+
+    #[test]
+    fn api_expectations_carry_http_contract_without_framework_specificity() {
+        let contract = TaskContract::from_request(
+            "Create app.py and tests/test_app.py for an HTTP notes API. Implement GET /notes returning an empty list and POST /notes accepting JSON with title and body, returning the created note with id=1.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::Python)
+            .with_evidence_command("python -m pytest tests/test_app.py");
+        let expectations = ContractGenerationExpectations::from_execution(&execution);
+        let summary = expectations.summary();
+
+        assert!(summary.contains("api_contracts="), "{summary}");
+        assert!(summary.contains("method=GET,path=/notes"), "{summary}");
+        assert!(
+            summary.contains("method=POST,path=/notes,request_body=json"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("request_binding=json_body_object"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("request_json_body_fields=title|body"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("response_fields=id|title|body"),
+            "{summary}"
+        );
+        assert!(!summary.contains("expected_status="), "{summary}");
     }
 
     #[test]

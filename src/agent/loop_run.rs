@@ -95,6 +95,7 @@ mod case_record_flow;
 // extracted from `turn.rs` (parent #680). Hosts 4 production entry
 // points + 4 private attempt/resolution helpers, all free fns over
 // `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod api_contract_expectation;
 mod classify_confirm_flow;
 mod completion_probe_gate;
 mod contract_bound_generation;

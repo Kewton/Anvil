@@ -153,13 +153,23 @@ pub(super) fn artifact_directed_recovery_message(
         .allowed_tool_names_for_prompt()
         .map(|tools| tools.join(", "))
         .unwrap_or_else(|| "Read, Write, Edit".to_string());
-    Some(artifact_directed_recovery_message_body(
+    let mut message = artifact_directed_recovery_message_body(
         &target_display,
         target.role.label(),
         &target.reason,
         &allowed,
         policy.target_already_read,
-    ))
+    );
+    if let Some(contract) = super::task_classification::task_contract_authority(agent)
+        && let Some(api_context) =
+            super::api_contract_expectation::api_contract_artifact_directed_context(
+                &contract.api_contract_expectations,
+            )
+    {
+        message.push(' ');
+        message.push_str(&api_context);
+    }
+    Some(message)
 }
 
 pub(super) fn artifact_directed_tool_policy_packet_message(
