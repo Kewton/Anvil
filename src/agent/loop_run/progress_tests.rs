@@ -8277,7 +8277,7 @@ export default function App() {
     }
 
     #[test]
-    fn repo_change_request_text_falls_back_to_latest_user_prompt() {
+    fn repo_change_request_text_prefers_latest_user_prompt() {
         let messages = vec![
             ConversationMessage::user("Build an interactive Next.js UI".to_string()),
             ConversationMessage::assistant("done".to_string(), Vec::new()),
@@ -8288,7 +8288,7 @@ export default function App() {
         );
         assert_eq!(
             repo_change_request_text(Some("Active task wins"), &messages).as_deref(),
-            Some("Active task wins")
+            Some("Build an interactive Next.js UI")
         );
     }
 

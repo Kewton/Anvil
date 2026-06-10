@@ -77,3 +77,11 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - The preflight predicate is now assertion-context scoped, but it remains a deterministic safety boundary. Future expansion should keep it tied to typed assertion/evidence intent, not benchmark text.
 - All-candidate preflight rejection is now observable as weak binding metadata, but there is still no dedicated repair operator for rejected generated-test content.
 - Real LLM validation requires localhost Ollama access; sandboxed evaluation fails before model invocation if `127.0.0.1:11434` is blocked.
+
+## WP-F: Current-Turn ObjectiveContract Authority
+
+- Continued-session real LLM smoke recovered the WP9-style contamination scenario in the focused sample: coding -> data, coding -> docs, docs -> coding, and data -> TDD all passed 4/4 high-quality.
+- This supports the narrow hypothesis that current user prompt authority must dominate stale `working_memory.active_task`; it is not yet a broad success-rate claim.
+- `docs_to_coding` externally passed but reported `repair_safe_stop`, so terminal projection can still disagree with externally valid artifacts/evidence.
+- The first setup turn in `coding_to_data` asked for `package.json` plus `src/add.js`, but the contract only required `src/add.js`; this is acceptable for stale-context setup but should not be used as coding completeness evidence.
+- Real LLM validation still requires unsandboxed localhost Ollama access.

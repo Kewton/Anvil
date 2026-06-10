@@ -1539,6 +1539,8 @@ impl TaskExecutionContract {
     /// existing generic lifecycle / telemetry consumers keep working unchanged.
     pub(super) fn objective_contract(&self) -> ObjectiveContract {
         ObjectiveContract {
+            authority: super::task_contract::ObjectiveAuthority::CurrentUserRequest,
+            auxiliary_context: super::task_contract::ObjectiveAuxiliaryContext::SessionContext,
             task_kind: self.objective_kind.to_task_kind(),
             objective_kind: self.objective_kind,
             deliverable_kind: self.deliverable_kind,

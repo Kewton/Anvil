@@ -175,11 +175,14 @@ fn emit_semantic_candidate_shadow(agent: &Agent, contract: &TaskContract) {
     } else {
         "shadow_only"
     };
+    let objective = contract.objective_contract();
     log_llm_event(
         "agent.semantic_candidate.shadow",
         serde_json::json!({
             "session_id": agent.session_store.session_id(),
             "turn_index": agent.current_turn_index,
+            "contract_authority": objective.authority.label(),
+            "auxiliary_context": objective.auxiliary_context.label(),
             "origin": "deterministic_shadow",
             "admission_mode": admission_mode,
             "status": decision.status.label(),

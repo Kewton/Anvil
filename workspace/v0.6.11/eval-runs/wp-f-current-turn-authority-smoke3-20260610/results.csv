@@ -1,0 +1,5 @@
+seq,case_id,first_kind,second_kind,pass,high_quality,verification_pass,turn1_rc,turn2_rc,turn1_exit_reason,turn2_exit_reason,duration_sec,changed_files,notes
+1,coding_to_data,coding,data,true,true,true,0,0,done,done,28.7,output/summary.json,
+2,coding_to_docs,coding,docs,true,true,true,0,0,done,done,76.2,docs/runbook.md,
+3,docs_to_coding,docs,coding,true,true,true,0,0,repair_safe_stop,repair_safe_stop,143.0,".pytest_cache/.gitignore,.pytest_cache/CACHEDIR.TAG,.pytest_cache/README.md,.pytest_cache/v/cache/nodeids,src/__pycache__/slugify.cpython-312.pyc,src/slugify.py,tests/__pycache__/test_slugify.cpython-312-pytest-9.0.2.pyc,tests/__pycache__/test_slugify.cpython-312.pyc,tests/test_slugify.py",
+4,data_to_tdd,data,coding_tdd,true,true,true,0,0,done,done,84.5,".pytest_cache/.gitignore,.pytest_cache/CACHEDIR.TAG,.pytest_cache/README.md,.pytest_cache/v/cache/nodeids,src/__init__.py,src/__pycache__/__init__.cpython-312.pyc,src/__pycache__/stats.cpython-312.pyc,src/stats.py,tests/__pycache__/test_stats.cpython-312-pytest-9.0.2.pyc,tests/__pycache__/test_stats.cpython-312.pyc,tests/test_stats.py",

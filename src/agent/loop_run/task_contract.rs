@@ -115,9 +115,39 @@ struct TaskKindInference {
     matched: bool,
 }
 
+#[allow(dead_code)] // WP-F: projected into ObjectiveContract telemetry/prompt surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectiveAuthority {
+    CurrentUserRequest,
+}
+
+impl ObjectiveAuthority {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::CurrentUserRequest => "current_user_request",
+        }
+    }
+}
+
+#[allow(dead_code)] // WP-F: context remains advisory, not contract authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectiveAuxiliaryContext {
+    SessionContext,
+}
+
+impl ObjectiveAuxiliaryContext {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::SessionContext => "session_context",
+        }
+    }
+}
+
 #[allow(dead_code)] // Issue #947: read-only ObjectiveContract projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ObjectiveContract {
+    pub(super) authority: ObjectiveAuthority,
+    pub(super) auxiliary_context: ObjectiveAuxiliaryContext,
     /// Classification-layer kind (kept for back-compat with existing readers).
     pub(super) task_kind: TaskKind,
     /// Issue #975: objective-layer kind — coding is `ObjectiveKind::Coding`,
@@ -137,6 +167,8 @@ impl ObjectiveContract {
     fn from_task_contract(contract: &TaskContract) -> Self {
         if contract.completion_policy.project_intent == CompletionProjectIntent::AnswerOnly {
             return Self {
+                authority: ObjectiveAuthority::CurrentUserRequest,
+                auxiliary_context: ObjectiveAuxiliaryContext::SessionContext,
                 task_kind: contract.task_kind,
                 objective_kind: ObjectiveKind::from_task_kind(contract.task_kind),
                 deliverable_kind: ObjectiveDeliverableKind::Answer,
@@ -178,6 +210,8 @@ impl ObjectiveContract {
             .unwrap_or(default_evidence_kind);
 
         Self {
+            authority: ObjectiveAuthority::CurrentUserRequest,
+            auxiliary_context: ObjectiveAuxiliaryContext::SessionContext,
             task_kind: contract.task_kind,
             objective_kind: ObjectiveKind::from_task_kind(contract.task_kind),
             deliverable_kind,
@@ -453,6 +487,11 @@ pub(super) fn objective_contract_prompt_message(contract: &TaskContract) -> Opti
     let mut lines = vec![
         "[Objective Contract]".to_string(),
         "This is the controller's sanitized contract for the current task. Follow it over guesses from mode labels or scaffolding habits.".to_string(),
+        format!(
+            "Authority: {}; auxiliary context: {} only.",
+            objective.authority.label(),
+            objective.auxiliary_context.label()
+        ),
         format!(
             "Objective kind: {}; deliverable spec: {}; evidence spec: {}.",
             objective.objective_kind.label(),
@@ -3780,6 +3819,26 @@ mod tests {
             assert_eq!(projection.deliverable_kind.label(), deliverable_label);
             assert_eq!(projection.evidence_kind.label(), evidence_label);
         }
+    }
+
+    #[test]
+    fn objective_contract_records_current_user_request_authority() {
+        let projection = TaskContract::from_request(
+            "Read input/orders.csv and create output/order-summary.csv with columns id,total.",
+        )
+        .objective_contract();
+
+        assert_eq!(projection.authority, ObjectiveAuthority::CurrentUserRequest);
+        assert_eq!(
+            projection.auxiliary_context,
+            ObjectiveAuxiliaryContext::SessionContext
+        );
+        assert_eq!(projection.objective_kind, ObjectiveKind::Data);
+        assert_eq!(
+            projection.deliverable_kind,
+            ObjectiveDeliverableKind::OutputFile
+        );
+        assert_eq!(projection.evidence_kind, ObjectiveEvidenceKind::SchemaCheck);
     }
 
     #[test]

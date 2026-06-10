@@ -219,7 +219,10 @@ fn observed_deliverable_role(evidence: &CompletionEvidence) -> Option<ArtifactRo
 #[cfg(test)]
 mod tests {
     use super::super::completion_evidence::RepoEditCategory;
-    use super::super::task_contract::{ObjectiveDeliverableKind, ObjectiveKind, TaskKind};
+    use super::super::task_contract::{
+        ObjectiveAuxiliaryContext, ObjectiveAuthority, ObjectiveDeliverableKind, ObjectiveKind,
+        TaskKind,
+    };
     use super::*;
 
     #[test]
@@ -242,6 +245,8 @@ mod tests {
     #[test]
     fn command_observation_collection_accepts_shell_chain_for_required_commands() {
         let objective = ObjectiveContract {
+            authority: ObjectiveAuthority::CurrentUserRequest,
+            auxiliary_context: ObjectiveAuxiliaryContext::SessionContext,
             task_kind: TaskKind::Ops,
             objective_kind: ObjectiveKind::Ops,
             deliverable_kind: ObjectiveDeliverableKind::CommandObservation,
@@ -266,6 +271,8 @@ mod tests {
     #[test]
     fn safety_boundary_data_output_can_be_validated_by_later_command() {
         let objective = ObjectiveContract {
+            authority: ObjectiveAuthority::CurrentUserRequest,
+            auxiliary_context: ObjectiveAuxiliaryContext::SessionContext,
             task_kind: TaskKind::Data,
             objective_kind: ObjectiveKind::Data,
             deliverable_kind: ObjectiveDeliverableKind::OutputFile,
@@ -293,6 +300,8 @@ mod tests {
     #[test]
     fn safety_boundary_ops_document_still_requires_artifact_after_command() {
         let objective = ObjectiveContract {
+            authority: ObjectiveAuthority::CurrentUserRequest,
+            auxiliary_context: ObjectiveAuxiliaryContext::SessionContext,
             task_kind: TaskKind::Ops,
             objective_kind: ObjectiveKind::Ops,
             deliverable_kind: ObjectiveDeliverableKind::DocumentSections,

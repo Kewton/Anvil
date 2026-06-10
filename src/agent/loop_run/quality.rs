@@ -197,7 +197,8 @@ pub(super) fn repo_change_request_text(
     active_task: Option<&str>,
     messages: &[ConversationMessage],
 ) -> Option<String> {
-    active_task
+    let latest_user_request = latest_explicit_user_request(messages);
+    let active_request = active_task
         .map(str::trim)
         .filter(|task| !task.is_empty())
         .and_then(|task| restore_truncated_active_task(task, messages))
@@ -214,25 +215,26 @@ pub(super) fn repo_change_request_text(
                 .filter(|task| !stored_active_task_looks_truncated(task))
                 .filter(|task| !is_plan_wrapper_or_approval_text(task))
                 .map(ToString::to_string)
-        })
-        .or_else(|| {
-            messages
-                .iter()
-                .rev()
-                .filter(|message| message.role == "user")
-                .filter_map(|message| extract_original_user_request(&message.content))
-                .next()
-        })
-        .or_else(|| {
-            messages
-                .iter()
-                .rev()
-                .filter(|message| message.role == "user")
-                .filter(|message| !is_plan_wrapper_or_approval_text(&message.content))
-                .find(|message| message.role == "user")
-                .map(|message| message.content.trim().to_string())
+        });
+
+    match (latest_user_request, active_request) {
+        (Some(latest), Some(active)) if latest != active => Some(latest),
+        (Some(latest), _) => Some(latest),
+        (None, active) => active,
+    }
+}
+
+fn latest_explicit_user_request(messages: &[ConversationMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != "user" {
+            return None;
+        }
+        extract_original_user_request(&message.content).or_else(|| {
+            (!is_plan_wrapper_or_approval_text(&message.content))
+                .then(|| message.content.trim().to_string())
                 .filter(|content| !content.is_empty())
         })
+    })
 }
 
 fn restore_truncated_active_task(
