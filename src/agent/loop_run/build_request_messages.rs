@@ -286,7 +286,7 @@ fn maybe_send_request_context_pack(
         None => None,
     };
     if resp_opt.is_none() {
-        agent.record_pam_unused_reason("context_pack_failed");
+        agent.record_pam_unused_reason("context_pack_failed:sidecar_call");
     }
     if let Some(resp) = resp_opt.as_ref() {
         let blocked_ids: std::collections::HashSet<String> = if agent.config.photon_respect_warnings

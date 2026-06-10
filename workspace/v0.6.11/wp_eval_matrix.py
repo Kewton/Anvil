@@ -44,6 +44,7 @@ RESULT_FIELDS = [
     "pam_availability",
     "pam_injected_count",
     "pam_unused_reason",
+    "pam_failure_phase",
     "shadow_terminal_class",
     "shadow_terminal_conflict",
     "shadow_missing_evidence",
@@ -598,34 +599,35 @@ def latest_eval_record(state_dir: Path) -> dict[str, object]:
     return latest
 
 
-def pam_availability_from_eval(variant: str, record: dict[str, object]) -> tuple[str, str, str]:
+def pam_availability_from_eval(variant: str, record: dict[str, object]) -> tuple[str, str, str, str]:
     pam_eval = record.get("pam_eval")
     if not isinstance(pam_eval, dict):
-        return ("unknown", "0", "")
+        return ("unknown", "0", "", "")
     availability = str(pam_eval.get("availability") or "")
     injected_count = str(pam_eval.get("actual_injected_count") or 0)
     unused_reason = str(pam_eval.get("unused_reason") or "")
+    failure_phase = str(pam_eval.get("failure_phase") or "")
     if availability:
-        return (availability, injected_count, unused_reason)
+        return (availability, injected_count, unused_reason, failure_phase)
     if variant == "no_pam" and unused_reason == "photon_unavailable":
-        return ("disabled", injected_count, unused_reason)
-    if unused_reason in {"photon_unavailable", "context_pack_failed"}:
-        return ("failed", injected_count, unused_reason)
+        return ("disabled", injected_count, unused_reason, failure_phase)
+    if unused_reason == "photon_unavailable" or unused_reason.startswith("context_pack_failed"):
+        return ("failed", injected_count, unused_reason, failure_phase)
     if unused_reason in {"disabled", "plan_mode"}:
-        return ("disabled", injected_count, unused_reason)
+        return ("disabled", injected_count, unused_reason, failure_phase)
     try:
         actual = int(injected_count)
         suppressed = int(pam_eval.get("suppressed_count") or 0)
         would = int(pam_eval.get("would_inject_in_live_count") or 0)
     except (TypeError, ValueError):
-        return ("unknown", injected_count, unused_reason)
+        return ("unknown", injected_count, unused_reason, failure_phase)
     if actual > 0:
-        return ("injected", injected_count, unused_reason)
+        return ("injected", injected_count, unused_reason, failure_phase)
     if suppressed > 0:
-        return ("blocked_warning", injected_count, unused_reason)
+        return ("blocked_warning", injected_count, unused_reason, failure_phase)
     if would > 0 or variant == "pam":
-        return ("not_injected", injected_count, unused_reason)
-    return ("disabled", injected_count, unused_reason)
+        return ("not_injected", injected_count, unused_reason, failure_phase)
+    return ("disabled", injected_count, unused_reason, failure_phase)
 
 
 def shadow_terminal_from_eval(record: dict[str, object]) -> tuple[str, str, str, str]:
@@ -752,9 +754,12 @@ def run_one(
     repair_exhausted = "repair_exhausted" in exit_reason or "repair_safe_stop" in exit_reason or "repair_exhausted" in output
     max_iter = "max_iterations" in exit_reason or "max iterations" in output.lower()
     eval_record = latest_eval_record(state_dir)
-    pam_availability, pam_injected_count, pam_unused_reason = pam_availability_from_eval(
-        variant, eval_record
-    )
+    (
+        pam_availability,
+        pam_injected_count,
+        pam_unused_reason,
+        pam_failure_phase,
+    ) = pam_availability_from_eval(variant, eval_record)
     shadow_class, shadow_conflict, shadow_missing, shadow_failed = shadow_terminal_from_eval(
         eval_record
     )
@@ -781,6 +786,7 @@ def run_one(
         "pam_availability": pam_availability,
         "pam_injected_count": pam_injected_count,
         "pam_unused_reason": pam_unused_reason,
+        "pam_failure_phase": pam_failure_phase,
         "shadow_terminal_class": shadow_class,
         "shadow_terminal_conflict": shadow_conflict,
         "shadow_missing_evidence": shadow_missing,

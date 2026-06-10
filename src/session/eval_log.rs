@@ -266,6 +266,8 @@ pub struct PamEvalSummary {
     pub decision_types: Vec<String>,
     #[serde(default = "default_pam_availability")]
     pub availability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_phase: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affected_targets: Vec<PamEvalTarget>,
     pub actual_injected_count: u32,
@@ -282,11 +284,13 @@ impl PamEvalSummary {
         let unused_reason = reason.into();
         let availability =
             Self::derive_availability("not_used", 0, 0, 0, Some(unused_reason.as_str()));
+        let failure_phase = Self::derive_failure_phase(Some(unused_reason.as_str()));
         Self {
             mode: "not_used".to_string(),
             decision_type: "not_used".to_string(),
             decision_types: vec!["not_used".to_string()],
             availability: availability.to_string(),
+            failure_phase: failure_phase.map(str::to_string),
             affected_targets: Vec::new(),
             actual_injected_count: 0,
             suppressed_count: 0,
@@ -306,7 +310,8 @@ impl PamEvalSummary {
     ) -> &'static str {
         match unused_reason {
             Some("disabled") | Some("plan_mode") => return "disabled",
-            Some("photon_unavailable") | Some("context_pack_failed") => return "failed",
+            Some("photon_unavailable") => return "failed",
+            Some(reason) if reason.starts_with("context_pack_failed") => return "failed",
             Some("shadow_mode") => return "not_injected",
             Some("canary_gate") => return "not_injected",
             Some(_) if mode == "not_used" => return "not_injected",
@@ -320,6 +325,28 @@ impl PamEvalSummary {
             "not_injected"
         } else {
             "not_injected"
+        }
+    }
+
+    pub fn derive_failure_phase(unused_reason: Option<&str>) -> Option<&'static str> {
+        match unused_reason {
+            Some("disabled") => Some("disabled"),
+            Some("plan_mode") => Some("plan_mode"),
+            Some("photon_unavailable") => Some("photon_availability"),
+            Some("shadow_mode") | Some("canary_gate") => Some("send_gate"),
+            Some("context_pack_failed") => Some("context_pack_call"),
+            Some(reason) if reason.starts_with("context_pack_failed:") => reason
+                .split_once(':')
+                .map(|(_, phase)| phase)
+                .and_then(|phase| match phase {
+                    "sidecar_call" => Some("sidecar_call"),
+                    "empty_response" => Some("empty_response"),
+                    "parse_failure" => Some("parse_failure"),
+                    "timeout" => Some("timeout"),
+                    "input_empty" => Some("input_empty"),
+                    _ => Some("context_pack_call"),
+                }),
+            _ => None,
         }
     }
 }
@@ -1803,8 +1830,28 @@ mod tests {
     fn pam_eval_summary_reports_availability_separately_from_terminal_authority() {
         assert_eq!(PamEvalSummary::skipped("disabled").availability, "disabled");
         assert_eq!(
+            PamEvalSummary::skipped("disabled").failure_phase.as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(
             PamEvalSummary::skipped("photon_unavailable").availability,
             "failed"
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("photon_unavailable")
+                .failure_phase
+                .as_deref(),
+            Some("photon_availability")
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("context_pack_failed:sidecar_call").availability,
+            "failed"
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("context_pack_failed:sidecar_call")
+                .failure_phase
+                .as_deref(),
+            Some("sidecar_call")
         );
         assert_eq!(
             PamEvalSummary::derive_availability("live", 1, 0, 0, None),

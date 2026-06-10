@@ -359,11 +359,15 @@ impl PamAdvisoryDecision {
             self.decision_effect.would_inject_in_live_count,
             unused_reason.as_deref(),
         );
+        let failure_phase = crate::session::eval_log::PamEvalSummary::derive_failure_phase(
+            unused_reason.as_deref(),
+        );
         crate::session::eval_log::PamEvalSummary {
             mode: self.mode.as_str().to_string(),
             decision_type: self.decision_effect.influenced_decision.to_string(),
             decision_types,
             availability: availability.to_string(),
+            failure_phase: failure_phase.map(str::to_string),
             affected_targets,
             actual_injected_count: self.decision_effect.actual_injected_count,
             suppressed_count: self.decision_effect.suppressed_count,
