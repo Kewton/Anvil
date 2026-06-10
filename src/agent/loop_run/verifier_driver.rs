@@ -200,6 +200,8 @@ pub(super) fn select_task_contract_verifier(
     changed_files: &[String],
     recent_successful_bash_commands: &[String],
     owned_test_artifacts: &[String],
+    owned_test_candidates_count: usize,
+    rejected_owned_test_candidates_count: usize,
     test_execution_required: bool,
     workspace_scope: Option<&TaskWorkspaceScope>,
     evidence_command_hint: Option<&str>,
@@ -213,7 +215,12 @@ pub(super) fn select_task_contract_verifier(
             owned_test_artifacts,
             project_unit,
         );
-        return structured_selection_from_owned_plan(owned_plan, owned_test_artifacts.len());
+        return structured_selection_from_owned_plan(
+            owned_plan,
+            owned_test_artifacts.len(),
+            owned_test_candidates_count,
+            rejected_owned_test_candidates_count,
+        );
     }
 
     if let Some(plan) =
@@ -244,6 +251,8 @@ pub(super) fn select_task_contract_verifier(
 fn structured_selection_from_owned_plan(
     owned_plan: OwnedTestVerifierPlan,
     owned_test_artifacts_count: usize,
+    owned_test_candidates_count: usize,
+    rejected_owned_test_candidates_count: usize,
 ) -> TaskContractVerifierSelection {
     match owned_plan {
         OwnedTestVerifierPlan::Runnable { plan, command } => {
@@ -264,6 +273,16 @@ fn structured_selection_from_owned_plan(
             detected_source,
             owned_test_artifacts_count,
         },
+        OwnedTestVerifierPlan::Missing
+            if owned_test_artifacts_count == 0
+                && owned_test_candidates_count > 0
+                && rejected_owned_test_candidates_count > 0 =>
+        {
+            TaskContractVerifierSelection::StructuredWeak {
+                detected_source: "generated_test_preflight",
+                owned_test_artifacts_count: owned_test_candidates_count,
+            }
+        }
         OwnedTestVerifierPlan::Missing => TaskContractVerifierSelection::StructuredMissing {
             outcome: task_contract_structured_missing_outcome(owned_test_artifacts_count),
             owned_test_artifacts_count,
@@ -625,6 +644,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
+                0,
                 true,
                 Some(&scope),
                 None,
@@ -649,6 +670,8 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
+                0,
                 true,
                 Some(&scope),
                 Some("cargo test --manifest-path Cargo.toml"),
@@ -679,6 +702,8 @@ mod tests {
             &["tests/lib.rs".to_string(), "Cargo.toml".to_string()],
             &[],
             &["tests/lib.rs".to_string()],
+            1,
+            0,
             true,
             Some(&scope),
             Some("cargo test --manifest-path Cargo.toml"),
@@ -708,6 +733,8 @@ mod tests {
             &[],
             &[],
             &[],
+            0,
+            0,
             false,
             None,
             Some("cargo test --manifest-path Cargo.toml"),
@@ -730,8 +757,32 @@ mod tests {
     fn verifier_selection_without_candidates_is_missing() {
         let dir = tempdir().unwrap();
         assert_eq!(
-            select_task_contract_verifier(dir.path(), &[], &[], &[], false, None, None, None),
+            select_task_contract_verifier(dir.path(), &[], &[], &[], 0, 0, false, None, None, None),
             TaskContractVerifierSelection::Missing
+        );
+    }
+
+    #[test]
+    fn verifier_selection_projects_rejected_test_candidates_to_weak_binding() {
+        let dir = tempdir().unwrap();
+        let scope = TaskWorkspaceScope::detect(dir.path(), "run tests");
+        assert_eq!(
+            select_task_contract_verifier(
+                dir.path(),
+                &[],
+                &[],
+                &[],
+                1,
+                1,
+                true,
+                Some(&scope),
+                None,
+                None,
+            ),
+            TaskContractVerifierSelection::StructuredWeak {
+                detected_source: "generated_test_preflight",
+                owned_test_artifacts_count: 1,
+            }
         );
     }
 }

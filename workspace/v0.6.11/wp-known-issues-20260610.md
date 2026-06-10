@@ -69,3 +69,11 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - Root cause was contract admission, not model unwillingness: command-observation report requests could still be classified as Coding or Research before reaching Ops.
 - After separating command-observation artifacts from implementation inference, Ops recovered to 6/6 pass and `done`.
 - Ops high_quality remains 3/6 because some runs create temporary stdout/stderr/exit-code files outside the requested report artifact. This should be addressed as artifact-scope hygiene, not by weakening terminal projection.
+
+## WP-D: EvidenceBinding / Terminal Projection
+
+- TOML false-missing recovered in the focused smoke: 4/4 TOML and 7/7 mixed coding rows exited `done` with `false_missing=0`.
+- The immediate cause was over-broad generated-test non-ASCII rejection: prose/docstring literals were treated as unsupported assertions and removed the explicit test artifact from verifier binding.
+- The preflight predicate is now assertion-context scoped, but it remains a deterministic safety boundary. Future expansion should keep it tied to typed assertion/evidence intent, not benchmark text.
+- All-candidate preflight rejection is now observable as weak binding metadata, but there is still no dedicated repair operator for rejected generated-test content.
+- Real LLM validation requires localhost Ollama access; sandboxed evaluation fails before model invocation if `127.0.0.1:11434` is blocked.

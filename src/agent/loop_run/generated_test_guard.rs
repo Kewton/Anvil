@@ -571,7 +571,7 @@ fn asserts_unsupported_non_ascii_contract(contract: &TaskContract, source: &str)
     {
         return false;
     }
-    double_quoted_literals(source).any(|literal| !literal.is_ascii())
+    contains_non_ascii_assertion_literal(source)
 }
 
 fn contract_mentions_non_ascii(contract: &TaskContract) -> bool {
@@ -857,6 +857,25 @@ fn coverage_term_is_informative(term: &str) -> bool {
     )
 }
 
+fn contains_non_ascii_assertion_literal(source: &str) -> bool {
+    source.lines().any(|line| {
+        assertion_context_line(line)
+            && double_quoted_literals(line).any(|literal| !literal.is_ascii())
+    })
+}
+
+fn assertion_context_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("assert")
+        || trimmed.contains(" assert")
+        || trimmed.contains("assert!")
+        || trimmed.contains("assert_eq!")
+        || trimmed.contains("assert_ne!")
+        || trimmed.contains("assert.equal")
+        || trimmed.contains("assert.deepEqual")
+        || trimmed.contains("expect(")
+}
+
 fn double_quoted_literals(source: &str) -> impl Iterator<Item = &str> {
     source.split('"').skip(1).step_by(2)
 }
@@ -1003,6 +1022,29 @@ fn slugifies_ascii_only() {
             err.failure_kind,
             GeneratedTestPreflightFailureKind::UnsupportedContractAssertion
         );
+    }
+
+    #[test]
+    fn preflight_allows_non_ascii_docstring_without_unicode_contract() {
+        let root = tempfile::tempdir().expect("tempdir");
+        write_test_file(
+            root.path(),
+            "tests/test_merge_toml.py",
+            r#""""Tests for merge_toml.py – parser and CLI."""
+
+import merge_toml
+
+
+def test_parse_simple_string():
+    assert merge_toml._parse_value('"hello"') == "hello"
+"#,
+        );
+        let contract = TaskContract::from_request(
+            "Create merge_toml.py. Support strings, integers, booleans, and one-level tables. Add pytest tests in tests/test_merge_toml.py and verify them.",
+        );
+
+        generated_test_preflight(root.path(), &contract, "tests/test_merge_toml.py")
+            .expect("non-ASCII prose in a docstring is not an unsupported assertion");
     }
 
     #[test]

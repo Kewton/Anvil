@@ -23,6 +23,19 @@
 use super::Agent;
 use crate::logging::log_llm_event;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OwnedTestVerifierProjection {
+    pub(super) admitted: Vec<String>,
+    pub(super) candidate_count: usize,
+    pub(super) rejected_count: usize,
+}
+
+impl OwnedTestVerifierProjection {
+    pub(super) fn all_candidates_rejected(&self) -> bool {
+        self.admitted.is_empty() && self.candidate_count > 0 && self.rejected_count > 0
+    }
+}
+
 /// Issue #659 (Task 3.3) — verifier-binding Owned-test-artifact slice.
 /// Reads through the production-authoritative ledger projection. When
 /// legacy and ledger disagree, emit a masked
@@ -35,6 +48,13 @@ pub(super) fn owned_test_artifacts_for_verifier(
     agent: &mut Agent,
     contract: &super::task_contract::TaskContract,
 ) -> Vec<String> {
+    owned_test_verifier_projection(agent, contract).admitted
+}
+
+pub(super) fn owned_test_verifier_projection(
+    agent: &mut Agent,
+    contract: &super::task_contract::TaskContract,
+) -> OwnedTestVerifierProjection {
     let scope = super::workspace_access::current_workspace_scope(agent);
     // `task_contract_artifact_states` has the side effect of seeding the
     // ledger with Existing / Scaffold baseline events. We MUST call it
@@ -65,7 +85,11 @@ pub(super) fn owned_test_artifacts_for_verifier(
     if legacy != ledger {
         emit_owned_test_artifacts_projection_divergence(agent, &legacy, &ledger);
     }
-    guarded
+    OwnedTestVerifierProjection {
+        admitted: guarded,
+        candidate_count: verifier_candidates.len(),
+        rejected_count: preflight_report.rejected.len(),
+    }
 }
 
 pub(super) fn contract_bound_owned_test_artifacts(

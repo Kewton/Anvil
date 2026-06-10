@@ -2307,16 +2307,26 @@ pub(super) fn verifier_repair_pass_client(
 
 pub(super) fn task_contract_verifier_test_binding(
     agent: &mut Agent,
-) -> (Vec<String>, bool, Option<TaskWorkspaceScope>) {
+) -> (Vec<String>, bool, Option<TaskWorkspaceScope>, usize, usize) {
     // Issue #917: per-turn classification authority (None → no binding).
     let Some(contract) = super::task_classification::task_contract_authority(agent) else {
-        return (Vec::new(), false, None);
+        return (Vec::new(), false, None, 0, 0);
     };
     let test_execution_required = contract.completion_policy.test_execution_required();
-    let owned_test_artifacts =
-        super::owned_test_projection::owned_test_artifacts_for_verifier(agent, &contract);
+    let projection = super::owned_test_projection::owned_test_verifier_projection(agent, &contract);
+    let all_candidates_rejected = projection.all_candidates_rejected();
     let scope = super::workspace_access::current_workspace_scope(agent);
-    (owned_test_artifacts, test_execution_required, Some(scope))
+    (
+        projection.admitted,
+        test_execution_required,
+        Some(scope),
+        projection.candidate_count,
+        if all_candidates_rejected {
+            projection.rejected_count
+        } else {
+            0
+        },
+    )
 }
 
 pub(super) fn handle_absent_task_contract_verifier_selection(
@@ -2435,8 +2445,13 @@ pub(super) fn select_task_contract_verifier_once(
 ) {
     let recent_successful_bash_commands =
         super::success::recent_successful_bash_commands_since_last_user(&agent.session.messages);
-    let (owned_test_artifacts, test_execution_required, workspace_scope_opt) =
-        task_contract_verifier_test_binding(agent);
+    let (
+        owned_test_artifacts,
+        test_execution_required,
+        workspace_scope_opt,
+        owned_test_candidates_count,
+        rejected_owned_test_candidates_count,
+    ) = task_contract_verifier_test_binding(agent);
     let recent_bash_verifier_hint =
         super::success::recent_bash_verifier_command_hint_since_last_user(&agent.session.messages);
     let task_contract_authority = super::task_classification::task_contract_authority(agent);
@@ -2469,6 +2484,8 @@ pub(super) fn select_task_contract_verifier_once(
         changed_files,
         &recent_successful_bash_commands,
         &owned_test_artifacts,
+        owned_test_candidates_count,
+        rejected_owned_test_candidates_count,
         test_execution_required,
         workspace_scope_opt.as_ref(),
         evidence_command_hint.as_deref(),
@@ -2491,6 +2508,8 @@ pub(super) fn select_task_contract_verifier_once(
             "turn_index": agent.current_turn_index,
             "selection": selection.label(),
             "owned_test_artifacts_count": selection.owned_test_artifacts_count(),
+            "owned_test_candidates_count": owned_test_candidates_count,
+            "rejected_owned_test_candidates_count": rejected_owned_test_candidates_count,
             "test_execution_required": test_execution_required,
             "authoring_style": authoring_style_decision
                 .map(|decision| decision.style.label()),
