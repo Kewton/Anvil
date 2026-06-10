@@ -164,15 +164,24 @@ fn emit_semantic_candidate_shadow(agent: &Agent, contract: &TaskContract) {
         super::task_contract_admission::SemanticCandidateAdmissionInput {
             candidate: &candidate,
             contract,
-            allow_equivalent_current_behavior: false,
+            allow_equivalent_current_behavior:
+                super::task_contract_semantic_candidate::limited_semantic_candidate_adoption_enabled(
+                    contract,
+                ),
         },
     );
+    let admission_mode = if decision.is_authoritative() {
+        "limited_adoption"
+    } else {
+        "shadow_only"
+    };
     log_llm_event(
         "agent.semantic_candidate.shadow",
         serde_json::json!({
             "session_id": agent.session_store.session_id(),
             "turn_index": agent.current_turn_index,
             "origin": "deterministic_shadow",
+            "admission_mode": admission_mode,
             "status": decision.status.label(),
             "reasons": decision.reason_labels(),
             "objective_kind": candidate.objective_kind.label(),

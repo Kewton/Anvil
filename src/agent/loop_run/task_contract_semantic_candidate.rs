@@ -7,11 +7,11 @@
 
 #![allow(dead_code)]
 
-use super::authoring_style::AuthoringStyleDecision;
+use super::authoring_style::{AuthoringStyleDecision, StyleAuthority};
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
     ObjectiveDeliverableKind, ObjectiveEvidenceKind, ObjectiveKind, ProjectLanguage, ProjectShape,
-    StructuredRecordSchema, TaskContract,
+    StructuredRecordSchema, TaskContract, TaskKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +144,20 @@ impl SemanticCandidate {
             &artifact_identity_signature(&contract.required_artifact_identities),
         );
         disagreements
+    }
+}
+
+pub(super) fn limited_semantic_candidate_adoption_enabled(contract: &TaskContract) -> bool {
+    match contract.task_kind {
+        TaskKind::Docs
+        | TaskKind::Data
+        | TaskKind::Research
+        | TaskKind::Ops
+        | TaskKind::Authoring => true,
+        TaskKind::Coding => !matches!(
+            contract.authoring_style_decision.authority,
+            StyleAuthority::Unknown
+        ),
     }
 }
 
@@ -303,5 +317,44 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("semantic_candidate_disagreement"))
         );
+    }
+
+    #[test]
+    fn limited_adoption_accepts_equivalent_docs_candidate() {
+        let contract = TaskContract::from_request("Create README.md with Usage and Validation.");
+        let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+        let decision = super::super::task_contract_admission::admit_semantic_candidate(
+            super::super::task_contract_admission::SemanticCandidateAdmissionInput {
+                candidate: &candidate,
+                contract: &contract,
+                allow_equivalent_current_behavior: limited_semantic_candidate_adoption_enabled(
+                    &contract,
+                ),
+            },
+        );
+
+        assert!(limited_semantic_candidate_adoption_enabled(&contract));
+        assert!(decision.is_authoritative());
+    }
+
+    #[test]
+    fn limited_adoption_does_not_accept_unstyled_coding_candidate() {
+        let contract = TaskContract::from_request("Implement feature X and add tests.");
+        let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+        let decision = super::super::task_contract_admission::admit_semantic_candidate(
+            super::super::task_contract_admission::SemanticCandidateAdmissionInput {
+                candidate: &candidate,
+                contract: &contract,
+                allow_equivalent_current_behavior: limited_semantic_candidate_adoption_enabled(
+                    &contract,
+                ),
+            },
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(!limited_semantic_candidate_adoption_enabled(&contract));
+        assert!(!decision.is_authoritative());
     }
 }
