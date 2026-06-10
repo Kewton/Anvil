@@ -77,6 +77,7 @@ mod active_job_arbiter;
 mod actor_loop_flow;
 mod cargo_manifest_summary;
 mod node_test_evidence_quality;
+mod objective_contract_projection;
 mod objective_evidence;
 mod package_manifest_summary;
 mod structured_data_observation;
