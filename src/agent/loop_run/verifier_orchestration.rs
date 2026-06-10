@@ -2424,7 +2424,12 @@ pub(super) fn select_task_contract_verifier_once(
         task_contract_verifier_test_binding(agent);
     let recent_bash_verifier_hint =
         super::success::recent_bash_verifier_command_hint_since_last_user(&agent.session.messages);
-    let evidence_command_hint = super::task_classification::task_contract_authority(agent)
+    let task_contract_authority = super::task_classification::task_contract_authority(agent);
+    let authoring_style_decision = task_contract_authority
+        .as_ref()
+        .map(|contract| contract.authoring_style_decision);
+    let evidence_command_hint = task_contract_authority
+        .as_ref()
         .and_then(|contract| contract.evidence_command_hint().map(str::to_string))
         .or(recent_bash_verifier_hint);
     let active_request = super::workspace_access::active_request_text(agent);
@@ -2454,6 +2459,16 @@ pub(super) fn select_task_contract_verifier_once(
         evidence_command_hint.as_deref(),
         task_contract_project_unit.as_ref(),
     );
+    let python_verifier_flavor = task_contract_verifier_selection_python_flavor(
+        &selection,
+        evidence_command_hint.as_deref(),
+    );
+    let runner_style_mismatch = match (authoring_style_decision, python_verifier_flavor) {
+        (Some(decision), Some(flavor)) => {
+            super::authoring_style::python_runner_style_mismatch_label(decision, flavor)
+        }
+        _ => "unknown",
+    };
     log_llm_event(
         "agent.task_contract.verifier.selection",
         serde_json::json!({
@@ -2462,6 +2477,13 @@ pub(super) fn select_task_contract_verifier_once(
             "selection": selection.label(),
             "owned_test_artifacts_count": selection.owned_test_artifacts_count(),
             "test_execution_required": test_execution_required,
+            "authoring_style": authoring_style_decision
+                .map(|decision| decision.style.label()),
+            "style_authority": authoring_style_decision
+                .map(|decision| decision.authority.label()),
+            "python_project_unit_verifier_flavor": python_verifier_flavor
+                .map(|flavor| flavor.label()),
+            "runner_style_mismatch": runner_style_mismatch,
             "evidence_command_hint_present": evidence_command_hint.is_some(),
             "evidence_command_hint_deferred_to_structured": evidence_command_hint.is_some()
                 && matches!(
@@ -2473,6 +2495,26 @@ pub(super) fn select_task_contract_verifier_once(
         }),
     );
     (selection, workspace_scope_opt)
+}
+
+fn task_contract_verifier_selection_python_flavor(
+    selection: &super::verifier_driver::TaskContractVerifierSelection,
+    evidence_command_hint: Option<&str>,
+) -> Option<super::verifier_command_policy::PythonProjectUnitVerifierFlavor> {
+    let selected_command = match selection {
+        super::verifier_driver::TaskContractVerifierSelection::StructuredRunnable {
+            display_command,
+            ..
+        } => Some(display_command.as_str()),
+        super::verifier_driver::TaskContractVerifierSelection::LegacyRunnable {
+            command_for_log,
+            ..
+        } => Some(command_for_log.as_str()),
+        super::verifier_driver::TaskContractVerifierSelection::StructuredWeak { .. }
+        | super::verifier_driver::TaskContractVerifierSelection::StructuredMissing { .. }
+        | super::verifier_driver::TaskContractVerifierSelection::Missing => evidence_command_hint,
+    };
+    super::verifier_command_policy::python_project_unit_verifier_flavor_if_python(selected_command)
 }
 
 pub(super) fn handle_legacy_task_contract_verifier_selection(

@@ -1758,17 +1758,27 @@ impl AutoTestRunner {
                 // explicit owned test paths. Missing dependencies then surface
                 // as normal verifier failures instead of collapsing the task
                 // into VerifierWeak.
-                let command =
-                    match super::verifier_command_policy::python_project_unit_verifier_flavor(Some(
+                let verifier_flavor =
+                    super::verifier_command_policy::python_project_unit_verifier_flavor(Some(
                         &display_command,
-                    )) {
-                        PythonProjectUnitVerifierFlavor::UnittestDiscover => {
-                            VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
-                        }
-                        PythonProjectUnitVerifierFlavor::PytestStdlib => {
-                            VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
-                        }
-                    };
+                    ));
+                let authoring_style_decision =
+                    super::authoring_style::decide_python_authoring_style(
+                        super::authoring_style::PythonAuthoringStyleSignals::default(),
+                        verifier_flavor,
+                    );
+                debug_assert_eq!(
+                    authoring_style_decision.style,
+                    super::authoring_style::AuthoringStyle::Unspecified
+                );
+                let command = match verifier_flavor {
+                    PythonProjectUnitVerifierFlavor::UnittestDiscover => {
+                        VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
+                    }
+                    PythonProjectUnitVerifierFlavor::PytestStdlib => {
+                        VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
+                    }
+                };
                 if let Some(command) = command {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }

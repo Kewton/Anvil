@@ -1,3 +1,4 @@
+use super::authoring_style::AuthoringStyleDecision;
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::contract_request_signals::contains_implementation_file_hint;
 #[cfg(test)]
@@ -557,6 +558,7 @@ pub(super) struct TaskContract {
     // is UNCHANGED by this field (D6: verifier gate does not regress).
     pub(super) classification_confidence: f32,
     pub(super) evidence_command_hint: Option<String>,
+    pub(super) authoring_style_decision: AuthoringStyleDecision,
     pub(super) objective_evidence_kind_override: Option<ObjectiveEvidenceKind>,
 }
 
@@ -1043,6 +1045,7 @@ impl TaskContract {
         let mut required_behavior = required_behavior::extract(request_for_inference);
         required_behavior.required_artifacts = None;
         required_behavior.verification = None;
+        let is_python_contract = matches!(project_intent.language, Some(ProjectLanguage::Python));
         let completion_policy = CompletionPolicy::from_contract_parts(
             task_kind,
             intent,
@@ -1055,6 +1058,12 @@ impl TaskContract {
             &lower,
             project_profile_inputs.as_ref(),
         );
+        let authoring_style_decision =
+            super::authoring_style::decide_python_authoring_style_from_request(
+                request_for_inference,
+                is_python_contract,
+                required.contains(&ArtifactRole::Test),
+            );
         Self {
             task_kind,
             intent,
@@ -1068,6 +1077,7 @@ impl TaskContract {
             required_behavior,
             classification_confidence,
             evidence_command_hint,
+            authoring_style_decision,
             objective_evidence_kind_override: project_profile_inputs
                 .as_ref()
                 .and_then(|inputs| inputs.evidence_kind),

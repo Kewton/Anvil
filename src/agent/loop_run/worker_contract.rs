@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::authoring_style::AuthoringStyleDecision;
 use super::scaffold_pipeline::ScaffoldFramework;
 use super::task_contract::{
     ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, ObjectiveContract,
@@ -1410,6 +1411,7 @@ pub(super) struct TaskExecutionContract {
     pub(super) scaffold_profile: ScaffoldProfile,
     pub(super) public_contract: PublicContract,
     pub(super) evidence: ExecutionEvidence,
+    pub(super) authoring_style_decision: AuthoringStyleDecision,
     pub(super) constraints: ExecutionConstraints,
     pub(super) repair_policy: ExecutionRepairPolicy,
     deliverable_kind: ObjectiveDeliverableKind,
@@ -1443,6 +1445,7 @@ impl TaskExecutionContract {
                 required: objective.evidence_required,
                 command: None,
             },
+            authoring_style_decision: contract.authoring_style_decision,
             constraints: ExecutionConstraints {
                 allowed_tools: capability.allowed_tools,
                 allowed_files,

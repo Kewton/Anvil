@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::authoring_style::AuthoringStyleDecision;
 use super::contract_generation_expectations::{
     declared_artifacts_summary, declared_expectations_summary,
 };
@@ -76,6 +77,9 @@ pub(super) struct ContractBoundGenerationPlan {
     phases: Vec<ContractGenerationPhase>,
     alignment_predicate: &'static str,
     runtime_profile: RuntimeProfile,
+    authoring_style_policy: &'static str,
+    authoring_style_decision: AuthoringStyleDecision,
+    test_binding_policy: &'static str,
     declared_artifacts: String,
     declared_expectations: String,
 }
@@ -137,6 +141,11 @@ impl ContractBoundGenerationPlan {
             phases,
             alignment_predicate,
             runtime_profile: execution.runtime_profile,
+            authoring_style_policy: super::authoring_style::authoring_style_policy_note_for_runtime(
+                execution.runtime_profile,
+            ),
+            authoring_style_decision: execution.authoring_style_decision,
+            test_binding_policy: test_binding_policy_for(execution.runtime_profile),
             declared_artifacts: declared_artifacts_summary(&execution.deliverables),
             declared_expectations: declared_expectations_summary(execution),
         })
@@ -167,10 +176,13 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; authoring_style_decision={}; authoring_style_policy={}; test_binding_policy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
+            self.authoring_style_decision.summary(),
+            self.authoring_style_policy,
+            self.test_binding_policy,
             self.declared_artifacts,
             self.declared_expectations,
             phase_text
@@ -309,6 +321,23 @@ fn runtime_constraint_for(runtime_profile: RuntimeProfile) -> &'static str {
     }
 }
 
+fn test_binding_policy_for(runtime_profile: RuntimeProfile) -> &'static str {
+    match runtime_profile {
+        RuntimeProfile::Python => {
+            "python_cli_subprocess_tests_bind_repo_local_entrypoints_to_repo_root_or_absolute_script_path_temp_dirs_hold_input_data_not_relative_script_cwd"
+        }
+        RuntimeProfile::Node | RuntimeProfile::TypeScript => {
+            "node_cli_subprocess_tests_bind_repo_local_entrypoints_to_package_root_or_absolute_script_path_temp_dirs_hold_input_data_not_relative_script_cwd"
+        }
+        RuntimeProfile::Rust => {
+            "rust_cli_tests_bind_binary_or_manifest_from_crate_root_not_from_unrelated_temp_working_directory"
+        }
+        RuntimeProfile::Unspecified => {
+            "test_entrypoints_and_working_directories_must_match_declared_artifacts"
+        }
+    }
+}
+
 fn has_roles(deliverables: &[ExecutionDeliverable], roles: &[ArtifactRole]) -> bool {
     roles.iter().all(|role| {
         deliverables
@@ -381,6 +410,20 @@ mod tests {
         );
         assert!(
             plan.policy_message()
+                .contains("evidence_runner_is_not_test_authoring_style")
+        );
+        assert!(
+            plan.policy_message()
+                .contains("style=unittest_class_style,authority=explicit_user_request"),
+            "{}",
+            plan.policy_message()
+        );
+        assert!(
+            plan.policy_message()
+                .contains("python_cli_subprocess_tests_bind_repo_local_entrypoints_to_repo_root")
+        );
+        assert!(
+            plan.policy_message()
                 .contains("test_artifact_targets_the_declared_public_contract")
         );
         assert!(
@@ -442,6 +485,7 @@ mod tests {
         assert!(message.contains("implementation@src/lib.rs(kind=file;format=rust_source)"));
         assert!(message.contains("test@tests/lib.rs(kind=file;format=rust_source)"));
         assert!(message.contains("evidence=test_run(required),command=cargo test"));
+        assert!(message.contains("rust_cli_tests_bind_binary_or_manifest_from_crate_root"));
     }
 
     #[test]
