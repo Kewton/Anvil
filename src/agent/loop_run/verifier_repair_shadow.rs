@@ -86,6 +86,18 @@ pub(super) fn verifier_repair_action_payload_for_context(
     }))
 }
 
+pub(super) fn verifier_repair_action_space_payload_for_context(
+    context: &super::repair_job::RepairJob,
+    target_hint: &super::task_contract::RecoveryTargetHint,
+) -> serde_json::Value {
+    let action = verifier_repair_action_for_context(context);
+    super::repair_action_space::repair_action_plan_for_selected_target(
+        Some(target_hint),
+        action.as_ref(),
+    )
+    .to_json_value()
+}
+
 pub(super) fn legacy_repair_brief_input_from_assessment(
     assessment: &super::VerifierRepairAssessment,
     default_confidence: f64,

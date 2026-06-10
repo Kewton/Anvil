@@ -1366,6 +1366,49 @@ mod inner {
         assert!(payload.contains("request_schema_mismatch"));
         assert!(payload.contains("request_binding_issue=json_body_fields_not_bound"));
         assert!(payload.contains("bind declared JSON body fields"));
+        assert!(payload.contains("\"repair_action_space\""));
+        assert!(payload.contains("\"allowed_tool_category\":\"edit_selected_artifact\""));
+        assert!(payload.contains("\"expected_evidence_delta\":\"verifier_result_should_change\""));
+    }
+
+    #[test]
+    fn verifier_repair_pass_prompt_reuses_action_space_after_malformed_proposal() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path();
+        std::fs::write(
+            work_root.join("app.py"),
+            "def total(items):\n    return sum(items)\n",
+        )
+        .unwrap();
+        let mut context = verifier_context_for("app.py");
+        context.output_excerpt = "FAILED tests/test_app.py::test_total - assert 4 == 6".to_string();
+        context.repair_error = Some("old_string matched 0 times".to_string());
+        let target = context
+            .assessment
+            .as_ref()
+            .unwrap()
+            .repair_target_hint
+            .as_ref()
+            .unwrap()
+            .clone();
+        let messages = verifier_repair_pass_messages(
+            work_root,
+            &context,
+            &target,
+            "Fix total(items) so the verifier passes.",
+            None,
+        )
+        .unwrap();
+        let payload = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(payload.contains("\"previous_repair_error\":\"old_string matched 0 times\""));
+        assert!(payload.contains("\"repair_action_space\""));
+        assert!(payload.contains("keeping the same repair_action_space target"));
+        assert!(payload.contains("\"path\":\"app.py\""));
     }
 
     #[test]

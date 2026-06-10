@@ -519,6 +519,7 @@ pub(crate) mod reminder;
 // v0.4.13 Phase 4: controller-owned action projected from a validated
 // RepairBrief. Private module; consumed by the repair pipeline as it is wired.
 mod repair_action;
+mod repair_action_space;
 // v0.4.15 MVP: provenance/authority boundary for verifier repair proposals.
 // Private module; `turn.rs` is the only production consumer.
 mod repair_authority;
