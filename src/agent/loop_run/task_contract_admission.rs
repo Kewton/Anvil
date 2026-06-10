@@ -134,6 +134,16 @@ pub(super) enum SemanticCandidateAdmissionStatus {
     Ignored,
 }
 
+impl SemanticCandidateAdmissionStatus {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Rejected => "rejected",
+            Self::Ignored => "ignored",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SemanticCandidateAdmissionReason {
     ShadowOnly,

@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use super::authoring_style::AuthoringStyleDecision;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
     ObjectiveDeliverableKind, ObjectiveEvidenceKind, ObjectiveKind, ProjectLanguage, ProjectShape,
@@ -79,6 +80,8 @@ pub(super) struct SemanticCandidate {
     pub(super) project_profile: SemanticProjectProfile,
     pub(super) api_expectations: Vec<SemanticExpectation>,
     pub(super) schema_expectations: Vec<SemanticExpectation>,
+    pub(super) authoring_style: AuthoringStyleDecision,
+    pub(super) compatibility_risks: Vec<String>,
     pub(super) ambiguity: SemanticAmbiguity,
 }
 
@@ -104,6 +107,8 @@ impl SemanticCandidate {
             },
             api_expectations: Vec::new(),
             schema_expectations,
+            authoring_style: contract.authoring_style_decision,
+            compatibility_risks: compatibility_risks_from_contract(contract),
             ambiguity: SemanticAmbiguity::from_contract(contract),
         }
     }
@@ -140,6 +145,17 @@ impl SemanticCandidate {
         );
         disagreements
     }
+}
+
+fn compatibility_risks_from_contract(contract: &TaskContract) -> Vec<String> {
+    let mut risks = Vec::new();
+    if contract.verification_required && contract.evidence_command_hint().is_none() {
+        risks.push("evidence_required_without_explicit_runner_hint".to_string());
+    }
+    if contract.required_artifact_identities.is_empty() && !contract.required_artifacts.is_empty() {
+        risks.push("required_roles_without_explicit_artifact_identity".to_string());
+    }
+    risks
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +246,7 @@ mod tests {
                 .any(|identity| identity.path == "Cargo.toml")
         );
         assert!(candidate.disagreements_with_contract(&contract).is_empty());
+        assert_eq!(candidate.authoring_style, contract.authoring_style_decision);
     }
 
     #[test]
@@ -244,6 +261,19 @@ mod tests {
                 .schema_expectations
                 .iter()
                 .any(|expectation| expectation.value.contains("id|total"))
+        );
+    }
+
+    #[test]
+    fn coding_candidate_records_missing_explicit_runner_risk() {
+        let contract = TaskContract::from_request("Create main.py and tests/test_main.py.");
+        let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+        assert!(
+            candidate
+                .compatibility_risks
+                .iter()
+                .any(|risk| risk == "evidence_required_without_explicit_runner_hint")
         );
     }
 

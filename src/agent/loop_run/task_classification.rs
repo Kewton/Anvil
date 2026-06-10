@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 use super::Agent;
 use super::task_contract::TaskContract;
+use crate::logging::log_llm_event;
 
 /// Eager populate at the single known point: called once in `run_turn`
 /// immediately after `push_user_message`. Idempotent via `OnceCell`; a no-op
@@ -88,6 +89,7 @@ pub(super) fn populate_task_contract_authority(agent: &mut Agent) {
             &request, kind, profile,
         )),
     };
+    emit_semantic_candidate_shadow(agent, &contract);
     let _ = agent.task_contract_this_turn.set(contract);
 }
 
@@ -151,4 +153,38 @@ pub(super) fn task_contract_authority(agent: &Agent) -> Option<Rc<TaskContract>>
         }
     }
     Some(contract.clone())
+}
+
+fn emit_semantic_candidate_shadow(agent: &Agent, contract: &TaskContract) {
+    let candidate =
+        super::task_contract_semantic_candidate::SemanticCandidate::deterministic_shadow_from_contract(
+            contract,
+        );
+    let decision = super::task_contract_admission::admit_semantic_candidate(
+        super::task_contract_admission::SemanticCandidateAdmissionInput {
+            candidate: &candidate,
+            contract,
+            allow_equivalent_current_behavior: false,
+        },
+    );
+    log_llm_event(
+        "agent.semantic_candidate.shadow",
+        serde_json::json!({
+            "session_id": agent.session_store.session_id(),
+            "turn_index": agent.current_turn_index,
+            "origin": "deterministic_shadow",
+            "status": decision.status.label(),
+            "reasons": decision.reason_labels(),
+            "objective_kind": candidate.objective_kind.label(),
+            "deliverable_kind": candidate.deliverable_kind.label(),
+            "evidence_kind": candidate.evidence_kind.label(),
+            "deliverable_candidate_count": candidate.deliverable_candidates.len(),
+            "artifact_identity_count": candidate.artifact_identities.len(),
+            "schema_expectation_count": candidate.schema_expectations.len(),
+            "authoring_style": candidate.authoring_style.style.label(),
+            "style_authority": candidate.authoring_style.authority.label(),
+            "compatibility_risks": candidate.compatibility_risks,
+            "disagreement_count": decision.disagreements.len(),
+        }),
+    );
 }
