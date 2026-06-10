@@ -3,6 +3,7 @@ use super::failure_packet::{CandidateArtifact, FailurePacket};
 use super::repair_job::SemanticRepairPlan;
 use super::semantic_failure::SemanticFailureReport;
 use super::spec_authority::SpecAuthorityInput;
+use super::structured_data_observation;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
     StructuredColumnPolicy, TaskKind,
@@ -525,7 +526,8 @@ impl DataVerifier {
         if !self.structured_data_pass(path_ref, excerpt, required_columns) {
             return None;
         }
-        let columns = observed_data_columns(path_ref, excerpt, required_columns);
+        let columns =
+            structured_data_observation::observed_data_columns(path_ref, excerpt, required_columns);
         Some(CompletionEvidence::StructuredDataPass { path, columns })
     }
 
@@ -853,7 +855,7 @@ fn verifier_diagnostic_for_obligation_parts(
             Some(&obligation.path),
             format!(
                 "documentation required section headings are missing: {}; add markdown headings for all required sections",
-                display_schema_columns(&missing)
+                structured_data_observation::display_schema_columns(&missing)
             ),
         ));
     }
@@ -942,7 +944,7 @@ fn data_artifact_diagnostic(
     excerpt: &str,
     required_columns: &[String],
 ) -> Option<VerifierDiagnostic> {
-    if let Some(message) = structured_data_exact_columns_diagnostic(
+    if let Some(message) = structured_data_observation::structured_data_exact_columns_diagnostic(
         path,
         excerpt,
         required_columns,
@@ -968,9 +970,10 @@ fn data_artifact_diagnostic(
     if let StructuredDataTier::Insufficient =
         assess_structured_data(Some(path), excerpt, required_columns)
     {
-        let message = structured_data_parse_error(path, excerpt).unwrap_or(
-            "structured data evidence is missing required columns or parse-ready records",
-        );
+        let message = structured_data_observation::structured_data_parse_error(path, excerpt)
+            .unwrap_or(
+                "structured data evidence is missing required columns or parse-ready records",
+            );
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::SchemaMismatch,
@@ -1010,57 +1013,14 @@ fn data_schema_obligation_diagnostic_with_rows(
     if required_columns.is_empty() {
         return data_artifact_diagnostic(task_kind, path, excerpt, required_columns);
     }
-    if let Some(message) =
-        structured_data_exact_columns_diagnostic(path, excerpt, required_columns, column_policy)
-    {
-        return Some(VerifierDiagnostic::new(
-            task_kind,
-            VerifierDiagnosticCode::SchemaMismatch,
-            ArtifactRole::DataOutput,
-            Some(path),
-            message,
-        ));
-    }
-    if let Some(message) = structured_data_parse_error(path, excerpt) {
-        return Some(VerifierDiagnostic::new(
-            task_kind,
-            VerifierDiagnosticCode::SchemaMismatch,
-            ArtifactRole::DataOutput,
-            Some(path),
-            message,
-        ));
-    }
-    if excerpt.trim().is_empty() {
-        return Some(VerifierDiagnostic::new(
-            task_kind,
-            VerifierDiagnosticCode::SchemaMismatch,
-            ArtifactRole::DataOutput,
-            Some(path),
-            "structured data evidence is empty",
-        ));
-    }
-    let observed = observed_data_columns(Some(path), excerpt, required_columns);
-    let missing = required_columns
-        .iter()
-        .filter(|column| !observed.iter().any(|seen| seen == *column))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Some(VerifierDiagnostic::new(
-            task_kind,
-            VerifierDiagnosticCode::SchemaMismatch,
-            ArtifactRole::DataOutput,
-            Some(path),
-            format!(
-                "structured data is missing required columns: {}; observed columns: {}; add all required columns",
-                display_schema_columns(&missing),
-                display_schema_columns(&observed)
-            ),
-        ));
-    }
-    if let Some(message) =
-        structured_data_expected_rows_diagnostic(path, excerpt, required_columns, expected_rows)
-    {
+    let observation = structured_data_observation::observe_structured_data_schema(
+        path,
+        excerpt,
+        required_columns,
+        expected_rows,
+        column_policy,
+    );
+    if let Some(message) = observation.diagnostic_message() {
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::SchemaMismatch,
@@ -1088,144 +1048,6 @@ pub(super) fn structured_data_schema_obligation_pass_with_rows(
         column_policy,
     )
     .is_none()
-}
-
-fn structured_data_exact_columns_diagnostic(
-    path: &str,
-    excerpt: &str,
-    required_columns: &[String],
-    column_policy: StructuredColumnPolicy,
-) -> Option<String> {
-    if required_columns.is_empty() {
-        return None;
-    }
-    let json_object = path_has_extension(Some(path), "json");
-    if !json_object && column_policy != StructuredColumnPolicy::Exact {
-        return None;
-    }
-    let observed = if json_object {
-        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(excerpt)
-        else {
-            return None;
-        };
-        sorted_unique(map.keys().cloned().collect())
-    } else {
-        sorted_unique(observed_data_columns(Some(path), excerpt, required_columns))
-    };
-    let required = sorted_unique(required_columns.to_vec());
-    (observed != required).then(|| {
-        format!(
-            "structured data columns must match exactly: expected {}; observed {}; remove extra fields and add missing required fields",
-            display_schema_columns(required_columns),
-            display_schema_columns(&observed)
-        )
-    })
-}
-
-fn structured_data_expected_rows_diagnostic(
-    path: &str,
-    excerpt: &str,
-    required_columns: &[String],
-    expected_rows: &[Vec<String>],
-) -> Option<String> {
-    if expected_rows.is_empty() {
-        return None;
-    }
-    let Some(delimiter) = delimited_data_delimiter(path) else {
-        return Some("structured data expected rows require CSV or TSV parse evidence".to_string());
-    };
-    let Some((observed_columns, observed_rows)) = delimited_table(excerpt, delimiter) else {
-        return Some("structured data expected rows have no parse-ready records".to_string());
-    };
-    if observed_columns != required_columns {
-        return Some(format!(
-            "structured data columns must match exactly for expected rows: expected {}; observed {}",
-            display_schema_columns(required_columns),
-            display_schema_columns(&observed_columns)
-        ));
-    }
-    if observed_rows
-        .iter()
-        .any(|row| row.len() != required_columns.len())
-    {
-        return Some(format!(
-            "structured data expected rows require {} cells per row",
-            required_columns.len()
-        ));
-    }
-    let expected = normalized_row_set(expected_rows);
-    let observed = normalized_row_set(&observed_rows);
-    (expected != observed).then(|| {
-        format!(
-            "structured data expected rows do not match: expected rows {}; observed rows {}",
-            display_schema_rows(expected_rows),
-            display_schema_rows(&observed_rows)
-        )
-    })
-}
-
-fn delimited_data_delimiter(path: &str) -> Option<char> {
-    match path_extension_lower(path).as_deref() {
-        Some("csv") => Some(','),
-        Some("tsv") => Some('\t'),
-        _ => None,
-    }
-}
-
-fn delimited_table(excerpt: &str, delimiter: char) -> Option<(Vec<String>, Vec<Vec<String>>)> {
-    let mut lines = excerpt.lines().filter(|line| !line.trim().is_empty());
-    let header = lines
-        .next()?
-        .split(delimiter)
-        .map(clean_data_column)
-        .collect::<Vec<_>>();
-    if header.is_empty() {
-        return None;
-    }
-    let rows = lines
-        .map(|line| {
-            line.split(delimiter)
-                .map(clean_data_column)
-                .collect::<Vec<_>>()
-        })
-        .filter(|row| row.iter().any(|cell| !cell.is_empty()))
-        .collect::<Vec<_>>();
-    Some((header, rows))
-}
-
-fn normalized_row_set(rows: &[Vec<String>]) -> Vec<String> {
-    let mut normalized = rows
-        .iter()
-        .map(|row| row.join("\u{1f}"))
-        .collect::<Vec<_>>();
-    normalized.sort();
-    normalized
-}
-
-fn display_schema_rows(rows: &[Vec<String>]) -> String {
-    if rows.is_empty() {
-        return "(none)".to_string();
-    }
-    rows.iter()
-        .map(|row| {
-            row.iter()
-                .map(|cell| crate::session::feedback::mask_secrets(cell))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn display_schema_columns(columns: &[String]) -> String {
-    if columns.is_empty() {
-        return "(none)".to_string();
-    }
-    columns
-        .iter()
-        .map(|column| crate::session::feedback::mask_secrets(column))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn manifest_readiness_diagnostic(
@@ -1370,26 +1192,6 @@ fn implementation_looks_semantically_wrong(excerpt: &str) -> bool {
     )
 }
 
-fn structured_data_parse_error(path: &str, excerpt: &str) -> Option<&'static str> {
-    match path_extension(path).as_deref() {
-        Some("json") => serde_json::from_str::<serde_json::Value>(excerpt)
-            .is_err()
-            .then_some("JSON data artifact is not parse-ready"),
-        Some("jsonl") | Some("ndjson") => excerpt
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .any(|line| serde_json::from_str::<serde_json::Value>(line).is_err())
-            .then_some("JSONL data artifact contains a non-parseable record"),
-        Some("csv") => delimited_header_columns(excerpt, ',')
-            .is_empty()
-            .then_some("CSV data artifact is missing a parse-ready header"),
-        Some("tsv") => delimited_header_columns(excerpt, '\t')
-            .is_empty()
-            .then_some("TSV data artifact is missing a parse-ready header"),
-        _ => None,
-    }
-}
-
 fn invalid_package_manifest_excerpt_detail(excerpt: &str) -> Option<&'static str> {
     serde_json::from_str::<serde_json::Value>(excerpt)
         .is_err()
@@ -1499,13 +1301,6 @@ fn normalize_path_label(path: &str) -> String {
         .next()
         .unwrap_or(path)
         .to_ascii_lowercase()
-}
-
-fn path_extension(path: &str) -> Option<String> {
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
 }
 
 /// Issue #919 (Decision #4 / OR-4): minimum trimmed content length (in chars)
@@ -1690,7 +1485,7 @@ pub(super) fn assess_structured_data(
     // Parse-readiness is extension-driven, so it is only meaningful with a path
     // (DD1): for `path == None` the floor/empty checks below carry the load.
     if let Some(path) = path
-        && structured_data_parse_error(path, excerpt).is_some()
+        && structured_data_observation::structured_data_parse_error(path, excerpt).is_some()
     {
         return StructuredDataTier::Insufficient;
     }
@@ -1703,7 +1498,8 @@ pub(super) fn assess_structured_data(
     if let Some(tier) = json_object_exact_columns_tier(path, excerpt, required_columns) {
         return tier;
     }
-    let observed = observed_data_columns(path, excerpt, required_columns);
+    let observed =
+        structured_data_observation::observed_data_columns(path, excerpt, required_columns);
     let all_observed = required_columns
         .iter()
         .all(|column| observed.iter().any(|seen| seen == column));
@@ -1719,7 +1515,7 @@ pub(super) fn assess_structured_data(
     // guarantee, so it stays `Insufficient`. Parse-checkable text formats
     // (csv/tsv/json/jsonl/ndjson) and the path-less completion case keep the
     // accept tier.
-    if !accept_tier_format_is_parse_checkable(path) {
+    if !structured_data_observation::accept_tier_format_is_parse_checkable(path) {
         return StructuredDataTier::Insufficient;
     }
     if excerpt.trim().chars().count() >= STRUCTURED_DATA_MIN_CHARS {
@@ -1734,49 +1530,20 @@ fn json_object_exact_columns_tier(
     excerpt: &str,
     required_columns: &[String],
 ) -> Option<StructuredDataTier> {
-    if !path_has_extension(path, "json") {
+    if !structured_data_observation::path_has_extension(path, "json") {
         return None;
     }
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(excerpt)
     else {
         return None;
     };
-    let observed = sorted_unique(map.keys().cloned().collect());
-    let required = sorted_unique(required_columns.to_vec());
+    let observed = structured_data_observation::sorted_unique(map.keys().cloned().collect());
+    let required = structured_data_observation::sorted_unique(required_columns.to_vec());
     Some(if observed == required {
         StructuredDataTier::SchemaSatisfied
     } else {
         StructuredDataTier::Insufficient
     })
-}
-
-/// Issue #921 (P4 / CB-001): whether the AcceptTier fallback may apply to this
-/// path's format. `None` (the path-less completion case) and the parse-checkable
-/// text formats are allowed; any other recognized extension (e.g. binary
-/// `.parquet`) is not, because parse-readiness cannot be established from a text
-/// excerpt. Mirrors the extension dispatch in [`observed_data_columns`] /
-/// [`structured_data_parse_error`].
-fn accept_tier_format_is_parse_checkable(path: Option<&str>) -> bool {
-    let Some(path) = path else {
-        return true;
-    };
-    match path_extension_lower(path).as_deref() {
-        None => true,
-        Some("csv" | "tsv" | "json" | "jsonl" | "ndjson") => true,
-        Some(_) => false,
-    }
-}
-
-fn path_has_extension(path: Option<&str>, expected: &str) -> bool {
-    path.and_then(path_extension_lower)
-        .is_some_and(|ext| ext == expected)
-}
-
-fn path_extension_lower(path: &str) -> Option<String> {
-    std::path::Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase)
 }
 
 fn structured_data_pass(path: Option<&str>, excerpt: &str, required_columns: &[String]) -> bool {
@@ -2042,92 +1809,6 @@ fn ops_runbook_pass(excerpt: &str, required_sections: &[String]) -> bool {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
-}
-
-fn observed_data_columns(
-    path: Option<&str>,
-    excerpt: &str,
-    required_columns: &[String],
-) -> Vec<String> {
-    let normalized_ext = path
-        .and_then(|path| std::path::Path::new(path).extension())
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase);
-    let columns = match normalized_ext.as_deref() {
-        Some("tsv") => delimited_header_columns(excerpt, '\t'),
-        Some("csv") => delimited_header_columns(excerpt, ','),
-        Some("json") => json_columns(excerpt),
-        Some("jsonl") | Some("ndjson") => jsonl_columns(excerpt),
-        _ => generic_data_columns(excerpt, required_columns),
-    };
-    sorted_unique(columns)
-}
-
-fn delimited_header_columns(excerpt: &str, delimiter: char) -> Vec<String> {
-    excerpt
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| {
-            line.split(delimiter)
-                .map(clean_data_column)
-                .filter(|column| !column.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn json_columns(excerpt: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(excerpt) else {
-        return Vec::new();
-    };
-    value_columns(&value)
-}
-
-fn jsonl_columns(excerpt: &str) -> Vec<String> {
-    let mut columns = Vec::new();
-    for line in excerpt.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            return Vec::new();
-        };
-        columns.extend(value_columns(&value));
-    }
-    columns
-}
-
-fn value_columns(value: &serde_json::Value) -> Vec<String> {
-    match value {
-        serde_json::Value::Object(map) => map.keys().cloned().collect(),
-        serde_json::Value::Array(items) => items.iter().flat_map(value_columns).collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn generic_data_columns(excerpt: &str, required_columns: &[String]) -> Vec<String> {
-    if excerpt.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut columns = required_columns
-        .iter()
-        .filter(|column| excerpt.contains(column.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if columns.is_empty() && required_columns.is_empty() {
-        columns.push("data".to_string());
-    }
-    columns
-}
-
-fn clean_data_column(raw: &str) -> String {
-    raw.trim()
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
-        .trim()
-        .to_string()
-}
-
-fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
-    values.sort();
-    values.dedup();
-    values
 }
 
 #[cfg(test)]

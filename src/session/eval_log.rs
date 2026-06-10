@@ -516,9 +516,10 @@ impl EvalRecord {
     }
 
     pub fn refresh_shadow_terminal_projection(&mut self) {
-        self.shadow_terminal_projection = self.terminal_diagnostics.as_ref().map(|diagnostics| {
-            build_shadow_terminal_projection(&self.final_outcome, diagnostics)
-        });
+        self.shadow_terminal_projection = self
+            .terminal_diagnostics
+            .as_ref()
+            .map(|diagnostics| build_shadow_terminal_projection(&self.final_outcome, diagnostics));
     }
 
     pub fn mark_artifact_evidence_repair_exhausted(&mut self) {
@@ -1109,7 +1110,9 @@ fn is_failure_domain(domain: Option<&str>) -> bool {
 
 fn shadow_terminal_reason(class: &str, conflict: bool) -> &'static str {
     match (class, conflict) {
-        ("success", true) => "shadow evidence indicates success while current terminal is non-success",
+        ("success", true) => {
+            "shadow evidence indicates success while current terminal is non-success"
+        }
         ("success", false) => "typed evidence obligations indicate success",
         ("missing_evidence", true) => {
             "shadow evidence indicates missing evidence while current terminal is success"
@@ -1119,9 +1122,7 @@ fn shadow_terminal_reason(class: &str, conflict: bool) -> &'static str {
             "shadow evidence indicates failed evidence while current terminal is success"
         }
         ("evidence_failed", false) => "typed evidence obligations indicate failed evidence",
-        ("evidence_repair_exhausted", _) => {
-            "typed repair-convergence obligation is unsatisfied"
-        }
+        ("evidence_repair_exhausted", _) => "typed repair-convergence obligation is unsatisfied",
         ("missing_deliverable", _) => "typed deliverable obligation is unsatisfied",
         _ => "typed evidence obligations were not observed",
     }

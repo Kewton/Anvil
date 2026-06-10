@@ -79,6 +79,7 @@ mod cargo_manifest_summary;
 mod node_test_evidence_quality;
 mod objective_evidence;
 mod package_manifest_summary;
+mod structured_data_observation;
 // Anti-pattern extraction + retrieval flow extracted from `turn.rs`
 // (parent #680). Hosts `maybe_extract_anti_pattern` and
 // `try_inject_anti_pattern_message` (free fns over `&mut Agent`) plus
