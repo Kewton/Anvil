@@ -1346,7 +1346,7 @@ impl TaskContract {
         CompletionDecision::Done
     }
 
-    fn requires_fresh_repo_edit_before_done(&self) -> bool {
+    pub(super) fn requires_fresh_repo_edit_before_done(&self) -> bool {
         self.task_kind == TaskKind::Coding
             && matches!(
                 self.intent,
@@ -1357,7 +1357,7 @@ impl TaskContract {
                 || self.required_behavior.confidence >= required_behavior::LOW_CONFIDENCE_THRESHOLD)
     }
 
-    fn fresh_repo_edit_missing_roles(&self) -> Vec<ArtifactRole> {
+    pub(super) fn fresh_repo_edit_missing_roles(&self) -> Vec<ArtifactRole> {
         if self.required_artifacts.is_empty() {
             return vec![ArtifactRole::Implementation];
         }

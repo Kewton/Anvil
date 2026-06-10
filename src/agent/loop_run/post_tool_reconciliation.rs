@@ -5,6 +5,7 @@
 //! move actor-loop routing behind this boundary without changing behavior now.
 
 use super::Agent;
+use super::deliverable_obligation_audit::deliverable_obligation_audit_payload;
 use super::evidence_runner::{EvidenceRunner, EvidenceRunnerKind, evidence_runner_for_task_kind};
 use super::task_contract::{
     ArtifactRecoveryAction, ArtifactRole, ObjectiveEvidenceKind, RecoveryTargetHint,
@@ -108,6 +109,7 @@ pub(super) fn emit_post_tool_reconciliation(
             "runner_kind": reconciliation.runner_kind.map(EvidenceRunnerKind::as_str),
             "status": reconciliation.label(),
             "authority": "projection_only",
+            "deliverable_obligations": deliverable_obligation_audit_payload(contract),
         }),
     );
 }

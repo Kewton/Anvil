@@ -102,6 +102,7 @@ mod completion_probe_gate;
 mod contract_bound_generation;
 mod contract_generation_expectations;
 mod deliverable_freshness;
+mod deliverable_obligation_audit;
 mod runtime_capability;
 // Tester invocation flow extracted from `turn.rs` (parent #680). Hosts
 // `try_invoke_tester` (pub(super)) and 5 private helpers as free fns
